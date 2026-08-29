@@ -40,6 +40,21 @@ _MAX_RESULT_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_ZIP_MEMBERS = 100_000
 _MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 _MAX_WIRE_JSON_BYTES = 1024 * 1024
+_IDEMPOTENCY_BUCKET_SECONDS = 3600
+
+
+def _make_idempotency_key(
+    source_pdf_sha256: str,
+    attempt_identity: str,
+    fence_identity: str,
+    *,
+    observed_unix: float,
+) -> str:
+    bucket = int(observed_unix // _IDEMPOTENCY_BUCKET_SECONDS)
+    digest = hashlib.sha256(
+        f"{bucket:x}\0{source_pdf_sha256}\0{attempt_identity}\0{fence_identity}".encode()
+    ).hexdigest()
+    return f"{bucket:x}.{digest}"
 
 
 def _fail(message: str) -> ParserOutputContractError:
@@ -78,12 +93,13 @@ class _Task:
     source_pdf_sha256: str
     attempt_identity: str
     fence_identity: str
+    idempotency_key: str = ""
     task_protocol_v2: bool = False
 
     def token(self, *, spool_path: Path | None, artifact_sha256: str) -> str:
         raw = json.dumps(
             {
-                "v": 2,
+                "v": 3,
                 "base_url": self.base_url,
                 "task_id": self.task_id,
                 "status_url": self.status_url,
@@ -91,6 +107,7 @@ class _Task:
                 "source_pdf_sha256": self.source_pdf_sha256,
                 "attempt_identity": self.attempt_identity,
                 "fence_identity": self.fence_identity,
+                "idempotency_key": self.idempotency_key,
                 "spool_path": "" if spool_path is None else str(spool_path),
                 "artifact_sha256": artifact_sha256,
                 "task_protocol_v2": self.task_protocol_v2,
@@ -106,7 +123,7 @@ class _Task:
             payload = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
         except (ValueError, json.JSONDecodeError) as exc:
             raise _fail("invalid durable resume token") from exc
-        if not isinstance(payload, dict) or payload.get("v") not in {1, 2}:
+        if not isinstance(payload, dict) or payload.get("v") not in {1, 2, 3}:
             raise _fail("invalid durable resume token shape")
         expected = {
             "v",
@@ -122,12 +139,17 @@ class _Task:
         }
         if payload["v"] == 2:
             expected.add("task_protocol_v2")
+        if payload["v"] == 3:
+            expected.update({"task_protocol_v2", "idempotency_key"})
         if set(payload) != expected:
             raise _fail("invalid durable resume token shape")
         values = {
             key: payload[key]
             for key in payload
-            if key not in {"v", "spool_path", "artifact_sha256", "task_protocol_v2"}
+            if key not in {
+                "v", "spool_path", "artifact_sha256", "task_protocol_v2",
+                "idempotency_key",
+            }
         }
         if not all(isinstance(value, str) for value in values.values()):
             raise _fail("invalid durable resume token values")
@@ -135,6 +157,7 @@ class _Task:
         if not isinstance(protocol_v2, bool):
             raise _fail("invalid durable resume token values")
         values["task_protocol_v2"] = protocol_v2
+        values["idempotency_key"] = payload.get("idempotency_key", "")
         task = cls(**values)
         task.validate()
         artifact_sha256 = payload["artifact_sha256"]
@@ -151,6 +174,15 @@ class _Task:
         _identity(self.task_id, "task id")
         _identity(self.attempt_identity, "attempt identity")
         _identity(self.fence_identity, "fence identity")
+        if self.idempotency_key:
+            bucket, separator, digest = self.idempotency_key.partition(".")
+            if (
+                not separator or not bucket
+                or any(char not in "0123456789abcdef" for char in bucket)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise _fail("invalid idempotency key")
         if (
             not self.source_pdf_sha256.startswith("sha256:")
             or len(self.source_pdf_sha256) != 71
@@ -305,10 +337,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         if owner != expected_owner:
             raise _fail("retained result owner is not canonical")
         if self._task.task_protocol_v2:
-            expected_idempotency = hashlib.sha256(
-                f"{self._task.source_pdf_sha256}\0{self._task.attempt_identity}\0"
-                f"{self._task.fence_identity}".encode()
-            ).hexdigest()
+            expected_idempotency = self._task.idempotency_key
             expected_protocol = {
                 "task_protocol_schema": "mineru-task-protocol.v2",
                 "protocol_state": "completed",
@@ -374,7 +403,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 if "application/zip" not in response.headers.get("content-type", ""):
                     raise _fail("result is not application/zip")
                 with part_path.open("wb") as sink:
-                    for chunk in response.iter_bytes():
+                    for chunk in response.iter_bytes(chunk_size=64 * 1024):
                         byte_count += len(chunk)
                         if byte_count > _MAX_RESULT_BYTES:
                             raise _fail("result exceeds the closed spool envelope")
@@ -530,13 +559,14 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                     required={"schema", "task_id", "status"},
                     allowed={"schema", "task_id", "status"},
                 )
-            if payload is not None:
-                if set(payload) != {"schema", "task_id", "status"} or payload != {
+            if payload is not None and (
+                set(payload) != {"schema", "task_id", "status"} or payload != {
                     "schema": "mineru-task-protocol.v2",
                     "task_id": self._task.task_id,
                     "status": "consumed",
-                }:
-                    raise _fail("result acknowledgement identity drifted")
+                }
+            ):
+                raise _fail("result acknowledgement identity drifted")
 
     def _download_retained_result(self, receipt: RemoteArtifactReceipt) -> Path:
         self._spool_root.mkdir(parents=True, exist_ok=True)
@@ -565,7 +595,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 ):
                     raise _fail("retained result headers drifted")
                 with path.open("wb") as sink:
-                    for chunk in response.iter_bytes():
+                    for chunk in response.iter_bytes(chunk_size=64 * 1024):
                         received += len(chunk)
                         if received > receipt.artifact_byte_count:
                             raise _fail("retained result exceeded attested bytes")
@@ -600,6 +630,7 @@ class MinerUHttpStagedParser:
         reader: MinerUMediumArtifactReader | None = None,
         transport: httpx.BaseTransport | None = None,
         task_protocol_v2: bool = False,
+        clock: Any = time.time,
     ) -> None:
         self._api_url = api_url.rstrip("/")
         self._server_url = server_url
@@ -607,6 +638,7 @@ class MinerUHttpStagedParser:
         self._transport = transport
         self._spool_root = spool_root
         self._task_protocol_v2 = task_protocol_v2
+        self._clock = clock
 
     def begin_remote_parse(
         self,
@@ -696,9 +728,10 @@ class MinerUHttpStagedParser:
             "end_page_id": "99999",
             "server_url": self._server_url,
         }
-        idempotency_key = hashlib.sha256(
-            f"{source_pdf_sha256}\0{attempt_identity}\0{fence_identity}".encode()
-        ).hexdigest()
+        idempotency_key = _make_idempotency_key(
+            source_pdf_sha256, attempt_identity, fence_identity,
+            observed_unix=float(self._clock()),
+        )
         if self._task_protocol_v2:
             data.update(
                 {
@@ -784,6 +817,7 @@ class MinerUHttpStagedParser:
             source_pdf_sha256=source_pdf_sha256,
             attempt_identity=attempt_identity,
             fence_identity=fence_identity,
+            idempotency_key=idempotency_key if self._task_protocol_v2 else "",
             task_protocol_v2=self._task_protocol_v2,
         )
         return MinerUHttpRemoteHandle(
@@ -826,7 +860,7 @@ def _closed_json(
 ) -> dict[str, Any]:
     chunks: list[bytes] = []
     total = 0
-    for chunk in response.iter_bytes():
+    for chunk in response.iter_bytes(chunk_size=64 * 1024):
         total += len(chunk)
         if total > _MAX_WIRE_JSON_BYTES:
             raise _fail("response JSON exceeds the closed wire envelope")

@@ -40,6 +40,141 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(record.state, "pending")
 
+    @staticmethod
+    def _lifecycle_key(index: int, now: float) -> str:
+        bucket = int(now // 3600)
+        digest = hashlib.sha256(f"task-key-{index}".encode()).hexdigest()
+        return f"{bucket:x}.{digest}"
+
+    def test_configured_output_root_rejects_task_from_other_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "owned"
+            output_root.mkdir()
+            other = root / "other" / "task-key"
+            uploads = other / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"pdf")
+            registry = DurableTaskRegistry(
+                root / "registry.json",
+                max_unacked_result_bytes=100,
+                output_root=output_root,
+            )
+            self._create(registry)
+            with self.assertRaisesRegex(TaskProtocolConflict, "escaped"):
+                registry.bind_task_payload(
+                    "key",
+                    {
+                        "task_id": "task-key",
+                        "output_dir": str(other),
+                        "uploads": [str(upload)],
+                    },
+                )
+
+    def test_registry_restart_rejects_replaced_configured_output_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "owned"
+            output_root.mkdir()
+            registry_path = root / "registry.json"
+            registry = DurableTaskRegistry(
+                registry_path,
+                max_unacked_result_bytes=100,
+                output_root=output_root,
+            )
+            self._create(registry)
+            output_root.rename(root / "replaced-owned")
+            output_root.mkdir()
+            with self.assertRaisesRegex(TaskProtocolConflict, "identity drifted"):
+                DurableTaskRegistry(
+                    registry_path,
+                    max_unacked_result_bytes=100,
+                    output_root=output_root,
+                )
+
+    def test_bounded_tombstone_lifecycle_allows_more_than_128_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [1_000_000.0]
+            registry_path = root / "registry.json"
+            registry = DurableTaskRegistry(
+                registry_path,
+                max_unacked_result_bytes=1024,
+                output_root=root,
+                tombstone_retention_seconds=7200,
+                enforce_key_lifecycle=True,
+                clock=lambda: now[0],
+            )
+            first_key = self._lifecycle_key(0, now[0])
+            for index in range(130):
+                key = self._lifecycle_key(index, now[0])
+                task_id = f"task-{index}"
+                registry.reconcile_or_create(
+                    idempotency_key=key,
+                    task_id=task_id,
+                    attempt_identity="attempt",
+                    fence_identity="fence",
+                )
+                registry.transition(key, "processing")
+                registry.transition(key, "finalizing")
+                registry.reserve_finalizer(key, byte_budget=1)
+                result = root / f"result-{index}.zip"
+                result.write_bytes(b"x")
+                digest = hashlib.sha256(b"x").hexdigest()
+                owner = hashlib.sha256(
+                    f"{task_id}\0{digest}\0{1}".encode()
+                ).hexdigest()
+                registry.complete(
+                    key,
+                    result_path=result,
+                    result_sha256=digest,
+                    result_bytes=1,
+                    result_owner=owner,
+                )
+                registry.acknowledge(key)
+                self.assertEqual(registry.cleanup_consumed(Path.unlink), 1)
+
+            restarted = DurableTaskRegistry(
+                registry_path,
+                max_unacked_result_bytes=1024,
+                output_root=root,
+                tombstone_retention_seconds=7200,
+                enforce_key_lifecycle=True,
+                clock=lambda: now[0],
+            )
+            replay, created = restarted.reconcile_or_create(
+                idempotency_key=first_key,
+                task_id="ignored",
+                attempt_identity="attempt",
+                fence_identity="fence",
+            )
+            self.assertFalse(created)
+            self.assertEqual(replay.state, "consumed")
+            with self.assertRaisesRegex(TaskProtocolConflict, "different attempt"):
+                restarted.reconcile_or_create(
+                    idempotency_key=first_key,
+                    task_id="ignored",
+                    attempt_identity="changed",
+                    fence_identity="fence",
+                )
+            now[0] += 10800
+            fresh_key = self._lifecycle_key(131, now[0])
+            _, created = restarted.reconcile_or_create(
+                idempotency_key=fresh_key,
+                task_id="task-131",
+                attempt_identity="attempt",
+                fence_identity="fence",
+            )
+            self.assertTrue(created)
+            with self.assertRaisesRegex(TaskProtocolConflict, "expired"):
+                restarted.reconcile_or_create(
+                    idempotency_key=first_key,
+                    task_id="new",
+                    attempt_identity="attempt",
+                    fence_identity="fence",
+                )
+
     def test_idempotency_reconciles_exact_and_rejects_conflict_before_allocation(
         self,
     ) -> None:
@@ -283,7 +418,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             )
             registry.transition("key", "processing")
             (output / "escape").symlink_to(root)
-            with self.assertRaisesRegex(TaskProtocolConflict, "escaped"):
+            with self.assertRaisesRegex(TaskProtocolConflict, "symlink"):
                 self._registry(root).recoverable_payloads()
 
     def test_parse_credit_is_released_while_previous_finalizer_waits(self) -> None:

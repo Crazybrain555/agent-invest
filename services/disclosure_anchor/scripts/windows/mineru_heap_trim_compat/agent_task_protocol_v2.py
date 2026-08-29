@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import os
-import shutil
 import stat
 import tempfile
 import time
@@ -22,7 +21,9 @@ TaskState = Literal[
 ]
 _MAX_REGISTRY_BYTES = 16 * 1024 * 1024
 _MAX_RECORDS = 128
+_MAX_TOMBSTONES = 8192
 _MAX_TASK_PAYLOAD_BYTES = 64 * 1024
+_KEY_BUCKET_SECONDS = 3600
 
 
 class TaskProtocolConflict(RuntimeError):
@@ -46,6 +47,7 @@ class DurableTaskRecord:
     task_payload: dict[str, Any] | None = None
     reserved_result_bytes: int = 0
     recovery_generation: int = 1
+    consumed_at_unix: float | None = None
 
     def __post_init__(self) -> None:
         for value in (
@@ -56,6 +58,12 @@ class DurableTaskRecord:
         ):
             if not isinstance(value, str) or not value or len(value) > 256:
                 raise TaskProtocolConflict("task registry identity is invalid")
+        if (
+            self.task_id in {".", ".."}
+            or "/" in self.task_id
+            or "\\" in self.task_id
+        ):
+            raise TaskProtocolConflict("task id is not one safe path component")
         if (
             not isinstance(self.active_readers, int)
             or isinstance(self.active_readers, bool)
@@ -85,6 +93,13 @@ class DurableTaskRecord:
             or not isinstance(self.lease_until_unix, (int, float))
         ):
             raise TaskProtocolConflict("task registry lease is invalid")
+        if self.consumed_at_unix is not None and (
+            isinstance(self.consumed_at_unix, bool)
+            or not isinstance(self.consumed_at_unix, (int, float))
+        ):
+            raise TaskProtocolConflict("task registry consumed time is invalid")
+        if (self.state == "consumed") != (self.consumed_at_unix is not None):
+            raise TaskProtocolConflict("task registry consumed lifecycle is invalid")
         if self.error is not None and not isinstance(self.error, str):
             raise TaskProtocolConflict("task registry error is invalid")
         if self.task_payload is not None and not isinstance(self.task_payload, dict):
@@ -124,11 +139,39 @@ class DurableTaskRecord:
 class DurableTaskRegistry:
     """Atomic registry with reconcile, leases, ACK and reader-safe cleanup."""
 
-    def __init__(self, path: Path, *, max_unacked_result_bytes: int) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_unacked_result_bytes: int,
+        output_root: Path | None = None,
+        tombstone_retention_seconds: int = 86400,
+        enforce_key_lifecycle: bool = False,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         if max_unacked_result_bytes < 1:
             raise ValueError("unacked result byte limit must be positive")
+        if not _KEY_BUCKET_SECONDS <= tombstone_retention_seconds <= 30 * 86400:
+            raise ValueError("tombstone retention must be between one hour and 30 days")
         self._path = path
         self._limit = max_unacked_result_bytes
+        self._clock = clock
+        self._retention = tombstone_retention_seconds
+        self._enforce_key_lifecycle = enforce_key_lifecycle
+        self._output_root = (output_root or path.parent).resolve()
+        root_fd = os.open(
+            self._output_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            root_meta = os.fstat(root_fd)
+            if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != os.getuid():
+                raise TaskProtocolConflict("configured output root is unsafe")
+            self._output_root_identity = (
+                root_meta.st_dev, root_meta.st_ino, root_meta.st_uid, root_meta.st_mode
+            )
+        finally:
+            os.close(root_fd)
         self._lock = RLock()
         self._records = self._load()
 
@@ -144,6 +187,8 @@ class DurableTaskRegistry:
         if not all(value.strip() for value in values):
             raise ValueError("task protocol identities must be non-empty")
         with self._lock:
+            self._validate_key_lifecycle(idempotency_key)
+            self._prune_expired_tombstones()
             existing = self._records.get(idempotency_key)
             if existing is not None:
                 if (
@@ -154,8 +199,10 @@ class DurableTaskRegistry:
                         "idempotency key was reused with different attempt/fence"
                     )
                 return existing, False
-            if len(self._records) >= _MAX_RECORDS:
-                raise TaskProtocolConflict("task registry tombstone capacity exhausted")
+            if sum(record.state != "consumed" for record in self._records.values()) >= _MAX_RECORDS:
+                raise TaskProtocolConflict("active task registry capacity exhausted")
+            if sum(record.state == "consumed" for record in self._records.values()) >= _MAX_TOMBSTONES:
+                raise TaskProtocolConflict("task tombstone retention capacity exhausted")
             record = DurableTaskRecord(
                 idempotency_key=idempotency_key,
                 task_id=task_id,
@@ -197,23 +244,40 @@ class DurableTaskRegistry:
             if not isinstance(output_value, str) or not isinstance(uploads_value, list):
                 raise TaskProtocolConflict("task payload ownership paths are absent")
             output = Path(output_value)
-            output_meta = output.lstat()
+            if output.parent.resolve() != self._output_root:
+                raise TaskProtocolConflict("task output root escaped configured parent")
+            root_fd, task_fd = self._open_task_dir(record.task_id)
+            output_meta = os.fstat(task_fd)
             if (
                 output.name != record.task_id
                 or not stat.S_ISDIR(output_meta.st_mode)
                 or output_meta.st_uid != os.getuid()
             ):
+                os.close(task_fd)
+                os.close(root_fd)
                 raise TaskProtocolConflict("task output root identity is unsafe")
             upload_root = output / "uploads"
-            if set(output.iterdir()) != {upload_root}:
-                raise TaskProtocolConflict(
-                    "task root contained data before generation ownership began"
+            try:
+                if set(os.listdir(task_fd)) != {"uploads"}:
+                    raise TaskProtocolConflict(
+                        "task root contained data before generation ownership began"
+                    )
+                upload_fd = os.open(
+                    "uploads", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0), dir_fd=task_fd,
                 )
-            upload_identities = [
-                self._stable_file_identity(Path(value), parent=upload_root)
-                for value in uploads_value
-                if isinstance(value, str)
-            ]
+                try:
+                    upload_identities = [
+                        self._stable_file_identity_at(
+                            upload_fd, Path(value), expected_parent=upload_root
+                        )
+                        for value in uploads_value if isinstance(value, str)
+                    ]
+                finally:
+                    os.close(upload_fd)
+            finally:
+                os.close(task_fd)
+                os.close(root_fd)
             if len(upload_identities) != len(uploads_value):
                 raise TaskProtocolConflict("task upload paths are invalid")
             normalized["_agent_protocol"] = {
@@ -279,7 +343,10 @@ class DurableTaskRegistry:
         if not isinstance(protocol, dict) or protocol.get("schema") != "mineru-task-payload-owner.v1":
             raise TaskProtocolConflict("restart task ownership receipt is absent")
         output = Path(output_value)
-        output_meta = output.lstat()
+        if output.parent.resolve() != self._output_root:
+            raise TaskProtocolConflict("restart task root escaped configured parent")
+        root_fd, task_fd = self._open_task_dir(record.task_id)
+        output_meta = os.fstat(task_fd)
         if (
             output.name != record.task_id
             or str(output.resolve()) != protocol.get("task_root")
@@ -291,35 +358,46 @@ class DurableTaskRegistry:
         expected_uploads = protocol.get("uploads")
         if not isinstance(expected_uploads, list) or len(expected_uploads) != len(uploads_value):
             raise TaskProtocolConflict("restart upload receipt drifted")
-        observed = [
-            self._stable_file_identity(Path(value), parent=upload_root)
-            for value in uploads_value
-            if isinstance(value, str)
-        ]
-        if observed != expected_uploads:
-            raise TaskProtocolConflict("restart upload snapshot identity drifted")
-        for child in output.iterdir():
-            if child == upload_root:
-                continue
-            child_meta = child.lstat()
-            if child.is_symlink() or child.parent != output:
-                raise TaskProtocolConflict("restart cleanup target escaped task root")
-            if stat.S_ISDIR(child_meta.st_mode):
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        protocol["generation"] = record.recovery_generation
+        try:
+            upload_fd = os.open(
+                "uploads", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0), dir_fd=task_fd,
+            )
+            try:
+                observed = [
+                    self._stable_file_identity_at(
+                        upload_fd, Path(value), expected_parent=upload_root
+                    ) for value in uploads_value if isinstance(value, str)
+                ]
+            finally:
+                os.close(upload_fd)
+            if observed != expected_uploads:
+                raise TaskProtocolConflict("restart upload snapshot identity drifted")
+            for child in os.listdir(task_fd):
+                if child == "uploads":
+                    continue
+                self._remove_at(task_fd, child)
+            protocol["generation"] = record.recovery_generation
+        finally:
+            os.close(task_fd)
+            os.close(root_fd)
 
     @staticmethod
-    def _stable_file_identity(path: Path, *, parent: Path) -> dict[str, Any]:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    def _stable_file_identity_at(
+        parent_fd: int, path: Path, *, expected_parent: Path
+    ) -> dict[str, Any]:
+        if path.parent.resolve() != expected_parent.resolve() or path.name in {"", ".", ".."}:
+            raise TaskProtocolConflict("task upload escaped configured task root")
+        descriptor = os.open(
+            path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+        )
         try:
             before = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(before.st_mode)
                 or before.st_uid != os.getuid()
                 or before.st_nlink != 1
-                or path.resolve().parent != parent.resolve()
+                or path.resolve().parent != expected_parent.resolve()
             ):
                 raise TaskProtocolConflict("task upload snapshot identity is unsafe")
             digest = hashlib.sha256()
@@ -339,6 +417,78 @@ class DurableTaskRegistry:
             return {"path": str(path.resolve()), "bytes": total, "sha256": digest.hexdigest()}
         finally:
             os.close(descriptor)
+
+    def _open_task_dir(self, task_id: str) -> tuple[int, int]:
+        root_fd = os.open(
+            self._output_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        root_meta = os.fstat(root_fd)
+        if (
+            root_meta.st_dev, root_meta.st_ino, root_meta.st_uid, root_meta.st_mode
+        ) != self._output_root_identity:
+            os.close(root_fd)
+            raise TaskProtocolConflict("configured output root identity drifted")
+        try:
+            task_fd = os.open(
+                task_id,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd,
+            )
+        except BaseException:
+            os.close(root_fd)
+            raise
+        return root_fd, task_fd
+
+    @classmethod
+    def _remove_at(cls, parent_fd: int, name: str) -> None:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise TaskProtocolConflict("restart cleanup target is a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = os.open(
+                name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd,
+            )
+            try:
+                for child in os.listdir(child_fd):
+                    cls._remove_at(child_fd, child)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=parent_fd)
+        else:
+            os.unlink(name, dir_fd=parent_fd)
+
+    def _validate_key_lifecycle(self, key: str) -> None:
+        if not self._enforce_key_lifecycle:
+            return
+        try:
+            bucket_text, digest = key.split(".", 1)
+            bucket = int(bucket_text, 16)
+        except (ValueError, TypeError) as exc:
+            raise TaskProtocolConflict("idempotency key lifecycle is invalid") from exc
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise TaskProtocolConflict("idempotency key digest is invalid")
+        now = self._clock()
+        now_bucket = int(now // _KEY_BUCKET_SECONDS)
+        oldest = int((now - self._retention) // _KEY_BUCKET_SECONDS)
+        if bucket < oldest or bucket > now_bucket:
+            raise TaskProtocolConflict("idempotency key lifecycle expired")
+
+    def _prune_expired_tombstones(self) -> None:
+        if not self._enforce_key_lifecycle:
+            return
+        cutoff = self._clock() - self._retention
+        expired = [
+            key for key, record in self._records.items()
+            if record.state == "consumed"
+            and record.consumed_at_unix is not None
+            and record.consumed_at_unix < cutoff
+        ]
+        for key in expired:
+            del self._records[key]
+        if expired:
+            self._persist()
 
     def abandon_unbound(self, idempotency_key: str) -> None:
         """Remove only a reservation that never acquired durable task ownership."""
@@ -497,6 +647,7 @@ class DurableTaskRegistry:
                     "result cannot be ACKed while unavailable/in use"
                 )
             record.state = "consumed"
+            record.consumed_at_unix = self._clock()
             self._persist()
 
     def cleanup_consumed(self, unlink: Callable[[Path], None]) -> int:
@@ -584,12 +735,21 @@ class DurableTaskRegistry:
         )
         if (
             not isinstance(payload, dict)
-            or set(payload) != {"schema", "records"}
+            or set(payload) != {"schema", "output_root", "records"}
             or payload.get("schema") != "mineru-task-registry.v2"
         ):
             raise TaskProtocolConflict("task registry schema is invalid")
+        expected_root = {
+            "path": str(self._output_root),
+            "device": self._output_root_identity[0],
+            "inode": self._output_root_identity[1],
+            "uid": self._output_root_identity[2],
+            "mode": self._output_root_identity[3],
+        }
+        if payload.get("output_root") != expected_root:
+            raise TaskProtocolConflict("configured output root identity drifted")
         records = payload.get("records")
-        if not isinstance(records, list) or len(records) > _MAX_RECORDS:
+        if not isinstance(records, list) or len(records) > _MAX_RECORDS + _MAX_TOMBSTONES:
             raise TaskProtocolConflict("task registry records are invalid")
         expected = {item.name for item in fields(DurableTaskRecord)}
         if any(not isinstance(item, dict) or set(item) != expected for item in records):
@@ -640,6 +800,13 @@ class DurableTaskRegistry:
         payload = json.dumps(
             {
                 "schema": "mineru-task-registry.v2",
+                "output_root": {
+                    "path": str(self._output_root),
+                    "device": self._output_root_identity[0],
+                    "inode": self._output_root_identity[1],
+                    "uid": self._output_root_identity[2],
+                    "mode": self._output_root_identity[3],
+                },
                 "records": [
                     asdict(record)
                     for record in sorted(
