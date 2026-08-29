@@ -205,6 +205,13 @@ class DurableTaskRegistry:
 
     @contextmanager
     def open_result(self, idempotency_key: str) -> Iterator[Path]:
+        path = self.acquire_result(idempotency_key)
+        try:
+            yield path
+        finally:
+            self.release_result(idempotency_key)
+
+    def acquire_result(self, idempotency_key: str) -> Path:
         with self._lock:
             record = self._required(idempotency_key)
             if record.state != "completed" or not record.result_path:
@@ -213,22 +220,23 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict("result lease is absent or expired")
             record.active_readers += 1
             self._persist()
-            path = Path(record.result_path)
-        try:
-            yield path
-        finally:
-            with self._lock:
-                current = self._required(idempotency_key)
-                current.active_readers -= 1
-                if current.active_readers < 0:
-                    raise RuntimeError("result reader count underflowed")
-                self._persist()
+            return Path(record.result_path)
+
+    def release_result(self, idempotency_key: str) -> None:
+        with self._lock:
+            current = self._required(idempotency_key)
+            current.active_readers -= 1
+            if current.active_readers < 0:
+                raise RuntimeError("result reader count underflowed")
+            self._persist()
 
     def acknowledge(self, idempotency_key: str) -> None:
         with self._lock:
             record = self._required(idempotency_key)
             if record.state != "completed" or record.active_readers:
-                raise TaskProtocolConflict("result cannot be ACKed while unavailable/in use")
+                raise TaskProtocolConflict(
+                    "result cannot be ACKed while unavailable/in use"
+                )
             record.state = "consumed"
             self._persist()
 
@@ -257,12 +265,17 @@ class DurableTaskRegistry:
         if not self._path.exists():
             return {}
         payload = json.loads(self._path.read_text())
-        if not isinstance(payload, dict) or payload.get("schema") != "mineru-task-registry.v2":
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "mineru-task-registry.v2"
+        ):
             raise TaskProtocolConflict("task registry schema is invalid")
         records = payload.get("records")
         if not isinstance(records, list):
             raise TaskProtocolConflict("task registry records are invalid")
-        loaded = {item["idempotency_key"]: DurableTaskRecord(**item) for item in records}
+        loaded = {
+            item["idempotency_key"]: DurableTaskRecord(**item) for item in records
+        }
         for record in loaded.values():
             record.active_readers = 0
         return loaded

@@ -28,6 +28,9 @@ MARKER_PATH: Final = Path(
     "/opt/agent-invest/mineru-serial-v1/compatibility.json"
 )
 TARGET_PREIMAGE_SHA256: Final = {
+    "mineru/cli/api_request.py": (
+        "16e16ee7fe9d3b1872f6fb43e1f7b2e7d314d2f726311e821813abece0334e77"
+    ),
     "mineru/cli/fast_api.py": (
         "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
     ),
@@ -106,6 +109,49 @@ def _replace_exact_span(
 
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
+
+    if relative_path == "mineru/cli/api_request.py":
+        source = _replace_exact(
+            source,
+            "    end_page_id: int\n",
+            "    end_page_id: int\n"
+            "    agent_idempotency_key: Optional[str]\n"
+            "    agent_attempt_identity: Optional[str]\n"
+            "    agent_fence_identity: Optional[str]\n",
+            count=1,
+            label="task protocol v2 request identities",
+        )
+        source = _replace_exact(
+            source,
+            "    end_page_id: Annotated[\n"
+            "        int,\n"
+            "        Form(description=\"The ending page for PDF parsing, beginning from 0\"),\n"
+            "    ] = 99999,\n"
+            ") -> ParseRequestOptions:\n",
+            "    end_page_id: Annotated[\n"
+            "        int,\n"
+            "        Form(description=\"The ending page for PDF parsing, beginning from 0\"),\n"
+            "    ] = 99999,\n"
+            "    agent_idempotency_key: Annotated[Optional[str], Form()] = None,\n"
+            "    agent_attempt_identity: Annotated[Optional[str], Form()] = None,\n"
+            "    agent_fence_identity: Annotated[Optional[str], Form()] = None,\n"
+            ") -> ParseRequestOptions:\n",
+            count=1,
+            label="task protocol v2 form identities",
+        )
+        source = _replace_exact(
+            source,
+            "        end_page_id=end_page_id,\n"
+            "    )\n",
+            "        end_page_id=end_page_id,\n"
+            "        agent_idempotency_key=agent_idempotency_key,\n"
+            "        agent_attempt_identity=agent_attempt_identity,\n"
+            "        agent_fence_identity=agent_fence_identity,\n"
+            "    )\n",
+            count=1,
+            label="task protocol v2 form result",
+        )
+        return source
 
     if relative_path == "mineru_vl_utils/vlm_client/http_client.py":
         limiter = '''

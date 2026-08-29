@@ -103,11 +103,23 @@ class _Task:
             payload = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
         except (ValueError, json.JSONDecodeError) as exc:
             raise _fail("invalid durable resume token") from exc
-        if not isinstance(payload, dict) or set(payload) != {
-            "v", "base_url", "task_id", "status_url", "result_url",
-            "source_pdf_sha256", "attempt_identity", "fence_identity",
-            "spool_path", "artifact_sha256",
-        } or payload["v"] != 1:
+        if (
+            not isinstance(payload, dict)
+            or set(payload)
+            != {
+                "v",
+                "base_url",
+                "task_id",
+                "status_url",
+                "result_url",
+                "source_pdf_sha256",
+                "attempt_identity",
+                "fence_identity",
+                "spool_path",
+                "artifact_sha256",
+            }
+            or payload["v"] != 1
+        ):
             raise _fail("invalid durable resume token shape")
         values = {
             key: payload[key]
@@ -132,8 +144,12 @@ class _Task:
         _identity(self.task_id, "task id")
         _identity(self.attempt_identity, "attempt identity")
         _identity(self.fence_identity, "fence identity")
-        if not self.source_pdf_sha256.startswith("sha256:") or len(self.source_pdf_sha256) != 71 or any(
-            char not in "0123456789abcdef" for char in self.source_pdf_sha256[7:]
+        if (
+            not self.source_pdf_sha256.startswith("sha256:")
+            or len(self.source_pdf_sha256) != 71
+            or any(
+                char not in "0123456789abcdef" for char in self.source_pdf_sha256[7:]
+            )
         ):
             raise _fail("invalid source sha256")
         _same_origin_url(self.base_url, self.status_url, "status URL")
@@ -195,11 +211,15 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 try:
                     response = client.get(self._task.status_url)
                 except httpx.TransportError:
-                    self._stop.wait(min(retry_delay, max(0.0, deadline - time.monotonic())))
+                    self._stop.wait(
+                        min(retry_delay, max(0.0, deadline - time.monotonic()))
+                    )
                     retry_delay = min(5.0, retry_delay * 2)
                     continue
                 if 500 <= response.status_code <= 599:
-                    self._stop.wait(min(retry_delay, max(0.0, deadline - time.monotonic())))
+                    self._stop.wait(
+                        min(retry_delay, max(0.0, deadline - time.monotonic()))
+                    )
                     retry_delay = min(5.0, retry_delay * 2)
                     continue
                 if response.status_code != 200:
@@ -208,7 +228,9 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 payload = _closed_json(response, required={"status"})
                 status_value = payload["status"]
                 if status_value in {"pending", "processing"}:
-                    if self._stop.wait(min(_POLL_SECONDS, max(0.0, deadline-time.monotonic()))):
+                    if self._stop.wait(
+                        min(_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+                    ):
                         return self._drain(client, deadline)
                     continue
                 if status_value != "completed":
@@ -340,7 +362,10 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         )
 
     def materialize(
-        self, *, receipt: RemoteArtifactReceipt, output_dir: Path,
+        self,
+        *,
+        receipt: RemoteArtifactReceipt,
+        output_dir: Path,
         source_pdf_sha256: str,
     ) -> ProviderParserResult:
         if source_pdf_sha256 != self._task.source_pdf_sha256:
@@ -360,7 +385,10 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         ):
             raise _fail("receipt ownership drifted before materialization")
         resolved_spool = spool_path.resolve() if spool_path is not None else None
-        if resolved_spool is not None and self._spool_root not in resolved_spool.parents:
+        if (
+            resolved_spool is not None
+            and self._spool_root not in resolved_spool.parents
+        ):
             raise _fail("spool path escaped its private root")
         if resolved_spool is None:
             resolved_spool = self._download_retained_result(receipt)
@@ -370,12 +398,17 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             while chunk := source.read(1024 * 1024):
                 received += len(chunk)
                 digest.update(chunk)
-        if received != receipt.artifact_byte_count or digest.hexdigest() != receipt.artifact_sha256:
+        if (
+            received != receipt.artifact_byte_count
+            or digest.hexdigest() != receipt.artifact_sha256
+        ):
             raise _fail("spooled result identity drifted")
         if output_dir.exists():
             raise _fail("materialization output must not already exist")
         output_dir.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}-stage-", dir=output_dir.parent))
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{output_dir.name}-stage-", dir=output_dir.parent)
+        )
         try:
             _safe_extract(resolved_spool, staging)
             _fsync_tree(staging)
@@ -399,7 +432,9 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                         Path(root, name).rmdir()
                 staging.rmdir()
         try:
-            provider_document = self._reader.read(output_dir, source_pdf_sha256=source_pdf_sha256)
+            provider_document = self._reader.read(
+                output_dir, source_pdf_sha256=source_pdf_sha256
+            )
         except BaseException:
             shutil.rmtree(output_dir, ignore_errors=True)
             if spool_path is None:
@@ -407,28 +442,52 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             raise
         resolved_spool.unlink(missing_ok=True)
         target_identity = ParserTargetIdentity(
-            name="MinerU", package_version="3.4.4", backend=self._options.backend,
-            method=self._options.method, language=self._options.language,
-            formula=self._options.formula, table=self._options.table,
+            name="MinerU",
+            package_version="3.4.4",
+            backend=self._options.backend,
+            method=self._options.method,
+            language=self._options.language,
+            formula=self._options.formula,
+            table=self._options.table,
             effort=self._options.effective_effort,
             image_analysis=self._options.effective_image_analysis,
-            full_pdf=True, start_page=None, end_page=None,
-            runtime_bundle_identity_sha256=self._options.runtime_bundle_identity_sha256 or "",
+            full_pdf=True,
+            start_page=None,
+            end_page=None,
+            runtime_bundle_identity_sha256=self._options.runtime_bundle_identity_sha256
+            or "",
         )
-        return ProviderParserResult(target_identity=target_identity, artifact_root=self._reader.locate_artifact_root(output_dir), provider_document=provider_document)
+        return ProviderParserResult(
+            target_identity=target_identity,
+            artifact_root=self._reader.locate_artifact_root(output_dir),
+            provider_document=provider_document,
+        )
 
     def _download_retained_result(self, receipt: RemoteArtifactReceipt) -> Path:
         self._spool_root.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=".retained-", suffix=".zip", dir=self._spool_root)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=".retained-", suffix=".zip", dir=self._spool_root
+        )
         os.close(fd)
         path = Path(temp_name)
         digest = hashlib.sha256()
         received = 0
         try:
-            with self._client(float(self._options.timeout_seconds or 600)) as client, client.stream("GET", self._task.result_url) as response:
-                if response.status_code != 200 or "application/zip" not in response.headers.get("content-type", ""):
+            with (
+                self._client(float(self._options.timeout_seconds or 600)) as client,
+                client.stream("GET", self._task.result_url) as response,
+            ):
+                if (
+                    response.status_code != 200
+                    or "application/zip" not in response.headers.get("content-type", "")
+                ):
                     raise _fail("retained result is unavailable")
-                if response.headers.get("x-mineru-result-sha256") != receipt.artifact_sha256 or response.headers.get("x-mineru-result-owner") != receipt.artifact_owner_identity:
+                if (
+                    response.headers.get("x-mineru-result-sha256")
+                    != receipt.artifact_sha256
+                    or response.headers.get("x-mineru-result-owner")
+                    != receipt.artifact_owner_identity
+                ):
                     raise _fail("retained result headers drifted")
                 with path.open("wb") as sink:
                     for chunk in response.iter_bytes():
@@ -439,7 +498,10 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                         sink.write(chunk)
                     sink.flush()
                     os.fsync(sink.fileno())
-            if received != receipt.artifact_byte_count or digest.hexdigest() != receipt.artifact_sha256:
+            if (
+                received != receipt.artifact_byte_count
+                or digest.hexdigest() != receipt.artifact_sha256
+            ):
                 raise _fail("retained result content drifted")
             return path
         except BaseException:
@@ -454,14 +516,32 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
 
 
 class MinerUHttpStagedParser:
-    def __init__(self, *, api_url: str, server_url: str, spool_root: Path, reader: MinerUMediumArtifactReader | None = None, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_url: str,
+        server_url: str,
+        spool_root: Path,
+        reader: MinerUMediumArtifactReader | None = None,
+        transport: httpx.BaseTransport | None = None,
+        task_protocol_v2: bool = False,
+    ) -> None:
         self._api_url = api_url.rstrip("/")
         self._server_url = server_url
         self._reader = reader or MinerUMediumArtifactReader()
         self._transport = transport
         self._spool_root = spool_root
+        self._task_protocol_v2 = task_protocol_v2
 
-    def begin_remote_parse(self, *, input_pdf: Path, options: ParserOptions, source_pdf_sha256: str, attempt_identity: str, fence_identity: str) -> MinerUHttpRemoteHandle:
+    def begin_remote_parse(
+        self,
+        *,
+        input_pdf: Path,
+        options: ParserOptions,
+        source_pdf_sha256: str,
+        attempt_identity: str,
+        fence_identity: str,
+    ) -> MinerUHttpRemoteHandle:
         _identity(attempt_identity, "attempt identity")
         _identity(fence_identity, "fence identity")
         if not source_pdf_sha256.startswith("sha256:") or len(source_pdf_sha256) != 71:
@@ -503,47 +583,118 @@ class MinerUHttpStagedParser:
             snapshot.unlink(missing_ok=True)
             raise
         after = input_pdf.stat()
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
             snapshot.unlink(missing_ok=True)
             raise _fail("source changed while hashing")
         if "sha256:" + digest.hexdigest() != source_pdf_sha256:
             snapshot.unlink(missing_ok=True)
             raise _fail("source changed before submission")
         data: dict[str, Any] = {
-            "lang_list": options.language, "backend": options.backend,
-            "effort": options.effective_effort or "medium", "parse_method": options.method,
-            "formula_enable": str(options.formula).lower(), "table_enable": str(options.table).lower(),
-            "image_analysis": str(options.effective_image_analysis).lower(), "return_md": "true",
-            "return_middle_json": "true", "return_model_output": "true",
-            "return_content_list": "true", "return_images": "true",
-            "response_format_zip": "true", "return_original_file": "true",
-            "client_side_output_generation": "false", "start_page_id": "0",
-            "end_page_id": "99999", "server_url": self._server_url,
+            "lang_list": options.language,
+            "backend": options.backend,
+            "effort": options.effective_effort or "medium",
+            "parse_method": options.method,
+            "formula_enable": str(options.formula).lower(),
+            "table_enable": str(options.table).lower(),
+            "image_analysis": str(options.effective_image_analysis).lower(),
+            "return_md": "true",
+            "return_middle_json": "true",
+            "return_model_output": "true",
+            "return_content_list": "true",
+            "return_images": "true",
+            "response_format_zip": "true",
+            "return_original_file": "true",
+            "client_side_output_generation": "false",
+            "start_page_id": "0",
+            "end_page_id": "99999",
+            "server_url": self._server_url,
         }
+        idempotency_key = hashlib.sha256(
+            f"{source_pdf_sha256}\0{attempt_identity}\0{fence_identity}".encode()
+        ).hexdigest()
+        if self._task_protocol_v2:
+            data.update(
+                {
+                    "agent_idempotency_key": idempotency_key,
+                    "agent_attempt_identity": attempt_identity,
+                    "agent_fence_identity": fence_identity,
+                }
+            )
         try:
             with (
-                httpx.Client(timeout=httpx.Timeout(float(options.timeout_seconds or 300)), follow_redirects=False, trust_env=False, transport=self._transport) as client,
+                httpx.Client(
+                    timeout=httpx.Timeout(float(options.timeout_seconds or 300)),
+                    follow_redirects=False,
+                    trust_env=False,
+                    transport=self._transport,
+                ) as client,
                 snapshot.open("rb") as source,
             ):
-                response = client.post(f"{self._api_url}/tasks", data=data, files={"files": (input_pdf.name, source, "application/pdf")})
+                response = client.post(
+                    f"{self._api_url}/tasks",
+                    data=data,
+                    files={"files": (input_pdf.name, source, "application/pdf")},
+                )
         finally:
             snapshot.unlink(missing_ok=True)
         if response.status_code != 202:
             raise _fail(f"submit returned HTTP {response.status_code}")
-        payload = _closed_json(response, required={"task_id", "status_url", "result_url"})
-        if not all(isinstance(payload[key], str) for key in ("task_id", "status_url", "result_url")):
+        payload = _closed_json(
+            response, required={"task_id", "status_url", "result_url"}
+        )
+        if not all(
+            isinstance(payload[key], str)
+            for key in ("task_id", "status_url", "result_url")
+        ):
             raise _fail("submit identities are not strings")
-        task = _Task(base_url=self._api_url, task_id=payload["task_id"], status_url=_same_origin_url(self._api_url, payload["status_url"], "status URL"), result_url=_same_origin_url(self._api_url, payload["result_url"], "result URL"), source_pdf_sha256=source_pdf_sha256, attempt_identity=attempt_identity, fence_identity=fence_identity)
-        return MinerUHttpRemoteHandle(task=task, options=options, reader=self._reader, spool_root=self._spool_root, transport=self._transport)
+        task = _Task(
+            base_url=self._api_url,
+            task_id=payload["task_id"],
+            status_url=_same_origin_url(
+                self._api_url, payload["status_url"], "status URL"
+            ),
+            result_url=_same_origin_url(
+                self._api_url, payload["result_url"], "result URL"
+            ),
+            source_pdf_sha256=source_pdf_sha256,
+            attempt_identity=attempt_identity,
+            fence_identity=fence_identity,
+        )
+        return MinerUHttpRemoteHandle(
+            task=task,
+            options=options,
+            reader=self._reader,
+            spool_root=self._spool_root,
+            transport=self._transport,
+        )
 
-    def resume_remote_parse(self, *, receipt: RemoteArtifactReceipt, options: ParserOptions) -> MinerUHttpRemoteHandle:
+    def resume_remote_parse(
+        self, *, receipt: RemoteArtifactReceipt, options: ParserOptions
+    ) -> MinerUHttpRemoteHandle:
         task, spool_path, artifact_sha256 = _Task.from_token(receipt.resume_token)
-        if task.base_url != self._api_url or task.source_pdf_sha256 != receipt.source_pdf_sha256 or task.attempt_identity != receipt.attempt_identity or task.fence_identity != receipt.fence_identity:
+        if (
+            task.base_url != self._api_url
+            or task.source_pdf_sha256 != receipt.source_pdf_sha256
+            or task.attempt_identity != receipt.attempt_identity
+            or task.fence_identity != receipt.fence_identity
+        ):
             raise _fail("resume receipt drifted")
         terminal_spool = (
             (spool_path, artifact_sha256) if spool_path is not None else None
         )
-        return MinerUHttpRemoteHandle(task=task, options=options, reader=self._reader, spool_root=self._spool_root, transport=self._transport, terminal_spool=terminal_spool)
+        return MinerUHttpRemoteHandle(
+            task=task,
+            options=options,
+            reader=self._reader,
+            spool_root=self._spool_root,
+            transport=self._transport,
+            terminal_spool=terminal_spool,
+        )
 
 
 def _closed_json(response: httpx.Response, *, required: set[str]) -> dict[str, Any]:
@@ -560,7 +711,10 @@ def _safe_extract(zip_path: Path, output_dir: Path) -> None:
     root = output_dir.resolve()
     with zipfile.ZipFile(zip_path) as archive:
         members = archive.infolist()
-        if len(members) > _MAX_ZIP_MEMBERS or sum(m.file_size for m in members) > _MAX_UNCOMPRESSED_BYTES:
+        if (
+            len(members) > _MAX_ZIP_MEMBERS
+            or sum(m.file_size for m in members) > _MAX_UNCOMPRESSED_BYTES
+        ):
             raise _fail("ZIP exceeds extraction envelope")
         seen: set[str] = set()
         for member in members:
@@ -568,8 +722,11 @@ def _safe_extract(zip_path: Path, output_dir: Path) -> None:
             key = member.filename.casefold()
             mode = member.external_attr >> 16
             file_type = stat.S_IFMT(mode)
-            if pure.is_absolute() or ".." in pure.parts or key in seen or (
-                file_type and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or key in seen
+                or (file_type and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)))
             ):
                 raise _fail("unsafe ZIP member")
             seen.add(key)

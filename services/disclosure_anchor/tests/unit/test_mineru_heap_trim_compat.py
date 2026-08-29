@@ -681,6 +681,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             TARGET_PREIMAGE_SHA256,
             {
+                "mineru/cli/api_request.py": (
+                    "16e16ee7fe9d3b1872f6fb43e1f7b2e7d314d2f726311e821813abece0334e77"
+                ),
                 "mineru/cli/fast_api.py": (
                     "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
                 ),
