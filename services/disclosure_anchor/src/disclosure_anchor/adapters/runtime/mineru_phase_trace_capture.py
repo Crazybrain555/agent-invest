@@ -431,6 +431,11 @@ def summarize_synchronized_phase_capture(
     for event in progress_events:
         if event.run_id != telemetry_receipt.run_id:
             raise ValueError("progress event run identity drifted")
+        if (
+            event.clock_domain_identity_sha256
+            != telemetry_receipt.clock_domain_identity_sha256
+        ):
+            raise ValueError("progress and phase clocks are not comparable")
         if event.sequence <= previous_progress_sequence:
             raise ValueError("progress event sequence is not increasing")
         previous_progress_sequence = event.sequence

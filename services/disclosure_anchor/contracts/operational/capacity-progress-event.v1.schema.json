@@ -22,6 +22,10 @@
           "title": "Blocked Reason",
           "type": "string"
         },
+        "clock_domain_identity_sha256": {
+          "title": "Clock Domain Identity Sha256",
+          "type": "string"
+        },
         "contract_version": {
           "const": "mineru.capacity-progress-event.v1",
           "default": "mineru.capacity-progress-event.v1",
@@ -67,6 +71,7 @@
         "sequence",
         "process_epoch_sha256",
         "process_profile_sha256",
+        "clock_domain_identity_sha256",
         "observed_at_utc",
         "monotonic_ns",
         "blocked_reason",
@@ -78,6 +83,10 @@
     "DurablePageCommitEvent": {
       "additionalProperties": false,
       "properties": {
+        "clock_domain_identity_sha256": {
+          "title": "Clock Domain Identity Sha256",
+          "type": "string"
+        },
         "commit_latency_ns": {
           "minimum": 0,
           "title": "Commit Latency Ns",
@@ -142,6 +151,7 @@
         "sequence",
         "process_epoch_sha256",
         "process_profile_sha256",
+        "clock_domain_identity_sha256",
         "observed_at_utc",
         "monotonic_ns",
         "source_identity_sha256",

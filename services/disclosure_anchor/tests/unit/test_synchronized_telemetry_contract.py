@@ -207,6 +207,25 @@ def _frame(
     )
 
 
+def _complete_frames() -> tuple[SynchronizedTelemetryFrame, ...]:
+    schedule = (
+        ("gpu_fast", 0, True),
+        ("host_slow", 0, True),
+        ("gpu_fast", 250_000_000, False),
+        ("gpu_fast", 500_000_000, False),
+        ("gpu_fast", 750_000_000, False),
+        ("gpu_fast", 1_000_000_000, False),
+        ("host_slow", 1_000_000_000, False),
+        ("gpu_fast", 1_250_000_000, False),
+        ("gpu_fast", 1_500_000_000, False),
+        ("gpu_fast", 1_750_000_000, False),
+    )
+    return tuple(
+        _frame(sequence=index, lane=lane, started_ns=started_ns, first=first)
+        for index, (lane, started_ns, first) in enumerate(schedule)
+    )
+
+
 def _vector(value: int) -> CapacityVector:
     return CapacityVector(
         source_disk_bytes=value,
@@ -395,22 +414,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
             SynchronizedTelemetryReceipt.model_validate(payload)
 
     def test_frame_sequence_aligns_lanes_to_one_receipt_clock(self) -> None:
-        frames = (
-            _frame(sequence=0, lane="gpu_fast", started_ns=0, first=True),
-            _frame(sequence=1, lane="host_slow", started_ns=0, first=True),
-            _frame(
-                sequence=2,
-                lane="gpu_fast",
-                started_ns=250_000_000,
-                first=False,
-            ),
-            _frame(
-                sequence=3,
-                lane="host_slow",
-                started_ns=1_000_000_000,
-                first=False,
-            ),
-        )
+        frames = _complete_frames()
         validate_frame_sequence(frames, receipt=_receipt())
 
         payload = frames[-1].model_dump()
@@ -426,6 +430,18 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
                 (*frames[:-1], wrong_clock),
                 receipt=_receipt(),
             )
+        payload = _receipt().model_dump()
+        payload["lane_quality"][0]["sample_count"] = 7
+        payload["lane_quality"][0]["supported_frame_count"] = 7
+        forged_quality = SynchronizedTelemetryReceipt.model_validate(payload)
+        with self.assertRaisesRegex(ValueError, "lane quality receipt drifted"):
+            validate_frame_sequence(frames, receipt=forged_quality)
+        payload = _receipt().model_dump()
+        payload["unsupported_observation_count"] = 1
+        payload["status"] = "incomplete"
+        forged_unsupported = SynchronizedTelemetryReceipt.model_validate(payload)
+        with self.assertRaisesRegex(ValueError, "unsupported observation count"):
+            validate_frame_sequence(frames, receipt=forged_unsupported)
 
     def test_progress_and_phase_summary_are_content_free_and_covered(self) -> None:
         blocked = BlockedProgressEvent(
@@ -433,6 +449,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
             sequence=0,
             process_epoch_sha256=HASH,
             process_profile_sha256=HASH_B,
+            clock_domain_identity_sha256=HASH_C,
             observed_at_utc=START,
             monotonic_ns=10,
             blocked_reason="gpu_input_starved",
@@ -443,6 +460,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
             sequence=1,
             process_epoch_sha256=HASH,
             process_profile_sha256=HASH_B,
+            clock_domain_identity_sha256=HASH_C,
             observed_at_utc=START,
             monotonic_ns=20,
             source_identity_sha256=HASH_C,
@@ -544,23 +562,36 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
                 capture,
                 telemetry_receipt=_receipt(),
                 telemetry_frames=(
-                    _frame(
-                        sequence=0,
-                        lane="gpu_fast",
-                        started_ns=250_000_000,
-                        first=True,
-                    ),
-                    _frame(
-                        sequence=1,
-                        lane="host_slow",
-                        started_ns=1_000_000_000,
-                        first=True,
-                    ),
+                    *_complete_frames(),
                 ),
                 progress_events=(),
                 phase_capture_sha256=HASH,
                 telemetry_receipt_sha256=HASH_B,
                 phase_clock_binding=binding,
+            )
+        correct_binding = binding.model_copy(
+            update={"clock_domain_identity_sha256": HASH_C}
+        )
+        wrong_clock_progress = BlockedProgressEvent(
+            run_id=RUN_ID,
+            sequence=0,
+            process_epoch_sha256=HASH,
+            process_profile_sha256=HASH_B,
+            clock_domain_identity_sha256=HASH,
+            observed_at_utc=START,
+            monotonic_ns=1_000_000_000,
+            blocked_reason="gpu_input_starved",
+            blocked_duration_ns=100,
+        )
+        with self.assertRaisesRegex(ValueError, "progress and phase clocks"):
+            summarize_synchronized_phase_capture(
+                capture,
+                telemetry_receipt=_receipt(),
+                telemetry_frames=_complete_frames(),
+                progress_events=(wrong_clock_progress,),
+                phase_capture_sha256=HASH,
+                telemetry_receipt_sha256=HASH_B,
+                phase_clock_binding=correct_binding,
             )
 
 

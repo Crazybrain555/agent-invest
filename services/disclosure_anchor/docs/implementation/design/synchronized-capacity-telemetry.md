@@ -52,8 +52,14 @@ reserve/borrow/return 对每一维原子守恒，attempt 结束必须归还全�
 
 progress contract 只暴露两类事件：带 `blocked_reason` 的阻塞区间，以及带 source identity hash、
 增量/累计页数和 commit latency 的 unique durable page commit。它不携带公司、文档、URL、路径或
-task ID。phase summary 只有在完整 trace、同 clock domain 的绑定、两条 lane 覆盖、严格递增事件和
+task ID。每个 progress event 显式绑定自身 clock domain；Mac worker 发出的事件不能直接与 Windows
+phase monotonic 比较。phase summary 只有在完整 trace、同 clock domain 的绑定、两条 lane 覆盖、严格递增事件和
 receipt identity 全部闭合时生成；否则独立保存 trace 与 telemetry，禁止声称 synchronized coverage。
+
+receipt 的 lane sample count、边界/相邻最大 gap、late、missed deadline、supported frame 和 required
+unsupported observation 数必须从 frames 机械重算。`gpu_fast` 只以 GPU observation 为 required；
+`host_slow` 只以 API process、host cgroup 和 queue/vLLM 为 required。其他 lane 上的 `not_due_at_this_tick`
+不计为缺失，避免合法的分频采样被误判为永远 incomplete。
 
 正式 schema 位于 `contracts/operational/synchronized-*.v1.schema.json`。所有对象 `extra=forbid`，
 新增字段或语义必须发布新版本。

@@ -347,17 +347,9 @@ class SynchronizedTelemetryFrame(_FrozenModel):
         if self.lane == "gpu_fast":
             if not 250 <= self.quality.nominal_interval_ms <= 500:
                 raise ValueError("GPU telemetry cadence must be 250-500ms")
-            if self.gpu.status != "supported":
-                raise ValueError("GPU fast lane requires GPU telemetry")
         else:
             if self.quality.nominal_interval_ms != 1000:
                 raise ValueError("host telemetry cadence must be 1s")
-            if (
-                self.api_process.status != "supported"
-                or self.host_cgroup.status != "supported"
-                or self.queue_vllm.status != "supported"
-            ):
-                raise ValueError("host slow lane requires CPU/cgroup/queue telemetry")
         duration_ms = (
             self.clock.finished_monotonic_ns - self.clock.started_monotonic_ns
         ) / 1_000_000
@@ -593,6 +585,7 @@ class _ProgressBase(_FrozenModel):
     sequence: int = Field(ge=0)
     process_epoch_sha256: str
     process_profile_sha256: str
+    clock_domain_identity_sha256: str
     observed_at_utc: datetime
     monotonic_ns: int = Field(ge=0)
 
@@ -602,6 +595,10 @@ class _ProgressBase(_FrozenModel):
         _utc(self.observed_at_utc, label="observed_at_utc")
         _sha256(self.process_epoch_sha256, label="process_epoch_sha256")
         _sha256(self.process_profile_sha256, label="process_profile_sha256")
+        _sha256(
+            self.clock_domain_identity_sha256,
+            label="clock_domain_identity_sha256",
+        )
         return self
 
 
@@ -872,6 +869,10 @@ def validate_frame_sequence(
         raise ValueError("telemetry frame sequence is empty")
     previous_started = -1
     lane_previous: dict[TelemetryLane, SynchronizedTelemetryFrame] = {}
+    lane_frames: dict[TelemetryLane, list[SynchronizedTelemetryFrame]] = {
+        "gpu_fast": [],
+        "host_slow": [],
+    }
     for sequence, frame in enumerate(frames):
         if frame.sequence != sequence or frame.run_id != receipt.run_id:
             raise ValueError("telemetry frame sequence or run identity drifted")
@@ -910,7 +911,55 @@ def validate_frame_sequence(
             ):
                 raise ValueError("observed lane interval differs from clock")
         lane_previous[frame.lane] = frame
+        lane_frames[frame.lane].append(frame)
         previous_started = frame.clock.started_monotonic_ns
+    receipt_quality = {item.lane: item for item in receipt.lane_quality}
+    unsupported_observation_count = 0
+    for lane, frames_in_lane in lane_frames.items():
+        if not frames_in_lane:
+            raise ValueError(f"telemetry {lane} lane is empty")
+        required_statuses = (
+            [(frame.gpu.status,) for frame in frames_in_lane]
+            if lane == "gpu_fast"
+            else [
+                (
+                    frame.api_process.status,
+                    frame.host_cgroup.status,
+                    frame.queue_vllm.status,
+                )
+                for frame in frames_in_lane
+            ]
+        )
+        unsupported_observation_count += sum(
+            status == "unsupported"
+            for statuses in required_statuses
+            for status in statuses
+        )
+        supported_frame_count = sum(
+            all(status == "supported" for status in statuses)
+            for statuses in required_statuses
+        )
+        starts = [frame.clock.started_monotonic_ns for frame in frames_in_lane]
+        gaps_ns = [starts[0] - receipt.started_monotonic_ns]
+        gaps_ns.extend(right - left for left, right in zip(starts, starts[1:]))
+        gaps_ns.append(receipt.finished_monotonic_ns - starts[-1])
+        expected = LaneQualitySummary(
+            lane=lane,
+            nominal_interval_ms=frames_in_lane[0].quality.nominal_interval_ms,
+            sample_count=len(frames_in_lane),
+            maximum_gap_ms=max(gaps_ns) / 1_000_000,
+            late_sample_count=sum(
+                frame.quality.status == "late" for frame in frames_in_lane
+            ),
+            missed_deadline_count=sum(
+                frame.quality.missed_deadlines for frame in frames_in_lane
+            ),
+            supported_frame_count=supported_frame_count,
+        )
+        if receipt_quality[lane] != expected:
+            raise ValueError(f"telemetry {lane} lane quality receipt drifted")
+    if receipt.unsupported_observation_count != unsupported_observation_count:
+        raise ValueError("telemetry unsupported observation count drifted")
 
 
 __all__ = [
