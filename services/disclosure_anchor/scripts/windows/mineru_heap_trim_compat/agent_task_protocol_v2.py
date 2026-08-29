@@ -123,7 +123,7 @@ class DurableTaskRegistry:
                         raise TaskProtocolConflict(
                             "nonterminal task has no durable replay payload"
                         )
-                    if record.state == "processing":
+                    if record.state in {"processing", "finalizing"}:
                         record.state = "pending"
                 if record.task_payload is not None and record.state != "consumed":
                     recovered = dict(record.task_payload)
@@ -140,6 +140,17 @@ class DurableTaskRegistry:
                     recoverable.append(recovered)
             self._persist()
             return tuple(recoverable)
+
+    def abandon_unbound(self, idempotency_key: str) -> None:
+        """Remove only a reservation that never acquired durable task ownership."""
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state != "pending" or record.task_payload is not None:
+                raise TaskProtocolConflict(
+                    "only an unbound pending task may be abandoned"
+                )
+            del self._records[idempotency_key]
+            self._persist()
 
     def fail(self, idempotency_key: str, *, error: str) -> None:
         if not error.strip():
