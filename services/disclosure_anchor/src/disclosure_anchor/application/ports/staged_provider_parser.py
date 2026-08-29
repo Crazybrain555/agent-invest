@@ -23,6 +23,7 @@ class RemoteArtifactReceipt:
     fence_identity: str
     artifact_owner_identity: str
     artifact_byte_count: int
+    artifact_sha256: str = ""
     source_pdf_sha256: str = ""
     resume_token: str = field(default="", repr=False)
 
@@ -38,8 +39,16 @@ class RemoteArtifactReceipt:
             raise ValueError("remote artifact identities must be non-empty")
         if self.artifact_byte_count < 0:
             raise ValueError("remote artifact byte count must be non-negative")
-        if self.source_pdf_sha256 and len(self.source_pdf_sha256) != 64:
-            raise ValueError("remote source identity must be sha256")
+        for value, label in (
+            (self.artifact_sha256, "remote artifact identity"),
+            (self.source_pdf_sha256, "remote source identity"),
+        ):
+            if value and (
+                len(value) != 64
+                or value != value.lower()
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError(f"{label} must be lowercase sha256")
 
 
 class RemoteProviderParseHandle(Protocol):

@@ -319,9 +319,13 @@ maintenance thread                 report writer thread
   失败或 restart 恢复失败都保持可见，绝不能把 remote terminal 提升为 succeeded run；
 
 Pinned MinerU 3.4.4 的 `/tasks` staged HTTP 机制实现在
-`adapters/parsers/mineru_medium/http_staged.py`：提交、terminal 轮询、同源 result-owner/字节回执和
-本地安全 ZIP materialize 是分开的，客户端显式 `trust_env=False`，durable resume token 不进入
-`repr`。它仍是 default-off capability：现有 `ParseDocument.execute()` 用一个 producer lease 包围
+`adapters/parsers/mineru_medium/http_staged.py`：提交、terminal 轮询、同源 result 和本地安全 ZIP
+materialize 是分开的，客户端显式 `trust_env=False`，durable resume token 不进入 `repr`。Exact
+FastAPI 每次 result GET 都重建临时 ZIP，FileResponse ETag 不是不可变版本；所以当前安全 fallback
+必须在 terminal stage 完整 spool 一次并绑定 bytes+SHA-256，remote credit 只能在 spool 完成后归还。
+未来若 Windows exact-source patch 在 completed 边界生成 retained immutable ZIP 并把 owner/bytes/SHA-256
+加入 status contract，才可把 remote credit 提前到纯 terminal 边界。它仍是 default-off capability：
+现有 `ParseDocument.execute()` 用一个 producer lease 包围
 prepare、同步 parser、本地原子写和 finish-run，而 stale-run reclaim 会直接终结遗留 `running`
 记录。在加入私有 durable checkpoint 路径、reclaim-before-resume 顺序和重新取得 lease 后的
 attempt/fence CAS 之前，worker 不得把该 capability 接成生产路径；否则进程重启会丢失已完成的
