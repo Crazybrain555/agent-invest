@@ -19,7 +19,7 @@ from scripts.mineru_smoke import (
 
 
 class MinerUSmokeCliReceiptTests(unittest.TestCase):
-    def test_v4_evidence_accepts_retained_gauge_cleanup_without_deltas(self) -> None:
+    def test_v5_evidence_accepts_retained_gauge_cleanup_without_deltas(self) -> None:
         def health(*, completed: int, failed: int) -> MinerUOrchestratorHealth:
             return MinerUOrchestratorHealth(
                 status="healthy",
@@ -30,6 +30,8 @@ class MinerUSmokeCliReceiptTests(unittest.TestCase):
                 completed_tasks=completed,
                 failed_tasks=failed,
                 max_concurrent_requests=1,
+                max_pending_tasks_requested=1,
+                max_pending_tasks_effective=1,
                 processing_window_size=16,
                 task_retention_seconds=600,
                 task_cleanup_interval_seconds=30,
@@ -40,7 +42,7 @@ class MinerUSmokeCliReceiptTests(unittest.TestCase):
             health(completed=0, failed=0),
         )
 
-        self.assertEqual(RECEIPT_SCHEMA, "mineru_smoke_receipt.v4")
+        self.assertEqual(RECEIPT_SCHEMA, "mineru_smoke_receipt.v5")
         self.assertEqual(
             evidence["task_registry_semantics"],
             "retained-terminal-gauges.v1",

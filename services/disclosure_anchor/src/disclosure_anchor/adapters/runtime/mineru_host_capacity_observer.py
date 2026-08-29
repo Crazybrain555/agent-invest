@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -35,6 +36,40 @@ _SSH_HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.-]+$")
 _SSH_USER_RE = re.compile(r"^(?!-)[A-Za-z0-9_.-]+$")
 _CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+
+
+@dataclass(frozen=True)
+class MineruHostServiceEpochValues:
+    """Content-free runtime epoch and safety counters, without capacity policy."""
+
+    collector_sha256: str
+    windows_node_identity_sha256: str
+    container_epoch_sha256: str
+    api_container_id: str
+    restart_count_total: int
+    oom_killed_count: int
+    unsafe_container_count: int
+    cgroup_oom_total: int
+    cgroup_oom_kill_total: int
+    cgroup_high_total: int
+
+
+@dataclass(frozen=True)
+class _ValidatedHostState:
+    epoch: MineruHostServiceEpochValues
+    container_count: int
+    docker_vm_memory_total_bytes: int
+    docker_vm_memory_available_bytes: int
+    api_pid1_rss_bytes: int
+    api_pid1_rss_hwm_bytes: int
+    safety_violation_codes: tuple[
+        Literal[
+            "cgroup_oom_observed",
+            "container_state_unsafe",
+            "memory_reserve_crossed",
+        ],
+        ...,
+    ]
 
 
 def _private_observer_file(path: Path, *, label: str) -> None:
@@ -119,14 +154,14 @@ def _integer(value: object, *, label: str, allow_zero: bool = False) -> int:
     return value
 
 
-def project_host_capacity_sample(
+def _project_host_state(
     payload: object,
     *,
     expected_collector_sha256: str,
     expected_windows_node_identity_sha256: str,
-    docker_memory_reserve_bytes: int,
-) -> HostSampleValues:
-    """Validate the collector contract and remove host/container identifiers."""
+    docker_memory_reserve_bytes: int | None,
+) -> _ValidatedHostState:
+    """Validate the collector contract once for capacity and epoch projections."""
 
     if not isinstance(payload, dict) or set(payload) != {
         "schema",
@@ -143,7 +178,10 @@ def project_host_capacity_sample(
         or payload.get("collector_sha256") != expected_collector_sha256
         or payload.get("windows_node_identity_sha256")
         != expected_windows_node_identity_sha256
-        or docker_memory_reserve_bytes < 1
+        or (
+            docker_memory_reserve_bytes is not None
+            and docker_memory_reserve_bytes < 1
+        )
     ):
         raise ValueError("host capacity sample identity drifted")
     try:
@@ -170,6 +208,7 @@ def project_host_capacity_sample(
     vm_available: int | None = None
     api_rss: int | None = None
     api_rss_hwm: int | None = None
+    api_container_id: str | None = None
     violation_codes: set[
         Literal[
             "cgroup_oom_observed",
@@ -283,7 +322,10 @@ def project_host_capacity_sample(
         else:
             assert vm_available is not None
             vm_available = min(vm_available, container_vm_available)
-        if container_vm_available < docker_memory_reserve_bytes:
+        if (
+            docker_memory_reserve_bytes is not None
+            and container_vm_available < docker_memory_reserve_bytes
+        ):
             violation_codes.add("memory_reserve_crossed")
         events = item.get("memory_events")
         if (
@@ -316,7 +358,13 @@ def project_host_capacity_sample(
         if name == "mineru-api":
             api_rss = rss
             api_rss_hwm = rss_hwm
-    if names != HOST_CONTAINER_NAMES or api_rss is None or api_rss_hwm is None:
+            api_container_id = container_id
+    if (
+        names != HOST_CONTAINER_NAMES
+        or api_rss is None
+        or api_rss_hwm is None
+        or api_container_id is None
+    ):
         raise ValueError("host capacity container identities drifted")
     assert vm_total is not None and vm_available is not None
     epoch_bytes = json.dumps(
@@ -324,25 +372,81 @@ def project_host_capacity_sample(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return HostSampleValues(
-        collector_sha256=expected_collector_sha256,
-        windows_node_identity_sha256=expected_windows_node_identity_sha256,
-        container_epoch_sha256=(
-            "sha256:" + hashlib.sha256(epoch_bytes).hexdigest()
+    return _ValidatedHostState(
+        epoch=MineruHostServiceEpochValues(
+            collector_sha256=expected_collector_sha256,
+            windows_node_identity_sha256=expected_windows_node_identity_sha256,
+            container_epoch_sha256=(
+                "sha256:" + hashlib.sha256(epoch_bytes).hexdigest()
+            ),
+            api_container_id=api_container_id,
+            restart_count_total=restart_total,
+            oom_killed_count=oom_killed_count,
+            unsafe_container_count=unsafe_count,
+            cgroup_oom_total=cgroup_oom_total,
+            cgroup_oom_kill_total=cgroup_oom_kill_total,
+            cgroup_high_total=cgroup_high_total,
         ),
         container_count=len(containers),
-        restart_count_total=restart_total,
-        oom_killed_count=oom_killed_count,
-        unsafe_container_count=unsafe_count,
-        cgroup_oom_total=cgroup_oom_total,
-        cgroup_oom_kill_total=cgroup_oom_kill_total,
-        cgroup_high_total=cgroup_high_total,
         docker_vm_memory_total_bytes=vm_total,
         docker_vm_memory_available_bytes=vm_available,
-        docker_memory_reserve_bytes=docker_memory_reserve_bytes,
         api_pid1_rss_bytes=api_rss,
         api_pid1_rss_hwm_bytes=api_rss_hwm,
         safety_violation_codes=tuple(sorted(violation_codes)),
+    )
+
+
+def project_host_service_epoch(
+    payload: object,
+    *,
+    expected_collector_sha256: str,
+    expected_windows_node_identity_sha256: str,
+) -> MineruHostServiceEpochValues:
+    """Project service identity and safety without inventing a memory policy."""
+
+    return _project_host_state(
+        payload,
+        expected_collector_sha256=expected_collector_sha256,
+        expected_windows_node_identity_sha256=expected_windows_node_identity_sha256,
+        docker_memory_reserve_bytes=None,
+    ).epoch
+
+
+def project_host_capacity_sample(
+    payload: object,
+    *,
+    expected_collector_sha256: str,
+    expected_windows_node_identity_sha256: str,
+    docker_memory_reserve_bytes: int,
+) -> HostSampleValues:
+    """Validate and project a capacity sample under an explicit reserve policy."""
+
+    projected = _project_host_state(
+        payload,
+        expected_collector_sha256=expected_collector_sha256,
+        expected_windows_node_identity_sha256=expected_windows_node_identity_sha256,
+        docker_memory_reserve_bytes=docker_memory_reserve_bytes,
+    )
+    epoch = projected.epoch
+    return HostSampleValues(
+        collector_sha256=epoch.collector_sha256,
+        windows_node_identity_sha256=epoch.windows_node_identity_sha256,
+        container_epoch_sha256=epoch.container_epoch_sha256,
+        container_count=projected.container_count,
+        restart_count_total=epoch.restart_count_total,
+        oom_killed_count=epoch.oom_killed_count,
+        unsafe_container_count=epoch.unsafe_container_count,
+        cgroup_oom_total=epoch.cgroup_oom_total,
+        cgroup_oom_kill_total=epoch.cgroup_oom_kill_total,
+        cgroup_high_total=epoch.cgroup_high_total,
+        docker_vm_memory_total_bytes=projected.docker_vm_memory_total_bytes,
+        docker_vm_memory_available_bytes=(
+            projected.docker_vm_memory_available_bytes
+        ),
+        docker_memory_reserve_bytes=docker_memory_reserve_bytes,
+        api_pid1_rss_bytes=projected.api_pid1_rss_bytes,
+        api_pid1_rss_hwm_bytes=projected.api_pid1_rss_hwm_bytes,
+        safety_violation_codes=projected.safety_violation_codes,
     )
 
 
@@ -540,14 +644,15 @@ class MineruHostCapacitySampler:
         ssh_command: list[str],
         expected_collector_sha256: str,
         expected_windows_node_identity_sha256: str,
-        docker_memory_reserve_bytes: int,
+        docker_memory_reserve_bytes: int | None = None,
     ) -> None:
         self._ssh_command = list(ssh_command)
         self._collector_sha256 = expected_collector_sha256
         self._node_identity_sha256 = expected_windows_node_identity_sha256
         self._reserve = docker_memory_reserve_bytes
 
-    def sample(self) -> HostSampleValues:
+    def sample_payload(self) -> dict[str, Any]:
+        """Return one bounded raw collector payload for strict local projection."""
         completed = subprocess.run(
             [
                 *self._ssh_command,
@@ -569,6 +674,14 @@ class MineruHostCapacitySampler:
             payload: Any = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
             raise ValueError("host capacity sample is not JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("host capacity sample root is not an object")
+        return payload
+
+    def sample(self) -> HostSampleValues:
+        if self._reserve is None:
+            raise ValueError("host capacity sampling requires an explicit reserve")
+        payload = self.sample_payload()
         return project_host_capacity_sample(
             payload,
             expected_collector_sha256=self._collector_sha256,
@@ -579,7 +692,9 @@ class MineruHostCapacitySampler:
 
 __all__ = [
     "MineruHostCapacitySampler",
+    "MineruHostServiceEpochValues",
     "build_host_observer_ssh_command",
     "project_host_capacity_sample",
+    "project_host_service_epoch",
     "project_synchronized_host_capacity_sample",
 ]

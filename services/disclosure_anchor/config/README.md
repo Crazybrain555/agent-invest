@@ -91,11 +91,10 @@
 | DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS | 86400 | 极端 live-but-stuck 进程保护；整本文档默认可运行 24 小时 |
 | WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | acquisition/project maintenance 的空闲/故障退避；parse 空队列由下载事件或 5 秒 fail-safe poll 唤醒 |
 | MINERU_PROCESSING_WINDOW_SIZE | 16 | GPU 页窗口红线（round22h OOM 后定案） |
-| DISCLOSURE_MINERU_SMOKE_RECEIPT / CANARY_CACHE | — | runtime bundle v6 的 DB-free smoke/canary v2 PASS 对；resident 在连 DB 前强制校验 |
-| DISCLOSURE_MINERU_STAGED_LOAD_RECEIPT / STAGED_LOAD_CONFIRMATION_RECEIPT | — | 同一 persistent identity 和真实异构 corpus 的两次独立完整 4/8/16 文档回放 PASS；客户端 API-facing window 固定为 1、huge 独占，并从进程外持续验证容器 epoch/restart/OOM/RSS/Docker VM 内存 |
-| DISCLOSURE_MINERU_STAGED_CORPUS_SHA256 | — | 两次 staged run 共用、至少 16 个不同 hash 且覆盖 regular/heavy/huge 的有序真实 PDF corpus 身份 |
-| DISCLOSURE_MINERU_DOCKER_MEMORY_RESERVE_BYTES | 0（未配置） | 当前 Docker VM 的 operator-calibrated 最低可用内存；parse-capable gate 要求正值，不能写死为跨机器常量 |
-| DISCLOSURE_MINERU_CANARY_MAX_AGE_SECONDS | 2592000 | 静态 smoke/staged-load 的进程启动租约（30 天）；启动后每 300 秒继续核 live API/model，incident 立即关闭 admission |
+| DISCLOSURE_MINERU_SMOKE_RECEIPT / CANARY_CACHE | — | runtime bundle v8 的 DB-free smoke v5/canary v2 PASS 对；resident 在连 DB 前强制校验 |
+| DISCLOSURE_MINERU_VALIDATION_RECEIPT | — | 2..8 份不同的完整多页 held-out PDF smoke v5，由同一 clean service epoch 前后夹住；页数、runtime、hash、restart/OOM 全部 fail closed |
+| DISCLOSURE_MINERU_DOCKER_MEMORY_RESERVE_BYTES | 0（未配置） | capacity observation/candidate policy 的显式配置；不再冒充跨机器 deployment gate 常量 |
+| DISCLOSURE_MINERU_CANARY_MAX_AGE_SECONDS | 2592000 | 静态 smoke/held-out validation 的进程启动租约（30 天）；启动后每 300 秒继续核 live API/model，incident 立即关闭 admission |
 | DISCLOSURE_MINERU_LIVE_PROBE_INTERVAL_SECONDS | 300 | parse admission 限频复核 `/v1/models` 唯一 served-model；首次入场必查 |
 | CNINFO_* | — | 凭据（只进环境，绝不进仓） |
 
@@ -109,12 +108,12 @@ make track CODES=600519    # 小范围快捷入池（最多20只保留即时解�
 make track CODES=600519 SKIP_PROFILE_RESOLUTION=YES  # 仅入池，解名交给 worker
 make track-export OUT=/timestamped/path/watchlist.csv  # DB 池子 → 独立复核快照
 make track-status          # 全池状态 + 每公司生效配置与来源层
-make mineru-smoke RUNTIME_MANIFEST=/path/runtime.json RECEIPT=/path/receipt.json CANARY_CACHE=/path/canary.json
+make mineru-smoke RUNTIME_MANIFEST=/path/runtime.json RECEIPT=/path/smoke-v5.json CANARY_CACHE=/path/canary.json
                            # 无 DB/队列/业务凭据下传：三次多模态 canary + 固定单页 full-PDF，进程/临时树差集归零
-make mineru-campaign-epoch-freeze RUNTIME_MANIFEST=/path/runtime.json EPOCH_RECEIPT=/path/new-epoch.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes>
-                           # 最后一次允许的服务恢复后，零推理、零 DB/队列地冻结 proxy/vLLM container ID+StartedAt
-make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> EXPECTED_CAMPAIGN_EPOCH_SHA256=<epoch-receipt-campaign-sha256> RECEIPT=/path/new-load-receipt.v7.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 API_DRAIN_TIMEOUT_SECONDS=86400
-                           # smoke PASS 后固定4/8/16文档数；arm 前后各一次 direct multimodal canary，且同一 proxy/vLLM epoch；其余容量/清理门保持不变
+make mineru-service-epoch-freeze RUNTIME_MANIFEST=/path/runtime.json EPOCH_RECEIPT=/path/epoch-before.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts
+                           # 零推理、零 DB/队列地冻结 exact service epoch；held-out smokes 后再冻结 epoch-after
+make mineru-validation-receipt SMOKE_RECEIPTS="/path/a-v5.json /path/b-v5.json" EPOCH_BEFORE=/path/epoch-before.json EPOCH_AFTER=/path/epoch-after.json RECEIPT=/path/validation-v1.json
+                           # 密封 2..8 份不同完整多页 PDF；不做固定轮次、重复确认或固定内存门槛
 make worker-once           # 手动跑一轮（同步→下载→解析→切分→发布）
 make worker-loop           # 常驻自适应排水；积压时零等待，空闲时 15→30 分钟退避
 make worker-status         # 单次只读快照：公司/文档两条进度、队列、当前任务、vLLM 与真实 GPU exporter
@@ -176,17 +175,16 @@ exchange、board、日期、市值下限、5,548 行审计闭合与 V10 变更�
 生成器。完整来源/投影证明必须运行上述 `cmp`、核对四个已固定 SHA，并检查完整 selection audit；
 不能把 `config-check` 单独理解为前瞻治理和行业证据已经补齐。
 
-## Capacity observation 与默认关闭的 Auto profile
+## Capacity observation 与默认关闭的 candidate profile
 
-Observation v1 仍只有旁路采样权限。默认 `legacy` 的 exact-source capacity runtime 可以读取已验证的
-profile catalog，但旧 A-B-B-A evaluator/catalog builder 已删除；在新的 synchronized telemetry、短时
-held-out 搜索和 profile receipt 落地前，`candidate`/`auto` 均未获运行授权。Document profile 在 admission
+Observation v1 仍只有旁路采样权限。旧 profile catalog reader 已删除；在新的 synchronized telemetry、
+短时 held-out 搜索和 profile receipt 落地前，`candidate` 未获运行授权。Document profile 在 admission
 冻结，process profile 只能在完全 quiescent 时切换；运行中不能修改 startup knob。旁路采样复用
 machine-local `worker.env` 中已有 API/vLLM/GPU URL、runtime bundle identity、GPU UUID 与 MinerU client；
 内存安全余量来自分资源域的实测动态 guard，不再使用固定 Docker reserve。tracked config 不写 SSH
 host/user/key，也不新增数据库 DSN。
 
-Operator 运行时显式传入 v6 `RUNTIME_MANIFEST`、`DURATION_SECONDS` 和与 staged load 相同的
+Operator 运行时显式传入 v8 `RUNTIME_MANIFEST`、`DURATION_SECONDS` 和同一 pinned observer 的
 `SSH_HOST` / `SSH_USER` / `SSH_IDENTITY` / `SSH_KNOWN_HOSTS`。这些参数只用于 pinned read-only
 collector；端点、hostname、username 与 container ID 不进入 evidence。命令和复算方法见
 `docs/implementation/runbooks/production-operations.md` §1.1d，设计见

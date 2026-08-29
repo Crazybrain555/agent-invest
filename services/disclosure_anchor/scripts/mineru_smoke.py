@@ -26,6 +26,7 @@ from disclosure_anchor.adapters.parsers.mineru_medium import (
     MinerUMediumDocumentParser,
     MinerUProcess,
 )
+from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     run_mineru_multimodal_canary,
 )
@@ -51,7 +52,7 @@ from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import DisclosureAnchorError
 
 
-RECEIPT_SCHEMA = "mineru_smoke_receipt.v4"
+RECEIPT_SCHEMA = "mineru_smoke_receipt.v5"
 TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 DEFAULT_INPUT = (
     Path(__file__).resolve().parents[1]
@@ -332,6 +333,12 @@ def main(argv: list[str] | None = None) -> int:
 
     input_bytes = args.input.read_bytes()
     input_sha256 = _sha256(input_bytes)
+    try:
+        input_page_count = count_pdf_pages(args.input)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"[abort] smoke input page count is unavailable: {exc}") from exc
+    if input_page_count < 1:
+        raise SystemExit("[abort] smoke input has no pages")
     expected_input = args.expected_input_sha256
     if expected_input is None and args.input.resolve() == DEFAULT_INPUT.resolve():
         expected_input = DEFAULT_INPUT_SHA256
@@ -447,6 +454,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("provider smoke returned no pages")
             if provider_document.parser_version != "3.4.4":
                 raise ValueError("provider smoke parser version drifted")
+            if len(provider_document.pages) != input_page_count:
+                raise ValueError(
+                    "provider smoke did not preserve the complete source page count"
+                )
             if (
                 provider_document.backend != "hybrid"
                 or provider_document.effort != "medium"
@@ -521,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
             "logical_name": args.input.name,
             "sha256": f"sha256:{input_sha256}",
             "bytes": len(input_bytes),
+            "page_count": input_page_count,
         },
         "identity": {
             "local_client_identity_sha256": local_digest,

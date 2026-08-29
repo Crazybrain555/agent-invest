@@ -198,7 +198,6 @@ $CapacityPolicy = "process-global-mineru-coordinator.v4"
 $RequiredComposeTarget = "C:\ProgramData\compose.tailnet.yaml"
 $RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1"
 $RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json"
-$RequiredCapacityCatalogSource = "C:\ProgramData\agent-invest\mineru-runtime-v6\mineru-capacity-catalog.v1.json"
 $ExpectedApiCompatImageId = $null
 $OldApiCompatImageId = $null
 $CompatBuildTagCreated = $false
@@ -626,8 +625,7 @@ function Get-ValidatedRuntime {
     if (
         $capacityModeEnvironment.Count -ne 1 -or
         $capacityModeEnvironment[0] -notin @(
-            "MINERU_CAPACITY_MODE=legacy", "MINERU_CAPACITY_MODE=candidate",
-            "MINERU_CAPACITY_MODE=auto"
+            "MINERU_CAPACITY_MODE=legacy", "MINERU_CAPACITY_MODE=candidate"
         )
     ) {
         throw "MinerU API capacity mode is not closed"
@@ -660,38 +658,6 @@ function Get-ValidatedRuntime {
         [string]$capacityProfile.schema -ne "mineru-execution-profile.v2"
     ) {
         throw "MinerU API capacity profile contract drifted"
-    }
-    $capacityCatalogNames = @(
-        "MINERU_CAPACITY_CATALOG_PATH",
-        "MINERU_CAPACITY_CATALOG_SHA256",
-        "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"
-    )
-    $capacityCatalogEnvironment = @{}
-    foreach ($name in $capacityCatalogNames) {
-        $matches = @($api.Config.Env | Where-Object { $_ -like "$name=*" })
-        if ($matches.Count -ne 1) {
-            throw "MinerU API Auto capacity catalog environment is not unique"
-        }
-        $capacityCatalogEnvironment[$name] = $matches[0].Substring($name.Length + 1)
-    }
-    $capacityMode = $capacityModeEnvironment[0].Substring(
-        "MINERU_CAPACITY_MODE=".Length
-    )
-    if ($capacityMode -eq "auto") {
-        if (
-            -not $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_PATH"].StartsWith("/") -or
-            $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_SHA256"] -notmatch '^sha256:[a-f0-9]{64}$' -or
-            $capacityCatalogEnvironment["MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"] -notmatch '^sha256:[a-f0-9]{64}$'
-        ) {
-            throw "MinerU API Auto capacity catalog identity is incomplete"
-        }
-    }
-    elseif (
-        $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_PATH"] -ne "" -or
-        $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_SHA256"] -ne "" -or
-        $capacityCatalogEnvironment["MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"] -ne ""
-    ) {
-        throw "MinerU API Auto capacity catalog leaked into non-Auto mode"
     }
     $phaseTraceEnvironment = @(
         $api.Config.Env | Where-Object { $_ -like "MINERU_PHASE_TRACE=*" }
@@ -758,7 +724,7 @@ function Get-ValidatedRuntime {
     }
 
     $apiMounts = @($api.Mounts)
-    $expectedMountCount = if ($capacityMode -eq "auto") { 2 } else { 1 }
+    $expectedMountCount = 1
     $outputMount = @(
         $apiMounts | Where-Object {
             [string]$_.Destination -eq "/var/lib/mineru-api-output"
@@ -775,23 +741,6 @@ function Get-ValidatedRuntime {
         @($inference.Mounts).Count -ne 0
     ) {
         throw "MinerU mount policy drifted"
-    }
-    if ($capacityMode -eq "auto") {
-        $catalogMount = @(
-            $apiMounts | Where-Object {
-                [string]$_.Destination -eq
-                    $capacityCatalogEnvironment["MINERU_CAPACITY_CATALOG_PATH"]
-            }
-        )
-        if (
-            $catalogMount.Count -ne 1 -or
-            [string]$catalogMount[0].Type -ne "bind" -or
-            [bool]$catalogMount[0].RW -ne $false -or
-            [IO.Path]::GetFullPath([string]$catalogMount[0].Source) -ine
-                [IO.Path]::GetFullPath($RequiredCapacityCatalogSource)
-        ) {
-            throw "MinerU Auto catalog mount is not exact read-only"
-        }
     }
 
     Assert-RequiredProperties -Value $health -Names @(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect one bounded, content-free MinerU trace after a staged-load arm."""
+"""Collect one content-free phase trace bound to held-out validation."""
 
 from __future__ import annotations
 
@@ -9,37 +9,28 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
 import subprocess
 
-from disclosure_anchor.adapters.runtime.mineru_identity import (
-    MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
-    MINERU_WINDOWS_COLLECTOR_PATH,
+from disclosure_anchor.adapters.runtime.mineru_host_capacity_observer import (
+    build_host_observer_ssh_command,
 )
-from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
-    MinerUDeploymentGateError,
-    verify_staged_load_inference_liveness_evidence,
+from disclosure_anchor.adapters.runtime.mineru_identity import (
+    MINERU_WINDOWS_COLLECTOR_PATH,
+    canonical_payload_sha256,
 )
 from disclosure_anchor.adapters.runtime.mineru_phase_trace_capture import (
     parse_phase_trace_capture,
     summarize_phase_trace_capture,
 )
-from scripts.mineru_staged_load import _host_observer_ssh_base
+from scripts.freeze_mineru_campaign_epoch import _read_private_json
 
 
-_MAX_RECEIPT_BYTES = 256 * 1024 * 1024
+_MAX_RECEIPT_BYTES = 16 * 1024 * 1024
 _MAX_CAPTURE_BYTES = 268_435_456
-_STAGE_COUNTS = (4, 8, 16)
-_SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
-_CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
 _LOCAL_COLLECTOR = (
     Path(__file__).resolve().parent / "windows" / "collect_mineru_runtime.ps1"
 )
-
-
-def _sha256(payload: bytes) -> str:
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def _read_regular(path: Path, *, label: str, maximum_bytes: int) -> bytes:
@@ -47,8 +38,7 @@ def _read_regular(path: Path, *, label: str, maximum_bytes: int) -> bytes:
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
-        or metadata.st_size <= 0
-        or metadata.st_size > maximum_bytes
+        or not 0 < metadata.st_size <= maximum_bytes
     ):
         raise ValueError(f"{label} must be one bounded regular file")
     payload = path.read_bytes()
@@ -58,154 +48,133 @@ def _read_regular(path: Path, *, label: str, maximum_bytes: int) -> bytes:
 
 
 def _utc(value: object, *, label: str) -> datetime:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str):
         raise ValueError(f"{label} is invalid")
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"{label} is invalid") from exc
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ValueError(f"{label} is not UTC")
     return parsed
 
 
-def _safe_staged_timeout(value: object) -> bool:
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, int)
-        and value >= MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
-    )
-
-
-def _receipt_identity(
-    receipt: object,
-) -> tuple[datetime, datetime, str, str, str, int, int]:
-    safety_limits = receipt.get("safety_limits") if isinstance(receipt, dict) else None
+def _wrapper(value: object, *, label: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"receipt_sha256", "receipt"}:
+        raise ValueError(f"{label} wrapper drifted")
+    receipt = value.get("receipt")
     if (
         not isinstance(receipt, dict)
-        or receipt.get("schema") != "mineru_staged_load_receipt.v7"
-        or receipt.get("receipt_schema_version") != 7
-        or receipt.get("status") != "pass"
-        or receipt.get("failure") is not None
-        or receipt.get("secondary_failures") != []
-        or receipt.get("database_access") != "none"
-        or receipt.get("queue_access") != "none"
-        or receipt.get("fixed_stage_document_counts") != list(_STAGE_COUNTS)
-        or not isinstance(safety_limits, dict)
-        or set(safety_limits)
-        != {
-            "profile",
-            "document_runaway_timeout_seconds",
-            "api_drain_timeout_seconds",
-        }
-        or safety_limits.get("profile")
-        != "whole-document-runaway-and-drain.v1"
-        or not _safe_staged_timeout(
-            safety_limits.get("document_runaway_timeout_seconds")
-        )
-        or not _safe_staged_timeout(
-            safety_limits.get("api_drain_timeout_seconds")
-        )
+        or value.get("receipt_sha256") != canonical_payload_sha256(receipt)
     ):
-        raise ValueError("staged-load receipt is not PASS")
-    started = _utc(receipt.get("started_at_utc"), label="staged-load start")
-    finished = _utc(receipt.get("finished_at_utc"), label="staged-load finish")
-    if not started < finished:
-        raise ValueError("staged-load timeline is invalid")
-    host = receipt.get("host_capacity")
+        raise ValueError(f"{label} hash drifted")
+    return receipt
+
+
+def _validation_identity(
+    value: object,
+) -> tuple[datetime, datetime, str, str, str, str, int, int]:
     if (
-        not isinstance(host, dict)
-        or host.get("status") != "pass"
-        or host.get("failure") is not None
-        or _SHA256_RE.fullmatch(str(host.get("collector_sha256"))) is None
-        or _SHA256_RE.fullmatch(
-            str(host.get("windows_node_identity_sha256"))
-        )
-        is None
-        or host.get("violations") != []
-        or host.get("sampling_failures") != []
-    ):
-        raise ValueError("staged-load host evidence is not PASS")
-    samples = host.get("samples")
-    if not isinstance(samples, list) or len(samples) < 2:
-        raise ValueError("staged-load host evidence has no stable epoch")
-    service_epochs: dict[str, set[tuple[str, str]]] = {
-        name: set()
-        for name in ("mineru-api", "mineru-api-proxy", "mineru-openai-server")
-    }
-    for sample in samples:
-        containers = sample.get("containers") if isinstance(sample, dict) else None
-        if not isinstance(containers, list) or len(containers) != len(service_epochs):
-            raise ValueError("staged-load host containers are invalid")
-        by_name = {
-            str(item.get("name")): item
-            for item in containers
-            if isinstance(item, dict)
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema",
+            "status",
+            "created_at_utc",
+            "policy",
+            "database_access",
+            "queue_access",
+            "document_count",
+            "documents",
+            "epoch_before",
+            "epoch_after",
         }
-        if len(by_name) != len(containers) or set(by_name) != set(service_epochs):
-            raise ValueError("staged-load host container identities are invalid")
-        for name in service_epochs:
-            container = by_name.get(name)
-            if (
-                not isinstance(container, dict)
-                or _CONTAINER_ID_RE.fullmatch(str(container.get("id"))) is None
-                or not isinstance(container.get("started_at_utc"), str)
-                or container.get("restart_count") != 0
-                or container.get("oom_killed") is not False
-                or container.get("running") is not True
-                or container.get("status") != "running"
-                or container.get("health") != "healthy"
-            ):
-                raise ValueError(f"staged-load {name} epoch is invalid")
-            service_epochs[name].add(
-                (str(container["id"]), str(container["started_at_utc"]))
-            )
-    if any(len(values) != 1 for values in service_epochs.values()):
-        raise ValueError("staged-load service epoch changed")
-    host_epochs = {name: values.pop() for name, values in service_epochs.items()}
-    try:
-        verify_staged_load_inference_liveness_evidence(
-            receipt,
-            host_epochs=host_epochs,
-        )
-    except MinerUDeploymentGateError as exc:
-        raise ValueError(
-            "staged-load arm-boundary inference liveness is not PASS"
-        ) from exc
-    stages = receipt.get("stages")
-    if not isinstance(stages, list) or len(stages) != len(_STAGE_COUNTS):
-        raise ValueError("staged-load stages are invalid")
-    document_count = 0
+        or value.get("schema") != "mineru_heldout_validation_receipt.v1"
+        or value.get("status") != "pass"
+        or value.get("policy") != "operator-held-out-complete-pdf.v1"
+        or value.get("database_access") != "none"
+        or value.get("queue_access") != "none"
+    ):
+        raise ValueError("held-out validation receipt is not PASS")
+    documents = value.get("documents")
+    if (
+        not isinstance(documents, list)
+        or not 2 <= len(documents) <= 8
+        or value.get("document_count") != len(documents)
+    ):
+        raise ValueError("held-out validation documents are invalid")
+    starts: list[datetime] = []
+    finishes: list[datetime] = []
     page_count = 0
-    for stage, expected_count in zip(stages, _STAGE_COUNTS, strict=True):
-        documents = stage.get("documents") if isinstance(stage, dict) else None
+    runtime_identities: set[str] = set()
+    source_identities: set[str] = set()
+    for index, item in enumerate(documents):
+        receipt = _wrapper(item, label=f"document {index}")
+        input_evidence = receipt.get("input")
+        provider = receipt.get("provider")
+        identity = receipt.get("identity")
         if (
-            not isinstance(stage, dict)
-            or stage.get("status") != "pass"
-            or stage.get("failure") is not None
-            or stage.get("stage_document_count") != expected_count
-            or not isinstance(documents, list)
-            or len(documents) != expected_count
+            receipt.get("schema") != "mineru_smoke_receipt.v5"
+            or receipt.get("status") != "pass"
+            or not isinstance(input_evidence, dict)
+            or not isinstance(provider, dict)
+            or not isinstance(identity, dict)
+            or input_evidence.get("profile") != "diagnostic_custom"
+            or provider.get("page_count") != input_evidence.get("page_count")
+            or isinstance(provider.get("page_count"), bool)
+            or not isinstance(provider.get("page_count"), int)
+            or provider["page_count"] < 2
+            or not isinstance(input_evidence.get("sha256"), str)
+            or input_evidence.get("sha256") in source_identities
         ):
-            raise ValueError("staged-load documents are invalid")
-        for document in documents:
-            if (
-                not isinstance(document, dict)
-                or document.get("status") != "pass"
-                or isinstance(document.get("page_count"), bool)
-                or not isinstance(document.get("page_count"), int)
-                or document["page_count"] <= 0
-            ):
-                raise ValueError("staged-load document is not PASS")
-            document_count += 1
-            page_count += int(document["page_count"])
+            raise ValueError(f"held-out document {index} is invalid")
+        starts.append(_utc(receipt.get("started_at_utc"), label="smoke start"))
+        finishes.append(_utc(receipt.get("finished_at_utc"), label="smoke finish"))
+        page_count += provider["page_count"]
+        source_identities.add(str(input_evidence["sha256"]))
+        runtime_identities.add(str(identity.get("runtime_manifest_identity_sha256")))
+    if len(runtime_identities) != 1:
+        raise ValueError("held-out validation runtime identity drifted")
+    before = _wrapper(value.get("epoch_before"), label="epoch before")
+    after = _wrapper(value.get("epoch_after"), label="epoch after")
+    before_epoch = before.get("service_epoch")
+    after_epoch = after.get("service_epoch")
+    clean_safety = {
+        "restart_count_total": 0,
+        "oom_killed_count": 0,
+        "unsafe_container_count": 0,
+        "cgroup_oom_total": 0,
+        "cgroup_oom_kill_total": 0,
+    }
+    if (
+        before.get("schema") != "mineru-service-epoch-freeze.v2"
+        or after.get("schema") != "mineru-service-epoch-freeze.v2"
+        or before.get("status") != "pass"
+        or after.get("status") != "pass"
+        or before.get("safety") != clean_safety
+        or after.get("safety") != clean_safety
+        or not isinstance(before_epoch, dict)
+        or before_epoch != after_epoch
+        or before.get("service_epoch_sha256")
+        != canonical_payload_sha256(before_epoch)
+        or after.get("service_epoch_sha256")
+        != canonical_payload_sha256(after_epoch)
+    ):
+        raise ValueError("held-out validation service epoch drifted")
+    started = min(starts)
+    finished = max(finishes)
+    if not (
+        _utc(before.get("created_at_utc"), label="epoch before creation")
+        <= started
+        < finished
+        <= _utc(after.get("created_at_utc"), label="epoch after creation")
+    ):
+        raise ValueError("held-out validation epoch does not bracket documents")
     return (
         started,
         finished,
-        str(host["collector_sha256"]),
-        str(host["windows_node_identity_sha256"]),
-        host_epochs["mineru-api"][0],
-        document_count,
+        str(before_epoch["runtime_manifest_identity_sha256"]),
+        str(before_epoch["collector_sha256"]),
+        str(before_epoch["windows_node_identity_sha256"]),
+        str(before_epoch["api_container_id"]),
+        len(documents),
         page_count,
     )
 
@@ -220,22 +189,21 @@ def _write_new_private(path: Path, payload: bytes) -> None:
         0o600,
     )
     try:
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             if not payload.endswith(b"\n"):
                 handle.write(b"\n")
             handle.flush()
             os.fsync(handle.fileno())
     except BaseException:
-        try:
-            path.unlink(missing_ok=True)
-        finally:
-            raise
+        path.unlink(missing_ok=True)
+        raise
 
 
 def _args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--staged-load-receipt", type=Path, required=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--validation-receipt", type=Path, required=True)
+    parser.add_argument("--runtime-manifest", type=Path, required=True)
     parser.add_argument("--capacity-mode", choices=("legacy", "candidate"), required=True)
     parser.add_argument("--profile-sha256", required=True)
     parser.add_argument("--ssh-host", required=True)
@@ -249,40 +217,48 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _args(argv)
-    receipt_payload = _read_regular(
-        args.staged_load_receipt,
-        label="staged-load receipt",
-        maximum_bytes=_MAX_RECEIPT_BYTES,
+    receipt = json.loads(
+        _read_regular(
+            args.validation_receipt,
+            label="held-out validation receipt",
+            maximum_bytes=_MAX_RECEIPT_BYTES,
+        )
     )
-    try:
-        receipt = json.loads(receipt_payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("staged-load receipt is not UTF-8 JSON") from exc
     (
         started,
         finished,
-        expected_collector_sha256,
-        expected_node_sha256,
-        expected_api_id,
-        expected_document_count,
-        expected_page_count,
-    ) = _receipt_identity(receipt)
-    local_collector_payload = _read_regular(
+        runtime_identity,
+        collector_sha256,
+        node_sha256,
+        api_container_id,
+        document_count,
+        page_count,
+    ) = _validation_identity(receipt)
+    manifest_wrapper = _read_private_json(args.runtime_manifest)
+    manifest = manifest_wrapper.get("manifest")
+    if (
+        not isinstance(manifest, dict)
+        or manifest_wrapper.get("identity_sha256") != runtime_identity
+    ):
+        raise ValueError("runtime manifest does not match held-out validation")
+    topology = manifest.get("topology")
+    if not isinstance(topology, dict):
+        raise ValueError("runtime manifest topology is invalid")
+    local_collector = _read_regular(
         _LOCAL_COLLECTOR,
         label="local Windows collector",
         maximum_bytes=4 * 1024 * 1024,
     )
-    if _sha256(local_collector_payload) != expected_collector_sha256:
-        raise ValueError("staged-load collector is not exact-current")
-    ssh = _host_observer_ssh_base(
+    if "sha256:" + hashlib.sha256(local_collector).hexdigest() != collector_sha256:
+        raise ValueError("held-out collector is not exact-current")
+    ssh = build_host_observer_ssh_command(
         host=args.ssh_host,
         user=args.ssh_user,
         port=args.ssh_port,
         identity_file=args.ssh_identity,
         known_hosts_file=args.ssh_known_hosts,
+        expected_host_key_sha256=str(topology.get("ssh_host_key_sha256")),
     )
-    since = (started - timedelta(seconds=1)).isoformat()
-    until = finished.isoformat()
     command = [
         *ssh,
         "powershell.exe",
@@ -295,9 +271,9 @@ def main(argv: list[str] | None = None) -> int:
         MINERU_WINDOWS_COLLECTOR_PATH,
         "-PhaseTrace",
         "-TraceSinceUtc",
-        since,
+        (started - timedelta(seconds=1)).isoformat(),
         "-TraceUntilUtc",
-        until,
+        finished.isoformat(),
         "-ExpectedCapacityMode",
         args.capacity_mode,
         "-ExpectedProfileSha256",
@@ -325,21 +301,20 @@ def main(argv: list[str] | None = None) -> int:
         capture,
         expected_profile_sha256=args.profile_sha256,
         expected_capacity_mode=args.capacity_mode,
-        expected_collector_sha256=expected_collector_sha256,
-        expected_windows_node_identity_sha256=expected_node_sha256,
-        expected_container_id=expected_api_id,
+        expected_collector_sha256=collector_sha256,
+        expected_windows_node_identity_sha256=node_sha256,
+        expected_container_id=api_container_id,
         require_pipeline_overlap=args.capacity_mode == "candidate",
     )
     if (
-        summary.get("document_count") != expected_document_count
-        or summary.get("page_count") != expected_page_count
+        summary.get("document_count") != document_count
+        or summary.get("page_count") != page_count
     ):
-        raise ValueError("phase trace does not conserve staged-load documents/pages")
+        raise ValueError("phase trace does not conserve held-out documents/pages")
     _write_new_private(args.capture_out, completed.stdout)
     print(
         "mineru-phase-trace-capture: PASS "
-        f"documents={expected_document_count} pages={expected_page_count} "
-        f"capture={args.capture_out}"
+        f"documents={document_count} pages={page_count} capture={args.capture_out}"
     )
     return 0
 

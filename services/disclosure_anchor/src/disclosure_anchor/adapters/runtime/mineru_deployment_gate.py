@@ -1,8 +1,8 @@
-"""Fail-closed deployment evidence and resident MinerU admission checker."""
+"""Fail-closed MinerU deployment evidence and resident admission checks."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -14,10 +14,8 @@ import stat
 import threading
 import time
 from typing import Any
-import uuid
 
 from disclosure_anchor.adapters.runtime.mineru_canary import (
-    CANARY_SCHEMA,
     MinerUCanaryError,
     MinerUCanaryUnavailableError,
     canary_cache_is_fresh,
@@ -31,7 +29,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_SMOKE_INPUT_NAME,
     MINERU_SMOKE_INPUT_SHA256,
-    MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
+    canonical_payload_sha256,
     client_bundle_identity,
     verify_runtime_manifest_payload,
     writer_code_digest,
@@ -41,6 +39,7 @@ from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorUnavailableError,
     fetch_mineru_orchestrator_health,
     mineru_orchestrator_incident_state,
+    parse_mineru_orchestrator_health_payload,
 )
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
@@ -49,37 +48,17 @@ from disclosure_anchor.application.contracts.parser_target import (
 from disclosure_anchor.settings import Settings
 
 
-_RECEIPT_SCHEMA = "mineru_smoke_receipt.v4"
-_STAGED_LOAD_RECEIPT_SCHEMA = "mineru_staged_load_receipt.v7"
-_STAGED_LOAD_RECEIPT_SCHEMA_VERSION = 7
-_STAGED_LOAD_ADMISSION_PROFILE = "copy-index-fifo.v1"
-_STAGED_LOAD_SAFETY_LIMITS_PROFILE = "whole-document-runaway-and-drain.v1"
-_STAGED_LOAD_INFERENCE_LIVENESS_PROFILE = "epoch-bound-multimodal-canary.v1"
-_STAGED_LOAD_BOUNDARY_CANARY_SCHEMA = "mineru-arm-boundary-canary.v1"
-_STAGED_LOAD_CAMPAIGN_EPOCH_SCHEMA = "mineru-campaign-service-epoch.v1"
+_SMOKE_SCHEMA = "mineru_smoke_receipt.v5"
+_VALIDATION_SCHEMA = "mineru_heldout_validation_receipt.v1"
+_VALIDATION_POLICY = "operator-held-out-complete-pdf.v1"
 _TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 _DEPLOYMENT_INPUT_PROFILE = "deployment_frozen_v1"
-_STAGED_LOAD_INPUT_PROFILE = "operator_frozen_heterogeneous_v2"
-_DEPLOYMENT_CANARY_ATTEMPTS = 3
-_STAGED_DOCUMENT_COUNTS = (4, 8, 16)
-_STAGED_DOCUMENT_EVIDENCE_FIELDS = {
-    "block_count",
-    "copy_index",
-    "elapsed_seconds",
-    "input_sha256",
-    "logical_name",
-    "page_count",
-    "provider_bundle_sha256",
-    "status",
-    "workload_class",
-}
+_HELDOUT_INPUT_PROFILE = "diagnostic_custom"
+_CANARY_ATTEMPTS = 3
+_MIN_HELDOUT_DOCUMENTS = 2
+_MAX_HELDOUT_DOCUMENTS = 8
 _MAX_EVIDENCE_BYTES = 2 * 1024 * 1024
-# Staged v6 deliberately retains 0.25 s orchestrator, 1 s vLLM, and 5 s
-# process-external host samples across the full 4/8/16 real-PDF rehearsal.
-# A valid run is therefore materially larger than the compact smoke/cache
-# evidence.  Keep the broader allowance type-specific and bounded; the same
-# owner-only, no-symlink, single-link checks still apply before any bytes load.
-_MAX_STAGED_LOAD_EVIDENCE_BYTES = 64 * 1024 * 1024
+_MAX_VALIDATION_EVIDENCE_BYTES = 16 * 1024 * 1024
 _EXPECTED_CLEANUP = {
     "external_api_temp_dirs_created": 0,
     "external_mineru_processes_after": 0,
@@ -137,7 +116,7 @@ class VerifiedMinerUDeployment:
                 self.api_url,
                 expected_task_slots=self.task_slots,
                 expected_task_retention_seconds=self.task_retention_seconds,
-                expected_cleanup_interval_seconds=(self.task_cleanup_interval_seconds),
+                expected_cleanup_interval_seconds=self.task_cleanup_interval_seconds,
             )
         except MinerUOrchestratorUnavailableError as exc:
             raise MinerUDeploymentUnavailableError(
@@ -154,16 +133,7 @@ class VerifiedMinerUDeployment:
 
 
 class MinerUDeploymentChecker:
-    """Thread-safe, rate-limited guard for resident parse admission.
-
-    Static source/package/receipt evidence, including its wall-clock startup
-    lease, is verified once before composition.  A healthy resident may run
-    past that fixed proof's timestamp: each admission is then guarded by the
-    process-local incident generation and rate-limited live API/model probes.
-    Any new process composition rechecks the complete static lease.  A caller
-    should treat an error as infrastructure admission stop, not a document
-    failure.
-    """
+    """Thread-safe static proof plus rate-limited live admission checks."""
 
     def __init__(
         self,
@@ -183,8 +153,6 @@ class MinerUDeploymentChecker:
         self._probe_interval_seconds = (
             settings.disclosure_mineru_live_probe_interval_seconds
         )
-        # A fresh static receipt proves the last smoke, not current liveness.
-        # Force the first admission to probe before any document can start.
         self._last_probe_success: float | None = None
         self._initial_idle_proved = False
         self._incident_generation = mineru_orchestrator_incident_state().generation
@@ -194,51 +162,46 @@ class MinerUDeploymentChecker:
         evidence = self._evidence
         if evidence is None:
             return
-        incident_state = mineru_orchestrator_incident_state()
-        if incident_state.drains_in_progress:
+        state = mineru_orchestrator_incident_state()
+        if state.drains_in_progress:
             raise MinerUDeploymentUnavailableError(
                 "MinerU API incident drain is still in progress"
             )
-        incident_generation = incident_state.generation
-        incident_changed = incident_generation != self._incident_generation
+        generation = state.generation
+        changed = generation != self._incident_generation
         observed = self._monotonic_clock()
         if (
-            not incident_changed
+            not changed
             and self._last_probe_success is not None
             and observed - self._last_probe_success < self._probe_interval_seconds
         ):
             return
         with self._probe_lock:
-            incident_state = mineru_orchestrator_incident_state()
-            if incident_state.drains_in_progress:
+            state = mineru_orchestrator_incident_state()
+            if state.drains_in_progress:
                 raise MinerUDeploymentUnavailableError(
                     "MinerU API incident drain is still in progress"
                 )
-            incident_generation = incident_state.generation
-            incident_changed = incident_generation != self._incident_generation
+            generation = state.generation
+            changed = generation != self._incident_generation
             observed = self._monotonic_clock()
             if (
-                not incident_changed
+                not changed
                 and self._last_probe_success is not None
-                and observed - self._last_probe_success < self._probe_interval_seconds
+                and observed - self._last_probe_success
+                < self._probe_interval_seconds
             ):
                 return
-            # An incident invalidates only the cached live proof. Recovery is
-            # safe after this checker freshly proves the fixed API is idle and
-            # the exact served-model identity still matches attestation.
             evidence.probe_orchestrator(
-                require_idle=(not self._initial_idle_proved or incident_changed)
+                require_idle=(not self._initial_idle_proved or changed)
             )
             evidence.probe_live_model()
-            confirmed_incident_state = mineru_orchestrator_incident_state()
-            if (
-                confirmed_incident_state.drains_in_progress
-                or confirmed_incident_state.generation != incident_generation
-            ):
+            confirmed = mineru_orchestrator_incident_state()
+            if confirmed.drains_in_progress or confirmed.generation != generation:
                 raise MinerUDeploymentUnavailableError(
                     "MinerU API incident changed during live admission proof"
                 )
-            self._incident_generation = incident_generation
+            self._incident_generation = generation
             self._initial_idle_proved = True
             self._last_probe_success = self._monotonic_clock()
 
@@ -270,21 +233,23 @@ def _load_evidence(
             final_metadata = os.fstat(evidence_file.fileno())
         if len(encoded) > max_bytes:
             raise MinerUDeploymentGateError(f"{label} exceeds the size limit")
-        if (
-            final_metadata.st_dev,
-            final_metadata.st_ino,
-            final_metadata.st_mode,
-            final_metadata.st_uid,
-            final_metadata.st_nlink,
-            final_metadata.st_size,
-        ) != (
+        initial = (
             metadata.st_dev,
             metadata.st_ino,
             metadata.st_mode,
             metadata.st_uid,
             metadata.st_nlink,
             metadata.st_size,
-        ):
+        )
+        final = (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_mode,
+            final_metadata.st_uid,
+            final_metadata.st_nlink,
+            final_metadata.st_size,
+        )
+        if final != initial:
             raise MinerUDeploymentGateError(f"{label} changed while being read")
         payload = json.loads(encoded)
     except MinerUDeploymentGateError:
@@ -305,7 +270,7 @@ def verify_mineru_deployment_gate(
     parse_enabled: bool | None = None,
     now: datetime | None = None,
 ) -> VerifiedMinerUDeployment | None:
-    """Verify the exact DB-free receipt before a parse-capable composition."""
+    """Prove exact runtime, fixed smoke, held-out PDFs, and live boundaries."""
 
     enabled = (
         settings.worker_batch_parse != 0 if parse_enabled is None else parse_enabled
@@ -317,7 +282,7 @@ def verify_mineru_deployment_gate(
             "MINERU_PROCESSING_WINDOW_SIZE drifted from the deployment contract"
         )
     if (
-        settings.worker_parse_concurrency > _STAGED_DOCUMENT_COUNTS[-1]
+        settings.worker_parse_concurrency > MINERU_PROCESSING_WINDOW_SIZE
         or settings.worker_mineru_client_outstanding_window
         > settings.disclosure_mineru_api_task_slots
         or settings.disclosure_mineru_api_task_slots
@@ -329,296 +294,131 @@ def verify_mineru_deployment_gate(
         or settings.worker_gpu_max_sequences != 128
     ):
         raise MinerUDeploymentGateError(
-            "MinerU worker/API fan-out exceeds the staged 16-document/bounded-client/"
-            "attested-active envelope or max sequences drifted from 128"
+            "MinerU worker/API fan-out exceeds the attested service envelope"
         )
     api_url = settings.disclosure_mineru_api_url
     observability_url = settings.disclosure_mineru_observability_url
     inference_upstream_url = settings.disclosure_mineru_inference_upstream_url
     runtime_identity = settings.disclosure_mineru_runtime_bundle_identity_sha256
     mineru_bin = settings.disclosure_mineru_bin
-    receipt_path = settings.disclosure_mineru_smoke_receipt
+    smoke_path = settings.disclosure_mineru_smoke_receipt
     cache_path = settings.disclosure_mineru_canary_cache
-    staged_load_path = settings.disclosure_mineru_staged_load_receipt
-    staged_confirmation_path = (
-        settings.disclosure_mineru_staged_load_confirmation_receipt
-    )
-    staged_input_sha256 = settings.disclosure_mineru_staged_corpus_sha256
+    validation_path = settings.disclosure_mineru_validation_receipt
     if (
         not api_url
         or not observability_url
         or not inference_upstream_url
         or not runtime_identity
         or mineru_bin is None
-        or not staged_input_sha256
-        or settings.disclosure_mineru_docker_memory_reserve_bytes < 1
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU fixed-API topology, executable, runtime identity, and "
-            "pinned staged input, and Docker memory reserve are required"
-        )
-    if (
-        receipt_path is None
+        or smoke_path is None
         or cache_path is None
-        or staged_load_path is None
-        or staged_confirmation_path is None
+        or validation_path is None
     ):
         raise MinerUDeploymentGateError(
-            "DISCLOSURE_MINERU_SMOKE_RECEIPT and "
-            "DISCLOSURE_MINERU_CANARY_CACHE and "
-            "both DISCLOSURE_MINERU_STAGED_LOAD receipts are required"
+            "MinerU exact topology, executable, runtime identity, smoke/cache and "
+            "held-out validation receipt are required"
         )
-    evidence_paths = {
-        receipt_path.resolve(strict=False),
-        cache_path.resolve(strict=False),
-        staged_load_path.resolve(strict=False),
-        staged_confirmation_path.resolve(strict=False),
-    }
-    if len(evidence_paths) != 4:
+    if len(
+        {
+            smoke_path.resolve(strict=False),
+            cache_path.resolve(strict=False),
+            validation_path.resolve(strict=False),
+        }
+    ) != 3:
         raise MinerUDeploymentGateError("MinerU evidence paths must differ")
-    receipt, receipt_file_identity = _load_evidence(
-        receipt_path, label="MinerU smoke receipt"
+    smoke, smoke_file = _load_evidence(smoke_path, label="MinerU smoke receipt")
+    cache, cache_file = _load_evidence(cache_path, label="MinerU canary cache")
+    validation, validation_file = _load_evidence(
+        validation_path,
+        label="MinerU held-out validation receipt",
+        max_bytes=_MAX_VALIDATION_EVIDENCE_BYTES,
     )
-    cache, cache_file_identity = _load_evidence(cache_path, label="MinerU canary cache")
-    staged_load, staged_load_file_identity = _load_evidence(
-        staged_load_path,
-        label="MinerU staged-load receipt",
-        max_bytes=_MAX_STAGED_LOAD_EVIDENCE_BYTES,
-    )
-    staged_confirmation, staged_confirmation_file_identity = _load_evidence(
-        staged_confirmation_path,
-        label="MinerU staged-load confirmation receipt",
-        max_bytes=_MAX_STAGED_LOAD_EVIDENCE_BYTES,
-    )
-    if (
-        len(
-            {
-                receipt_file_identity,
-                cache_file_identity,
-                staged_load_file_identity,
-                staged_confirmation_file_identity,
-            }
-        )
-        != 4
-    ):
+    if len({smoke_file, cache_file, validation_file}) != 3:
         raise MinerUDeploymentGateError(
             "MinerU evidence files must not be hard-linked aliases"
         )
-    if receipt.get("schema") == "mineru_smoke_receipt.v3":
-        raise MinerUDeploymentGateError(
-            "legacy cumulative-gauge smoke receipt; regenerate under "
-            "retained-terminal-gauges.v1"
-        )
-    if receipt.get("schema") != _RECEIPT_SCHEMA or receipt.get("status") != "pass":
-        raise MinerUDeploymentGateError("MinerU smoke receipt is not PASS")
-    if cache.get("schema") != CANARY_SCHEMA or receipt.get("canary") != cache:
-        raise MinerUDeploymentGateError("MinerU receipt/cache pair does not match")
-    current = now or datetime.now(UTC)
-    if not canary_cache_is_fresh(
-        cache,
-        observability_url=observability_url,
-        runtime_bundle_identity_sha256=runtime_identity,
-        max_age_seconds=settings.disclosure_mineru_canary_max_age_seconds,
-        now=current,
-    ):
-        raise MinerUDeploymentGateError("MinerU canary cache is stale or drifted")
-    if cache.get("attempts") != _DEPLOYMENT_CANARY_ATTEMPTS:
-        raise MinerUDeploymentGateError(
-            "MinerU deployment canary must have exactly three attempts"
-        )
-
+    current = (now or datetime.now(UTC)).astimezone(UTC)
     try:
         local_client = client_bundle_identity(mineru_bin)
         local_code_digest = writer_code_digest()
-        verified_manifest = verify_runtime_manifest_payload(
+        manifest = verify_runtime_manifest_payload(
             {
                 "identity_sha256": runtime_identity,
-                "manifest": receipt.get("runtime_manifest"),
+                "manifest": smoke.get("runtime_manifest"),
             },
             configured_identity=runtime_identity,
             local_client_identity=local_client,
             local_processing_window_size=MINERU_PROCESSING_WINDOW_SIZE,
             local_writer_code_digest=local_code_digest,
         )
-        if (
-            verified_manifest.max_concurrent_requests
-            != settings.disclosure_mineru_api_task_slots
-        ):
-            raise ValueError(
-                "runtime manifest task slots drifted from worker configuration"
-            )
     except (OSError, ValueError) as exc:
         raise MinerUDeploymentGateError(
             f"MinerU exact runtime identity cannot be verified: {exc}"
         ) from exc
-
-    identity = receipt.get("identity")
-    if not isinstance(identity, dict):
-        raise MinerUDeploymentGateError("MinerU receipt identity is invalid")
-    expected_identity = {
+    if manifest.max_concurrent_requests != settings.disclosure_mineru_api_task_slots:
+        raise MinerUDeploymentGateError(
+            "runtime manifest task slots drifted from worker configuration"
+        )
+    expected_identity: dict[str, object] = {
         "local_client_identity_sha256": local_client.package_set_sha256,
         "local_content_package_versions": dict(local_client.content_package_versions),
         "local_processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
         "local_writer_code_sha256": local_code_digest,
         "runtime_manifest_identity_sha256": runtime_identity,
         "orchestrator_runtime_identity_sha256": (
-            verified_manifest.orchestrator_identity_sha256
+            manifest.orchestrator_identity_sha256
         ),
-        "provider_runtime_identity_sha256": (
-            verified_manifest.provider_identity_sha256
-        ),
-        "served_model_id": verified_manifest.served_model_id,
-        "orchestrator_task_slots": (verified_manifest.max_concurrent_requests),
+        "provider_runtime_identity_sha256": manifest.provider_identity_sha256,
+        "served_model_id": manifest.served_model_id,
+        "orchestrator_task_slots": manifest.max_concurrent_requests,
     }
-    if identity != expected_identity:
-        raise MinerUDeploymentGateError("MinerU receipt identity drifted")
-
     expected_topology = {
         "api_endpoint_sha256": _endpoint_sha256(api_url),
         "observability_endpoint_sha256": _endpoint_sha256(observability_url),
         "inference_upstream_sha256": _endpoint_sha256(inference_upstream_url),
     }
-    manifest_topology = verified_manifest.manifest["topology"]
-    if receipt.get("topology") != expected_topology or any(
+    manifest_topology = manifest.manifest["topology"]
+    if any(
         manifest_topology.get(field) != value
         for field, value in expected_topology.items()
     ):
         raise MinerUDeploymentGateError("MinerU endpoint topology drifted")
-
-    input_evidence = receipt.get("input")
-    if (
-        not isinstance(input_evidence, dict)
-        or input_evidence.get("profile") != _DEPLOYMENT_INPUT_PROFILE
-        or input_evidence.get("logical_name") != MINERU_SMOKE_INPUT_NAME
-        or input_evidence.get("sha256") != MINERU_SMOKE_INPUT_SHA256
-        or isinstance(input_evidence.get("bytes"), bool)
-        or not isinstance(input_evidence.get("bytes"), int)
-        or input_evidence["bytes"] < 1
-    ):
-        raise MinerUDeploymentGateError("MinerU frozen smoke input is invalid")
-
-    served_model_id = verified_manifest.served_model_id
-    if cache.get("model_id_sha256") != model_id_sha256(served_model_id):
-        raise MinerUDeploymentGateError("MinerU canary model identity drifted")
-    if cache.get("request_sha256") != canary_request_sha256(served_model_id):
-        raise MinerUDeploymentGateError("MinerU canary request identity drifted")
-
-    _verify_smoke_orchestrator(
-        receipt.get("orchestrator"),
-        task_slots=settings.disclosure_mineru_api_task_slots,
-        task_retention_seconds=(settings.disclosure_mineru_api_task_retention_seconds),
-        cleanup_interval_seconds=(
+    contract: dict[str, Any] = {
+        "expected_identity": expected_identity,
+        "expected_topology": expected_topology,
+        "expected_runtime_manifest": manifest.manifest,
+        "runtime_identity": runtime_identity,
+        "task_slots": settings.disclosure_mineru_api_task_slots,
+        "task_retention_seconds": (
+            settings.disclosure_mineru_api_task_retention_seconds
+        ),
+        "cleanup_interval_seconds": (
             settings.disclosure_mineru_api_cleanup_interval_seconds
         ),
-    )
-
-    cleanup = receipt.get("cleanup")
-    if cleanup != _EXPECTED_CLEANUP:
-        raise MinerUDeploymentGateError("MinerU smoke cleanup was not proved")
-    provider = receipt.get("provider")
-    _verify_provider_evidence(provider, runtime_identity=runtime_identity)
-    if (
-        receipt.get("database_access") != "none"
-        or receipt.get("queue_access") != "none"
-    ):
-        raise MinerUDeploymentGateError("MinerU smoke was not DB/queue free")
-
-    smoke_started_at = _required_aware_timestamp(
-        receipt.get("started_at_utc"),
-        label="MinerU smoke start",
-    )
-    passed_at = _required_aware_timestamp(
-        cache.get("passed_at_utc"),
-        label="MinerU canary",
-    )
-    smoke_finished_at = _required_aware_timestamp(
-        receipt.get("finished_at_utc"),
-        label="MinerU smoke finish",
-    )
-    current_utc = current.astimezone(UTC)
-    smoke_elapsed = _nonnegative_finite_value(receipt.get("elapsed_seconds"))
-    if (
-        smoke_elapsed is None
-        or not smoke_started_at < smoke_finished_at <= current_utc
-        or not smoke_started_at <= passed_at <= smoke_finished_at
-        or not elapsed_matches_timeline(
-            smoke_elapsed,
-            started_at=smoke_started_at,
-            finished_at=smoke_finished_at,
-        )
-    ):
-        raise MinerUDeploymentGateError("MinerU smoke/canary timeline is invalid")
-    host_identity = {
-        "collector_path": manifest_topology["windows_collector_path"],
-        "collector_sha256": manifest_topology["windows_collector_sha256"],
-        "windows_node_identity_sha256": manifest_topology[
-            "windows_node_identity_sha256"
-        ],
-        "docker_memory_reserve_bytes": (
-            settings.disclosure_mineru_docker_memory_reserve_bytes
-        ),
+        "observability_url": observability_url,
+        "max_age_seconds": settings.disclosure_mineru_canary_max_age_seconds,
+        "current": current,
     }
-    (
-        first_staged_input,
-        first_execution_id,
-        first_host_epochs,
-    ) = _verify_staged_load_receipt(
-        staged_load,
-        expected_identity=expected_identity,
-        expected_topology=expected_topology,
-        smoke_finished_at=smoke_finished_at,
-        current=current,
-        max_age_seconds=settings.disclosure_mineru_canary_max_age_seconds,
-        expected_input_sha256=staged_input_sha256,
-        task_slots=settings.disclosure_mineru_api_task_slots,
-        expected_document_runaway_timeout_seconds=(
-            settings.disclosure_parse_runaway_timeout_seconds
-        ),
-        expected_api_drain_timeout_seconds=(
-            settings.disclosure_mineru_api_drain_timeout_seconds
-        ),
-        expected_host_identity=host_identity,
+    _verify_smoke_receipt(
+        smoke,
+        label="MinerU deployment smoke",
+        expected_profile=_DEPLOYMENT_INPUT_PROFILE,
+        expected_cache=cache,
+        **contract,
     )
-    first_staged_finished = _required_aware_timestamp(
-        staged_load.get("finished_at_utc"),
-        label="MinerU first staged-load finish",
+    _verify_heldout_validation(validation, **contract)
+    passed_at = _required_aware_timestamp(
+        cache.get("passed_at_utc"), label="MinerU canary"
     )
-    (
-        _,
-        confirmation_execution_id,
-        _,
-    ) = _verify_staged_load_receipt(
-        staged_confirmation,
-        expected_identity=expected_identity,
-        expected_topology=expected_topology,
-        smoke_finished_at=first_staged_finished,
-        current=current,
-        max_age_seconds=settings.disclosure_mineru_canary_max_age_seconds,
-        expected_input=first_staged_input,
-        expected_input_sha256=staged_input_sha256,
-        task_slots=settings.disclosure_mineru_api_task_slots,
-        expected_document_runaway_timeout_seconds=(
-            settings.disclosure_parse_runaway_timeout_seconds
-        ),
-        expected_api_drain_timeout_seconds=(
-            settings.disclosure_mineru_api_drain_timeout_seconds
-        ),
-        expected_host_identity=host_identity,
-        expected_host_epochs=first_host_epochs,
-    )
-    if confirmation_execution_id == first_execution_id:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load confirmation is not an independent execution"
-        )
     evidence = VerifiedMinerUDeployment(
         api_url=api_url,
         observability_url=observability_url,
         inference_upstream_url=inference_upstream_url,
         runtime_identity_sha256=runtime_identity,
-        served_model_id=served_model_id,
+        served_model_id=manifest.served_model_id,
         canary_passed_at_utc=passed_at,
         canary_max_age_seconds=settings.disclosure_mineru_canary_max_age_seconds,
-        task_retention_seconds=(settings.disclosure_mineru_api_task_retention_seconds),
+        task_retention_seconds=settings.disclosure_mineru_api_task_retention_seconds,
         task_cleanup_interval_seconds=(
             settings.disclosure_mineru_api_cleanup_interval_seconds
         ),
@@ -628,969 +428,296 @@ def verify_mineru_deployment_gate(
     return evidence
 
 
-def _expected_stage_documents(
-    corpus: list[dict[str, object]],
-    *,
-    document_count: int,
-) -> list[dict[str, object]]:
-    """Reconstruct the exact heterogeneous stage selection from the receipt."""
-
-    selected: list[dict[str, object]] = []
-    selected_hashes: set[str] = set()
-    for workload_class in ("regular", "heavy", "huge"):
-        item = next(
-            (
-                candidate
-                for candidate in corpus
-                if candidate.get("workload_class") == workload_class
-            ),
-            None,
-        )
-        if item is None:
-            raise MinerUDeploymentGateError(
-                f"MinerU staged-load corpus has no {workload_class} PDF"
-            )
-        selected.append(item)
-        selected_hashes.add(str(item["sha256"]))
-    for item in corpus:
-        if len(selected) >= document_count:
-            break
-        digest = str(item["sha256"])
-        if digest not in selected_hashes:
-            selected.append(item)
-            selected_hashes.add(digest)
-    if len(selected) != document_count:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load corpus cannot fill an exact stage"
-        )
-    return selected
-
-
-def verify_staged_load_admission_evidence(
-    stage: Mapping[str, object],
-    *,
-    document_count: int,
+def _verify_heldout_validation(
+    value: object,
+    **smoke_contract: Any,
 ) -> None:
-    """Prove that a PASS stage admitted every copy in its frozen FIFO order."""
-
-    expected = list(range(1, document_count + 1))
-    admission = stage.get("admission")
-    records = admission.get("records") if isinstance(admission, dict) else None
+    required = {
+        "schema",
+        "status",
+        "created_at_utc",
+        "policy",
+        "database_access",
+        "queue_access",
+        "document_count",
+        "documents",
+        "epoch_before",
+        "epoch_after",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise MinerUDeploymentGateError("MinerU held-out validation fields drifted")
+    documents = value.get("documents")
+    document_count = value.get("document_count")
     if (
-        stage.get("admission_order_profile") != _STAGED_LOAD_ADMISSION_PROFILE
-        or stage.get("admission_order_copy_indices") != expected
-        or not isinstance(admission, dict)
-        or set(admission)
-        != {
-            "profile",
-            "expected_copy_indices",
-            "admission_order_copy_indices",
-            "records",
-            "closed",
-            "abort_reason",
-        }
-        or admission.get("profile") != _STAGED_LOAD_ADMISSION_PROFILE
-        or admission.get("expected_copy_indices") != expected
-        or admission.get("admission_order_copy_indices") != expected
-        or admission.get("closed") is not True
-        or admission.get("abort_reason") is not None
-        or not isinstance(records, list)
-        or len(records) != document_count
+        value.get("schema") != _VALIDATION_SCHEMA
+        or value.get("status") != "pass"
+        or value.get("policy") != _VALIDATION_POLICY
+        or value.get("database_access") != "none"
+        or value.get("queue_access") != "none"
+        or isinstance(document_count, bool)
+        or not isinstance(document_count, int)
+        or not _MIN_HELDOUT_DOCUMENTS
+        <= document_count
+        <= _MAX_HELDOUT_DOCUMENTS
+        or not isinstance(documents, list)
+        or len(documents) != document_count
     ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load FIFO admission evidence is invalid"
-        )
-    for ordinal, record in enumerate(records):
+        raise MinerUDeploymentGateError("MinerU held-out validation is not PASS")
+    current = smoke_contract["current"]
+    max_age_seconds = smoke_contract["max_age_seconds"]
+    created_at = _required_aware_timestamp(
+        value.get("created_at_utc"), label="MinerU held-out validation creation"
+    )
+    if not (
+        current.timestamp() - max_age_seconds
+        <= created_at.timestamp()
+        <= current.timestamp()
+    ):
+        raise MinerUDeploymentGateError("MinerU held-out validation is stale")
+    source_identities: set[str] = set()
+    earliest_start: datetime | None = None
+    latest_finish: datetime | None = None
+    for index, item in enumerate(documents):
+        if not isinstance(item, dict) or set(item) != {"receipt_sha256", "receipt"}:
+            raise MinerUDeploymentGateError(
+                f"MinerU held-out document {index} wrapper drifted"
+            )
+        receipt = item.get("receipt")
         if (
-            not isinstance(record, dict)
-            or set(record) != {"copy_index", "admission_ordinal", "state"}
-            or record.get("copy_index") != ordinal + 1
-            or record.get("admission_ordinal") != ordinal
-            or record.get("state") != "completed"
+            not isinstance(receipt, dict)
+            or item.get("receipt_sha256") != canonical_payload_sha256(receipt)
         ):
             raise MinerUDeploymentGateError(
-                "MinerU staged-load FIFO admission record is invalid"
+                f"MinerU held-out document {index} hash drifted"
             )
+        source_identity, started_at, finished_at = _verify_smoke_receipt(
+            receipt,
+            label=f"MinerU held-out document {index}",
+            expected_profile=_HELDOUT_INPUT_PROFILE,
+            require_multi_page=True,
+            expected_cache=None,
+            **smoke_contract,
+        )
+        if source_identity in source_identities:
+            raise MinerUDeploymentGateError(
+                "MinerU held-out validation repeats a source PDF"
+            )
+        source_identities.add(source_identity)
+        earliest_start = (
+            started_at if earliest_start is None else min(earliest_start, started_at)
+        )
+        latest_finish = (
+            finished_at if latest_finish is None else max(latest_finish, finished_at)
+        )
+    before_identity, before_time = _verify_epoch_wrapper(
+        value.get("epoch_before"),
+        runtime_identity=smoke_contract["runtime_identity"],
+        label="before",
+    )
+    after_identity, after_time = _verify_epoch_wrapper(
+        value.get("epoch_after"),
+        runtime_identity=smoke_contract["runtime_identity"],
+        label="after",
+    )
+    if (
+        earliest_start is None
+        or latest_finish is None
+        or created_at < latest_finish
+        or before_identity != after_identity
+        or not before_time <= earliest_start < latest_finish <= after_time <= created_at
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU held-out validation epoch/timeline is invalid"
+        )
 
 
-def _verify_staged_load_receipt(
-    receipt: dict[str, Any],
+def _verify_epoch_wrapper(
+    value: object,
     *,
-    expected_identity: dict[str, Any],
-    expected_topology: dict[str, str],
-    smoke_finished_at: datetime,
-    current: datetime,
-    max_age_seconds: int,
-    expected_input_sha256: str,
-    expected_input: dict[str, object] | None = None,
-    task_slots: int,
-    expected_document_runaway_timeout_seconds: int,
-    expected_api_drain_timeout_seconds: int,
-    expected_host_identity: dict[str, object],
-    expected_host_epochs: dict[str, tuple[str, str]] | None = None,
-) -> tuple[
-    dict[str, object],
-    str,
-    dict[str, tuple[str, str]],
-]:
-    effective_inference_request_upper_bound = (
-        task_slots * MINERU_API_INFERENCE_MAX_CONCURRENCY
-    )
+    runtime_identity: str,
+    label: str,
+) -> tuple[str, datetime]:
+    if not isinstance(value, dict) or set(value) != {"receipt_sha256", "receipt"}:
+        raise MinerUDeploymentGateError(f"MinerU {label} epoch wrapper drifted")
+    receipt = value.get("receipt")
     if (
-        expected_document_runaway_timeout_seconds
-        < MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
-        or expected_api_drain_timeout_seconds
-        < MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
+        not isinstance(receipt, dict)
+        or value.get("receipt_sha256") != canonical_payload_sha256(receipt)
+        or set(receipt)
+        != {
+            "schema",
+            "status",
+            "created_at_utc",
+            "database_access",
+            "queue_access",
+            "service_epoch",
+            "service_epoch_sha256",
+            "safety",
+        }
     ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load configured safety limit is below policy"
-        )
-    expected_safety_limits = {
-        "profile": _STAGED_LOAD_SAFETY_LIMITS_PROFILE,
-        "document_runaway_timeout_seconds": (
-            expected_document_runaway_timeout_seconds
-        ),
-        "api_drain_timeout_seconds": expected_api_drain_timeout_seconds,
+        raise MinerUDeploymentGateError(f"MinerU {label} epoch receipt drifted")
+    epoch = receipt.get("service_epoch")
+    safety = receipt.get("safety")
+    expected_safety = {
+        "restart_count_total": 0,
+        "oom_killed_count": 0,
+        "unsafe_container_count": 0,
+        "cgroup_oom_total": 0,
+        "cgroup_oom_kill_total": 0,
     }
-    if receipt.get("schema") == "mineru_staged_load_receipt.v4":
-        raise MinerUDeploymentGateError(
-            "legacy cumulative-gauge staged-load receipt; regenerate under "
-            "retained-terminal-gauges.v1"
-        )
     if (
-        receipt.get("schema") != _STAGED_LOAD_RECEIPT_SCHEMA
-        or receipt.get("receipt_schema_version")
-        != _STAGED_LOAD_RECEIPT_SCHEMA_VERSION
+        receipt.get("schema") != "mineru-service-epoch-freeze.v2"
         or receipt.get("status") != "pass"
-        or receipt.get("failure") is not None
-        or receipt.get("secondary_failures") != []
-    ):
-        raise MinerUDeploymentGateError("MinerU staged-load receipt is not PASS")
-    execution_id = receipt.get("execution_id")
-    try:
-        parsed_execution_id = uuid.UUID(str(execution_id))
-    except (ValueError, AttributeError) as exc:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load execution identity is invalid"
-        ) from exc
-    if str(parsed_execution_id) != execution_id:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load execution identity is not canonical"
-        )
-    if (
-        receipt.get("database_access") != "none"
+        or receipt.get("database_access") != "none"
         or receipt.get("queue_access") != "none"
-        or receipt.get("identity") != expected_identity
-        or receipt.get("topology") != expected_topology
-        or receipt.get("fixed_stage_document_counts") != list(_STAGED_DOCUMENT_COUNTS)
-        or receipt.get("orchestrator_task_concurrency") != task_slots
-        or receipt.get("orchestrator_inference_concurrency")
-        != MINERU_API_INFERENCE_MAX_CONCURRENCY
-        or receipt.get("effective_inference_request_upper_bound")
-        != effective_inference_request_upper_bound
+        or not isinstance(epoch, dict)
+        or set(epoch)
+        != {
+            "schema",
+            "runtime_manifest_identity_sha256",
+            "collector_sha256",
+            "windows_node_identity_sha256",
+            "container_epoch_sha256",
+            "api_container_id",
+        }
+        or epoch.get("schema") != "mineru-service-epoch.v1"
+        or epoch.get("runtime_manifest_identity_sha256") != runtime_identity
+        or receipt.get("service_epoch_sha256") != canonical_payload_sha256(epoch)
+        or safety != expected_safety
     ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load identity or endpoint drifted"
-        )
-    if receipt.get("safety_limits") != expected_safety_limits:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load safety limits drifted"
-        )
-
-    input_evidence = receipt.get("input")
-    corpus_documents = (
-        input_evidence.get("documents") if isinstance(input_evidence, dict) else None
+        raise MinerUDeploymentGateError(f"MinerU {label} epoch is not clean PASS")
+    return str(receipt["service_epoch_sha256"]), _required_aware_timestamp(
+        receipt.get("created_at_utc"), label=f"MinerU {label} epoch creation"
     )
+
+
+def _verify_smoke_receipt(
+    receipt: object,
+    *,
+    label: str,
+    expected_profile: str,
+    expected_identity: dict[str, object],
+    expected_topology: dict[str, str],
+    expected_runtime_manifest: dict[str, Any],
+    runtime_identity: str,
+    task_slots: int,
+    task_retention_seconds: int,
+    cleanup_interval_seconds: int,
+    observability_url: str,
+    max_age_seconds: int,
+    current: datetime,
+    expected_cache: dict[str, Any] | None,
+    require_multi_page: bool = False,
+) -> tuple[str, datetime, datetime]:
+    required_receipt_fields = {
+        "schema",
+        "status",
+        "started_at_utc",
+        "finished_at_utc",
+        "elapsed_seconds",
+        "database_access",
+        "queue_access",
+        "input",
+        "identity",
+        "topology",
+        "orchestrator",
+        "runtime_manifest",
+        "canary",
+        "provider",
+        "cleanup",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != required_receipt_fields:
+        raise MinerUDeploymentGateError(f"{label} fields drifted")
+    if receipt.get("schema") != _SMOKE_SCHEMA or receipt.get("status") != "pass":
+        raise MinerUDeploymentGateError(f"{label} is not v5 PASS")
+    canary = receipt.get("canary")
+    if not isinstance(canary, dict) or (
+        expected_cache is not None and canary != expected_cache
+    ):
+        raise MinerUDeploymentGateError(f"{label} canary evidence drifted")
+    if not canary_cache_is_fresh(
+        canary,
+        observability_url=observability_url,
+        runtime_bundle_identity_sha256=runtime_identity,
+        max_age_seconds=max_age_seconds,
+        now=current,
+    ):
+        raise MinerUDeploymentGateError(f"{label} canary is stale or drifted")
+    model_id = expected_identity["served_model_id"]
     if (
-        not isinstance(input_evidence, dict)
-        or input_evidence.get("profile") != _STAGED_LOAD_INPUT_PROFILE
-        or not isinstance(input_evidence.get("logical_name"), str)
-        or not input_evidence["logical_name"]
-        or not _is_prefixed_sha256(input_evidence.get("sha256"))
-        or input_evidence.get("sha256") != expected_input_sha256
+        canary.get("attempts") != _CANARY_ATTEMPTS
+        or canary.get("model_id_sha256") != model_id_sha256(str(model_id))
+        or canary.get("request_sha256") != canary_request_sha256(str(model_id))
+    ):
+        raise MinerUDeploymentGateError(f"{label} canary identity drifted")
+    if receipt.get("identity") != expected_identity:
+        raise MinerUDeploymentGateError(f"{label} runtime identity drifted")
+    if receipt.get("topology") != expected_topology:
+        raise MinerUDeploymentGateError(f"{label} topology drifted")
+    if receipt.get("runtime_manifest") != expected_runtime_manifest:
+        raise MinerUDeploymentGateError(f"{label} crossed a runtime epoch")
+    input_evidence = receipt.get("input")
+    if not isinstance(input_evidence, dict) or set(input_evidence) != {
+        "profile",
+        "logical_name",
+        "sha256",
+        "bytes",
+        "page_count",
+    }:
+        raise MinerUDeploymentGateError(f"{label} input evidence is invalid")
+    source_identity = input_evidence.get("sha256")
+    source_pages = input_evidence.get("page_count")
+    if (
+        input_evidence.get("profile") != expected_profile
+        or not _is_prefixed_sha256(source_identity)
         or isinstance(input_evidence.get("bytes"), bool)
         or not isinstance(input_evidence.get("bytes"), int)
         or input_evidence["bytes"] < 1
-        or input_evidence.get("minimum_required_pages") != 7
-        or not isinstance(corpus_documents, list)
-        or len(corpus_documents) < _STAGED_DOCUMENT_COUNTS[-1]
+        or isinstance(source_pages, bool)
+        or not isinstance(source_pages, int)
+        or source_pages < (2 if require_multi_page else 1)
     ):
-        raise MinerUDeploymentGateError("MinerU staged-load input is invalid")
-    canonical_documents: list[dict[str, object]] = []
-    corpus_names: set[str] = set()
-    corpus_hashes: set[str] = set()
-    workload_classes: set[str] = set()
-    assert isinstance(corpus_documents, list)
-    for item in corpus_documents:
-        if (
-            not isinstance(item, dict)
-            or set(item)
-            != {"logical_name", "sha256", "bytes", "page_count", "workload_class"}
-            or not isinstance(item.get("logical_name"), str)
-            or not item["logical_name"]
-            or not _is_prefixed_sha256(item.get("sha256"))
-            or isinstance(item.get("bytes"), bool)
-            or not isinstance(item.get("bytes"), int)
-            or item["bytes"] < 1
-            or isinstance(item.get("page_count"), bool)
-            or not isinstance(item.get("page_count"), int)
-            or item["page_count"] < 1
-            or item.get("workload_class") not in {"regular", "heavy", "huge"}
-        ):
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load corpus document is invalid"
-            )
-        logical_name = str(item["logical_name"])
-        sha256 = str(item["sha256"])
-        if logical_name in corpus_names or sha256 in corpus_hashes:
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load corpus identities are not unique"
-            )
-        corpus_names.add(logical_name)
-        corpus_hashes.add(sha256)
-        workload_classes.add(str(item["workload_class"]))
-        canonical_documents.append(dict(item))
-    if not {"regular", "heavy", "huge"}.issubset(workload_classes):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load corpus is not workload-heterogeneous"
-        )
-    canonical_input: dict[str, object] = {
-        "profile": input_evidence["profile"],
-        "logical_name": input_evidence["logical_name"],
-        "sha256": input_evidence["sha256"],
-        "bytes": input_evidence["bytes"],
-        "minimum_required_pages": input_evidence["minimum_required_pages"],
-        "documents": canonical_documents,
-    }
-    if expected_input is not None and canonical_input != expected_input:
-        raise MinerUDeploymentGateError("MinerU staged-load confirmation input drifted")
-
-    stages = receipt.get("stages")
-    if not isinstance(stages, list) or len(stages) != len(_STAGED_DOCUMENT_COUNTS):
-        raise MinerUDeploymentGateError("MinerU staged-load stages are incomplete")
-    staged_preemptions: float | None = None
-    total_stage_elapsed = 0.0
-    for stage, document_count in zip(
-        stages,
-        _STAGED_DOCUMENT_COUNTS,
-        strict=True,
+        raise MinerUDeploymentGateError(f"{label} input evidence drifted")
+    if expected_profile == _DEPLOYMENT_INPUT_PROFILE and (
+        input_evidence.get("logical_name") != MINERU_SMOKE_INPUT_NAME
+        or source_identity != MINERU_SMOKE_INPUT_SHA256
     ):
-        expected_documents = _expected_stage_documents(
-            canonical_documents,
-            document_count=document_count,
-        )
-        client_outstanding_window = min(document_count, task_slots)
-        stage_elapsed = (
-            _nonnegative_finite_value(stage.get("elapsed_seconds"))
-            if isinstance(stage, dict)
-            else None
-        )
-        if (
-            not isinstance(stage, dict)
-            or stage.get("status") != "pass"
-            or stage.get("failure") is not None
-            or stage.get("stage_document_count") != document_count
-            or stage.get("client_outstanding_window") != client_outstanding_window
-            or isinstance(stage.get("peak_client_outstanding"), bool)
-            or not isinstance(stage.get("peak_client_outstanding"), int)
-            or not 1 <= stage["peak_client_outstanding"] <= client_outstanding_window
-            or stage.get("selection_profile") != "per_stage_regular_heavy_huge.v1"
-            or stage.get("orchestrator_task_concurrency") != task_slots
-            or stage.get("orchestrator_inference_concurrency")
-            != MINERU_API_INFERENCE_MAX_CONCURRENCY
-            or stage.get("effective_inference_request_upper_bound")
-            != effective_inference_request_upper_bound
-            or not _cleanup_is_proved(stage.get("cleanup"))
-            or stage_elapsed is None
-            or stage_elapsed <= 0
-        ):
-            raise MinerUDeploymentGateError("MinerU staged-load stage drifted")
-        verify_staged_load_admission_evidence(
-            stage,
-            document_count=document_count,
-        )
-        total_stage_elapsed += stage_elapsed
-        documents = stage.get("documents")
-        if not isinstance(documents, list) or len(documents) != document_count:
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load documents are incomplete"
-            )
-        for copy_index, document in enumerate(documents, start=1):
-            expected_document = expected_documents[copy_index - 1]
-            document_elapsed = (
-                _nonnegative_finite_value(document.get("elapsed_seconds"))
-                if isinstance(document, dict)
-                else None
-            )
-            if (
-                not isinstance(document, dict)
-                or set(document) != _STAGED_DOCUMENT_EVIDENCE_FIELDS
-                or document.get("status") != "pass"
-                or document.get("copy_index") != copy_index
-                or document.get("logical_name") != expected_document["logical_name"]
-                or document.get("input_sha256") != expected_document["sha256"]
-                or document.get("workload_class") != expected_document["workload_class"]
-                or isinstance(document.get("page_count"), bool)
-                or not isinstance(document.get("page_count"), int)
-                or document["page_count"] != expected_document["page_count"]
-                or isinstance(document.get("block_count"), bool)
-                or not isinstance(document.get("block_count"), int)
-                or document["block_count"] < 0
-                or document_elapsed is None
-                or document_elapsed <= 0
-                or not _is_prefixed_sha256(document.get("provider_bundle_sha256"))
-            ):
-                raise MinerUDeploymentGateError(
-                    "MinerU staged-load document evidence is invalid"
-                )
-        metrics = stage.get("metrics")
-        if (
-            not isinstance(metrics, dict)
-            or isinstance(metrics.get("sample_count"), bool)
-            or not isinstance(metrics.get("sample_count"), int)
-            or metrics["sample_count"] < 1
-            or not isinstance(metrics.get("baseline"), dict)
-            or not isinstance(metrics.get("range"), dict)
-            or not isinstance(metrics.get("percentiles"), dict)
-            or not staged_load_metrics_are_proved(
-                metrics,
-                stage_elapsed_seconds=stage_elapsed,
-            )
-        ):
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load metrics were not proved"
-            )
-        current_preemptions = _nonnegative_finite_value(
-            metrics["baseline"].get("preemptions")
-        )
-        assert current_preemptions is not None
-        if staged_preemptions is None:
-            staged_preemptions = current_preemptions
-        elif current_preemptions != staged_preemptions:
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load preemption baseline changed between stages"
-            )
-        verify_staged_load_orchestrator_evidence(
-            stage.get("orchestrator"),
-            stage_elapsed_seconds=stage_elapsed,
-            task_slots=task_slots,
-            client_outstanding_window=client_outstanding_window,
-        )
-
-    if not _cleanup_is_proved(receipt.get("cleanup")):
-        raise MinerUDeploymentGateError("MinerU staged-load cleanup was not proved")
+        raise MinerUDeploymentGateError("MinerU frozen smoke input drifted")
+    provider_pages = _verify_provider_evidence(
+        receipt.get("provider"), runtime_identity=runtime_identity
+    )
+    if provider_pages != source_pages:
+        raise MinerUDeploymentGateError(f"{label} did not preserve all source pages")
+    _verify_smoke_orchestrator(
+        receipt.get("orchestrator"),
+        task_retention_seconds=task_retention_seconds,
+        cleanup_interval_seconds=cleanup_interval_seconds,
+        task_slots=task_slots,
+    )
+    if receipt.get("cleanup") != _EXPECTED_CLEANUP:
+        raise MinerUDeploymentGateError(f"{label} cleanup was not proved")
+    if (
+        receipt.get("database_access") != "none"
+        or receipt.get("queue_access") != "none"
+    ):
+        raise MinerUDeploymentGateError(f"{label} was not DB/queue free")
     started_at = _required_aware_timestamp(
-        receipt.get("started_at_utc"),
-        label="MinerU staged-load start",
+        receipt.get("started_at_utc"), label=f"{label} start"
     )
     finished_at = _required_aware_timestamp(
-        receipt.get("finished_at_utc"),
-        label="MinerU staged-load finish",
+        receipt.get("finished_at_utc"), label=f"{label} finish"
     )
-    elapsed_seconds = _nonnegative_finite_value(receipt.get("elapsed_seconds"))
-    if elapsed_seconds is None or elapsed_seconds <= 0:
-        raise MinerUDeploymentGateError("MinerU staged-load elapsed time is invalid")
-    current_utc = current.astimezone(UTC)
-    age = (current_utc - finished_at).total_seconds()
+    elapsed = _nonnegative_finite_value(receipt.get("elapsed_seconds"))
     if (
-        not smoke_finished_at < started_at < finished_at <= current_utc
-        or not elapsed_matches_timeline(
-            elapsed_seconds,
-            started_at=started_at,
-            finished_at=finished_at,
+        elapsed is None
+        or not started_at < finished_at <= current
+        or (current - finished_at).total_seconds() > max_age_seconds
+        or not _elapsed_matches_timeline(
+            elapsed, started_at=started_at, finished_at=finished_at
         )
-        or elapsed_seconds < total_stage_elapsed
     ):
-        raise MinerUDeploymentGateError("MinerU smoke/staged-load timeline is invalid")
-    if age < 0 or age > max_age_seconds:
-        raise MinerUDeploymentGateError("MinerU staged-load receipt is stale")
-    host_epochs = verify_host_capacity_evidence(
-        receipt.get("host_capacity"),
-        expected_identity=expected_host_identity,
-        receipt_elapsed_seconds=elapsed_seconds,
-        expected_epochs=expected_host_epochs,
-    )
-    verify_staged_load_inference_liveness_evidence(
-        receipt,
-        host_epochs=host_epochs,
-    )
-    return (
-        canonical_input,
-        str(execution_id),
-        host_epochs,
-    )
-
-
-def verify_staged_load_inference_liveness_evidence(
-    receipt: Mapping[str, object],
-    *,
-    host_epochs: Mapping[str, tuple[str, str]],
-) -> tuple[str, str]:
-    """Verify both arm-boundary canaries inside one trusted service epoch."""
-
-    identity = receipt.get("identity")
-    campaign_epoch = receipt.get("campaign_epoch")
-    liveness = receipt.get("inference_liveness")
-    if not all(
-        isinstance(value, dict)
-        for value in (identity, campaign_epoch, liveness)
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load inference liveness evidence is missing"
-        )
-    assert isinstance(identity, dict)
-    assert isinstance(campaign_epoch, dict)
-    assert isinstance(liveness, dict)
-    host_capacity = receipt.get("host_capacity")
-    if not isinstance(host_capacity, dict):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load host evidence is missing"
-        )
-    if (
-        set(campaign_epoch)
-        != {
-            "schema",
-            "expected_sha256",
-            "observed_sha256",
-            "windows_node_identity_sha256",
-            "collector_sha256",
-            "services",
-        }
-        or campaign_epoch.get("schema") != _STAGED_LOAD_CAMPAIGN_EPOCH_SCHEMA
-        or not _is_prefixed_sha256(campaign_epoch.get("observed_sha256"))
-        or not _is_prefixed_sha256(campaign_epoch.get("expected_sha256"))
-        or campaign_epoch.get("expected_sha256")
-        != campaign_epoch.get("observed_sha256")
-        or not _is_prefixed_sha256(
-            campaign_epoch.get("windows_node_identity_sha256")
-        )
-        or not _is_prefixed_sha256(campaign_epoch.get("collector_sha256"))
-        or campaign_epoch.get("windows_node_identity_sha256")
-        != host_capacity.get("windows_node_identity_sha256")
-        or campaign_epoch.get("collector_sha256")
-        != host_capacity.get("collector_sha256")
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load campaign epoch evidence is invalid"
-        )
-    services = campaign_epoch.get("services")
-    if not isinstance(services, dict) or set(services) != {
-        "proxy",
-        "inference",
-    }:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load campaign epoch containers are invalid"
-        )
-    canonical_services: dict[str, dict[str, str]] = {}
-    for role, name in (
-        ("proxy", "mineru-api-proxy"),
-        ("inference", "mineru-openai-server"),
-    ):
-        value = services.get(role)
-        expected_epoch = host_epochs.get(name)
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"name", "container_id", "started_at_utc"}
-            or value.get("name") != name
-            or not isinstance(value.get("container_id"), str)
-            or not isinstance(value.get("started_at_utc"), str)
-            or expected_epoch
-            != (value.get("container_id"), value.get("started_at_utc"))
-        ):
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load campaign epoch drifted from host evidence"
-            )
-        canonical_services[role] = {
-            "name": name,
-            "container_id": str(value["container_id"]),
-            "started_at_utc": str(value["started_at_utc"]),
-        }
-    canonical_epoch = {
-        "schema": _STAGED_LOAD_CAMPAIGN_EPOCH_SCHEMA,
-        "windows_node_identity_sha256": campaign_epoch[
-            "windows_node_identity_sha256"
-        ],
-        "collector_sha256": campaign_epoch["collector_sha256"],
-        "services": canonical_services,
-    }
-    observed_sha256 = "sha256:" + hashlib.sha256(
-        json.dumps(
-            canonical_epoch,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    if campaign_epoch.get("observed_sha256") != observed_sha256:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load campaign epoch hash is invalid"
-        )
-    if set(liveness) != {
-        "schema",
-        "profile",
-        "pre_arm",
-        "workload_started_at_utc",
-        "workload_finished_at_utc",
-        "workload_started_observed_seconds",
-        "workload_finished_observed_seconds",
-        "post_arm",
-    } or (
-        liveness.get("schema") != "mineru-arm-inference-liveness.v1"
-        or liveness.get("profile") != _STAGED_LOAD_INFERENCE_LIVENESS_PROFILE
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load inference liveness profile is invalid"
-        )
-    arm_started = _required_aware_timestamp(
-        receipt.get("started_at_utc"),
-        label="MinerU staged-load start",
-    )
-    arm_finished = _required_aware_timestamp(
-        receipt.get("finished_at_utc"),
-        label="MinerU staged-load finish",
-    )
-    workload_started = _required_aware_timestamp(
-        liveness.get("workload_started_at_utc"),
-        label="MinerU staged-load workload start",
-    )
-    workload_finished = _required_aware_timestamp(
-        liveness.get("workload_finished_at_utc"),
-        label="MinerU staged-load workload finish",
-    )
-    workload_started_observed = _nonnegative_finite_value(
-        liveness.get("workload_started_observed_seconds")
-    )
-    workload_finished_observed = _nonnegative_finite_value(
-        liveness.get("workload_finished_observed_seconds")
-    )
-    if (
-        workload_started_observed is None
-        or workload_finished_observed is None
-        or workload_started_observed >= workload_finished_observed
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load observed workload timeline is invalid"
-        )
-    model_id = identity.get("served_model_id")
-    runtime_identity = identity.get("runtime_manifest_identity_sha256")
-    if not isinstance(model_id, str) or not _is_prefixed_sha256(runtime_identity):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load liveness identity is invalid"
-        )
-
-    topology = receipt.get("topology")
-    expected_endpoint_sha256 = (
-        topology.get("observability_endpoint_sha256")
-        if isinstance(topology, dict)
-        else None
-    )
-    if not _is_prefixed_sha256(expected_endpoint_sha256):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load liveness endpoint identity is invalid"
-        )
-    expected_inference_epoch = canonical_services["inference"]
-
-    def verify_boundary(
-        value: object,
-        *,
-        label: str,
-        phase: str,
-    ) -> tuple[datetime, datetime, float, float]:
-        if not isinstance(value, dict) or set(value) != {
-            "schema",
-            "phase",
-            "status",
-            "started_at_utc",
-            "finished_at_utc",
-            "started_observed_seconds",
-            "finished_observed_seconds",
-            "elapsed_seconds",
-            "model_id",
-            "attempts",
-            "observability_endpoint_sha256",
-            "request_sha256",
-            "response_sha256",
-            "runtime_manifest_identity_sha256",
-            "campaign_epoch_sha256",
-            "inference_epoch",
-            "failure",
-        }:
-            raise MinerUDeploymentGateError(
-                f"MinerU staged-load {label} canary evidence is invalid"
-            )
-        response_sha256 = value.get("response_sha256")
-        started_observed = _nonnegative_finite_value(
-            value.get("started_observed_seconds")
-        )
-        finished_observed = _nonnegative_finite_value(
-            value.get("finished_observed_seconds")
-        )
-        elapsed_seconds = _nonnegative_finite_value(value.get("elapsed_seconds"))
-        if (
-            value.get("schema") != _STAGED_LOAD_BOUNDARY_CANARY_SCHEMA
-            or value.get("phase") != phase
-            or value.get("status") != "pass"
-            or value.get("failure") is not None
-            or value.get("model_id") != model_id
-            or value.get("attempts") != 1
-            or value.get("observability_endpoint_sha256")
-            != expected_endpoint_sha256
-            or value.get("request_sha256")
-            != "sha256:" + canary_request_sha256(model_id)
-            or not isinstance(response_sha256, list)
-            or len(response_sha256) != 1
-            or not _is_prefixed_sha256(response_sha256[0])
-            or value.get("runtime_manifest_identity_sha256") != runtime_identity
-            or value.get("campaign_epoch_sha256") != observed_sha256
-            or value.get("inference_epoch") != expected_inference_epoch
-            or started_observed is None
-            or finished_observed is None
-            or elapsed_seconds is None
-            or elapsed_seconds <= 0
-            or finished_observed <= started_observed
-            or abs(
-                (finished_observed - started_observed) - elapsed_seconds
-            )
-            > 0.001
-        ):
-            raise MinerUDeploymentGateError(
-                f"MinerU staged-load {label} canary identity is invalid"
-            )
-        started = _required_aware_timestamp(
-            value.get("started_at_utc"),
-            label=f"MinerU staged-load {label} canary start",
-        )
-        finished = _required_aware_timestamp(
-            value.get("finished_at_utc"),
-            label=f"MinerU staged-load {label} canary finish",
-        )
-        if not started < finished:
-            raise MinerUDeploymentGateError(
-                f"MinerU staged-load {label} canary timeline is invalid"
-            )
-        return started, finished, started_observed, finished_observed
-
-    pre_started, pre_finished, pre_started_observed, pre_finished_observed = (
-        verify_boundary(
-            liveness.get("pre_arm"),
-            label="pre-arm",
-            phase="pre_arm",
-        )
-    )
-    post_started, post_finished, post_started_observed, post_finished_observed = (
-        verify_boundary(
-            liveness.get("post_arm"),
-            label="post-arm",
-            phase="post_arm",
-        )
-    )
-    if not (
-        arm_started
-        <= pre_started
-        < pre_finished
-        <= workload_started
-        < workload_finished
-        <= post_started
-        < post_finished
-        <= arm_finished
-        and pre_started_observed
-        < pre_finished_observed
-        <= workload_started_observed
-        < workload_finished_observed
-        <= post_started_observed
-        < post_finished_observed
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load inference liveness timeline is invalid"
-        )
-    samples = host_capacity.get("samples")
-    first_sample = samples[0] if isinstance(samples, list) and samples else None
-    last_sample = samples[-1] if isinstance(samples, list) and samples else None
-    first_observed = (
-        _nonnegative_finite_value(first_sample.get("observed_seconds"))
-        if isinstance(first_sample, dict)
-        else None
-    )
-    last_observed = (
-        _nonnegative_finite_value(last_sample.get("observed_seconds"))
-        if isinstance(last_sample, dict)
-        else None
-    )
-    if (
-        first_observed is None
-        or last_observed is None
-        or first_observed > pre_started_observed
-        or last_observed < post_finished_observed
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load host samples do not bracket arm canaries"
-        )
-    expected_sha256 = campaign_epoch.get("expected_sha256")
-    assert isinstance(expected_sha256, str)
-    return expected_sha256, observed_sha256
-
-
-def verify_host_capacity_evidence(
-    value: object,
-    *,
-    expected_identity: dict[str, object],
-    receipt_elapsed_seconds: float,
-    expected_epochs: dict[str, tuple[str, str]] | None,
-) -> dict[str, tuple[str, str]]:
-    reserve_value = expected_identity.get("docker_memory_reserve_bytes")
-    if (
-        not isinstance(reserve_value, int)
-        or isinstance(reserve_value, bool)
-        or reserve_value <= 0
-    ):
-        raise MinerUDeploymentGateError(
-            "configured Docker memory reserve must be a positive integer"
-        )
-    if not isinstance(value, dict) or set(value) != {
-        "schema",
-        "status",
-        "failure",
-        "sample_interval_seconds",
-        "max_sample_gap_seconds",
-        "docker_memory_reserve_bytes",
-        "collector_path",
-        "collector_sha256",
-        "windows_node_identity_sha256",
-        "samples",
-        "violations",
-        "sampling_failures",
-        "summary",
-    }:
-        raise MinerUDeploymentGateError("MinerU host-capacity evidence fields drifted")
-    if (
-        value.get("schema") != "mineru-host-capacity-evidence.v2"
-        or value.get("status") != "pass"
-        or value.get("failure") is not None
-        or value.get("sample_interval_seconds") != 5.0
-        or value.get("max_sample_gap_seconds") != 15.0
-        or value.get("docker_memory_reserve_bytes") != reserve_value
-        or value.get("collector_path") != expected_identity["collector_path"]
-        or value.get("collector_sha256") != expected_identity["collector_sha256"]
-        or value.get("windows_node_identity_sha256")
-        != expected_identity["windows_node_identity_sha256"]
-        or value.get("violations") != []
-        or value.get("sampling_failures") != []
-    ):
-        raise MinerUDeploymentGateError("MinerU host-capacity identity drifted")
-    reserve = reserve_value
-    samples = value.get("samples")
-    if not isinstance(samples, list) or len(samples) < 2:
-        raise MinerUDeploymentGateError("MinerU host-capacity samples are incomplete")
-    expected_sample_fields = {
-        "schema",
-        "observed_at_utc",
-        "collector_path",
-        "collector_sha256",
-        "windows_node_identity_sha256",
-        "containers",
-        "observed_seconds",
-    }
-    expected_container_fields = {
-        "name",
-        "id",
-        "started_at_utc",
-        "restart_count",
-        "oom_killed",
-        "exit_code",
-        "running",
-        "status",
-        "health",
-        "pid",
-        "memory_current_bytes",
-        "memory_max_bytes",
-        "memory_events",
-        "pid1_rss_bytes",
-        "pid1_rss_hwm_bytes",
-        "docker_vm_memory_total_bytes",
-        "docker_vm_memory_available_bytes",
-    }
-    names_expected = {
-        "mineru-api",
-        "mineru-api-proxy",
-        "mineru-openai-server",
-    }
-    epochs: dict[str, tuple[str, str]] | None = None
-    observed_values: list[float] = []
-    remote_times: list[datetime] = []
-    max_api_rss = 0
-    min_vm_available: int | None = None
-    for sample in samples:
-        if not isinstance(sample, dict) or set(sample) != expected_sample_fields:
-            raise MinerUDeploymentGateError(
-                "MinerU host-capacity sample fields drifted"
-            )
-        observed = _nonnegative_finite_value(sample.get("observed_seconds"))
-        if observed is None or observed > receipt_elapsed_seconds:
-            raise MinerUDeploymentGateError(
-                "MinerU host-capacity sample timing is invalid"
-            )
-        observed_values.append(observed)
-        remote_times.append(
-            _required_aware_timestamp(
-                sample.get("observed_at_utc"),
-                label="MinerU host-capacity sample",
-            )
-        )
-        if (
-            sample.get("schema") != "mineru-host-capacity-sample.v1"
-            or sample.get("collector_path") != expected_identity["collector_path"]
-            or sample.get("collector_sha256") != expected_identity["collector_sha256"]
-            or sample.get("windows_node_identity_sha256")
-            != expected_identity["windows_node_identity_sha256"]
-        ):
-            raise MinerUDeploymentGateError(
-                "MinerU host-capacity sample identity drifted"
-            )
-        containers = sample.get("containers")
-        if not isinstance(containers, list) or len(containers) != 3:
-            raise MinerUDeploymentGateError(
-                "MinerU host-capacity container set is incomplete"
-            )
-        sample_epochs: dict[str, tuple[str, str]] = {}
-        vm_totals: set[int] = set()
-        for container in containers:
-            if (
-                not isinstance(container, dict)
-                or set(container) != expected_container_fields
-            ):
-                raise MinerUDeploymentGateError(
-                    "MinerU host-capacity container fields drifted"
-                )
-            name = container.get("name")
-            container_id = container.get("id")
-            started_at = container.get("started_at_utc")
-            if (
-                not isinstance(name, str)
-                or name in sample_epochs
-                or not isinstance(container_id, str)
-                or len(container_id) != 64
-                or any(
-                    character not in "0123456789abcdef" for character in container_id
-                )
-                or container.get("restart_count") != 0
-                or container.get("oom_killed") is not False
-                or container.get("exit_code") != 0
-                or container.get("running") is not True
-                or container.get("status") != "running"
-                or container.get("health") != "healthy"
-            ):
-                raise MinerUDeploymentGateError(
-                    "MinerU host-capacity container state is unsafe"
-                )
-            _required_aware_timestamp(
-                started_at,
-                label="MinerU host-capacity container epoch",
-            )
-            for field, allow_zero in (
-                ("pid", False),
-                ("memory_current_bytes", True),
-                ("pid1_rss_bytes", True),
-                ("pid1_rss_hwm_bytes", True),
-                ("docker_vm_memory_total_bytes", False),
-                ("docker_vm_memory_available_bytes", False),
-            ):
-                item = container.get(field)
-                minimum = 0 if allow_zero else 1
-                if (
-                    isinstance(item, bool)
-                    or not isinstance(item, int)
-                    or item < minimum
-                ):
-                    raise MinerUDeploymentGateError(
-                        f"MinerU host-capacity {field} is invalid"
-                    )
-            memory_max = container.get("memory_max_bytes")
-            if memory_max is not None and (
-                isinstance(memory_max, bool)
-                or not isinstance(memory_max, int)
-                or memory_max < int(container["memory_current_bytes"])
-            ):
-                raise MinerUDeploymentGateError(
-                    "MinerU host-capacity cgroup limit is invalid"
-                )
-            if int(container["pid1_rss_hwm_bytes"]) < int(container["pid1_rss_bytes"]):
-                raise MinerUDeploymentGateError(
-                    "MinerU host-capacity RSS evidence is invalid"
-                )
-            events = container.get("memory_events")
-            if (
-                not isinstance(events, dict)
-                or events.get("oom") != 0
-                or events.get("oom_kill") != 0
-                or any(
-                    isinstance(item, bool) or not isinstance(item, int) or item < 0
-                    for item in events.values()
-                )
-            ):
-                raise MinerUDeploymentGateError(
-                    "MinerU host-capacity OOM evidence is unsafe"
-                )
-            vm_total = int(container["docker_vm_memory_total_bytes"])
-            vm_available = int(container["docker_vm_memory_available_bytes"])
-            if vm_available > vm_total or vm_available < reserve:
-                raise MinerUDeploymentGateError(
-                    "MinerU host-capacity Docker VM reserve was crossed"
-                )
-            vm_totals.add(vm_total)
-            min_vm_available = (
-                vm_available
-                if min_vm_available is None
-                else min(min_vm_available, vm_available)
-            )
-            if name == "mineru-api":
-                max_api_rss = max(
-                    max_api_rss,
-                    int(container["pid1_rss_hwm_bytes"]),
-                )
-            sample_epochs[name] = (container_id, str(started_at))
-        if set(sample_epochs) != names_expected or len(vm_totals) != 1:
-            raise MinerUDeploymentGateError(
-                "MinerU host-capacity host/container identities drifted"
-            )
-        if epochs is None:
-            epochs = sample_epochs
-        elif sample_epochs != epochs:
-            raise MinerUDeploymentGateError(
-                "MinerU host-capacity container epoch changed"
-            )
-    assert epochs is not None
-    if expected_epochs is not None and epochs != expected_epochs:
-        raise MinerUDeploymentGateError(
-            "MinerU host-capacity epoch changed between independent runs"
-        )
-    if observed_values != sorted(observed_values) or remote_times != sorted(
-        remote_times
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU host-capacity samples are not monotonic"
-        )
-    max_gap = float(value["max_sample_gap_seconds"])
-    gaps = [
-        observed_values[0],
-        *(
-            later - earlier
-            for earlier, later in zip(
-                observed_values,
-                observed_values[1:],
-                strict=False,
-            )
-        ),
-        receipt_elapsed_seconds - observed_values[-1],
-    ]
-    if max(gaps) > max_gap:
-        raise MinerUDeploymentGateError("MinerU host-capacity sample gap is unsafe")
-    expected_summary = {
-        "sample_count": len(samples),
-        "max_api_pid1_rss_hwm_bytes": max_api_rss,
-        "min_docker_vm_memory_available_bytes": min_vm_available,
-    }
-    if value.get("summary") != expected_summary:
-        raise MinerUDeploymentGateError("MinerU host-capacity summary drifted")
-    return epochs
+        raise MinerUDeploymentGateError(f"{label} timeline is invalid")
+    return str(source_identity), started_at, finished_at
 
 
 def _verify_smoke_orchestrator(
@@ -1613,41 +740,26 @@ def _verify_smoke_orchestrator(
     after = value.get("after")
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise MinerUDeploymentGateError("MinerU smoke API samples are invalid")
-    required = {
-        "status",
-        "version",
-        "protocol_version",
-        "queued_tasks",
-        "processing_tasks",
-        "completed_tasks",
-        "failed_tasks",
-        "max_concurrent_requests",
-        "processing_window_size",
-        "task_retention_seconds",
-        "task_cleanup_interval_seconds",
-    }
-    if set(before) != required or set(after) != required:
-        raise MinerUDeploymentGateError("MinerU smoke API health fields drifted")
-    for sample in (before, after):
-        for field in required - {"status", "version"}:
-            item = sample.get(field)
-            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
-                raise MinerUDeploymentGateError(
-                    f"MinerU smoke API health {field} is invalid"
-                )
-        if (
-            sample.get("status") != "healthy"
-            or sample.get("version") != "3.4.4"
-            or sample.get("protocol_version") != 2
-            or sample.get("max_concurrent_requests") != task_slots
-            or sample.get("processing_window_size") != 16
-            or sample.get("task_retention_seconds") != task_retention_seconds
-            or sample.get("task_cleanup_interval_seconds") != cleanup_interval_seconds
-            or sample["processing_tasks"] > sample["max_concurrent_requests"]
-            or sample["queued_tasks"] + sample["processing_tasks"]
-            > sample["processing_window_size"]
-        ):
-            raise MinerUDeploymentGateError("MinerU smoke API identity drifted")
+    try:
+        health_samples = tuple(
+            parse_mineru_orchestrator_health_payload(
+                sample,
+                expected_task_slots=task_slots,
+                expected_task_retention_seconds=task_retention_seconds,
+                expected_cleanup_interval_seconds=cleanup_interval_seconds,
+            )
+            for sample in (before, after)
+        )
+    except MinerUOrchestratorError as exc:
+        raise MinerUDeploymentGateError(
+            f"MinerU smoke API health drifted: {exc}"
+        ) from exc
+    if any(
+        sample.max_pending_tasks_requested != task_slots
+        or sample.max_pending_tasks_effective != task_slots
+        for sample in health_samples
+    ):
+        raise MinerUDeploymentGateError("MinerU smoke API pending capacity drifted")
     if (
         before.get("queued_tasks") != 0
         or before.get("processing_tasks") != 0
@@ -1660,410 +772,14 @@ def _verify_smoke_orchestrator(
         raise MinerUDeploymentGateError("MinerU smoke API evidence was not proved")
 
 
-def verify_staged_load_orchestrator_evidence(
-    value: object,
-    *,
-    stage_elapsed_seconds: float,
-    task_slots: int,
-    client_outstanding_window: int,
-) -> None:
-    required_fields = {
-        "task_registry_semantics",
-        "baseline",
-        "samples",
-        "sample_count",
-        "sampling_failures",
-        "observer",
-        "terminal",
-        "terminal_active_tasks",
-        "preflight_drain_seconds",
-        "terminal_drain_seconds",
-        "stop_semantics",
-        "range",
-    }
-    if not isinstance(value, dict) or set(value) != required_fields:
-        raise MinerUDeploymentGateError("MinerU staged-load API evidence is invalid")
-    baseline = _strict_health_payload(value.get("baseline"), task_slots=task_slots)
-    terminal = _strict_health_payload(value.get("terminal"), task_slots=task_slots)
-    samples = value.get("samples")
-    if not isinstance(samples, list) or not samples:
-        raise MinerUDeploymentGateError("MinerU staged-load API samples are incomplete")
-    if value.get("sampling_failures") != []:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load API observation has transport gaps"
-        )
-    observer = value.get("observer")
-    if not isinstance(observer, dict) or set(observer) != {
-        "profile",
-        "state",
-        "observation_complete",
-        "hard_failure",
-        "admission_stop_reason",
-        "transitions",
+def _verify_provider_evidence(provider: object, *, runtime_identity: str) -> int:
+    if not isinstance(provider, dict) or set(provider) != {
+        "target_identity",
+        "provider_bundle_sha256",
+        "page_count",
+        "block_count",
+        "artifact_count",
     }:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load API observer evidence is invalid"
-        )
-    transitions = observer.get("transitions")
-    if (
-        observer.get("profile") != "orchestrator-observer.v1"
-        or observer.get("state") != "CLOSED"
-        or observer.get("observation_complete") is not True
-        or observer.get("hard_failure") is not None
-        or observer.get("admission_stop_reason") is not None
-        or not isinstance(transitions, list)
-        or not transitions
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load API observer did not close cleanly"
-        )
-    expected_from = "STARTING"
-    previous_transition_seconds = -1.0
-    saw_healthy = False
-    for transition in transitions:
-        if not isinstance(transition, dict) or set(transition) != {
-            "from",
-            "to",
-            "reason",
-            "observed_seconds",
-        }:
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load API observer transition drifted"
-            )
-        transition_seconds = _nonnegative_finite_value(
-            transition.get("observed_seconds")
-        )
-        if (
-            transition.get("from") != expected_from
-            or transition.get("to") not in {"HEALTHY", "CLOSED"}
-            or not isinstance(transition.get("reason"), str)
-            or not transition.get("reason")
-            or transition_seconds is None
-            or transition_seconds < previous_transition_seconds
-            or transition_seconds > stage_elapsed_seconds
-        ):
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load API observer transition is invalid"
-            )
-        expected_from = str(transition["to"])
-        saw_healthy = saw_healthy or expected_from == "HEALTHY"
-        previous_transition_seconds = transition_seconds
-    if expected_from != "CLOSED" or not saw_healthy:
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load API observer terminal state is missing"
-        )
-    normalized_samples: list[dict[str, int | float]] = []
-    previous_observed_seconds = -1.0
-    for sample in samples:
-        if not isinstance(sample, dict) or set(sample) != {
-            "observed_seconds",
-            "queued_tasks",
-            "processing_tasks",
-            "completed_tasks",
-            "failed_tasks",
-        }:
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load API sample fields drifted"
-            )
-        observed_seconds = _nonnegative_finite_value(sample.get("observed_seconds"))
-        if (
-            observed_seconds is None
-            or observed_seconds < previous_observed_seconds
-            or observed_seconds > stage_elapsed_seconds
-        ):
-            raise MinerUDeploymentGateError(
-                "MinerU staged-load API sample timing is invalid"
-            )
-        previous_observed_seconds = observed_seconds
-        normalized: dict[str, int | float] = {"observed_seconds": observed_seconds}
-        for field in (
-            "queued_tasks",
-            "processing_tasks",
-            "completed_tasks",
-            "failed_tasks",
-        ):
-            item = sample.get(field)
-            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
-                raise MinerUDeploymentGateError(
-                    f"MinerU staged-load API sample {field} is invalid"
-                )
-            normalized[field] = item
-        normalized_samples.append(normalized)
-
-    completed_values = [
-        int(baseline["completed_tasks"]),
-        *(int(sample["completed_tasks"]) for sample in normalized_samples),
-        int(terminal["completed_tasks"]),
-    ]
-    failed_values = [
-        int(baseline["failed_tasks"]),
-        *(int(sample["failed_tasks"]) for sample in normalized_samples),
-        int(terminal["failed_tasks"]),
-    ]
-    processing_values = [
-        int(baseline["processing_tasks"]),
-        *(int(sample["processing_tasks"]) for sample in normalized_samples),
-        int(terminal["processing_tasks"]),
-    ]
-    queued_values = [
-        int(baseline["queued_tasks"]),
-        *(int(sample["queued_tasks"]) for sample in normalized_samples),
-        int(terminal["queued_tasks"]),
-    ]
-    expected_range = {
-        "queued_tasks": {"min": min(queued_values), "max": max(queued_values)},
-        "processing_tasks": {
-            "min": min(processing_values),
-            "max": max(processing_values),
-        },
-        "completed_tasks": {
-            "min": min(completed_values),
-            "max": max(completed_values),
-        },
-        "failed_tasks": {"min": min(failed_values), "max": max(failed_values)},
-    }
-    preflight_drain = _nonnegative_finite_value(value.get("preflight_drain_seconds"))
-    terminal_drain = _nonnegative_finite_value(value.get("terminal_drain_seconds"))
-    if (
-        baseline["queued_tasks"] != 0
-        or baseline["processing_tasks"] != 0
-        or terminal["queued_tasks"] != 0
-        or terminal["processing_tasks"] != 0
-        or value.get("sample_count") != len(normalized_samples)
-        or value.get("task_registry_semantics") != _TASK_REGISTRY_SEMANTICS
-        or value.get("terminal_active_tasks") != 0
-        or value.get("stop_semantics") != "drain-not-cancel.v1"
-        or max(processing_values) > task_slots
-        or max(
-            queued + processing
-            for queued, processing in zip(
-                queued_values,
-                processing_values,
-                strict=True,
-            )
-        )
-        > client_outstanding_window
-        or max(processing_values) == 0
-        or value.get("range") != expected_range
-        or preflight_drain is None
-        or terminal_drain is None
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU staged-load API accounting was not proved"
-        )
-
-
-def _strict_health_payload(value: object, *, task_slots: int) -> dict[str, int | str]:
-    required = {
-        "status",
-        "version",
-        "protocol_version",
-        "queued_tasks",
-        "processing_tasks",
-        "completed_tasks",
-        "failed_tasks",
-        "max_concurrent_requests",
-        "processing_window_size",
-        "task_retention_seconds",
-        "task_cleanup_interval_seconds",
-    }
-    if not isinstance(value, dict) or set(value) != required:
-        raise MinerUDeploymentGateError("MinerU staged-load API health fields drifted")
-    for field in required - {"status", "version"}:
-        item = value.get(field)
-        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
-            raise MinerUDeploymentGateError(
-                f"MinerU staged-load API health {field} is invalid"
-            )
-    if (
-        value.get("status") != "healthy"
-        or value.get("version") != "3.4.4"
-        or value.get("protocol_version") != 2
-        or value.get("max_concurrent_requests") != task_slots
-        or value.get("processing_window_size") != MINERU_PROCESSING_WINDOW_SIZE
-        or value.get("task_retention_seconds") != 600
-        or value.get("task_cleanup_interval_seconds") != 30
-        or int(value["processing_tasks"]) > task_slots
-        or int(value["queued_tasks"]) + int(value["processing_tasks"])
-        > MINERU_PROCESSING_WINDOW_SIZE
-    ):
-        raise MinerUDeploymentGateError("MinerU staged-load API identity drifted")
-    return value
-
-
-def _endpoint_sha256(value: str) -> str:
-    return "sha256:" + hashlib.sha256(value.rstrip("/").encode("utf-8")).hexdigest()
-
-
-def elapsed_matches_timeline(
-    elapsed_seconds: float,
-    *,
-    started_at: datetime,
-    finished_at: datetime,
-) -> bool:
-    observed = (finished_at - started_at).total_seconds()
-    tolerance = max(1.0, observed * 0.05)
-    return (
-        elapsed_seconds > 0
-        and observed > 0
-        and abs(observed - elapsed_seconds) <= tolerance
-    )
-
-
-def _cleanup_is_proved(value: object) -> bool:
-    return bool(
-        isinstance(value, dict)
-        and value.get("external_api_temp_dirs_after") == 0
-        and value.get("api_temp_cleanup_errors") == []
-        and value.get("external_mineru_processes_after") == 0
-        and value.get("temporary_tree_removed") is True
-        and value.get("observation_error") is None
-    )
-
-
-def staged_load_metrics_are_proved(
-    metrics: dict[str, Any],
-    *,
-    stage_elapsed_seconds: float,
-) -> bool:
-    baseline = metrics.get("baseline")
-    ranges = metrics.get("range")
-    percentiles = metrics.get("percentiles")
-    sampling_failures = metrics.get("sampling_failures")
-    observer = metrics.get("observer")
-    transitions = observer.get("transitions") if isinstance(observer, dict) else None
-    assert isinstance(baseline, dict)
-    assert isinstance(ranges, dict)
-    assert isinstance(percentiles, dict)
-    terminal_sample = _nonnegative_finite_value(
-        metrics.get("terminal_sample_observed_seconds")
-    )
-    if (
-        terminal_sample is None
-        or terminal_sample > stage_elapsed_seconds
-        or not isinstance(sampling_failures, list)
-        or sampling_failures != []
-        or not isinstance(observer, dict)
-        or set(observer)
-        != {
-            "profile",
-            "state",
-            "observation_complete",
-            "hard_failure",
-            "transitions",
-        }
-        or observer.get("profile") != "metrics-observer.v1"
-        or observer.get("state") != "CLOSED"
-        or observer.get("observation_complete") is not True
-        or observer.get("hard_failure") is not None
-        or not isinstance(transitions, list)
-    ):
-        return False
-    observer_state = "STARTING"
-    transition_seconds = -1.0
-    observed_states: list[str] = []
-    assert isinstance(transitions, list)
-    for transition in transitions:
-        observed_seconds = (
-            _nonnegative_finite_value(transition.get("observed_seconds"))
-            if isinstance(transition, dict)
-            else None
-        )
-        if (
-            not isinstance(transition, dict)
-            or set(transition) != {"from", "to", "reason", "observed_seconds"}
-            or transition.get("from") != observer_state
-            or transition.get("to")
-            not in {"HEALTHY", "DEGRADED_TRANSPORT", "CLOSED"}
-            or not isinstance(transition.get("reason"), str)
-            or not transition["reason"]
-            or observed_seconds is None
-            or observed_seconds < transition_seconds
-        ):
-            return False
-        observer_state = str(transition["to"])
-        transition_seconds = observed_seconds
-        observed_states.append(observer_state)
-    if (
-        observer_state != "CLOSED"
-        or observed_states != ["HEALTHY", "CLOSED"]
-    ):
-        return False
-    normalized: dict[str, tuple[float, float, float]] = {}
-    for name in ("running", "waiting", "preemptions", "kv_cache"):
-        baseline_value = _nonnegative_finite_value(baseline.get(name))
-        metric_range = ranges.get(name)
-        minimum = (
-            _nonnegative_finite_value(metric_range.get("min"))
-            if isinstance(metric_range, dict)
-            else None
-        )
-        maximum = (
-            _nonnegative_finite_value(metric_range.get("max"))
-            if isinstance(metric_range, dict)
-            else None
-        )
-        if (
-            baseline_value is None
-            or minimum is None
-            or maximum is None
-            or minimum > maximum
-            or not minimum <= baseline_value <= maximum
-        ):
-            return False
-        if name == "preemptions" and minimum != maximum:
-            return False
-        normalized[name] = (baseline_value, minimum, maximum)
-    for name in ("running", "waiting", "kv_cache"):
-        p95 = _nonnegative_finite_value(percentiles.get(f"{name}_p95"))
-        _, minimum, maximum = normalized[name]
-        if p95 is None or not minimum <= p95 <= maximum:
-            return False
-    running_baseline, _, running_maximum = normalized["running"]
-    waiting_baseline, _, _ = normalized["waiting"]
-    kv_baseline, _, kv_maximum = normalized["kv_cache"]
-    return bool(
-        running_baseline == 0
-        and waiting_baseline == 0
-        and (running_maximum > running_baseline or kv_maximum > kv_baseline)
-    )
-
-
-def _nonnegative_finite_value(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    normalized = float(value)
-    return normalized if math.isfinite(normalized) and normalized >= 0 else None
-
-
-def _required_aware_timestamp(value: object, *, label: str) -> datetime:
-    if not isinstance(value, str):
-        raise MinerUDeploymentGateError(f"{label} timestamp is invalid")
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as exc:
-        raise MinerUDeploymentGateError(f"{label} timestamp is invalid") from exc
-    if parsed.tzinfo is None:
-        raise MinerUDeploymentGateError(f"{label} timestamp is naive")
-    return parsed.astimezone(UTC)
-
-
-def require_mineru_deployment_gate(
-    settings: Settings,
-    *,
-    parse_enabled: bool | None = None,
-) -> None:
-    """Compatibility entry point used by one-shot and resident workers."""
-
-    verify_mineru_deployment_gate(settings, parse_enabled=parse_enabled)
-
-
-def _verify_provider_evidence(
-    provider: object,
-    *,
-    runtime_identity: str,
-) -> None:
-    if not isinstance(provider, dict):
         raise MinerUDeploymentGateError("MinerU provider evidence is invalid")
     for field, minimum in (
         ("page_count", 1),
@@ -2097,6 +813,45 @@ def _verify_provider_evidence(
         or target.runtime_bundle_identity_sha256 != runtime_identity
     ):
         raise MinerUDeploymentGateError("MinerU provider target drifted")
+    return int(provider["page_count"])
+
+
+def _endpoint_sha256(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.rstrip("/").encode("utf-8")).hexdigest()
+
+
+def _elapsed_matches_timeline(
+    elapsed_seconds: float,
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+) -> bool:
+    observed = (finished_at - started_at).total_seconds()
+    tolerance = max(1.0, observed * 0.05)
+    return (
+        elapsed_seconds > 0
+        and observed > 0
+        and abs(observed - elapsed_seconds) <= tolerance
+    )
+
+
+def _nonnegative_finite_value(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) and normalized >= 0 else None
+
+
+def _required_aware_timestamp(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise MinerUDeploymentGateError(f"{label} timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise MinerUDeploymentGateError(f"{label} timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise MinerUDeploymentGateError(f"{label} timestamp is naive")
+    return parsed.astimezone(UTC)
 
 
 def _is_prefixed_sha256(value: object) -> bool:
@@ -2108,6 +863,16 @@ def _is_prefixed_sha256(value: object) -> bool:
     )
 
 
+def require_mineru_deployment_gate(
+    settings: Settings,
+    *,
+    parse_enabled: bool | None = None,
+) -> None:
+    """Entry point used by one-shot and resident workers."""
+
+    verify_mineru_deployment_gate(settings, parse_enabled=parse_enabled)
+
+
 __all__ = [
     "MinerUDeploymentChecker",
     "MinerUDeploymentGateError",
@@ -2115,5 +880,4 @@ __all__ = [
     "VerifiedMinerUDeployment",
     "require_mineru_deployment_gate",
     "verify_mineru_deployment_gate",
-    "verify_staged_load_inference_liveness_evidence",
 ]

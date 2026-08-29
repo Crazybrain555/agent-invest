@@ -329,33 +329,15 @@ class Settings(BaseSettings):
             "disclosure_mineru_canary_cache",
         ),
     )
-    disclosure_mineru_staged_load_receipt: Optional[Path] = Field(
+    disclosure_mineru_validation_receipt: Optional[Path] = Field(
         default=None,
         validation_alias=AliasChoices(
-            "DISCLOSURE_MINERU_STAGED_LOAD_RECEIPT",
-            "disclosure_mineru_staged_load_receipt",
+            "DISCLOSURE_MINERU_VALIDATION_RECEIPT",
+            "disclosure_mineru_validation_receipt",
         ),
     )
-    disclosure_mineru_staged_load_confirmation_receipt: Optional[Path] = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "DISCLOSURE_MINERU_STAGED_LOAD_CONFIRMATION_RECEIPT",
-            "disclosure_mineru_staged_load_confirmation_receipt",
-        ),
-    )
-    # Hash of the canonical evidence for the ordered, heterogeneous real-PDF
-    # corpus used by both independent 4/8/16 deployment rehearsals.  This is a
-    # new contract: legacy single-PDF receipt hashes are deliberately rejected.
-    disclosure_mineru_staged_corpus_sha256: Optional[str] = Field(
-        default=None,
-        pattern=r"^sha256:[a-f0-9]{64}$",
-        validation_alias=AliasChoices(
-            "DISCLOSURE_MINERU_STAGED_CORPUS_SHA256",
-            "disclosure_mineru_staged_corpus_sha256",
-        ),
-    )
-    # Operator-calibrated free-memory reserve for the current Docker VM.  Zero
-    # means unconfigured and is rejected by the parse-capable deployment gate.
+    # Operator-calibrated safety reserve for capacity observation and candidate
+    # evaluation.  It is not a fixed deployment/admission requirement.
     disclosure_mineru_docker_memory_reserve_bytes: int = Field(
         default=0,
         ge=0,

@@ -14,7 +14,6 @@ import yaml
 
 from scripts.attest_mineru_remote_runtime import (
     EXPECTED_API_COMPAT_IMAGE,
-    EXPECTED_CAPACITY_CATALOG_SOURCE,
     EXPECTED_COLLECTOR_PATH,
     EXPECTED_COMPAT_PREIMAGES,
     EXPECTED_IMAGE_ID,
@@ -63,11 +62,8 @@ def _observation() -> dict[str, Any]:
         separators=(",", ":"),
     )
     api_environment = [
-        "MINERU_CAPACITY_CATALOG_PATH=",
-        "MINERU_CAPACITY_CATALOG_SHA256=",
         "MINERU_CAPACITY_MODE=legacy",
         f"MINERU_CAPACITY_PROFILE_JSON={capacity_profile}",
-        "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256=",
         "MINERU_MODEL_SOURCE=local",
         "MINERU_MALLOC_TRIM=1",
         "MINERU_PHASE_TRACE=0",
@@ -312,67 +308,6 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             payload["manifest"]["topology"]["windows_collector_sha256"],
             "sha256:" + "7" * 64,
         )
-
-    def test_auto_catalog_requires_exact_read_only_mount(self) -> None:
-        observation = _observation()
-        build_arguments = {
-            "mineru_bin": Path("/private/mineru"),
-            "ssh_host_key_sha256": "sha256:" + "6" * 64,
-            "api_url": "http://127.0.0.1:30002",
-            "observability_url": "http://127.0.0.1:30001/v1",
-            "inference_upstream_url": "http://mineru-openai-server:30000/v1",
-            "expected_compose_sha256": "sha256:" + "3" * 64,
-            "expected_collector_sha256": "sha256:" + "7" * 64,
-            "expected_compat_patcher_sha256": PATCHER_DIGEST,
-            "expected_compat_dockerfile_sha256": DOCKERFILE_DIGEST,
-        }
-        with (
-            patch(
-                "scripts.attest_mineru_remote_runtime.client_bundle_identity",
-                return_value=CLIENT,
-            ),
-            patch(
-                "scripts.attest_mineru_remote_runtime.writer_code_digest",
-                return_value=CODE_DIGEST,
-            ),
-        ):
-            legacy = build_manifest(observation, **build_arguments)
-            runtime_sha256 = legacy["manifest"]["orchestrator"][
-                "capacity_runtime_compatibility_sha256"
-            ]
-            catalog_path = "/run/agent-invest/mineru-capacity-catalog.v1.json"
-            environment = observation["api"]["environment"]
-            environment.update(
-                {
-                    "MINERU_CAPACITY_MODE": "auto",
-                    "MINERU_CAPACITY_CATALOG_PATH": catalog_path,
-                    "MINERU_CAPACITY_CATALOG_SHA256": "sha256:" + "e" * 64,
-                    "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256": runtime_sha256,
-                }
-            )
-            observation["api"]["mounts"].append(
-                {
-                    "Type": "bind",
-                    "Source": EXPECTED_CAPACITY_CATALOG_SOURCE,
-                    "Destination": catalog_path,
-                    "RW": False,
-                    "Propagation": "rprivate",
-                }
-            )
-            observation["api_compatibility"]["capacity_runtime"] = (
-                _expected_capacity_runtime(environment)
-            )
-            auto = build_manifest(observation, **build_arguments)
-            self.assertEqual(
-                auto["manifest"]["orchestrator"][
-                    "capacity_runtime_compatibility_sha256"
-                ],
-                runtime_sha256,
-            )
-
-            observation["api"]["mounts"][1]["RW"] = True
-            with self.assertRaisesRegex(ValueError, "exact read-only"):
-                build_manifest(observation, **build_arguments)
 
     def test_build_manifest_rejects_exposed_or_busy_remote(self) -> None:
         for tamper in (

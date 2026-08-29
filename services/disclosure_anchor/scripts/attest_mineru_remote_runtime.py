@@ -75,11 +75,8 @@ COMPAT_LABEL_KEYS = {
     "io.agent-invest.mineru.compatibility-dockerfile-sha256",
 }
 API_ENV_KEYS = {
-    "MINERU_CAPACITY_CATALOG_PATH",
-    "MINERU_CAPACITY_CATALOG_SHA256",
     "MINERU_CAPACITY_MODE",
     "MINERU_CAPACITY_PROFILE_JSON",
-    "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256",
     "MINERU_MODEL_SOURCE",
     "MINERU_MALLOC_TRIM",
     "MINERU_PHASE_TRACE",
@@ -119,9 +116,6 @@ EXPECTED_INFERENCE_COMMAND = [
 EXPECTED_COMPOSE_PATH = MINERU_WINDOWS_COMPOSE_PATH
 EXPECTED_COLLECTOR_PATH = MINERU_WINDOWS_COLLECTOR_PATH
 EXPECTED_OUTPUT_ROOT = r"C:\ProgramData\agent-invest\mineru-api-output"
-EXPECTED_CAPACITY_CATALOG_SOURCE = (
-    r"C:\ProgramData\agent-invest\mineru-runtime-v6\mineru-capacity-catalog.v1.json"
-)
 EXPECTED_MODEL_REPOSITORY = "opendatalab/MinerU2.5-Pro-2605-1.2B"
 EXPECTED_MODEL_REVISION = "bff20d4ae2bf202df9f45284b4d43681555a97ed"
 EXPECTED_PROXY_CODE_SHA256 = (
@@ -238,26 +232,11 @@ def _capacity_integer(value: object, *, label: str, minimum: int = 0) -> int:
 
 def _expected_capacity_runtime(environment: dict[str, str]) -> dict[str, Any]:
     mode = environment.get("MINERU_CAPACITY_MODE")
-    if mode not in {"legacy", "candidate", "auto"}:
+    if mode not in {"legacy", "candidate"}:
         raise ValueError("remote API capacity mode is not closed")
     configured_window_size = int(environment["MINERU_PROCESSING_WINDOW_SIZE"])
     if configured_window_size <= 0:
         raise ValueError("remote API processing window is invalid")
-    catalog_path = environment.get("MINERU_CAPACITY_CATALOG_PATH", "")
-    catalog_sha256 = environment.get("MINERU_CAPACITY_CATALOG_SHA256", "")
-    runtime_compatibility_sha256 = environment.get(
-        "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256",
-        "",
-    )
-    if mode == "auto":
-        if (
-            not catalog_path.startswith("/")
-            or SHA256_RE.fullmatch(catalog_sha256) is None
-            or SHA256_RE.fullmatch(runtime_compatibility_sha256) is None
-        ):
-            raise ValueError("remote API Auto catalog identity is incomplete")
-    elif any((catalog_path, catalog_sha256, runtime_compatibility_sha256)):
-        raise ValueError("remote API Auto catalog authority leaked into non-Auto mode")
     try:
         payload = json.loads(environment["MINERU_CAPACITY_PROFILE_JSON"])
     except (KeyError, json.JSONDecodeError) as exc:
@@ -331,11 +310,6 @@ def _expected_capacity_runtime(environment: dict[str, str]) -> dict[str, Any]:
         ).encode("utf-8")
     ).hexdigest()
     candidate_profile = {
-        "auto_catalog_sha256": (
-            environment.get("MINERU_CAPACITY_CATALOG_SHA256")
-            if mode == "auto"
-            else None
-        ),
         "inner_inference_concurrency": inner_inference_concurrency,
         "max_document_pages": max_document_pages,
         "max_resident_decoded_bytes": (
@@ -356,7 +330,7 @@ def _expected_capacity_runtime(environment: dict[str, str]) -> dict[str, Any]:
         "configured_window_size": configured_window_size,
         "legacy_profile_sha256": legacy_profile_sha256,
         "mode": mode,
-        "nonlegacy_admission_enabled": mode in {"candidate", "auto"},
+        "nonlegacy_admission_enabled": mode == "candidate",
         "schema": "mineru-capacity-runtime.v1",
     }
 
@@ -571,10 +545,7 @@ def build_manifest(
         for item in mounts
         if isinstance(item, dict) and isinstance(item.get("Destination"), str)
     }
-    capacity_mode = api_environment["MINERU_CAPACITY_MODE"]
     expected_destinations = {"/var/lib/mineru-api-output"}
-    if capacity_mode == "auto":
-        expected_destinations.add(api_environment["MINERU_CAPACITY_CATALOG_PATH"])
     if set(mount_by_destination) != expected_destinations or len(mounts) != len(
         expected_destinations
     ):
@@ -587,17 +558,6 @@ def build_manifest(
         or output_mount.get("RW") is not True
     ):
         raise ValueError("remote MinerU mount policy drifted")
-    if capacity_mode == "auto":
-        catalog_mount = mount_by_destination[
-            api_environment["MINERU_CAPACITY_CATALOG_PATH"]
-        ]
-        if (
-            catalog_mount.get("Type") != "bind"
-            or _windows_path(catalog_mount.get("Source"))
-            != _windows_path(EXPECTED_CAPACITY_CATALOG_SOURCE)
-            or catalog_mount.get("RW") is not False
-        ):
-            raise ValueError("remote MinerU Auto catalog mount is not exact read-only")
     if proxy.get("mounts") != [] or inference.get("mounts") != []:
         raise ValueError("remote MinerU mount policy drifted")
     output_root = observation.get("output_root")
@@ -692,14 +652,6 @@ def build_manifest(
             "vllm_version": served_model.get("vllm_version"),
         }
     )
-    if (
-        expected_capacity_runtime["mode"] == "auto"
-        and api_environment[
-            "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"
-        ]
-        != capacity_runtime_compatibility_sha256
-    ):
-        raise ValueError("remote API Auto runtime compatibility identity drifted")
     if (
         len(proxy_command) != 4
         or proxy_command[:3] != ["/usr/bin/python3.12", "-I", "-c"]

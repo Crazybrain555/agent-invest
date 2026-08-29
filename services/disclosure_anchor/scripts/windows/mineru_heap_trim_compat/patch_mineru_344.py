@@ -391,7 +391,6 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "import json\n"
             "import math\n"
             "import os\n"
-            "import stat\n"
             "import sys\n"
             "import threading\n"
             "import time\n"
@@ -471,27 +470,12 @@ _CAPACITY_PROFILE_FIELDS = frozenset({
     "vllm_max_num_seqs",
     "window_size",
 })
-_CAPACITY_CATALOG_SCHEMA = "mineru-capacity-catalog.v1"
-_CAPACITY_CATALOG_PATH_ENV = "MINERU_CAPACITY_CATALOG_PATH"
-_CAPACITY_CATALOG_SHA256_ENV = "MINERU_CAPACITY_CATALOG_SHA256"
-_CAPACITY_RUNTIME_COMPATIBILITY_SHA256_ENV = (
-    "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"
-)
-_CAPACITY_CATALOG_FIELDS = frozenset({
-    "commissioning_evaluator_sha256",
-    "commissioning_receipt_sha256",
-    "profile_id",
-    "profile_sha256",
-    "runtime_compatibility_sha256",
-    "schema",
-})
-_CAPACITY_MAX_CATALOG_BYTES = 64 * 1024
 _CAPACITY_MAX_PAGE_PIXEL_BYTES = 3500 * 3500 * 4
 
 
 def capacity_mode() -> str:
     value = os.getenv("MINERU_CAPACITY_MODE", "legacy").strip().lower()
-    if value not in {"legacy", "candidate", "auto"}:
+    if value not in {"legacy", "candidate"}:
         raise RuntimeError("MINERU_CAPACITY_MODE has an invalid value")
     return value
 
@@ -523,17 +507,6 @@ def _capacity_profile_hash(payload: dict) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
-
-
-def _capacity_sha256(value, *, label: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 71
-        or not value.startswith("sha256:")
-        or any(char not in "0123456789abcdef" for char in value[7:])
-    ):
-        raise RuntimeError(f"capacity {label} SHA-256 is invalid")
-    return value
 
 
 @dataclass(frozen=True)
@@ -690,80 +663,6 @@ def _configured_capacity_execution_profile(
     )
 
 
-def _authorized_capacity_catalog(candidate: CapacityExecutionProfile) -> dict:
-    raw_path = os.getenv(_CAPACITY_CATALOG_PATH_ENV)
-    expected_catalog_sha256 = os.getenv(_CAPACITY_CATALOG_SHA256_ENV)
-    runtime_compatibility_sha256 = os.getenv(
-        _CAPACITY_RUNTIME_COMPATIBILITY_SHA256_ENV
-    )
-    if not raw_path or not os.path.isabs(raw_path):
-        raise RuntimeError("Auto capacity catalog path is not absolute")
-    expected_catalog_sha256 = _capacity_sha256(
-        expected_catalog_sha256,
-        label="catalog",
-    )
-    runtime_compatibility_sha256 = _capacity_sha256(
-        runtime_compatibility_sha256,
-        label="runtime compatibility",
-    )
-    descriptor = None
-    try:
-        descriptor = os.open(
-            raw_path,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        )
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_size <= 0
-            or metadata.st_size > _CAPACITY_MAX_CATALOG_BYTES
-        ):
-            raise RuntimeError("Auto capacity catalog file is not bounded regular data")
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = None
-            encoded = handle.read(_CAPACITY_MAX_CATALOG_BYTES + 1)
-    except OSError as exc:
-        raise RuntimeError("Auto capacity catalog cannot be read") from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    if len(encoded) > _CAPACITY_MAX_CATALOG_BYTES:
-        raise RuntimeError("Auto capacity catalog exceeds the size limit")
-    if "sha256:" + hashlib.sha256(encoded).hexdigest() != expected_catalog_sha256:
-        raise RuntimeError("Auto capacity catalog hash drifted")
-    try:
-        payload = json.loads(encoded)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Auto capacity catalog JSON is invalid") from exc
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    if canonical != encoded:
-        raise RuntimeError("Auto capacity catalog is not canonical JSON")
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != _CAPACITY_CATALOG_FIELDS
-        or payload.get("schema") != _CAPACITY_CATALOG_SCHEMA
-        or payload.get("profile_id") != candidate.profile_id
-        or payload.get("profile_sha256") != candidate.profile_sha256
-        or payload.get("runtime_compatibility_sha256")
-        != runtime_compatibility_sha256
-    ):
-        raise RuntimeError("Auto capacity catalog identity drifted")
-    for field in (
-        "commissioning_evaluator_sha256",
-        "commissioning_receipt_sha256",
-        "profile_sha256",
-        "runtime_compatibility_sha256",
-    ):
-        _capacity_sha256(payload.get(field), label=field)
-    return {
-        "catalog_sha256": expected_catalog_sha256,
-        **payload,
-    }
-
-
 def capacity_runtime_status(configured_window_size: int) -> dict:
     """Return a content-free, hash-bound view of process admission policy."""
     configured_window_size = _capacity_integer(
@@ -776,21 +675,10 @@ def capacity_runtime_status(configured_window_size: int) -> dict:
     candidate = _configured_capacity_execution_profile(configured_window_size)
     if mode != "legacy" and candidate is None:
         raise RuntimeError("MINERU_CAPACITY_PROFILE_JSON must be configured")
-    auto_catalog = (
-        _authorized_capacity_catalog(candidate)
-        if mode == "auto" and candidate is not None
-        else None
-    )
-    nonlegacy_admission_enabled = bool(
-        candidate is not None
-        and (mode == "candidate" or auto_catalog is not None)
-    )
+    nonlegacy_admission_enabled = bool(candidate is not None and mode == "candidate")
     candidate_payload = None
     if candidate is not None:
         candidate_payload = {
-            "auto_catalog_sha256": (
-                auto_catalog["catalog_sha256"] if auto_catalog is not None else None
-            ),
             "inner_inference_concurrency": candidate.inner_inference_concurrency,
             "max_document_pages": candidate.max_document_pages,
             "max_resident_decoded_bytes": candidate.max_resident_decoded_bytes,
@@ -836,8 +724,6 @@ def select_capacity_execution_profile(
         candidate.min_document_pages <= page_count <= candidate.max_document_pages
         and source_pdf_bytes <= candidate.max_source_pdf_bytes
     )
-    if mode == "auto":
-        _authorized_capacity_catalog(candidate)
     if not eligible:
         return legacy
     return candidate
@@ -1431,17 +1317,6 @@ def capacity_pipeline_enabled() -> bool:
     mode = capacity_mode()
     if mode == "legacy":
         return False
-    if mode == "candidate":
-        return True
-    configured_window_size = _capacity_integer(
-        int(os.getenv("MINERU_PROCESSING_WINDOW_SIZE", "0")),
-        label="configured_window_size",
-        minimum=1,
-    )
-    profile = _configured_capacity_execution_profile(configured_window_size)
-    if profile is None:
-        raise RuntimeError("MINERU_CAPACITY_PROFILE_JSON must be configured")
-    _authorized_capacity_catalog(profile)
     return True
 
 
@@ -1458,8 +1333,6 @@ def capacity_active_window_size(configured_window_size: int) -> int:
     profile = _configured_capacity_execution_profile(configured_window_size)
     if profile is None:
         raise RuntimeError("MINERU_CAPACITY_PROFILE_JSON must be configured")
-    if mode == "auto":
-        _authorized_capacity_catalog(profile)
     return profile.window_size
 
 

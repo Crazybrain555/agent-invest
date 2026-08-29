@@ -24,6 +24,8 @@ def _payload(**overrides: object) -> bytes:
         "completed_tasks": 1,
         "failed_tasks": 0,
         "max_concurrent_requests": 3,
+        "max_pending_tasks_requested": 3,
+        "max_pending_tasks_effective": 3,
         "processing_window_size": 16,
         "task_retention_seconds": 600,
         "task_cleanup_interval_seconds": 30,
@@ -64,6 +66,8 @@ class MinerUOrchestratorTests(unittest.TestCase):
             ({"processing_window_size": 64}, None),
             ({"queued_tasks": -1}, None),
             ({"processing_tasks": 4}, None),
+            ({"max_pending_tasks_requested": 4}, None),
+            ({"max_pending_tasks_effective": 2}, None),
             ({"queued_tasks": 14, "processing_tasks": 3}, None),
             ({"extra": 1}, None),
         )

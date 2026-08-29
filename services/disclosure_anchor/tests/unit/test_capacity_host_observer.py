@@ -1,4 +1,4 @@
-"""Golden parity tests for staged and passive host-capacity validation."""
+"""Host-capacity and service-epoch projection regressions."""
 
 from __future__ import annotations
 
@@ -9,11 +9,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import scripts.mineru_staged_load as staged
 from disclosure_anchor.adapters.runtime.mineru_host_capacity_observer import (
     build_host_observer_ssh_command,
     project_host_capacity_sample,
+    project_host_service_epoch,
     project_synchronized_host_capacity_sample,
+)
+from disclosure_anchor.adapters.runtime.mineru_identity import (
+    MINERU_WINDOWS_COLLECTOR_PATH,
 )
 
 
@@ -51,7 +54,7 @@ def _payload(*, available: int = 8192, restart: int = 0) -> dict[str, object]:
     return {
         "schema": "mineru-host-capacity-sample.v1",
         "observed_at_utc": "2026-08-25T00:00:01+00:00",
-        "collector_path": staged.MINERU_WINDOWS_COLLECTOR_PATH,
+        "collector_path": MINERU_WINDOWS_COLLECTOR_PATH,
         "collector_sha256": COLLECTOR,
         "windows_node_identity_sha256": NODE,
         "containers": containers,
@@ -161,14 +164,8 @@ class CapacityHostObserverTests(unittest.TestCase):
                     expected_host_key_sha256="sha256:" + "0" * 64,
                 )
 
-    def test_safe_fixture_matches_staged_validator_and_removes_raw_ids(self) -> None:
+    def test_safe_capacity_projection_removes_raw_ids(self) -> None:
         payload = _payload()
-        staged._validate_host_capacity_sample(
-            payload,
-            expected_collector_sha256=COLLECTOR,
-            expected_windows_node_identity_sha256=NODE,
-            docker_memory_reserve_bytes=4096,
-        )
         projected = project_host_capacity_sample(
             payload,
             expected_collector_sha256=COLLECTOR,
@@ -181,20 +178,11 @@ class CapacityHostObserverTests(unittest.TestCase):
         self.assertNotIn(str(1) * 64, encoded)
         self.assertEqual(projected.container_count, 3)
 
-    def test_reserve_and_restart_violations_have_staged_parity(self) -> None:
+    def test_reserve_and_restart_violations_remain_visible(self) -> None:
         for payload, expected in (
             (_payload(available=1024), "memory_reserve_crossed"),
             (_payload(restart=1), "container_state_unsafe"),
         ):
-            with self.subTest(expected=expected), self.assertRaises(
-                staged._TrustedHostCapacityViolation
-            ):
-                staged._validate_host_capacity_sample(
-                    payload,
-                    expected_collector_sha256=COLLECTOR,
-                    expected_windows_node_identity_sha256=NODE,
-                    docker_memory_reserve_bytes=4096,
-                )
             projected = project_host_capacity_sample(
                 payload,
                 expected_collector_sha256=COLLECTOR,
@@ -203,24 +191,23 @@ class CapacityHostObserverTests(unittest.TestCase):
             )
             self.assertIn(expected, projected.safety_violation_codes)
 
-    def test_malformed_fixture_fails_both_validators(self) -> None:
+    def test_malformed_fixture_fails_capacity_and_epoch_projection(self) -> None:
         payload = _payload()
         containers = payload["containers"]
         assert isinstance(containers, list)
         assert isinstance(containers[0], dict)
         containers[0]["unexpected"] = 1
         for validator in (
-            lambda: staged._validate_host_capacity_sample(
-                payload,
-                expected_collector_sha256=COLLECTOR,
-                expected_windows_node_identity_sha256=NODE,
-                docker_memory_reserve_bytes=4096,
-            ),
             lambda: project_host_capacity_sample(
                 payload,
                 expected_collector_sha256=COLLECTOR,
                 expected_windows_node_identity_sha256=NODE,
                 docker_memory_reserve_bytes=4096,
+            ),
+            lambda: project_host_service_epoch(
+                payload,
+                expected_collector_sha256=COLLECTOR,
+                expected_windows_node_identity_sha256=NODE,
             ),
         ):
             with self.assertRaises(ValueError):
@@ -232,13 +219,6 @@ class CapacityHostObserverTests(unittest.TestCase):
         assert isinstance(containers, list)
         assert isinstance(containers[1], dict)
         containers[1]["docker_vm_memory_available_bytes"] = 7000
-        staged._validate_host_capacity_sample(
-            payload,
-            expected_collector_sha256=COLLECTOR,
-            expected_windows_node_identity_sha256=NODE,
-            docker_memory_reserve_bytes=4096,
-        )
-
         projected = project_host_capacity_sample(
             payload,
             expected_collector_sha256=COLLECTOR,
@@ -246,6 +226,21 @@ class CapacityHostObserverTests(unittest.TestCase):
             docker_memory_reserve_bytes=4096,
         )
         self.assertEqual(projected.docker_vm_memory_available_bytes, 7000)
+
+    def test_service_epoch_has_no_operator_memory_reserve(self) -> None:
+        payload = _payload(available=1)
+        projected = project_host_service_epoch(
+            payload,
+            expected_collector_sha256=COLLECTOR,
+            expected_windows_node_identity_sha256=NODE,
+        )
+
+        self.assertEqual(projected.api_container_id, str(1) * 64)
+        self.assertEqual(projected.restart_count_total, 0)
+        self.assertNotIn(
+            "reserve",
+            json.dumps(projected.__dict__, sort_keys=True),
+        )
 
     def test_synchronized_projection_is_closed_and_has_no_fixed_reserve(self) -> None:
         observed_at, process, host = project_synchronized_host_capacity_sample(

@@ -109,7 +109,7 @@ bootout 新 job、恢复旧 plist 和原 disabled 状态。恢复后用上面两
 
 parser target 契约要求 `DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256`
 （否则 parse 在 parser_identity 阶段 fail loud）。它必须来自 operator/provider 保存于仓外的
-canonical runtime manifest v6，分别绑定本地 client、固定 MinerU API orchestrator、vLLM inference
+canonical runtime manifest v8，分别绑定本地 client、固定 MinerU API orchestrator、vLLM inference
 server 与网络 topology。它至少包含 derived API image、原始 base image 和 inference image 三个
 immutable digest、模型仓库与不可变 revision、served
 model ID、两侧配置/env/mount/network policy hash，以及 pinned SSH host-key 与 Windows node identity；以 sorted-key、
@@ -125,7 +125,7 @@ fresh deployment 必须先在 worker/GC 保持 unloaded + persistently disabled 
 ```bash
 make mineru-smoke \
   RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
-  RECEIPT=/private/path/mineru-smoke-receipt.v4.json \
+  RECEIPT=/private/path/mineru-smoke-receipt.v5.json \
   CANARY_CACHE=/private/path/mineru-canary.v2.json
 ```
 
@@ -140,10 +140,9 @@ API before/after 必须原样保留 retained terminal gauges 且两端 queued=pr
 official writer、ProviderDocument 和清理证据证明，不对 completed/failed 人口 gauge 做差值推断。独立 `TMPDIR`、MinerU 进程和
 外部 `mineru-api-client-*` 差集
 必须在 PASS 前都证明为零，只保留新建且路径不同的显式 receipt/cache；已有输出路径会 fail closed，
-不能覆盖旧 PASS。smoke 成功只产生 bootstrap 证据，此时仍不得启动 worker；先继续完成下述
-staged-load。最终把三条新路径分别写入 `DISCLOSURE_MINERU_SMOKE_RECEIPT`、
-`DISCLOSURE_MINERU_CANARY_CACHE`、`DISCLOSURE_MINERU_STAGED_LOAD_RECEIPT` 与第二轮
-`DISCLOSURE_MINERU_STAGED_LOAD_CONFIRMATION_RECEIPT`，并固定
+不能覆盖旧 PASS。smoke 成功只产生 bootstrap 证据，此时仍不得启动 worker；还要完成下述短
+held-out validation。最终把三条新路径分别写入 `DISCLOSURE_MINERU_SMOKE_RECEIPT`、
+`DISCLOSURE_MINERU_CANARY_CACHE` 与 `DISCLOSURE_MINERU_VALIDATION_RECEIPT`，并固定
 `DISCLOSURE_MINERU_CANARY_MAX_AGE_SECONDS`（规模回补使用 30 天启动租约）。resident
 worker 在连接 PostgreSQL 前机械重算内嵌 manifest、冻结输入、endpoint/runtime/provider/client/code/
 window/served-model/request identity、cleanup 和有效期；缺失、陈旧或漂移都会拒绝启动，不能拿旧
@@ -154,7 +153,7 @@ cache 代替。租约只裁决一次 process composition，避免一个健康多
 owner 退出后仍须重新证明 API idle、精确模型身份和稳定 incident generation 才能恢复。transport、
 408/429/500/502/503/504 与截断响应进入有界退避；4xx/501、schema/version/capacity/model drift 仍
 fail closed。这些 live probe 不是逐文档 full OCR，也不能替代部署 smoke。
-v6 manifest 是闭合字段合同且会内嵌到 mode 0600 的私有 receipt；其中只能存不可变身份、hash 与
+v8 manifest 是闭合字段合同且会内嵌到 mode 0600 的私有 receipt；其中只能存不可变身份、hash 与
 非秘密启动参数，command 出现 credential flag 会 fail closed，原始 token/密码不得进入 manifest。
 
 MinerU 3.4.4 在 WSL/FastAPI 连续处理大 PDF 后可能把已经 free 的 glibc arena 长期保留在 API
@@ -163,7 +162,7 @@ PID1 RSS；本机真实 heavy 文档已复现该行为，与上游
 精确源码兼容层，而不是复制未合并的 [PR #5354](https://github.com/opendatalab/MinerU/pull/5354)：
 derived image 固定 base digest、MinerU 版本和三个源文件 preimage hash，只在每个处理窗口及文档
 final cleanup 后显式调用 glibc `malloc_trim(0)`；开关必须为闭合值，启用时缺少 glibc/hook 会
-fail loud。collector、install receipt 和 manifest v6 同时绑定 patcher/Dockerfile hash、derived
+fail loud。collector、install receipt 和 manifest v8 同时绑定 patcher/Dockerfile hash、derived
 image ID、base digest、策略名、patched source hash 与 live hook；任一漂移都拒绝准入。它不改变
 解析语义、页窗口或并发，只把 allocator 可归还的空闲页返还给 OS；上游正式修复合并并通过同一
 held-out 验收后，应删除这个兼容层而不是永久形成私有 fork。
@@ -192,97 +191,55 @@ health、网络、egress、空 output-root 或 formal collector 校验失败都�
 `$LASTEXITCODE` 的调用运算符，也不得跳过 exact source preflight。
 
 bootstrap 与 steady state 是两个独立 profile：bootstrap 不启动 resident worker、不开放 queue
-admission；steady state 只在当前 runtime smoke 与两次相互独立的完整 staged load 通过后使用已验证
-包络。当前候选 steady 参数是 `WORKER_BATCH_SYNC=13`、download/parse=`50/50`、
+admission；steady state 只在当前 runtime smoke 与短 held-out validation 通过后使用已验证包络。
+当前候选 steady 参数是 `WORKER_BATCH_SYNC=13`、download/parse=`50/50`、
 backfill waterline=`2000`、loop=`900..1800`、document concurrency=`16`、GPU budget/max-seq=
 `7/128`、API task slots/inference cap=`1/7`、worker client outstanding window=`1`、finalize=`2`、oversized=`10240 KiB`、
 soft parse expected=`3600s`。任何新 OOM/EngineCore death、429/5xx、持续 preemption 或 vLLM
-waiting≥64 持续 30 秒都停止 staged load；不能据一次利用率截图扩大 1 outstanding / 7 active / 128 seq。
+waiting≥64 持续 30 秒都停止 candidate 验证；不能据一次利用率截图扩大 1 outstanding / 7 active / 128 seq。
 
-在同一 v6 manifest 的 smoke PASS 后、启动任何 producer 前，先从当前受信 host collector 冻结一次
-campaign service epoch。该命令不发送推理请求、不读 DB/队列，只记录 proxy 与 vLLM 的 container
-ID/StartedAt、collector/node 身份和同一 Docker memory reserve；receipt 必须是 mode 0600 的新路径：
-
-```bash
-make mineru-campaign-epoch-freeze \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
-  EPOCH_RECEIPT=/private/path/mineru-campaign-epoch-freeze.v1.json \
-  SSH_HOST=<pinned-windows-host> SSH_USER=<operator> \
-  SSH_IDENTITY=/private/path/operator-key \
-  SSH_KNOWN_HOSTS=/private/path/known_hosts \
-  DOCKER_MEMORY_RESERVE_BYTES=<operator-calibrated-bytes>
-
-CAMPAIGN_EPOCH_SHA256="$(jq -r '.campaign_epoch.observed_sha256' \
-  /private/path/mineru-campaign-epoch-freeze.v1.json)"
-```
-
-冻结必须发生在本轮最后一次允许的 proxy/vLLM 恢复之后；任一服务重启都会使该值和此前全部 arm
-失效。随后显式运行固定 staged-load gate：
+在同一 v8 manifest 的 smoke PASS 后、启动任何 producer 前，先冻结 clean service epoch；随后用
+`make mineru-smoke INPUT=/private/path/heldout.pdf` 分别解析 2..8 份操作者选择、互不相同的完整多页
+PDF，并在结束后再次冻结 epoch。epoch 只绑定 runtime、collector/node、三只容器 identity、API container
+identity 以及 restart/OOM/unsafe counters；它不伪造跨机器的固定内存 reserve。
 
 ```bash
-make mineru-staged-load \
+make mineru-service-epoch-freeze \
   RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
-  CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
-  EXPECTED_CORPUS_SHA256=<reviewed-canonical-corpus-sha256> \
-  EXPECTED_CAMPAIGN_EPOCH_SHA256="$CAMPAIGN_EPOCH_SHA256" \
-  RECEIPT=/private/path/mineru-staged-load-receipt.v7.json \
+  EPOCH_RECEIPT=/private/path/epoch-before.json \
   SSH_HOST=<pinned-windows-host> SSH_USER=<operator> \
   SSH_IDENTITY=/private/path/operator-key \
-  SSH_KNOWN_HOSTS=/private/path/known_hosts \
-  DOCKER_MEMORY_RESERVE_BYTES=<operator-calibrated-bytes> \
-  DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 \
-  API_DRAIN_TIMEOUT_SECONDS=86400 \
-  WORK_ROOT=/private/disposable-scratch
+  SSH_KNOWN_HOSTS=/private/path/known_hosts
 
-# 第一轮完整 PASS 后，用不存在的新路径原样再运行一次：
-make mineru-staged-load \
+# 逐份生成新路径的 diagnostic_custom smoke v5；示例只列两份。
+make mineru-smoke RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
+  INPUT=/private/path/heldout-a.pdf RECEIPT=/private/path/heldout-a-v5.json \
+  CANARY_CACHE=/private/path/heldout-a-canary.json
+make mineru-smoke RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
+  INPUT=/private/path/heldout-b.pdf RECEIPT=/private/path/heldout-b-v5.json \
+  CANARY_CACHE=/private/path/heldout-b-canary.json
+
+make mineru-service-epoch-freeze \
   RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
-  CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
-  EXPECTED_CORPUS_SHA256=<same-reviewed-canonical-corpus-sha256> \
-  EXPECTED_CAMPAIGN_EPOCH_SHA256="$CAMPAIGN_EPOCH_SHA256" \
-  RECEIPT=/private/path/mineru-staged-load-confirmation-receipt.v7.json \
+  EPOCH_RECEIPT=/private/path/epoch-after.json \
   SSH_HOST=<same-pinned-windows-host> SSH_USER=<same-operator> \
   SSH_IDENTITY=/private/path/operator-key \
-  SSH_KNOWN_HOSTS=/private/path/known_hosts \
-  DOCKER_MEMORY_RESERVE_BYTES=<same-operator-calibrated-bytes> \
-  DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 \
-  API_DRAIN_TIMEOUT_SECONDS=86400 \
-  WORK_ROOT=/private/disposable-scratch
+  SSH_KNOWN_HOSTS=/private/path/known_hosts
+
+make mineru-validation-receipt \
+  SMOKE_RECEIPTS="/private/path/heldout-a-v5.json /private/path/heldout-b-v5.json" \
+  EPOCH_BEFORE=/private/path/epoch-before.json \
+  EPOCH_AFTER=/private/path/epoch-after.json \
+  RECEIPT=/private/path/mineru-heldout-validation-v1.json
 ```
 
-该入口没有自定义 stage 参数，固定按 4、8、16 份真实 PDF 运行 official writer。两个 86400s
-值是 whole-document runaway 与远端自然 drain 的灾难保险，不是吞吐调参或普通 SLA；formal gate
-拒绝更小的值，并把两者写入 exact receipt。正常慢文档不得仅因耗时越过 soft expected 而失败。
-若私有环境把任一对应 setting 提高到 86400s 以上，命令必须传入与当前 settings 完全相同的两个值；
-deployment gate 不接受“测试边界”和“实际 worker 边界”漂移。
-每个 v7 arm 在任何 PDF admission 前先要求当前 host epoch 精确等于冻结值，再对 attested served model
-运行一次现有 96×48 `M7` direct multimodal canary；三阶段全部 PASS、自然 drain 且 epoch 仍相同后，
-再运行一次同请求 canary。`/health`、`/v1/models` 或空 scheduler gauges 不能替代这两个边界证明。
-canary 的 models GET 固定单次 15s logical wall deadline，completion POST 固定单次 90s logical wall
-deadline；两者都使用 direct `http.client`、不读取环境 proxy，且响应 header/body 每次 read 共享同一
-deadline、严格 framing 与 1MiB 上限，slow-drip 不能把 socket idle timeout 延长成无界等待。
-pre-arm 失败时零 admission；workload/epoch/observer 失败时不得用 post-arm canary 掩盖主失败；post-arm
-失败则整 arm FAIL。v6 及更早 staged receipt 不含该合同，只可用于 RCA。
-每个 stage 都从
-冻结 corpus 机械选出 regular、heavy、huge 各至少一份，再按 corpus 顺序补足精确集合。corpus
-至少包含 16 个不同 SHA，且必须同时覆盖 regular（<80 页）、heavy（80–499 页）和 huge（≥500 页）；
-单页 smoke fixture 或重复同一 PDF 不能冒充负载验证。4/8/16 是每阶段处理的文档总数，不是同时
-提交数；客户端 API-facing outstanding 固定为 `min(stage count, task slots)`（当前为 1），huge/未知页数任务
-独占该窗口。其余 backlog 只保留在 durable queue，不预先提交到 process-local API registry。固定 API 的 processing task 上限来自 v6 manifest（当前为 1），每个 active task 的
-server-side inference cap 是 7，因此当前 active upper bound 为 7。
-启动前会拒绝 active worker/pipeline producer、MinerU 残留进程和 `mineru-api-client-*` 残留目录，核对 v6 manifest、
-本地 client/content packages、writer code、window=16、provider runtime 与 served model，并先探测
-`/v1/models` 和 `/metrics`。同一版本化远端 collector 还会在整轮前、中、后每 5 秒从进程外采样三只
-容器的 ID/StartedAt/restart/OOM/exit、cgroup memory、PID1 RSS/HWM 与 Docker VM available memory；
-epoch 变化、restart/OOM、15 秒以上采样缺口或跌破 operator-calibrated reserve 均 fail closed。
-每阶段运行中及结束时都采样 running、waiting、preemptions、KV cache；
-每个逻辑 metrics 样本只对 transport failure 允许在同一 10 秒总预算内做两次最长 4.5 秒尝试；HTTP
-429/5xx、响应超限、缺字段或非法值不重试。两次 transport 尝试都失败只形成一个 transport-only
-sample gap。transport-only gap 只把 observer 切到 `DEGRADED_TRANSPORT`，不会终止仍健康的 MinerU
-数据面；阶段继续自然 drain，并原样记录 gap 与后续恢复。由于 gap 期间无法证明 waiting/preemption/KV
-安全，任意 sampling failure 或缺失终样本都会把该阶段判为 evidence-incomplete，不能形成 PASS receipt、
-不能进入 commissioning；它与 OOM/restart/reserve/preemption 等 operational failure 的区别仅是不得因此
-杀死健康解析进程或丢弃已完成输出，不是降低 promotion 门槛。
+validation builder 与 resident gate 都要求输入/输出为 owner-only、单链接、稳定读取的新文件；每份 PDF
+必须是 `diagnostic_custom`、full-PDF、多页、source/provider 页数完全相等，且所有 receipt 使用同一 exact
+runtime/topology。before/after epoch 必须 clean、identity 相等并完整夹住每份 smoke；任一 hash、页数、
+时间线、restart、OOM、容器或 runtime 漂移都会 fail closed。固定轮次、重复确认 arm、固定 4/8/16 corpus
+和固定 Docker reserve 都不是准入条件。需要定位 GPU 空档时，可用 `make mineru-phase-trace-capture`
+对这段 validation interval 做 content-free document/page/DAG closure；phase trace 是诊断证据，不是另一个
+deployment ritual。
 同时连续采样 API `/health`：processing 不得超过 attested task slots；window=1 时不要求人为制造 process-local queue。
 一次可分类为 `MinerUOrchestratorUnavailableError` 的 transport gap 只记录
 `DEGRADED_TRANSPORT`、关闭后续 admission 并继续当前 owner 的自然 drain；恢复后的样本必须原样保留，
@@ -361,7 +318,7 @@ make capacity-observe \
 
 可选 `INTERVAL_SECONDS` 默认 60；`RUN_ID` 仅接受 canonical UUID，省略时自动生成。运行前会用 pinned
 local MinerU client、writer code、configured runtime bundle digest、task slots 和三个 endpoint digest
-复核 v6 manifest，再验证 operator SSH key/known_hosts 是 owner-only 0600，且 known_hosts 内
+复核 v8 manifest，再验证 operator SSH key/known_hosts 是 owner-only 0600，且 known_hosts 内
 Ed25519 key blob 的 SHA-256 与 manifest topology 完全一致。Observation v1 只接受当前 commissioned、
 UUID-pinned 的单卡 nvidia-smi exporter；API/vLLM/GPU 每秒采样，host 每
 5 秒采样；任何 sampler 故障只让 evidence `incomplete`，不得中止数据面。安全事件让 receipt

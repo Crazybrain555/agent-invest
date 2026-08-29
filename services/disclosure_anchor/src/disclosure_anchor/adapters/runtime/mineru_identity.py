@@ -24,11 +24,6 @@ MINERU_HYBRID_BATCH_RATIO = 1
 MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED = True
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS = 30
-# Formal whole-document load evidence must exercise the same liveness-only
-# boundary as the resident worker.  This is deliberately not a throughput
-# tuning knob: healthy large PDFs are allowed to finish while the independent
-# host/orchestrator observers retain authority to stop unsafe work.
-MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS = 86400
 MINERU_API_OUTPUT_ROOT_POLICY = "dedicated-scratch-retention.v1"
 MINERU_API_TRANSPORT_PROFILE = "pinned-ssh-local-forward.v1"
 MINERU_API_EXPOSURE_POLICY = "windows-loopback-only.v1"
@@ -129,8 +124,8 @@ _CREDENTIAL_COMMAND_FLAGS = {
     "--token",
 }
 _WRITER_CODE_RELPATHS = (
+    "scripts/build_mineru_validation_receipt.py",
     "scripts/mineru_smoke.py",
-    "scripts/mineru_staged_load.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/artifacts.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/parser.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/process.py",

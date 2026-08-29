@@ -67,19 +67,13 @@ services:
       # Shared pipeline model objects are process-scoped. Their native locks
       # remain enabled even while the externally admitted task slot stays 1.
       MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS: "1"
-      # Only an operator may switch this immutable per-process value to auto,
+      # Only an operator may switch this immutable per-process value to candidate,
       # after commissioning, a new attestation and fallback/cancellation smoke.
       # A running document never changes its active window or residency plan.
       MINERU_CAPACITY_MODE: legacy
       # Present while default-off so the exact candidate bytes can be built,
-      # attested and A/B tested. Auto additionally requires a canonical,
-      # hash-bound commissioning catalog mounted read-only at runtime.
+      # attested and tested without a second runtime catalog authority.
       MINERU_CAPACITY_PROFILE_JSON: '{"inner_inference_concurrency":7,"max_document_pages":10000,"max_resident_pages":16,"max_source_pdf_bytes":1073741824,"min_document_pages":9,"pipeline_depth":1,"profile_id":"rtx5080-w8-d1-c7-s128-v1","schema":"mineru-execution-profile.v2","vllm_max_num_seqs":128,"window_size":8}'
-      # Empty outside Auto. A commissioned deployment supplies an absolute
-      # read-only mount path plus the exact catalog and runtime fingerprints.
-      MINERU_CAPACITY_CATALOG_PATH: ""
-      MINERU_CAPACITY_CATALOG_SHA256: ""
-      MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256: ""
       # Current 30 GiB Docker Desktop profile.  Slots 2/3 require a distinct
       # attested compose identity and two heterogeneous load receipts.
       MINERU_API_MAX_CONCURRENT_REQUESTS: "1"

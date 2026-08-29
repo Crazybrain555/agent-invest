@@ -519,7 +519,7 @@ artifact、overlap/context、deterministic merge、exactly-once commit，以及�
 
 | 风险/入口 | 当前任务分支 | 边界或待验证项 |
 |---|---|---|
-| resident worker 内层请求扇出 | 固定 API `1 task slot × 7 inference=7`，16 是本地候选上限，实际 client outstanding=1 | commissioning 必须从 runtime v6 manifest、API health、heap-return compatibility、外部 Docker epoch/OOM/RSS/memory 与两轮 4/8/16 文档 receipt 核对 |
+| resident worker 内层请求扇出 | 固定 API `1 task slot × 7 inference=7`，16 是本地候选上限，实际 client outstanding=1 | commissioning 必须从 runtime v8 manifest、API health、heap-return compatibility、clean service epoch 与 2..8 份完整多页 held-out receipt 核对 |
 | admin 与 pipeline 并发绕行 | 已统一 cap，并用同一 PostgreSQL advisory lock 排他 | 仓外直连 GPU 的客户端不受控 |
 | 大小不一导致短任务饥饿 | 已有 regular/heavy/huge 名义份额和借用 | 页数只是初始代理；历史 GPU 秒 EWMA 尚未引入 |
 | 固定 200 / 一小时 round 批尾 | resident 常驻补槽；`WORKER_BATCH_PARSE` 仅约束 once；报告快照不排空 | 需 A/B 验证 3–10 分钟尾部及 2026-07-26 的 deadline 长谷是否消失 |
@@ -583,8 +583,8 @@ control plane 会制造第二任务真相，而不能自动解决错误的请求
 ### 7.5 盲目继续提高 API task slots 或 inference concurrency
 
 拒绝。现场高峰已是 `running≈128 + waiting 数百`；提高 16 只会扩大临时进程、内存和请求
-洪峰。task slots 1→2 必须生成新的 runtime v6 identity，并用两个独立的真实异构
-regular/heavy/huge 4/8/16 corpus receipt 证明；旧凭证一律失效。
+洪峰。task slots 1→2 必须生成新的 runtime v8 identity，并用新的完整多页 held-out validation 与实际
+host/cgroup 动态安全信号证明；旧凭证一律失效。
 
 ## 8. 重启与生产 A/B 验收
 
@@ -608,7 +608,7 @@ regular/heavy/huge 4/8/16 corpus receipt 证明；旧凭证一律失效。
 - startup banner 必须同时打印
   `resident_dispatch=continuous report_interval=300s` 与
   `parse_submit_slots=16 gpu_request_cap=1x7=7<=128`；
-- runtime v6 manifest 与 API `/health` 必须同时证明 task slots=1、inference concurrency=7、
+- runtime v8 manifest 与 API `/health` 必须同时证明 task slots=1、inference concurrency=7、
   window=16、retention=600、cleanup=30；client `--api-url` 模式不得再声称本地
   `--max-concurrency` 控制远端；
 - singleton advisory lock 只有一个持有者；

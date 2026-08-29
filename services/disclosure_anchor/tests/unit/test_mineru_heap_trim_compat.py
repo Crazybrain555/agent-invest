@@ -10,7 +10,6 @@ import io
 import json
 import os
 from pathlib import Path
-import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -95,35 +94,6 @@ def _candidate_profile_json() -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
-def _capacity_catalog_environment(root: Path, raw_profile: str) -> dict[str, str]:
-    profile = json.loads(raw_profile)
-    profile_sha256 = "sha256:" + hashlib.sha256(
-        json.dumps(profile, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    catalog = {
-        "commissioning_evaluator_sha256": "sha256:" + "7" * 64,
-        "commissioning_receipt_sha256": "sha256:" + "8" * 64,
-        "profile_id": profile["profile_id"],
-        "profile_sha256": profile_sha256,
-        "runtime_compatibility_sha256": _RUNTIME_COMPATIBILITY_SHA256,
-        "schema": "mineru-capacity-catalog.v1",
-    }
-    encoded = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    path = root / "capacity-catalog.v1.json"
-    path.write_bytes(encoded)
-    return {
-        "MINERU_CAPACITY_CATALOG_PATH": str(path),
-        "MINERU_CAPACITY_CATALOG_SHA256": (
-            "sha256:" + hashlib.sha256(encoded).hexdigest()
-        ),
-        "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256": (
-            _RUNTIME_COMPATIBILITY_SHA256
-        ),
-    }
 
 
 def _http_client_fixture() -> str:
@@ -1373,43 +1343,6 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             runtime_status["candidate_profile"]["max_resident_pages"], 16
         )
 
-        with patch.dict(
-            os.environ,
-            {
-                "MINERU_CAPACITY_MODE": "auto",
-                "MINERU_CAPACITY_PROFILE_JSON": _candidate_profile_json(),
-            },
-            clear=False,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "catalog path"):
-                select(
-                    configured_window_size=16,
-                    page_count=100,
-                    source_pdf_bytes=1000,
-                )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            raw_profile = _candidate_profile_json()
-            auto_environment = {
-                "MINERU_CAPACITY_MODE": "auto",
-                "MINERU_CAPACITY_PROFILE_JSON": raw_profile,
-                **_capacity_catalog_environment(Path(tmp), raw_profile),
-            }
-            with patch.dict(os.environ, auto_environment, clear=False):
-                too_small = select(
-                    configured_window_size=16,
-                    page_count=8,
-                    source_pdf_bytes=1000,
-                )
-                commissioned = select(
-                    configured_window_size=16,
-                    page_count=100,
-                    source_pdf_bytes=1000,
-                )
-        self.assertEqual(too_small.pipeline_mode, "legacy")
-        self.assertEqual(commissioned.pipeline_mode, "depth1")
-        self.assertNotEqual(commissioned.profile_sha256, legacy.profile_sha256)
-
         invalid_payload = json.loads(_candidate_profile_json())
         invalid_payload["max_resident_pages"] = 17
         with patch.dict(
@@ -1480,68 +1413,6 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 await bank.release(first)
 
         asyncio.run(exercise())
-
-    def test_auto_catalog_is_canonical_and_hash_bound(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-        select = namespace["select_capacity_execution_profile"]
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            raw_profile = _candidate_profile_json()
-            base_environment = {
-                "MINERU_CAPACITY_MODE": "auto",
-                "MINERU_CAPACITY_PROFILE_JSON": raw_profile,
-                **_capacity_catalog_environment(root, raw_profile),
-            }
-            with patch.dict(os.environ, base_environment, clear=False):
-                profile = select(
-                    configured_window_size=16,
-                    page_count=100,
-                    source_pdf_bytes=1000,
-                )
-                status = namespace["capacity_runtime_status"](16)
-            self.assertEqual(profile.pipeline_mode, "depth1")
-            self.assertEqual(
-                status["candidate_profile"]["auto_catalog_sha256"],
-                base_environment["MINERU_CAPACITY_CATALOG_SHA256"],
-            )
-
-            mismatched_runtime = dict(base_environment)
-            mismatched_runtime[
-                "MINERU_CAPACITY_RUNTIME_COMPATIBILITY_SHA256"
-            ] = "sha256:" + "6" * 64
-            with (
-                patch.dict(os.environ, mismatched_runtime, clear=False),
-                self.assertRaisesRegex(RuntimeError, "identity drifted"),
-            ):
-                select(
-                    configured_window_size=16,
-                    page_count=100,
-                    source_pdf_bytes=1000,
-                )
-
-            catalog_path = Path(base_environment["MINERU_CAPACITY_CATALOG_PATH"])
-            catalog_path.write_bytes(catalog_path.read_bytes() + b"\n")
-            with (
-                patch.dict(os.environ, base_environment, clear=False),
-                self.assertRaisesRegex(RuntimeError, "hash drifted"),
-            ):
-                select(
-                    configured_window_size=16,
-                    page_count=100,
-                    source_pdf_bytes=1000,
-                )
 
     def test_fallback_gate_closes_atomically_before_candidate_output(self) -> None:
         source = (
@@ -1656,22 +1527,19 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             ),
             helper_namespace,
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            raw_profile = _candidate_profile_json()
-            with patch.dict(
-                os.environ,
-                {
-                    "MINERU_CAPACITY_MODE": "auto",
-                    "MINERU_CAPACITY_PROFILE_JSON": raw_profile,
-                    **_capacity_catalog_environment(Path(tmp), raw_profile),
-                },
-                clear=False,
-            ):
-                profile = runtime["select_capacity_execution_profile"](
-                    configured_window_size=16,
-                    page_count=9,
-                    source_pdf_bytes=1000,
-                )
+        with patch.dict(
+            os.environ,
+            {
+                "MINERU_CAPACITY_MODE": "candidate",
+                "MINERU_CAPACITY_PROFILE_JSON": _candidate_profile_json(),
+            },
+            clear=False,
+        ):
+            profile = runtime["select_capacity_execution_profile"](
+                configured_window_size=16,
+                page_count=9,
+                source_pdf_bytes=1000,
+            )
 
         async def exercise() -> None:
             fallback_type = runtime["CapacityCandidateFallback"]

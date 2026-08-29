@@ -148,7 +148,7 @@ class SettingsTests(unittest.TestCase):
                 300,
             )
             self.assertIsNone(settings.disclosure_mineru_bin)
-            self.assertIsNone(settings.disclosure_mineru_staged_load_receipt)
+            self.assertIsNone(settings.disclosure_mineru_validation_receipt)
             self.assertIsNone(settings.disclosure_mineru_api_url)
             self.assertEqual(settings.cninfo_max_qps, 1.0)
             self.assertEqual(settings.cninfo_max_retries, 3)
