@@ -18,6 +18,10 @@ import httpx
 from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import (
     MinerUHttpStagedParser,
 )
+from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    TerminalReceipt,
+    encode_terminal_receipt,
+)
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
     RemoteArtifactReceipt,
@@ -582,6 +586,24 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             prepared = handle.prepare_materialization(
                 receipt=receipt, source_pdf_sha256=source_sha256
             )
+            expected_terminal = encode_terminal_receipt(TerminalReceipt(
+                attempt_identity=receipt.attempt_identity,
+                fence_identity=receipt.fence_identity,
+                source_pdf_sha256=receipt.source_pdf_sha256,
+                artifact_owner_identity=receipt.artifact_owner_identity,
+                artifact_byte_count=receipt.artifact_byte_count,
+                artifact_sha256="sha256:" + receipt.artifact_sha256,
+                resume_token_sha256="sha256:"
+                + hashlib.sha256(receipt.resume_token.encode("ascii")).hexdigest(),
+            ))
+            self.assertEqual(prepared.terminal_receipt_sha256, expected_terminal.sha256)
+            with self.assertRaisesRegex(ParserOutputContractError, "claim generation"):
+                handle.materialize_prepared(
+                    prepared=prepared, receipt=receipt, output_dir=output,
+                    source_pdf_sha256=source_sha256,
+                    parser_target_identity_sha256="sha256:" + "c" * 64,
+                    producer_claim_generation=0,
+                )
             parsed = handle.materialize_prepared(
                 prepared=prepared,
                 receipt=receipt,
