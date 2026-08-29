@@ -4,8 +4,10 @@
 
 本契约为 MinerU 容量试验提供 content-free、跨采样源可对齐、可重放的证据。它默认不启用，
 不读取 PDF 内容、不写数据库、不调 worker、不激活 profile，也不替代既有 Observation v1。
-本轮只提供 schema、纯验证器和 host/phase 投影接口；Windows collector、采样循环和 DB commit
-事件接线必须在后续受控 runtime 变更中单独完成。
+当前实现还提供默认关闭、collector-injected 的 resident core：两个独立线程以绝对 deadline 运行，
+`gpu_fast` 的慢/失败不会阻塞 `host_slow`，反之亦然；第三个单写者按 sample start 做有界归并。
+本 core 不包含 Windows collector、CLI/worker 接线、DB commit 或 profile 激活，这些仍须在后续受控
+runtime 变更中单独完成。
 
 目标指标是 `unique correct durably published source pages / full GPU-host-hour`。GPU 利用率、CPU、
 队列和内存是解释吞吐损失的信号，不是独立优化目标。缺失采样必须写成 `unsupported + reason`，
@@ -26,6 +28,24 @@ Mac `time.monotonic_ns()`、PowerShell Stopwatch 和容器 monotonic 不得仅�
 receipt 记录 observer CPU 开销，超过 2% 即 `unsafe`。wall 与 monotonic 的允许误差不是固定 5 ms，
 而是 `50 ms + elapsed × 50 ppm`；实测 divergence 必须原样写入并机械复算。任一 epoch drift、
 identity drift、超限或缺少必需 lane 都 fail closed。
+
+## Resident core 与证据格式
+
+runner 状态机是 `INIT -> PREFLIGHT -> RUNNING -> DRAINING -> SEALED`；文件创建、写入、fsync、
+canonical replay 或 receipt sealing 失败进入 `FAILED_EVIDENCE` 并抛错，绝不留下可冒充成功的 receipt。
+cancel、sampler/transport shutdown、mailbox overflow 和 artifact bound 是闭集 termination reason，均为
+`incomplete`；runtime/profile/clock/process/GPU/cgroup identity drift 为 `unsafe`。正常结束只有
+`duration_elapsed`。
+
+每个 run 使用 new-only `0700` 目录；frames/receipt 使用 new-only、`0600`、single-link、`O_NOFOLLOW`
+文件，并分别 fsync 文件、run 目录和父目录。frames 是换行结尾的逐行 canonical UTF-8 JSONL，SHA-256
+绑定 exact bytes；receipt 是单个 canonical JSON object。replay 从私有文件重新解析每帧、SHA、全局/
+lane 序列、绝对 schedule、边界 deadline、wall/monotonic divergence、required unsupported 数和 observer
+process CPU 起止计数。旧 JSON array 不是 frames v1 的执行格式。
+
+每 lane mailbox 有独立固定上限且 producer 永不因另一 lane 或 writer backpressure 阻塞；overflow 丢弃
+该 observation 并令 receipt incomplete，后续 written frame/boundary 会机械暴露缺失 deadline。scheduler
+从前一绝对 deadline 推进，采集过慢时跳过已过期 slot，不补发 catch-up burst。
 
 ## 参数生命周期
 

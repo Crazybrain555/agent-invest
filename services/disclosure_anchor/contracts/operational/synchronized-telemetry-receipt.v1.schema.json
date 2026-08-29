@@ -406,6 +406,16 @@
       "title": "Observer Cpu Ns",
       "type": "integer"
     },
+    "observer_process_cpu_finished_ns": {
+      "minimum": 0,
+      "title": "Observer Process Cpu Finished Ns",
+      "type": "integer"
+    },
+    "observer_process_cpu_started_ns": {
+      "minimum": 0,
+      "title": "Observer Process Cpu Started Ns",
+      "type": "integer"
+    },
     "observer_source_sha256": {
       "title": "Observer Source Sha256",
       "type": "string"
@@ -450,6 +460,18 @@
       "title": "Status",
       "type": "string"
     },
+    "termination_reason": {
+      "enum": [
+        "duration_elapsed",
+        "cancelled",
+        "sampler_or_transport_shutdown",
+        "queue_overflow",
+        "artifact_bound_exceeded",
+        "identity_drift"
+      ],
+      "title": "Termination Reason",
+      "type": "string"
+    },
     "unsupported_observation_count": {
       "minimum": 0,
       "title": "Unsupported Observation Count",
@@ -468,6 +490,9 @@
     "finished_monotonic_ns",
     "status",
     "lane_quality",
+    "termination_reason",
+    "observer_process_cpu_started_ns",
+    "observer_process_cpu_finished_ns",
     "observer_cpu_ns",
     "observed_clock_divergence_ns",
     "epoch_changed",

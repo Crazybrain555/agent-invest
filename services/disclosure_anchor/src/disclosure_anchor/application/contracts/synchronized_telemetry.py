@@ -49,6 +49,14 @@ UnsupportedReason = Literal[
     "not_due_at_this_tick",
 ]
 RunStatus = Literal["complete", "incomplete", "unsafe"]
+ObserverTerminationReason = Literal[
+    "duration_elapsed",
+    "cancelled",
+    "sampler_or_transport_shutdown",
+    "queue_overflow",
+    "artifact_bound_exceeded",
+    "identity_drift",
+]
 ProfileOutcome = Literal["running", "succeeded", "failed", "drained"]
 BlockedReason = Literal[
     "api_pending_limit",
@@ -718,6 +726,9 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
     finished_monotonic_ns: int = Field(ge=0)
     status: RunStatus
     lane_quality: tuple[LaneQualitySummary, LaneQualitySummary]
+    termination_reason: ObserverTerminationReason
+    observer_process_cpu_started_ns: int = Field(ge=0)
+    observer_process_cpu_finished_ns: int = Field(ge=0)
     observer_cpu_ns: int = Field(ge=0)
     maximum_observer_overhead_ratio: float = Field(default=0.02, ge=0.02, le=0.02)
     maximum_clock_divergence_fixed_ns: Literal[50_000_000] = 50_000_000
@@ -748,6 +759,16 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
             or self.finished_monotonic_ns <= self.started_monotonic_ns
         ):
             raise ValueError("telemetry receipt interval is invalid")
+        if (
+            self.observer_process_cpu_finished_ns
+            < self.observer_process_cpu_started_ns
+        ):
+            raise ValueError("observer CPU interval is invalid")
+        if self.observer_cpu_ns != (
+            self.observer_process_cpu_finished_ns
+            - self.observer_process_cpu_started_ns
+        ):
+            raise ValueError("observer CPU duration disagrees with counters")
         wall_ns = int(
             (self.finished_at_utc - self.started_at_utc).total_seconds()
             * 1_000_000_000
@@ -766,8 +787,10 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
         if lanes != {"gpu_fast", "host_slow"}:
             raise ValueError("receipt requires one quality summary per lane")
         overhead_ratio = self.observer_cpu_ns / monotonic_ns
+        if self.epoch_changed != (self.termination_reason == "identity_drift"):
+            raise ValueError("epoch drift and termination reason disagree")
         unsafe = self.epoch_changed or overhead_ratio > self.maximum_observer_overhead_ratio
-        incomplete = self.unsupported_observation_count > 0 or any(
+        incomplete = self.termination_reason != "duration_elapsed" or self.unsupported_observation_count > 0 or any(
             item.late_sample_count > 0
             or item.missed_deadline_count > 0
             or item.supported_frame_count == 0
@@ -978,6 +1001,49 @@ def parse_canonical_json_artifact(
     return decoded
 
 
+def parse_canonical_jsonl_artifact(
+    payload: bytes,
+    *,
+    label: str,
+    maximum_bytes: int = 268_435_456,
+    maximum_record_bytes: int = 262_144,
+    maximum_records: int = 1_000_000,
+) -> tuple[object, ...]:
+    """Parse bounded newline-terminated canonical JSON records.
+
+    JSONL is the durable streaming representation for synchronized telemetry
+    frames.  Each record independently retains the duplicate-key, finite-number,
+    UTF-8 and canonical-byte guarantees of :func:`parse_canonical_json_artifact`.
+    """
+
+    if not isinstance(payload, bytes) or not payload or len(payload) > maximum_bytes:
+        raise ValueError(f"{label} JSONL artifact bytes are invalid")
+    if not payload.endswith(b"\n"):
+        raise ValueError(f"{label} JSONL artifact is not newline terminated")
+    lines = payload.splitlines()
+    if not lines or len(lines) > maximum_records:
+        raise ValueError(f"{label} JSONL record count is invalid")
+    records: list[object] = []
+    for line in lines:
+        if not line or len(line) > maximum_record_bytes:
+            raise ValueError(f"{label} JSONL record bytes are invalid")
+        records.append(
+            parse_canonical_json_artifact(
+                line,
+                label=f"{label} record",
+                maximum_bytes=maximum_record_bytes,
+            )
+        )
+    return tuple(records)
+
+
+def canonical_jsonl_artifact_sha256(payload: bytes, *, label: str) -> str:
+    """Hash only bytes proven to be bounded canonical JSONL."""
+
+    parse_canonical_jsonl_artifact(payload, label=label)
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
 def canonical_json_artifact_sha256(payload: bytes, *, label: str) -> str:
     """Hash only bytes proven to be the canonical encoding of one JSON value."""
 
@@ -1011,8 +1077,12 @@ def validate_telemetry_artifact_hashes(
             continue
         if payload is None:
             raise ValueError(f"missing {field} artifact bytes")
-        observed = canonical_json_artifact_sha256(
-            payload, label=field.removesuffix("_sha256")
+        observed = (
+            canonical_jsonl_artifact_sha256(payload, label="frames")
+            if field == "frames_sha256"
+            else canonical_json_artifact_sha256(
+                payload, label=field.removesuffix("_sha256")
+            )
         )
         if observed != recorded:
             raise ValueError(f"{field} artifact hash drifted")
@@ -1086,7 +1156,13 @@ def validate_frame_sequence(
             ):
                 raise ValueError("observed lane interval differs from clock")
             nominal_ns = frame.quality.nominal_interval_ms * 1_000_000
-            expected_missed = max(0, (observed_ns - 1) // nominal_ns)
+            scheduled_ns = (
+                frame.clock.scheduled_monotonic_ns
+                - previous.clock.scheduled_monotonic_ns
+            )
+            if scheduled_ns < nominal_ns or scheduled_ns % nominal_ns:
+                raise ValueError("telemetry lane absolute schedule drifted")
+            expected_missed = scheduled_ns // nominal_ns - 1
             expected_status = "late" if expected_missed else "on_time"
             if (
                 frame.quality.missed_deadlines != expected_missed
@@ -1126,9 +1202,17 @@ def validate_frame_sequence(
         gaps_ns = [starts[0] - receipt.started_monotonic_ns]
         gaps_ns.extend(right - left for left, right in zip(starts, starts[1:]))
         gaps_ns.append(receipt.finished_monotonic_ns - starts[-1])
+        scheduled = [
+            frame.clock.scheduled_monotonic_ns for frame in frames_in_lane
+        ]
+        schedule_gaps_ns = [scheduled[0] - receipt.started_monotonic_ns]
+        schedule_gaps_ns.extend(
+            right - left for left, right in zip(scheduled, scheduled[1:])
+        )
+        schedule_gaps_ns.append(receipt.finished_monotonic_ns - scheduled[-1])
         nominal_ns = frames_in_lane[0].quality.nominal_interval_ms * 1_000_000
         expected_missed_deadlines = sum(
-            max(0, (gap_ns - 1) // nominal_ns) for gap_ns in gaps_ns
+            max(0, (gap_ns - 1) // nominal_ns) for gap_ns in schedule_gaps_ns
         )
         expected = LaneQualitySummary(
             lane=lane,
@@ -1145,6 +1229,134 @@ def validate_frame_sequence(
             raise ValueError(f"telemetry {lane} lane quality receipt drifted")
     if receipt.unsupported_observation_count != unsupported_observation_count:
         raise ValueError("telemetry unsupported observation count drifted")
+
+
+def derive_frame_evidence(
+    frames: tuple[SynchronizedTelemetryFrame, ...],
+    *,
+    started_monotonic_ns: int,
+    finished_monotonic_ns: int,
+) -> tuple[tuple[LaneQualitySummary, LaneQualitySummary], int]:
+    """Mechanically derive receipt lane quality and required missing evidence."""
+
+    if not frames:
+        raise ValueError("telemetry frame sequence is empty")
+    if finished_monotonic_ns <= started_monotonic_ns:
+        raise ValueError("telemetry evidence interval is invalid")
+    lane_previous: dict[TelemetryLane, SynchronizedTelemetryFrame] = {}
+    lane_frames: dict[TelemetryLane, list[SynchronizedTelemetryFrame]] = {
+        "gpu_fast": [],
+        "host_slow": [],
+    }
+    previous_started = -1
+    for sequence, frame in enumerate(frames):
+        if frame.sequence != sequence:
+            raise ValueError("telemetry frame sequence is not contiguous")
+        if not (
+            started_monotonic_ns
+            <= frame.clock.started_monotonic_ns
+            <= frame.clock.finished_monotonic_ns
+            <= finished_monotonic_ns
+        ):
+            raise ValueError("telemetry frame lies outside evidence bounds")
+        if frame.clock.started_monotonic_ns < previous_started:
+            raise ValueError("telemetry frames are not monotonic")
+        previous = lane_previous.get(frame.lane)
+        if previous is None:
+            if frame.quality.status != "first":
+                raise ValueError("first lane frame is not marked first")
+        else:
+            if (
+                frame.quality.nominal_interval_ms
+                != previous.quality.nominal_interval_ms
+            ):
+                raise ValueError("telemetry lane cadence drifted")
+            observed_ns = (
+                frame.clock.started_monotonic_ns
+                - previous.clock.started_monotonic_ns
+            )
+            expected_observed_ms = observed_ns / 1_000_000
+            if frame.quality.observed_interval_ms is None or not math.isclose(
+                frame.quality.observed_interval_ms,
+                expected_observed_ms,
+                abs_tol=0.001,
+            ):
+                raise ValueError("observed lane interval differs from clock")
+            nominal_ns = frame.quality.nominal_interval_ms * 1_000_000
+            scheduled_ns = (
+                frame.clock.scheduled_monotonic_ns
+                - previous.clock.scheduled_monotonic_ns
+            )
+            if scheduled_ns < nominal_ns or scheduled_ns % nominal_ns:
+                raise ValueError("telemetry lane absolute schedule drifted")
+            expected_missed = scheduled_ns // nominal_ns - 1
+            expected_status = "late" if expected_missed else "on_time"
+            if (
+                frame.quality.missed_deadlines != expected_missed
+                or frame.quality.status != expected_status
+            ):
+                raise ValueError("telemetry lane deadline evidence differs from clock")
+        lane_previous[frame.lane] = frame
+        lane_frames[frame.lane].append(frame)
+        previous_started = frame.clock.started_monotonic_ns
+
+    unsupported_observation_count = 0
+    summaries: list[LaneQualitySummary] = []
+    for lane in ("gpu_fast", "host_slow"):
+        frames_in_lane = lane_frames[lane]
+        if not frames_in_lane:
+            raise ValueError(f"telemetry {lane} lane is empty")
+        required_statuses = (
+            [(frame.gpu.status,) for frame in frames_in_lane]
+            if lane == "gpu_fast"
+            else [
+                (
+                    frame.api_process.status,
+                    frame.host_cgroup.status,
+                    frame.queue_vllm.status,
+                )
+                for frame in frames_in_lane
+            ]
+        )
+        unsupported_observation_count += sum(
+            status == "unsupported"
+            for statuses in required_statuses
+            for status in statuses
+        )
+        supported_frame_count = sum(
+            all(status == "supported" for status in statuses)
+            for statuses in required_statuses
+        )
+        starts = [frame.clock.started_monotonic_ns for frame in frames_in_lane]
+        gaps_ns = [starts[0] - started_monotonic_ns]
+        gaps_ns.extend(right - left for left, right in zip(starts, starts[1:]))
+        gaps_ns.append(finished_monotonic_ns - starts[-1])
+        scheduled = [
+            frame.clock.scheduled_monotonic_ns for frame in frames_in_lane
+        ]
+        schedule_gaps_ns = [scheduled[0] - started_monotonic_ns]
+        schedule_gaps_ns.extend(
+            right - left for left, right in zip(scheduled, scheduled[1:])
+        )
+        schedule_gaps_ns.append(finished_monotonic_ns - scheduled[-1])
+        nominal_ns = frames_in_lane[0].quality.nominal_interval_ms * 1_000_000
+        summaries.append(
+            LaneQualitySummary(
+                lane=lane,
+                nominal_interval_ms=frames_in_lane[0].quality.nominal_interval_ms,
+                sample_count=len(frames_in_lane),
+                maximum_gap_ms=max(gaps_ns) / 1_000_000,
+                late_sample_count=sum(
+                    frame.quality.status == "late" for frame in frames_in_lane
+                ),
+                missed_deadline_count=sum(
+                    max(0, (gap_ns - 1) // nominal_ns)
+                    for gap_ns in schedule_gaps_ns
+                ),
+                supported_frame_count=supported_frame_count,
+            )
+        )
+    return (summaries[0], summaries[1]), unsupported_observation_count
 
 
 __all__ = [
@@ -1166,6 +1378,7 @@ __all__ = [
     "HostCgroupTelemetryValues",
     "LaneQualitySummary",
     "MeasuredSafetyMargin",
+    "ObserverTerminationReason",
     "PhaseClockBinding",
     "PressureLine",
     "PressureSample",
@@ -1180,11 +1393,14 @@ __all__ = [
     "SynchronizedTelemetryFrame",
     "SynchronizedTelemetryReceipt",
     "TelemetryArtifacts",
+    "canonical_jsonl_artifact_sha256",
     "canonical_json_artifact_sha256",
     "canonical_json_sha256",
+    "derive_frame_evidence",
     "operational_telemetry_schema_documents",
     "operational_schema_documents",
     "parse_canonical_json_artifact",
+    "parse_canonical_jsonl_artifact",
     "validate_credit_event_chain",
     "validate_frame_sequence",
     "validate_telemetry_artifact_hashes",

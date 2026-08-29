@@ -49,6 +49,7 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     SynchronizedTelemetryReceipt,
     TelemetryArtifacts,
     parse_canonical_json_artifact,
+    parse_canonical_jsonl_artifact,
     validate_credit_event_chain,
     validate_frame_sequence,
 )
@@ -113,6 +114,10 @@ def _canonical(value: object) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()
+
+
+def _canonical_jsonl(values: tuple[object, ...] | list[object]) -> bytes:
+    return b"".join(_canonical(value) + b"\n" for value in values)
 
 
 def _digest(payload: bytes) -> str:
@@ -185,7 +190,7 @@ def _summary_inputs(
     binding: PhaseClockBinding,
 ) -> dict[str, object]:
     frames = _complete_frames()
-    frames_bytes = _canonical(
+    frames_bytes = _canonical_jsonl(
         [frame.model_dump(mode="json") for frame in frames]
     )
     progress_bytes = _canonical(
@@ -453,6 +458,9 @@ def _receipt(*, status: str = "complete") -> SynchronizedTelemetryReceipt:
                 supported_frame_count=2,
             ),
         ),
+        termination_reason="duration_elapsed",
+        observer_process_cpu_started_ns=10_000_000,
+        observer_process_cpu_finished_ns=30_000_000,
         observer_cpu_ns=20_000_000,
         observed_clock_divergence_ns=0,
         epoch_changed=False,
@@ -476,6 +484,21 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
     def test_canonical_artifact_rejects_nonfinite_json_numbers(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-finite JSON number"):
             parse_canonical_json_artifact(b'{"value":NaN}', label="test")
+
+    def test_canonical_jsonl_is_newline_terminated_and_record_canonical(self) -> None:
+        self.assertEqual(
+            parse_canonical_jsonl_artifact(b'{"a":1}\n{"b":2}\n', label="test"),
+            ({"a": 1}, {"b": 2}),
+        )
+        for payload in (
+            b'{"a":1}',
+            b'{ "a":1}\n',
+            b'{"a":1,"a":2}\n',
+            b'{"a":NaN}\n',
+            b'{"a":1}\n\n',
+        ):
+            with self.assertRaises(ValueError):
+                parse_canonical_jsonl_artifact(payload, label="test")
 
     def test_frames_require_explicit_coverage_and_cadence(self) -> None:
         fast = _frame(sequence=0, lane="gpu_fast", started_ns=0, first=True)
@@ -558,8 +581,20 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         self.assertFalse(receipt.activation_authorized)
 
         for update, expected_status in (
-            ({"epoch_changed": True}, "unsafe"),
-            ({"observer_cpu_ns": 50_000_000}, "unsafe"),
+            (
+                {
+                    "epoch_changed": True,
+                    "termination_reason": "identity_drift",
+                },
+                "unsafe",
+            ),
+            (
+                {
+                    "observer_process_cpu_finished_ns": 60_000_000,
+                    "observer_cpu_ns": 50_000_000,
+                },
+                "unsafe",
+            ),
             ({"unsupported_observation_count": 1}, "incomplete"),
         ):
             payload = receipt.model_dump()
@@ -870,7 +905,9 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         self.assertEqual(summary.clock_domain_identity_sha256, HASH_C)
 
         stale_frames = dict(inputs)
-        stale_frames["telemetry_frames_artifact"] = _canonical([])
+        stale_frames["telemetry_frames_artifact"] = _canonical_jsonl(
+            [inputs["telemetry_frames"][0].model_dump(mode="json")]  # type: ignore[index,union-attr]
+        )
         with self.assertRaisesRegex(ValueError, "differs from parsed frames"):
             summarize_synchronized_phase_capture(capture, **stale_frames)
 

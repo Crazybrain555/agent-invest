@@ -28,6 +28,7 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     SynchronizedTelemetryReceipt,
     canonical_json_artifact_sha256,
     parse_canonical_json_artifact,
+    parse_canonical_jsonl_artifact,
     validate_telemetry_artifact_hashes,
     validate_frame_sequence,
 )
@@ -411,7 +412,7 @@ def summarize_synchronized_phase_capture(
     parsed_receipt = SynchronizedTelemetryReceipt.model_validate(receipt_value)
     if parsed_receipt != telemetry_receipt:
         raise ValueError("telemetry receipt artifact differs from parsed receipt")
-    frames_value = parse_canonical_json_artifact(
+    frames_value = parse_canonical_jsonl_artifact(
         telemetry_frames_artifact, label="telemetry frames"
     )
     parsed_frames = tuple(
