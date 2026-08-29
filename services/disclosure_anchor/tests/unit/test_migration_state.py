@@ -30,12 +30,12 @@ class MigrationStateTests(unittest.TestCase):
 
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
-            "0051_backfill_uscc_source_access"
+            "0052_publish_kpi_outbox_indexes"
         )
         self.assertEqual(heads[0], migration.revision)
         self.assertEqual(
             migration.down_revision,
-            "0050_verify_unit_routes",
+            "0051_uscc_observation",
         )
 
     def test_0051_binds_only_first_later_exact_uscc_observation(self) -> None:
