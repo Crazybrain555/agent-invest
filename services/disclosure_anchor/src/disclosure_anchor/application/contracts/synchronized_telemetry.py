@@ -857,6 +857,30 @@ class QueueVllmObservationV2(_ObservationV2):
         return _check_observation(self)
 
 
+class ResidentExporterSampleProvenance(_FrozenModel):
+    """Windows exporter evidence carried into every sealed observer frame."""
+
+    exporter_source_sha256: str
+    host_assignment_identity_sha256: str
+    boot_identity_sha256: str
+    exporter_process_epoch_sha256: str
+    wire_sequence: int = Field(ge=1)
+    wire_observed_at_utc: datetime
+    wire_sampled_monotonic_ns: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _closed(self) -> "ResidentExporterSampleProvenance":
+        for label, value in (
+            ("exporter_source_sha256", self.exporter_source_sha256),
+            ("host_assignment_identity_sha256", self.host_assignment_identity_sha256),
+            ("boot_identity_sha256", self.boot_identity_sha256),
+            ("exporter_process_epoch_sha256", self.exporter_process_epoch_sha256),
+        ):
+            _sha256(value, label=label)
+        _utc(self.wire_observed_at_utc, label="wire_observed_at_utc")
+        return self
+
+
 class SynchronizedTelemetryFrameV2(_FrozenModel):
     """Streaming frame contract; v1 remains the original JSON-array contract."""
 
@@ -877,6 +901,7 @@ class SynchronizedTelemetryFrameV2(_FrozenModel):
     runtime_bundle_identity_sha256: str
     process_profile_sha256: str
     observer_source_sha256: str
+    resident_exporter_provenance: ResidentExporterSampleProvenance | None = None
     clock: SampleClock
     quality: SampleQuality
     gpu: GpuObservationV2

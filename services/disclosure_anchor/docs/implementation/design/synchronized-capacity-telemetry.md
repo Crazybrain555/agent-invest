@@ -7,7 +7,10 @@
 当前实现还提供默认关闭、collector-injected 的 resident core：两个独立线程以绝对 deadline 运行，
 `gpu_fast` 的慢/失败不会阻塞 `host_slow`，反之亦然；第三个单写者按 sample start 做有界归并。
 本 core 不包含 Windows collector、CLI/worker 接线、DB commit 或 profile 激活，这些仍须在后续受控
-runtime 变更中单独完成。
+runtime 变更中单独完成。仓库同时提供一个未激活的 Windows resident wire/持久 HTTP adapter、PS5.1
+exporter/supervisor 源码和纯 replay 合同；它们没有 installer/worker/Auto 接线，尚未经过 Windows Job
+Object、真实 4 Hz GPU backend、WSL/Docker 1 Hz backend、observer+exporter 总开销或完整 3600 秒实机门禁。
+源码存在不等于生产支持。
 
 目标指标是 `unique correct durably published source pages / full GPU-host-hour`。GPU 利用率、CPU、
 队列和内存是解释吞吐损失的信号，不是独立优化目标。缺失采样必须写成 `unsupported + reason`，
@@ -109,6 +112,18 @@ receipt identity 全部闭合时生成；否则独立保存 trace 与 telemetry�
 progress 还必须绑定 receipt 的 process epoch/profile。durable commit 的 source identity 在同一 run
 只能出现一次，累计页数必须严格等于前累计加本次 delta；blocked event 携带闭合的起止 monotonic
 区间，重叠区间或跨 phase 边界区间不得相加，避免把同时发生的多个阻塞原因重复计时。
+
+`full-gpu-host-hour-kpi.v1` 只接受已验证的 v2 observer coverage 摘要和带原 publish commit UTC、source
+identity、profile identity、闭合页数的 durable evidence。bucket 固定为 UTC `[hour, hour+3600s)`；idle、
+readiness、restart、故障和恢复均留在分母。coverage gap/overlap、identity drift、unsafe observer、页数冲突
+或旧 outbox 缺 profile/runtime 都令结果 incomplete，既不缩短分母，也不补零或外推。late supplement 仍按
+原 publish commit hour 回填。host goodput 可跨 profile 汇总；profile-eligible goodput 只在整小时 profile
+单一且所有 publish evidence 同 profile 时给出。
+
+当前 relay checkpoint 只是 owner-only、canonical 的本地 cache；它没有独立 anchored head，不能单独证明
+restart continuity。生产接线前必须用 append-only evidence ledger/DB cursor 固化最新 head，并从同一事务的
+publish evidence replay 推导 first durable publish；调用者布尔值或事后补写文件都不能使 host-hour complete。
+同理，当前 artifact adapter 把 resident exporter overhead 固定为 unverified，因此只能生成 incomplete KPI。
 
 receipt 的 lane sample count、边界/相邻最大 gap、late、missed deadline、supported frame 和 required
 unsupported observation 数必须从 frames 机械重算。`gpu_fast` 只以 GPU observation 为 required；

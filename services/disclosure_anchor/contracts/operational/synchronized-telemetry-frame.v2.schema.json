@@ -651,6 +651,54 @@
       "title": "QueueVllmTelemetryValues",
       "type": "object"
     },
+    "ResidentExporterSampleProvenance": {
+      "additionalProperties": false,
+      "description": "Windows exporter evidence carried into every sealed observer frame.",
+      "properties": {
+        "boot_identity_sha256": {
+          "title": "Boot Identity Sha256",
+          "type": "string"
+        },
+        "exporter_process_epoch_sha256": {
+          "title": "Exporter Process Epoch Sha256",
+          "type": "string"
+        },
+        "exporter_source_sha256": {
+          "title": "Exporter Source Sha256",
+          "type": "string"
+        },
+        "host_assignment_identity_sha256": {
+          "title": "Host Assignment Identity Sha256",
+          "type": "string"
+        },
+        "wire_observed_at_utc": {
+          "format": "date-time",
+          "title": "Wire Observed At Utc",
+          "type": "string"
+        },
+        "wire_sampled_monotonic_ns": {
+          "minimum": 0,
+          "title": "Wire Sampled Monotonic Ns",
+          "type": "integer"
+        },
+        "wire_sequence": {
+          "minimum": 1,
+          "title": "Wire Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "exporter_source_sha256",
+        "host_assignment_identity_sha256",
+        "boot_identity_sha256",
+        "exporter_process_epoch_sha256",
+        "wire_sequence",
+        "wire_observed_at_utc",
+        "wire_sampled_monotonic_ns"
+      ],
+      "title": "ResidentExporterSampleProvenance",
+      "type": "object"
+    },
     "SampleClock": {
       "additionalProperties": false,
       "properties": {
@@ -785,6 +833,17 @@
     },
     "queue_vllm": {
       "$ref": "#/$defs/QueueVllmObservationV2"
+    },
+    "resident_exporter_provenance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResidentExporterSampleProvenance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "run_id": {
       "title": "Run Id",

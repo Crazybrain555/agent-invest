@@ -10,6 +10,7 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     GpuObservation,
     HostCgroupObservation,
     QueueVllmObservation,
+    ResidentExporterSampleProvenance,
     parse_canonical_json_artifact,
 )
 
@@ -27,6 +28,7 @@ class TelemetrySampleIdentity:
 class GpuLaneSnapshot:
     identity: TelemetrySampleIdentity
     gpu: GpuObservation
+    resident_exporter_provenance: ResidentExporterSampleProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +37,7 @@ class HostLaneSnapshot:
     api_process: ApiProcessObservation
     host_cgroup: HostCgroupObservation
     queue_vllm: QueueVllmObservation
+    resident_exporter_provenance: ResidentExporterSampleProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)

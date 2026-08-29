@@ -167,6 +167,7 @@ class _PendingSample:
     started_monotonic_ns: int
     finished_monotonic_ns: int
     observed_at_utc: datetime
+    resident_exporter_provenance: contract_module.ResidentExporterSampleProvenance | None
     gpu: GpuObservationV2
     api_process: ApiProcessObservationV2
     host_cgroup: HostCgroupObservationV2
@@ -1239,6 +1240,11 @@ def validate_synchronized_telemetry_v2(
 ) -> None:
     if not frames:
         raise ValueError("telemetry frame sequence is empty")
+    resident_previous: dict[
+        str, contract_module.ResidentExporterSampleProvenance
+    ] = {}
+    resident_missing_lanes: set[str] = set()
+    resident_host_identity: tuple[str, str] | None = None
     for sequence, frame in enumerate(frames):
         if frame.sequence != sequence or frame.run_id != receipt.run_id:
             raise ValueError("telemetry frame sequence or run identity drifted")
@@ -1257,6 +1263,35 @@ def validate_synchronized_telemetry_v2(
                 raise ValueError("GPU lane carries observations owned by the host lane")
         elif frame.gpu.status != "unsupported" or frame.gpu.reason != "not_due_at_this_tick":
             raise ValueError("host lane carries an observation owned by the GPU lane")
+        provenance = frame.resident_exporter_provenance
+        if provenance is None:
+            resident_missing_lanes.add(frame.lane)
+        if provenance is not None:
+            host_identity = (
+                provenance.host_assignment_identity_sha256,
+                provenance.boot_identity_sha256,
+            )
+            if resident_host_identity is None:
+                resident_host_identity = host_identity
+            elif resident_host_identity != host_identity:
+                raise ValueError("resident exporter host or boot identity drifted")
+            previous = resident_previous.get(frame.lane)
+            if previous is not None:
+                if (
+                    provenance.exporter_source_sha256
+                    != previous.exporter_source_sha256
+                    or provenance.exporter_process_epoch_sha256
+                    != previous.exporter_process_epoch_sha256
+                    or provenance.wire_sequence != previous.wire_sequence + 1
+                    or provenance.wire_sampled_monotonic_ns
+                    <= previous.wire_sampled_monotonic_ns
+                ):
+                    raise ValueError("resident exporter sequence or identity drifted")
+            resident_previous[frame.lane] = provenance
+    if resident_previous and set(resident_previous) != {"gpu_fast", "host_slow"}:
+        raise ValueError("resident exporter provenance is missing one lane")
+    if resident_previous and resident_missing_lanes:
+        raise ValueError("resident exporter provenance is missing from a frame")
     expected_quality, unsupported = derive_frame_evidence(
         cast(tuple[contract_module.SynchronizedTelemetryFrame, ...], frames),
         started_monotonic_ns=receipt.started_monotonic_ns,
@@ -1530,6 +1565,7 @@ def _merge_lane_mailboxes(
             ),
             process_profile_sha256=process_profile.process_profile_sha256,
             observer_source_sha256=observer_source_sha256,
+            resident_exporter_provenance=pending.resident_exporter_provenance,
             clock=SampleClock(
                 clock_domain_identity_sha256=(
                     process_profile.clock_domain_identity_sha256
@@ -1606,6 +1642,7 @@ def _project_snapshot(
             started_monotonic_ns=started,
             finished_monotonic_ns=finished,
             observed_at_utc=observed_at,
+            resident_exporter_provenance=snapshot.resident_exporter_provenance,
             gpu=GpuObservationV2.model_validate(snapshot.gpu.model_dump()),
             api_process=_unsupported_process("not_due_at_this_tick"),
             host_cgroup=_unsupported_host("not_due_at_this_tick"),
@@ -1632,6 +1669,7 @@ def _project_snapshot(
         started_monotonic_ns=started,
         finished_monotonic_ns=finished,
         observed_at_utc=observed_at,
+        resident_exporter_provenance=snapshot.resident_exporter_provenance,
         gpu=_unsupported_gpu("not_due_at_this_tick"),
         api_process=ApiProcessObservationV2.model_validate(snapshot.api_process.model_dump()),
         host_cgroup=HostCgroupObservationV2.model_validate(snapshot.host_cgroup.model_dump()),
@@ -1698,6 +1736,7 @@ def _unsupported_pending(
         started_monotonic_ns=started,
         finished_monotonic_ns=max(started, finished),
         observed_at_utc=observed_at,
+        resident_exporter_provenance=None,
         gpu=(
             _unsupported_gpu(reason)
             if lane == "gpu_fast"

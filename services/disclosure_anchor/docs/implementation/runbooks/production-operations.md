@@ -340,6 +340,12 @@ configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 r
 固定内存门槛和 catalog builder 不再构成当前操作面。同步 telemetry 与容量搜索尚未形成受支持命令前，
 不得仅凭历史 receipt 改变运行参数。
 
+仓库中的 `mineru_resident_telemetry_exporter.ps1`、`start_mineru_resident_telemetry.ps1` 和
+`windows_resident_telemetry.py` 当前仅为 default-off 源码与离线合同，不是受支持的生产命令。不得手工
+启动、安装或接入现有 worker。激活前必须在同一 exact source identity 下完成 Windows PowerShell 5.1、
+Job Object 树归属、无 per-tick helper、GPU 250--500 ms、host/queue 1 s、exporter+observer 总 CPU 开销、
+断线/重启和完整 UTC 3600 秒门禁；任何 unsupported/gap/stale 都只能生成 incomplete evidence。
+
 默认构建和部署只提供单一串行执行身份，并保持 `MINERU_PHASE_TRACE=0`、
 `MINERU_API_MAX_CONCURRENT_REQUESTS=1`、`MINERU_API_MAX_PENDING_TASKS=1`。旧的双模式、并行候选 profile
 及其 fallback 已从执行面删除；任何 process-startup 参数变化都要求先完全 quiesce，产生新的 exact

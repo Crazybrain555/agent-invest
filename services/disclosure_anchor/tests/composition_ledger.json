@@ -141,6 +141,10 @@
    "private_imports": [],
    "tests": 11
   },
+  "tests/unit/test_capacity_progress_relay.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_capacity_runtime_identity.py": {
    "private_imports": [],
    "tests": 2
@@ -242,6 +246,10 @@
   "tests/unit/test_freeze_mineru_campaign_epoch.py": {
    "private_imports": [],
    "tests": 2
+  },
+  "tests/unit/test_full_host_hour_kpi.py": {
+   "private_imports": [],
+   "tests": 7
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
@@ -487,6 +495,10 @@
   "tests/unit/test_value_objects.py": {
    "private_imports": [],
    "tests": 14
+  },
+  "tests/unit/test_windows_resident_telemetry.py": {
+   "private_imports": [],
+   "tests": 7
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
