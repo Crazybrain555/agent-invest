@@ -623,6 +623,24 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 producer_claim_generation=2,
             )
             self.assertEqual(replay.result.artifact_root, output)
+            self.assertEqual(replay.evidence.producer_claim_generation, 1)
+            manifest_path = output / ".agent-materialization-manifest.v1.json"
+            original_manifest = manifest_path.read_bytes()
+            zero_manifest = json.loads(original_manifest)
+            zero_manifest["produced_generation"] = 0
+            manifest_path.write_bytes(json.dumps(
+                zero_manifest, sort_keys=True, separators=(",", ":")
+            ).encode())
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "claim generation drifted"
+            ):
+                handle.materialize_prepared(
+                    prepared=prepared, receipt=receipt, output_dir=output,
+                    source_pdf_sha256=source_sha256,
+                    parser_target_identity_sha256="sha256:" + "c" * 64,
+                    producer_claim_generation=2,
+                )
+            manifest_path.write_bytes(original_manifest)
             (output / "document" / "result.txt").write_bytes(b"drift")
             with self.assertRaisesRegex(ParserOutputContractError, "output drifted"):
                 handle.materialize_prepared(

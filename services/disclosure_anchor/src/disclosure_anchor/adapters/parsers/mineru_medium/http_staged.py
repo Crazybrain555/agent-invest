@@ -589,7 +589,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             fence_identity=task.fence_identity,
             source_pdf_sha256=task.source_pdf_sha256,
             parser_target_identity_sha256=manifest["parser_target_identity_sha256"],
-            producer_claim_generation=producer_claim_generation,
+            producer_claim_generation=manifest["produced_generation"],
             terminal_owner_identity=receipt.artifact_owner_identity,
             terminal_artifact_sha256=receipt.artifact_sha256,
             terminal_artifact_bytes=receipt.artifact_byte_count,
@@ -1190,7 +1190,7 @@ def _read_and_verify_manifest(
     if (
         isinstance(produced_generation, bool)
         or not isinstance(produced_generation, int)
-        or produced_generation < 0
+        or produced_generation < 1
         or produced_generation > current_generation
     ):
         raise _fail("materialization manifest claim generation drifted")
