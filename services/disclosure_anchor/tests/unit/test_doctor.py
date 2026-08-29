@@ -1,9 +1,7 @@
 import hashlib
 import json
-import http.client
 import tempfile
 import unittest
-import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,6 +21,9 @@ from disclosure_anchor.adapters.runtime.doctor import (
     running_run_liveness_checks,
     run_doctor,
     run_startup_preflight,
+)
+from disclosure_anchor.adapters.runtime.bounded_http import (
+    BoundedHTTPProtocolError,
 )
 from disclosure_anchor.domain.errors import ConfigurationError
 from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
@@ -265,33 +266,33 @@ class DoctorTests(unittest.TestCase):
             settings = _settings(Path(tmp)).model_copy(
                 update={"disclosure_mineru_observability_url": "http://gpu:30000"}
             )
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = json.dumps(
-            {"data": [{"id": "mineru-model"}]}
-        ).encode()
-        completion = MagicMock()
-        completion.__enter__.return_value.read.return_value = json.dumps(
-            {
-                "choices": [
-                    {
-                        "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": "M7"},
-                    }
-                ]
-            }
-        ).encode()
-        opener = MagicMock()
-        opener.open.side_effect = [models, completion]
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "mineru-model"}]}).encode(),
+        )
+        client.post_bytes.return_value = (
+            200,
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "M7"},
+                        }
+                    ]
+                }
+            ).encode(),
+        )
 
         with patch(
-            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-            return_value=opener,
+            "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+            return_value=client,
         ):
             result = mineru_remote_inference_check(settings)
 
         self.assertEqual(result.status, "PASS")
-        request = opener.open.call_args_list[1].args[0]
-        payload = json.loads(request.data)
+        payload = json.loads(client.post_bytes.call_args.args[1])
         self.assertEqual(payload["model"], "mineru-model")
         self.assertEqual(
             payload["messages"][0]["content"][1]["type"],
@@ -303,18 +304,12 @@ class DoctorTests(unittest.TestCase):
             settings = _settings(Path(tmp)).model_copy(
                 update={"disclosure_mineru_observability_url": "http://gpu:30000"}
             )
-        opener = MagicMock()
-        opener.open.side_effect = urllib.error.HTTPError(
-            "http://gpu:30000/v1/models",
-            500,
-            "internal error",
-            hdrs=None,
-            fp=None,
-        )
+        client = MagicMock()
+        client.get_bytes.return_value = (500, b"internal error")
 
         with patch(
-            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-            return_value=opener,
+            "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+            return_value=client,
         ):
             result = mineru_remote_inference_check(settings)
 
@@ -327,12 +322,14 @@ class DoctorTests(unittest.TestCase):
             settings = _settings(Path(tmp)).model_copy(
                 update={"disclosure_mineru_observability_url": "http://gpu:30000"}
             )
-        opener = MagicMock()
-        opener.open.side_effect = http.client.BadStatusLine("partial response")
+        client = MagicMock()
+        client.get_bytes.side_effect = BoundedHTTPProtocolError(
+            "partial response"
+        )
 
         with patch(
-            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-            return_value=opener,
+            "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+            return_value=client,
         ):
             result = mineru_remote_inference_check(settings)
 
@@ -343,38 +340,40 @@ class DoctorTests(unittest.TestCase):
             settings = _settings(Path(tmp)).model_copy(
                 update={"disclosure_mineru_observability_url": "http://gpu:30000/v1"}
             )
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = json.dumps(
-            {"data": [{"id": "mineru-model"}]}
-        ).encode()
-        completion = MagicMock()
-        completion.__enter__.return_value.read.return_value = json.dumps(
-            {
-                "choices": [
-                    {
-                        "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": "M7"},
-                    }
-                ]
-            }
-        ).encode()
-        opener = MagicMock()
-        opener.open.side_effect = [models, completion]
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "mineru-model"}]}).encode(),
+        )
+        client.post_bytes.return_value = (
+            200,
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "M7"},
+                        }
+                    ]
+                }
+            ).encode(),
+        )
 
         with patch(
-            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-            return_value=opener,
-        ):
+            "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+            return_value=client,
+        ) as direct_client:
             result = mineru_remote_inference_check(settings)
 
         self.assertEqual(result.status, "PASS")
+        direct_client.assert_called_once_with("http://gpu:30000/v1")
         self.assertEqual(
-            opener.open.call_args_list[0].args[0],
-            "http://gpu:30000/v1/models",
+            client.get_bytes.call_args.args[0],
+            "/models",
         )
         self.assertEqual(
-            opener.open.call_args_list[1].args[0].full_url,
-            "http://gpu:30000/v1/chat/completions",
+            client.post_bytes.call_args.args[0],
+            "/chat/completions",
         )
 
     def test_running_run_liveness_separates_parse_runaway_from_stale_work(

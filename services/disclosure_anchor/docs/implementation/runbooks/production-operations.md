@@ -199,14 +199,33 @@ backfill waterline=`2000`、loop=`900..1800`、document concurrency=`16`、GPU b
 soft parse expected=`3600s`。任何新 OOM/EngineCore death、429/5xx、持续 preemption 或 vLLM
 waiting≥64 持续 30 秒都停止 staged load；不能据一次利用率截图扩大 1 outstanding / 7 active / 128 seq。
 
-在同一 v6 manifest 的 smoke PASS 后、启动任何 producer 前，显式运行固定 staged-load gate：
+在同一 v6 manifest 的 smoke PASS 后、启动任何 producer 前，先从当前受信 host collector 冻结一次
+campaign service epoch。该命令不发送推理请求、不读 DB/队列，只记录 proxy 与 vLLM 的 container
+ID/StartedAt、collector/node 身份和同一 Docker memory reserve；receipt 必须是 mode 0600 的新路径：
+
+```bash
+make mineru-campaign-epoch-freeze \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v6.json \
+  EPOCH_RECEIPT=/private/path/mineru-campaign-epoch-freeze.v1.json \
+  SSH_HOST=<pinned-windows-host> SSH_USER=<operator> \
+  SSH_IDENTITY=/private/path/operator-key \
+  SSH_KNOWN_HOSTS=/private/path/known_hosts \
+  DOCKER_MEMORY_RESERVE_BYTES=<operator-calibrated-bytes>
+
+CAMPAIGN_EPOCH_SHA256="$(jq -r '.campaign_epoch.observed_sha256' \
+  /private/path/mineru-campaign-epoch-freeze.v1.json)"
+```
+
+冻结必须发生在本轮最后一次允许的 proxy/vLLM 恢复之后；任一服务重启都会使该值和此前全部 arm
+失效。随后显式运行固定 staged-load gate：
 
 ```bash
 make mineru-staged-load \
   RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v6.json \
   CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
   EXPECTED_CORPUS_SHA256=<reviewed-canonical-corpus-sha256> \
-  RECEIPT=/private/path/mineru-staged-load-receipt.v6.json \
+  EXPECTED_CAMPAIGN_EPOCH_SHA256="$CAMPAIGN_EPOCH_SHA256" \
+  RECEIPT=/private/path/mineru-staged-load-receipt.v7.json \
   SSH_HOST=<pinned-windows-host> SSH_USER=<operator> \
   SSH_IDENTITY=/private/path/operator-key \
   SSH_KNOWN_HOSTS=/private/path/known_hosts \
@@ -220,7 +239,8 @@ make mineru-staged-load \
   RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v6.json \
   CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
   EXPECTED_CORPUS_SHA256=<same-reviewed-canonical-corpus-sha256> \
-  RECEIPT=/private/path/mineru-staged-load-confirmation-receipt.v6.json \
+  EXPECTED_CAMPAIGN_EPOCH_SHA256="$CAMPAIGN_EPOCH_SHA256" \
+  RECEIPT=/private/path/mineru-staged-load-confirmation-receipt.v7.json \
   SSH_HOST=<same-pinned-windows-host> SSH_USER=<same-operator> \
   SSH_IDENTITY=/private/path/operator-key \
   SSH_KNOWN_HOSTS=/private/path/known_hosts \
@@ -235,6 +255,14 @@ make mineru-staged-load \
 拒绝更小的值，并把两者写入 exact receipt。正常慢文档不得仅因耗时越过 soft expected 而失败。
 若私有环境把任一对应 setting 提高到 86400s 以上，命令必须传入与当前 settings 完全相同的两个值；
 deployment gate 不接受“测试边界”和“实际 worker 边界”漂移。
+每个 v7 arm 在任何 PDF admission 前先要求当前 host epoch 精确等于冻结值，再对 attested served model
+运行一次现有 96×48 `M7` direct multimodal canary；三阶段全部 PASS、自然 drain 且 epoch 仍相同后，
+再运行一次同请求 canary。`/health`、`/v1/models` 或空 scheduler gauges 不能替代这两个边界证明。
+canary 的 models GET 固定单次 15s logical wall deadline，completion POST 固定单次 90s logical wall
+deadline；两者都使用 direct `http.client`、不读取环境 proxy，且响应 header/body 每次 read 共享同一
+deadline、严格 framing 与 1MiB 上限，slow-drip 不能把 socket idle timeout 延长成无界等待。
+pre-arm 失败时零 admission；workload/epoch/observer 失败时不得用 post-arm canary 掩盖主失败；post-arm
+失败则整 arm FAIL。v6 及更早 staged receipt 不含该合同，只可用于 RCA。
 每个 stage 都从
 冻结 corpus 机械选出 regular、heavy、huge 各至少一份，再按 corpus 顺序补足精确集合。corpus
 至少包含 16 个不同 SHA，且必须同时覆盖 regular（<80 页）、heavy（80–499 页）和 huge（≥500 页）；
@@ -260,7 +288,7 @@ sample gap。transport-only gap 只把 observer 切到 `DEGRADED_TRANSPORT`，�
 `DEGRADED_TRANSPORT`、关闭后续 admission 并继续当前 owner 的自然 drain；恢复后的样本必须原样保留，
 但该阶段仍是 evidence-incomplete。health JSON/identity/slot/window 的严格合同错误仍是 operational failure。
 `completed_tasks`/`failed_tasks` 是保留期内 terminal registry 的人口 gauge，可随 600 秒 retention/30 秒
-cleanup 合法下降；v6 receipt 原样保留 baseline/samples/terminal 与 min/max，但禁止把它们解释为累计任务账。
+cleanup 合法下降；v7 receipt 原样保留 baseline/samples/terminal 与 min/max，但禁止把它们解释为累计任务账。
 修复前缺少 orchestrator observer/sampling-failure 固定字段的旧 v6 receipt 只可用于 RCA；exact-current
 deployment/commissioning verifier 会拒绝其 shape，不能用于 catalog、Auto 或 worker admission。
 每份输入是否成功改由 exact input SHA、official writer 零退出、完整源/输出页数相等和 provider bundle hash
@@ -359,8 +387,10 @@ candidate profile 使用 exact `mineru-execution-profile.v2` 且不携带授权�
 bytes 可运行，不能启用 Auto。受控试验期间 worker 必须卸载、API/vLLM idle、没有第二 producer；每次
 compose mode/profile 变化都要新 runtime manifest，不能拿上一 arm 的身份运行下一 arm。
 
-试验顺序固定 A1 legacy → B1 candidate → B2 candidate → A2 legacy。四次都对同一 frozen
-regular/heavy/huge corpus 运行 §1.1c 的 `make mineru-staged-load`，每次完成后立即采集：
+试验顺序固定 A1 legacy → B1 candidate → B2 candidate → A2 legacy。A1 前按上文只冻结一次
+campaign epoch，四个 arm 必须传入同一个 `EXPECTED_CAMPAIGN_EPOCH_SHA256`；任一 proxy/vLLM
+StartedAt/ID 漂移立即作废整轮。四次都对同一 frozen regular/heavy/huge corpus 运行上文的
+`make mineru-staged-load`，每次完成后立即采集：
 
 安装器在每个 arm 仍重做 exact-source/image 校验，但构建命令固定 `--provenance=false`。不得删掉该项：
 默认 BuildKit provenance manifest 含执行期元数据，会让相同业务镜像的外层 OCI index ID 跨构建变化；
@@ -388,7 +418,8 @@ error trace、profile mismatch、restart/OOM 或日志缺口都会非零退出�
 
 四 arm 闭合后运行 `make capacity-commission`（完整参数见 design §5.3 或 `make -n`）。机械门同时要求：
 
-- frozen input、endpoint topology、model/client/writer 与 proxy/vLLM epoch 不变；
+- frozen input、endpoint topology、model/client/writer 与 proxy/vLLM epoch 不变；每个 arm 的 pre/post
+  direct multimodal canary 均 PASS 且 host sample 完整包围两个 canary；
 - UTC 证明真实非重叠 A1→B1→B2→A2；page/block/source identity 跨 arm 相等；每 arm 的
   provider bundle SHA 自身合法但不要求 bundle 容器跨执行字节相等；
 - 本机 A1 前固定 `DOCKER_MEMORY_RESERVE_BYTES=7516192768`（7 GiB）；完整 host verifier 重算

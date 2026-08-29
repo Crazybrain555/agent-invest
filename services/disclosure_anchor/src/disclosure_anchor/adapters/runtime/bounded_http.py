@@ -6,7 +6,7 @@ import http.client
 import socket
 import threading
 import time
-from typing import Callable
+from typing import Callable, Mapping
 from urllib.parse import SplitResult, urlsplit
 
 
@@ -234,23 +234,23 @@ class ThreadOwnedPersistentHTTPClient:
         base_path = self._parsed.path.rstrip("/")
         return f"{base_path}{path}" or "/"
 
-    def get_bytes(
+    def _request_bytes(
         self,
+        method: str,
         path: str,
         *,
+        body: bytes | None,
+        headers: Mapping[str, str],
         timeout_seconds: float,
         transport_attempts: int = 1,
         maximum_attempt_timeout_seconds: float | None = None,
     ) -> tuple[int, bytes]:
-        """Return one complete bounded response, reconnecting only on transport.
-
-        ``timeout_seconds`` is a logical deadline shared by all attempts.
-        HTTP status handling stays with the endpoint-specific caller.
-        """
-
         self._bind_owner()
         if (
-            timeout_seconds <= 0
+            method not in {"GET", "POST"}
+            or (method == "GET" and body is not None)
+            or (method == "POST" and body is None)
+            or timeout_seconds <= 0
             or transport_attempts <= 0
             or (
                 maximum_attempt_timeout_seconds is not None
@@ -258,6 +258,12 @@ class ThreadOwnedPersistentHTTPClient:
             )
         ):
             raise ValueError("persistent HTTP request budget is invalid")
+        request_headers = {
+            "Accept": "*/*",
+            "User-Agent": self._user_agent,
+            "Connection": "keep-alive",
+            **headers,
+        }
         target = self._request_target(path)
         deadline = self._clock() + timeout_seconds
         last_error: BaseException | None = None
@@ -286,13 +292,10 @@ class ThreadOwnedPersistentHTTPClient:
                     attempt_deadline=attempt_deadline,
                 )
                 connection.request(
-                    "GET",
+                    method,
                     target,
-                    headers={
-                        "Accept": "*/*",
-                        "User-Agent": self._user_agent,
-                        "Connection": "keep-alive",
-                    },
+                    body=body,
+                    headers=request_headers,
                 )
                 self._set_operation_timeout(
                     connection,
@@ -342,6 +345,63 @@ class ThreadOwnedPersistentHTTPClient:
         raise BoundedHTTPTransportError(
             "HTTP transport unavailable inside the logical request budget"
         ) from last_error
+
+    def get_bytes(
+        self,
+        path: str,
+        *,
+        timeout_seconds: float,
+        transport_attempts: int = 1,
+        maximum_attempt_timeout_seconds: float | None = None,
+    ) -> tuple[int, bytes]:
+        """Return one complete bounded GET, reconnecting only on transport.
+
+        ``timeout_seconds`` is a logical deadline shared by all attempts.
+        HTTP status handling stays with the endpoint-specific caller.
+        """
+
+        return self._request_bytes(
+            "GET",
+            path,
+            body=None,
+            headers={},
+            timeout_seconds=timeout_seconds,
+            transport_attempts=transport_attempts,
+            maximum_attempt_timeout_seconds=maximum_attempt_timeout_seconds,
+        )
+
+    def post_bytes(
+        self,
+        path: str,
+        payload: bytes,
+        *,
+        content_type: str,
+        timeout_seconds: float,
+        transport_attempts: int = 1,
+        maximum_attempt_timeout_seconds: float | None = None,
+    ) -> tuple[int, bytes]:
+        """Return one complete bounded POST without consulting proxy state."""
+
+        if (
+            not isinstance(payload, bytes)
+            or not content_type
+            or not content_type.isascii()
+            or "\r" in content_type
+            or "\n" in content_type
+        ):
+            raise ValueError("persistent HTTP POST payload metadata is invalid")
+        return self._request_bytes(
+            "POST",
+            path,
+            body=payload,
+            headers={
+                "Content-Type": content_type,
+                "Content-Length": str(len(payload)),
+            },
+            timeout_seconds=timeout_seconds,
+            transport_attempts=transport_attempts,
+            maximum_attempt_timeout_seconds=maximum_attempt_timeout_seconds,
+        )
 
     def close(self) -> None:
         """Close the connection from its owner, or an as-yet-unbound client."""

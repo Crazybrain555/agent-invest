@@ -134,8 +134,8 @@ duty、waiting/KV 只用于定位瓶颈。任何 OOM、restart、preemption、ho
   `mineru-capacity-catalog.v1` 精确绑定 profile、COMMISSION receipt/evaluator 与当前 runtime
   compatibility fingerprint 的文档，其余配置缺失或漂移一律 fail closed；
 - commissioning receipt 闭合 exact evaluation、8 份 arm 输入 hash、collector identity 与当前 evaluator
-  bundle；bundle 机械哈希 CLI、staged-load、phase capture、commissioning、deployment gate 和 identity
-  的 9 个源文件。catalog builder 会从当前字节重算 bundle 并要求完全相等，防止旧 evaluator receipt
+  bundle；bundle 机械哈希 freeze、CLI、staged-load、phase capture、commissioning、deployment gate 和
+  identity 的 exact-current 源文件清单。catalog builder 会从当前字节重算 bundle 并要求完全相等，防止旧 evaluator receipt
   在代码漂移后继续授权；这是一条 trusted-operator 的 reproducibility gate，不冒充对有本机写权限者的
   密码学签名；
 - Auto 候选只有在首个可观察 append 之前、所有 task/owner/credits 已 drain 时才可整文档回退一次；
@@ -149,6 +149,15 @@ duty、waiting/KV 只用于定位瓶颈。任何 OOM、restart、preemption、ho
 
 四个 arm 必须使用同一 frozen heterogeneous corpus、同一顺序、同一 node/model/client/writer、
 同一 API image 和稳定 proxy/vLLM epoch：A1 legacy → B1 candidate → B2 candidate → A2 legacy。
+最后一次允许的运行时恢复后、A1 前由只读 host collector 生成 new-only
+`mineru-campaign-epoch-freeze.v1`，四个 arm 都必须把同一 canonical proxy/vLLM container
+ID+StartedAt hash 作为 expected epoch。每个 v7 staged arm 在零 admission 时先证明当前 epoch 相等并运行
+一次 direct multimodal canary，完整 workload 与 drain 后在同一 epoch 再运行一次；GET health/models
+和空 scheduler gauges 不能替代推理存活。任一重启、pre/post canary 失败或 host sample 未包围 canary
+都使该 arm 及此前 campaign 证据失效。
+两个 boundary canary 的 direct GET/POST 都是单 attempt、共享 operation remaining time 的真 logical
+wall deadline；watchdog 到期关闭活动 socket，slow-drip、partial、ambiguous framing 与超限响应均 fail
+closed，不能用 per-read idle timeout 冒充 15s/90s 总边界。
 四份 staged receipt 还必须绑定同一 `whole-document-runaway-and-drain.v1` safety limits；document
 runaway 与 API drain 均不得低于 86400s。它们只防 live-but-never-return/无法证明 drain，不参与候选
 吞吐调参；任何缺失、缩短或 arm 间漂移都在算 throughput 前 fail closed。

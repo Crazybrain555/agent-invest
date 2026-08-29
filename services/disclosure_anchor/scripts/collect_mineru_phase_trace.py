@@ -17,6 +17,10 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS,
     MINERU_WINDOWS_COLLECTOR_PATH,
 )
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentGateError,
+    verify_staged_load_inference_liveness_evidence,
+)
 from disclosure_anchor.adapters.runtime.mineru_phase_trace_capture import (
     parse_phase_trace_capture,
     summarize_phase_trace_capture,
@@ -79,10 +83,11 @@ def _receipt_identity(
     safety_limits = receipt.get("safety_limits") if isinstance(receipt, dict) else None
     if (
         not isinstance(receipt, dict)
-        or receipt.get("schema") != "mineru_staged_load_receipt.v6"
-        or receipt.get("receipt_schema_version") != 6
+        or receipt.get("schema") != "mineru_staged_load_receipt.v7"
+        or receipt.get("receipt_schema_version") != 7
         or receipt.get("status") != "pass"
         or receipt.get("failure") is not None
+        or receipt.get("secondary_failures") != []
         or receipt.get("database_access") != "none"
         or receipt.get("queue_access") != "none"
         or receipt.get("fixed_stage_document_counts") != list(_STAGE_COUNTS)
@@ -124,29 +129,49 @@ def _receipt_identity(
     samples = host.get("samples")
     if not isinstance(samples, list) or len(samples) < 2:
         raise ValueError("staged-load host evidence has no stable epoch")
-    api_ids: set[str] = set()
+    service_epochs: dict[str, set[tuple[str, str]]] = {
+        name: set()
+        for name in ("mineru-api", "mineru-api-proxy", "mineru-openai-server")
+    }
     for sample in samples:
         containers = sample.get("containers") if isinstance(sample, dict) else None
-        if not isinstance(containers, list):
+        if not isinstance(containers, list) or len(containers) != len(service_epochs):
             raise ValueError("staged-load host containers are invalid")
-        api = [
-            item
+        by_name = {
+            str(item.get("name")): item
             for item in containers
-            if isinstance(item, dict) and item.get("name") == "mineru-api"
-        ]
-        if (
-            len(api) != 1
-            or _CONTAINER_ID_RE.fullmatch(str(api[0].get("id"))) is None
-            or api[0].get("restart_count") != 0
-            or api[0].get("oom_killed") is not False
-            or api[0].get("running") is not True
-            or api[0].get("status") != "running"
-            or api[0].get("health") != "healthy"
-        ):
-            raise ValueError("staged-load API epoch is invalid")
-        api_ids.add(str(api[0]["id"]))
-    if len(api_ids) != 1:
-        raise ValueError("staged-load API epoch changed")
+            if isinstance(item, dict)
+        }
+        if len(by_name) != len(containers) or set(by_name) != set(service_epochs):
+            raise ValueError("staged-load host container identities are invalid")
+        for name in service_epochs:
+            container = by_name.get(name)
+            if (
+                not isinstance(container, dict)
+                or _CONTAINER_ID_RE.fullmatch(str(container.get("id"))) is None
+                or not isinstance(container.get("started_at_utc"), str)
+                or container.get("restart_count") != 0
+                or container.get("oom_killed") is not False
+                or container.get("running") is not True
+                or container.get("status") != "running"
+                or container.get("health") != "healthy"
+            ):
+                raise ValueError(f"staged-load {name} epoch is invalid")
+            service_epochs[name].add(
+                (str(container["id"]), str(container["started_at_utc"]))
+            )
+    if any(len(values) != 1 for values in service_epochs.values()):
+        raise ValueError("staged-load service epoch changed")
+    host_epochs = {name: values.pop() for name, values in service_epochs.items()}
+    try:
+        verify_staged_load_inference_liveness_evidence(
+            receipt,
+            host_epochs=host_epochs,
+        )
+    except MinerUDeploymentGateError as exc:
+        raise ValueError(
+            "staged-load arm-boundary inference liveness is not PASS"
+        ) from exc
     stages = receipt.get("stages")
     if not isinstance(stages, list) or len(stages) != len(_STAGE_COUNTS):
         raise ValueError("staged-load stages are invalid")
@@ -179,7 +204,7 @@ def _receipt_identity(
         finished,
         str(host["collector_sha256"]),
         str(host["windows_node_identity_sha256"]),
-        api_ids.pop(),
+        host_epochs["mineru-api"][0],
         document_count,
         page_count,
     )

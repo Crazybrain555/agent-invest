@@ -38,7 +38,9 @@ from disclosure_anchor.adapters.parsers.mineru_medium.process import (
 )
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.runtime.mineru_canary import (
+    canary_request_sha256,
     probe_mineru_served_model,
+    run_mineru_multimodal_canary,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
@@ -69,8 +71,8 @@ from disclosure_anchor.adapters.runtime.mineru_process_isolation import (
 from disclosure_anchor.application.ports.parser import ParserOptions
 
 
-RECEIPT_SCHEMA = "mineru_staged_load_receipt.v6"
-RECEIPT_SCHEMA_VERSION = 6
+RECEIPT_SCHEMA = "mineru_staged_load_receipt.v7"
+RECEIPT_SCHEMA_VERSION = 7
 ADMISSION_ORDER_PROFILE = "copy-index-fifo.v1"
 NOT_ADMITTED_ATOMIC_ABORT = "not_admitted_atomic_abort"
 METRICS_OBSERVER_PROFILE = "metrics-observer.v1"
@@ -79,6 +81,10 @@ TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 STAGE_DOCUMENT_COUNTS = (4, 8, 16)
 ORCHESTRATOR_INFERENCE_CONCURRENCY = MINERU_API_INFERENCE_MAX_CONCURRENCY
 SAFETY_LIMITS_PROFILE = "whole-document-runaway-and-drain.v1"
+ARM_INFERENCE_LIVENESS_PROFILE = "epoch-bound-multimodal-canary.v1"
+ARM_INFERENCE_LIVENESS_SCHEMA = "mineru-arm-inference-liveness.v1"
+ARM_BOUNDARY_CANARY_SCHEMA = "mineru-arm-boundary-canary.v1"
+CAMPAIGN_EPOCH_SCHEMA = "mineru-campaign-service-epoch.v1"
 MINIMUM_INPUT_PAGES = 7
 MINIMUM_CORPUS_DOCUMENTS = 16
 CORPUS_SCHEMA = "mineru_staged_corpus.v1"
@@ -1110,6 +1116,216 @@ class _HostCapacityMonitor:
                 "min_docker_vm_memory_available_bytes": min_vm_available,
             },
         }
+
+    def stable_epochs(self) -> dict[str, tuple[str, str]]:
+        """Return the trusted current epochs only while admission is safe."""
+
+        with self._lock:
+            if (
+                self._epochs is None
+                or self._failure is not None
+                or self._admission_stop_reason is not None
+            ):
+                raise RuntimeError("host capacity epoch is not currently trusted")
+            return dict(self._epochs)
+
+    def observed_seconds(self) -> float:
+        return max(0.0, self._clock() - self._started)
+
+    def campaign_epoch_source(
+        self,
+    ) -> tuple[str, str, dict[str, tuple[str, str]]]:
+        return (
+            self._collector_sha256,
+            self._node_identity,
+            self.stable_epochs(),
+        )
+
+
+def _campaign_epoch_payload(
+    *,
+    collector_sha256: str,
+    windows_node_identity_sha256: str,
+    epochs: dict[str, tuple[str, str]],
+) -> dict[str, object]:
+    services: dict[str, dict[str, str]] = {}
+    for role, name in (
+        ("proxy", "mineru-api-proxy"),
+        ("inference", "mineru-openai-server"),
+    ):
+        try:
+            container_id, started_at_utc = epochs[name]
+        except KeyError as exc:
+            raise RuntimeError(f"campaign epoch is missing {name}") from exc
+        services[role] = {
+            "name": name,
+            "container_id": container_id,
+            "started_at_utc": started_at_utc,
+        }
+    canonical = {
+        "schema": CAMPAIGN_EPOCH_SCHEMA,
+        "windows_node_identity_sha256": windows_node_identity_sha256,
+        "collector_sha256": collector_sha256,
+        "services": services,
+    }
+    observed_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        **canonical,
+        "observed_sha256": observed_sha256,
+    }
+
+
+def _campaign_epoch_evidence(
+    host_monitor: _HostCapacityMonitor,
+    *,
+    expected_sha256: str,
+) -> dict[str, object]:
+    collector_sha256, windows_node_identity_sha256, epochs = (
+        host_monitor.campaign_epoch_source()
+    )
+    return {
+        **_campaign_epoch_payload(
+            collector_sha256=collector_sha256,
+            windows_node_identity_sha256=windows_node_identity_sha256,
+            epochs=epochs,
+        ),
+        "expected_sha256": expected_sha256,
+    }
+
+
+def _campaign_inference_epoch(
+    campaign_epoch: dict[str, object],
+) -> dict[str, str]:
+    services = campaign_epoch.get("services")
+    inference = services.get("inference") if isinstance(services, dict) else None
+    if (
+        not isinstance(inference, dict)
+        or set(inference) != {"name", "container_id", "started_at_utc"}
+        or inference.get("name") != "mineru-openai-server"
+        or not isinstance(inference.get("container_id"), str)
+        or not isinstance(inference.get("started_at_utc"), str)
+    ):
+        raise RuntimeError("campaign inference epoch is invalid")
+    return {
+        "name": "mineru-openai-server",
+        "container_id": str(inference["container_id"]),
+        "started_at_utc": str(inference["started_at_utc"]),
+    }
+
+
+def _run_arm_boundary_canary(
+    observability_url: str,
+    *,
+    expected_model_id: str,
+    runtime_identity_sha256: str,
+    campaign_epoch: dict[str, object],
+    phase: str,
+    host_monitor: _HostCapacityMonitor,
+) -> tuple[dict[str, object], Exception | None]:
+    campaign_epoch_sha256 = str(campaign_epoch["observed_sha256"])
+    inference_epoch = _campaign_inference_epoch(campaign_epoch)
+    started_at_utc = datetime.now(UTC).isoformat()
+    started_observed_seconds = host_monitor.observed_seconds()
+    record: dict[str, object] = {
+        "schema": ARM_BOUNDARY_CANARY_SCHEMA,
+        "phase": phase,
+        "status": "not_run",
+        "started_at_utc": started_at_utc,
+        "finished_at_utc": None,
+        "started_observed_seconds": round(started_observed_seconds, 6),
+        "finished_observed_seconds": None,
+        "elapsed_seconds": None,
+        "model_id": expected_model_id,
+        "attempts": 1,
+        "observability_endpoint_sha256": (
+            "sha256:" + _endpoint_sha256(observability_url)
+        ),
+        "request_sha256": "sha256:" + canary_request_sha256(expected_model_id),
+        "response_sha256": [],
+        "runtime_manifest_identity_sha256": runtime_identity_sha256,
+        "campaign_epoch_sha256": campaign_epoch_sha256,
+        "inference_epoch": inference_epoch,
+        "failure": "not_run",
+    }
+    try:
+        evidence = run_mineru_multimodal_canary(
+            observability_url,
+            attempts=1,
+            expected_model_id=expected_model_id,
+        )
+    except Exception as exc:
+        finished_observed_seconds = host_monitor.observed_seconds()
+        record.update(
+            {
+                "status": "fail",
+                "finished_at_utc": datetime.now(UTC).isoformat(),
+                "finished_observed_seconds": round(
+                    finished_observed_seconds, 6
+                ),
+                "elapsed_seconds": round(
+                    finished_observed_seconds - started_observed_seconds, 6
+                ),
+                "failure": f"{type(exc).__name__}:{_safe_detail(str(exc))}",
+            }
+        )
+        return record, exc
+    finished_observed_seconds = host_monitor.observed_seconds()
+    record.update(
+        {
+            "status": "pass",
+            "finished_at_utc": datetime.now(UTC).isoformat(),
+            "finished_observed_seconds": round(finished_observed_seconds, 6),
+            "elapsed_seconds": round(
+                finished_observed_seconds - started_observed_seconds, 6
+            ),
+            "model_id": evidence.model_id,
+            "attempts": evidence.attempts,
+            "request_sha256": "sha256:" + evidence.request_sha256,
+            "response_sha256": [
+                "sha256:" + digest for digest in evidence.response_sha256
+            ],
+            "failure": None,
+        }
+    )
+    return record, None
+
+
+def _not_run_arm_boundary_canary(
+    *,
+    observability_url: str,
+    expected_model_id: str,
+    runtime_identity_sha256: str,
+    campaign_epoch: dict[str, object],
+    phase: str,
+) -> dict[str, object]:
+    inference_epoch = _campaign_inference_epoch(campaign_epoch)
+    return {
+        "schema": ARM_BOUNDARY_CANARY_SCHEMA,
+        "phase": phase,
+        "status": "not_run",
+        "started_at_utc": None,
+        "finished_at_utc": None,
+        "started_observed_seconds": None,
+        "finished_observed_seconds": None,
+        "elapsed_seconds": None,
+        "model_id": expected_model_id,
+        "attempts": 0,
+        "observability_endpoint_sha256": (
+            "sha256:" + _endpoint_sha256(observability_url)
+        ),
+        "request_sha256": "sha256:" + canary_request_sha256(expected_model_id),
+        "response_sha256": [],
+        "runtime_manifest_identity_sha256": runtime_identity_sha256,
+        "campaign_epoch_sha256": campaign_epoch.get("observed_sha256"),
+        "inference_epoch": inference_epoch,
+        "failure": "not_run",
+    }
 
 
 def _select_stage_inputs(
@@ -2828,6 +3044,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host-observer-identity-file", type=Path)
     parser.add_argument("--host-observer-known-hosts-file", type=Path)
     parser.add_argument("--docker-memory-reserve-bytes", type=int)
+    parser.add_argument("--expected-campaign-epoch-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -2863,6 +3080,11 @@ def _resolve_staged_preflight(
         raise ValueError("runtime bundle identity is missing or invalid")
     if args.work_root is not None and not args.work_root.is_dir():
         raise ValueError(f"work-root is not a directory: {args.work_root}")
+    if (
+        args.expected_campaign_epoch_sha256 is not None
+        and not _is_prefixed_sha256(args.expected_campaign_epoch_sha256)
+    ):
+        raise ValueError("expected campaign epoch SHA-256 is invalid")
     if (
         args.document_runaway_timeout_seconds
         < MINERU_STAGED_LOAD_MINIMUM_RUNAWAY_TIMEOUT_SECONDS
@@ -2948,6 +3170,18 @@ def main(argv: list[str] | None = None) -> int:
     host_transport: _HostObserverControlMaster | None = None
     run_abort_latch = _StageAbortLatch()
     host_capacity_evidence: dict[str, Any] = {}
+    secondary_failures: list[dict[str, str]] = []
+    campaign_epoch_evidence: dict[str, object] = {}
+    inference_liveness_evidence: dict[str, object] = {
+        "schema": ARM_INFERENCE_LIVENESS_SCHEMA,
+        "profile": ARM_INFERENCE_LIVENESS_PROFILE,
+        "pre_arm": None,
+        "workload_started_at_utc": None,
+        "workload_finished_at_utc": None,
+        "workload_started_observed_seconds": None,
+        "workload_finished_observed_seconds": None,
+        "post_arm": None,
+    }
     try:
         (
             mineru_bin,
@@ -3037,6 +3271,47 @@ def main(argv: list[str] | None = None) -> int:
         expected_cleanup_interval_seconds = int(
             orchestrator_manifest["task_cleanup_interval_seconds"]
         )
+        failure_phase = "campaign_epoch_preflight"
+        campaign_epoch_evidence = _campaign_epoch_evidence(
+            host_monitor,
+            expected_sha256=args.expected_campaign_epoch_sha256,
+        )
+        observed_campaign_epoch_sha256 = str(
+            campaign_epoch_evidence["observed_sha256"]
+        )
+        if (
+            args.expected_campaign_epoch_sha256 is not None
+            and args.expected_campaign_epoch_sha256
+            != observed_campaign_epoch_sha256
+        ):
+            raise RuntimeError("expected campaign service epoch drifted")
+        inference_liveness_evidence["pre_arm"] = _not_run_arm_boundary_canary(
+            observability_url=observability_url,
+            expected_model_id=verified.served_model_id,
+            runtime_identity_sha256=verified.identity_sha256,
+            campaign_epoch=campaign_epoch_evidence,
+            phase="pre_arm",
+        )
+        inference_liveness_evidence["post_arm"] = _not_run_arm_boundary_canary(
+            observability_url=observability_url,
+            expected_model_id=verified.served_model_id,
+            runtime_identity_sha256=verified.identity_sha256,
+            campaign_epoch=campaign_epoch_evidence,
+            phase="post_arm",
+        )
+        failure_phase = "pre_arm_inference_liveness"
+        pre_arm_canary, pre_arm_failure = _run_arm_boundary_canary(
+            observability_url,
+            expected_model_id=verified.served_model_id,
+            runtime_identity_sha256=verified.identity_sha256,
+            campaign_epoch=campaign_epoch_evidence,
+            phase="pre_arm",
+            host_monitor=host_monitor,
+        )
+        inference_liveness_evidence["pre_arm"] = pre_arm_canary
+        if pre_arm_failure is not None:
+            raise pre_arm_failure
+        failure_phase = "runtime_preflight"
         probe_mineru_served_model(
             observability_url,
             expected_model_id=verified.served_model_id,
@@ -3063,6 +3338,12 @@ def main(argv: list[str] | None = None) -> int:
             dir=args.work_root,
         ) as tmp:
             run_tree = Path(tmp)
+            inference_liveness_evidence["workload_started_at_utc"] = (
+                datetime.now(UTC).isoformat()
+            )
+            inference_liveness_evidence["workload_started_observed_seconds"] = (
+                round(host_monitor.observed_seconds(), 6)
+            )
             def run_persistent_stage(document_count: int) -> dict[str, Any]:
                 metrics_monitor_client = _PersistentVLLMMetricsClient(
                     observability_url
@@ -3133,11 +3414,38 @@ def main(argv: list[str] | None = None) -> int:
                         ) from close_error
 
             stage_results = execute_fixed_stage_sequence(run_persistent_stage)
+        inference_liveness_evidence["workload_finished_at_utc"] = (
+            datetime.now(UTC).isoformat()
+        )
+        inference_liveness_evidence["workload_finished_observed_seconds"] = (
+            round(host_monitor.observed_seconds(), 6)
+        )
         if len(stage_results) != len(STAGE_DOCUMENT_COUNTS) or any(
             result.get("status") != "pass" for result in stage_results
         ):
             failure = "staged_load_stopped_before_all_fixed_stages_passed"
         else:
+            failure_phase = "post_arm_inference_liveness"
+            current_campaign_epoch = _campaign_epoch_evidence(
+                host_monitor,
+                expected_sha256=args.expected_campaign_epoch_sha256,
+            )
+            if (
+                current_campaign_epoch["observed_sha256"]
+                != observed_campaign_epoch_sha256
+            ):
+                raise RuntimeError("campaign service epoch drifted during arm")
+            post_arm_canary, post_arm_failure = _run_arm_boundary_canary(
+                observability_url,
+                expected_model_id=verified.served_model_id,
+                runtime_identity_sha256=verified.identity_sha256,
+                campaign_epoch=campaign_epoch_evidence,
+                phase="post_arm",
+                host_monitor=host_monitor,
+            )
+            inference_liveness_evidence["post_arm"] = post_arm_canary
+            if post_arm_failure is not None:
+                raise post_arm_failure
             failure_phase = "complete"
     except Exception as exc:
         failure = f"{type(exc).__name__}:{_safe_detail(str(exc))}"
@@ -3146,17 +3454,26 @@ def main(argv: list[str] | None = None) -> int:
             host_monitor.stop()
             host_capacity_evidence = host_monitor.evidence()
             if host_capacity_evidence.get("status") != "pass":
-                failure_phase = "host_capacity_observer"
-                failure = failure or str(host_capacity_evidence.get("failure"))
+                if failure is None:
+                    failure_phase = "host_capacity_observer"
+                    failure = str(host_capacity_evidence.get("failure"))
         if host_transport is not None:
             try:
                 host_transport.close()
             except Exception as exc:
-                failure_phase = "host_capacity_observer"
-                failure = failure or (
+                transport_cleanup_failure = (
                     "host_capacity_transport_cleanup_failed:"
                     f"{type(exc).__name__}:{_safe_detail(str(exc))}"
                 )
+                secondary_failures.append(
+                    {
+                        "phase": "host_capacity_transport_cleanup",
+                        "failure": transport_cleanup_failure,
+                    }
+                )
+                if failure is None:
+                    failure_phase = "host_capacity_observer"
+                    failure = transport_cleanup_failure
         if runtime_cleanup_armed:
             try:
                 remaining_processes = _wait_for_process_cleanup()
@@ -3176,7 +3493,9 @@ def main(argv: list[str] | None = None) -> int:
                     "cleanup_observation_failed:"
                     f"{type(exc).__name__}:{_safe_detail(str(exc))}"
                 )
-                failure = failure or cleanup_observation_error
+                if failure is None:
+                    failure_phase = "cleanup"
+                    failure = cleanup_observation_error
             if (
                 remaining_processes
                 or new_api_temp_dirs
@@ -3189,7 +3508,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"temp_cleanup_errors={len(api_temp_cleanup_errors)}:"
                     f"tree={temporary_tree_removed}"
                 )
-                failure = failure or cleanup_failure
+                if failure is None:
+                    failure_phase = "cleanup"
+                    failure = cleanup_failure
 
     receipt_status = "pass" if failure is None else "fail"
     receipt = {
@@ -3234,10 +3555,13 @@ def main(argv: list[str] | None = None) -> int:
         },
         "input": corpus_evidence,
         "identity": identity_payload,
+        "campaign_epoch": campaign_epoch_evidence,
+        "inference_liveness": inference_liveness_evidence,
         "host_capacity": host_capacity_evidence,
         "stages": stage_results,
         "failure": failure,
         "failure_phase": failure_phase if failure is not None else None,
+        "secondary_failures": secondary_failures,
         "cleanup": {
             "external_api_temp_dirs_created": api_temp_dirs_created,
             "external_api_temp_dirs_after": len(new_api_temp_dirs),

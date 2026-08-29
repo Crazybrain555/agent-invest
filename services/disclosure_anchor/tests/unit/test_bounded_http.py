@@ -18,6 +18,8 @@ class _CountingHTTPServer(ThreadingHTTPServer):
 
     def __init__(self) -> None:
         self.accepted_connections = 0
+        self.last_post_body = b""
+        self.last_post_content_type: str | None = None
         super().__init__(("127.0.0.1", 0), _KeepAliveHandler)
 
     def get_request(self) -> tuple[socket.socket, tuple[str, int]]:
@@ -33,6 +35,24 @@ class _KeepAliveHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
+        self._respond()
+
+    def do_POST(self) -> None:
+        raw_length = self.headers.get("Content-Length")
+        try:
+            content_length = int(raw_length or "-1")
+        except ValueError:
+            self.send_error(400)
+            return
+        if content_length < 0:
+            self.send_error(411)
+            return
+        server = cast(_CountingHTTPServer, self.server)
+        server.last_post_body = self.rfile.read(content_length)
+        server.last_post_content_type = self.headers.get("Content-Type")
+        self._respond()
+
+    def _respond(self) -> None:
         if self.path in {"/slow-drip", "/slow-header-body"}:
             payload = b"abcdefgh"
             if self.path == "/slow-header-body":
@@ -85,6 +105,13 @@ class _KeepAliveHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
             self.close_connection = True
+            return
+        if self.path == "/status503":
+            payload = b"down"
+            self.send_response(503)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
         payload = b"x" * 128 if self.path == "/oversize" else b"ok"
         self.send_response(200)
@@ -375,6 +402,87 @@ class ThreadOwnedPersistentHTTPClientTests(unittest.TestCase):
         finally:
             client.close()
         self.assertEqual(self.server.accepted_connections, 2)
+
+    def test_post_sends_exact_body_and_reuses_the_direct_connection(self) -> None:
+        client = ThreadOwnedPersistentHTTPClient(
+            self.base_url,
+            maximum_response_bytes=64,
+        )
+        payload = b'{"value":"M7"}'
+        try:
+            self.assertEqual(
+                client.post_bytes(
+                    "/ok",
+                    payload,
+                    content_type="application/json",
+                    timeout_seconds=2,
+                ),
+                (200, b"ok"),
+            )
+            self.assertEqual(client.get_bytes("/ok", timeout_seconds=2)[1], b"ok")
+        finally:
+            client.close()
+        self.assertEqual(self.server.last_post_body, payload)
+        self.assertEqual(self.server.last_post_content_type, "application/json")
+        self.assertEqual(self.server.accepted_connections, 1)
+
+    def test_post_wall_deadline_covers_header_and_slow_drip_body(self) -> None:
+        for path in ("/slow-drip", "/slow-header-body"):
+            with self.subTest(path=path):
+                client = ThreadOwnedPersistentHTTPClient(
+                    self.base_url,
+                    maximum_response_bytes=64,
+                )
+                started = time.monotonic()
+                try:
+                    with self.assertRaises(BoundedHTTPTransportError):
+                        client.post_bytes(
+                            path,
+                            b"{}",
+                            content_type="application/json",
+                            timeout_seconds=0.2,
+                        )
+                    self.assertLess(time.monotonic() - started, 0.5)
+                    self.assertIsNone(client._connection)
+                finally:
+                    client.close()
+
+    def test_post_reuses_response_framing_bounds_and_exposes_status(self) -> None:
+        for path, error, maximum_bytes in (
+            ("/ambiguous-framing", BoundedHTTPProtocolError, 64),
+            ("/oversize", BoundedHTTPProtocolError, 64),
+            ("/short", BoundedHTTPTransportError, 128),
+        ):
+            with self.subTest(path=path):
+                client = ThreadOwnedPersistentHTTPClient(
+                    self.base_url,
+                    maximum_response_bytes=maximum_bytes,
+                )
+                with self.assertRaises(error):
+                    client.post_bytes(
+                        path,
+                        b"{}",
+                        content_type="application/json",
+                        timeout_seconds=2,
+                    )
+                self.assertIsNone(client._connection)
+                client.close()
+        client = ThreadOwnedPersistentHTTPClient(
+            self.base_url,
+            maximum_response_bytes=64,
+        )
+        try:
+            self.assertEqual(
+                client.post_bytes(
+                    "/status503",
+                    b"{}",
+                    content_type="application/json",
+                    timeout_seconds=2,
+                ),
+                (503, b"down"),
+            )
+        finally:
+            client.close()
 
     def test_request_header_and_body_share_one_attempt_deadline(self) -> None:
         client = ThreadOwnedPersistentHTTPClient(

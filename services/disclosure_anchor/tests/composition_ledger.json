@@ -105,7 +105,7 @@
   },
   "tests/unit/test_bounded_http.py": {
    "private_imports": [],
-   "tests": 15
+   "tests": 18
   },
   "tests/unit/test_build_mineru_capacity_catalog.py": {
    "private_imports": [],
@@ -165,7 +165,7 @@
   },
   "tests/unit/test_collect_mineru_phase_trace.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_config_check.py": {
    "private_imports": [],
@@ -231,6 +231,10 @@
    ],
    "tests": 12
   },
+  "tests/unit/test_freeze_mineru_campaign_epoch.py": {
+   "private_imports": [],
+   "tests": 6
+  },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
    "tests": 7
@@ -276,15 +280,15 @@
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 17
   },
   "tests/unit/test_mineru_capacity_commissioning.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 15
   },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],
-   "tests": 34
+   "tests": 36
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
@@ -316,7 +320,7 @@
   },
   "tests/unit/test_mineru_staged_load.py": {
    "private_imports": [],
-   "tests": 67
+   "tests": 74
   },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],

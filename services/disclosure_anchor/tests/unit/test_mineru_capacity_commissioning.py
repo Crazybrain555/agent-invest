@@ -5,11 +5,16 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import unittest
 from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime.mineru_capacity_commissioning import (
     evaluate_capacity_commissioning,
+)
+from disclosure_anchor.adapters.runtime.mineru_canary import (
+    canary_request_sha256,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_WINDOWS_COLLECTOR_PATH,
@@ -24,6 +29,8 @@ _NODE_SHA = "sha256:" + "b" * 64
 _LEGACY_SHA = "sha256:" + "c" * 64
 _CANDIDATE_SHA = "sha256:" + "d" * 64
 _IMAGE_SHA = "sha256:" + "e" * 64
+_RUNTIME_A_SHA = "sha256:" + "1" * 64
+_RUNTIME_B_SHA = "sha256:" + "2" * 64
 _MEMORY_RESERVE_BYTES = 7 * 1024**3
 
 
@@ -239,6 +246,113 @@ def _documents(count: int) -> list[dict[str, object]]:
     ]
 
 
+def _bind_arm_liveness(receipt: dict[str, object]) -> None:
+    host = receipt["host_capacity"]
+    assert isinstance(host, dict)
+    samples = host["samples"]
+    assert isinstance(samples, list) and samples
+    first = samples[0]
+    assert isinstance(first, dict)
+    containers = first["containers"]
+    assert isinstance(containers, list)
+    by_name = {
+        str(container["name"]): container
+        for container in containers
+        if isinstance(container, dict)
+    }
+    services = {
+        role: {
+            "name": name,
+            "container_id": str(by_name[name]["id"]),
+            "started_at_utc": str(by_name[name]["started_at_utc"]),
+        }
+        for role, name in (
+            ("proxy", "mineru-api-proxy"),
+            ("inference", "mineru-openai-server"),
+        )
+    }
+    canonical_epoch = {
+        "schema": "mineru-campaign-service-epoch.v1",
+        "windows_node_identity_sha256": host[
+            "windows_node_identity_sha256"
+        ],
+        "collector_sha256": host["collector_sha256"],
+        "services": services,
+    }
+    campaign_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(
+            canonical_epoch,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt["campaign_epoch"] = {
+        **canonical_epoch,
+        "expected_sha256": campaign_sha256,
+        "observed_sha256": campaign_sha256,
+    }
+    identity = receipt["identity"]
+    topology = receipt["topology"]
+    assert isinstance(identity, dict) and isinstance(topology, dict)
+    started_at = datetime.fromisoformat(str(receipt["started_at_utc"]))
+    elapsed = float(receipt["elapsed_seconds"])
+
+    def boundary(
+        *, phase: str, start_offset: float, finish_offset: float
+    ) -> dict[str, object]:
+        return {
+            "schema": "mineru-arm-boundary-canary.v1",
+            "phase": phase,
+            "status": "pass",
+            "started_at_utc": (
+                started_at + timedelta(seconds=start_offset)
+            ).isoformat(),
+            "finished_at_utc": (
+                started_at + timedelta(seconds=finish_offset)
+            ).isoformat(),
+            "started_observed_seconds": start_offset,
+            "finished_observed_seconds": finish_offset,
+            "elapsed_seconds": finish_offset - start_offset,
+            "model_id": identity["served_model_id"],
+            "attempts": 1,
+            "observability_endpoint_sha256": topology[
+                "observability_endpoint_sha256"
+            ],
+            "request_sha256": "sha256:"
+            + canary_request_sha256(str(identity["served_model_id"])),
+            "response_sha256": ["sha256:" + "7" * 64],
+            "runtime_manifest_identity_sha256": identity[
+                "runtime_manifest_identity_sha256"
+            ],
+            "campaign_epoch_sha256": campaign_sha256,
+            "inference_epoch": services["inference"],
+            "failure": None,
+        }
+
+    receipt["inference_liveness"] = {
+        "schema": "mineru-arm-inference-liveness.v1",
+        "profile": "epoch-bound-multimodal-canary.v1",
+        "pre_arm": boundary(
+            phase="pre_arm",
+            start_offset=0.5,
+            finish_offset=1.0,
+        ),
+        "workload_started_at_utc": (
+            started_at + timedelta(seconds=2.0)
+        ).isoformat(),
+        "workload_finished_at_utc": (
+            started_at + timedelta(seconds=elapsed - 2.0)
+        ).isoformat(),
+        "workload_started_observed_seconds": 2.0,
+        "workload_finished_observed_seconds": elapsed - 2.0,
+        "post_arm": boundary(
+            phase="post_arm",
+            start_offset=elapsed - 1.5,
+            finish_offset=elapsed - 1.0,
+        ),
+    }
+
+
 def _receipt(
     *,
     execution_id: str,
@@ -249,12 +363,13 @@ def _receipt(
 ) -> dict[str, object]:
     finished_at = started_at + timedelta(seconds=elapsed_seconds)
     stage_elapsed = elapsed_seconds / 4
-    return {
-        "schema": "mineru_staged_load_receipt.v6",
-        "receipt_schema_version": 6,
+    receipt = {
+        "schema": "mineru_staged_load_receipt.v7",
+        "receipt_schema_version": 7,
         "execution_id": execution_id,
         "status": "pass",
         "failure": None,
+        "secondary_failures": [],
         "database_access": "none",
         "queue_access": "none",
         "fixed_stage_document_counts": [4, 8, 16],
@@ -272,7 +387,10 @@ def _receipt(
         "cleanup": _cleanup(),
         "host_capacity": _host(api_id, elapsed_seconds=elapsed_seconds),
         "input": {"profile": "frozen", "sha256": "sha256:" + "f" * 64},
-        "topology": {"api_endpoint_sha256": "sha256:" + "9" * 64},
+        "topology": {
+            "api_endpoint_sha256": "sha256:" + "9" * 64,
+            "observability_endpoint_sha256": "sha256:" + "8" * 64,
+        },
         "identity": {
             "local_client_identity_sha256": "sha256:" + "3" * 64,
             "local_content_package_versions": {"mineru": "3.4.4"},
@@ -322,6 +440,8 @@ def _receipt(
             for stage_index, count in enumerate((4, 8, 16))
         ],
     }
+    _bind_arm_liveness(receipt)
+    return receipt
 
 
 def _capture(
@@ -358,7 +478,12 @@ class MineruCapacityCommissioningTests(unittest.TestCase):
         modes = ("legacy", "candidate", "candidate", "legacy")
         profiles = (_LEGACY_SHA, _CANDIDATE_SHA, _CANDIDATE_SHA, _LEGACY_SHA)
         elapsed = (100.0, 80.0, 82.0, 101.0)
-        runtime = ("A", "B", "B", "A")
+        runtime = (
+            _RUNTIME_A_SHA,
+            _RUNTIME_B_SHA,
+            _RUNTIME_B_SHA,
+            _RUNTIME_A_SHA,
+        )
         arms = []
         cursor = datetime(2026, 8, 27, 1, 0, tzinfo=timezone.utc)
         for index, (mode, profile, duration, identity) in enumerate(
@@ -400,6 +525,7 @@ class MineruCapacityCommissioningTests(unittest.TestCase):
                 capture.container_id,
                 elapsed_seconds=duration,
             )
+            _bind_arm_liveness(receipt)
             arms[index] = (
                 receipt,
                 replace(
@@ -465,6 +591,58 @@ class MineruCapacityCommissioningTests(unittest.TestCase):
         self.assertEqual(result["decision"], "STOP")
         self.assertFalse(result["profile_commissioning_authorized"])
 
+    def test_secondary_cleanup_failure_rejects_arm(self) -> None:
+        arms = self._arms()
+        arms[0][0]["secondary_failures"] = [
+            {
+                "phase": "host_observer_transport_close",
+                "failure": "RuntimeError:control master close failed",
+            }
+        ]
+        with patch(
+            "disclosure_anchor.adapters.runtime.mineru_capacity_commissioning."
+            "summarize_phase_trace_capture",
+            side_effect=self._summary,
+        ):
+            with self.assertRaisesRegex(ValueError, "staged-load arm is not PASS"):
+                evaluate_capacity_commissioning(
+                    arms,
+                    expected_legacy_profile_sha256=_LEGACY_SHA,
+                    expected_candidate_profile_sha256=_CANDIDATE_SHA,
+                    expected_collector_sha256=_COLLECTOR_SHA,
+                    expected_collector_path=MINERU_WINDOWS_COLLECTOR_PATH,
+                    expected_docker_memory_reserve_bytes=_MEMORY_RESERVE_BYTES,
+                    expected_windows_node_identity_sha256=_NODE_SHA,
+                    minimum_improvement_basis_points=500,
+                    maximum_repeat_spread_basis_points=300,
+                )
+
+    def test_individually_valid_arms_cannot_cross_service_epochs(self) -> None:
+        arms = self._arms()
+        changed_receipt = arms[1][0]
+        for sample in changed_receipt["host_capacity"]["samples"]:
+            for container in sample["containers"]:
+                if container["name"] == "mineru-openai-server":
+                    container["id"] = "9" * 64
+        _bind_arm_liveness(changed_receipt)
+        with patch(
+            "disclosure_anchor.adapters.runtime.mineru_capacity_commissioning."
+            "summarize_phase_trace_capture",
+            side_effect=self._summary,
+        ):
+            with self.assertRaisesRegex(ValueError, "service epoch drifted"):
+                evaluate_capacity_commissioning(
+                    arms,
+                    expected_legacy_profile_sha256=_LEGACY_SHA,
+                    expected_candidate_profile_sha256=_CANDIDATE_SHA,
+                    expected_collector_sha256=_COLLECTOR_SHA,
+                    expected_collector_path=MINERU_WINDOWS_COLLECTOR_PATH,
+                    expected_docker_memory_reserve_bytes=_MEMORY_RESERVE_BYTES,
+                    expected_windows_node_identity_sha256=_NODE_SHA,
+                    minimum_improvement_basis_points=500,
+                    maximum_repeat_spread_basis_points=300,
+                )
+
     def test_per_arm_provider_bundle_hash_may_vary(self) -> None:
         arms = self._arms()
         arms[1][0]["stages"][0]["documents"][0][
@@ -519,6 +697,7 @@ class MineruCapacityCommissioningTests(unittest.TestCase):
         )
         arms[1][0]["started_at_utc"] = overlap_start.isoformat()
         arms[1][0]["finished_at_utc"] = overlap_finish.isoformat()
+        _bind_arm_liveness(arms[1][0])
         arms[1] = (
             arms[1][0],
             replace(

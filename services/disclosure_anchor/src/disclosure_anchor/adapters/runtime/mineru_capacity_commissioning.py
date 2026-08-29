@@ -20,6 +20,7 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     staged_load_metrics_are_proved,
     verify_host_capacity_evidence,
     verify_staged_load_admission_evidence,
+    verify_staged_load_inference_liveness_evidence,
     verify_staged_load_orchestrator_evidence,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
@@ -60,8 +61,8 @@ CAPACITY_COMMISSIONING_FIELDS: Final = frozenset(
         "windows_node_identity_sha256",
     }
 )
-_STAGED_LOAD_SCHEMA = "mineru_staged_load_receipt.v6"
-_STAGED_LOAD_SCHEMA_VERSION = 6
+_STAGED_LOAD_SCHEMA = "mineru_staged_load_receipt.v7"
+_STAGED_LOAD_SCHEMA_VERSION = 7
 _STAGED_LOAD_SAFETY_LIMITS_PROFILE = "whole-document-runaway-and-drain.v1"
 _STAGE_COUNTS = (4, 8, 16)
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -89,6 +90,8 @@ class _ArmEvidence:
     memory_reserve_bytes: int
     safety_limits: Mapping[str, object]
     started_at: datetime
+    expected_campaign_epoch_sha256: str | None
+    observed_campaign_epoch_sha256: str
 
 
 def _sha256(value: object, *, label: str) -> str:
@@ -295,6 +298,7 @@ def _arm_evidence(
         or receipt.get("receipt_schema_version") != _STAGED_LOAD_SCHEMA_VERSION
         or receipt.get("status") != "pass"
         or receipt.get("failure") is not None
+        or receipt.get("secondary_failures") != []
         or receipt.get("database_access") != "none"
         or receipt.get("queue_access") != "none"
         or receipt.get("fixed_stage_document_counts") != list(_STAGE_COUNTS)
@@ -363,6 +367,17 @@ def _arm_evidence(
     except MinerUDeploymentGateError as exc:
         raise ValueError(
             "capacity commissioning host evidence is not proved"
+        ) from exc
+    try:
+        expected_campaign_epoch_sha256, observed_campaign_epoch_sha256 = (
+            verify_staged_load_inference_liveness_evidence(
+                receipt,
+                host_epochs=epochs,
+            )
+        )
+    except MinerUDeploymentGateError as exc:
+        raise ValueError(
+            "capacity commissioning arm-boundary inference liveness is not proved"
         ) from exc
     api_container_id = epochs["mineru-api"][0]
     capture_summary = summarize_phase_trace_capture(
@@ -489,6 +504,8 @@ def _arm_evidence(
         memory_reserve_bytes=expected_docker_memory_reserve_bytes,
         safety_limits=safety_limits,
         started_at=started,
+        expected_campaign_epoch_sha256=expected_campaign_epoch_sha256,
+        observed_campaign_epoch_sha256=observed_campaign_epoch_sha256,
     )
 
 
@@ -604,6 +621,18 @@ def evaluate_capacity_commissioning(
     }
     if len(proxy_epochs) != 1 or len(inference_epochs) != 1:
         raise ValueError("capacity commissioning stable service epoch drifted")
+    campaign_epoch_sha256 = evidence[0].observed_campaign_epoch_sha256
+    if (
+        any(
+            item.observed_campaign_epoch_sha256 != campaign_epoch_sha256
+            for item in evidence
+        )
+        or any(
+            item.expected_campaign_epoch_sha256 != campaign_epoch_sha256
+            for item in evidence
+        )
+    ):
+        raise ValueError("capacity commissioning campaign epoch preflight drifted")
 
     pages = evidence[0].page_count
     rates = tuple(

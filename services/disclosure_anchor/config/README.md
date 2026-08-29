@@ -111,8 +111,10 @@ make track-export OUT=/timestamped/path/watchlist.csv  # DB 池子 → 独立复
 make track-status          # 全池状态 + 每公司生效配置与来源层
 make mineru-smoke RUNTIME_MANIFEST=/path/runtime.json RECEIPT=/path/receipt.json CANARY_CACHE=/path/canary.json
                            # 无 DB/队列/业务凭据下传：三次多模态 canary + 固定单页 full-PDF，进程/临时树差集归零
-make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-load-receipt.v6.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 API_DRAIN_TIMEOUT_SECONDS=86400
-                           # smoke PASS 后固定4/8/16文档数；两值最低86400，私有settings更高时必须同步；API-facing window=1、huge独占；每阶段都含regular/heavy/huge；API/vLLM/外部Docker epoch-OOM-RSS-memory/清理任一越界立即停止
+make mineru-campaign-epoch-freeze RUNTIME_MANIFEST=/path/runtime.json EPOCH_RECEIPT=/path/new-epoch.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes>
+                           # 最后一次允许的服务恢复后，零推理、零 DB/队列地冻结 proxy/vLLM container ID+StartedAt
+make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> EXPECTED_CAMPAIGN_EPOCH_SHA256=<epoch-receipt-campaign-sha256> RECEIPT=/path/new-load-receipt.v7.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 API_DRAIN_TIMEOUT_SECONDS=86400
+                           # smoke PASS 后固定4/8/16文档数；arm 前后各一次 direct multimodal canary，且同一 proxy/vLLM epoch；其余容量/清理门保持不变
 make worker-once           # 手动跑一轮（同步→下载→解析→切分→发布）
 make worker-loop           # 常驻自适应排水；积压时零等待，空闲时 15→30 分钟退避
 make worker-status         # 单次只读快照：公司/文档两条进度、队列、当前任务、vLLM 与真实 GPU exporter

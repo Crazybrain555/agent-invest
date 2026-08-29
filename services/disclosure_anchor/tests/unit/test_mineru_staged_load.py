@@ -67,6 +67,36 @@ def _host_capacity_sample(
     }
 
 
+def _campaign_epoch_source() -> tuple[
+    str,
+    str,
+    dict[str, tuple[str, str]],
+]:
+    sample = _host_capacity_sample()
+    return (
+        str(sample["collector_sha256"]),
+        str(sample["windows_node_identity_sha256"]),
+        {
+            str(container["name"]): (
+                str(container["id"]),
+                str(container["started_at_utc"]),
+            )
+            for container in sample["containers"]
+        },
+    )
+
+
+def _campaign_epoch_sha256() -> str:
+    collector_sha256, node_sha256, epochs = _campaign_epoch_source()
+    return str(
+        staged._campaign_epoch_payload(
+            collector_sha256=collector_sha256,
+            windows_node_identity_sha256=node_sha256,
+            epochs=epochs,
+        )["observed_sha256"]
+    )
+
+
 class MinerUStagedLoadTests(unittest.TestCase):
     @staticmethod
     def _corpus(count: int = 16) -> tuple[staged.FrozenCorpusInput, ...]:
@@ -145,11 +175,188 @@ vllm:gpu_cache_usage_perc 0.1
             task_cleanup_interval_seconds=30,
         )
 
+    def _run_main_scenario(
+        self,
+        *,
+        expected_campaign_epoch_sha256: str | None = None,
+        canary_side_effect: list[object] | None = None,
+        stage_statuses: tuple[str, ...] = ("pass", "pass", "pass"),
+        campaign_epoch_sources: list[
+            tuple[str, str, dict[str, tuple[str, str]]]
+        ]
+        | None = None,
+        host_evidence_status: str = "pass",
+        transport_close_error: Exception | None = None,
+    ) -> tuple[int, dict[str, object], MagicMock, MagicMock]:
+        input_bytes = b"%PDF-1.4 frozen fixture"
+        input_sha = "sha256:" + hashlib.sha256(input_bytes).hexdigest()
+        runtime_identity = "sha256:" + "a" * 64
+        api_url = "http://127.0.0.1:30000"
+        observability_url = "http://127.0.0.1:30002/v1"
+        inference_upstream_url = "http://mineru-vllm:30000/v1"
+        topology = {
+            name: "sha256:"
+            + hashlib.sha256(url.rstrip("/").encode()).hexdigest()
+            for name, url in {
+                "api_endpoint_sha256": api_url,
+                "observability_endpoint_sha256": observability_url,
+                "inference_upstream_sha256": inference_upstream_url,
+            }.items()
+        }
+        topology.update(
+            {
+                "windows_collector_path": staged.MINERU_WINDOWS_COLLECTOR_PATH,
+                "windows_collector_sha256": "sha256:" + "f" * 64,
+                "windows_node_identity_sha256": "sha256:" + "0" * 64,
+            }
+        )
+        verified = SimpleNamespace(
+            manifest={
+                "topology": topology,
+                "orchestrator": {
+                    "task_retention_seconds": 600,
+                    "task_cleanup_interval_seconds": 30,
+                },
+            },
+            identity_sha256=runtime_identity,
+            orchestrator_identity_sha256="sha256:" + "d" * 64,
+            provider_identity_sha256="sha256:" + "e" * 64,
+            served_model_id="mineru-model",
+            max_concurrent_requests=1,
+        )
+        metrics = staged.MetricsSample(0, 0, 0, 0, 0)
+        client = SimpleNamespace(
+            package_set_sha256="sha256:" + "b" * 64,
+            content_package_versions={},
+        )
+        run_stage = MagicMock()
+        statuses = iter(stage_statuses)
+        run_stage.side_effect = lambda **kwargs: {
+            "status": next(statuses),
+            "stage_document_count": kwargs["document_count"],
+        }
+        host_monitor = MagicMock()
+        host_monitor.failure = None
+        sources = campaign_epoch_sources or [_campaign_epoch_source()] * 2
+        host_monitor.campaign_epoch_source.side_effect = sources
+        observed = iter(float(index) for index in range(1, 20))
+        host_monitor.observed_seconds.side_effect = lambda: next(observed)
+        host_monitor.evidence.return_value = {
+            "schema": "mineru-host-capacity-evidence.v2",
+            "status": host_evidence_status,
+            "failure": (
+                None
+                if host_evidence_status == "pass"
+                else "host_capacity_sample_gap"
+            ),
+        }
+        transport = MagicMock()
+        if transport_close_error is not None:
+            transport.close.side_effect = transport_close_error
+        canary = MagicMock()
+        default_canary = SimpleNamespace(
+            model_id="mineru-model",
+            attempts=1,
+            request_sha256=staged.canary_request_sha256("mineru-model"),
+            response_sha256=("7" * 64,),
+        )
+        canary.side_effect = canary_side_effect or [
+            default_canary,
+            default_canary,
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corpus_manifest = root / "corpus.json"
+            corpus_manifest.write_text("{}", encoding="utf-8")
+            mineru = root / "mineru"
+            mineru.write_text("executable", encoding="utf-8")
+            manifest = root / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            receipt = root / "receipt.json"
+            observer_identity, observer_known_hosts = self._host_observer_files(root)
+            with (
+                patch.dict(os.environ, {"MINERU_PROCESSING_WINDOW_SIZE": "16"}),
+                patch.object(staged, "mineru_api_temp_dirs", return_value=set()),
+                patch.object(staged, "process_snapshot", return_value={}),
+                patch.object(staged, "_wait_for_process_cleanup", return_value={}),
+                patch.object(staged, "client_bundle_identity", return_value=client),
+                patch.object(
+                    staged,
+                    "_load_frozen_corpus",
+                    return_value=self._corpus_fixture(input_sha),
+                ),
+                patch.object(
+                    staged,
+                    "writer_code_digest",
+                    return_value="sha256:" + "c" * 64,
+                ),
+                patch.object(
+                    staged,
+                    "verify_runtime_manifest_payload",
+                    return_value=verified,
+                ),
+                patch.object(staged, "probe_mineru_served_model"),
+                patch.object(staged, "fetch_vllm_metrics", return_value=metrics),
+                patch.object(staged, "_run_stage", run_stage),
+                patch.object(
+                    staged,
+                    "_HostCapacityMonitor",
+                    return_value=host_monitor,
+                ),
+                patch.object(
+                    staged,
+                    "_HostObserverControlMaster",
+                    return_value=transport,
+                ),
+                patch.object(
+                    staged,
+                    "run_mineru_multimodal_canary",
+                    canary,
+                ),
+            ):
+                result = staged.main(
+                    [
+                        "--runtime-manifest",
+                        str(manifest),
+                        "--receipt-out",
+                        str(receipt),
+                        "--corpus-manifest",
+                        str(corpus_manifest),
+                        "--expected-corpus-sha256",
+                        input_sha,
+                        "--expected-campaign-epoch-sha256",
+                        expected_campaign_epoch_sha256
+                        or _campaign_epoch_sha256(),
+                        "--mineru-bin",
+                        str(mineru),
+                        "--api-url",
+                        api_url,
+                        "--observability-url",
+                        observability_url,
+                        "--inference-upstream-url",
+                        inference_upstream_url,
+                        "--runtime-bundle-identity",
+                        runtime_identity,
+                        "--host-observer-ssh-host",
+                        "100.64.0.1",
+                        "--host-observer-ssh-user",
+                        "operator",
+                        "--host-observer-identity-file",
+                        str(observer_identity),
+                        "--host-observer-known-hosts-file",
+                        str(observer_known_hosts),
+                        "--docker-memory-reserve-bytes",
+                        "1024",
+                    ]
+                )
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+        return result, payload, run_stage, canary
+
     def test_fixed_envelope_has_no_operator_stage_override(self) -> None:
         self.assertEqual(staged.STAGE_DOCUMENT_COUNTS, (4, 8, 16))
         self.assertEqual(staged.ORCHESTRATOR_INFERENCE_CONCURRENCY, 7)
-        self.assertEqual(staged.RECEIPT_SCHEMA, "mineru_staged_load_receipt.v6")
-        self.assertEqual(staged.RECEIPT_SCHEMA_VERSION, 6)
+        self.assertEqual(staged.RECEIPT_SCHEMA, "mineru_staged_load_receipt.v7")
+        self.assertEqual(staged.RECEIPT_SCHEMA_VERSION, 7)
 
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             staged._parse_args(
@@ -162,10 +369,125 @@ vllm:gpu_cache_usage_perc 0.1
                     "corpus.json",
                     "--expected-corpus-sha256",
                     "a" * 64,
+                    "--expected-campaign-epoch-sha256",
+                    "sha256:" + "b" * 64,
                     "--stages",
                     "32",
                 ]
             )
+
+    def test_campaign_epoch_is_required_before_any_remote_action(self) -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            staged._parse_args(
+                [
+                    "--runtime-manifest",
+                    "manifest.json",
+                    "--receipt-out",
+                    "receipt.json",
+                    "--corpus-manifest",
+                    "corpus.json",
+                    "--expected-corpus-sha256",
+                    "a" * 64,
+                ]
+            )
+
+    def test_wrong_campaign_epoch_runs_no_canary_or_stage(self) -> None:
+        result, payload, run_stage, canary = self._run_main_scenario(
+            expected_campaign_epoch_sha256="sha256:" + "9" * 64,
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["failure_phase"], "campaign_epoch_preflight")
+        self.assertIn("expected campaign service epoch drifted", payload["failure"])
+        self.assertEqual(payload["stages"], [])
+        run_stage.assert_not_called()
+        canary.assert_not_called()
+
+    def test_pre_arm_canary_failure_admits_no_stage(self) -> None:
+        result, payload, run_stage, canary = self._run_main_scenario(
+            canary_side_effect=[TimeoutError("inference canary timed out")],
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["failure_phase"], "pre_arm_inference_liveness")
+        self.assertEqual(payload["inference_liveness"]["pre_arm"]["status"], "fail")
+        self.assertEqual(
+            payload["inference_liveness"]["post_arm"]["status"],
+            "not_run",
+        )
+        self.assertEqual(payload["stages"], [])
+        run_stage.assert_not_called()
+        self.assertEqual(canary.call_count, 1)
+
+    def test_stage_failure_skips_post_arm_canary(self) -> None:
+        result, payload, run_stage, canary = self._run_main_scenario(
+            stage_statuses=("fail",),
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["failure_phase"], "staged_load")
+        self.assertEqual(len(payload["stages"]), 1)
+        self.assertEqual(
+            payload["inference_liveness"]["post_arm"]["status"],
+            "not_run",
+        )
+        self.assertEqual(run_stage.call_count, 1)
+        self.assertEqual(canary.call_count, 1)
+
+    def test_post_arm_canary_failure_rejects_complete_workload(self) -> None:
+        passing_canary = SimpleNamespace(
+            model_id="mineru-model",
+            attempts=1,
+            request_sha256=staged.canary_request_sha256("mineru-model"),
+            response_sha256=("7" * 64,),
+        )
+        result, payload, run_stage, canary = self._run_main_scenario(
+            canary_side_effect=[
+                passing_canary,
+                TimeoutError("post-arm inference canary timed out"),
+            ],
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["failure_phase"], "post_arm_inference_liveness")
+        self.assertEqual(len(payload["stages"]), 3)
+        self.assertEqual(payload["inference_liveness"]["post_arm"]["status"], "fail")
+        self.assertEqual(run_stage.call_count, 3)
+        self.assertEqual(canary.call_count, 2)
+
+    def test_campaign_epoch_drift_after_workload_skips_post_canary(self) -> None:
+        collector, node, epochs = _campaign_epoch_source()
+        drifted_epochs = dict(epochs)
+        inference_id, _ = drifted_epochs["mineru-openai-server"]
+        drifted_epochs["mineru-openai-server"] = (
+            inference_id,
+            "2026-08-29T01:00:01+00:00",
+        )
+        result, payload, run_stage, canary = self._run_main_scenario(
+            campaign_epoch_sources=[
+                (collector, node, epochs),
+                (collector, node, drifted_epochs),
+            ],
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["failure_phase"], "post_arm_inference_liveness")
+        self.assertIn("campaign service epoch drifted during arm", payload["failure"])
+        self.assertEqual(payload["inference_liveness"]["post_arm"]["status"], "not_run")
+        self.assertEqual(run_stage.call_count, 3)
+        self.assertEqual(canary.call_count, 1)
+
+    def test_transport_cleanup_failure_is_primary_and_secondary(self) -> None:
+        result, payload, run_stage, canary = self._run_main_scenario(
+            transport_close_error=RuntimeError("control master close failed"),
+        )
+
+        self.assertEqual(result, 2)
+        self.assertEqual(payload["failure_phase"], "host_capacity_observer")
+        self.assertEqual(len(payload["secondary_failures"]), 1)
+        self.assertIn("transport_cleanup_failed", payload["failure"])
+        self.assertEqual(run_stage.call_count, 3)
+        self.assertEqual(canary.call_count, 2)
 
     def test_stage_sequence_stops_before_unsafe_next_stage(self) -> None:
         calls: list[int] = []
@@ -1773,6 +2095,7 @@ vllm:gpu_cache_usage_perc 0.5
                 "docker_memory_reserve_bytes": 1024,
                 "corpus_manifest": root / "corpus.json",
                 "expected_corpus_sha256": "sha256:" + "b" * 64,
+                "expected_campaign_epoch_sha256": "sha256:" + "c" * 64,
             }
             for field in (
                 "document_runaway_timeout_seconds",
@@ -2423,6 +2746,8 @@ vllm:gpu_cache_usage_perc 0.5
                         str(corpus_manifest),
                         "--expected-corpus-sha256",
                         input_sha,
+                        "--expected-campaign-epoch-sha256",
+                        _campaign_epoch_sha256(),
                         "--mineru-bin",
                         str(mineru),
                         "--api-url",
@@ -2449,8 +2774,8 @@ vllm:gpu_cache_usage_perc 0.5
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(result, 2)
             self.assertEqual(payload["status"], "fail")
-            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v6")
-            self.assertEqual(payload["receipt_schema_version"], 6)
+            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v7")
+            self.assertEqual(payload["receipt_schema_version"], 7)
             self.assertEqual(
                 payload["topology"]["api_endpoint_sha256"],
                 "sha256:" + hashlib.sha256(b"http://unused-api").hexdigest(),
@@ -2482,6 +2807,8 @@ vllm:gpu_cache_usage_perc 0.5
                     str(corpus),
                     "--expected-corpus-sha256",
                     "sha256:" + "a" * 64,
+                    "--expected-campaign-epoch-sha256",
+                    _campaign_epoch_sha256(),
                     "--mineru-bin",
                     str(mineru),
                     "--api-url",
@@ -2512,13 +2839,13 @@ vllm:gpu_cache_usage_perc 0.5
 
                 payload = json.loads(receipt.read_text(encoding="utf-8"))
                 self.assertEqual(result, 2)
-                self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v6")
-                self.assertEqual(payload["receipt_schema_version"], 6)
+                self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v7")
+                self.assertEqual(payload["receipt_schema_version"], 7)
                 self.assertEqual(payload["status"], "fail")
                 self.assertEqual(payload["failure_phase"], "preflight_configuration")
                 self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
 
-    def test_main_routes_three_urls_and_emits_staged_v6_receipt(self) -> None:
+    def test_main_routes_three_urls_and_emits_staged_v7_receipt(self) -> None:
         input_bytes = b"%PDF-1.4 frozen fixture"
         input_sha = "sha256:" + hashlib.sha256(input_bytes).hexdigest()
         runtime_identity = "sha256:" + "a" * 64
@@ -2584,6 +2911,17 @@ vllm:gpu_cache_usage_perc 0.5
             idle_waiter = MagicMock(return_value=(health, 0.0))
             host_monitor = MagicMock()
             host_monitor.failure = None
+            host_monitor.campaign_epoch_source.return_value = (
+                _campaign_epoch_source()
+            )
+            host_monitor.observed_seconds.side_effect = [
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                5.0,
+                6.0,
+            ]
             host_monitor.evidence.return_value = {
                 "schema": "mineru-host-capacity-evidence.v2",
                 "status": "pass",
@@ -2611,6 +2949,18 @@ vllm:gpu_cache_usage_perc 0.5
                     return_value=verified,
                 ),
                 patch.object(staged, "probe_mineru_served_model") as probe,
+                patch.object(
+                    staged,
+                    "run_mineru_multimodal_canary",
+                    return_value=SimpleNamespace(
+                        model_id="mineru-model",
+                        attempts=1,
+                        request_sha256=staged.canary_request_sha256(
+                            "mineru-model"
+                        ),
+                        response_sha256=("7" * 64,),
+                    ),
+                ) as canary,
                 patch.object(staged, "fetch_vllm_metrics", metrics_fetch),
                 patch.object(
                     staged,
@@ -2640,6 +2990,8 @@ vllm:gpu_cache_usage_perc 0.5
                         str(corpus_manifest),
                         "--expected-corpus-sha256",
                         input_sha,
+                        "--expected-campaign-epoch-sha256",
+                        _campaign_epoch_sha256(),
                         "--mineru-bin",
                         str(mineru),
                         "--api-url",
@@ -2674,6 +3026,7 @@ vllm:gpu_cache_usage_perc 0.5
             )
             self.assertEqual(metrics_fetch.call_args_list[0].args, (observability_url,))
             self.assertEqual(run_stage.call_count, 3)
+            self.assertEqual(canary.call_count, 2)
             self.assertEqual(first_call["api_url"], api_url)
             self.assertEqual(
                 first_call["document_runaway_timeout_seconds"],
@@ -2714,8 +3067,12 @@ vllm:gpu_cache_usage_perc 0.5
             self.assertEqual(idle_waiter.call_args.kwargs["timeout_seconds"], 86400)
             payload = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "pass")
-            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v6")
-            self.assertEqual(payload["receipt_schema_version"], 6)
+            self.assertEqual(payload["schema"], "mineru_staged_load_receipt.v7")
+            self.assertEqual(payload["receipt_schema_version"], 7)
+            self.assertEqual(payload["campaign_epoch"]["expected_sha256"], _campaign_epoch_sha256())
+            self.assertEqual(payload["campaign_epoch"]["observed_sha256"], _campaign_epoch_sha256())
+            self.assertEqual(payload["inference_liveness"]["pre_arm"]["status"], "pass")
+            self.assertEqual(payload["inference_liveness"]["post_arm"]["status"], "pass")
             self.assertEqual(
                 payload["topology"],
                 {

@@ -8,9 +8,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-import urllib.error
 from unittest.mock import MagicMock, patch
 
+from disclosure_anchor.adapters.runtime.bounded_http import (
+    BoundedHTTPProtocolError,
+    BoundedHTTPTransportError,
+)
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     MinerUCanaryError,
     MinerUCanaryUnavailableError,
@@ -171,33 +174,38 @@ class MinerUCanaryTests(unittest.TestCase):
         self.assertEqual(command[1:3], ["-I", "-c"])
 
     def test_repeated_canary_binds_request_and_every_response(self) -> None:
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = json.dumps(
-            {"data": [{"id": "mineru-model"}]}
-        ).encode()
-        completions = []
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "mineru-model"}]}).encode(),
+        )
+        completions: list[tuple[int, bytes]] = []
         for index in range(3):
-            response = MagicMock()
-            response.__enter__.return_value.read.return_value = json.dumps(
-                {
-                    "choices": [
+            completions.append(
+                (
+                    200,
+                    json.dumps(
                         {
-                            "index": index,
-                            "message": {
-                                "role": "assistant",
-                                "content": "M7." if index == 2 else "M7",
-                            },
+                            "choices": [
+                                {
+                                    "index": index,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": (
+                                            "M7." if index == 2 else "M7"
+                                        ),
+                                    },
+                                }
+                            ]
                         }
-                    ]
-                }
-            ).encode()
-            completions.append(response)
-        opener = MagicMock()
-        opener.open.side_effect = [models, *completions]
+                    ).encode(),
+                )
+            )
+        client.post_bytes.side_effect = completions
 
         with patch(
-            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-            return_value=opener,
+            "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+            return_value=client,
         ):
             evidence = run_mineru_multimodal_canary(
                 "http://gpu:30000",
@@ -211,33 +219,50 @@ class MinerUCanaryTests(unittest.TestCase):
             evidence.request_sha256,
             canary_request_sha256("mineru-model"),
         )
-        self.assertEqual(opener.open.call_count, 4)
+        client.get_bytes.assert_called_once_with(
+            "/models",
+            timeout_seconds=15,
+            transport_attempts=1,
+        )
+        self.assertEqual(client.post_bytes.call_count, 3)
+        request_body = client.post_bytes.call_args_list[0].args[1]
+        self.assertEqual(hashlib.sha256(request_body).hexdigest(), evidence.request_sha256)
+        self.assertEqual(
+            client.post_bytes.call_args_list[0].kwargs,
+            {
+                "content_type": "application/json",
+                "timeout_seconds": 90,
+                "transport_attempts": 1,
+            },
+        )
+        client.close.assert_called_once_with()
 
     def test_canary_rejects_expected_token_with_extra_text(self) -> None:
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = json.dumps(
-            {"data": [{"id": "mineru-model"}]}
-        ).encode()
-        completion = MagicMock()
-        completion.__enter__.return_value.read.return_value = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "M7 is shown",
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "mineru-model"}]}).encode(),
+        )
+        client.post_bytes.return_value = (
+            200,
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "M7 is shown",
+                            }
                         }
-                    }
-                ]
-            }
-        ).encode()
-        opener = MagicMock()
-        opener.open.side_effect = [models, completion]
+                    ]
+                }
+            ).encode(),
+        )
 
         with (
             patch(
-                "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-                return_value=opener,
+                "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+                return_value=client,
             ),
             self.assertRaisesRegex(MinerUCanaryError, "exact expected M7"),
         ):
@@ -296,69 +321,63 @@ class MinerUCanaryTests(unittest.TestCase):
         self.assertNotEqual(remote_identity, configured)
 
     def test_models_root_must_be_an_object(self) -> None:
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = b"[]"
-        opener = MagicMock()
-        opener.open.return_value = models
+        client = MagicMock()
+        client.get_bytes.return_value = (200, b"[]")
         with (
             patch(
-                "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-                return_value=opener,
+                "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+                return_value=client,
             ),
             self.assertRaisesRegex(MinerUCanaryError, "root must be an object"),
         ):
             run_mineru_multimodal_canary("http://gpu:30000")
 
     def test_completion_root_must_be_an_object(self) -> None:
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = json.dumps(
-            {"data": [{"id": "mineru-model"}]}
-        ).encode()
-        completion = MagicMock()
-        completion.__enter__.return_value.read.return_value = b"[]"
-        opener = MagicMock()
-        opener.open.side_effect = [models, completion]
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "mineru-model"}]}).encode(),
+        )
+        client.post_bytes.return_value = (200, b"[]")
         with (
             patch(
-                "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-                return_value=opener,
+                "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+                return_value=client,
             ),
             self.assertRaisesRegex(MinerUCanaryError, "root must be an object"),
         ):
             run_mineru_multimodal_canary("http://gpu:30000")
 
     def test_canary_rejects_empty_assistant_payload(self) -> None:
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = json.dumps(
-            {"data": [{"id": "mineru-model"}]}
-        ).encode()
-        completion = MagicMock()
-        completion.__enter__.return_value.read.return_value = json.dumps(
-            {"choices": [{}]}
-        ).encode()
-        opener = MagicMock()
-        opener.open.side_effect = [models, completion]
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "mineru-model"}]}).encode(),
+        )
+        client.post_bytes.return_value = (
+            200,
+            json.dumps({"choices": [{}]}).encode(),
+        )
 
         with (
             patch(
-                "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-                return_value=opener,
+                "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+                return_value=client,
             ),
             self.assertRaisesRegex(MinerUCanaryError, "no assistant message"),
         ):
             run_mineru_multimodal_canary("http://gpu:30000")
 
     def test_light_probe_rejects_model_drift(self) -> None:
-        models = MagicMock()
-        models.__enter__.return_value.read.return_value = json.dumps(
-            {"data": [{"id": "replacement-model"}]}
-        ).encode()
-        opener = MagicMock()
-        opener.open.return_value = models
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "replacement-model"}]}).encode(),
+        )
         with (
             patch(
-                "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-                return_value=opener,
+                "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
+                return_value=client,
             ),
             self.assertRaisesRegex(MinerUCanaryError, "drifted"),
         ):
@@ -368,26 +387,85 @@ class MinerUCanaryTests(unittest.TestCase):
             )
 
     def test_light_probe_classifies_http_statuses(self) -> None:
-        opener = MagicMock()
-        with patch(
-            "disclosure_anchor.adapters.runtime.mineru_canary.urllib.request.build_opener",
-            return_value=opener,
+        for status, expected_error in (
+            (404, MinerUCanaryError),
+            (503, MinerUCanaryUnavailableError),
+            (501, MinerUCanaryError),
         ):
-            for status, expected_error in (
-                (404, MinerUCanaryError),
-                (503, MinerUCanaryUnavailableError),
-                (501, MinerUCanaryError),
-            ):
-                with self.subTest(status=status):
-                    opener.open.side_effect = urllib.error.HTTPError(
-                        "http://gpu:30000/v1/models",
-                        status,
-                        "probe failed",
-                        {},
-                        None,
-                    )
-                    with self.assertRaises(expected_error):
+            with self.subTest(status=status):
+                client = MagicMock()
+                client.get_bytes.return_value = (status, b"{}")
+                with (
+                    patch(
+                        "disclosure_anchor.adapters.runtime.mineru_canary."
+                        "_direct_client",
+                        return_value=client,
+                    ),
+                    self.assertRaises(expected_error),
+                ):
                         probe_mineru_served_model("http://gpu:30000")
+
+    def test_canary_rejects_non_200_and_closes_after_bounded_failure(self) -> None:
+        model_payload = json.dumps(
+            {"data": [{"id": "mineru-model"}]}
+        ).encode()
+        for failure in (
+            503,
+            BoundedHTTPTransportError("wall deadline"),
+            BoundedHTTPProtocolError("ambiguous framing"),
+        ):
+            with self.subTest(failure=repr(failure)):
+                client = MagicMock()
+                client.get_bytes.return_value = (200, model_payload)
+                client.post_bytes.side_effect = (
+                    None if isinstance(failure, int) else failure
+                )
+                if isinstance(failure, int):
+                    client.post_bytes.return_value = (failure, b"down")
+                with (
+                    patch(
+                        "disclosure_anchor.adapters.runtime.mineru_canary."
+                        "_direct_client",
+                        return_value=client,
+                    ),
+                    self.assertRaises(MinerUCanaryError),
+                ):
+                    run_mineru_multimodal_canary("http://gpu:30000")
+                client.close.assert_called_once_with()
+
+    def test_direct_client_ignores_environment_proxy_configuration(self) -> None:
+        client = MagicMock()
+        client.get_bytes.return_value = (
+            200,
+            json.dumps({"data": [{"id": "mineru-model"}]}).encode(),
+        )
+        with (
+            patch.dict(
+                "os.environ",
+                {"HTTP_PROXY": "http://127.0.0.1:1"},
+                clear=False,
+            ),
+            patch(
+                "disclosure_anchor.adapters.runtime.mineru_canary."
+                "ThreadOwnedPersistentHTTPClient",
+                return_value=client,
+            ) as client_type,
+        ):
+            self.assertEqual(
+                probe_mineru_served_model("http://gpu:30000"),
+                "mineru-model",
+            )
+        client_type.assert_called_once_with(
+            "http://gpu:30000/v1",
+            maximum_response_bytes=1024 * 1024,
+            user_agent="disclosure-anchor-mineru-canary/1",
+        )
+
+    def test_invalid_direct_url_preserves_typed_canary_boundary(self) -> None:
+        with self.assertRaises(MinerUCanaryError):
+            probe_mineru_served_model("ftp://gpu.invalid")
+        with self.assertRaises(MinerUCanaryError):
+            run_mineru_multimodal_canary("ftp://gpu.invalid")
 
     def test_runtime_manifest_rejects_duplicate_safety_flag(self) -> None:
         manifest = _manifest(duplicate_max_num_seqs=True)

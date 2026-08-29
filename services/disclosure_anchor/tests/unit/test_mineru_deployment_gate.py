@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +22,7 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentGateError,
     MinerUDeploymentUnavailableError,
     require_mineru_deployment_gate,
+    verify_staged_load_inference_liveness_evidence,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_CONTENT_PACKAGE_VERSIONS,
@@ -46,6 +49,112 @@ from disclosure_anchor.settings import Settings
 LOCAL_DIGEST = "sha256:" + "1" * 64
 CODE_DIGEST = "sha256:" + "2" * 64
 MODEL_ID = "provider/model"
+
+
+def bind_staged_arm_liveness(receipt: dict[str, object]) -> None:
+    host = receipt["host_capacity"]
+    assert isinstance(host, dict)
+    samples = host["samples"]
+    assert isinstance(samples, list) and samples
+    first_sample = samples[0]
+    assert isinstance(first_sample, dict)
+    containers = first_sample["containers"]
+    assert isinstance(containers, list)
+    by_name = {
+        str(container["name"]): container
+        for container in containers
+        if isinstance(container, dict)
+    }
+    services = {
+        role: {
+            "name": name,
+            "container_id": str(by_name[name]["id"]),
+            "started_at_utc": str(by_name[name]["started_at_utc"]),
+        }
+        for role, name in (
+            ("proxy", "mineru-api-proxy"),
+            ("inference", "mineru-openai-server"),
+        )
+    }
+    canonical_epoch = {
+        "schema": "mineru-campaign-service-epoch.v1",
+        "windows_node_identity_sha256": host[
+            "windows_node_identity_sha256"
+        ],
+        "collector_sha256": host["collector_sha256"],
+        "services": services,
+    }
+    campaign_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(
+            canonical_epoch,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt["campaign_epoch"] = {
+        **canonical_epoch,
+        "expected_sha256": campaign_sha256,
+        "observed_sha256": campaign_sha256,
+    }
+    identity = receipt["identity"]
+    topology = receipt["topology"]
+    assert isinstance(identity, dict) and isinstance(topology, dict)
+    arm_started = datetime.fromisoformat(str(receipt["started_at_utc"]))
+
+    def boundary(
+        *, phase: str, start_offset: float, finish_offset: float
+    ) -> dict[str, object]:
+        return {
+            "schema": "mineru-arm-boundary-canary.v1",
+            "phase": phase,
+            "status": "pass",
+            "started_at_utc": (
+                arm_started + timedelta(seconds=start_offset)
+            ).isoformat(),
+            "finished_at_utc": (
+                arm_started + timedelta(seconds=finish_offset)
+            ).isoformat(),
+            "started_observed_seconds": start_offset,
+            "finished_observed_seconds": finish_offset,
+            "elapsed_seconds": finish_offset - start_offset,
+            "model_id": identity["served_model_id"],
+            "attempts": 1,
+            "observability_endpoint_sha256": topology[
+                "observability_endpoint_sha256"
+            ],
+            "request_sha256": "sha256:"
+            + canary_request_sha256(str(identity["served_model_id"])),
+            "response_sha256": ["sha256:" + "7" * 64],
+            "runtime_manifest_identity_sha256": identity[
+                "runtime_manifest_identity_sha256"
+            ],
+            "campaign_epoch_sha256": campaign_sha256,
+            "inference_epoch": services["inference"],
+            "failure": None,
+        }
+
+    receipt["inference_liveness"] = {
+        "schema": "mineru-arm-inference-liveness.v1",
+        "profile": "epoch-bound-multimodal-canary.v1",
+        "pre_arm": boundary(
+            phase="pre_arm",
+            start_offset=0.5,
+            finish_offset=1.0,
+        ),
+        "workload_started_at_utc": (
+            arm_started + timedelta(seconds=2.0)
+        ).isoformat(),
+        "workload_finished_at_utc": (
+            arm_started + timedelta(seconds=7.0)
+        ).isoformat(),
+        "workload_started_observed_seconds": 2.0,
+        "workload_finished_observed_seconds": 7.0,
+        "post_arm": boundary(
+            phase="post_arm",
+            start_offset=8.0,
+            finish_offset=8.5,
+        ),
+    }
 
 
 class MinerUDeploymentGateTests(unittest.TestCase):
@@ -264,11 +373,12 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             return selected
 
         staged_load = {
-            "schema": "mineru_staged_load_receipt.v6",
-            "receipt_schema_version": 6,
+            "schema": "mineru_staged_load_receipt.v7",
+            "receipt_schema_version": 7,
             "execution_id": "11111111-1111-4111-8111-111111111111",
             "status": "pass",
             "failure": None,
+            "secondary_failures": [],
             "started_at_utc": (passed_at - timedelta(seconds=27)).isoformat(),
             "finished_at_utc": (passed_at - timedelta(seconds=17)).isoformat(),
             "elapsed_seconds": 10.0,
@@ -398,6 +508,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ],
             "cleanup": staged_cleanup,
         }
+        bind_staged_arm_liveness(staged_load)
         cache_path.write_text(json.dumps(cache), encoding="utf-8")
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
         staged_load_path.write_text(json.dumps(staged_load), encoding="utf-8")
@@ -420,6 +531,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 sample["completed_tasks"] += 28
             orchestrator["range"]["completed_tasks"]["min"] += 28
             orchestrator["range"]["completed_tasks"]["max"] += 28
+        bind_staged_arm_liveness(staged_confirmation)
         staged_confirmation_path.write_text(
             json.dumps(staged_confirmation), encoding="utf-8"
         )
@@ -767,6 +879,140 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     ),
                 ):
                     require_mineru_deployment_gate(settings)
+
+    def test_staged_arm_liveness_tamper_matrix_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, _, _, _ = self._fixture(
+                Path(tmp), passed_at=datetime.now(UTC)
+            )
+            staged_path = settings.disclosure_mineru_staged_load_receipt
+            assert staged_path is not None
+            baseline = json.loads(staged_path.read_text(encoding="utf-8"))
+            first_sample = baseline["host_capacity"]["samples"][0]
+            host_epochs = {
+                container["name"]: (
+                    container["id"],
+                    container["started_at_utc"],
+                )
+                for container in first_sample["containers"]
+            }
+            verify_staged_load_inference_liveness_evidence(
+                baseline,
+                host_epochs=host_epochs,
+            )
+
+            for tamper in (
+                "missing_pre",
+                "missing_post",
+                "failed_pre",
+                "failed_post",
+                "request",
+                "response",
+                "runtime_identity",
+                "endpoint",
+                "expected_campaign",
+                "boundary_campaign",
+                "inference_epoch",
+                "wall_timeline",
+                "monotonic_timeline",
+                "first_host_sample",
+                "terminal_host_sample",
+            ):
+                with self.subTest(tamper=tamper):
+                    receipt = deepcopy(baseline)
+                    liveness = receipt["inference_liveness"]
+                    pre = liveness["pre_arm"]
+                    post = liveness["post_arm"]
+                    if tamper == "missing_pre":
+                        liveness.pop("pre_arm")
+                    elif tamper == "missing_post":
+                        liveness.pop("post_arm")
+                    elif tamper == "failed_pre":
+                        pre["status"] = "fail"
+                        pre["failure"] = "TimeoutError:deadline"
+                    elif tamper == "failed_post":
+                        post["status"] = "fail"
+                        post["failure"] = "TimeoutError:deadline"
+                    elif tamper == "request":
+                        pre["request_sha256"] = "sha256:" + "0" * 64
+                    elif tamper == "response":
+                        pre["response_sha256"] = []
+                    elif tamper == "runtime_identity":
+                        pre["runtime_manifest_identity_sha256"] = (
+                            "sha256:" + "0" * 64
+                        )
+                    elif tamper == "endpoint":
+                        pre["observability_endpoint_sha256"] = (
+                            "sha256:" + "0" * 64
+                        )
+                    elif tamper == "expected_campaign":
+                        receipt["campaign_epoch"]["expected_sha256"] = (
+                            "sha256:" + "0" * 64
+                        )
+                    elif tamper == "boundary_campaign":
+                        pre["campaign_epoch_sha256"] = "sha256:" + "0" * 64
+                    elif tamper == "inference_epoch":
+                        pre["inference_epoch"]["container_id"] = "0" * 64
+                    elif tamper == "wall_timeline":
+                        liveness["workload_started_at_utc"] = pre[
+                            "started_at_utc"
+                        ]
+                    elif tamper == "monotonic_timeline":
+                        liveness["workload_started_observed_seconds"] = 0.75
+                    elif tamper == "first_host_sample":
+                        receipt["host_capacity"]["samples"][0][
+                            "observed_seconds"
+                        ] = 0.75
+                    else:
+                        receipt["host_capacity"]["samples"][-1][
+                            "observed_seconds"
+                        ] = 8.25
+                    with self.assertRaises(MinerUDeploymentGateError):
+                        verify_staged_load_inference_liveness_evidence(
+                            receipt,
+                            host_epochs=host_epochs,
+                        )
+
+    def test_confirmation_cannot_change_a_valid_campaign_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, _, _, client = self._fixture(
+                Path(tmp), passed_at=datetime.now(UTC)
+            )
+            confirmation_path = (
+                settings.disclosure_mineru_staged_load_confirmation_receipt
+            )
+            assert confirmation_path is not None
+            confirmation = json.loads(
+                confirmation_path.read_text(encoding="utf-8")
+            )
+            for sample in confirmation["host_capacity"]["samples"]:
+                for container in sample["containers"]:
+                    if container["name"] == "mineru-openai-server":
+                        container["id"] = "0" * 64
+            bind_staged_arm_liveness(confirmation)
+            first_sample = confirmation["host_capacity"]["samples"][0]
+            confirmation_epochs = {
+                container["name"]: (
+                    container["id"],
+                    container["started_at_utc"],
+                )
+                for container in first_sample["containers"]
+            }
+            verify_staged_load_inference_liveness_evidence(
+                confirmation,
+                host_epochs=confirmation_epochs,
+            )
+            confirmation_path.write_text(
+                json.dumps(confirmation), encoding="utf-8"
+            )
+            confirmation_path.chmod(0o600)
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                client_patch,
+                code_patch,
+                self.assertRaisesRegex(MinerUDeploymentGateError, "epoch"),
+            ):
+                require_mineru_deployment_gate(settings)
 
     def test_staged_api_retained_gauges_may_change_between_stages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

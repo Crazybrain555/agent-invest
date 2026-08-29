@@ -50,10 +50,13 @@ from disclosure_anchor.settings import Settings
 
 
 _RECEIPT_SCHEMA = "mineru_smoke_receipt.v4"
-_STAGED_LOAD_RECEIPT_SCHEMA = "mineru_staged_load_receipt.v6"
-_STAGED_LOAD_RECEIPT_SCHEMA_VERSION = 6
+_STAGED_LOAD_RECEIPT_SCHEMA = "mineru_staged_load_receipt.v7"
+_STAGED_LOAD_RECEIPT_SCHEMA_VERSION = 7
 _STAGED_LOAD_ADMISSION_PROFILE = "copy-index-fifo.v1"
 _STAGED_LOAD_SAFETY_LIMITS_PROFILE = "whole-document-runaway-and-drain.v1"
+_STAGED_LOAD_INFERENCE_LIVENESS_PROFILE = "epoch-bound-multimodal-canary.v1"
+_STAGED_LOAD_BOUNDARY_CANARY_SCHEMA = "mineru-arm-boundary-canary.v1"
+_STAGED_LOAD_CAMPAIGN_EPOCH_SCHEMA = "mineru-campaign-service-epoch.v1"
 _TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 _DEPLOYMENT_INPUT_PROFILE = "deployment_frozen_v1"
 _STAGED_LOAD_INPUT_PROFILE = "operator_frozen_heterogeneous_v2"
@@ -760,6 +763,7 @@ def _verify_staged_load_receipt(
         != _STAGED_LOAD_RECEIPT_SCHEMA_VERSION
         or receipt.get("status") != "pass"
         or receipt.get("failure") is not None
+        or receipt.get("secondary_failures") != []
     ):
         raise MinerUDeploymentGateError("MinerU staged-load receipt is not PASS")
     execution_id = receipt.get("execution_id")
@@ -1006,11 +1010,323 @@ def _verify_staged_load_receipt(
         receipt_elapsed_seconds=elapsed_seconds,
         expected_epochs=expected_host_epochs,
     )
+    verify_staged_load_inference_liveness_evidence(
+        receipt,
+        host_epochs=host_epochs,
+    )
     return (
         canonical_input,
         str(execution_id),
         host_epochs,
     )
+
+
+def verify_staged_load_inference_liveness_evidence(
+    receipt: Mapping[str, object],
+    *,
+    host_epochs: Mapping[str, tuple[str, str]],
+) -> tuple[str, str]:
+    """Verify both arm-boundary canaries inside one trusted service epoch."""
+
+    identity = receipt.get("identity")
+    campaign_epoch = receipt.get("campaign_epoch")
+    liveness = receipt.get("inference_liveness")
+    if not all(
+        isinstance(value, dict)
+        for value in (identity, campaign_epoch, liveness)
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load inference liveness evidence is missing"
+        )
+    assert isinstance(identity, dict)
+    assert isinstance(campaign_epoch, dict)
+    assert isinstance(liveness, dict)
+    host_capacity = receipt.get("host_capacity")
+    if not isinstance(host_capacity, dict):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load host evidence is missing"
+        )
+    if (
+        set(campaign_epoch)
+        != {
+            "schema",
+            "expected_sha256",
+            "observed_sha256",
+            "windows_node_identity_sha256",
+            "collector_sha256",
+            "services",
+        }
+        or campaign_epoch.get("schema") != _STAGED_LOAD_CAMPAIGN_EPOCH_SCHEMA
+        or not _is_prefixed_sha256(campaign_epoch.get("observed_sha256"))
+        or not _is_prefixed_sha256(campaign_epoch.get("expected_sha256"))
+        or campaign_epoch.get("expected_sha256")
+        != campaign_epoch.get("observed_sha256")
+        or not _is_prefixed_sha256(
+            campaign_epoch.get("windows_node_identity_sha256")
+        )
+        or not _is_prefixed_sha256(campaign_epoch.get("collector_sha256"))
+        or campaign_epoch.get("windows_node_identity_sha256")
+        != host_capacity.get("windows_node_identity_sha256")
+        or campaign_epoch.get("collector_sha256")
+        != host_capacity.get("collector_sha256")
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load campaign epoch evidence is invalid"
+        )
+    services = campaign_epoch.get("services")
+    if not isinstance(services, dict) or set(services) != {
+        "proxy",
+        "inference",
+    }:
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load campaign epoch containers are invalid"
+        )
+    canonical_services: dict[str, dict[str, str]] = {}
+    for role, name in (
+        ("proxy", "mineru-api-proxy"),
+        ("inference", "mineru-openai-server"),
+    ):
+        value = services.get(role)
+        expected_epoch = host_epochs.get(name)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"name", "container_id", "started_at_utc"}
+            or value.get("name") != name
+            or not isinstance(value.get("container_id"), str)
+            or not isinstance(value.get("started_at_utc"), str)
+            or expected_epoch
+            != (value.get("container_id"), value.get("started_at_utc"))
+        ):
+            raise MinerUDeploymentGateError(
+                "MinerU staged-load campaign epoch drifted from host evidence"
+            )
+        canonical_services[role] = {
+            "name": name,
+            "container_id": str(value["container_id"]),
+            "started_at_utc": str(value["started_at_utc"]),
+        }
+    canonical_epoch = {
+        "schema": _STAGED_LOAD_CAMPAIGN_EPOCH_SCHEMA,
+        "windows_node_identity_sha256": campaign_epoch[
+            "windows_node_identity_sha256"
+        ],
+        "collector_sha256": campaign_epoch["collector_sha256"],
+        "services": canonical_services,
+    }
+    observed_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(
+            canonical_epoch,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if campaign_epoch.get("observed_sha256") != observed_sha256:
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load campaign epoch hash is invalid"
+        )
+    if set(liveness) != {
+        "schema",
+        "profile",
+        "pre_arm",
+        "workload_started_at_utc",
+        "workload_finished_at_utc",
+        "workload_started_observed_seconds",
+        "workload_finished_observed_seconds",
+        "post_arm",
+    } or (
+        liveness.get("schema") != "mineru-arm-inference-liveness.v1"
+        or liveness.get("profile") != _STAGED_LOAD_INFERENCE_LIVENESS_PROFILE
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load inference liveness profile is invalid"
+        )
+    arm_started = _required_aware_timestamp(
+        receipt.get("started_at_utc"),
+        label="MinerU staged-load start",
+    )
+    arm_finished = _required_aware_timestamp(
+        receipt.get("finished_at_utc"),
+        label="MinerU staged-load finish",
+    )
+    workload_started = _required_aware_timestamp(
+        liveness.get("workload_started_at_utc"),
+        label="MinerU staged-load workload start",
+    )
+    workload_finished = _required_aware_timestamp(
+        liveness.get("workload_finished_at_utc"),
+        label="MinerU staged-load workload finish",
+    )
+    workload_started_observed = _nonnegative_finite_value(
+        liveness.get("workload_started_observed_seconds")
+    )
+    workload_finished_observed = _nonnegative_finite_value(
+        liveness.get("workload_finished_observed_seconds")
+    )
+    if (
+        workload_started_observed is None
+        or workload_finished_observed is None
+        or workload_started_observed >= workload_finished_observed
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load observed workload timeline is invalid"
+        )
+    model_id = identity.get("served_model_id")
+    runtime_identity = identity.get("runtime_manifest_identity_sha256")
+    if not isinstance(model_id, str) or not _is_prefixed_sha256(runtime_identity):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load liveness identity is invalid"
+        )
+
+    topology = receipt.get("topology")
+    expected_endpoint_sha256 = (
+        topology.get("observability_endpoint_sha256")
+        if isinstance(topology, dict)
+        else None
+    )
+    if not _is_prefixed_sha256(expected_endpoint_sha256):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load liveness endpoint identity is invalid"
+        )
+    expected_inference_epoch = canonical_services["inference"]
+
+    def verify_boundary(
+        value: object,
+        *,
+        label: str,
+        phase: str,
+    ) -> tuple[datetime, datetime, float, float]:
+        if not isinstance(value, dict) or set(value) != {
+            "schema",
+            "phase",
+            "status",
+            "started_at_utc",
+            "finished_at_utc",
+            "started_observed_seconds",
+            "finished_observed_seconds",
+            "elapsed_seconds",
+            "model_id",
+            "attempts",
+            "observability_endpoint_sha256",
+            "request_sha256",
+            "response_sha256",
+            "runtime_manifest_identity_sha256",
+            "campaign_epoch_sha256",
+            "inference_epoch",
+            "failure",
+        }:
+            raise MinerUDeploymentGateError(
+                f"MinerU staged-load {label} canary evidence is invalid"
+            )
+        response_sha256 = value.get("response_sha256")
+        started_observed = _nonnegative_finite_value(
+            value.get("started_observed_seconds")
+        )
+        finished_observed = _nonnegative_finite_value(
+            value.get("finished_observed_seconds")
+        )
+        elapsed_seconds = _nonnegative_finite_value(value.get("elapsed_seconds"))
+        if (
+            value.get("schema") != _STAGED_LOAD_BOUNDARY_CANARY_SCHEMA
+            or value.get("phase") != phase
+            or value.get("status") != "pass"
+            or value.get("failure") is not None
+            or value.get("model_id") != model_id
+            or value.get("attempts") != 1
+            or value.get("observability_endpoint_sha256")
+            != expected_endpoint_sha256
+            or value.get("request_sha256")
+            != "sha256:" + canary_request_sha256(model_id)
+            or not isinstance(response_sha256, list)
+            or len(response_sha256) != 1
+            or not _is_prefixed_sha256(response_sha256[0])
+            or value.get("runtime_manifest_identity_sha256") != runtime_identity
+            or value.get("campaign_epoch_sha256") != observed_sha256
+            or value.get("inference_epoch") != expected_inference_epoch
+            or started_observed is None
+            or finished_observed is None
+            or elapsed_seconds is None
+            or elapsed_seconds <= 0
+            or finished_observed <= started_observed
+            or abs(
+                (finished_observed - started_observed) - elapsed_seconds
+            )
+            > 0.001
+        ):
+            raise MinerUDeploymentGateError(
+                f"MinerU staged-load {label} canary identity is invalid"
+            )
+        started = _required_aware_timestamp(
+            value.get("started_at_utc"),
+            label=f"MinerU staged-load {label} canary start",
+        )
+        finished = _required_aware_timestamp(
+            value.get("finished_at_utc"),
+            label=f"MinerU staged-load {label} canary finish",
+        )
+        if not started < finished:
+            raise MinerUDeploymentGateError(
+                f"MinerU staged-load {label} canary timeline is invalid"
+            )
+        return started, finished, started_observed, finished_observed
+
+    pre_started, pre_finished, pre_started_observed, pre_finished_observed = (
+        verify_boundary(
+            liveness.get("pre_arm"),
+            label="pre-arm",
+            phase="pre_arm",
+        )
+    )
+    post_started, post_finished, post_started_observed, post_finished_observed = (
+        verify_boundary(
+            liveness.get("post_arm"),
+            label="post-arm",
+            phase="post_arm",
+        )
+    )
+    if not (
+        arm_started
+        <= pre_started
+        < pre_finished
+        <= workload_started
+        < workload_finished
+        <= post_started
+        < post_finished
+        <= arm_finished
+        and pre_started_observed
+        < pre_finished_observed
+        <= workload_started_observed
+        < workload_finished_observed
+        <= post_started_observed
+        < post_finished_observed
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load inference liveness timeline is invalid"
+        )
+    samples = host_capacity.get("samples")
+    first_sample = samples[0] if isinstance(samples, list) and samples else None
+    last_sample = samples[-1] if isinstance(samples, list) and samples else None
+    first_observed = (
+        _nonnegative_finite_value(first_sample.get("observed_seconds"))
+        if isinstance(first_sample, dict)
+        else None
+    )
+    last_observed = (
+        _nonnegative_finite_value(last_sample.get("observed_seconds"))
+        if isinstance(last_sample, dict)
+        else None
+    )
+    if (
+        first_observed is None
+        or last_observed is None
+        or first_observed > pre_started_observed
+        or last_observed < post_finished_observed
+    ):
+        raise MinerUDeploymentGateError(
+            "MinerU staged-load host samples do not bracket arm canaries"
+        )
+    expected_sha256 = campaign_epoch.get("expected_sha256")
+    assert isinstance(expected_sha256, str)
+    return expected_sha256, observed_sha256
 
 
 def verify_host_capacity_evidence(
@@ -1799,4 +2115,5 @@ __all__ = [
     "VerifiedMinerUDeployment",
     "require_mineru_deployment_gate",
     "verify_mineru_deployment_gate",
+    "verify_staged_load_inference_liveness_evidence",
 ]

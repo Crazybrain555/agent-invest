@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
-import http.client
 import json
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+from disclosure_anchor.adapters.runtime.bounded_http import (
+    BoundedHTTPProtocolError,
+    BoundedHTTPTransportError,
+    ThreadOwnedPersistentHTTPClient,
+)
 
 
 CANARY_SCHEMA = "mineru_multimodal_canary.v2"
@@ -45,6 +48,12 @@ class MinerUCanaryError(RuntimeError):
 
 class MinerUCanaryUnavailableError(MinerUCanaryError):
     """The remote model endpoint was temporarily unreachable."""
+
+
+class _CanaryHTTPStatusError(RuntimeError):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -93,31 +102,30 @@ def probe_mineru_served_model(
 ) -> str:
     """Read the singleton served-model identity without an OCR request."""
 
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    client: ThreadOwnedPersistentHTTPClient | None = None
     try:
+        client = _direct_client(server_url)
         model_id = _read_served_model(
-            opener,
-            _api_root(server_url),
+            client,
             timeout_seconds=timeout_seconds,
         )
-    except urllib.error.HTTPError as exc:
-        if exc.code in _RETRYABLE_HTTP_STATUS_CODES:
+    except _CanaryHTTPStatusError as exc:
+        if exc.status in _RETRYABLE_HTTP_STATUS_CODES:
             raise MinerUCanaryUnavailableError(str(exc)) from exc
         raise MinerUCanaryError(
-            f"served-model endpoint returned non-retryable HTTP {exc.code}"
+            f"served-model endpoint returned non-retryable HTTP {exc.status}"
         ) from exc
-    except (
-        OSError,
-        TimeoutError,
-        http.client.HTTPException,
-        urllib.error.URLError,
-    ) as exc:
+    except BoundedHTTPTransportError as exc:
         raise MinerUCanaryUnavailableError(str(exc)) from exc
     except (
+        BoundedHTTPProtocolError,
         ValueError,
         json.JSONDecodeError,
     ) as exc:
         raise MinerUCanaryError(str(exc)) from exc
+    finally:
+        if client is not None:
+            client.close()
     if expected_model_id is not None and model_id != expected_model_id:
         raise MinerUCanaryError(
             "served MinerU model identity drifted from attestation"
@@ -133,23 +141,24 @@ def run_mineru_multimodal_canary(
 ) -> MinerUCanaryEvidence:
     if attempts < 1:
         raise ValueError("canary attempts must be positive")
-    api_root = _api_root(server_url)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    client: ThreadOwnedPersistentHTTPClient | None = None
     try:
-        model_id = _read_served_model(opener, api_root, timeout_seconds=15)
+        client = _direct_client(server_url)
+        model_id = _read_served_model(client, timeout_seconds=15)
         if expected_model_id is not None and model_id != expected_model_id:
             raise ValueError("served MinerU model identity drifted from attestation")
         request_bytes = _canary_request_bytes(model_id)
         response_hashes: list[str] = []
         for _ in range(attempts):
-            request = urllib.request.Request(
-                api_root + "/chat/completions",
-                data=request_bytes,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+            status, completion_bytes = client.post_bytes(
+                "/chat/completions",
+                request_bytes,
+                content_type="application/json",
+                timeout_seconds=90,
+                transport_attempts=1,
             )
-            with opener.open(request, timeout=90) as response:
-                completion_bytes = _read_bounded(response)
+            if status != 200:
+                raise _CanaryHTTPStatusError(status)
             completion_payload = json.loads(completion_bytes)
             if not isinstance(completion_payload, dict):
                 raise ValueError("multimodal canary response root must be an object")
@@ -177,14 +186,16 @@ def run_mineru_multimodal_canary(
                 )
             response_hashes.append(_sha256(completion_bytes))
     except (
-        OSError,
-        TimeoutError,
-        http.client.HTTPException,
-        urllib.error.URLError,
+        _CanaryHTTPStatusError,
+        BoundedHTTPProtocolError,
+        BoundedHTTPTransportError,
         ValueError,
         json.JSONDecodeError,
     ) as exc:
         raise MinerUCanaryError(str(exc)) from exc
+    finally:
+        if client is not None:
+            client.close()
     return MinerUCanaryEvidence(
         model_id=model_id,
         attempts=attempts,
@@ -200,14 +211,27 @@ def _api_root(server_url: str) -> str:
     return api_root
 
 
+def _direct_client(server_url: str) -> ThreadOwnedPersistentHTTPClient:
+    return ThreadOwnedPersistentHTTPClient(
+        _api_root(server_url),
+        maximum_response_bytes=_MAX_RESPONSE_BYTES,
+        user_agent="disclosure-anchor-mineru-canary/1",
+    )
+
+
 def _read_served_model(
-    opener: Any,
-    api_root: str,
+    client: ThreadOwnedPersistentHTTPClient,
     *,
     timeout_seconds: float,
 ) -> str:
-    with opener.open(api_root + "/models", timeout=timeout_seconds) as response:
-        models_payload = json.loads(_read_bounded(response))
+    status, payload = client.get_bytes(
+        "/models",
+        timeout_seconds=timeout_seconds,
+        transport_attempts=1,
+    )
+    if status != 200:
+        raise _CanaryHTTPStatusError(status)
+    models_payload = json.loads(payload)
     if not isinstance(models_payload, dict):
         raise ValueError("served-model response root must be an object")
     models = models_payload.get("data")
@@ -253,15 +277,6 @@ def _canary_request_bytes(model_id: str) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-
-
-def _read_bounded(response: Any) -> bytes:
-    payload = response.read(_MAX_RESPONSE_BYTES + 1)
-    if not isinstance(payload, bytes):
-        raise ValueError("MinerU response body is not bytes")
-    if len(payload) > _MAX_RESPONSE_BYTES:
-        raise ValueError("MinerU response body exceeds the safety limit")
-    return payload
 
 
 def canary_cache_is_fresh(

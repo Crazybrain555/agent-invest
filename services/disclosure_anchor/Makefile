@@ -28,7 +28,7 @@ WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISC
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	lint typecheck agent-check api archive pg-init pg-start pg-stop \
 	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
-	worker-status worker-restart mineru-smoke mineru-staged-load mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
+	worker-status worker-restart mineru-smoke mineru-campaign-epoch-freeze mineru-staged-load mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
 	generate-current-source-replay audit-live-unit-replay capacity-observe capacity-verify capacity-summary capacity-commission capacity-catalog
 
 doctor:
@@ -225,11 +225,27 @@ mineru-smoke:
 # DB/queue-free fixed-API load gate. Stages are intentionally not configurable:
 # 4/8/16 documents use a single API-facing outstanding submission; huge inputs
 # remain exclusive. A pinned process-external observer proves epoch/OOM/RSS/memory.
+mineru-campaign-epoch-freeze:
+	@test -n "$(RUNTIME_MANIFEST)" || (echo 'mineru-campaign-epoch-freeze: RUNTIME_MANIFEST is required' && exit 2)
+	@test -n "$(EPOCH_RECEIPT)" || (echo 'mineru-campaign-epoch-freeze: EPOCH_RECEIPT is required' && exit 2)
+	@test -n "$(SSH_HOST)" || (echo 'mineru-campaign-epoch-freeze: SSH_HOST is required' && exit 2)
+	@test -n "$(SSH_USER)" || (echo 'mineru-campaign-epoch-freeze: SSH_USER is required' && exit 2)
+	@test -n "$(SSH_IDENTITY)" || (echo 'mineru-campaign-epoch-freeze: SSH_IDENTITY is required' && exit 2)
+	@test -n "$(SSH_KNOWN_HOSTS)" || (echo 'mineru-campaign-epoch-freeze: SSH_KNOWN_HOSTS is required' && exit 2)
+	@test -n "$(DOCKER_MEMORY_RESERVE_BYTES)" || (echo 'mineru-campaign-epoch-freeze: DOCKER_MEMORY_RESERVE_BYTES is required' && exit 2)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m scripts.freeze_mineru_campaign_epoch \
+		--runtime-manifest "$(RUNTIME_MANIFEST)" \
+		--receipt-out "$(EPOCH_RECEIPT)" \
+		--ssh-host "$(SSH_HOST)" --ssh-user "$(SSH_USER)" --ssh-port "$(SSH_PORT)" \
+		--ssh-identity "$(SSH_IDENTITY)" --ssh-known-hosts "$(SSH_KNOWN_HOSTS)" \
+		--docker-memory-reserve-bytes "$(DOCKER_MEMORY_RESERVE_BYTES)"
+
 mineru-staged-load:
-	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> RECEIPT=/path/new-receipt.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> [WORK_ROOT=/private/scratch DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 API_DRAIN_TIMEOUT_SECONDS=86400]' && exit 2)
+	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-staged-load RUNTIME_MANIFEST=/path/runtime.json CORPUS_MANIFEST=/path/frozen-corpus.json EXPECTED_CORPUS_SHA256=<sha256> EXPECTED_CAMPAIGN_EPOCH_SHA256=<sha256> RECEIPT=/path/new-receipt.json SSH_HOST=<host> SSH_USER=<user> SSH_IDENTITY=/private/key SSH_KNOWN_HOSTS=/private/known_hosts DOCKER_MEMORY_RESERVE_BYTES=<bytes> [WORK_ROOT=/private/scratch DOCUMENT_RUNAWAY_TIMEOUT_SECONDS=86400 API_DRAIN_TIMEOUT_SECONDS=86400]' && exit 2)
 	@test -z "$(TIMEOUT_SECONDS)" || (echo 'mineru-staged-load: TIMEOUT_SECONDS is obsolete; use the two explicit safety-limit variables' && exit 2)
 	@test -n "$(CORPUS_MANIFEST)" || (echo 'mineru-staged-load: CORPUS_MANIFEST is required' && exit 2)
 	@test -n "$(EXPECTED_CORPUS_SHA256)" || (echo 'mineru-staged-load: EXPECTED_CORPUS_SHA256 is required' && exit 2)
+	@test -n "$(EXPECTED_CAMPAIGN_EPOCH_SHA256)" || (echo 'mineru-staged-load: EXPECTED_CAMPAIGN_EPOCH_SHA256 is required' && exit 2)
 	@test -n "$(RECEIPT)" || (echo 'mineru-staged-load: RECEIPT is required' && exit 2)
 	@test -n "$(SSH_HOST)" || (echo 'mineru-staged-load: SSH_HOST is required' && exit 2)
 	@test -n "$(SSH_USER)" || (echo 'mineru-staged-load: SSH_USER is required' && exit 2)
@@ -240,6 +256,7 @@ mineru-staged-load:
 		--runtime-manifest "$(RUNTIME_MANIFEST)" \
 		--corpus-manifest "$(CORPUS_MANIFEST)" \
 		--expected-corpus-sha256 "$(EXPECTED_CORPUS_SHA256)" \
+		--expected-campaign-epoch-sha256 "$(EXPECTED_CAMPAIGN_EPOCH_SHA256)" \
 		--receipt-out "$(RECEIPT)" \
 		--host-observer-ssh-host "$(SSH_HOST)" \
 		--host-observer-ssh-user "$(SSH_USER)" \
