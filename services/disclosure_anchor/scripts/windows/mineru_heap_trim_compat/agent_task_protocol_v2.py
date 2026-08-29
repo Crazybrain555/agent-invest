@@ -17,13 +17,14 @@ from threading import RLock
 from typing import Any, Literal
 
 TaskState = Literal[
-    "pending", "processing", "finalizing", "completed", "failed", "consumed"
+    "pending", "processing", "finalizing", "completed", "failed",
+    "cleanup_pending", "consumed"
 ]
 _MAX_REGISTRY_BYTES = 16 * 1024 * 1024
 _MAX_RECORDS = 128
 _MAX_TOMBSTONES = 8192
 _MAX_TASK_PAYLOAD_BYTES = 64 * 1024
-_KEY_BUCKET_SECONDS = 3600
+_MAX_CLOCK_SKEW_SECONDS = 300
 
 
 class TaskProtocolConflict(RuntimeError):
@@ -120,11 +121,13 @@ class DurableTaskRecord:
                 self.result_owner,
             )
         )
-        if self.state in {"completed", "consumed"} and not has_result_identity:
+        if self.state in {"completed", "cleanup_pending"} and not has_result_identity:
             raise TaskProtocolConflict("terminal task result identity is incomplete")
-        if self.state == "completed" and not isinstance(self.result_path, str):
+        if self.state == "consumed" and any(value is not None for value in identities) != has_result_identity:
+            raise TaskProtocolConflict("consumed result identity is incomplete")
+        if self.state in {"completed", "cleanup_pending"} and not isinstance(self.result_path, str):
             raise TaskProtocolConflict("completed task result path is absent")
-        if self.state not in {"completed", "consumed"} and any(
+        if self.state not in {"completed", "cleanup_pending", "consumed"} and any(
             value is not None
             for value in (
                 self.result_path,
@@ -151,7 +154,7 @@ class DurableTaskRegistry:
     ) -> None:
         if max_unacked_result_bytes < 1:
             raise ValueError("unacked result byte limit must be positive")
-        if not _KEY_BUCKET_SECONDS <= tombstone_retention_seconds <= 30 * 86400:
+        if not 3600 <= tombstone_retention_seconds <= 30 * 86400:
             raise ValueError("tombstone retention must be between one hour and 30 days")
         self._path = path
         self._limit = max_unacked_result_bytes
@@ -173,6 +176,7 @@ class DurableTaskRegistry:
         finally:
             os.close(root_fd)
         self._lock = RLock()
+        self._submission_watermark_bucket = -1
         self._records = self._load()
 
     def reconcile_or_create(
@@ -187,7 +191,7 @@ class DurableTaskRegistry:
         if not all(value.strip() for value in values):
             raise ValueError("task protocol identities must be non-empty")
         with self._lock:
-            self._validate_key_lifecycle(idempotency_key)
+            observed_server_epoch = self._validate_key_lifecycle(idempotency_key)
             self._prune_expired_tombstones()
             existing = self._records.get(idempotency_key)
             if existing is not None:
@@ -198,7 +202,23 @@ class DurableTaskRegistry:
                     raise TaskProtocolConflict(
                         "idempotency key was reused with different attempt/fence"
                     )
+                if (
+                    observed_server_epoch is not None
+                    and observed_server_epoch > self._submission_watermark_bucket
+                ):
+                    previous_watermark = self._submission_watermark_bucket
+                    self._submission_watermark_bucket = observed_server_epoch
+                    try:
+                        self._persist()
+                    except BaseException:
+                        self._submission_watermark_bucket = previous_watermark
+                        raise
                 return existing, False
+            previous_watermark = self._submission_watermark_bucket
+            if observed_server_epoch is not None:
+                self._submission_watermark_bucket = max(
+                    self._submission_watermark_bucket, observed_server_epoch
+                )
             if sum(record.state != "consumed" for record in self._records.values()) >= _MAX_RECORDS:
                 raise TaskProtocolConflict("active task registry capacity exhausted")
             if sum(record.state == "consumed" for record in self._records.values()) >= _MAX_TOMBSTONES:
@@ -210,7 +230,12 @@ class DurableTaskRegistry:
                 fence_identity=fence_identity,
             )
             self._records[idempotency_key] = record
-            self._persist()
+            try:
+                self._persist()
+            except BaseException:
+                del self._records[idempotency_key]
+                self._submission_watermark_bucket = previous_watermark
+                raise
             return record, True
 
     def get(self, idempotency_key: str) -> DurableTaskRecord | None:
@@ -267,6 +292,7 @@ class DurableTaskRegistry:
                     | getattr(os, "O_NOFOLLOW", 0), dir_fd=task_fd,
                 )
                 try:
+                    upload_meta = os.fstat(upload_fd)
                     upload_identities = [
                         self._stable_file_identity_at(
                             upload_fd, Path(value), expected_parent=upload_root
@@ -283,6 +309,8 @@ class DurableTaskRegistry:
             normalized["_agent_protocol"] = {
                 "schema": "mineru-task-payload-owner.v1",
                 "task_root": str(output.resolve()),
+                "task_root_identity": self._directory_identity(output_meta),
+                "uploads_root_identity": self._directory_identity(upload_meta),
                 "generation": record.recovery_generation,
                 "uploads": upload_identities,
             }
@@ -364,6 +392,12 @@ class DurableTaskRegistry:
                 | getattr(os, "O_NOFOLLOW", 0), dir_fd=task_fd,
             )
             try:
+                if self._directory_identity(output_meta) != protocol.get(
+                    "task_root_identity"
+                ) or self._directory_identity(os.fstat(upload_fd)) != protocol.get(
+                    "uploads_root_identity"
+                ):
+                    raise TaskProtocolConflict("restart task directory identity drifted")
                 observed = [
                     self._stable_file_identity_at(
                         upload_fd, Path(value), expected_parent=upload_root
@@ -381,6 +415,15 @@ class DurableTaskRegistry:
         finally:
             os.close(task_fd)
             os.close(root_fd)
+
+    @staticmethod
+    def _directory_identity(metadata: os.stat_result) -> dict[str, int]:
+        return {
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "uid": metadata.st_uid,
+            "mode": metadata.st_mode,
+        }
 
     @staticmethod
     def _stable_file_identity_at(
@@ -459,9 +502,9 @@ class DurableTaskRegistry:
         else:
             os.unlink(name, dir_fd=parent_fd)
 
-    def _validate_key_lifecycle(self, key: str) -> None:
+    def _validate_key_lifecycle(self, key: str) -> int | None:
         if not self._enforce_key_lifecycle:
-            return
+            return None
         try:
             bucket_text, digest = key.split(".", 1)
             bucket = int(bucket_text, 16)
@@ -470,10 +513,12 @@ class DurableTaskRegistry:
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise TaskProtocolConflict("idempotency key digest is invalid")
         now = self._clock()
-        now_bucket = int(now // _KEY_BUCKET_SECONDS)
-        oldest = int((now - self._retention) // _KEY_BUCKET_SECONDS)
-        if bucket < oldest or bucket > now_bucket:
+        oldest = int(now - self._retention)
+        if bucket < oldest or bucket > int(now + _MAX_CLOCK_SKEW_SECONDS):
             raise TaskProtocolConflict("idempotency key lifecycle expired")
+        if int(now) < self._submission_watermark_bucket - _MAX_CLOCK_SKEW_SECONDS:
+            raise TaskProtocolConflict("server clock rolled back behind watermark")
+        return int(now)
 
     def _prune_expired_tombstones(self) -> None:
         if not self._enforce_key_lifecycle:
@@ -513,13 +558,35 @@ class DurableTaskRegistry:
             record.reserved_result_bytes = 0
             self._persist()
 
+    def acknowledge_failed(self, idempotency_key: str) -> None:
+        """Compact one observed failed terminal without losing idempotency history."""
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state == "consumed":
+                return
+            if record.state != "failed":
+                raise TaskProtocolConflict("only failed tasks can use failed ACK")
+            previous_error = record.error
+            record.state = "consumed"
+            record.consumed_at_unix = self._clock()
+            record.task_payload = None
+            record.error = None
+            try:
+                self._persist()
+            except BaseException:
+                record.state = "failed"
+                record.consumed_at_unix = None
+                record.error = previous_error
+                raise
+
     def transition(self, idempotency_key: str, target: TaskState) -> None:
         allowed: dict[TaskState, frozenset[TaskState]] = {
             "pending": frozenset({"processing", "failed"}),
             "processing": frozenset({"finalizing", "failed"}),
             "finalizing": frozenset({"completed", "failed"}),
-            "completed": frozenset({"consumed"}),
+            "completed": frozenset({"cleanup_pending"}),
             "failed": frozenset(),
+            "cleanup_pending": frozenset({"consumed"}),
             "consumed": frozenset(),
         }
         with self._lock:
@@ -596,7 +663,7 @@ class DurableTaskRegistry:
         return sum(
             record.result_bytes or 0
             for record in self._records.values()
-            if record.state in {"completed", "consumed"} and record.result_path
+            if record.state in {"completed", "cleanup_pending", "consumed"} and record.result_path
         )
 
     def lease(self, idempotency_key: str, *, seconds: float) -> float:
@@ -640,37 +707,121 @@ class DurableTaskRegistry:
     def acknowledge(self, idempotency_key: str) -> None:
         with self._lock:
             record = self._required(idempotency_key)
-            if record.state == "consumed":
+            if record.state in {"cleanup_pending", "consumed"}:
                 return
             if record.state != "completed" or record.active_readers:
                 raise TaskProtocolConflict(
                     "result cannot be ACKed while unavailable/in use"
                 )
-            record.state = "consumed"
-            record.consumed_at_unix = self._clock()
-            self._persist()
+            record.state = "cleanup_pending"
+            try:
+                self._persist()
+            except BaseException:
+                record.state = "completed"
+                raise
 
-    def cleanup_consumed(self, unlink: Callable[[Path], None]) -> int:
+    def cleanup_consumed(
+        self, unlink: Callable[[Path], None] | None = None
+    ) -> int:
         with self._lock:
             removable = [
                 key
                 for key, record in self._records.items()
-                if record.state == "consumed" and record.active_readers == 0
+                if record.state == "cleanup_pending" and record.active_readers == 0
             ]
             cleaned = 0
             for key in removable:
                 record = self._records[key]
                 if record.result_path:
-                    unlink(Path(record.result_path))
+                    previous = (
+                        record.result_path,
+                        record.task_payload,
+                        record.lease_until_unix,
+                        record.error,
+                        record.reserved_result_bytes,
+                        record.state,
+                        record.consumed_at_unix,
+                    )
+                    try:
+                        self._unlink_owned_result(
+                            record, before_unlink=unlink
+                        )
+                    except FileNotFoundError:
+                        pass
                     record.result_path = None
                     record.task_payload = None
                     record.lease_until_unix = None
                     record.error = None
                     record.reserved_result_bytes = 0
+                    record.state = "consumed"
+                    record.consumed_at_unix = self._clock()
+                    try:
+                        self._persist()
+                    except BaseException:
+                        (
+                            record.result_path,
+                            record.task_payload,
+                            record.lease_until_unix,
+                            record.error,
+                            record.reserved_result_bytes,
+                            record.state,
+                            record.consumed_at_unix,
+                        ) = previous
+                        raise
                     cleaned += 1
-            if cleaned:
-                self._persist()
             return cleaned
+
+    def _unlink_owned_result(
+        self,
+        record: DurableTaskRecord,
+        *,
+        before_unlink: Callable[[Path], None] | None,
+    ) -> None:
+        payload = record.task_payload or {}
+        protocol = payload.get("_agent_protocol")
+        output_value = payload.get("output_dir")
+        if not isinstance(protocol, dict) or not isinstance(output_value, str):
+            if not self._enforce_key_lifecycle and record.result_path:
+                if before_unlink is None:
+                    Path(record.result_path).unlink()
+                else:
+                    before_unlink(Path(record.result_path))
+                return
+            raise TaskProtocolConflict("cleanup task ownership receipt is absent")
+        output = Path(output_value)
+        result = Path(record.result_path or "")
+        if result.parent.resolve() != output.resolve() or result.name in {"", ".", ".."}:
+            raise TaskProtocolConflict("cleanup result escaped task root")
+        root_fd, task_fd = self._open_task_dir(record.task_id)
+        try:
+            if self._directory_identity(os.fstat(task_fd)) != protocol.get(
+                "task_root_identity"
+            ):
+                raise TaskProtocolConflict("cleanup task directory identity drifted")
+            upload_fd = os.open(
+                "uploads",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=task_fd,
+            )
+            try:
+                if self._directory_identity(os.fstat(upload_fd)) != protocol.get(
+                    "uploads_root_identity"
+                ):
+                    raise TaskProtocolConflict(
+                        "cleanup uploads directory identity drifted"
+                    )
+            finally:
+                os.close(upload_fd)
+            metadata = os.stat(result.name, dir_fd=task_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise TaskProtocolConflict("cleanup result identity is unsafe")
+            if before_unlink is not None:
+                before_unlink(result)
+            os.unlink(result.name, dir_fd=task_fd)
+        finally:
+            os.close(task_fd)
+            os.close(root_fd)
 
     def _required(self, key: str) -> DurableTaskRecord:
         try:
@@ -735,7 +886,7 @@ class DurableTaskRegistry:
         )
         if (
             not isinstance(payload, dict)
-            or set(payload) != {"schema", "output_root", "records"}
+            or set(payload) != {"schema", "output_root", "submission_watermark_bucket", "records"}
             or payload.get("schema") != "mineru-task-registry.v2"
         ):
             raise TaskProtocolConflict("task registry schema is invalid")
@@ -748,6 +899,10 @@ class DurableTaskRegistry:
         }
         if payload.get("output_root") != expected_root:
             raise TaskProtocolConflict("configured output root identity drifted")
+        watermark = payload.get("submission_watermark_bucket")
+        if not isinstance(watermark, int) or isinstance(watermark, bool) or watermark < -1:
+            raise TaskProtocolConflict("submission watermark is invalid")
+        self._submission_watermark_bucket = watermark
         records = payload.get("records")
         if not isinstance(records, list) or len(records) > _MAX_RECORDS + _MAX_TOMBSTONES:
             raise TaskProtocolConflict("task registry records are invalid")
@@ -766,6 +921,7 @@ class DurableTaskRegistry:
                 "finalizing",
                 "completed",
                 "failed",
+                "cleanup_pending",
                 "consumed",
             }:
                 raise TaskProtocolConflict("task registry state is invalid")
@@ -773,9 +929,16 @@ class DurableTaskRegistry:
             task_ids.add(record.task_id)
         for record in loaded.values():
             record.active_readers = 0
-            if record.state in {"completed", "consumed"} and record.result_path:
+            if record.state in {"completed", "cleanup_pending", "consumed"} and record.result_path:
                 result_path = Path(record.result_path or "")
-                metadata = result_path.lstat()
+                try:
+                    metadata = result_path.lstat()
+                except FileNotFoundError:
+                    if record.state == "cleanup_pending":
+                        continue
+                    raise TaskProtocolConflict(
+                        "retained result disappeared outside cleanup intent"
+                    ) from None
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise TaskProtocolConflict("retained result file identity is unsafe")
                 digest = hashlib.sha256()
@@ -807,6 +970,7 @@ class DurableTaskRegistry:
                     "uid": self._output_root_identity[2],
                     "mode": self._output_root_identity[3],
                 },
+                "submission_watermark_bucket": self._submission_watermark_bucket,
                 "records": [
                     asdict(record)
                     for record in sorted(

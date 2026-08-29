@@ -42,7 +42,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
 
     @staticmethod
     def _lifecycle_key(index: int, now: float) -> str:
-        bucket = int(now // 3600)
+        bucket = int(now)
         digest = hashlib.sha256(f"task-key-{index}".encode()).hexdigest()
         return f"{bucket:x}.{digest}"
 
@@ -116,10 +116,23 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                     attempt_identity="attempt",
                     fence_identity="fence",
                 )
+                task_root = root / task_id
+                uploads = task_root / "uploads"
+                uploads.mkdir(parents=True)
+                upload = uploads / "input.pdf"
+                upload.write_bytes(b"pdf")
+                registry.bind_task_payload(
+                    key,
+                    {
+                        "task_id": task_id,
+                        "output_dir": str(task_root),
+                        "uploads": [str(upload)],
+                    },
+                )
                 registry.transition(key, "processing")
                 registry.transition(key, "finalizing")
                 registry.reserve_finalizer(key, byte_budget=1)
-                result = root / f"result-{index}.zip"
+                result = task_root / ".retained-result.zip"
                 result.write_bytes(b"x")
                 digest = hashlib.sha256(b"x").hexdigest()
                 owner = hashlib.sha256(
@@ -133,7 +146,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                     result_owner=owner,
                 )
                 registry.acknowledge(key)
-                self.assertEqual(registry.cleanup_consumed(Path.unlink), 1)
+                self.assertEqual(registry.cleanup_consumed(), 1)
 
             restarted = DurableTaskRegistry(
                 registry_path,
@@ -174,6 +187,144 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                     attempt_identity="attempt",
                     fence_identity="fence",
                 )
+
+    def test_failed_terminal_ack_allows_more_than_128_tasks_and_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [1_000_000.0]
+            registry_path = root / "registry.json"
+            registry = DurableTaskRegistry(
+                registry_path,
+                max_unacked_result_bytes=100,
+                output_root=root,
+                tombstone_retention_seconds=7200,
+                enforce_key_lifecycle=True,
+                clock=lambda: now[0],
+            )
+            first_key = self._lifecycle_key(0, now[0])
+            for index in range(130):
+                key = self._lifecycle_key(index, now[0])
+                registry.reconcile_or_create(
+                    idempotency_key=key,
+                    task_id=f"failed-{index}",
+                    attempt_identity="attempt",
+                    fence_identity="fence",
+                )
+                registry.fail(key, error="visible")
+                registry.acknowledge_failed(key)
+            restarted = DurableTaskRegistry(
+                registry_path,
+                max_unacked_result_bytes=100,
+                output_root=root,
+                tombstone_retention_seconds=7200,
+                enforce_key_lifecycle=True,
+                clock=lambda: now[0],
+            )
+            record, created = restarted.reconcile_or_create(
+                idempotency_key=first_key,
+                task_id="ignored",
+                attempt_identity="attempt",
+                fence_identity="fence",
+            )
+            self.assertFalse(created)
+            self.assertEqual(record.state, "consumed")
+            with self.assertRaisesRegex(TaskProtocolConflict, "different attempt"):
+                restarted.reconcile_or_create(
+                    idempotency_key=first_key,
+                    task_id="ignored",
+                    attempt_identity="changed",
+                    fence_identity="fence",
+                )
+
+    def test_submission_epoch_skew_and_server_clock_rollback_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [1_000_000.0]
+            registry = DurableTaskRegistry(
+                root / "registry.json",
+                max_unacked_result_bytes=100,
+                output_root=root,
+                tombstone_retention_seconds=7200,
+                enforce_key_lifecycle=True,
+                clock=lambda: now[0],
+            )
+            for index, epoch in enumerate((now[0] - 300, now[0] + 300)):
+                registry.reconcile_or_create(
+                    idempotency_key=self._lifecycle_key(index, epoch),
+                    task_id=f"skew-{index}",
+                    attempt_identity="attempt",
+                    fence_identity="fence",
+                )
+            now[0] += 1000
+            registry.reconcile_or_create(
+                idempotency_key=self._lifecycle_key(3, now[0]),
+                task_id="forward",
+                attempt_identity="attempt",
+                fence_identity="fence",
+            )
+            now[0] -= 301
+            with self.assertRaisesRegex(TaskProtocolConflict, "server clock rolled back"):
+                registry.reconcile_or_create(
+                    idempotency_key=self._lifecycle_key(4, now[0]),
+                    task_id="rollback",
+                    attempt_identity="attempt",
+                    fence_identity="fence",
+                )
+
+    def test_cleanup_intent_resumes_after_unlink_then_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            registry.transition("key", "processing")
+            registry.transition("key", "finalizing")
+            registry.reserve_finalizer("key", byte_budget=1)
+            result = root / "result.zip"
+            result.write_bytes(b"x")
+            digest = hashlib.sha256(b"x").hexdigest()
+            registry.complete(
+                "key",
+                result_path=result,
+                result_sha256=digest,
+                result_bytes=1,
+                result_owner=hashlib.sha256(
+                    f"task-key\0{digest}\0{1}".encode()
+                ).hexdigest(),
+            )
+            registry.acknowledge("key")
+            result.unlink()  # crash after unlink, before compact persistence
+            restarted = self._registry(root)
+            self.assertEqual(restarted.cleanup_consumed(Path.unlink), 1)
+            self.assertEqual(restarted.get("key").state, "consumed")  # type: ignore[union-attr]
+
+    def test_cleanup_persist_failure_keeps_retryable_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            registry.transition("key", "processing")
+            registry.transition("key", "finalizing")
+            registry.reserve_finalizer("key", byte_budget=1)
+            result = root / "result.zip"
+            result.write_bytes(b"x")
+            digest = hashlib.sha256(b"x").hexdigest()
+            registry.complete(
+                "key",
+                result_path=result,
+                result_sha256=digest,
+                result_bytes=1,
+                result_owner=hashlib.sha256(
+                    f"task-key\0{digest}\0{1}".encode()
+                ).hexdigest(),
+            )
+            registry.acknowledge("key")
+            original_persist = registry._persist
+            registry._persist = lambda: (_ for _ in ()).throw(OSError("persist"))
+            with self.assertRaisesRegex(OSError, "persist"):
+                registry.cleanup_consumed(Path.unlink)
+            self.assertEqual(registry.get("key").state, "cleanup_pending")  # type: ignore[union-attr]
+            registry._persist = original_persist
+            self.assertEqual(registry.cleanup_consumed(Path.unlink), 1)
 
     def test_idempotency_reconciles_exact_and_rejects_conflict_before_allocation(
         self,
@@ -316,7 +467,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
                 registry.cleanup_consumed(
                     lambda _path: (_ for _ in ()).throw(OSError("blocked"))
                 )
-            self.assertEqual(registry.get("key").state, "consumed")  # type: ignore[union-attr]
+            self.assertEqual(registry.get("key").state, "cleanup_pending")  # type: ignore[union-attr]
             self.assertEqual(registry.cleanup_consumed(Path.unlink), 1)
             self.assertIsNotNone(registry.get("key"))
 
@@ -502,6 +653,32 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             self.assertIsNotNone(by_task)
             assert by_task is not None
             self.assertEqual(by_task.idempotency_key, "key")
+
+    def test_restart_rejects_renamed_and_replaced_task_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            output = root / "task-key"
+            uploads = output / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"pdf")
+            registry.bind_task_payload(
+                "key",
+                {
+                    "task_id": "task-key",
+                    "output_dir": str(output),
+                    "uploads": [str(upload)],
+                },
+            )
+            registry.transition("key", "processing")
+            output.rename(root / "original-task-key")
+            replacement_uploads = output / "uploads"
+            replacement_uploads.mkdir(parents=True)
+            (replacement_uploads / "input.pdf").write_bytes(b"pdf")
+            with self.assertRaisesRegex(TaskProtocolConflict, "directory identity"):
+                self._registry(root).recoverable_payloads()
 
 
 if __name__ == "__main__":

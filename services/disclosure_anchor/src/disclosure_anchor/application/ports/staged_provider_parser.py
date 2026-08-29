@@ -90,6 +90,7 @@ class StagedProviderDocumentParserPort(Protocol):
         source_pdf_sha256: str,
         attempt_identity: str,
         fence_identity: str,
+        submission_epoch_unix: int,
     ) -> RemoteProviderParseHandle:
         ...
 

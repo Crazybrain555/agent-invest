@@ -40,9 +40,6 @@ _MAX_RESULT_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_ZIP_MEMBERS = 100_000
 _MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 _MAX_WIRE_JSON_BYTES = 1024 * 1024
-_IDEMPOTENCY_BUCKET_SECONDS = 3600
-
-
 def _make_idempotency_key(
     source_pdf_sha256: str,
     attempt_identity: str,
@@ -50,11 +47,11 @@ def _make_idempotency_key(
     *,
     observed_unix: float,
 ) -> str:
-    bucket = int(observed_unix // _IDEMPOTENCY_BUCKET_SECONDS)
+    epoch = int(observed_unix)
     digest = hashlib.sha256(
-        f"{bucket:x}\0{source_pdf_sha256}\0{attempt_identity}\0{fence_identity}".encode()
+        f"{epoch:x}\0{source_pdf_sha256}\0{attempt_identity}\0{fence_identity}".encode()
     ).hexdigest()
-    return f"{bucket:x}.{digest}"
+    return f"{epoch:x}.{digest}"
 
 
 def _fail(message: str) -> ParserOutputContractError:
@@ -630,7 +627,6 @@ class MinerUHttpStagedParser:
         reader: MinerUMediumArtifactReader | None = None,
         transport: httpx.BaseTransport | None = None,
         task_protocol_v2: bool = False,
-        clock: Any = time.time,
     ) -> None:
         self._api_url = api_url.rstrip("/")
         self._server_url = server_url
@@ -638,7 +634,6 @@ class MinerUHttpStagedParser:
         self._transport = transport
         self._spool_root = spool_root
         self._task_protocol_v2 = task_protocol_v2
-        self._clock = clock
 
     def begin_remote_parse(
         self,
@@ -648,9 +643,16 @@ class MinerUHttpStagedParser:
         source_pdf_sha256: str,
         attempt_identity: str,
         fence_identity: str,
+        submission_epoch_unix: int | None = None,
     ) -> MinerUHttpRemoteHandle:
         _identity(attempt_identity, "attempt identity")
         _identity(fence_identity, "fence identity")
+        if self._task_protocol_v2 and (
+            isinstance(submission_epoch_unix, bool)
+            or not isinstance(submission_epoch_unix, int)
+            or submission_epoch_unix < 0
+        ):
+            raise _fail("durable submission epoch is required")
         if not source_pdf_sha256.startswith("sha256:") or len(source_pdf_sha256) != 71:
             raise _fail("source identity is not canonical sha256")
         if (
@@ -730,7 +732,7 @@ class MinerUHttpStagedParser:
         }
         idempotency_key = _make_idempotency_key(
             source_pdf_sha256, attempt_identity, fence_identity,
-            observed_unix=float(self._clock()),
+            observed_unix=float(submission_epoch_unix or 0),
         )
         if self._task_protocol_v2:
             data.update(

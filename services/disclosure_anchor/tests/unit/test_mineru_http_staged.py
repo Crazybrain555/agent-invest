@@ -123,7 +123,6 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 server_url="http://vlm.test:30000/v1",
                 spool_root=Path(directory) / "spool",
                 transport=httpx.MockTransport(handler),
-                clock=lambda: 1_000_000.0,
             )
             source = Path(directory) / "input.pdf"
             source.write_bytes(b"%PDF-stage")
@@ -137,6 +136,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
             )
             receipt = handle.wait_terminal()
 
@@ -226,7 +226,6 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 spool_root=Path(directory) / "spool",
                 transport=httpx.MockTransport(handler),
                 task_protocol_v2=True,
-                clock=lambda: 1_000_000.0,
             )
             handle = parser.begin_remote_parse(
                 input_pdf=source,
@@ -234,6 +233,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
             )
             receipt = handle.wait_terminal()
             with self.assertRaisesRegex(
@@ -281,6 +281,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
+                    submission_epoch_unix=1_000_000,
                 )
 
     def test_v2_accepts_identity_bound_existing_post_200(self) -> None:
@@ -306,12 +307,12 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 server_url="http://vlm.test:30000/v1",
                 spool_root=Path(directory) / "spool",
                 transport=httpx.MockTransport(handler), task_protocol_v2=True,
-                clock=lambda: 1_000_000.0,
             )
             handle = parser.begin_remote_parse(
                 input_pdf=source, options=PINNED_OPTIONS,
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1", fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
             )
             self.assertIsNotNone(handle)
 
@@ -336,6 +337,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     input_pdf=source, options=PINNED_OPTIONS,
                     source_pdf_sha256="sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1", fence_identity="fence-1",
+                    submission_epoch_unix=1_000_000,
                 )
 
     def test_submit_rejects_cross_origin_result_url(self) -> None:
