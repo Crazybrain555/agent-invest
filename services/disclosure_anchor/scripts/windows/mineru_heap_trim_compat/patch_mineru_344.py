@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Build-time, exact-source runtime compatibility patch for MinerU 3.4.4.
 
-The patch preserves the explicit, fail-visible glibc ``malloc_trim(0)`` hook
-and adds a default-off, bounded two-window Hybrid pipeline with content-free
-phase evidence. Every source file must match the deployed 3.4.4 bytes before
-any write occurs; legacy remains the image default until commissioning closes.
+The patch preserves the explicit, fail-visible glibc ``malloc_trim(0)`` hook,
+single-owner serial execution and content-free phase evidence. Every source
+file must match the deployed 3.4.4 bytes before any write occurs.
 """
 
 from __future__ import annotations
@@ -23,10 +22,10 @@ BASE_IMAGE_DIGEST: Final = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
 POLICY: Final = "glibc-malloc-trim-per-window.v1"
-CAPACITY_POLICY: Final = "process-global-mineru-coordinator.v4"
+CAPACITY_POLICY: Final = "single-owner-serial-mineru.v1"
 SITE_PACKAGES: Final = Path("/usr/local/lib/python3.12/dist-packages")
 MARKER_PATH: Final = Path(
-    "/opt/agent-invest/mineru-capacity-v1/compatibility.json"
+    "/opt/agent-invest/mineru-serial-v1/compatibility.json"
 )
 TARGET_PREIMAGE_SHA256: Final = {
     "mineru/cli/fast_api.py": (
@@ -402,7 +401,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         helper = '''_PHASE_TRACE_PREFIX = "MINERU_PHASE_TRACE "
 _PHASE_TRACE_SCHEMA = "mineru-phase-trace.v3"
 _PHASE_TRACE_BACKENDS = frozenset({"hybrid", "vlm"})
-_PHASE_TRACE_PIPELINE_MODES = frozenset({"legacy", "depth1"})
+_PHASE_TRACE_PIPELINE_MODES = frozenset({"serial"})
 _PHASE_TRACE_PHASES = frozenset({
     "document",
     "document_finalize",
@@ -418,6 +417,7 @@ _PHASE_TRACE_PHASES = frozenset({
 })
 _PHASE_TRACE_OUTPUT_LOCK = threading.Lock()
 _PHASE_TRACE_PROCESS_EPOCH = uuid.uuid4().hex
+_SERIAL_PROFILE_SCHEMA = "mineru-serial-execution-profile.v1"
 
 
 def is_phase_trace_enabled() -> bool:
@@ -456,51 +456,13 @@ class _DisabledPhaseTrace:
 _DISABLED_PHASE_TRACE = _DisabledPhaseTrace()
 
 
-_CAPACITY_PROFILE_SCHEMA = "mineru-execution-profile.v2"
-_CAPACITY_PROFILE_ENV = "MINERU_CAPACITY_PROFILE_JSON"
-_CAPACITY_PROFILE_FIELDS = frozenset({
-    "inner_inference_concurrency",
-    "max_document_pages",
-    "max_resident_pages",
-    "max_source_pdf_bytes",
-    "min_document_pages",
-    "pipeline_depth",
-    "profile_id",
-    "schema",
-    "vllm_max_num_seqs",
-    "window_size",
-})
-_CAPACITY_MAX_PAGE_PIXEL_BYTES = 3500 * 3500 * 4
-
-
-def capacity_mode() -> str:
-    value = os.getenv("MINERU_CAPACITY_MODE", "legacy").strip().lower()
-    if value not in {"legacy", "candidate"}:
-        raise RuntimeError("MINERU_CAPACITY_MODE has an invalid value")
-    return value
-
-
-def _capacity_integer(value, *, label: str, minimum: int = 0) -> int:
+def _serial_integer(value, *, label: str, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise RuntimeError(f"capacity profile {label} is invalid")
+        raise RuntimeError(f"serial execution profile {label} is invalid")
     return value
 
 
-def _capacity_profile_id(value) -> str:
-    if (
-        not isinstance(value, str)
-        or not 1 <= len(value) <= 64
-        or value[0] not in "abcdefghijklmnopqrstuvwxyz0123456789"
-        or any(
-            char not in "abcdefghijklmnopqrstuvwxyz0123456789._-"
-            for char in value
-        )
-    ):
-        raise RuntimeError("capacity profile identity is invalid")
-    return value
-
-
-def _capacity_profile_hash(payload: dict) -> str:
+def _serial_profile_hash(payload: dict) -> str:
     canonical = json.dumps(
         payload,
         sort_keys=True,
@@ -510,268 +472,66 @@ def _capacity_profile_hash(payload: dict) -> str:
 
 
 @dataclass(frozen=True)
-class CapacityExecutionProfile:
+class SerialExecutionProfile:
     profile_id: str
     profile_sha256: str
     pipeline_mode: str
     pipeline_depth: int
     window_size: int
     max_resident_pages: int
-    max_source_pdf_bytes: int
-    min_document_pages: int
-    max_document_pages: int
     inner_inference_concurrency: int
     vllm_max_num_seqs: int
 
     @property
-    def max_resident_decoded_bytes(self) -> int:
-        return self.max_resident_pages * _CAPACITY_MAX_PAGE_PIXEL_BYTES
+    def max_resident_windows(self) -> int:
+        return 1
 
     @property
-    def max_resident_windows(self) -> int:
-        return self.pipeline_depth + 1 if self.pipeline_depth else 1
+    def max_resident_decoded_bytes(self) -> int:
+        return self.max_resident_pages * 3500 * 3500 * 4
 
-def _legacy_execution_profile(configured_window_size: int) -> CapacityExecutionProfile:
-    configured_window_size = _capacity_integer(
+
+def serial_execution_profile(configured_window_size: int) -> SerialExecutionProfile:
+    configured_window_size = _serial_integer(
         configured_window_size,
         label="configured_window_size",
         minimum=1,
     )
     payload = {
         "inner_inference_concurrency": 7,
-        "max_document_pages": 2147483647,
-        "max_resident_pages": configured_window_size,
-        "max_source_pdf_bytes": 9223372036854775807,
-        "min_document_pages": 0,
         "pipeline_depth": 0,
-        "profile_id": f"legacy-w{configured_window_size}-d0",
-        "schema": _CAPACITY_PROFILE_SCHEMA,
+        "pipeline_mode": "serial",
+        "profile_id": f"serial-w{configured_window_size}",
+        "schema": _SERIAL_PROFILE_SCHEMA,
         "vllm_max_num_seqs": 128,
         "window_size": configured_window_size,
     }
-    return CapacityExecutionProfile(
+    return SerialExecutionProfile(
         profile_id=payload["profile_id"],
-        profile_sha256=_capacity_profile_hash(payload),
-        pipeline_mode="legacy",
+        profile_sha256=_serial_profile_hash(payload),
+        pipeline_mode="serial",
         pipeline_depth=0,
         window_size=configured_window_size,
         max_resident_pages=configured_window_size,
-        max_source_pdf_bytes=payload["max_source_pdf_bytes"],
-        min_document_pages=0,
-        max_document_pages=payload["max_document_pages"],
         inner_inference_concurrency=7,
         vllm_max_num_seqs=128,
     )
 
 
-def legacy_capacity_execution_profile(
-    configured_window_size: int,
-) -> CapacityExecutionProfile:
-    return _legacy_execution_profile(configured_window_size)
-
-
-@lru_cache(maxsize=16)
-def _parse_capacity_execution_profile(
-    raw_profile: str,
-    configured_window_size: int,
-) -> CapacityExecutionProfile:
-    try:
-        payload = json.loads(raw_profile)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("capacity profile JSON is invalid") from exc
-    if not isinstance(payload, dict) or set(payload) != _CAPACITY_PROFILE_FIELDS:
-        raise RuntimeError("capacity profile fields drifted")
-    if payload.get("schema") != _CAPACITY_PROFILE_SCHEMA:
-        raise RuntimeError("capacity profile schema drifted")
-    profile_id = _capacity_profile_id(payload.get("profile_id"))
-    window_size = _capacity_integer(
-        payload.get("window_size"),
-        label="window_size",
-        minimum=1,
-    )
-    pipeline_depth = _capacity_integer(
-        payload.get("pipeline_depth"),
-        label="pipeline_depth",
-        minimum=1,
-    )
-    max_resident_pages = _capacity_integer(
-        payload.get("max_resident_pages"),
-        label="max_resident_pages",
-        minimum=1,
-    )
-    min_document_pages = _capacity_integer(
-        payload.get("min_document_pages"),
-        label="min_document_pages",
-        minimum=2,
-    )
-    max_document_pages = _capacity_integer(
-        payload.get("max_document_pages"),
-        label="max_document_pages",
-        minimum=min_document_pages,
-    )
-    max_source_pdf_bytes = _capacity_integer(
-        payload.get("max_source_pdf_bytes"),
-        label="max_source_pdf_bytes",
-        minimum=1,
-    )
-    inner_inference_concurrency = _capacity_integer(
-        payload.get("inner_inference_concurrency"),
-        label="inner_inference_concurrency",
-        minimum=1,
-    )
-    vllm_max_num_seqs = _capacity_integer(
-        payload.get("vllm_max_num_seqs"),
-        label="vllm_max_num_seqs",
-        minimum=inner_inference_concurrency,
-    )
-    configured_window_size = _capacity_integer(
-        configured_window_size,
-        label="configured_window_size",
-        minimum=1,
-    )
-    if (
-        pipeline_depth != 1
-        or window_size * (pipeline_depth + 1) > max_resident_pages
-        or max_resident_pages > configured_window_size
-        or min_document_pages <= window_size
-    ):
-        raise RuntimeError("capacity profile exceeds the legacy owner envelope")
-    return CapacityExecutionProfile(
-        profile_id=profile_id,
-        profile_sha256=_capacity_profile_hash(payload),
-        pipeline_mode="depth1",
-        pipeline_depth=pipeline_depth,
-        window_size=window_size,
-        max_resident_pages=max_resident_pages,
-        max_source_pdf_bytes=max_source_pdf_bytes,
-        min_document_pages=min_document_pages,
-        max_document_pages=max_document_pages,
-        inner_inference_concurrency=inner_inference_concurrency,
-        vllm_max_num_seqs=vllm_max_num_seqs,
-    )
-
-
-def _configured_capacity_execution_profile(
-    configured_window_size: int,
-):
-    raw_profile = os.getenv(_CAPACITY_PROFILE_ENV)
-    if raw_profile is None or not raw_profile.strip():
-        return None
-    return _parse_capacity_execution_profile(
-        raw_profile.strip(),
-        configured_window_size,
-    )
-
-
-def capacity_runtime_status(configured_window_size: int) -> dict:
-    """Return a content-free, hash-bound view of process admission policy."""
-    configured_window_size = _capacity_integer(
-        configured_window_size,
-        label="configured_window_size",
-        minimum=1,
-    )
-    mode = capacity_mode()
-    legacy = _legacy_execution_profile(configured_window_size)
-    candidate = _configured_capacity_execution_profile(configured_window_size)
-    if mode != "legacy" and candidate is None:
-        raise RuntimeError("MINERU_CAPACITY_PROFILE_JSON must be configured")
-    nonlegacy_admission_enabled = bool(candidate is not None and mode == "candidate")
-    candidate_payload = None
-    if candidate is not None:
-        candidate_payload = {
-            "inner_inference_concurrency": candidate.inner_inference_concurrency,
-            "max_document_pages": candidate.max_document_pages,
-            "max_resident_decoded_bytes": candidate.max_resident_decoded_bytes,
-            "max_resident_pages": candidate.max_resident_pages,
-            "max_source_pdf_bytes": candidate.max_source_pdf_bytes,
-            "min_document_pages": candidate.min_document_pages,
-            "pipeline_depth": candidate.pipeline_depth,
-            "pipeline_mode": candidate.pipeline_mode,
-            "profile_id": candidate.profile_id,
-            "profile_sha256": candidate.profile_sha256,
-            "vllm_max_num_seqs": candidate.vllm_max_num_seqs,
-            "window_size": candidate.window_size,
-        }
+def serial_runtime_status(configured_window_size: int) -> dict:
+    profile = serial_execution_profile(configured_window_size)
     return {
-        "candidate_profile": candidate_payload,
-        "configured_window_size": configured_window_size,
-        "legacy_profile_sha256": legacy.profile_sha256,
-        "mode": mode,
-        "nonlegacy_admission_enabled": nonlegacy_admission_enabled,
-        "schema": "mineru-capacity-runtime.v1",
+        "configured_window_size": profile.window_size,
+        "mode": "serial",
+        "profile_sha256": profile.profile_sha256,
+        "schema": "mineru-serial-runtime.v1",
     }
 
 
-def select_capacity_execution_profile(
-    *,
-    configured_window_size: int,
-    page_count: int,
-    source_pdf_bytes: int,
-) -> CapacityExecutionProfile:
-    legacy = _legacy_execution_profile(configured_window_size)
-    mode = capacity_mode()
-    if mode == "legacy":
-        return legacy
-    candidate = _configured_capacity_execution_profile(configured_window_size)
-    if candidate is None:
-        raise RuntimeError("MINERU_CAPACITY_PROFILE_JSON must be configured")
-    page_count = _capacity_integer(page_count, label="page_count")
-    source_pdf_bytes = _capacity_integer(
-        source_pdf_bytes,
-        label="source_pdf_bytes",
-    )
-    eligible = (
-        candidate.min_document_pages <= page_count <= candidate.max_document_pages
-        and source_pdf_bytes <= candidate.max_source_pdf_bytes
-    )
-    if not eligible:
-        return legacy
-    return candidate
-
-
-@dataclass
-class CapacityCreditLease:
-    owner_id: str
-    page_count: int
-    reserved_windows: int
-    reserved_decoded_bytes: int
-    resident_windows_after_acquire: int
-    resident_pages_after_acquire: int
-    resident_decoded_bytes_after_acquire: int
-    actual_decoded_bytes: int = 0
-    state: str = "leased"
-
-
-class _ProcessCapacityPool:
-    """One vector/page/decoded-byte envelope shared by all documents."""
-
-    def __init__(self, profile: CapacityExecutionProfile) -> None:
-        self.profile_sha256 = profile.profile_sha256
-        self.max_windows = profile.max_resident_windows
-        self.max_pages = profile.max_resident_pages
-        self.max_decoded_bytes = profile.max_resident_decoded_bytes
-        self.available_windows = self.max_windows
-        self.available_pages = self.max_pages
-        self.available_decoded_bytes = self.max_decoded_bytes
-        self.condition = asyncio.Condition()
-
-
-_PROCESS_CAPACITY_POOLS = {}
 _PROCESS_STAGE_GATES = {}
 
 
-def _process_capacity_pool(profile: CapacityExecutionProfile) -> _ProcessCapacityPool:
-    loop = asyncio.get_running_loop()
-    pool = _PROCESS_CAPACITY_POOLS.get(loop)
-    if pool is None:
-        pool = _ProcessCapacityPool(profile)
-        _PROCESS_CAPACITY_POOLS[loop] = pool
-    elif pool.profile_sha256 != profile.profile_sha256:
-        raise RuntimeError("process capacity profile drifted while work is resident")
-    return pool
-
-
-def process_capacity_stage_gates():
+def process_stage_gates():
     """Return distinct process-global A and C owners for the active loop."""
     loop = asyncio.get_running_loop()
     gates = _PROCESS_STAGE_GATES.get(loop)
@@ -779,99 +539,6 @@ def process_capacity_stage_gates():
         gates = (asyncio.Lock(), asyncio.Lock())
         _PROCESS_STAGE_GATES[loop] = gates
     return gates
-
-
-class CapacityCreditBank:
-    """Per-document lease owner backed by one process-global credit pool."""
-
-    def __init__(self, profile: CapacityExecutionProfile) -> None:
-        if profile.pipeline_mode != "depth1":
-            raise RuntimeError("capacity credit bank requires a depth-one profile")
-        self.profile = profile
-        self.owner_id = uuid.uuid4().hex
-        self.pool = _process_capacity_pool(profile)
-        self.active_lease_ids = set()
-
-    async def acquire(self, page_count: int) -> CapacityCreditLease:
-        page_count = _capacity_integer(page_count, label="lease_page_count", minimum=1)
-        decoded_bytes = page_count * _CAPACITY_MAX_PAGE_PIXEL_BYTES
-        if (
-            page_count > self.profile.max_resident_pages
-            or decoded_bytes > self.profile.max_resident_decoded_bytes
-        ):
-            raise RuntimeError("capacity lease exceeds its immutable profile")
-        async with self.pool.condition:
-            await self.pool.condition.wait_for(
-                lambda: (
-                    self.pool.available_windows >= 1
-                    and self.pool.available_pages >= page_count
-                    and self.pool.available_decoded_bytes >= decoded_bytes
-                )
-            )
-            self.pool.available_windows -= 1
-            self.pool.available_pages -= page_count
-            self.pool.available_decoded_bytes -= decoded_bytes
-            lease = CapacityCreditLease(
-                owner_id=self.owner_id,
-                page_count=page_count,
-                reserved_windows=1,
-                reserved_decoded_bytes=decoded_bytes,
-                resident_windows_after_acquire=(
-                    self.pool.max_windows - self.pool.available_windows
-                ),
-                resident_pages_after_acquire=(
-                    self.pool.max_pages - self.pool.available_pages
-                ),
-                resident_decoded_bytes_after_acquire=(
-                    self.pool.max_decoded_bytes
-                    - self.pool.available_decoded_bytes
-                ),
-            )
-            self.active_lease_ids.add(id(lease))
-            return lease
-
-    def record_actual_decoded_bytes(
-        self,
-        lease: CapacityCreditLease,
-        actual_decoded_bytes: int,
-    ) -> None:
-        if lease.owner_id != self.owner_id or lease.state != "leased":
-            raise RuntimeError("capacity lease is not active")
-        actual_decoded_bytes = _capacity_integer(
-            actual_decoded_bytes,
-            label="actual_decoded_bytes",
-        )
-        if actual_decoded_bytes > lease.reserved_decoded_bytes:
-            raise RuntimeError("decoded pixels exceed the capacity reservation")
-        lease.actual_decoded_bytes = actual_decoded_bytes
-
-    async def release(self, lease: CapacityCreditLease) -> None:
-        if (
-            lease.owner_id != self.owner_id
-            or id(lease) not in self.active_lease_ids
-            or lease.state != "leased"
-        ):
-            raise RuntimeError("capacity lease release state is invalid")
-        async with self.pool.condition:
-            if (
-                self.pool.available_windows + lease.reserved_windows
-                > self.pool.max_windows
-                or self.pool.available_pages + lease.page_count
-                > self.pool.max_pages
-                or self.pool.available_decoded_bytes + lease.reserved_decoded_bytes
-                > self.pool.max_decoded_bytes
-            ):
-                raise RuntimeError("capacity credit bank overflowed")
-            self.pool.available_windows += lease.reserved_windows
-            self.pool.available_pages += lease.page_count
-            self.pool.available_decoded_bytes += lease.reserved_decoded_bytes
-            self.active_lease_ids.remove(id(lease))
-            lease.state = "released"
-            self.pool.condition.notify_all()
-
-    def assert_fully_released(self) -> None:
-        if self.active_lease_ids:
-            raise RuntimeError("capacity document leases did not close")
 
 
 class MinerUPhaseTrace:
@@ -884,7 +551,7 @@ class MinerUPhaseTrace:
         page_count: int,
         window_size: int,
         total_windows: int,
-        execution_profile: CapacityExecutionProfile,
+        execution_profile: SerialExecutionProfile,
         source_pdf_bytes: int,
         hybrid_batch_ratio_requested=None,
         hybrid_batch_ratio_effective=None,
@@ -896,8 +563,6 @@ class MinerUPhaseTrace:
         profile_id = execution_profile.profile_id
         if pipeline_mode not in _PHASE_TRACE_PIPELINE_MODES:
             raise RuntimeError("phase trace pipeline mode is unsupported")
-        if pipeline_mode == "depth1" and backend != "hybrid":
-            raise RuntimeError("phase trace pipeline/backend combination is invalid")
         if (
             not isinstance(profile_id, str)
             or not 1 <= len(profile_id) <= 64
@@ -1287,137 +952,6 @@ async def _await_inference_started(started, inference_task) -> None:
             await asyncio.gather(started_task, return_exceptions=True)
 
 
-def capacity_pipeline_enabled() -> bool:
-    """Report whether this process permits a non-legacy document profile."""
-    mode = capacity_mode()
-    if mode == "legacy":
-        return False
-    return True
-
-
-def capacity_active_window_size(configured_window_size: int) -> int:
-    """Return the configured candidate size for process-level diagnostics only."""
-    configured_window_size = _capacity_integer(
-        configured_window_size,
-        label="configured_window_size",
-        minimum=1,
-    )
-    mode = capacity_mode()
-    if mode == "legacy":
-        return configured_window_size
-    profile = _configured_capacity_execution_profile(configured_window_size)
-    if profile is None:
-        raise RuntimeError("MINERU_CAPACITY_PROFILE_JSON must be configured")
-    return profile.window_size
-
-
-async def run_bounded_ordered_pipeline(
-    items,
-    *,
-    prepare,
-    infer,
-    commit,
-    release,
-) -> None:
-    """Run an ordered depth-one pipeline with at most two prepared owners."""
-    ordered_items = tuple(items)
-    if not ordered_items:
-        return
-    current = None
-    prepared_next = None
-    prepare_task = None
-    inference_task = None
-    next_inference_task = None
-    primary = None
-    try:
-        current = await prepare(ordered_items[0])
-        inference_started = asyncio.Event()
-        inference_task = asyncio.create_task(infer(current, inference_started))
-        await _await_inference_started(inference_started, inference_task)
-        for index in range(len(ordered_items)):
-            if index + 1 < len(ordered_items):
-                prepare_task = asyncio.create_task(prepare(ordered_items[index + 1]))
-            inference_result = await inference_task
-            inference_task = None
-            if prepare_task is not None:
-                prepared_next = await prepare_task
-                prepare_task = None
-                next_inference_started = asyncio.Event()
-                next_inference_task = asyncio.create_task(
-                    infer(prepared_next, next_inference_started)
-                )
-                await _await_inference_started(
-                    next_inference_started,
-                    next_inference_task,
-                )
-            await commit(current, inference_result)
-            current = None
-            if prepared_next is not None:
-                current = prepared_next
-                prepared_next = None
-                inference_task = next_inference_task
-                next_inference_task = None
-    except BaseException as exc:
-        primary = exc
-    finally:
-        task_pairs = tuple(
-            (name, task)
-            for name, task in (
-                ("prepare", prepare_task),
-                ("inference", inference_task),
-                ("next_inference", next_inference_task),
-            )
-            if task is not None
-        )
-        for _name, task in task_pairs:
-            if not task.done():
-                task.cancel()
-        task_results = ()
-        if task_pairs:
-            try:
-                task_results = await drain_owned_awaitable(
-                    asyncio.gather(
-                        *(task for _name, task in task_pairs),
-                        return_exceptions=True,
-                    )
-                )
-            except BaseException as exc:
-                if primary is None:
-                    primary = exc
-                else:
-                    primary.add_note(
-                        f"pipeline task drain failed: {type(exc).__name__}"
-                    )
-        orphan = None
-        for (name, _task), result in zip(task_pairs, task_results):
-            if isinstance(result, BaseException):
-                if not isinstance(result, asyncio.CancelledError):
-                    if primary is None:
-                        primary = result
-                    else:
-                        primary.add_note(
-                            f"{name} task failed while draining: {type(result).__name__}"
-                        )
-            elif name == "prepare":
-                orphan = result
-        released_ids = set()
-        for prepared in (orphan, prepared_next, current):
-            if prepared is None or id(prepared) in released_ids:
-                continue
-            released_ids.add(id(prepared))
-            try:
-                await release(prepared)
-            except BaseException as exc:
-                if primary is None:
-                    primary = exc
-                else:
-                    primary.add_note(
-                        f"pipeline release failed: {type(exc).__name__}"
-                    )
-    if primary is not None:
-        raise primary
-
-
 def is_heap_trim_enabled() -> bool:
     """Require an explicit, closed-vocabulary heap-return policy."""
     value = os.getenv("MINERU_MALLOC_TRIM")
@@ -1469,9 +1003,9 @@ def trim_process_heap() -> bool:
             "from ...utils.config_reader import get_device, get_processing_window_size\n"
             "from ...utils.model_utils import (\n"
             "    drain_owned_awaitable,\n"
-            "    legacy_capacity_execution_profile,\n"
+            "    serial_execution_profile,\n"
             "    new_phase_trace,\n"
-            "    process_capacity_stage_gates,\n"
+            "    process_stage_gates,\n"
             "    trim_process_heap,\n"
             ")\n\n"
             "from ...utils.enum_class import ImageType\n",
@@ -1634,7 +1168,7 @@ def trim_process_heap() -> bool:
             "            f'VLM processing-window run. page_count={page_count}, '\n"
             "            f'window_size={configured_window_size}, total_windows={total_windows}'\n"
             "        )\n"
-            "        execution_profile = legacy_capacity_execution_profile(\n"
+            "        execution_profile = serial_execution_profile(\n"
             "            configured_window_size\n"
             "        )\n"
             "        phase_trace = new_phase_trace(\n"
@@ -1808,16 +1342,13 @@ def trim_process_heap() -> bool:
             source,
             "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n",
             "from mineru.utils.model_utils import (\n"
-            "    CapacityCreditBank,\n"
             "    clean_memory,\n"
             "    crop_img,\n"
             "    get_vram,\n"
-            "    legacy_capacity_execution_profile,\n"
+            "    serial_execution_profile,\n"
             "    new_phase_trace,\n"
-            "    run_bounded_ordered_pipeline,\n"
             "    run_async_owned,\n"
             "    run_native_owned,\n"
-            "    select_capacity_execution_profile,\n"
             "    drain_owned_awaitable,\n"
             "    trim_process_heap,\n"
             ")\n",
@@ -1869,442 +1400,6 @@ def trim_process_heap() -> bool:
             "    hybrid_pipeline_model = None\n",
             count=2,
             label="Hybrid phase trace declaration",
-        )
-        pipeline_helper = '''async def _aio_run_hybrid_capacity_pipeline(
-    *,
-    pdf_bytes,
-    pdf_doc,
-    image_writer,
-    predictor,
-    middle_json,
-    page_count,
-    effective_window_size,
-    phase_trace,
-    inline_formula_enable,
-    batch_ratio,
-    ocr_enable,
-    effort,
-    effective_image_analysis,
-    a_owner,
-    c_owner,
-    execution_profile,
-):
-    """Run a two-window, ordered A/B/C pipeline inside one whole PDF."""
-    model_list = []
-    hybrid_pipeline_model = None
-    progress_bar = None
-    last_append_end_time = None
-    expected_append_index = 0
-    credit_bank = CapacityCreditBank(execution_profile)
-    windows = tuple(
-        (
-            window_index,
-            window_start,
-            min(page_count - 1, window_start + effective_window_size - 1),
-        )
-        for window_index, window_start in enumerate(
-            range(0, page_count, effective_window_size or 1)
-        )
-    )
-
-    def close_and_trim(images_list) -> None:
-        _close_images(images_list)
-        trim_process_heap()
-
-    async def release(prepared) -> None:
-        owner_state = prepared.get("owner_state")
-        if owner_state == "released":
-            return
-        if owner_state not in {"owned", "resources_released"}:
-            raise RuntimeError(
-                f"prepared window release state is invalid: {owner_state}"
-            )
-        release_started_ns = phase_trace.start()
-        try:
-            if owner_state == "owned":
-                prepared["owner_state"] = "releasing"
-                close_and_trim(prepared.get("images_list"))
-                prepared["owner_state"] = "resources_released"
-            await drain_owned_awaitable(
-                credit_bank.release(prepared["credit_lease"])
-            )
-            prepared["owner_state"] = "released"
-        except BaseException:
-            if prepared.get("owner_state") == "releasing":
-                prepared["owner_state"] = "owned"
-            phase_trace.complete(
-                "window_release",
-                release_started_ns,
-                window=prepared["trace_window"],
-                outcome="error",
-                credit_lease=prepared["credit_lease"],
-            )
-            raise
-        phase_trace.complete(
-            "window_release",
-            release_started_ns,
-            window=prepared["trace_window"],
-            credit_lease=prepared["credit_lease"],
-        )
-
-    async def prepare(window):
-        window_index, window_start, window_end = window
-        trace_window = phase_trace.window(
-            window_index=window_index,
-            page_start=window_start,
-            page_end_exclusive=window_end + 1,
-        )
-        images_list = None
-        credit_lease = None
-        window_started_ns = phase_trace.start()
-        try:
-            credit_wait_started_ns = phase_trace.start()
-            try:
-                credit_lease = await credit_bank.acquire(
-                    window_end - window_start + 1
-                )
-            except BaseException:
-                phase_trace.complete(
-                    "window_credit_wait",
-                    credit_wait_started_ns,
-                    window=trace_window,
-                    outcome="error",
-                )
-                raise
-            phase_trace.complete(
-                "window_credit_wait",
-                credit_wait_started_ns,
-                window=trace_window,
-                credit_lease=credit_lease,
-            )
-            render_started_ns = phase_trace.start()
-            try:
-                images_list = await run_async_owned(
-                    a_owner,
-                    lambda: aio_load_images_from_pdf_bytes_range(
-                        pdf_bytes,
-                        start_page_id=window_start,
-                        end_page_id=window_end,
-                        image_type=ImageType.PIL,
-                    ),
-                    on_cancel_result=close_and_trim,
-                )
-            except BaseException:
-                phase_trace.complete(
-                    "window_render",
-                    render_started_ns,
-                    window=trace_window,
-                    outcome="error",
-                    credit_lease=credit_lease,
-                )
-                raise
-            phase_trace.complete(
-                "window_render",
-                render_started_ns,
-                window=trace_window,
-                credit_lease=credit_lease,
-            )
-            images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
-            actual_decoded_bytes = sum(
-                int(np.asarray(image).nbytes) for image in images_pil_list
-            )
-            credit_bank.record_actual_decoded_bytes(
-                credit_lease,
-                actual_decoded_bytes,
-            )
-            page_sizes = [_normalize_page_size(image) for image in images_pil_list]
-            logger.info(
-                f'Hybrid capacity window {window_index + 1}/{len(windows)}: '
-                f'pages {window_start + 1}-{window_end + 1}/{page_count} '
-                f'({len(images_pil_list)} pages)'
-            )
-            layout_started_ns = phase_trace.start()
-            try:
-                images_layout_res, pipeline_model = await run_native_owned(
-                    a_owner,
-                    _predict_layout_for_window,
-                    images_pil_list,
-                    inline_formula_enable,
-                    batch_ratio,
-                    ocr_enable,
-                )
-                vlm_blocks_list = None
-                if effort == "medium":
-                    await run_native_owned(
-                        a_owner,
-                        _apply_medium_table_orientation_labels,
-                        images_pil_list,
-                        images_layout_res,
-                        pipeline_model,
-                        batch_ratio,
-                    )
-                    vlm_blocks_list = [
-                        _build_medium_vlm_layout_blocks(
-                            page_layout_res,
-                            pil_img.width,
-                            pil_img.height,
-                        )
-                        for page_layout_res, pil_img in zip(
-                            images_layout_res,
-                            images_pil_list,
-                        )
-                    ]
-            except BaseException:
-                phase_trace.complete(
-                    "window_layout",
-                    layout_started_ns,
-                    window=trace_window,
-                    outcome="error",
-                    credit_lease=credit_lease,
-                )
-                raise
-            phase_trace.complete(
-                "window_layout",
-                layout_started_ns,
-                window=trace_window,
-                credit_lease=credit_lease,
-            )
-            b_ready_ns = phase_trace.start()
-            return {
-                "images_layout_res": images_layout_res,
-                "images_list": images_list,
-                "images_pil_list": images_pil_list,
-                "page_sizes": page_sizes,
-                "pipeline_model": pipeline_model,
-                "credit_lease": credit_lease,
-                "b_ready_ns": b_ready_ns,
-                "owner_state": "owned",
-                "trace_window": trace_window,
-                "vlm_blocks_list": vlm_blocks_list,
-                "window_end": window_end,
-                "window_index": window_index,
-                "window_start": window_start,
-                "window_started_ns": window_started_ns,
-            }
-        except BaseException as primary:
-            resources_released = images_list is None
-            if images_list is not None:
-                try:
-                    close_and_trim(images_list)
-                    resources_released = True
-                except BaseException as cleanup_error:
-                    primary.add_note(
-                        "prepare cleanup failed: "
-                        f"{type(cleanup_error).__name__}"
-                    )
-            if (
-                resources_released
-                and credit_lease is not None
-                and credit_lease.state == "leased"
-            ):
-                try:
-                    release_started_ns = phase_trace.start()
-                    await drain_owned_awaitable(
-                        credit_bank.release(credit_lease)
-                    )
-                except BaseException as credit_error:
-                    phase_trace.complete(
-                        "window_release",
-                        release_started_ns,
-                        window=trace_window,
-                        outcome="error",
-                        credit_lease=credit_lease,
-                    )
-                    primary.add_note(
-                        "prepare credit release failed: "
-                        f"{type(credit_error).__name__}"
-                    )
-                else:
-                    phase_trace.complete(
-                        "window_release",
-                        release_started_ns,
-                        window=trace_window,
-                        credit_lease=credit_lease,
-                    )
-            raise
-
-    async def infer(prepared, inference_started):
-        trace_window = prepared["trace_window"]
-        try:
-            if effort == "medium":
-                async with aio_predictor_execution_guard(
-                    predictor,
-                    phase_trace=phase_trace,
-                    trace_window=trace_window,
-                    trace_ready_ns=prepared["b_ready_ns"],
-                    trace_credit_lease=prepared["credit_lease"],
-                ):
-                    inference_started.set()
-                    return await drain_owned_awaitable(
-                        predictor.aio_batch_extract_with_layout(
-                            prepared["images_pil_list"],
-                            prepared["vlm_blocks_list"],
-                            not_extract_list=None if ocr_enable else not_extract_list,
-                            image_analysis=effective_image_analysis,
-                        )
-                    )
-            if effort == "high":
-                async with aio_predictor_execution_guard(
-                    predictor,
-                    phase_trace=phase_trace,
-                    trace_window=trace_window,
-                    trace_ready_ns=prepared["b_ready_ns"],
-                    trace_credit_lease=prepared["credit_lease"],
-                ):
-                    inference_started.set()
-                    return await drain_owned_awaitable(
-                        predictor.aio_batch_two_step_extract(
-                            images=prepared["images_pil_list"],
-                            not_extract_list=None if ocr_enable else not_extract_list,
-                            image_analysis=effective_image_analysis,
-                        )
-                    )
-            raise ValueError(f"Unsupported hybrid effort: {effort}")
-        except Exception:
-            raise
-
-    async def commit(prepared, window_model_list) -> None:
-        nonlocal hybrid_pipeline_model, progress_bar, last_append_end_time
-        nonlocal expected_append_index
-        trace_window = prepared["trace_window"]
-        completed = False
-        try:
-            images_pil_list = prepared["images_pil_list"]
-            images_layout_res = prepared["images_layout_res"]
-            pipeline_model = prepared["pipeline_model"]
-            postprocess_started_ns = phase_trace.start()
-            try:
-                if effort == "medium":
-                    optimize_hybrid_formula_number_blocks(window_model_list)
-                if ocr_enable:
-                    await run_native_owned(
-                        c_owner,
-                        _apply_vlm_ocr_det_sidecars_for_window,
-                        images_pil_list,
-                        window_model_list,
-                        batch_ratio,
-                        images_layout_res=images_layout_res,
-                        hybrid_pipeline_model=pipeline_model,
-                    )
-                else:
-                    window_model_list = await run_native_owned(
-                        c_owner,
-                        _process_ocr_and_formulas,
-                        images_pil_list,
-                        window_model_list,
-                        inline_formula_enable,
-                        batch_ratio=batch_ratio,
-                        images_layout_res=images_layout_res,
-                        hybrid_pipeline_model=pipeline_model,
-                    )
-                await run_native_owned(
-                    c_owner,
-                    _apply_layout_title_split,
-                    window_model_list,
-                    images_layout_res,
-                    prepared["page_sizes"],
-                )
-            except BaseException as primary:
-                phase_trace.complete(
-                    "window_postprocess",
-                    postprocess_started_ns,
-                    window=trace_window,
-                    outcome="error",
-                    credit_lease=prepared["credit_lease"],
-                )
-                raise
-            phase_trace.complete(
-                "window_postprocess",
-                postprocess_started_ns,
-                window=trace_window,
-                credit_lease=prepared["credit_lease"],
-            )
-            # No await is permitted between this close and the first mutation.
-            # The event loop therefore cannot misclassify a speculative failure
-            # as pre-append after candidate output becomes observable.
-            hybrid_pipeline_model = pipeline_model
-            if prepared["window_index"] != expected_append_index:
-                raise RuntimeError("capacity pipeline append order drifted")
-            model_list.extend(window_model_list)
-            if progress_bar is None:
-                progress_bar = tqdm(total=page_count, desc="Processing pages")
-            else:
-                exclude_progress_bar_idle_time(
-                    progress_bar,
-                    last_append_end_time,
-                    now=time.time(),
-                )
-            append_started_ns = phase_trace.start()
-            try:
-                append_page_model_list_to_middle_json(
-                    middle_json,
-                    window_model_list,
-                    prepared["images_list"],
-                    pdf_doc,
-                    image_writer,
-                    page_start_index=prepared["window_start"],
-                    _ocr_enable=ocr_enable,
-                    progress_bar=progress_bar,
-                )
-            except BaseException:
-                phase_trace.complete(
-                    "window_append",
-                    append_started_ns,
-                    window=trace_window,
-                    outcome="error",
-                    append_index=expected_append_index,
-                    credit_lease=prepared["credit_lease"],
-                )
-                raise
-            phase_trace.complete(
-                "window_append",
-                append_started_ns,
-                window=trace_window,
-                append_index=expected_append_index,
-                credit_lease=prepared["credit_lease"],
-            )
-            expected_append_index += 1
-            last_append_end_time = time.time()
-            completed = True
-        finally:
-            await release(prepared)
-            if completed:
-                phase_trace.complete(
-                    "window_total",
-                    prepared["window_started_ns"],
-                    window=trace_window,
-                    credit_lease=prepared["credit_lease"],
-                )
-
-    infer_start = time.time()
-    try:
-        await run_bounded_ordered_pipeline(
-            windows,
-            prepare=prepare,
-            infer=infer,
-            commit=commit,
-            release=release,
-        )
-        credit_bank.assert_fully_released()
-    finally:
-        if progress_bar is not None:
-            progress_bar.close()
-    infer_time = round(time.time() - infer_start, 2)
-    if infer_time > 0 and page_count > 0:
-        logger.debug(
-            f"capacity pipeline infer finished, cost: {infer_time}, "
-            f"speed: {round(len(model_list) / infer_time, 3)} page/s"
-        )
-    return model_list, hybrid_pipeline_model
-
-
-'''
-        source = _replace_exact(
-            source,
-            "async def aio_doc_analyze(\n",
-            pipeline_helper + "async def aio_doc_analyze(\n",
-            count=1,
-            label="Hybrid capacity pipeline helper",
         )
         source = _replace_exact(
             source,
@@ -2423,29 +1518,27 @@ def trim_process_heap() -> bool:
             "        configured_window_size = get_processing_window_size(default=64)\n"
             "        effective_window_size = min(page_count, configured_window_size) if page_count else 0\n",
             "        configured_window_size = get_processing_window_size(default=64)\n"
-            "        execution_profile = legacy_capacity_execution_profile(\n"
+            "        execution_profile = serial_execution_profile(\n"
             "            configured_window_size\n"
             "        )\n"
             "        active_window_size = execution_profile.window_size\n"
             "        effective_window_size = min(page_count, active_window_size) if page_count else 0\n",
             count=2,
             occurrence=0,
-            label="Hybrid synchronous legacy window selection",
+            label="Hybrid synchronous serial window selection",
         )
         source = _replace_exact(
             source,
             "        configured_window_size = get_processing_window_size(default=64)\n"
             "        effective_window_size = min(page_count, configured_window_size) if page_count else 0\n",
             "        configured_window_size = get_processing_window_size(default=64)\n"
-            "        execution_profile = select_capacity_execution_profile(\n"
-            "            configured_window_size=configured_window_size,\n"
-            "            page_count=page_count,\n"
-            "            source_pdf_bytes=len(pdf_bytes),\n"
+            "        execution_profile = serial_execution_profile(\n"
+            "            configured_window_size\n"
             "        )\n"
             "        active_window_size = execution_profile.window_size\n"
             "        effective_window_size = min(page_count, active_window_size) if page_count else 0\n",
             count=1,
-            label="Hybrid asynchronous active window selection",
+            label="Hybrid asynchronous serial window selection",
         )
         source = _replace_exact_occurrence(
             source,
@@ -2505,63 +1598,6 @@ def trim_process_heap() -> bool:
             "        phase_trace.document_started()\n",
             count=1,
             label="Hybrid asynchronous document phase start",
-        )
-        source = _replace_exact_occurrence(
-            source,
-            "        phase_trace.document_started()\n\n"
-            "        infer_start = time.time()\n",
-            "        phase_trace.document_started()\n\n"
-            "        if execution_profile.pipeline_mode == \"depth1\":\n"
-            "            a_owner, c_owner = process_capacity_stage_gates()\n"
-            "            model_list, hybrid_pipeline_model = (\n"
-            "                await _aio_run_hybrid_capacity_pipeline(\n"
-            "                    pdf_bytes=pdf_bytes,\n"
-            "                    pdf_doc=pdf_doc,\n"
-            "                    image_writer=image_writer,\n"
-            "                    predictor=predictor,\n"
-            "                    middle_json=middle_json,\n"
-            "                    page_count=page_count,\n"
-            "                    effective_window_size=effective_window_size,\n"
-            "                    phase_trace=phase_trace,\n"
-            "                    inline_formula_enable=inline_formula_enable,\n"
-            "                    batch_ratio=batch_ratio,\n"
-            "                    ocr_enable=_ocr_enable,\n"
-            "                    effort=effort,\n"
-            "                    effective_image_analysis=effective_image_analysis,\n"
-            "                    a_owner=a_owner,\n"
-            "                    c_owner=c_owner,\n"
-            "                    execution_profile=execution_profile,\n"
-            "                )\n"
-            "            )\n"
-            "            finalize_started_ns = phase_trace.start()\n"
-            "            if client_side_output_generation:\n"
-            "                await run_native_owned(\n"
-            "                    c_owner,\n"
-            "                    apply_server_side_postprocess,\n"
-            "                    middle_json[\"pdf_info\"],\n"
-            "                    hybrid_pipeline_model,\n"
-            "                    _ocr_enable,\n"
-            "                )\n"
-            "            else:\n"
-            "                await run_native_owned(\n"
-            "                    c_owner,\n"
-            "                    finalize_middle_json,\n"
-            "                    middle_json[\"pdf_info\"],\n"
-            "                    hybrid_pipeline_model,\n"
-            "                    _ocr_enable,\n"
-            "                    effort=effort,\n"
-            "                )\n"
-            "            phase_trace.complete(\"document_finalize\", finalize_started_ns)\n"
-            "            close_pdfium_document(pdf_doc)\n"
-            "            doc_closed = True\n"
-            "            clean_memory(device)\n"
-            "            phase_trace.document_completed()\n"
-            "            trim_process_heap()\n"
-            "            return middle_json, model_list\n\n"
-            "        infer_start = time.time()\n",
-            count=2,
-            occurrence=1,
-            label="Hybrid asynchronous capacity branch",
         )
         source = _replace_exact(
             source,

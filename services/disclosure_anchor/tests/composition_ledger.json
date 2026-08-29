@@ -296,7 +296,7 @@
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
-   "tests": 20
+   "tests": 13
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -389,6 +389,10 @@
   "tests/unit/test_remote_parse_checkpoint.py": {
    "private_imports": [],
    "tests": 4
+  },
+  "tests/unit/test_retired_mineru_candidate_closure.py": {
+   "private_imports": [],
+   "tests": 1
   },
   "tests/unit/test_retrieval_primary.py": {
    "private_imports": [],

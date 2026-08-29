@@ -191,10 +191,10 @@ function Invoke-Docker {
 # END MINERU NATIVE PROCESS V1
 
 $ProjectName = "mineru-tailnet"
-$ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v3"
+$ApiCompatImage = "agent-invest/mineru-api:3.4.4-serial-v1"
 $ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
 $HeapReturnPolicy = "glibc-malloc-trim-per-window.v1"
-$CapacityPolicy = "process-global-mineru-coordinator.v4"
+$CapacityPolicy = "single-owner-serial-mineru.v1"
 $RequiredComposeTarget = "C:\ProgramData\compose.tailnet.yaml"
 $RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1"
 $RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json"
@@ -619,46 +619,6 @@ function Get-ValidatedRuntime {
     if (@($api.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1") {
         throw "MinerU API heap-return compatibility switch is not enabled"
     }
-    $capacityModeEnvironment = @(
-        $api.Config.Env | Where-Object { $_ -like "MINERU_CAPACITY_MODE=*" }
-    )
-    if (
-        $capacityModeEnvironment.Count -ne 1 -or
-        $capacityModeEnvironment[0] -notin @(
-            "MINERU_CAPACITY_MODE=legacy", "MINERU_CAPACITY_MODE=candidate"
-        )
-    ) {
-        throw "MinerU API capacity mode is not closed"
-    }
-    $capacityProfileEnvironment = @(
-        $api.Config.Env | Where-Object { $_ -like "MINERU_CAPACITY_PROFILE_JSON=*" }
-    )
-    if ($capacityProfileEnvironment.Count -ne 1) {
-        throw "MinerU API capacity profile is not unique"
-    }
-    try {
-        $capacityProfile = (
-            $capacityProfileEnvironment[0].Substring(
-                "MINERU_CAPACITY_PROFILE_JSON=".Length
-            ) | ConvertFrom-Json
-        )
-    }
-    catch {
-        throw "MinerU API capacity profile JSON is invalid"
-    }
-    $capacityProfileFields = @($capacityProfile.PSObject.Properties.Name | Sort-Object)
-    $expectedCapacityProfileFields = @(
-        "inner_inference_concurrency", "max_document_pages",
-        "max_resident_pages", "max_source_pdf_bytes", "min_document_pages",
-        "pipeline_depth", "profile_id", "schema", "vllm_max_num_seqs", "window_size"
-    ) | Sort-Object
-    if (
-        ($capacityProfileFields -join ",") -ne
-            ($expectedCapacityProfileFields -join ",") -or
-        [string]$capacityProfile.schema -ne "mineru-execution-profile.v2"
-    ) {
-        throw "MinerU API capacity profile contract drifted"
-    }
     $phaseTraceEnvironment = @(
         $api.Config.Env | Where-Object { $_ -like "MINERU_PHASE_TRACE=*" }
     )
@@ -860,8 +820,7 @@ function Get-ValidatedApiCompatImage {
         [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-dockerfile-sha256" -ne
             [string]$BuildIdentity.dockerfile_sha256 -or
         @($image.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1" -or
-        @($image.Config.Env) -notcontains "MINERU_PHASE_TRACE=0" -or
-        @($image.Config.Env) -notcontains "MINERU_CAPACITY_MODE=legacy"
+        @($image.Config.Env) -notcontains "MINERU_PHASE_TRACE=0"
     ) {
         throw "MinerU API compatibility image labels or environment drifted"
     }

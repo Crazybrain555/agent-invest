@@ -261,9 +261,6 @@ mineru-phase-trace-capture:
 	@test -n "$(OBSERVABILITY_URL)" || (echo 'mineru-phase-trace-capture: OBSERVABILITY_URL is required' && exit 2)
 	@test -n "$(INFERENCE_UPSTREAM_URL)" || (echo 'mineru-phase-trace-capture: INFERENCE_UPSTREAM_URL is required' && exit 2)
 	@test -n "$(RUNTIME_BUNDLE_IDENTITY)" || (echo 'mineru-phase-trace-capture: RUNTIME_BUNDLE_IDENTITY is required' && exit 2)
-	@test -n "$(CAPACITY_MODE)" || (echo 'mineru-phase-trace-capture: CAPACITY_MODE is required' && exit 2)
-	@test -n "$(PROFILE_SHA256)" || (echo 'mineru-phase-trace-capture: PROFILE_SHA256 is required' && exit 2)
-	@test -n "$(PROFILE)" || (echo 'mineru-phase-trace-capture: PROFILE is required' && exit 2)
 	@test -n "$(CAPTURE)" || (echo 'mineru-phase-trace-capture: CAPTURE is required' && exit 2)
 	@test -n "$(SSH_HOST)" || (echo 'mineru-phase-trace-capture: SSH_HOST is required' && exit 2)
 	@test -n "$(SSH_USER)" || (echo 'mineru-phase-trace-capture: SSH_USER is required' && exit 2)
@@ -275,7 +272,6 @@ mineru-phase-trace-capture:
 		--observability-url "$(OBSERVABILITY_URL)" \
 		--inference-upstream-url "$(INFERENCE_UPSTREAM_URL)" \
 		--runtime-bundle-identity "$(RUNTIME_BUNDLE_IDENTITY)" \
-		--capacity-mode "$(CAPACITY_MODE)" --profile "$(PROFILE)" --profile-sha256 "$(PROFILE_SHA256)" \
 		--ssh-host "$(SSH_HOST)" --ssh-user "$(SSH_USER)" --ssh-port "$(SSH_PORT)" \
 		--ssh-identity "$(SSH_IDENTITY)" --ssh-known-hosts "$(SSH_KNOWN_HOSTS)" \
 		--capture-out "$(CAPTURE)"

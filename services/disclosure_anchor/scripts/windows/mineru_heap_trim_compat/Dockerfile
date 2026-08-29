@@ -11,12 +11,10 @@ RUN test "${COMPAT_PATCHER_SHA256}" = "sha256:$(sha256sum /tmp/patch_mineru_344.
 
 ENV MINERU_MALLOC_TRIM=1
 ENV MINERU_PHASE_TRACE=0
-ENV MINERU_CAPACITY_MODE=legacy
-
-RUN /usr/bin/python3.12 -I -c "from mineru.cli.fast_api import AsyncTaskManager; from mineru.utils.model_utils import capacity_pipeline_enabled, is_heap_trim_enabled, is_phase_trace_enabled, process_capacity_stage_gates, trim_process_heap; from mineru_vl_utils.post_process.cross_page_table import _HAS_TABLE_MERGE; from mineru_vl_utils.vlm_client.http_client import _process_async_request_limiter; assert AsyncTaskManager; assert _HAS_TABLE_MERGE; assert _process_async_request_limiter; assert process_capacity_stage_gates; assert not capacity_pipeline_enabled(); assert is_heap_trim_enabled(); assert not is_phase_trace_enabled(); assert trim_process_heap()"
+RUN /usr/bin/python3.12 -I -c "from mineru.cli.fast_api import AsyncTaskManager; from mineru.utils.model_utils import is_heap_trim_enabled, is_phase_trace_enabled, process_stage_gates, serial_execution_profile, trim_process_heap; from mineru_vl_utils.post_process.cross_page_table import _HAS_TABLE_MERGE; from mineru_vl_utils.vlm_client.http_client import _process_async_request_limiter; assert AsyncTaskManager; assert _HAS_TABLE_MERGE; assert _process_async_request_limiter; assert process_stage_gates; assert serial_execution_profile(16).pipeline_mode == 'serial'; assert is_heap_trim_enabled(); assert not is_phase_trace_enabled(); assert trim_process_heap()"
 
 LABEL io.agent-invest.mineru.base-image-digest="sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458" \
       io.agent-invest.mineru.compatibility-policy="glibc-malloc-trim-per-window.v1" \
-      io.agent-invest.mineru.capacity-policy="process-global-mineru-coordinator.v4" \
+      io.agent-invest.mineru.capacity-policy="single-owner-serial-mineru.v1" \
       io.agent-invest.mineru.compatibility-patcher-sha256="${COMPAT_PATCHER_SHA256}" \
       io.agent-invest.mineru.compatibility-dockerfile-sha256="${COMPAT_DOCKERFILE_SHA256}"

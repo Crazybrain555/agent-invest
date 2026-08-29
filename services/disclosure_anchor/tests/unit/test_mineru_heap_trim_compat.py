@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import redirect_stderr
-from dataclasses import replace
-import hashlib
 import io
 import json
 import os
@@ -17,12 +15,7 @@ from unittest.mock import patch
 from disclosure_anchor.adapters.runtime.mineru_phase_trace import (
     PHASE_TRACE_PREFIX,
     parse_phase_trace_line,
-    summarize_complete_phase_trace,
     validate_complete_phase_trace,
-)
-from disclosure_anchor.adapters.runtime.mineru_phase_trace_capture import (
-    parse_phase_trace_capture,
-    summarize_phase_trace_capture,
 )
 from scripts.windows.mineru_heap_trim_compat.patch_mineru_344 import (
     BASE_IMAGE_DIGEST,
@@ -75,25 +68,6 @@ def get_batch_ratio(device):
 def _close_images(images_list):
     return None
 '''
-
-
-def _candidate_profile_json() -> str:
-    return json.dumps(
-        {
-            "inner_inference_concurrency": 7,
-            "max_document_pages": 10000,
-            "max_resident_pages": 16,
-            "max_source_pdf_bytes": 1024 * 1024 * 1024,
-            "min_document_pages": 9,
-            "pipeline_depth": 1,
-            "profile_id": "rtx5080-w8-d1-c7-s128-v1",
-            "schema": "mineru-execution-profile.v2",
-            "vllm_max_num_seqs": 128,
-            "window_size": 8,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
 
 
 def _http_client_fixture() -> str:
@@ -517,69 +491,6 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("async with limiter:", patched)
         self.assertNotIn("async with semaphore:\n            response = await client.post", patched)
 
-    def test_process_credit_pool_is_shared_across_documents_and_stage_gates_split(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-
-        async def exercise() -> None:
-            profile = namespace["CapacityExecutionProfile"](
-                profile_id="candidate-w2-d1",
-                profile_sha256="sha256:" + "a" * 64,
-                pipeline_mode="depth1",
-                pipeline_depth=1,
-                window_size=2,
-                max_resident_pages=4,
-                max_source_pdf_bytes=10000,
-                min_document_pages=3,
-                max_document_pages=100,
-                inner_inference_concurrency=2,
-                vllm_max_num_seqs=8,
-            )
-            first = namespace["CapacityCreditBank"](profile)
-            second = namespace["CapacityCreditBank"](profile)
-            first_lease = await first.acquire(2)
-            second_lease = await second.acquire(2)
-            self.assertIs(first.pool, second.pool)
-            self.assertEqual(second_lease.resident_windows_after_acquire, 2)
-            self.assertEqual(second_lease.resident_pages_after_acquire, 4)
-            blocked = asyncio.create_task(first.acquire(1))
-            await asyncio.sleep(0)
-            self.assertFalse(blocked.done())
-            await first.release(first_lease)
-            third_lease = await blocked
-            await first.release(third_lease)
-            await second.release(second_lease)
-            first.assert_fully_released()
-            second.assert_fully_released()
-            a_gate, c_gate = namespace["process_capacity_stage_gates"]()
-            same_a, same_c = namespace["process_capacity_stage_gates"]()
-            self.assertIs(a_gate, same_a)
-            self.assertIs(c_gate, same_c)
-            self.assertIsNot(a_gate, c_gate)
-            await a_gate.acquire()
-            same_stage = asyncio.create_task(same_a.acquire())
-            other_stage = asyncio.create_task(c_gate.acquire())
-            await asyncio.sleep(0)
-            self.assertFalse(same_stage.done())
-            self.assertTrue(other_stage.done())
-            c_gate.release()
-            a_gate.release()
-            await same_stage
-            same_a.release()
-
-        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
-            asyncio.run(exercise())
 
     def test_cross_page_transport_and_cardinality_fail_visible(self) -> None:
         patched = patch_source(
@@ -609,7 +520,6 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn('normalized not in {"1", "2", "4", "8"}', patched)
         self.assertIn("rotate_labels = run_ocr_inference(", patched)
         self.assertIn("hybrid_batch_ratio_requested=batch_ratio_requested", patched)
-        self.assertIn("a_owner, c_owner = process_capacity_stage_gates()", patched)
         ratio_start = patched.index("def get_batch_ratio(_device):")
         ratio_end = patched.index("def _close_images", ratio_start)
 
@@ -766,18 +676,12 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(patched_vlm.count("trim_process_heap()"), 4)
-        self.assertEqual(patched_hybrid.count("trim_process_heap()"), 6)
+        self.assertEqual(patched_hybrid.count("trim_process_heap()"), 4)
         self.assertEqual(patched_vlm.count('"window_vlm",'), 2)
-        self.assertEqual(patched_hybrid.count('"window_layout",'), 4)
-        self.assertEqual(patched_hybrid.count('"window_postprocess",'), 4)
-        self.assertEqual(patched_hybrid.count('"window_total",'), 3)
-        self.assertNotIn("CapacityCandidateFallback", patched_hybrid)
-        self.assertNotIn("allow_auto_fallback", patched_hybrid)
-        capacity_helper = patched_hybrid[
-            patched_hybrid.index("async def _aio_run_hybrid_capacity_pipeline(") :
-            patched_hybrid.index("async def aio_doc_analyze(")
-        ]
-        self.assertIn("model_list.extend(window_model_list)", capacity_helper)
+        self.assertEqual(patched_hybrid.count('"window_layout",'), 2)
+        self.assertEqual(patched_hybrid.count('"window_postprocess",'), 2)
+        self.assertEqual(patched_hybrid.count('"window_total",'), 2)
+        self.assertIn("serial_execution_profile", patched_hybrid)
 
     def test_phase_trace_is_default_off_content_free_and_strictly_closed(self) -> None:
         source = (
@@ -809,7 +713,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         with patch.dict(os.environ, {"MINERU_PHASE_TRACE": "1"}), redirect_stderr(
             output
         ):
-            execution_profile = namespace["legacy_capacity_execution_profile"](16)
+            execution_profile = namespace["serial_execution_profile"](16)
             trace = namespace["new_phase_trace"](
                 backend="hybrid",
                 page_count=2,
@@ -880,655 +784,11 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                     total_windows=1,
                 )
 
-    def test_auto_capacity_pipeline_is_ordered_overlapped_and_two_resident(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-        with patch.dict(os.environ, {"MINERU_CAPACITY_MODE": "legacy"}):
-            self.assertFalse(namespace["capacity_pipeline_enabled"]())
-            self.assertEqual(namespace["capacity_active_window_size"](16), 16)
-        with patch.dict(
-            os.environ,
-            {
-                "MINERU_CAPACITY_MODE": "candidate",
-                "MINERU_CAPACITY_PROFILE_JSON": _candidate_profile_json(),
-            },
-        ):
-            self.assertTrue(namespace["capacity_pipeline_enabled"]())
-            self.assertEqual(namespace["capacity_active_window_size"](16), 8)
 
-        async def exercise() -> tuple[list[str], int, int, list[int]]:
-            timeline: list[str] = []
-            resident = 0
-            max_resident = 0
-            committed: list[int] = []
 
-            async def prepare(item: int) -> dict[str, object]:
-                nonlocal resident, max_resident
-                timeline.append(f"prepare-start-{item}")
-                resident += 1
-                max_resident = max(max_resident, resident)
-                await asyncio.sleep(0.002)
-                timeline.append(f"prepare-end-{item}")
-                return {"item": item, "released": False}
 
-            async def infer(
-                prepared: dict[str, object], inference_started: asyncio.Event
-            ) -> int:
-                item = int(prepared["item"])
-                timeline.append(f"infer-start-{item}")
-                inference_started.set()
-                await asyncio.sleep(0.008)
-                timeline.append(f"infer-end-{item}")
-                return item
 
-            async def release(prepared: dict[str, object]) -> None:
-                nonlocal resident
-                if prepared["released"]:
-                    return
-                prepared["released"] = True
-                resident -= 1
 
-            async def commit(prepared: dict[str, object], result: int) -> None:
-                timeline.append(f"commit-start-{result}")
-                await asyncio.sleep(0.004)
-                committed.append(result)
-                await release(prepared)
-                timeline.append(f"commit-end-{result}")
-
-            await namespace["run_bounded_ordered_pipeline"](
-                range(3),
-                prepare=prepare,
-                infer=infer,
-                commit=commit,
-                release=release,
-            )
-            return timeline, resident, max_resident, committed
-
-        timeline, resident, max_resident, committed = asyncio.run(exercise())
-        self.assertEqual(resident, 0)
-        self.assertEqual(max_resident, 2)
-        self.assertEqual(committed, [0, 1, 2])
-        self.assertLess(
-            timeline.index("prepare-start-1"), timeline.index("infer-end-0")
-        )
-        self.assertLess(
-            timeline.index("infer-start-1"), timeline.index("commit-end-0")
-        )
-
-    def test_depth_one_phase_trace_proves_order_and_both_overlaps(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-
-        output = io.StringIO()
-
-        async def exercise() -> None:
-            profile = namespace["CapacityExecutionProfile"](
-                profile_id="candidate-w2-d1",
-                profile_sha256="sha256:" + "a" * 64,
-                pipeline_mode="depth1",
-                pipeline_depth=1,
-                window_size=2,
-                max_resident_pages=4,
-                max_source_pdf_bytes=10000,
-                min_document_pages=3,
-                max_document_pages=100,
-                inner_inference_concurrency=2,
-                vllm_max_num_seqs=8,
-            )
-            bank = namespace["CapacityCreditBank"](profile)
-            trace = namespace["new_phase_trace"](
-                backend="hybrid",
-                page_count=6,
-                window_size=2,
-                total_windows=3,
-                execution_profile=profile,
-                source_pdf_bytes=1234,
-                hybrid_batch_ratio_requested=4,
-                hybrid_batch_ratio_effective=4,
-                hybrid_batch_ratio_ocr_override=False,
-            )
-            trace.document_started()
-
-            async def prepare(item: int) -> dict[str, object]:
-                window = trace.window(
-                    window_index=item,
-                    page_start=item * 2,
-                    page_end_exclusive=item * 2 + 2,
-                )
-                total_started_ns = trace.start()
-                credit_wait_started_ns = trace.start()
-                lease = await bank.acquire(2)
-                trace.complete(
-                    "window_credit_wait",
-                    credit_wait_started_ns,
-                    window=window,
-                    credit_lease=lease,
-                )
-                render_started_ns = trace.start()
-                await asyncio.sleep(0.002)
-                trace.complete(
-                    "window_render",
-                    render_started_ns,
-                    window=window,
-                    credit_lease=lease,
-                )
-                bank.record_actual_decoded_bytes(lease, 1024)
-                layout_started_ns = trace.start()
-                await asyncio.sleep(0.001)
-                trace.complete(
-                    "window_layout",
-                    layout_started_ns,
-                    window=window,
-                    credit_lease=lease,
-                )
-                return {
-                    "item": item,
-                    "lease": lease,
-                    "released": False,
-                    "ready_ns": trace.start(),
-                    "total_started_ns": total_started_ns,
-                    "window": window,
-                }
-
-            async def infer(
-                prepared: dict[str, object], inference_started: asyncio.Event
-            ) -> int:
-                trace.complete(
-                    "window_b_queue_wait",
-                    prepared["ready_ns"],
-                    window=prepared["window"],
-                    credit_lease=prepared["lease"],
-                )
-                started_ns = trace.start()
-                inference_started.set()
-                await asyncio.sleep(0.008)
-                trace.complete(
-                    "window_vlm",
-                    started_ns,
-                    window=prepared["window"],
-                    credit_lease=prepared["lease"],
-                )
-                return int(prepared["item"])
-
-            async def release(prepared: dict[str, object]) -> None:
-                if prepared["released"]:
-                    return
-                prepared["released"] = True
-                release_started_ns = trace.start()
-                await bank.release(prepared["lease"])
-                trace.complete(
-                    "window_release",
-                    release_started_ns,
-                    window=prepared["window"],
-                    credit_lease=prepared["lease"],
-                )
-
-            async def commit(prepared: dict[str, object], result: int) -> None:
-                postprocess_started_ns = trace.start()
-                await asyncio.sleep(0.004)
-                trace.complete(
-                    "window_postprocess",
-                    postprocess_started_ns,
-                    window=prepared["window"],
-                    credit_lease=prepared["lease"],
-                )
-                append_started_ns = trace.start()
-                trace.complete(
-                    "window_append",
-                    append_started_ns,
-                    window=prepared["window"],
-                    append_index=result,
-                    credit_lease=prepared["lease"],
-                )
-                await release(prepared)
-                trace.complete(
-                    "window_total",
-                    prepared["total_started_ns"],
-                    window=prepared["window"],
-                    credit_lease=prepared["lease"],
-                )
-
-            await namespace["run_bounded_ordered_pipeline"](
-                range(3),
-                prepare=prepare,
-                infer=infer,
-                commit=commit,
-                release=release,
-            )
-            bank.assert_fully_released()
-            finalize_started_ns = trace.start()
-            trace.complete("document_finalize", finalize_started_ns)
-            trace.document_completed()
-
-        with patch.dict(os.environ, {"MINERU_PHASE_TRACE": "1"}), redirect_stderr(
-            output
-        ):
-            asyncio.run(exercise())
-        events = tuple(
-            parse_phase_trace_line(line) for line in output.getvalue().splitlines()
-        )
-        self.assertEqual(
-            validate_complete_phase_trace(
-                events,
-                expected_profile_sha256="sha256:" + "a" * 64,
-                require_pipeline_overlap=True,
-            ),
-            events,
-        )
-        summary = summarize_complete_phase_trace(
-            events,
-            expected_profile_sha256="sha256:" + "a" * 64,
-            require_pipeline_overlap=True,
-        )
-        self.assertEqual(summary["schema"], "mineru-phase-trace-summary.v1")
-        self.assertEqual(summary["pipeline_mode"], "depth1")
-        self.assertEqual(summary["page_count"], 6)
-        self.assertGreater(summary["a_b_overlap_ns"], 0)
-        self.assertGreater(summary["b_c_overlap_ns"], 0)
-        self.assertGreater(summary["max_observed_resident_pages"], 0)
-        self.assertGreater(summary["max_actual_decoded_bytes"], 0)
-
-        layout_index = next(
-            index
-            for index, event in enumerate(events)
-            if event.window_index == 0 and event.phase == "window_layout"
-        )
-        drifted = list(events)
-        drifted[layout_index] = replace(
-            drifted[layout_index],
-            actual_decoded_bytes=2048,
-        )
-        with self.assertRaisesRegex(ValueError, "reconciliation drifted"):
-            validate_complete_phase_trace(
-                drifted,
-                expected_profile_sha256="sha256:" + "a" * 64,
-            )
-
-        lines = output.getvalue().splitlines()
-        trace_text = "".join(f"{line}\n" for line in lines)
-        capture_payload = {
-            "active_profile_sha256": "sha256:" + "a" * 64,
-            "capacity_mode": "candidate",
-            "collected_at_utc": "2026-08-27T01:10:00+00:00",
-            "collector_path": (
-                r"C:\ProgramData\agent-invest\mineru-runtime-v6"
-                r"\collect_mineru_runtime.ps1"
-            ),
-            "collector_sha256": "sha256:" + "b" * 64,
-            "container": {
-                "health": "healthy",
-                "id": "c" * 64,
-                "image": "agent-invest/mineru-api:test",
-                "image_id": "sha256:" + "d" * 64,
-                "name": "mineru-api",
-                "oom_killed": False,
-                "restart_count": 0,
-                "running": True,
-                "started_at_utc": "2026-08-27T00:00:00+00:00",
-                "status": "running",
-            },
-            "line_count": len(lines),
-            "lines": lines,
-            "schema": "mineru-phase-trace-capture.v1",
-            "since_utc": "2026-08-27T01:00:00+00:00",
-            "trace_bytes": len(trace_text.encode("utf-8")),
-            "trace_lines_sha256": (
-                "sha256:" + hashlib.sha256(trace_text.encode("utf-8")).hexdigest()
-            ),
-            "until_utc": "2026-08-27T01:09:00+00:00",
-            "windows_node_identity_sha256": "sha256:" + "e" * 64,
-        }
-        capture = parse_phase_trace_capture(
-            json.dumps(capture_payload, sort_keys=True, separators=(",", ":"))
-        )
-        capture_summary = summarize_phase_trace_capture(
-            capture,
-            expected_profile_sha256="sha256:" + "a" * 64,
-            expected_capacity_mode="candidate",
-            expected_collector_sha256="sha256:" + "b" * 64,
-            expected_windows_node_identity_sha256="sha256:" + "e" * 64,
-            expected_container_id="c" * 64,
-            require_pipeline_overlap=True,
-        )
-        self.assertEqual(capture_summary["document_count"], 1)
-        self.assertEqual(capture_summary["page_count"], 6)
-
-    def test_pipeline_failure_before_b_start_releases_the_prepared_owner(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-
-        async def exercise() -> tuple[int, list[int]]:
-            resident = 0
-            released: list[int] = []
-
-            async def prepare(item: int) -> dict[str, object]:
-                nonlocal resident
-                resident += 1
-                return {"item": item, "released": False}
-
-            async def infer(
-                _prepared: dict[str, object], _inference_started: asyncio.Event
-            ) -> int:
-                raise RuntimeError("B failed before owner acquisition")
-
-            async def release(prepared: dict[str, object]) -> None:
-                nonlocal resident
-                if prepared["released"]:
-                    return
-                prepared["released"] = True
-                resident -= 1
-                released.append(int(prepared["item"]))
-
-            async def commit(_prepared: dict[str, object], _result: int) -> None:
-                raise AssertionError("commit must not run")
-
-            with self.assertRaisesRegex(RuntimeError, "before owner acquisition"):
-                await namespace["run_bounded_ordered_pipeline"](
-                    range(2),
-                    prepare=prepare,
-                    infer=infer,
-                    commit=commit,
-                    release=release,
-                )
-            return resident, released
-
-        resident, released = asyncio.run(exercise())
-        self.assertEqual(resident, 0)
-        self.assertEqual(released, [0])
-
-    def test_execution_profile_selection_is_strict_immutable_and_fail_closed(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-        select = namespace["select_capacity_execution_profile"]
-
-        with patch.dict(os.environ, {"MINERU_CAPACITY_MODE": "legacy"}, clear=False):
-            legacy = select(
-                configured_window_size=16,
-                page_count=100,
-                source_pdf_bytes=1000,
-            )
-        self.assertEqual(legacy.pipeline_mode, "legacy")
-        self.assertEqual(legacy.window_size, 16)
-        self.assertRegex(legacy.profile_sha256, r"^sha256:[a-f0-9]{64}$")
-
-        with patch.dict(
-            os.environ,
-            {
-                "MINERU_CAPACITY_MODE": "candidate",
-                "MINERU_CAPACITY_PROFILE_JSON": _candidate_profile_json(),
-            },
-            clear=False,
-        ):
-            candidate = select(
-                configured_window_size=16,
-                page_count=100,
-                source_pdf_bytes=1000,
-            )
-        self.assertEqual(candidate.pipeline_mode, "depth1")
-        self.assertEqual(candidate.max_resident_pages, 16)
-        self.assertEqual(candidate.window_size, 8)
-        with patch.dict(
-            os.environ,
-            {
-                "MINERU_CAPACITY_MODE": "candidate",
-                "MINERU_CAPACITY_PROFILE_JSON": _candidate_profile_json(),
-            },
-            clear=False,
-        ):
-            runtime_status = namespace["capacity_runtime_status"](16)
-        self.assertEqual(runtime_status["schema"], "mineru-capacity-runtime.v1")
-        self.assertTrue(runtime_status["nonlegacy_admission_enabled"])
-        self.assertEqual(
-            runtime_status["legacy_profile_sha256"], legacy.profile_sha256
-        )
-        self.assertEqual(
-            runtime_status["candidate_profile"]["profile_sha256"],
-            candidate.profile_sha256,
-        )
-        self.assertEqual(
-            runtime_status["candidate_profile"]["max_resident_pages"], 16
-        )
-
-        invalid_payload = json.loads(_candidate_profile_json())
-        invalid_payload["max_resident_pages"] = 17
-        with patch.dict(
-            os.environ,
-            {
-                "MINERU_CAPACITY_MODE": "candidate",
-                "MINERU_CAPACITY_PROFILE_JSON": json.dumps(invalid_payload),
-            },
-            clear=False,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "legacy owner envelope"):
-                select(
-                    configured_window_size=16,
-                    page_count=100,
-                    source_pdf_bytes=1000,
-                )
-
-    def test_vector_credit_bank_is_atomic_bounded_and_closes(self) -> None:
-        source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        namespace: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            namespace,
-        )
-
-        async def exercise() -> None:
-            with patch.dict(
-                os.environ,
-                {
-                    "MINERU_CAPACITY_MODE": "candidate",
-                    "MINERU_CAPACITY_PROFILE_JSON": _candidate_profile_json(),
-                },
-                clear=False,
-            ):
-                profile = namespace["select_capacity_execution_profile"](
-                    configured_window_size=16,
-                    page_count=100,
-                    source_pdf_bytes=1000,
-                )
-            bank = namespace["CapacityCreditBank"](profile)
-            first = await bank.acquire(8)
-            second = await bank.acquire(8)
-            self.assertEqual(second.resident_pages_after_acquire, 16)
-            third_task = asyncio.create_task(bank.acquire(1))
-            await asyncio.sleep(0.01)
-            self.assertFalse(third_task.done())
-
-            bank.record_actual_decoded_bytes(first, 1024)
-            with self.assertRaisesRegex(RuntimeError, "exceed"):
-                bank.record_actual_decoded_bytes(
-                    second,
-                    second.reserved_decoded_bytes + 1,
-                )
-            await bank.release(first)
-            third = await third_task
-            self.assertEqual(third.page_count, 1)
-            await bank.release(second)
-            await bank.release(third)
-            bank.assert_fully_released()
-            with self.assertRaisesRegex(RuntimeError, "release state"):
-                await bank.release(first)
-
-        asyncio.run(exercise())
-
-    def test_render_failure_releases_credit_without_document_fallback(
-        self,
-    ) -> None:
-        model_utils_source = (
-            "import math\nimport os\nimport time\nimport gc\n"
-            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
-        )
-        runtime: dict[str, object] = {}
-        exec(
-            compile(
-                patch_source("mineru/utils/model_utils.py", model_utils_source),
-                "patched-model-utils.py",
-                "exec",
-            ),
-            runtime,
-        )
-        hybrid_source = (
-            "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n"
-            + _HYBRID_COORDINATOR_FIXTURE
-            + _hybrid_document_fixture(asynchronous=False)
-            + "async def aio_doc_analyze(\n"
-            + _hybrid_document_fixture(asynchronous=True)
-        )
-        patched_hybrid = patch_source(
-            "mineru/backend/hybrid/hybrid_analyze.py",
-            hybrid_source,
-        )
-        helper_start = patched_hybrid.index(
-            "async def _aio_run_hybrid_capacity_pipeline("
-        )
-        helper_end = patched_hybrid.index(
-            "async def aio_doc_analyze(", helper_start
-        )
-
-        acquired = []
-        released = []
-        render_states: list[str] = []
-        closed_images: list[object] = []
-        base_bank = runtime["CapacityCreditBank"]
-
-        class RecordingCreditBank(base_bank):
-            async def acquire(self, page_count):
-                lease = await super().acquire(page_count)
-                acquired.append(lease)
-                return lease
-
-            async def release(self, lease):
-                await super().release(lease)
-                released.append(lease)
-
-        async def fail_render(*_args, **_kwargs):
-            render_states.append(acquired[-1].state)
-            raise RuntimeError("render failed after credit acquisition")
-
-        class PhaseTraceStub:
-            def start(self):
-                return 1
-
-            def window(self, **kwargs):
-                return kwargs
-
-            def complete(self, *_args, **_kwargs):
-                return None
-
-        class ImageTypeStub:
-            PIL = object()
-
-        helper_namespace = dict(runtime)
-        helper_namespace.update(
-            {
-                "CapacityCreditBank": RecordingCreditBank,
-                "ImageType": ImageTypeStub,
-                "_close_images": closed_images.append,
-                "aio_load_images_from_pdf_bytes_range": fail_render,
-            }
-        )
-        exec(
-            compile(
-                patched_hybrid[helper_start:helper_end],
-                "patched-hybrid-capacity-helper.py",
-                "exec",
-            ),
-            helper_namespace,
-        )
-        with patch.dict(
-            os.environ,
-            {
-                "MINERU_CAPACITY_MODE": "candidate",
-                "MINERU_CAPACITY_PROFILE_JSON": _candidate_profile_json(),
-            },
-            clear=False,
-        ):
-            profile = runtime["select_capacity_execution_profile"](
-                configured_window_size=16,
-                page_count=9,
-                source_pdf_bytes=1000,
-            )
-
-        async def exercise() -> None:
-            with self.assertRaises(RuntimeError):
-                await helper_namespace["_aio_run_hybrid_capacity_pipeline"](
-                    pdf_bytes=b"pdf",
-                    pdf_doc=object(),
-                    image_writer=object(),
-                    predictor=object(),
-                    middle_json={},
-                    page_count=9,
-                    effective_window_size=8,
-                    phase_trace=PhaseTraceStub(),
-                    inline_formula_enable=False,
-                    batch_ratio=1,
-                    ocr_enable=False,
-                    effort="medium",
-                    effective_image_analysis=False,
-                    a_owner=asyncio.Lock(),
-                    c_owner=asyncio.Lock(),
-                    execution_profile=profile,
-                )
-
-        asyncio.run(exercise())
-        self.assertEqual(render_states, ["leased"])
-        self.assertEqual(len(acquired), 1)
-        self.assertEqual(released, acquired)
-        self.assertEqual(acquired[0].state, "released")
-        self.assertEqual(closed_images, [])
 
     def test_async_owned_factory_is_not_created_while_waiting_for_owner(self) -> None:
         source = (
@@ -1640,9 +900,8 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn(f"FROM mineru@{BASE_IMAGE_DIGEST}", dockerfile)
         self.assertIn("ENV MINERU_MALLOC_TRIM=1", dockerfile)
         self.assertIn("ENV MINERU_PHASE_TRACE=0", dockerfile)
-        self.assertIn("ENV MINERU_CAPACITY_MODE=legacy", dockerfile)
         self.assertIn(
-            'io.agent-invest.mineru.capacity-policy="process-global-mineru-coordinator.v4"',
+            'io.agent-invest.mineru.capacity-policy="single-owner-serial-mineru.v1"',
             dockerfile,
         )
         self.assertIn("COMPAT_PATCHER_SHA256", dockerfile)
@@ -1839,7 +1098,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("$traceLines.Count -gt $MaxTraceLines", collector)
         self.assertIn("$traceByteCount -gt $MaxTraceBytes", collector)
         self.assertIn("active_profile_sha256", collector)
-        self.assertIn("mineru-capacity-v1/compatibility.json", collector)
+        self.assertIn("mineru-serial-v1/compatibility.json", collector)
         self.assertIn("actual_source_sha256", collector)
         self.assertIn("heap_trim_enabled", collector)
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import json
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -21,7 +20,7 @@ from scripts.attest_mineru_remote_runtime import (
     EXPECTED_REPO_DIGEST,
     _known_host_key_sha256,
     _canonical_remote_collector_path,
-    _expected_capacity_runtime,
+    _expected_serial_runtime,
     _read_remote_file,
     _ssh_base,
     build_manifest,
@@ -45,25 +44,7 @@ API_IMAGE_ID = "sha256:" + "a" * 64
 
 
 def _observation() -> dict[str, Any]:
-    capacity_profile = json.dumps(
-        {
-            "inner_inference_concurrency": 7,
-            "max_document_pages": 10000,
-            "max_resident_pages": 16,
-            "max_source_pdf_bytes": 1073741824,
-            "min_document_pages": 9,
-            "pipeline_depth": 1,
-            "profile_id": "rtx5080-w8-d1-c7-s128-v1",
-            "schema": "mineru-execution-profile.v2",
-            "vllm_max_num_seqs": 128,
-            "window_size": 8,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     api_environment = [
-        "MINERU_CAPACITY_MODE=legacy",
-        f"MINERU_CAPACITY_PROFILE_JSON={capacity_profile}",
         "MINERU_MODEL_SOURCE=local",
         "MINERU_MALLOC_TRIM=1",
         "MINERU_PHASE_TRACE=0",
@@ -134,7 +115,7 @@ def _observation() -> dict[str, Any]:
             "marker": {
                 "schema": "mineru-runtime-compatibility.v4",
                 "policy": "glibc-malloc-trim-per-window.v1",
-                "capacity_policy": "process-global-mineru-coordinator.v4",
+                "capacity_policy": "single-owner-serial-mineru.v1",
                 "mineru_version": "3.4.4",
                 "mineru_vl_utils_version": "1.0.5",
                 "base_image_digest": EXPECTED_IMAGE_ID,
@@ -149,7 +130,7 @@ def _observation() -> dict[str, Any]:
                     )
                 },
             },
-            "capacity_runtime": _expected_capacity_runtime(api_environment_map),
+            "capacity_runtime": _expected_serial_runtime(api_environment_map),
             "actual_source_sha256": {
                 path: "sha256:" + character * 64
                 for path, character in zip(
@@ -167,7 +148,7 @@ def _observation() -> dict[str, Any]:
             "image_labels": {
                 "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
                 "io.agent-invest.mineru.capacity-policy": (
-                    "process-global-mineru-coordinator.v4"
+                    "single-owner-serial-mineru.v1"
                 ),
                 "io.agent-invest.mineru.compatibility-policy": (
                     "glibc-malloc-trim-per-window.v1"
@@ -320,7 +301,7 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             "model",
             "vllm",
             "compatibility",
-            "capacity_profile",
+            "serial_runtime",
             "pending_health_drift",
             "pending_compatibility_drift",
         ):
@@ -344,19 +325,10 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                     )
                 elif tamper == "vllm":
                     observation["served_model"]["vllm_version"] = "99.0"
-                elif tamper == "capacity_profile":
-                    profile = json.loads(
-                        observation["api"]["environment"][
-                            "MINERU_CAPACITY_PROFILE_JSON"
-                        ]
-                    )
-                    profile["inner_inference_concurrency"] = 6
-                    observation["api"]["environment"][
-                        "MINERU_CAPACITY_PROFILE_JSON"
-                    ] = json.dumps(profile, sort_keys=True, separators=(",", ":"))
-                    observation["api_compatibility"]["capacity_runtime"] = (
-                        _expected_capacity_runtime(observation["api"]["environment"])
-                    )
+                elif tamper == "serial_runtime":
+                    observation["api_compatibility"]["capacity_runtime"][
+                        "profile_sha256"
+                    ] = "sha256:" + "0" * 64
                 elif tamper == "pending_health_drift":
                     observation["api_health"]["max_pending_tasks_effective"] = 2
                 elif tamper == "pending_compatibility_drift":

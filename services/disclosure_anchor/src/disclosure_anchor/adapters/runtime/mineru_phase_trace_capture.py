@@ -43,7 +43,7 @@ _MAX_TRACE_LINE_BYTES = 8_192
 _CAPTURE_FIELDS = frozenset(
     {
         "active_profile_sha256",
-        "capacity_mode",
+        "execution_mode",
         "collected_at_utc",
         "collector_path",
         "collector_sha256",
@@ -77,7 +77,7 @@ _CONTAINER_FIELDS = frozenset(
 @dataclass(frozen=True, slots=True)
 class MineruPhaseTraceCapture:
     active_profile_sha256: str
-    capacity_mode: str
+    execution_mode: str
     collected_at_utc: str
     collector_path: str
     collector_sha256: str
@@ -159,9 +159,9 @@ def parse_phase_trace_capture(payload: str | bytes) -> MineruPhaseTraceCapture:
     if value.get("schema") != PHASE_TRACE_CAPTURE_SCHEMA:
         raise ValueError("phase trace capture schema drifted")
 
-    capacity_mode = _text(value.get("capacity_mode"), label="capacity_mode")
-    if capacity_mode not in {"legacy", "candidate"}:
-        raise ValueError("phase trace capture capacity mode is invalid")
+    execution_mode = _text(value.get("execution_mode"), label="execution_mode")
+    if execution_mode != "serial":
+        raise ValueError("phase trace capture execution mode is invalid")
     active_profile_sha256 = _text(
         value.get("active_profile_sha256"), label="active_profile_sha256"
     )
@@ -250,7 +250,7 @@ def parse_phase_trace_capture(payload: str | bytes) -> MineruPhaseTraceCapture:
 
     return MineruPhaseTraceCapture(
         active_profile_sha256=active_profile_sha256,
-        capacity_mode=capacity_mode,
+        execution_mode=execution_mode,
         collected_at_utc=str(value["collected_at_utc"]),
         collector_path=collector_path,
         collector_sha256=collector_sha256,
@@ -293,7 +293,7 @@ def summarize_phase_trace_capture(
     capture: MineruPhaseTraceCapture,
     *,
     expected_profile_sha256: str,
-    expected_capacity_mode: str,
+    expected_execution_mode: str,
     expected_collector_sha256: str,
     expected_windows_node_identity_sha256: str,
     expected_container_id: str,
@@ -306,12 +306,12 @@ def summarize_phase_trace_capture(
         or _SHA256_RE.fullmatch(expected_collector_sha256) is None
         or _SHA256_RE.fullmatch(expected_windows_node_identity_sha256) is None
         or _CONTAINER_ID_RE.fullmatch(expected_container_id) is None
-        or expected_capacity_mode not in {"legacy", "candidate"}
+        or expected_execution_mode != "serial"
     ):
         raise ValueError("expected phase trace capture identity is invalid")
     if (
         capture.active_profile_sha256 != expected_profile_sha256
-        or capture.capacity_mode != expected_capacity_mode
+        or capture.execution_mode != expected_execution_mode
         or capture.collector_sha256 != expected_collector_sha256
         or capture.windows_node_identity_sha256
         != expected_windows_node_identity_sha256
@@ -330,14 +330,10 @@ def summarize_phase_trace_capture(
         )
         for trace in traces
     ]
-    if expected_capacity_mode == "legacy" and any(
-        document["pipeline_mode"] != "legacy" for document in documents
+    if any(
+        document["pipeline_mode"] != "serial" for document in documents
     ):
-        raise ValueError("legacy capture contains a candidate trace")
-    if expected_capacity_mode == "candidate" and any(
-        document["pipeline_mode"] != "depth1" for document in documents
-    ):
-        raise ValueError("candidate capture contains a fallback trace")
+        raise ValueError("serial capture contains a non-serial trace")
 
     total_duration_ns = sum(
         _summary_integer(item, "document_duration_ns") for item in documents
@@ -353,7 +349,7 @@ def summarize_phase_trace_capture(
         "b_c_overlap_ns": sum(
             _summary_integer(item, "b_c_overlap_ns") for item in documents
         ),
-        "capacity_mode": capture.capacity_mode,
+        "execution_mode": capture.execution_mode,
         "collector_sha256": capture.collector_sha256,
         "container_id": capture.container_id,
         "document_count": len(documents),

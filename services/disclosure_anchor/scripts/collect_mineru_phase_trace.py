@@ -145,9 +145,6 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--inference-upstream-url", required=True)
     parser.add_argument("--runtime-bundle-identity", required=True)
     parser.add_argument("--validation-max-age-seconds", type=int, default=86400)
-    parser.add_argument("--capacity-mode", choices=("legacy", "candidate"), required=True)
-    parser.add_argument("--profile", type=Path, required=True)
-    parser.add_argument("--profile-sha256", required=True)
     parser.add_argument("--ssh-host", required=True)
     parser.add_argument("--ssh-user", required=True)
     parser.add_argument("--ssh-port", type=int, default=22)
@@ -159,17 +156,16 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _args(argv)
-    if _SHA256_RE.fullmatch(args.profile_sha256) is None:
-        raise ValueError("profile SHA-256 is not canonical")
-    profile = strict_json_loads(
-        _read_regular(
-            args.profile,
-            label="execution profile",
-            maximum_bytes=1024 * 1024,
-        )
-    )
-    if not isinstance(profile, dict) or canonical_payload_sha256(profile) != args.profile_sha256:
-        raise ValueError("profile SHA-256 does not match canonical execution profile")
+    profile = {
+        "inner_inference_concurrency": 7,
+        "pipeline_depth": 0,
+        "pipeline_mode": "serial",
+        "profile_id": "serial-w16",
+        "schema": "mineru-serial-execution-profile.v1",
+        "vllm_max_num_seqs": 128,
+        "window_size": 16,
+    }
+    profile_sha256 = canonical_payload_sha256(profile)
     receipt = strict_json_loads(
         _read_regular(
             args.validation_receipt,
@@ -274,10 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         (started - timedelta(seconds=1)).isoformat(),
         "-TraceUntilUtc",
         finished.isoformat(),
-        "-ExpectedCapacityMode",
-        args.capacity_mode,
+        "-ExpectedExecutionMode",
+        "serial",
         "-ExpectedProfileSha256",
-        args.profile_sha256,
+        profile_sha256,
     ]
     completed = subprocess.run(
         command,
@@ -299,12 +295,12 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("remote phase-trace collector path drifted")
     summary = summarize_phase_trace_capture(
         capture,
-        expected_profile_sha256=args.profile_sha256,
-        expected_capacity_mode=args.capacity_mode,
+        expected_profile_sha256=profile_sha256,
+        expected_execution_mode="serial",
         expected_collector_sha256=collector_sha256,
         expected_windows_node_identity_sha256=node_sha256,
         expected_container_id=api_container_id,
-        require_pipeline_overlap=args.capacity_mode == "candidate",
+        require_pipeline_overlap=False,
     )
     if (
         summary.get("document_count") != document_count

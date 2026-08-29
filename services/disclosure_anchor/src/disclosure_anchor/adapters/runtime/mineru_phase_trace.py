@@ -15,7 +15,7 @@ _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _EVENTS = frozenset({"document_start", "interval_complete", "document_end"})
 _OUTCOMES = frozenset({"started", "success", "error"})
-_PIPELINE_MODES = frozenset({"legacy", "depth1"})
+_PIPELINE_MODES = frozenset({"serial"})
 _WINDOW_PHASES = frozenset(
     {
         "window_append",
@@ -191,8 +191,6 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
         or pipeline_mode not in _PIPELINE_MODES
     ):
         raise ValueError("phase trace vocabulary drifted")
-    if pipeline_mode == "depth1" and backend != "hybrid":
-        raise ValueError("phase trace pipeline/backend combination is invalid")
     if (
         _HEX32_RE.fullmatch(process_epoch) is None
         or _HEX32_RE.fullmatch(trace_id) is None
@@ -394,56 +392,14 @@ def parse_phase_trace_line(line: str) -> MineruPhaseEvent:
         resident_windows_after_acquire,
     )
     all_credit_null = all(value is None for value in credit_values)
-    all_credit_present = all(value is not None for value in credit_values)
-    if not (all_credit_null or all_credit_present):
-        raise ValueError("phase trace credit fields are partially null")
-    if pipeline_mode == "legacy":
-        if (
-            pipeline_depth != 0
-            or max_resident_pages != window_size
-            or max_resident_windows != 1
-        ):
-            raise ValueError("phase trace legacy profile is invalid")
-        if not all_credit_null:
-            raise ValueError("phase trace legacy event unexpectedly owns credits")
-    else:
-        if (
-            pipeline_depth != 1
-            or max_resident_pages < window_size * 2
-            or max_resident_windows != pipeline_depth + 1
-        ):
-            raise ValueError("phase trace depth-one profile is invalid")
-        candidate_window_event = event == "interval_complete" and has_window
-        unacquired_credit_error = (
-            phase == "window_credit_wait"
-            and outcome == "error"
-            and all_credit_null
-        )
-        if candidate_window_event and not (all_credit_present or unacquired_credit_error):
-            raise ValueError("phase trace candidate window lacks credit evidence")
-        if not candidate_window_event and not all_credit_null:
-            raise ValueError("phase trace non-window event unexpectedly owns credits")
-        if all_credit_present:
-            assert actual_decoded_bytes is not None
-            assert reserved_decoded_bytes is not None
-            assert resident_decoded_bytes_after_acquire is not None
-            assert resident_pages_after_acquire is not None
-            assert reserved_windows is not None
-            assert resident_windows_after_acquire is not None
-            if (
-                actual_decoded_bytes > reserved_decoded_bytes
-                or reserved_decoded_bytes > max_resident_decoded_bytes
-                or resident_pages_after_acquire > max_resident_pages
-                or reserved_windows != 1
-                or resident_windows_after_acquire > max_resident_windows
-                or resident_decoded_bytes_after_acquire
-                > max_resident_decoded_bytes
-                or (
-                    window_page_count is not None
-                    and resident_pages_after_acquire < window_page_count
-                )
-            ):
-                raise ValueError("phase trace credit evidence exceeds its profile")
+    if (
+        pipeline_depth != 0
+        or max_resident_pages != window_size
+        or max_resident_windows != 1
+    ):
+        raise ValueError("phase trace serial profile is invalid")
+    if not all_credit_null:
+        raise ValueError("phase trace serial event unexpectedly owns credits")
 
     return MineruPhaseEvent(
         append_index=append_index,
@@ -611,10 +567,6 @@ def validate_complete_phase_trace(
     }
     if first.backend == "hybrid":
         expected_window_phases.update({"window_layout", "window_postprocess"})
-    if first.pipeline_mode == "depth1":
-        expected_window_phases.update(
-            {"window_b_queue_wait", "window_credit_wait", "window_release"}
-        )
     by_window: dict[int, dict[str, MineruPhaseEvent]] = {}
     for event in completions:
         if event.window_index is None:
@@ -650,32 +602,6 @@ def validate_complete_phase_trace(
             raise ValueError("phase trace page coverage has a gap")
         expected_page_start = page_end_exclusive
 
-        if first.pipeline_mode == "depth1":
-            credit_identity = {
-                (
-                    event.reserved_decoded_bytes,
-                    event.resident_pages_after_acquire,
-                    event.resident_decoded_bytes_after_acquire,
-                )
-                for event in phases.values()
-            }
-            if len(credit_identity) != 1 or None in next(iter(credit_identity)):
-                raise ValueError("phase trace window credit identity drifted")
-            pre_measurement = {
-                phases[phase].actual_decoded_bytes
-                for phase in ("window_credit_wait", "window_render")
-            }
-            measured = {
-                event.actual_decoded_bytes
-                for phase, event in phases.items()
-                if phase not in {"window_credit_wait", "window_render"}
-            }
-            if pre_measurement != {0} or len(measured) != 1:
-                raise ValueError("phase trace decoded-byte reconciliation drifted")
-            measured_decoded = next(iter(measured))
-            if measured_decoded is None or measured_decoded <= 0:
-                raise ValueError("phase trace decoded-byte reconciliation is empty")
-
         total = phases["window_total"]
         render = phases["window_render"]
         vlm = phases["window_vlm"]
@@ -690,26 +616,7 @@ def validate_complete_phase_trace(
         if first.backend == "hybrid":
             layout = phases["window_layout"]
             postprocess = phases["window_postprocess"]
-            if first.pipeline_mode == "depth1":
-                credit_wait = phases["window_credit_wait"]
-                b_queue_wait = phases["window_b_queue_wait"]
-                release = phases["window_release"]
-                if not (
-                    credit_wait.ended_monotonic_ns <= render.started_monotonic_ns
-                    and render.ended_monotonic_ns <= layout.started_monotonic_ns
-                    and layout.ended_monotonic_ns
-                    <= b_queue_wait.started_monotonic_ns
-                    and b_queue_wait.ended_monotonic_ns
-                    <= vlm.started_monotonic_ns
-                    and vlm.ended_monotonic_ns
-                    <= postprocess.started_monotonic_ns
-                    and postprocess.ended_monotonic_ns
-                    <= append.started_monotonic_ns
-                    and append.ended_monotonic_ns <= release.started_monotonic_ns
-                    and release.ended_monotonic_ns <= total.ended_monotonic_ns
-                ):
-                    raise ValueError("phase trace depth-one window DAG is invalid")
-            elif not (
+            if not (
                 render.ended_monotonic_ns <= layout.started_monotonic_ns
                 and layout.ended_monotonic_ns <= vlm.started_monotonic_ns
                 and vlm.ended_monotonic_ns <= postprocess.started_monotonic_ns
@@ -740,32 +647,13 @@ def validate_complete_phase_trace(
     ):
         raise ValueError("phase trace finalize overlaps window ownership")
 
-    if first.pipeline_mode == "legacy":
-        if any(
-            earlier.ended_monotonic_ns > later.started_monotonic_ns
-            for earlier, later in zip(totals, totals[1:])
-        ):
-            raise ValueError("phase trace legacy windows overlap")
-    else:
-        _assert_non_overlapping(native_intervals)
-        for index in range(first.total_windows - 1):
-            if vlms[index + 1].started_monotonic_ns > postprocesses[index].started_monotonic_ns:
-                raise ValueError("phase trace next inference did not precede commit")
-        for index in range(first.total_windows - 2):
-            if totals[index].ended_monotonic_ns > renders[index + 2].started_monotonic_ns:
-                raise ValueError("phase trace exceeds the two-window owner bound")
-        if require_pipeline_overlap and first.total_windows > 1:
-            a_b_overlap = any(
-                renders[index + 1].started_monotonic_ns < vlms[index].ended_monotonic_ns
-                for index in range(first.total_windows - 1)
-            )
-            b_c_overlap = any(
-                vlms[index + 1].started_monotonic_ns
-                < postprocesses[index].ended_monotonic_ns
-                for index in range(first.total_windows - 1)
-            )
-            if not a_b_overlap or not b_c_overlap:
-                raise ValueError("phase trace pipeline overlap was not observed")
+    if require_pipeline_overlap:
+        raise ValueError("serial phase trace cannot require pipeline overlap")
+    if any(
+        earlier.ended_monotonic_ns > later.started_monotonic_ns
+        for earlier, later in zip(totals, totals[1:])
+    ):
+        raise ValueError("phase trace serial windows overlap")
     return ordered
 
 
@@ -810,21 +698,6 @@ def summarize_complete_phase_trace(
     )
     a_b_overlap_ns = 0
     b_c_overlap_ns = 0
-    if first.pipeline_mode == "depth1":
-        for index in range(first.total_windows - 1):
-            next_window = by_window[index + 1]
-            current_window = by_window[index]
-            a_b_overlap_ns += _overlap_ns(vlms[index], next_window["window_render"])
-            a_b_overlap_ns += _overlap_ns(vlms[index], next_window["window_layout"])
-            b_c_overlap_ns += _overlap_ns(
-                vlms[index + 1], current_window["window_postprocess"]
-            )
-            b_c_overlap_ns += _overlap_ns(
-                vlms[index + 1], current_window["window_append"]
-            )
-            b_c_overlap_ns += _overlap_ns(
-                vlms[index + 1], current_window["window_release"]
-            )
 
     phase_duration_ns = {
         phase: sum(event.duration_ns for event in phase_events)

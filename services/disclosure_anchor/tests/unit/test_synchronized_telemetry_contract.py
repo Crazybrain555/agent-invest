@@ -88,9 +88,9 @@ def _phase_document_end_event(*, process_epoch: str) -> MineruPhaseEvent:
         page_start=None,
         phase="document",
         pipeline_depth=0,
-        pipeline_mode="legacy",
+        pipeline_mode="serial",
         process_epoch=process_epoch,
-        profile_id="legacy",
+        profile_id="serial",
         profile_sha256=HASH_B,
         reserved_decoded_bytes=None,
         reserved_windows=None,
@@ -129,7 +129,7 @@ def _capture(event: MineruPhaseEvent) -> tuple[MineruPhaseTraceCapture, bytes]:
     payload = _canonical(
         {
             "active_profile_sha256": HASH_B,
-            "capacity_mode": "legacy",
+            "execution_mode": "serial",
             "collected_at_utc": (START + timedelta(seconds=2)).isoformat(),
             "collector_path": r"C:\collector.ps1",
             "collector_sha256": HASH,

@@ -340,16 +340,16 @@ configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 r
 固定内存门槛和 catalog builder 不再构成当前操作面。同步 telemetry 与容量搜索尚未形成受支持命令前，
 不得仅凭历史 receipt 改变运行参数。
 
-默认构建和部署仍必须保持 `MINERU_CAPACITY_MODE=legacy`、`MINERU_PHASE_TRACE=0`、
-`MINERU_API_MAX_CONCURRENT_REQUESTS=1`、`MINERU_API_MAX_PENDING_TASKS=1`。合入的调度代码和 candidate
-profile 不代表已启用；任何 process-startup 参数变化都要求先完全 quiesce，产生新的 exact runtime/profile
-identity，并重新通过 multimodal canary、epoch、OOM/restart 和 drain 门。
+默认构建和部署只提供单一串行执行身份，并保持 `MINERU_PHASE_TRACE=0`、
+`MINERU_API_MAX_CONCURRENT_REQUESTS=1`、`MINERU_API_MAX_PENDING_TASKS=1`。旧的双模式、并行候选 profile
+及其 fallback 已从执行面删除；任何 process-startup 参数变化都要求先完全 quiesce，产生新的 exact
+runtime/profile identity，并重新通过 multimodal canary、epoch、OOM/restart 和 drain 门。
 
 新的受控容量搜索必须满足：
 
 - 使用独立 held-out 完整真实 PDF，覆盖 regular/heavy/huge、OCR、表格/公式、跨页结构和
   controlled failure；单轮目标 10--20 分钟，不机械重复数小时 baseline；
-- 先做一个短 legacy anchor；只有 measurement path/epoch 漂移或噪声超过门槛才重跑；
+- 先做一个短串行 anchor；只有 measurement path/epoch 漂移或噪声超过门槛才重跑；
 - 先在单 task slot 下隔离 sweep effective hybrid ratio `1/2/4/8`，再一次只改变 slots、pending、window、
   C-stage 或 credit envelope 的一个相邻值；不得预设某个候选是局部最优；
 - 全程用 synchronized telemetry 记录 GPU 250--500 ms、host/queue 1 s、phase transition 与 durable commit；

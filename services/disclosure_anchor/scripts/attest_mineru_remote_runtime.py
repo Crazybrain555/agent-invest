@@ -44,9 +44,9 @@ EXPECTED_REPO_DIGEST = (
 EXPECTED_IMAGE_ID = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
-EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-capacity-v3"
+EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-serial-v1"
 EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v4"
-EXPECTED_CAPACITY_POLICY = "process-global-mineru-coordinator.v4"
+EXPECTED_CAPACITY_POLICY = "single-owner-serial-mineru.v1"
 EXPECTED_COMPAT_PREIMAGES = {
     "mineru/cli/fast_api.py": (
         "sha256:f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
@@ -75,8 +75,6 @@ COMPAT_LABEL_KEYS = {
     "io.agent-invest.mineru.compatibility-dockerfile-sha256",
 }
 API_ENV_KEYS = {
-    "MINERU_CAPACITY_MODE",
-    "MINERU_CAPACITY_PROFILE_JSON",
     "MINERU_MODEL_SOURCE",
     "MINERU_MALLOC_TRIM",
     "MINERU_PHASE_TRACE",
@@ -124,20 +122,6 @@ EXPECTED_PROXY_CODE_SHA256 = (
 SSH_HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.-]+$")
 SSH_USER_RE = re.compile(r"^(?!-)[A-Za-z0-9_.-]+$")
 SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
-CAPACITY_PROFILE_FIELDS = {
-    "inner_inference_concurrency",
-    "max_document_pages",
-    "max_resident_pages",
-    "max_source_pdf_bytes",
-    "min_document_pages",
-    "pipeline_depth",
-    "profile_id",
-    "schema",
-    "vllm_max_num_seqs",
-    "window_size",
-}
-CAPACITY_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
-CAPACITY_MAX_PAGE_PIXEL_BYTES = 3500 * 3500 * 4
 
 
 def _windows_path(value: object) -> str:
@@ -224,114 +208,30 @@ def _endpoint_sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.rstrip("/").encode()).hexdigest()
 
 
-def _capacity_integer(value: object, *, label: str, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ValueError(f"remote capacity profile {label} is invalid")
-    return value
-
-
-def _expected_capacity_runtime(environment: dict[str, str]) -> dict[str, Any]:
-    mode = environment.get("MINERU_CAPACITY_MODE")
-    if mode not in {"legacy", "candidate"}:
-        raise ValueError("remote API capacity mode is not closed")
-    configured_window_size = int(environment["MINERU_PROCESSING_WINDOW_SIZE"])
+def _expected_serial_runtime(environment: dict[str, str]) -> dict[str, Any]:
+    try:
+        configured_window_size = int(environment["MINERU_PROCESSING_WINDOW_SIZE"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("remote API processing window is invalid") from exc
     if configured_window_size <= 0:
         raise ValueError("remote API processing window is invalid")
-    try:
-        payload = json.loads(environment["MINERU_CAPACITY_PROFILE_JSON"])
-    except (KeyError, json.JSONDecodeError) as exc:
-        raise ValueError("remote API capacity profile JSON is invalid") from exc
-    if not isinstance(payload, dict) or set(payload) != CAPACITY_PROFILE_FIELDS:
-        raise ValueError("remote API capacity profile fields drifted")
-    if payload.get("schema") != "mineru-execution-profile.v2":
-        raise ValueError("remote API capacity profile schema drifted")
-    profile_id = payload.get("profile_id")
-    if not isinstance(profile_id, str):
-        raise ValueError("remote API capacity profile identity is invalid")
-    if CAPACITY_PROFILE_ID_RE.fullmatch(profile_id) is None:
-        raise ValueError("remote API capacity profile identity is invalid")
-    window_size = _capacity_integer(
-        payload.get("window_size"), label="window_size", minimum=1
-    )
-    pipeline_depth = _capacity_integer(
-        payload.get("pipeline_depth"), label="pipeline_depth", minimum=1
-    )
-    max_resident_pages = _capacity_integer(
-        payload.get("max_resident_pages"), label="max_resident_pages", minimum=1
-    )
-    min_document_pages = _capacity_integer(
-        payload.get("min_document_pages"), label="min_document_pages", minimum=2
-    )
-    max_document_pages = _capacity_integer(
-        payload.get("max_document_pages"),
-        label="max_document_pages",
-        minimum=min_document_pages,
-    )
-    max_source_pdf_bytes = _capacity_integer(
-        payload.get("max_source_pdf_bytes"),
-        label="max_source_pdf_bytes",
-        minimum=1,
-    )
-    inner_inference_concurrency = _capacity_integer(
-        payload.get("inner_inference_concurrency"),
-        label="inner_inference_concurrency",
-        minimum=1,
-    )
-    vllm_max_num_seqs = _capacity_integer(
-        payload.get("vllm_max_num_seqs"),
-        label="vllm_max_num_seqs",
-        minimum=inner_inference_concurrency,
-    )
-    if (
-        pipeline_depth != 1
-        or window_size * (pipeline_depth + 1) > max_resident_pages
-        or max_resident_pages > configured_window_size
-        or min_document_pages <= window_size
-    ):
-        raise ValueError("remote API capacity profile exceeds its legacy envelope")
-    profile_sha256 = "sha256:" + hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    legacy_payload = {
+    payload = {
         "inner_inference_concurrency": 7,
-        "max_document_pages": 2147483647,
-        "max_resident_pages": configured_window_size,
-        "max_source_pdf_bytes": 9223372036854775807,
-        "min_document_pages": 0,
         "pipeline_depth": 0,
-        "profile_id": f"legacy-w{configured_window_size}-d0",
-        "schema": "mineru-execution-profile.v2",
+        "pipeline_mode": "serial",
+        "profile_id": f"serial-w{configured_window_size}",
+        "schema": "mineru-serial-execution-profile.v1",
         "vllm_max_num_seqs": 128,
         "window_size": configured_window_size,
     }
-    legacy_profile_sha256 = "sha256:" + hashlib.sha256(
-        json.dumps(
-            legacy_payload, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+    profile_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    candidate_profile = {
-        "inner_inference_concurrency": inner_inference_concurrency,
-        "max_document_pages": max_document_pages,
-        "max_resident_decoded_bytes": (
-            max_resident_pages * CAPACITY_MAX_PAGE_PIXEL_BYTES
-        ),
-        "max_resident_pages": max_resident_pages,
-        "max_source_pdf_bytes": max_source_pdf_bytes,
-        "min_document_pages": min_document_pages,
-        "pipeline_depth": pipeline_depth,
-        "pipeline_mode": "depth1",
-        "profile_id": profile_id,
-        "profile_sha256": profile_sha256,
-        "vllm_max_num_seqs": vllm_max_num_seqs,
-        "window_size": window_size,
-    }
     return {
-        "candidate_profile": candidate_profile,
         "configured_window_size": configured_window_size,
-        "legacy_profile_sha256": legacy_profile_sha256,
-        "mode": mode,
-        "nonlegacy_admission_enabled": mode == "candidate",
-        "schema": "mineru-capacity-runtime.v1",
+        "mode": "serial",
+        "profile_sha256": profile_sha256,
+        "schema": "mineru-serial-runtime.v1",
     }
 
 
@@ -607,16 +507,9 @@ def build_manifest(
         raise ValueError("remote API hybrid batch ratio is not closed")
     if compatibility.get("hybrid_batch_ratio_requested") != int(ratio_raw):
         raise ValueError("remote API hybrid batch ratio observation drifted")
-    expected_capacity_runtime = _expected_capacity_runtime(api_environment)
-    if compatibility.get("capacity_runtime") != expected_capacity_runtime:
-        raise ValueError("remote API capacity observation and environment drifted")
-    candidate_profile = expected_capacity_runtime["candidate_profile"]
-    if (
-        candidate_profile["inner_inference_concurrency"]
-        != MINERU_API_INFERENCE_MAX_CONCURRENCY
-        or candidate_profile["vllm_max_num_seqs"] != 128
-    ):
-        raise ValueError("remote API capacity profile and service commands drifted")
+    expected_serial_runtime = _expected_serial_runtime(api_environment)
+    if compatibility.get("capacity_runtime") != expected_serial_runtime:
+        raise ValueError("remote API serial observation and environment drifted")
     phase_trace_value = api_environment.get("MINERU_PHASE_TRACE")
     if phase_trace_value not in {"0", "1"}:
         raise ValueError("remote API phase-trace switch is not closed")

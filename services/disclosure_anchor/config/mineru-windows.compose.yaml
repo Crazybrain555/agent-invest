@@ -49,7 +49,7 @@ services:
       - inference
 
   mineru-api:
-    image: agent-invest/mineru-api:3.4.4-capacity-v3
+    image: agent-invest/mineru-api:3.4.4-serial-v1
     pull_policy: never
     container_name: mineru-api
     restart: always
@@ -67,18 +67,11 @@ services:
       # Shared pipeline model objects are process-scoped. Their native locks
       # remain enabled even while the externally admitted task slot stays 1.
       MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS: "1"
-      # Only an operator may switch this immutable per-process value to candidate,
-      # after commissioning, a new attestation and fallback/cancellation smoke.
-      # A running document never changes its active window or residency plan.
-      MINERU_CAPACITY_MODE: legacy
-      # Present while default-off so the exact candidate bytes can be built,
-      # attested and tested without a second runtime catalog authority.
-      MINERU_CAPACITY_PROFILE_JSON: '{"inner_inference_concurrency":7,"max_document_pages":10000,"max_resident_pages":16,"max_source_pdf_bytes":1073741824,"min_document_pages":9,"pipeline_depth":1,"profile_id":"rtx5080-w8-d1-c7-s128-v1","schema":"mineru-execution-profile.v2","vllm_max_num_seqs":128,"window_size":8}'
       # Current 30 GiB Docker Desktop profile.  Slots 2/3 require a distinct
       # attested compose identity and two heterogeneous load receipts.
       MINERU_API_MAX_CONCURRENT_REQUESTS: "1"
       # Total accepted nonterminal depth is independent from active slots;
-      # legacy remains 1/1 until a larger pair is separately attested.
+      # The serial runtime remains 1/1 until a larger design is separately attested.
       MINERU_API_MAX_PENDING_TASKS: "1"
       MINERU_PROCESSING_WINDOW_SIZE: "16"
       MINERU_API_OUTPUT_ROOT: /var/lib/mineru-api-output

@@ -175,11 +175,11 @@ exchange、board、日期、市值下限、5,548 行审计闭合与 V10 变更�
 生成器。完整来源/投影证明必须运行上述 `cmp`、核对四个已固定 SHA，并检查完整 selection audit；
 不能把 `config-check` 单独理解为前瞻治理和行业证据已经补齐。
 
-## Capacity observation 与默认关闭的 candidate profile
+## Capacity observation 与单一串行执行身份
 
-Observation v1 仍只有旁路采样权限。旧 profile catalog reader 已删除；在新的 synchronized telemetry、
-短时 held-out 搜索和 profile receipt 落地前，`candidate` 未获运行授权。Document profile 在 admission
-冻结，process profile 只能在完全 quiescent 时切换；运行中不能修改 startup knob。旁路采样复用
+Observation v1 只有旁路采样权限。运行时仅保留一个按 processing window 派生并固定 hash 的串行
+执行身份，不再接受并行候选 profile、旧 catalog 或切换入口。process startup 参数只能在完全
+quiescent 时修改；运行中不能修改 startup knob。旁路采样复用
 machine-local `worker.env` 中已有 API/vLLM/GPU URL、runtime bundle identity、GPU UUID 与 MinerU client；
 内存安全余量来自分资源域的实测动态 guard，不再使用固定 Docker reserve。tracked config 不写 SSH
 host/user/key，也不新增数据库 DSN。

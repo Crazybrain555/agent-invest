@@ -6,7 +6,7 @@ param(
     [switch]$PhaseTrace,
     [string]$TraceSinceUtc = "",
     [string]$TraceUntilUtc = "",
-    [ValidateSet("legacy", "candidate")][string]$ExpectedCapacityMode = "legacy",
+    [ValidateSet("serial")][string]$ExpectedExecutionMode = "serial",
     [string]$ExpectedProfileSha256 = "",
     [ValidateRange(1, 200000)][int]$MaxTraceLines = 100000,
     [ValidateRange(1024, 268435456)][int]$MaxTraceBytes = 67108864
@@ -447,33 +447,21 @@ if ($PhaseTrace) {
     if ($traceSwitch -notin @("1", "true", "yes", "on")) {
         throw "MinerU phase trace is not enabled"
     }
-    if ([string]$traceEnvironment["MINERU_CAPACITY_MODE"] -ne $ExpectedCapacityMode) {
-        throw "MinerU capacity mode drifted during phase-trace capture"
-    }
-
     $profileProbeCode = @'
 import json
 import os
 from mineru.utils.model_utils import (
-    capacity_runtime_status,
     is_phase_trace_enabled,
-    legacy_capacity_execution_profile,
+    serial_execution_profile,
+    serial_runtime_status,
 )
 
 window_size = int(os.environ["MINERU_PROCESSING_WINDOW_SIZE"])
-runtime = capacity_runtime_status(window_size)
-if runtime["mode"] == "legacy":
-    active_profile_sha256 = legacy_capacity_execution_profile(
-        window_size
-    ).profile_sha256
-else:
-    candidate = runtime["candidate_profile"]
-    if candidate is None or not runtime["nonlegacy_admission_enabled"]:
-        raise RuntimeError("candidate admission is not enabled")
-    active_profile_sha256 = candidate["profile_sha256"]
+runtime = serial_runtime_status(window_size)
+active_profile_sha256 = serial_execution_profile(window_size).profile_sha256
 print(json.dumps({
     "active_profile_sha256": active_profile_sha256,
-    "capacity_mode": runtime["mode"],
+    "execution_mode": runtime["mode"],
     "phase_trace_enabled": is_phase_trace_enabled(),
 }, sort_keys=True, separators=(",", ":")))
 '@
@@ -489,7 +477,7 @@ print(json.dumps({
     $profileProbe = ([string]$profileProbeOutput[0]) | ConvertFrom-Json
     if (
         -not [bool]$profileProbe.phase_trace_enabled -or
-        [string]$profileProbe.capacity_mode -ne $ExpectedCapacityMode -or
+        [string]$profileProbe.execution_mode -ne $ExpectedExecutionMode -or
         [string]$profileProbe.active_profile_sha256 -ne $ExpectedProfileSha256
     ) {
         throw "active MinerU phase-trace profile drifted"
@@ -537,7 +525,7 @@ print(json.dumps({
         windows_node_identity_sha256 = Get-Sha256Text -Value ([string]$machineGuid).Trim().ToLowerInvariant()
         since_utc = $since.ToUniversalTime().ToString("o")
         until_utc = $until.ToUniversalTime().ToString("o")
-        capacity_mode = $ExpectedCapacityMode
+        execution_mode = $ExpectedExecutionMode
         active_profile_sha256 = $ExpectedProfileSha256
         container = [ordered]@{
             name = ([string]$traceContainer.Name).TrimStart("/")
@@ -596,7 +584,6 @@ $apiAllowedEnvironment = @(
     "MINERU_API_ENABLE_FASTAPI_DOCS", "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_API_MAX_PENDING_TASKS",
     "MINERU_API_OUTPUT_ROOT", "MINERU_API_TASK_RETENTION_SECONDS",
-    "MINERU_CAPACITY_MODE", "MINERU_CAPACITY_PROFILE_JSON",
     "MINERU_MALLOC_TRIM",
     "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS", "MINERU_HYBRID_BATCH_RATIO",
     "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE"
@@ -620,9 +607,9 @@ import os
 from pathlib import Path
 
 from mineru.utils.model_utils import (
-    capacity_runtime_status,
     is_heap_trim_enabled,
     is_phase_trace_enabled,
+    serial_runtime_status,
 )
 from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
 from mineru.cli.fast_api import get_max_pending_tasks
@@ -637,7 +624,7 @@ paths = (
 )
 root = Path("/usr/local/lib/python3.12/dist-packages")
 marker = json.loads(
-    Path("/opt/agent-invest/mineru-capacity-v1/compatibility.json")
+    Path("/opt/agent-invest/mineru-serial-v1/compatibility.json")
     .read_text(encoding="utf-8")
 )
 print(json.dumps({
@@ -647,7 +634,7 @@ print(json.dumps({
         for path in paths
     },
     "heap_trim_enabled": is_heap_trim_enabled(),
-    "capacity_runtime": capacity_runtime_status(
+    "capacity_runtime": serial_runtime_status(
         int(os.environ["MINERU_PROCESSING_WINDOW_SIZE"])
     ),
     "phase_trace_enabled": is_phase_trace_enabled(),
