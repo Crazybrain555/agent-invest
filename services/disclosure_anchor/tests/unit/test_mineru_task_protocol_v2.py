@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -66,6 +67,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             root = Path(directory)
             registry = self._registry(root)
             self._create(registry)
+            registry.bind_task_payload("key", {"task_id": "task-key"})
             registry.transition("key", "processing")
             registry.transition("key", "finalizing")
             registry.complete(
@@ -80,6 +82,9 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             assert recovered is not None
             self.assertEqual(recovered.state, "completed")
             self.assertEqual(recovered.result_bytes, 12)
+            payload = self._registry(root).recoverable_payloads()[0]
+            self.assertEqual(payload["status"], "completed")
+            self.assertEqual(payload["result_artifact_sha256"], "a" * 64)
 
     def test_lease_reader_blocks_ack_and_cleanup_until_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -105,6 +110,30 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             registry.acknowledge("key")
             self.assertEqual(registry.cleanup_consumed(Path.unlink), 1)
             self.assertFalse(result.exists())
+
+    def test_expired_lease_fails_closed_without_consuming_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            registry.transition("key", "processing")
+            registry.transition("key", "finalizing")
+            result = root / "result.zip"
+            result.write_bytes(b"result")
+            registry.complete(
+                "key",
+                result_path=result,
+                result_sha256="a" * 64,
+                result_bytes=6,
+                result_owner="b" * 64,
+            )
+            registry.lease("key", seconds=0.001)
+            time.sleep(0.005)
+            with self.assertRaisesRegex(TaskProtocolConflict, "expired"):
+                registry.acquire_result("key")
+            record = registry.get("key")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.state, "completed")
 
     def test_unacked_result_bytes_apply_backpressure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

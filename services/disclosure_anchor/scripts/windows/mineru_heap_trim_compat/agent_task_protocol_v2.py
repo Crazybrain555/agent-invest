@@ -126,7 +126,18 @@ class DurableTaskRegistry:
                     if record.state == "processing":
                         record.state = "pending"
                 if record.task_payload is not None and record.state != "consumed":
-                    recoverable.append(dict(record.task_payload))
+                    recovered = dict(record.task_payload)
+                    recovered["status"] = (
+                        "pending"
+                        if record.state in {"pending", "processing", "finalizing"}
+                        else record.state
+                    )
+                    recovered["result_artifact_path"] = record.result_path
+                    recovered["result_artifact_sha256"] = record.result_sha256
+                    recovered["result_artifact_bytes"] = record.result_bytes
+                    recovered["result_artifact_owner"] = record.result_owner
+                    recovered["error"] = record.error
+                    recoverable.append(recovered)
             self._persist()
             return tuple(recoverable)
 
