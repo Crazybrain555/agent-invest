@@ -11,6 +11,7 @@ import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -44,6 +45,55 @@ class _Reader:
 
 
 class MinerUHttpStagedParserTests(unittest.TestCase):
+    def test_accept_disconnect_reconciles_and_submitted_checkpoint_resumes(self) -> None:
+        posts = 0
+        accepted = False
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            key = _expected_idempotency_key(
+                source_sha256, "attempt-1", "fence-1", 1_000_000
+            )
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal posts, accepted
+                if request.url.path.startswith("/tasks/by-idempotency/"):
+                    if not accepted:
+                        return httpx.Response(404)
+                    return httpx.Response(200, json={
+                        "task_id": "task-1", "status_url": "/tasks/task-1",
+                        "result_url": "/tasks/task-1/result",
+                        "task_protocol_schema": "mineru-task-protocol.v2",
+                        "idempotency_key": key, "attempt_identity": "attempt-1",
+                        "fence_identity": "fence-1",
+                    })
+                if request.method == "POST" and request.url.path == "/tasks":
+                    posts += 1
+                    accepted = True
+                    raise httpx.ReadTimeout("accepted then disconnected", request=request)
+                return httpx.Response(500)
+
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+            )
+            handle = parser.begin_remote_parse(
+                input_pdf=source, options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1", fence_identity="fence-1",
+                client_submit_key=key, submission_epoch_unix=1_000_000,
+            )
+            public, secret = handle.submission_checkpoint()
+            self.assertNotIn(secret.token_bytes, public.exact_bytes)
+            resumed = parser.resume_submitted_parse(
+                receipt=public, secret=secret, options=PINNED_OPTIONS
+            )
+            self.assertEqual(resumed.submission_checkpoint(), (public, secret))
+            self.assertEqual(posts, 1)
+
     def test_resume_rejects_retired_v1_and_v2_tokens(self) -> None:
         parser = MinerUHttpStagedParser(
             api_url="http://mineru.test:30000",
@@ -85,6 +135,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
 
             def handler(request: httpx.Request) -> httpx.Response:
                 nonlocal ack_calls
+                if request.url.path.startswith("/tasks/by-idempotency/"):
+                    return httpx.Response(404)
                 if request.url.path.endswith("/ack"):
                     ack_calls += 1
                     return httpx.Response(
@@ -120,6 +172,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                client_submit_key=key,
                 submission_epoch_unix=1_000_000,
             )
             with self.assertRaisesRegex(ParserOutputContractError, "failure_committed"):
@@ -162,6 +215,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         idempotency_key = ""
 
         def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.startswith("/tasks/by-idempotency/"):
+                return httpx.Response(404)
             if request.method == "POST" and request.url.path == "/tasks":
                 submissions.append(request.read())
                 return httpx.Response(
@@ -238,6 +293,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append(f"{request.method} {request.url.path}")
+            if request.url.path.startswith("/tasks/by-idempotency/"):
+                return httpx.Response(404)
             if request.method == "POST" and request.url.path == "/tasks":
                 body = request.read()
                 self.assertIn(b"agent_idempotency_key", body)
@@ -308,6 +365,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                client_submit_key=idempotency_key,
                 submission_epoch_unix=1_000_000,
             )
             receipt = handle.wait_terminal()
@@ -328,6 +386,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
 
     def test_v2_rejects_duplicate_submit_wire_fields(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
+            if _request.url.path.startswith("/tasks/by-idempotency/"):
+                return httpx.Response(404)
             return httpx.Response(
                 202,
                 content=(
@@ -355,6 +415,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
+                    client_submit_key=_expected_idempotency_key(
+                        "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "attempt-1", "fence-1", 1_000_000,
+                    ),
                     submission_epoch_unix=1_000_000,
                 )
 
@@ -368,6 +432,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             )
 
             def handler(_request: httpx.Request) -> httpx.Response:
+                if _request.url.path.startswith("/tasks/by-idempotency/"):
+                    return httpx.Response(404)
                 return httpx.Response(200, json={
                     "task_id": "task-1", "status_url": "/tasks/task-1",
                     "result_url": "/tasks/task-1/result",
@@ -386,12 +452,15 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 input_pdf=source, options=PINNED_OPTIONS,
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1", fence_identity="fence-1",
+                client_submit_key=key,
                 submission_epoch_unix=1_000_000,
             )
             self.assertIsNotNone(handle)
 
     def test_v2_rejects_wire_json_before_exceeding_bound(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
+            if _request.url.path.startswith("/tasks/by-idempotency/"):
+                return httpx.Response(404)
             return httpx.Response(
                 202, content=b"{" + b" " * (1024 * 1024) + b"}",
                 headers={"content-type": "application/json"},
@@ -411,6 +480,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     input_pdf=source, options=PINNED_OPTIONS,
                     source_pdf_sha256="sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1", fence_identity="fence-1",
+                    client_submit_key=_expected_idempotency_key(
+                        "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "attempt-1", "fence-1", 1_000_000,
+                    ),
                     submission_epoch_unix=1_000_000,
                 )
 
@@ -418,6 +491,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
         idempotency_key = ""
 
         def handler(_request: httpx.Request) -> httpx.Response:
+            if _request.url.path.startswith("/tasks/by-idempotency/"):
+                return httpx.Response(404)
             return httpx.Response(
                 202,
                 json={
@@ -457,6 +532,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
+                    client_submit_key=idempotency_key,
                     submission_epoch_unix=1_000_000,
                 )
 
@@ -472,6 +548,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                client_submit_key=_expected_idempotency_key(
+                    source_sha256, "attempt-1", "fence-1", 1_000_000
+                ),
                 submission_epoch_unix=1_000_000,
             )
         body = submissions[0]
@@ -493,17 +572,79 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                client_submit_key=_expected_idempotency_key(
+                    source_sha256, "attempt-1", "fence-1", 1_000_000
+                ),
                 submission_epoch_unix=1_000_000,
             )
             receipt = handle.wait_terminal()
             output = Path(directory) / "out"
-            parsed = handle.materialize(
-                receipt=receipt, output_dir=output, source_pdf_sha256=source_sha256
+            prepared = handle.prepare_materialization(
+                receipt=receipt, source_pdf_sha256=source_sha256
             )
-            self.assertEqual(parsed.artifact_root, output)
+            parsed = handle.materialize_prepared(
+                prepared=prepared,
+                receipt=receipt,
+                output_dir=output,
+                source_pdf_sha256=source_sha256,
+                parser_target_identity_sha256="sha256:" + "c" * 64,
+                producer_claim_generation=1,
+            )
+            self.assertEqual(parsed.result.artifact_root, output)
             self.assertEqual(
                 (output / "document" / "result.txt").read_bytes(), b"verified"
             )
+            replay = handle.materialize_prepared(
+                prepared=prepared, receipt=receipt, output_dir=output,
+                source_pdf_sha256=source_sha256,
+                parser_target_identity_sha256="sha256:" + "c" * 64,
+                producer_claim_generation=2,
+            )
+            self.assertEqual(replay.result.artifact_root, output)
+            (output / "document" / "result.txt").write_bytes(b"drift")
+            with self.assertRaisesRegex(ParserOutputContractError, "output drifted"):
+                handle.materialize_prepared(
+                    prepared=prepared, receipt=receipt, output_dir=output,
+                    source_pdf_sha256=source_sha256,
+                    parser_target_identity_sha256="sha256:" + "c" * 64,
+                    producer_claim_generation=2,
+                )
+            self.assertEqual(
+                (output / "document" / "result.txt").read_bytes(), b"drift"
+            )
+
+    def test_prepare_enforces_member_and_decoded_projection_caps(self) -> None:
+        result_zip = self._zip([("a.json", b"1234"), ("b.txt", b"56")])
+        with tempfile.TemporaryDirectory() as directory:
+            parser, source, source_sha256, _ = self._completed_parser(
+                directory, result_zip
+            )
+            key = _expected_idempotency_key(
+                source_sha256, "attempt-1", "fence-1", 1_000_000
+            )
+            handle = parser.begin_remote_parse(
+                input_pdf=source, options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1", fence_identity="fence-1",
+                client_submit_key=key, submission_epoch_unix=1_000_000,
+            )
+            receipt = handle.wait_terminal()
+            with patch(
+                "disclosure_anchor.adapters.parsers.mineru_medium.http_staged._MAX_ZIP_MEMBERS",
+                1,
+            ):
+                with self.assertRaisesRegex(ParserOutputContractError, "member envelope"):
+                    handle.prepare_materialization(
+                        receipt=receipt, source_pdf_sha256=source_sha256
+                    )
+            with patch(
+                "disclosure_anchor.adapters.parsers.mineru_medium.http_staged._MAX_DECODED_BYTES",
+                8,
+            ):
+                with self.assertRaisesRegex(ParserOutputContractError, "decoded-byte"):
+                    handle.prepare_materialization(
+                        receipt=receipt, source_pdf_sha256=source_sha256
+                    )
 
     def test_retained_capability_returns_credit_before_result_download(self) -> None:
         result_zip = self._zip([("document/result.txt", b"retained")])
@@ -516,6 +657,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal result_gets
+            if request.url.path.startswith("/tasks/by-idempotency/"):
+                return httpx.Response(404)
             if request.method == "POST" and request.url.path == "/tasks":
                 return httpx.Response(
                     202,
@@ -583,14 +726,20 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                client_submit_key=idempotency_key,
                 submission_epoch_unix=1_000_000,
             )
             receipt = handle.wait_terminal()
             self.assertEqual(result_gets, 0)
-            handle.materialize(
-                receipt=receipt,
+            prepared = handle.prepare_materialization(
+                receipt=receipt, source_pdf_sha256=source_sha256
+            )
+            handle.materialize_prepared(
+                prepared=prepared, receipt=receipt,
                 output_dir=Path(directory) / "out",
                 source_pdf_sha256=source_sha256,
+                parser_target_identity_sha256="sha256:" + "c" * 64,
+                producer_claim_generation=1,
             )
             self.assertEqual(result_gets, 1)
 
@@ -605,6 +754,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal result_gets
+            if request.url.path.startswith("/tasks/by-idempotency/"):
+                return httpx.Response(404)
             if request.method == "POST" and request.url.path == "/tasks":
                 return httpx.Response(
                     202,
@@ -666,6 +817,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
+                client_submit_key=idempotency_key,
                 submission_epoch_unix=1_000_000,
             )
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -694,17 +846,28 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     source_pdf_sha256=source_sha256,
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
+                    client_submit_key=_expected_idempotency_key(
+                        source_sha256, "attempt-1", "fence-1", 1_000_000
+                    ),
                     submission_epoch_unix=1_000_000,
                 )
                 receipt = handle.wait_terminal()
                 output = Path(directory) / "out"
                 with self.assertRaisesRegex(ParserOutputContractError, "unsafe ZIP"):
-                    handle.materialize(
-                        receipt=receipt,
+                    prepared = handle.prepare_materialization(
+                        receipt=receipt, source_pdf_sha256=source_sha256
+                    )
+                    handle.materialize_prepared(
+                        prepared=prepared, receipt=receipt,
                         output_dir=output,
                         source_pdf_sha256=source_sha256,
+                        parser_target_identity_sha256="sha256:" + "c" * 64,
+                        producer_claim_generation=1,
                     )
                 self.assertFalse(output.exists())
+                self.assertEqual(
+                    list((Path(directory) / "spool").glob(".retained-*.zip")), []
+                )
 
     def test_receipt_rejects_non_hex_source_identity(self) -> None:
         with self.assertRaisesRegex(ValueError, "canonical sha256"):

@@ -9,8 +9,12 @@ contract; there is no staged-protocol fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.provider_parser import ProviderParserResult
@@ -38,8 +42,8 @@ class RemoteArtifactReceipt:
             )
         ):
             raise ValueError("remote artifact identities must be non-empty")
-        if self.artifact_byte_count < 0:
-            raise ValueError("remote artifact byte count must be non-negative")
+        if self.artifact_byte_count <= 0:
+            raise ValueError("remote artifact byte count must be positive")
         for value, label in (
             (self.artifact_sha256, "remote artifact identity"),
             (self.source_pdf_sha256, "remote source identity"),
@@ -56,20 +60,246 @@ class RemoteArtifactReceipt:
                 raise ValueError(f"{label} must be canonical sha256")
 
 
+@dataclass(frozen=True, slots=True)
+class PersistedSubmissionReceipt:
+    """Closed public projection written before a submitted task is resumed."""
+
+    schema: str
+    attempt_identity: str
+    fence_identity: str
+    source_pdf_sha256: str
+    client_submit_key: str
+    submission_epoch_unix: int
+    remote_task_identity: str
+    status_url: str
+    result_url: str
+    exact_bytes: bytes = field(repr=False)
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "mineru-staged-submission.v1":
+            raise ValueError("submission receipt schema is unsupported")
+        if not self.exact_bytes or len(self.exact_bytes) > 65_536:
+            raise ValueError("submission receipt bytes are outside the closed envelope")
+        _require_sha256(self.source_pdf_sha256, "submission source")
+        _require_sha256(self.sha256, "submission receipt")
+        if (
+            isinstance(self.submission_epoch_unix, bool)
+            or not isinstance(self.submission_epoch_unix, int)
+            or self.submission_epoch_unix < 0
+        ):
+            raise ValueError("submission epoch must be non-negative")
+        for value in (
+            self.attempt_identity,
+            self.fence_identity,
+            self.client_submit_key,
+            self.remote_task_identity,
+            self.status_url,
+            self.result_url,
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("submission identities must be non-empty")
+        status = urlsplit(self.status_url)
+        result = urlsplit(self.result_url)
+        if (
+            status.scheme not in {"http", "https"}
+            or status.scheme != result.scheme
+            or status.netloc != result.netloc
+            or status.username is not None
+            or result.username is not None
+            or status.fragment
+            or result.fragment
+        ):
+            raise ValueError("submission URLs must share a closed HTTP origin")
+        projection = {
+            "schema": self.schema,
+            "attempt_identity": self.attempt_identity,
+            "fence_identity": self.fence_identity,
+            "source_pdf_sha256": self.source_pdf_sha256,
+            "client_submit_key": self.client_submit_key,
+            "submission_epoch_unix": self.submission_epoch_unix,
+            "remote_task_identity": self.remote_task_identity,
+            "status_url": self.status_url,
+            "result_url": self.result_url,
+        }
+        canonical = json.dumps(
+            projection, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if self.exact_bytes != canonical or self.sha256 != (
+            "sha256:" + hashlib.sha256(canonical).hexdigest()
+        ):
+            raise ValueError("submission receipt exact bytes drifted")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateSubmittedTaskResume:
+    """Opaque private token; persist only in the private resume-token store."""
+
+    token_bytes: bytes = field(repr=False)
+    token_sha256: str
+
+    def __post_init__(self) -> None:
+        if not self.token_bytes or len(self.token_bytes) > 65_536:
+            raise ValueError("private resume token is outside the closed envelope")
+        _require_sha256(self.token_sha256, "private resume token")
+        if self.token_sha256 != "sha256:" + hashlib.sha256(self.token_bytes).hexdigest():
+            raise ValueError("private resume token hash drifted")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedMaterialization:
+    """Verified local admission facts for a downloaded retained result."""
+
+    attempt_identity: str
+    fence_identity: str
+    source_pdf_sha256: str
+    terminal_receipt_sha256: str
+    spool_sha256: str
+    compressed_bytes: int
+    uncompressed_bytes: int
+    member_count: int
+    disk_bytes: int
+    decoded_bytes: int
+    private_token_bytes: bytes = field(repr=False)
+    private_token_sha256: str
+
+    def __post_init__(self) -> None:
+        if not self.attempt_identity.strip() or not self.fence_identity.strip():
+            raise ValueError("prepared identities must be non-empty")
+        for value, label in (
+            (self.source_pdf_sha256, "prepared source"),
+            (self.terminal_receipt_sha256, "terminal receipt"),
+            (self.spool_sha256, "prepared spool"),
+            (self.private_token_sha256, "prepared private token"),
+        ):
+            _require_sha256(value, label)
+        for count in (
+            self.compressed_bytes,
+            self.uncompressed_bytes,
+            self.member_count,
+            self.disk_bytes,
+            self.decoded_bytes,
+        ):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("prepared projection must be a non-negative integer")
+        if not self.private_token_bytes or len(self.private_token_bytes) > 65_536:
+            raise ValueError("prepared private token is outside the closed envelope")
+        if self.private_token_sha256 != (
+            "sha256:" + hashlib.sha256(self.private_token_bytes).hexdigest()
+        ):
+            raise ValueError("prepared private token hash drifted")
+
+
+def _require_sha256(value: str, label: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or len(value) != 71
+        or any(char not in "0123456789abcdef" for char in value[7:])
+    ):
+        raise ValueError(f"{label} must be canonical sha256")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderMaterializationEvidence:
+    """Content-free evidence returned with a locally materialized parse."""
+
+    attempt_identity: str
+    fence_identity: str
+    source_pdf_sha256: str
+    parser_target_identity_sha256: str
+    producer_claim_generation: int
+    terminal_owner_identity: str
+    terminal_artifact_sha256: str
+    terminal_artifact_bytes: int
+    artifact_root_relpath: str
+    manifest_relpath: str
+    manifest_sha256: str
+    manifest_bytes: int
+    provider_envelope_relpath: str | None = None
+    provider_envelope_sha256: str | None = None
+    provider_envelope_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.source_pdf_sha256, "evidence source"),
+            (self.parser_target_identity_sha256, "evidence parser target"),
+            ("sha256:" + self.terminal_artifact_sha256, "terminal artifact"),
+            (self.manifest_sha256, "evidence manifest"),
+        ):
+            _require_sha256(value, label)
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                self.attempt_identity,
+                self.fence_identity,
+                self.terminal_owner_identity,
+                self.artifact_root_relpath,
+                self.manifest_relpath,
+            )
+        ):
+            raise ValueError("materialization evidence identities must be non-empty")
+        for count in (
+            self.producer_claim_generation,
+            self.terminal_artifact_bytes,
+            self.manifest_bytes,
+        ):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError("materialization evidence counts are invalid")
+        for relpath in (self.artifact_root_relpath, self.manifest_relpath):
+            pure = PurePosixPath(relpath)
+            if pure.is_absolute() or ".." in pure.parts:
+                raise ValueError("materialization evidence path is unsafe")
+        envelope = (
+            self.provider_envelope_relpath,
+            self.provider_envelope_sha256,
+            self.provider_envelope_bytes,
+        )
+        if any(value is not None for value in envelope):
+            if not all(value is not None for value in envelope):
+                raise ValueError("provider envelope evidence must be all-or-none")
+            _require_sha256(self.provider_envelope_sha256 or "", "provider envelope")
+            pure = PurePosixPath(self.provider_envelope_relpath or "")
+            if pure.is_absolute() or ".." in pure.parts:
+                raise ValueError("provider envelope path is unsafe")
+            if (
+                isinstance(self.provider_envelope_bytes, bool)
+                or not isinstance(self.provider_envelope_bytes, int)
+                or self.provider_envelope_bytes < 1
+            ):
+                raise ValueError("provider envelope byte count is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class StagedProviderParserResult:
+    result: ProviderParserResult
+    evidence: ProviderMaterializationEvidence
+
+
 class RemoteProviderParseHandle(Protocol):
     """One accepted remote task whose local result has not been materialized."""
 
     def wait_terminal(self) -> RemoteArtifactReceipt:
         """Return only after terminal state and result ownership are proven."""
 
-    def materialize(
+    def submission_checkpoint(
+        self,
+    ) -> tuple[PersistedSubmissionReceipt, PrivateSubmittedTaskResume]: ...
+
+    def prepare_materialization(
+        self, *, receipt: RemoteArtifactReceipt, source_pdf_sha256: str
+    ) -> PreparedMaterialization: ...
+
+    def materialize_prepared(
         self,
         *,
+        prepared: PreparedMaterialization,
         receipt: RemoteArtifactReceipt,
         output_dir: Path,
         source_pdf_sha256: str,
-    ) -> ProviderParserResult:
-        """Download, verify and decode the owned result into local artifacts."""
+        parser_target_identity_sha256: str,
+        producer_claim_generation: int,
+    ) -> StagedProviderParserResult: ...
 
     def cancel_and_drain(self) -> None:
         """Close admission and prove the accepted remote task terminal."""
@@ -94,6 +324,7 @@ class StagedProviderDocumentParserPort(Protocol):
         source_pdf_sha256: str,
         attempt_identity: str,
         fence_identity: str,
+        client_submit_key: str,
         submission_epoch_unix: int,
     ) -> RemoteProviderParseHandle:
         ...
@@ -106,9 +337,22 @@ class StagedProviderDocumentParserPort(Protocol):
     ) -> RemoteProviderParseHandle:
         """Rehydrate a terminal result from durable state after restart."""
 
+    def resume_submitted_parse(
+        self,
+        *,
+        receipt: PersistedSubmissionReceipt,
+        secret: PrivateSubmittedTaskResume,
+        options: ParserOptions,
+    ) -> RemoteProviderParseHandle: ...
+
 
 __all__ = [
     "RemoteArtifactReceipt",
+    "PersistedSubmissionReceipt",
+    "PrivateSubmittedTaskResume",
+    "PreparedMaterialization",
+    "ProviderMaterializationEvidence",
     "RemoteProviderParseHandle",
+    "StagedProviderParserResult",
     "StagedProviderDocumentParserPort",
 ]

@@ -27,11 +27,20 @@ from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
     MinerUMediumArtifactReader,
 )
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
+from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    TerminalReceipt,
+    encode_terminal_receipt,
+)
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.provider_parser import ProviderParserResult
 from disclosure_anchor.application.ports.staged_provider_parser import (
+    PersistedSubmissionReceipt,
+    PreparedMaterialization,
+    PrivateSubmittedTaskResume,
+    ProviderMaterializationEvidence,
     RemoteArtifactReceipt,
     RemoteProviderParseHandle,
+    StagedProviderParserResult,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -40,6 +49,8 @@ _MAX_RESULT_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_ZIP_MEMBERS = 100_000
 _MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 _MAX_WIRE_JSON_BYTES = 1024 * 1024
+_MANIFEST_NAME = ".agent-materialization-manifest.v1.json"
+_MAX_DECODED_BYTES = 4 * 1024 * 1024 * 1024
 def _make_idempotency_key(
     source_pdf_sha256: str,
     attempt_identity: str,
@@ -91,6 +102,7 @@ class _Task:
     attempt_identity: str
     fence_identity: str
     idempotency_key: str
+    submission_epoch_unix: int
 
     def token(self, *, spool_path: Path | None, artifact_sha256: str) -> str:
         raw = json.dumps(
@@ -104,6 +116,7 @@ class _Task:
                 "attempt_identity": self.attempt_identity,
                 "fence_identity": self.fence_identity,
                 "idempotency_key": self.idempotency_key,
+                "submission_epoch_unix": self.submission_epoch_unix,
                 "spool_path": "" if spool_path is None else str(spool_path),
                 "artifact_sha256": artifact_sha256,
             },
@@ -132,6 +145,7 @@ class _Task:
             "spool_path",
             "artifact_sha256",
             "idempotency_key",
+            "submission_epoch_unix",
         }
         if set(payload) != expected:
             raise _fail("invalid durable resume token shape")
@@ -142,7 +156,10 @@ class _Task:
                 "v", "spool_path", "artifact_sha256",
             }
         }
-        if not all(isinstance(value, str) for value in values.values()):
+        if not all(
+            isinstance(value, str) for key, value in values.items()
+            if key != "submission_epoch_unix"
+        ) or type(values.get("submission_epoch_unix")) is not int:
             raise _fail("invalid durable resume token values")
         task = cls(**values)
         task.validate()
@@ -178,6 +195,44 @@ class _Task:
             raise _fail("invalid source sha256")
         _same_origin_url(self.base_url, self.status_url, "status URL")
         _same_origin_url(self.base_url, self.result_url, "result URL")
+        if self.submission_epoch_unix < 0:
+            raise _fail("invalid submission epoch")
+
+    def submission_checkpoint(
+        self,
+    ) -> tuple[PersistedSubmissionReceipt, PrivateSubmittedTaskResume]:
+        projection = {
+            "schema": "mineru-staged-submission.v1",
+            "attempt_identity": self.attempt_identity,
+            "fence_identity": self.fence_identity,
+            "source_pdf_sha256": self.source_pdf_sha256,
+            "client_submit_key": self.idempotency_key,
+            "submission_epoch_unix": self.submission_epoch_unix,
+            "remote_task_identity": self.task_id,
+            "status_url": self.status_url,
+            "result_url": self.result_url,
+        }
+        exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+        secret = self.token(spool_path=None, artifact_sha256="0" * 64).encode()
+        return (
+            PersistedSubmissionReceipt(
+                schema="mineru-staged-submission.v1",
+                attempt_identity=self.attempt_identity,
+                fence_identity=self.fence_identity,
+                source_pdf_sha256=self.source_pdf_sha256,
+                client_submit_key=self.idempotency_key,
+                submission_epoch_unix=self.submission_epoch_unix,
+                remote_task_identity=self.task_id,
+                status_url=self.status_url,
+                result_url=self.result_url,
+                exact_bytes=exact,
+                sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
+            ),
+            PrivateSubmittedTaskResume(
+                token_bytes=secret,
+                token_sha256="sha256:" + hashlib.sha256(secret).hexdigest(),
+            ),
+        )
 
 
 class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
@@ -211,6 +266,11 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             trust_env=False,
             transport=self._transport,
         )
+
+    def submission_checkpoint(
+        self,
+    ) -> tuple[PersistedSubmissionReceipt, PrivateSubmittedTaskResume]:
+        return self._task.submission_checkpoint()
 
     def wait_terminal(self) -> RemoteArtifactReceipt:
         with self._terminal_lock:
@@ -351,13 +411,198 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             ),
         )
 
-    def materialize(
+    def prepare_materialization(
+        self, *, receipt: RemoteArtifactReceipt, source_pdf_sha256: str
+    ) -> PreparedMaterialization:
+        task, spool_path, artifact_sha256 = self._validate_receipt(
+            receipt, source_pdf_sha256=source_pdf_sha256
+        )
+        resolved_spool = spool_path.resolve() if spool_path is not None else None
+        if resolved_spool is not None and self._spool_root not in resolved_spool.parents:
+            raise _fail("spool path escaped its private root")
+        downloaded = resolved_spool is None
+        if resolved_spool is None:
+            resolved_spool = self._download_retained_result(receipt)
+        try:
+            compressed, uncompressed, members, decoded = _inspect_zip(resolved_spool)
+            if compressed != receipt.artifact_byte_count:
+                raise _fail("prepared compressed byte count drifted")
+            if _sha256_file(resolved_spool) != receipt.artifact_sha256:
+                raise _fail("prepared spool content drifted")
+        except BaseException:
+            if downloaded:
+                resolved_spool.unlink(missing_ok=True)
+            raise
+        terminal_exact = _terminal_receipt_exact(receipt)
+        token = task.token(
+            spool_path=resolved_spool, artifact_sha256=artifact_sha256
+        ).encode("ascii")
+        self._terminal_spool = (resolved_spool, artifact_sha256)
+        return PreparedMaterialization(
+            attempt_identity=task.attempt_identity,
+            fence_identity=task.fence_identity,
+            source_pdf_sha256=task.source_pdf_sha256,
+            terminal_receipt_sha256="sha256:" + hashlib.sha256(terminal_exact).hexdigest(),
+            spool_sha256="sha256:" + artifact_sha256,
+            compressed_bytes=compressed,
+            uncompressed_bytes=uncompressed,
+            member_count=members,
+            disk_bytes=uncompressed,
+            decoded_bytes=decoded,
+            private_token_bytes=token,
+            private_token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+        )
+
+    def materialize_prepared(
         self,
         *,
+        prepared: PreparedMaterialization,
         receipt: RemoteArtifactReceipt,
         output_dir: Path,
         source_pdf_sha256: str,
-    ) -> ProviderParserResult:
+        parser_target_identity_sha256: str,
+        producer_claim_generation: int,
+    ) -> StagedProviderParserResult:
+        if isinstance(producer_claim_generation, bool) or producer_claim_generation < 1:
+            raise _fail("producer claim generation is invalid")
+        if (
+            not parser_target_identity_sha256.startswith("sha256:")
+            or len(parser_target_identity_sha256) != 71
+        ):
+            raise _fail("parser target identity is invalid")
+        task, spool_path, artifact_sha256 = _Task.from_token(
+            prepared.private_token_bytes.decode("ascii")
+        )
+        self._validate_receipt(receipt, source_pdf_sha256=source_pdf_sha256)
+        terminal_sha = "sha256:" + hashlib.sha256(
+            _terminal_receipt_exact(receipt)
+        ).hexdigest()
+        if (
+            task != self._task
+            or prepared.attempt_identity != task.attempt_identity
+            or prepared.fence_identity != task.fence_identity
+            or prepared.source_pdf_sha256 != task.source_pdf_sha256
+            or prepared.terminal_receipt_sha256 != terminal_sha
+            or prepared.spool_sha256 != "sha256:" + artifact_sha256
+            or prepared.private_token_sha256
+            != "sha256:" + hashlib.sha256(prepared.private_token_bytes).hexdigest()
+            or spool_path is None
+        ):
+            raise _fail("prepared materialization identity drifted")
+        resolved_spool = spool_path.resolve()
+        if self._spool_root not in resolved_spool.parents:
+            raise _fail("prepared spool escaped its private root")
+        compressed = prepared.compressed_bytes
+        uncompressed = prepared.uncompressed_bytes
+        members = prepared.member_count
+        decoded = prepared.decoded_bytes
+        if artifact_sha256 != receipt.artifact_sha256:
+            raise _fail("prepared materialization projections drifted")
+        if not output_dir.exists():
+            compressed, uncompressed, members, decoded = _inspect_zip(resolved_spool)
+            if (
+                (compressed, uncompressed, members, uncompressed, decoded)
+                != (
+                    prepared.compressed_bytes,
+                    prepared.uncompressed_bytes,
+                    prepared.member_count,
+                    prepared.disk_bytes,
+                    prepared.decoded_bytes,
+                )
+                or _sha256_file(resolved_spool) != receipt.artifact_sha256
+            ):
+                raise _fail("prepared materialization projections drifted")
+
+        target_identity = self._target_identity()
+        manifest_projection = {
+            "schema": "mineru-local-materialization.v1",
+            "attempt_identity": task.attempt_identity,
+            "fence_identity": task.fence_identity,
+            "source_pdf_sha256": task.source_pdf_sha256,
+            "terminal_receipt_sha256": terminal_sha,
+            "terminal_owner_identity": receipt.artifact_owner_identity,
+            "terminal_artifact_sha256": receipt.artifact_sha256,
+            "terminal_artifact_bytes": receipt.artifact_byte_count,
+            "parser_target_identity_sha256": parser_target_identity_sha256,
+            "produced_generation": producer_claim_generation,
+            "projections": {
+                "compressed_bytes": compressed,
+                "uncompressed_bytes": uncompressed,
+                "member_count": members,
+                "disk_bytes": uncompressed,
+                "decoded_bytes": decoded,
+            },
+        }
+        if output_dir.exists():
+            if output_dir.is_symlink() or not output_dir.is_dir():
+                raise _fail("existing output is not an owned directory")
+            manifest_exact, manifest = _read_and_verify_manifest(
+                output_dir,
+                expected=manifest_projection,
+                current_generation=producer_claim_generation,
+            )
+        else:
+            output_dir.parent.mkdir(parents=True, exist_ok=True)
+            staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{output_dir.name}-{hashlib.sha256(task.attempt_identity.encode()).hexdigest()[:12]}-",
+                    dir=output_dir.parent,
+                )
+            )
+            promoted = False
+            try:
+                _safe_extract(resolved_spool, staging)
+                files = _tree_file_receipts(staging)
+                manifest = {**manifest_projection, "files": files}
+                manifest_exact = json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ).encode()
+                _write_fsynced(staging / _MANIFEST_NAME, manifest_exact)
+                _fsync_tree(staging)
+                os.replace(staging, output_dir)
+                _fsync_directory(output_dir.parent)
+                promoted = True
+            finally:
+                if not promoted and staging.exists():
+                    shutil.rmtree(staging)
+            manifest_exact, manifest = _read_and_verify_manifest(
+                output_dir,
+                expected=manifest_projection,
+                current_generation=producer_claim_generation,
+            )
+        provider_document = self._reader.read(
+            output_dir, source_pdf_sha256=source_pdf_sha256
+        )
+        resolved_spool.unlink(missing_ok=True)
+        result = ProviderParserResult(
+            target_identity=target_identity,
+            artifact_root=self._reader.locate_artifact_root(output_dir),
+            provider_document=provider_document,
+        )
+        artifact_root = self._reader.locate_artifact_root(output_dir)
+        try:
+            artifact_root_relpath = artifact_root.relative_to(output_dir).as_posix()
+        except ValueError as exc:
+            raise _fail("reader artifact root escaped materialized output") from exc
+        evidence = ProviderMaterializationEvidence(
+            attempt_identity=task.attempt_identity,
+            fence_identity=task.fence_identity,
+            source_pdf_sha256=task.source_pdf_sha256,
+            parser_target_identity_sha256=manifest["parser_target_identity_sha256"],
+            producer_claim_generation=producer_claim_generation,
+            terminal_owner_identity=receipt.artifact_owner_identity,
+            terminal_artifact_sha256=receipt.artifact_sha256,
+            terminal_artifact_bytes=receipt.artifact_byte_count,
+            artifact_root_relpath=artifact_root_relpath or ".",
+            manifest_relpath=_MANIFEST_NAME,
+            manifest_sha256="sha256:" + hashlib.sha256(manifest_exact).hexdigest(),
+            manifest_bytes=len(manifest_exact),
+        )
+        return StagedProviderParserResult(result=result, evidence=evidence)
+
+    def _validate_receipt(
+        self, receipt: RemoteArtifactReceipt, *, source_pdf_sha256: str
+    ) -> tuple[_Task, Path | None, str]:
         if source_pdf_sha256 != self._task.source_pdf_sha256:
             raise _fail("receipt/source ownership drifted before materialization")
         task, spool_path, artifact_sha256 = _Task.from_token(receipt.resume_token)
@@ -374,64 +619,10 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             or receipt.artifact_byte_count <= 0
         ):
             raise _fail("receipt ownership drifted before materialization")
-        resolved_spool = spool_path.resolve() if spool_path is not None else None
-        if (
-            resolved_spool is not None
-            and self._spool_root not in resolved_spool.parents
-        ):
-            raise _fail("spool path escaped its private root")
-        if resolved_spool is None:
-            resolved_spool = self._download_retained_result(receipt)
-        digest = hashlib.sha256()
-        received = 0
-        with resolved_spool.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                received += len(chunk)
-                digest.update(chunk)
-        if (
-            received != receipt.artifact_byte_count
-            or digest.hexdigest() != receipt.artifact_sha256
-        ):
-            raise _fail("spooled result identity drifted")
-        if output_dir.exists():
-            raise _fail("materialization output must not already exist")
-        output_dir.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(
-            tempfile.mkdtemp(prefix=f".{output_dir.name}-stage-", dir=output_dir.parent)
-        )
-        try:
-            _safe_extract(resolved_spool, staging)
-            _fsync_tree(staging)
-            os.replace(staging, output_dir)
-            parent_fd = os.open(output_dir.parent, os.O_RDONLY)
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
-            staging = output_dir.parent / f".{output_dir.name}-promoted"
-        except BaseException:
-            if spool_path is None:
-                resolved_spool.unlink(missing_ok=True)
-            raise
-        finally:
-            if staging.exists():
-                for root, dirs, files in os.walk(staging, topdown=False):
-                    for name in files:
-                        Path(root, name).unlink(missing_ok=True)
-                    for name in dirs:
-                        Path(root, name).rmdir()
-                staging.rmdir()
-        try:
-            provider_document = self._reader.read(
-                output_dir, source_pdf_sha256=source_pdf_sha256
-            )
-        except BaseException:
-            shutil.rmtree(output_dir, ignore_errors=True)
-            if spool_path is None:
-                resolved_spool.unlink(missing_ok=True)
-            raise
-        resolved_spool.unlink(missing_ok=True)
-        target_identity = ParserTargetIdentity(
+        return task, spool_path, artifact_sha256
+
+    def _target_identity(self) -> ParserTargetIdentity:
+        return ParserTargetIdentity(
             name="MinerU",
             package_version="3.4.4",
             backend=self._options.backend,
@@ -446,11 +637,6 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             end_page=None,
             runtime_bundle_identity_sha256=self._options.runtime_bundle_identity_sha256
             or "",
-        )
-        return ProviderParserResult(
-            target_identity=target_identity,
-            artifact_root=self._reader.locate_artifact_root(output_dir),
-            provider_document=provider_document,
         )
 
     def acknowledge_after_finish_committed(
@@ -567,6 +753,7 @@ class MinerUHttpStagedParser:
         source_pdf_sha256: str,
         attempt_identity: str,
         fence_identity: str,
+        client_submit_key: str,
         submission_epoch_unix: int | None = None,
     ) -> MinerUHttpRemoteHandle:
         _identity(attempt_identity, "attempt identity")
@@ -654,10 +841,14 @@ class MinerUHttpStagedParser:
             "end_page_id": "99999",
             "server_url": self._server_url,
         }
-        idempotency_key = _make_idempotency_key(
+        expected_idempotency_key = _make_idempotency_key(
             source_pdf_sha256, attempt_identity, fence_identity,
             observed_unix=float(submission_epoch_unix or 0),
         )
+        if client_submit_key != expected_idempotency_key:
+            snapshot.unlink(missing_ok=True)
+            raise _fail("durable client submit key drifted")
+        idempotency_key = client_submit_key
         data.update(
             {
                 "agent_idempotency_key": idempotency_key,
@@ -673,7 +864,6 @@ class MinerUHttpStagedParser:
             "result_artifact_sha256", "result_artifact_bytes",
             "result_artifact_owner", "protocol_state",
         }
-        reconciled = False
         try:
             with (
                 httpx.Client(
@@ -684,29 +874,59 @@ class MinerUHttpStagedParser:
                 ) as client,
                 snapshot.open("rb") as source,
             ):
-                try:
+                # Reconcile the durable key before POST. A failed lookup is not
+                # permission to submit: only an exact 404 proves absence.
+                lookup = client.send(
+                    client.build_request(
+                        "GET",
+                        f"{self._api_url}/tasks/by-idempotency/{idempotency_key}",
+                    ),
+                    stream=True,
+                )
+                if lookup.status_code == 200:
+                    try:
+                        payload = _closed_json(
+                            lookup,
+                            required={"task_id", "status_url", "result_url"},
+                            allowed=submit_allowed,
+                        )
+                    finally:
+                        lookup.close()
+                elif lookup.status_code == 404:
+                    lookup.close()
                     request = client.build_request(
                         "POST", f"{self._api_url}/tasks", data=data,
                         files={"files": (input_pdf.name, source, "application/pdf")},
                     )
-                    response = client.send(request, stream=True)
-                except httpx.TransportError:
-                    request = client.build_request(
-                        "GET", f"{self._api_url}/tasks/by-idempotency/{idempotency_key}"
-                    )
-                    response = client.send(request, stream=True)
-                    reconciled = True
-                expected_statuses = {200} if reconciled else {200, 202}
-                try:
-                    if response.status_code not in expected_statuses:
-                        raise _fail(f"submit returned HTTP {response.status_code}")
-                    payload = _closed_json(
-                        response,
-                        required={"task_id", "status_url", "result_url"},
-                        allowed=submit_allowed,
-                    )
-                finally:
-                    response.close()
+                    try:
+                        response = client.send(request, stream=True)
+                    except httpx.TransportError:
+                        response = client.send(
+                            client.build_request(
+                                "GET",
+                                f"{self._api_url}/tasks/by-idempotency/{idempotency_key}",
+                            ),
+                            stream=True,
+                        )
+                        expected_statuses = {200}
+                    else:
+                        expected_statuses = {200, 202}
+                    try:
+                        if response.status_code not in expected_statuses:
+                            raise _fail(
+                                f"submit/reconcile returned HTTP {response.status_code}"
+                            )
+                        payload = _closed_json(
+                            response,
+                            required={"task_id", "status_url", "result_url"},
+                            allowed=submit_allowed,
+                        )
+                    finally:
+                        response.close()
+                else:
+                    status = lookup.status_code
+                    lookup.close()
+                    raise _fail(f"idempotency reconcile returned HTTP {status}")
         finally:
             snapshot.unlink(missing_ok=True)
         if not all(
@@ -735,6 +955,7 @@ class MinerUHttpStagedParser:
             attempt_identity=attempt_identity,
             fence_identity=fence_identity,
             idempotency_key=idempotency_key,
+            submission_epoch_unix=submission_epoch_unix,
         )
         return MinerUHttpRemoteHandle(
             task=task,
@@ -765,6 +986,36 @@ class MinerUHttpStagedParser:
             spool_root=self._spool_root,
             transport=self._transport,
             terminal_spool=terminal_spool,
+        )
+
+    def resume_submitted_parse(
+        self,
+        *,
+        receipt: PersistedSubmissionReceipt,
+        secret: PrivateSubmittedTaskResume,
+        options: ParserOptions,
+    ) -> MinerUHttpRemoteHandle:
+        if (
+            hashlib.sha256(receipt.exact_bytes).hexdigest()
+            != receipt.sha256.removeprefix("sha256:")
+            or hashlib.sha256(secret.token_bytes).hexdigest()
+            != secret.token_sha256.removeprefix("sha256:")
+        ):
+            raise _fail("submitted checkpoint hash drifted")
+        task, spool_path, artifact_sha256 = _Task.from_token(
+            secret.token_bytes.decode("ascii")
+        )
+        expected, _ = task.submission_checkpoint()
+        if receipt != expected or spool_path is not None or artifact_sha256 != "0" * 64:
+            raise _fail("submitted checkpoint identity drifted")
+        if task.base_url != self._api_url:
+            raise _fail("submitted checkpoint API origin drifted")
+        return MinerUHttpRemoteHandle(
+            task=task,
+            options=options,
+            reader=self._reader,
+            spool_root=self._spool_root,
+            transport=self._transport,
         )
 
 
@@ -806,29 +1057,171 @@ def _closed_json(
     return payload
 
 
+def _terminal_receipt_exact(receipt: RemoteArtifactReceipt) -> bytes:
+    return encode_terminal_receipt(
+        TerminalReceipt(
+            attempt_identity=receipt.attempt_identity,
+            fence_identity=receipt.fence_identity,
+            source_pdf_sha256=receipt.source_pdf_sha256,
+            artifact_owner_identity=receipt.artifact_owner_identity,
+            artifact_byte_count=receipt.artifact_byte_count,
+            artifact_sha256="sha256:" + receipt.artifact_sha256,
+            resume_token_sha256="sha256:"
+            + hashlib.sha256(receipt.resume_token.encode("ascii")).hexdigest(),
+        )
+    ).exact_bytes
+
+
+def _inspect_zip(zip_path: Path) -> tuple[int, int, int, int]:
+    digest = hashlib.sha256()
+    compressed = 0
+    with zip_path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            compressed += len(chunk)
+            if compressed > _MAX_RESULT_BYTES:
+                raise _fail("ZIP exceeds compressed-byte envelope")
+            digest.update(chunk)
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            members = archive.infolist()
+            if len(members) > _MAX_ZIP_MEMBERS:
+                raise _fail("ZIP exceeds member envelope")
+            uncompressed = 0
+            decoded = 0
+            seen: set[str] = set()
+            for member in members:
+                _validate_zip_member(member, seen=seen)
+                uncompressed += member.file_size
+                if uncompressed > _MAX_UNCOMPRESSED_BYTES:
+                    raise _fail("ZIP exceeds uncompressed-byte envelope")
+                if Path(member.filename).suffix.lower() in {".json", ".md", ".txt"}:
+                    # Parsing and JSON object graphs can amplify source text.
+                    # Reserve a conservative 4x decoded-memory envelope.
+                    decoded += member.file_size * 4
+                    if decoded > _MAX_DECODED_BYTES:
+                        raise _fail("ZIP exceeds decoded-byte envelope")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise _fail("retained result is not a readable ZIP") from exc
+    return compressed, uncompressed, len(members), decoded
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_zip_member(member: zipfile.ZipInfo, *, seen: set[str]) -> None:
+    pure = PurePosixPath(member.filename)
+    key = member.filename.casefold()
+    mode = member.external_attr >> 16
+    file_type = stat.S_IFMT(mode)
+    if (
+        not pure.parts
+        or pure.is_absolute()
+        or ".." in pure.parts
+        or key in seen
+        or (file_type and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)))
+    ):
+        raise _fail("unsafe ZIP member")
+    seen.add(key)
+
+
+def _tree_file_receipts(root: Path) -> list[dict[str, object]]:
+    receipts: list[dict[str, object]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise _fail("materialized tree contains a symlink")
+        if not path.is_file():
+            continue
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
+        receipts.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "bytes": size,
+                "sha256": digest.hexdigest(),
+            }
+        )
+    return receipts
+
+
+def _write_fsynced(path: Path, content: bytes) -> None:
+    with path.open("xb") as sink:
+        sink.write(content)
+        sink.flush()
+        os.fsync(sink.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _read_and_verify_manifest(
+    root: Path, *, expected: dict[str, object], current_generation: int
+) -> tuple[bytes, dict[str, Any]]:
+    manifest_path = root / _MANIFEST_NAME
+    try:
+        exact = manifest_path.read_bytes()
+    except OSError as exc:
+        raise _fail("existing output has no closed materialization manifest") from exc
+    if len(exact) > _MAX_WIRE_JSON_BYTES:
+        raise _fail("materialization manifest exceeds the closed envelope")
+    try:
+        manifest = json.loads(exact)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _fail("materialization manifest is invalid") from exc
+    if not isinstance(manifest, dict) or set(manifest) != set(expected) | {"files"}:
+        raise _fail("materialization manifest shape drifted")
+    immutable_keys = set(expected) - {"produced_generation"}
+    if any(manifest.get(key) != expected[key] for key in immutable_keys):
+        raise _fail("materialization manifest identity drifted")
+    produced_generation = manifest.get("produced_generation")
+    if (
+        isinstance(produced_generation, bool)
+        or not isinstance(produced_generation, int)
+        or produced_generation < 0
+        or produced_generation > current_generation
+    ):
+        raise _fail("materialization manifest claim generation drifted")
+    files = manifest.get("files")
+    if not isinstance(files, list) or files != _tree_file_receipts_excluding_manifest(root):
+        raise _fail("existing materialization output drifted")
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    if exact != canonical:
+        raise _fail("materialization manifest is not canonical")
+    return exact, manifest
+
+
+def _tree_file_receipts_excluding_manifest(root: Path) -> list[dict[str, object]]:
+    return [
+        item
+        for item in _tree_file_receipts(root)
+        if item["path"] != _MANIFEST_NAME
+    ]
+
+
 def _safe_extract(zip_path: Path, output_dir: Path) -> None:
     root = output_dir.resolve()
     with zipfile.ZipFile(zip_path) as archive:
         members = archive.infolist()
-        if (
-            len(members) > _MAX_ZIP_MEMBERS
-            or sum(m.file_size for m in members) > _MAX_UNCOMPRESSED_BYTES
-        ):
+        if len(members) > _MAX_ZIP_MEMBERS:
             raise _fail("ZIP exceeds extraction envelope")
         seen: set[str] = set()
+        written = 0
         for member in members:
+            _validate_zip_member(member, seen=seen)
             pure = PurePosixPath(member.filename)
-            key = member.filename.casefold()
-            mode = member.external_attr >> 16
-            file_type = stat.S_IFMT(mode)
-            if (
-                pure.is_absolute()
-                or ".." in pure.parts
-                or key in seen
-                or (file_type and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)))
-            ):
-                raise _fail("unsafe ZIP member")
-            seen.add(key)
             target = (root / Path(*pure.parts)).resolve()
             if target != root and root not in target.parents:
                 raise _fail("ZIP member escaped output root")
@@ -838,6 +1231,9 @@ def _safe_extract(zip_path: Path, output_dir: Path) -> None:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(member) as source, target.open("xb") as sink:
                     while chunk := source.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > _MAX_UNCOMPRESSED_BYTES:
+                            raise _fail("ZIP exceeded extraction byte envelope")
                         sink.write(chunk)
 
 
