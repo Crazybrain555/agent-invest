@@ -258,6 +258,44 @@ def health_payload(task_manager):
         ),
     }
 '''
+
+
+def _retained_fast_api_fixture() -> str:
+    return (
+        "import asyncio\nimport mimetypes\n"
+        "class AsyncParseTask:\n"
+        "    completed_at: Optional[str] = None\n"
+        "    error: Optional[str] = None\n\n"
+        "    def to_status_payload(self, queued_ahead=None):\n"
+        "        if queued_ahead is not None:\n"
+        "            payload[\"queued_ahead\"] = queued_ahead\n\n"
+        "def create_result_zip():\n"
+        "    return zip_path\n\n\n"
+        "def _cleanup_generated_zip_task(task):\n"
+        "    pass\n\n"
+        "class RetainedComplete:\n"
+        "    async def complete(self, task):\n"
+        "        task.status = TASK_COMPLETED\n"
+        "        task.completed_at = utc_now_iso()\n\n"
+        + _fast_api_fixture()
+        + "\nasync def get_async_task_result():\n"
+        "    return await build_result_response(\n"
+        "        background_tasks=background_tasks,\n"
+        "        status_code=200,\n"
+        "        output_dir=task.output_dir,\n"
+        "        pdf_file_names=task.file_names,\n"
+        "        backend=task.backend,\n"
+        "        parse_method=task.parse_method,\n"
+        "        return_md=task.return_md,\n"
+        "        return_middle_json=task.return_middle_json,\n"
+        "        return_model_output=task.return_model_output,\n"
+        "        return_content_list=task.return_content_list,\n"
+        "        return_images=task.return_images,\n"
+        "        response_format_zip=task.response_format_zip,\n"
+        "        return_original_file=task.return_original_file,\n"
+        "        zip_filename=f\"{task.task_id}.zip\",\n"
+        "    )\n"
+    )
 def _vlm_document_fixture(*, asynchronous: bool) -> str:
     render = (
         "                images_list = await aio_load_images_from_pdf_bytes_range(\n"
@@ -625,6 +663,19 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
             with self.assertRaisesRegex(RuntimeError, "serial execution"):
                 get_pending()
+
+    def test_fast_api_retains_one_content_identified_result_until_cleanup(self) -> None:
+        patched = patch_source(
+            "mineru/cli/fast_api.py",
+            _retained_fast_api_fixture(),
+        )
+        self.assertIn("async def build_retained_task_result", patched)
+        self.assertIn('"mineru-retained-result.v1"', patched)
+        self.assertIn("await build_retained_task_result(task)", patched)
+        self.assertIn('path=task.result_artifact_path', patched)
+        self.assertIn('"X-MinerU-Result-SHA256"', patched)
+        self.assertIn("cleanup_file(task.result_artifact_path)", patched)
+        self.assertNotIn("return await build_result_response", patched)
 
     def test_preimages_match_the_reproduced_deployed_344_sources(self) -> None:
         self.assertEqual(

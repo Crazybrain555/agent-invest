@@ -43,12 +43,16 @@ class RemoteArtifactReceipt:
             (self.artifact_sha256, "remote artifact identity"),
             (self.source_pdf_sha256, "remote source identity"),
         ):
-            if value and (
-                len(value) != 64
-                or value != value.lower()
-                or any(char not in "0123456789abcdef" for char in value)
+            if not value:
+                continue
+            candidate = value[7:] if label == "remote source identity" and value.startswith("sha256:") else value
+            if (
+                len(candidate) != 64
+                or candidate != candidate.lower()
+                or any(char not in "0123456789abcdef" for char in candidate)
+                or (label == "remote source identity" and not value.startswith("sha256:"))
             ):
-                raise ValueError(f"{label} must be lowercase sha256")
+                raise ValueError(f"{label} must be canonical sha256")
 
 
 class RemoteProviderParseHandle(Protocol):

@@ -333,6 +333,13 @@ prepare、同步 parser、本地原子写和 finish-run，而 stale-run reclaim 
 attempt/fence CAS 之前，worker 不得把该 capability 接成生产路径；否则进程重启会丢失已完成的
 远端结果，或者把旧 attempt 写进新 run。此限制不需要新增公开 DB contract，但需要一个明确的
 私有 checkpoint/recovery adapter，不能用内存映射代替。
+
+Retained v1 也不等于跨重启 durable：MinerU task registry 仍是进程内状态，retention 仍按完成时间
+清理，当前协议没有 client idempotency key、result lease 或 ACK/consume。提交响应歧义不得自动
+重试；local backlog 也不得超过 retention。并且 exact v1 finalizer 当前仍处于 task slot 内，尚未
+把 GPU parse credit 与 CPU ZIP/hash finalizer credit 分开。因此在 server 增加 idempotent submit、
+lease/ACK 以及 bounded finalizer stage 并通过 crash/race 行为测试前，此能力只能作为 default-off
+机制证据，不能宣称已达到生产吞吐或 durable resume 要求。
 - 当前 MinerU 3.4.4 CLI 的 `--api-url` 路径把 submit/status/terminal、result ZIP 下载/解压绑定在
   同一个 CLI process return 中，没有可证明的提前 terminal/result-owner 回调。因此 production adapter
   仍走 legacy synchronous port；`BoundedTwoStageParserPump` 只在 adapter 实现
