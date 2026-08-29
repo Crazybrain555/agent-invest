@@ -110,6 +110,28 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_restart_recovers_route_payload_and_requeues_interrupted_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            registry.bind_task_payload(
+                "key",
+                {"task_id": "task-key", "output_dir": "task-key"},
+            )
+            registry.transition("key", "processing")
+            recovered_registry = self._registry(root)
+            payloads = recovered_registry.recoverable_payloads()
+            self.assertEqual(payloads[0]["task_id"], "task-key")
+            record = recovered_registry.get("key")
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.state, "pending")
+            by_task = recovered_registry.get_by_task_id("task-key")
+            self.assertIsNotNone(by_task)
+            assert by_task is not None
+            self.assertEqual(by_task.idempotency_key, "key")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import Any, Literal
 
 TaskState = Literal[
     "pending", "processing", "finalizing", "completed", "failed", "consumed"
@@ -37,6 +37,7 @@ class DurableTaskRecord:
     lease_until_unix: float | None = None
     active_readers: int = 0
     error: str | None = None
+    task_payload: dict[str, Any] | None = None
 
 
 class DurableTaskRegistry:
@@ -85,6 +86,60 @@ class DurableTaskRegistry:
     def get(self, idempotency_key: str) -> DurableTaskRecord | None:
         with self._lock:
             return self._records.get(idempotency_key)
+
+    def get_by_task_id(self, task_id: str) -> DurableTaskRecord | None:
+        with self._lock:
+            matches = [
+                record for record in self._records.values() if record.task_id == task_id
+            ]
+            if len(matches) > 1:
+                raise TaskProtocolConflict("task id is not unique")
+            return matches[0] if matches else None
+
+    def bind_task_payload(
+        self,
+        idempotency_key: str,
+        payload: dict[str, Any],
+    ) -> None:
+        # Round-trip now so restart cannot discover a non-JSON task payload.
+        normalized = json.loads(json.dumps(payload, sort_keys=True))
+        if not isinstance(normalized, dict):
+            raise TypeError("task payload must be one JSON object")
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.task_payload is not None and record.task_payload != normalized:
+                raise TaskProtocolConflict("task payload drifted after allocation")
+            record.task_payload = normalized
+            self._persist()
+
+    def recoverable_payloads(self) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            recoverable = []
+            for record in self._records.values():
+                if record.state in {"pending", "processing", "finalizing"}:
+                    # A partially allocated request without a bound upload/output
+                    # description cannot be safely replayed.
+                    if record.task_payload is None:
+                        raise TaskProtocolConflict(
+                            "nonterminal task has no durable replay payload"
+                        )
+                    if record.state == "processing":
+                        record.state = "pending"
+                if record.task_payload is not None and record.state != "consumed":
+                    recoverable.append(dict(record.task_payload))
+            self._persist()
+            return tuple(recoverable)
+
+    def fail(self, idempotency_key: str, *, error: str) -> None:
+        if not error.strip():
+            raise ValueError("task failure must be visible")
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state not in {"pending", "processing", "finalizing"}:
+                raise TaskProtocolConflict("terminal task cannot fail again")
+            record.state = "failed"
+            record.error = error
+            self._persist()
 
     def transition(self, idempotency_key: str, target: TaskState) -> None:
         allowed: dict[TaskState, frozenset[TaskState]] = {
