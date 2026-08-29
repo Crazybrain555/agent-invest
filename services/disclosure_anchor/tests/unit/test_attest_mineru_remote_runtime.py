@@ -74,6 +74,7 @@ def _observation() -> dict[str, Any]:
         "MINERU_HYBRID_BATCH_RATIO=1",
         "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS=1",
         "MINERU_API_MAX_CONCURRENT_REQUESTS=1",
+        "MINERU_API_MAX_PENDING_TASKS=1",
         "MINERU_PROCESSING_WINDOW_SIZE=16",
         "MINERU_API_OUTPUT_ROOT=/var/lib/mineru-api-output",
         "MINERU_API_TASK_RETENTION_SECONDS=600",
@@ -135,9 +136,9 @@ def _observation() -> dict[str, Any]:
         },
         "api_compatibility": {
             "marker": {
-                "schema": "mineru-runtime-compatibility.v3",
+                "schema": "mineru-runtime-compatibility.v4",
                 "policy": "glibc-malloc-trim-per-window.v1",
-                "capacity_policy": "process-global-mineru-coordinator.v3",
+                "capacity_policy": "process-global-mineru-coordinator.v4",
                 "mineru_version": "3.4.4",
                 "mineru_vl_utils_version": "1.0.5",
                 "base_image_digest": EXPECTED_IMAGE_ID,
@@ -164,11 +165,13 @@ def _observation() -> dict[str, Any]:
             "heap_trim_enabled": True,
             "phase_trace_enabled": False,
             "hybrid_batch_ratio_requested": 1,
+            "max_pending_tasks_requested": 1,
+            "max_pending_tasks_effective": 1,
             "pipeline_inference_locks_enabled": True,
             "image_labels": {
                 "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
                 "io.agent-invest.mineru.capacity-policy": (
-                    "process-global-mineru-coordinator.v3"
+                    "process-global-mineru-coordinator.v4"
                 ),
                 "io.agent-invest.mineru.compatibility-policy": (
                     "glibc-malloc-trim-per-window.v1"
@@ -242,6 +245,8 @@ def _observation() -> dict[str, Any]:
             "completed_tasks": 0,
             "failed_tasks": 0,
             "max_concurrent_requests": 1,
+            "max_pending_tasks_requested": 1,
+            "max_pending_tasks_effective": 1,
             "processing_window_size": 16,
             "task_retention_seconds": 600,
             "task_cleanup_interval_seconds": 30,
@@ -381,6 +386,8 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             "vllm",
             "compatibility",
             "capacity_profile",
+            "pending_health_drift",
+            "pending_compatibility_drift",
         ):
             with self.subTest(tamper=tamper):
                 observation = _observation()
@@ -415,6 +422,12 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                     observation["api_compatibility"]["capacity_runtime"] = (
                         _expected_capacity_runtime(observation["api"]["environment"])
                     )
+                elif tamper == "pending_health_drift":
+                    observation["api_health"]["max_pending_tasks_effective"] = 2
+                elif tamper == "pending_compatibility_drift":
+                    observation["api_compatibility"][
+                        "max_pending_tasks_effective"
+                    ] = 2
                 else:
                     observation["api_compatibility"]["heap_trim_enabled"] = False
                 with (

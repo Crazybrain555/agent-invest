@@ -18,6 +18,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_EXPOSURE_POLICY,
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
     MINERU_API_MAX_SUPPORTED_TASK_SLOTS,
+    MINERU_API_MAX_SUPPORTED_PENDING_TASKS,
     MINERU_API_OUTPUT_ROOT_POLICY,
     MINERU_API_PROTOCOL_VERSION,
     MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
@@ -43,9 +44,9 @@ EXPECTED_REPO_DIGEST = (
 EXPECTED_IMAGE_ID = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
-EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-capacity-v2"
-EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v3"
-EXPECTED_CAPACITY_POLICY = "process-global-mineru-coordinator.v3"
+EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-capacity-v3"
+EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v4"
+EXPECTED_CAPACITY_POLICY = "process-global-mineru-coordinator.v4"
 EXPECTED_COMPAT_PREIMAGES = {
     "mineru/cli/fast_api.py": (
         "sha256:f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
@@ -83,6 +84,7 @@ API_ENV_KEYS = {
     "MINERU_MALLOC_TRIM",
     "MINERU_PHASE_TRACE",
     "MINERU_API_MAX_CONCURRENT_REQUESTS",
+    "MINERU_API_MAX_PENDING_TASKS",
     "MINERU_PROCESSING_WINDOW_SIZE",
     "MINERU_API_OUTPUT_ROOT",
     "MINERU_API_TASK_RETENTION_SECONDS",
@@ -372,6 +374,8 @@ def _verify_api_compatibility(
         "heap_trim_enabled",
         "phase_trace_enabled",
         "hybrid_batch_ratio_requested",
+        "max_pending_tasks_requested",
+        "max_pending_tasks_effective",
         "pipeline_inference_locks_enabled",
         "image_labels",
     }:
@@ -487,6 +491,8 @@ def build_manifest(
         expected_dockerfile_sha256=expected_compat_dockerfile_sha256,
     )
     task_slots = health.get("max_concurrent_requests")
+    pending_requested = health.get("max_pending_tasks_requested")
+    pending_effective = health.get("max_pending_tasks_effective")
     if (
         health.get("status") != "healthy"
         or health.get("version") != "3.4.4"
@@ -494,6 +500,12 @@ def build_manifest(
         or isinstance(task_slots, bool)
         or not isinstance(task_slots, int)
         or not 1 <= task_slots <= MINERU_API_MAX_SUPPORTED_TASK_SLOTS
+        or isinstance(pending_requested, bool)
+        or not isinstance(pending_requested, int)
+        or isinstance(pending_effective, bool)
+        or not isinstance(pending_effective, int)
+        or pending_requested != pending_effective
+        or not task_slots <= pending_effective <= MINERU_API_MAX_SUPPORTED_PENDING_TASKS
         or health.get("processing_window_size") != MINERU_PROCESSING_WINDOW_SIZE
         or health.get("task_retention_seconds") != MINERU_API_TASK_RETENTION_SECONDS
         or health.get("task_cleanup_interval_seconds")
@@ -617,6 +629,15 @@ def build_manifest(
         raise ValueError("remote API proxy environment drifted")
     if api_environment.get("MINERU_API_MAX_CONCURRENT_REQUESTS") != str(task_slots):
         raise ValueError("remote API environment and health task slots drifted")
+    if api_environment.get("MINERU_API_MAX_PENDING_TASKS") != str(
+        pending_requested
+    ):
+        raise ValueError("remote API environment and health pending depth drifted")
+    if (
+        compatibility.get("max_pending_tasks_requested") != pending_requested
+        or compatibility.get("max_pending_tasks_effective") != pending_effective
+    ):
+        raise ValueError("remote API pending depth compatibility drifted")
     if api_environment.get("MINERU_MALLOC_TRIM") != "1":
         raise ValueError("remote API heap-return switch is not enabled")
     if api_environment.get("MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS") != "1":
@@ -665,6 +686,8 @@ def build_manifest(
             "hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
             "pipeline_inference_locks": MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,
             "task_slots": task_slots,
+            "max_pending_tasks_requested": pending_requested,
+            "max_pending_tasks_effective": pending_effective,
             "vllm_max_num_seqs": 128,
             "vllm_version": served_model.get("vllm_version"),
         }
@@ -728,6 +751,8 @@ def build_manifest(
             "mineru_version": "3.4.4",
             "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
             "max_concurrent_requests": task_slots,
+            "max_pending_tasks_requested": pending_requested,
+            "max_pending_tasks_effective": pending_effective,
             "inference_max_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
             "hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
             "pipeline_inference_locks": MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,

@@ -594,6 +594,7 @@ $baseImageEnvironment = @($baseImageInspect[0].Config.Env)
 $apiAllowedEnvironment = @(
     "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS", "MINERU_API_DISABLE_ACCESS_LOG",
     "MINERU_API_ENABLE_FASTAPI_DOCS", "MINERU_API_MAX_CONCURRENT_REQUESTS",
+    "MINERU_API_MAX_PENDING_TASKS",
     "MINERU_API_OUTPUT_ROOT", "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_CAPACITY_CATALOG_PATH", "MINERU_CAPACITY_CATALOG_SHA256",
     "MINERU_CAPACITY_MODE", "MINERU_CAPACITY_PROFILE_JSON",
@@ -625,6 +626,7 @@ from mineru.utils.model_utils import (
     is_phase_trace_enabled,
 )
 from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
+from mineru.cli.fast_api import get_max_pending_tasks
 
 paths = (
     "mineru/backend/vlm/vlm_analyze.py",
@@ -651,6 +653,8 @@ print(json.dumps({
     ),
     "phase_trace_enabled": is_phase_trace_enabled(),
     "hybrid_batch_ratio_requested": int(os.environ["MINERU_HYBRID_BATCH_RATIO"]),
+    "max_pending_tasks_requested": int(os.environ["MINERU_API_MAX_PENDING_TASKS"]),
+    "max_pending_tasks_effective": get_max_pending_tasks(),
     "pipeline_inference_locks_enabled": PIPELINE_INFERENCE_LOCKS_ENABLED,
     "mineru_version": importlib.metadata.version("mineru"),
     "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),

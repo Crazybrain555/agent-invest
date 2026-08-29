@@ -12,11 +12,15 @@ param(
     [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [switch]$ReuseCurrentPublishedImage,
     [string]$CampaignApiCompatImageId = "",
-    [ValidateRange(1, 3)][int]$ExpectedApiTaskSlots = 1
+    [ValidateRange(1, 3)][int]$ExpectedApiTaskSlots = 1,
+    [ValidateSet(1, 2, 3, 4, 6, 8)][int]$ExpectedApiMaxPendingTasks = 1
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+if ($ExpectedApiMaxPendingTasks -lt $ExpectedApiTaskSlots) {
+    throw "ExpectedApiMaxPendingTasks must be >= ExpectedApiTaskSlots"
+}
 $DockerCommand = (
     Get-Command docker.exe -CommandType Application -ErrorAction Stop |
         Select-Object -First 1 -ExpandProperty Source
@@ -187,10 +191,10 @@ function Invoke-Docker {
 # END MINERU NATIVE PROCESS V1
 
 $ProjectName = "mineru-tailnet"
-$ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v2"
+$ApiCompatImage = "agent-invest/mineru-api:3.4.4-capacity-v3"
 $ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
 $HeapReturnPolicy = "glibc-malloc-trim-per-window.v1"
-$CapacityPolicy = "process-global-mineru-coordinator.v3"
+$CapacityPolicy = "process-global-mineru-coordinator.v4"
 $RequiredComposeTarget = "C:\ProgramData\compose.tailnet.yaml"
 $RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1"
 $RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json"
@@ -792,6 +796,7 @@ function Get-ValidatedRuntime {
 
     Assert-RequiredProperties -Value $health -Names @(
         "status", "version", "protocol_version", "max_concurrent_requests",
+        "max_pending_tasks_requested", "max_pending_tasks_effective",
         "processing_window_size", "task_retention_seconds",
         "task_cleanup_interval_seconds", "queued_tasks", "processing_tasks"
     ) -Label "new MinerU API health"
@@ -800,6 +805,9 @@ function Get-ValidatedRuntime {
         [string]$health.version -ne "3.4.4" -or
         [int]$health.protocol_version -ne 2 -or
         [int]$health.max_concurrent_requests -ne $ExpectedApiTaskSlots -or
+        [int]$health.max_pending_tasks_requested -ne $ExpectedApiMaxPendingTasks -or
+        [int]$health.max_pending_tasks_effective -ne $ExpectedApiMaxPendingTasks -or
+        $ExpectedApiMaxPendingTasks -lt $ExpectedApiTaskSlots -or
         [int]$health.processing_window_size -ne 16 -or
         [int]$health.task_retention_seconds -ne 600 -or
         [int]$health.task_cleanup_interval_seconds -ne 30

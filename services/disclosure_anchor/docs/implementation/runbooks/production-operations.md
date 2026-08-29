@@ -124,7 +124,7 @@ fresh deployment 必须先在 worker/GC 保持 unloaded + persistently disabled 
 
 ```bash
 make mineru-smoke \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v7.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
   RECEIPT=/private/path/mineru-smoke-receipt.v4.json \
   CANARY_CACHE=/private/path/mineru-canary.v2.json
 ```
@@ -205,7 +205,7 @@ ID/StartedAt、collector/node 身份和同一 Docker memory reserve；receipt �
 
 ```bash
 make mineru-campaign-epoch-freeze \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v7.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
   EPOCH_RECEIPT=/private/path/mineru-campaign-epoch-freeze.v1.json \
   SSH_HOST=<pinned-windows-host> SSH_USER=<operator> \
   SSH_IDENTITY=/private/path/operator-key \
@@ -221,7 +221,7 @@ CAMPAIGN_EPOCH_SHA256="$(jq -r '.campaign_epoch.observed_sha256' \
 
 ```bash
 make mineru-staged-load \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v7.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
   CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
   EXPECTED_CORPUS_SHA256=<reviewed-canonical-corpus-sha256> \
   EXPECTED_CAMPAIGN_EPOCH_SHA256="$CAMPAIGN_EPOCH_SHA256" \
@@ -236,7 +236,7 @@ make mineru-staged-load \
 
 # 第一轮完整 PASS 后，用不存在的新路径原样再运行一次：
 make mineru-staged-load \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v7.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
   CORPUS_MANIFEST=/private/path/frozen-real-pdf-corpus.v1.json \
   EXPECTED_CORPUS_SHA256=<same-reviewed-canonical-corpus-sha256> \
   EXPECTED_CAMPAIGN_EPOCH_SHA256="$CAMPAIGN_EPOCH_SHA256" \
@@ -352,7 +352,7 @@ Observation v1，不提高 `WORKER_REPORT_INTERVAL_SECONDS`，也不从 `worker_
 
 ```bash
 make capacity-observe \
-  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v7.json \
+  RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
   DURATION_SECONDS=3600 \
   SSH_HOST=<pinned-host> SSH_USER=<operator-user> \
   SSH_IDENTITY=/private/path/operator-key \

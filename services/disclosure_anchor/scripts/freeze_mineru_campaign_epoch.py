@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_identity = wrapper.get("identity_sha256")
         if (
             not isinstance(manifest, dict)
-            or manifest.get("contract_version") != "mineru-runtime-bundle.v7"
+            or manifest.get("contract_version") != "mineru-runtime-bundle.v8"
             or runtime_identity != canonical_payload_sha256(manifest)
         ):
             raise ValueError("runtime manifest identity is invalid")

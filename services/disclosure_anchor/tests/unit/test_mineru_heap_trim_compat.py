@@ -190,7 +190,18 @@ async def aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn):
 
 
 def _fast_api_fixture() -> str:
-    return '''class AsyncTaskManager:
+    return '''_configured_max_concurrent_requests = 1
+
+
+def get_max_concurrent_requests() -> int:
+    return _configured_max_concurrent_requests
+
+
+def get_task_retention_seconds() -> int:
+    return 0
+
+
+class AsyncTaskManager:
     def __init__(self, fastapi_app: FastAPI):
         self.app = fastapi_app
         self.tasks = {}
@@ -287,6 +298,15 @@ def _fast_api_fixture() -> str:
         await task.release.wait()
         task.status = TASK_COMPLETED
         self._signal_task_event(task.task_id)
+
+
+def health_payload(task_manager):
+    return {
+        "max_concurrent_requests": get_max_concurrent_requests(),
+        "processing_window_size": get_processing_window_size(
+            default=16
+        ),
+    }
 '''
 def _vlm_document_fixture(*, asynchronous: bool) -> str:
     render = (
@@ -522,7 +542,8 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             self.assertEqual(limiter.active, 0)
             self.assertEqual(limiter.semaphore._value, 2)
 
-        asyncio.run(exercise())
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
+            asyncio.run(exercise())
         self.assertIn("async with limiter:", patched)
         self.assertNotIn("async with semaphore:\n            response = await client.post", patched)
 
@@ -587,7 +608,8 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             await same_stage
             same_a.release()
 
-        asyncio.run(exercise())
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
+            asyncio.run(exercise())
 
     def test_cross_page_transport_and_cardinality_fail_visible(self) -> None:
         patched = patch_source(
@@ -658,14 +680,15 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             "TASK_PROCESSING": "processing",
             "TASK_COMPLETED": "completed",
             "TASK_FAILED": "failed",
-            "get_max_concurrent_requests": lambda: 1,
-            "get_task_retention_seconds": lambda: 0,
             "get_task_cleanup_interval_seconds": lambda: 0,
+            "get_processing_window_size": lambda default: default,
             "is_task_terminal": lambda status: status in {"completed", "failed"},
             "utc_now_iso": lambda: "now",
             "logger": LoggerStub(),
+            "os": os,
         }
-        exec(compile(patched, "fast-api.py", "exec"), namespace)
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
+            exec(compile(patched, "fast-api.py", "exec"), namespace)
 
         async def exercise() -> None:
             manager = namespace["AsyncTaskManager"](object())
@@ -684,18 +707,33 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             await manager.submit(first)
             while first.status != "processing":
                 await asyncio.sleep(0)
+            second = task("second")
+            await manager.submit(second)
             with self.assertRaises(HTTPExceptionStub) as full:
-                await manager.submit(task("second"))
+                await manager.submit(task("third"))
             self.assertEqual(full.exception.status_code, 429)
             first.release.set()
+            while second.status != "processing":
+                await asyncio.sleep(0)
+            second.release.set()
             await manager.shutdown()
             self.assertEqual(first.status, "completed")
+            self.assertEqual(second.status, "completed")
             self.assertEqual(manager.queue._unfinished_tasks, 0)
             with self.assertRaises(HTTPExceptionStub) as closed:
-                await manager.submit(task("third"))
+                await manager.submit(task("fourth"))
             self.assertEqual(closed.exception.status_code, 503)
 
-        asyncio.run(exercise())
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
+            asyncio.run(exercise())
+
+        get_pending = namespace["get_max_pending_tasks"]
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "explicitly configured"):
+                get_pending()
+        with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "5"}):
+            with self.assertRaisesRegex(RuntimeError, "one of"):
+                get_pending()
 
     def test_preimages_match_the_reproduced_deployed_344_sources(self) -> None:
         self.assertEqual(
@@ -1778,7 +1816,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("ENV MINERU_PHASE_TRACE=0", dockerfile)
         self.assertIn("ENV MINERU_CAPACITY_MODE=legacy", dockerfile)
         self.assertIn(
-            'io.agent-invest.mineru.capacity-policy="process-global-mineru-coordinator.v3"',
+            'io.agent-invest.mineru.capacity-policy="process-global-mineru-coordinator.v4"',
             dockerfile,
         )
         self.assertIn("COMPAT_PATCHER_SHA256", dockerfile)

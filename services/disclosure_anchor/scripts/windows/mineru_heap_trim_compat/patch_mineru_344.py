@@ -23,7 +23,7 @@ BASE_IMAGE_DIGEST: Final = (
     "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 )
 POLICY: Final = "glibc-malloc-trim-per-window.v1"
-CAPACITY_POLICY: Final = "process-global-mineru-coordinator.v3"
+CAPACITY_POLICY: Final = "process-global-mineru-coordinator.v4"
 SITE_PACKAGES: Final = Path("/usr/local/lib/python3.12/dist-packages")
 MARKER_PATH: Final = Path(
     "/opt/agent-invest/mineru-capacity-v1/compatibility.json"
@@ -218,8 +218,32 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
     if relative_path == "mineru/cli/fast_api.py":
         source = _replace_exact(
             source,
+            "def get_max_concurrent_requests() -> int:\n"
+            "    return _configured_max_concurrent_requests\n\n\n"
+            "def get_task_retention_seconds() -> int:\n",
+            "def get_max_concurrent_requests() -> int:\n"
+            "    return _configured_max_concurrent_requests\n\n\n"
+            "def get_max_pending_tasks() -> int:\n"
+            "    raw = os.getenv(\"MINERU_API_MAX_PENDING_TASKS\")\n"
+            "    if raw not in {\"1\", \"2\", \"3\", \"4\", \"6\", \"8\"}:\n"
+            "        raise RuntimeError(\n"
+            "            \"MINERU_API_MAX_PENDING_TASKS must be explicitly configured \"\n"
+            "            \"to one of {1,2,3,4,6,8}\"\n"
+            "        )\n"
+            "    requested = int(raw)\n"
+            "    if requested < get_max_concurrent_requests():\n"
+            "        raise RuntimeError(\n"
+            "            \"MINERU_API_MAX_PENDING_TASKS must be >= active task slots\"\n"
+            "        )\n"
+            "    return requested\n\n\n"
+            "def get_task_retention_seconds() -> int:\n",
+            count=1,
+            label="FastAPI strict pending admission depth",
+        )
+        source = _replace_exact(
+            source,
             "        self.queue: asyncio.Queue[str] = asyncio.Queue()\n",
-            "        self.max_nonterminal_tasks = get_max_concurrent_requests()\n"
+            "        self.max_nonterminal_tasks = get_max_pending_tasks()\n"
             "        self.queue: asyncio.Queue[str] = asyncio.Queue(\n"
             "            maxsize=self.max_nonterminal_tasks\n"
             "        )\n",
@@ -314,7 +338,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             count=1,
             label="FastAPI queue completion ownership",
         )
-        return _replace_exact(
+        source = _replace_exact(
             source,
             "        except asyncio.CancelledError:\n"
             "            raise\n"
@@ -342,6 +366,17 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "    async def _run_task(self, task: AsyncParseTask) -> None:\n",
             count=1,
             label="FastAPI terminal processor completion",
+        )
+        return _replace_exact(
+            source,
+            "        \"max_concurrent_requests\": get_max_concurrent_requests(),\n"
+            "        \"processing_window_size\": get_processing_window_size(\n",
+            "        \"max_concurrent_requests\": get_max_concurrent_requests(),\n"
+            "        \"max_pending_tasks_requested\": get_max_pending_tasks(),\n"
+            "        \"max_pending_tasks_effective\": task_manager.max_nonterminal_tasks,\n"
+            "        \"processing_window_size\": get_processing_window_size(\n",
+            count=1,
+            label="FastAPI pending depth health identity",
         )
 
     if relative_path == "mineru/utils/model_utils.py":
@@ -2991,7 +3026,7 @@ def apply_patch(
 
     patcher_sha256 = _sha256(Path(__file__).read_bytes())
     marker: dict[str, object] = {
-        "schema": "mineru-runtime-compatibility.v3",
+        "schema": "mineru-runtime-compatibility.v4",
         "policy": POLICY,
         "capacity_policy": CAPACITY_POLICY,
         "mineru_version": MINERU_VERSION,

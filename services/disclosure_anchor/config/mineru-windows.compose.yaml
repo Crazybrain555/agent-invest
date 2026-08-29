@@ -49,7 +49,7 @@ services:
       - inference
 
   mineru-api:
-    image: agent-invest/mineru-api:3.4.4-capacity-v2
+    image: agent-invest/mineru-api:3.4.4-capacity-v3
     pull_policy: never
     container_name: mineru-api
     restart: always
@@ -83,6 +83,9 @@ services:
       # Current 30 GiB Docker Desktop profile.  Slots 2/3 require a distinct
       # attested compose identity and two heterogeneous load receipts.
       MINERU_API_MAX_CONCURRENT_REQUESTS: "1"
+      # Total accepted nonterminal depth is independent from active slots;
+      # legacy remains 1/1 until a larger pair is separately attested.
+      MINERU_API_MAX_PENDING_TASKS: "1"
       MINERU_PROCESSING_WINDOW_SIZE: "16"
       MINERU_API_OUTPUT_ROOT: /var/lib/mineru-api-output
       MINERU_API_TASK_RETENTION_SECONDS: "600"

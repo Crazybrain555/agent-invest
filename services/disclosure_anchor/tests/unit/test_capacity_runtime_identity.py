@@ -64,6 +64,7 @@ class CapacityRuntimeIdentityTests(unittest.TestCase):
             provider_identity_sha256="sha256:" + "6" * 64,
             served_model_id="model",
             max_concurrent_requests=slots,
+            max_pending_tasks=slots,
         )
 
     def test_verified_topology_returns_closed_host_identity(self) -> None:

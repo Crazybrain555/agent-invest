@@ -70,6 +70,8 @@ def _manifest() -> dict[str, object]:
             "mineru_version": "3.4.4",
             "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
             "max_concurrent_requests": MINERU_API_DEFAULT_TASK_SLOTS,
+            "max_pending_tasks_requested": 1,
+            "max_pending_tasks_effective": 1,
             "inference_max_concurrency": MINERU_API_INFERENCE_MAX_CONCURRENCY,
             "hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
             "pipeline_inference_locks": MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED,
@@ -232,7 +234,26 @@ class MinerURuntimeIdentityV6Tests(unittest.TestCase):
             orchestrator = manifest["orchestrator"]
             assert isinstance(orchestrator, dict)
             orchestrator["max_concurrent_requests"] = task_slots
+            orchestrator["max_pending_tasks_requested"] = task_slots
+            orchestrator["max_pending_tasks_effective"] = task_slots
             self.assertEqual(_verify(manifest).max_concurrent_requests, task_slots)
+
+        manifest = _manifest()
+        orchestrator = manifest["orchestrator"]
+        assert isinstance(orchestrator, dict)
+        orchestrator["max_pending_tasks_requested"] = 3
+        orchestrator["max_pending_tasks_effective"] = 3
+        self.assertEqual(_verify(manifest).max_pending_tasks, 3)
+
+        for requested, effective in ((0, 0), (2, 3), (9, 9)):
+            with self.subTest(pending=(requested, effective)):
+                manifest = _manifest()
+                orchestrator = manifest["orchestrator"]
+                assert isinstance(orchestrator, dict)
+                orchestrator["max_pending_tasks_requested"] = requested
+                orchestrator["max_pending_tasks_effective"] = effective
+                with self.assertRaisesRegex(ValueError, "pending task depth"):
+                    _verify(manifest)
 
     def test_orchestrator_expected_window_argument_is_also_fixed(self) -> None:
         manifest = _manifest()

@@ -17,6 +17,6 @@ RUN /usr/bin/python3.12 -I -c "from mineru.cli.fast_api import AsyncTaskManager;
 
 LABEL io.agent-invest.mineru.base-image-digest="sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458" \
       io.agent-invest.mineru.compatibility-policy="glibc-malloc-trim-per-window.v1" \
-      io.agent-invest.mineru.capacity-policy="process-global-mineru-coordinator.v3" \
+      io.agent-invest.mineru.capacity-policy="process-global-mineru-coordinator.v4" \
       io.agent-invest.mineru.compatibility-patcher-sha256="${COMPAT_PATCHER_SHA256}" \
       io.agent-invest.mineru.compatibility-dockerfile-sha256="${COMPAT_DOCKERFILE_SHA256}"

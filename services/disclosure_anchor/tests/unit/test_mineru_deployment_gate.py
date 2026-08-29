@@ -216,6 +216,8 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "mineru_version": "3.4.4",
             "api_protocol_version": 2,
             "max_concurrent_requests": 1,
+            "max_pending_tasks_requested": 1,
+            "max_pending_tasks_effective": 1,
             "inference_max_concurrency": 7,
             "hybrid_batch_ratio": 1,
             "pipeline_inference_locks": True,
@@ -244,7 +246,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "windows_collector_sha256": "sha256:" + "e" * 64,
         }
         manifest = {
-            "contract_version": "mineru-runtime-bundle.v7",
+            "contract_version": "mineru-runtime-bundle.v8",
             "client": {
                 "package_set_sha256": LOCAL_DIGEST,
                 "writer_code_sha256": CODE_DIGEST,
