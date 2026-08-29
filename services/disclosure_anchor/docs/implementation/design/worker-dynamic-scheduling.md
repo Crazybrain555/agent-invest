@@ -326,6 +326,12 @@ maintenance thread                 report writer thread
   `raw_file_hash` 去重累计 source pages；同 identity 页数冲突显式失败。interval 输出携带闭合
   identity/page 条目，跨 interval/host-hour 去重由 telemetry aggregator 完成，不在常驻 worker
   保存无界全量集合；
+- 同一 publish 事务写入 content-free `processing_run_published` outbox evidence（raw source
+  identity、source page count、commit instant）。worker progress 以固定 UTC host-hour 查询 base publish，
+  并联查这些 publish 在任意后续时刻写入的 supplement；因此 report rotation、同一 host-hour 内的
+  worker restart 或跨小时晚到补账都不会重置/漏掉主分子，高频 observer 的查询窗口也不会随进程
+  寿命无界增长。旧事件缺字段时保持 incomplete，并由 resident recovery 校验 canonical envelope 后
+  追加 supplement event，绝不重开或回滚已成功 publish；
 - PostgreSQL QueuePool 不使用 SQLAlchemy 的固定默认 `5+10`。每个 active parse/finalize 在完整
   document producer lease 期间持有一条 session connection，并可能短暂再取一条 transaction
   connection；因此 worker 从当前 `parse_concurrency + finalize_concurrency` 动态派生

@@ -24,7 +24,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.engine import Engine
 
 from disclosure_anchor.application.dto.worker_report import WorkerReport
+from disclosure_anchor.application.contracts.durable_publish_kpi import (
+    replay_durable_publish_kpi,
+)
 from disclosure_anchor.application.worker.queries import (
+    durable_publish_kpi_events,
     worker_progress_database_snapshot,
 )
 from disclosure_anchor.settings import Settings
@@ -554,6 +558,18 @@ def collect_worker_progress(
                 max_build_retries=settings.disclosure_max_build_retries,
                 scope_classes=scope_classes,
             )
+            host_hour_started_at = observed_at.replace(
+                minute=0, second=0, microsecond=0
+            )
+            durable_publish_host_hour = replay_durable_publish_kpi(
+                durable_publish_kpi_events(
+                    connection,
+                    started_at=host_hour_started_at,
+                    finished_at=observed_at,
+                ),
+                started_at=host_hour_started_at,
+                finished_at=observed_at,
+            ).as_dict(boundary="utc_host_hour")
     api_url = getattr(settings, "disclosure_mineru_api_url", None)
     observability_url = getattr(
         settings,
@@ -574,6 +590,7 @@ def collect_worker_progress(
         "sequence": sequence,
         "observed_at": observed_at.isoformat(),
         **database,
+        "durable_publish_host_hour": durable_publish_host_hour,
         "latest_interval": report.as_dict() if report is not None else None,
         "orchestration": _probe_snapshot(
             url=api_health_url,

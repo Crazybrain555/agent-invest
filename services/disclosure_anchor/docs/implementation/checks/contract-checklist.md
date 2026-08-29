@@ -228,6 +228,13 @@ limit 生效
 可从 last_seq 增量拉取
 事件 payload 不含 private details
 事件携带 event_kind（与 outbox 列同名）
+
+`processing_run_published` 的非幂等提交必须在同一事务携带 content-free source identity、source
+page count 与 commit instant；历史缺失只能以 hash-validated supplemental outbox event 补齐，不能
+从 Unit 数量、页码覆盖或内容猜值。
+两种事件均通过现有开放 `change_event.v1` feed 原样暴露；字段是 additive、content-free，consumer
+必须按 `event_kind` 选择自己理解的事件，未知种类不得推断业务变化。0052 的两个 partial index 只
+约束 worker progress 的 host-hour base lookup 与 late supplement join，不改变 feed 顺序或内容。
 事件携带 change_kind，取值仅 observed / materialized（历史事件默认 materialized）
 at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果；“无重复事件”指 feed 内 seq 不重复）
 同一 subject（document / asset）内事件保序

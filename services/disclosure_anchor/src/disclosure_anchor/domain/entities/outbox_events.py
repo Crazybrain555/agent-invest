@@ -210,6 +210,9 @@ def processing_run_published(
     projection_changed_count: int,
     occurred_at: datetime,
     allow_empty_reason: str | None = None,
+    source_identity: str,
+    source_page_count: int,
+    publish_committed_at: datetime,
 ) -> OutboxEvent:
     payload: dict[str, Any] = {
         "previous_processing_run_id": previous_processing_run_id,
@@ -219,6 +222,9 @@ def processing_run_published(
         "created_count": created_count,
         "removed_count": removed_count,
         "projection_changed_count": projection_changed_count,
+        "source_identity": source_identity,
+        "source_page_count": source_page_count,
+        "publish_committed_at": publish_committed_at.isoformat(),
     }
     if allow_empty_reason is not None:
         payload["allow_empty_reason"] = allow_empty_reason
@@ -231,5 +237,31 @@ def processing_run_published(
         document_id=document_id,
         processing_run_id=processing_run_id,
         payload=payload,
+        occurred_at=occurred_at,
+    )
+
+
+def processing_run_publish_evidence_backfilled(
+    *,
+    document_id: str,
+    processing_run_id: str,
+    source_identity: str,
+    source_page_count: int,
+    publish_committed_at: datetime,
+    occurred_at: datetime,
+) -> OutboxEvent:
+    return OutboxEvent(
+        event_id=ids.new_outbox_event_id(),
+        event_kind="processing_run_publish_evidence_backfilled",
+        change_kind="observed",
+        subject_kind="processing_run",
+        subject_ref=processing_run_id,
+        document_id=document_id,
+        processing_run_id=processing_run_id,
+        payload={
+            "source_identity": source_identity,
+            "source_page_count": source_page_count,
+            "publish_committed_at": publish_committed_at.isoformat(),
+        },
         occurred_at=occurred_at,
     )

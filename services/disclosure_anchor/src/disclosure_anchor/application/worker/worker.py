@@ -93,6 +93,7 @@ from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-expo
     stable_document_hash,
 )
 from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
     DisclosureAnchorError,
@@ -1402,8 +1403,19 @@ def _publish_one_document(
         outcome.superseded_run = publish_result.superseded_run_id is not None
         outcome.published_idempotent = publish_result.idempotent is True
         if not outcome.published_idempotent:
-            source_pages = source_page_count
-            recovered_identity = source_identity
+            committed_pages = getattr(publish_result, "source_page_count", None)
+            committed_identity = getattr(publish_result, "source_identity", None)
+            source_pages = (
+                committed_pages
+                if isinstance(committed_pages, int)
+                and not isinstance(committed_pages, bool)
+                else source_page_count
+            )
+            recovered_identity = (
+                committed_identity
+                if isinstance(committed_identity, str)
+                else source_identity
+            )
             if source_pages is None or recovered_identity is None:
                 recovered = _published_source_evidence(
                     deps,
@@ -1762,6 +1774,12 @@ def run_resident_parse(
                 )
             if publish_recovery_limit > 0 and not should_stop():
                 _publish_stage(
+                    recovery_report,
+                    deps,
+                    limit=publish_recovery_limit,
+                    should_stop=should_stop,
+                )
+                _backfill_publish_kpi(
                     recovery_report,
                     deps,
                     limit=publish_recovery_limit,
@@ -2769,6 +2787,40 @@ def _publish_stage(
         _fold_outcome(report, outcome)
         if publish_failures_indicate_outage(report.failures):
             return
+
+
+def _backfill_publish_kpi(
+    report: WorkerReport,
+    deps: WorkerDeps,
+    *,
+    limit: int,
+    should_stop: Callable[[], bool],
+) -> None:
+    """Append missing historical publish evidence without reopening publish."""
+
+    with deps.engine.connect() as conn:
+        pending = queries.pending_publish_kpi_backfill(conn, limit=limit)
+    for row in pending:
+        if should_stop():
+            return
+        run_id = str(row["processing_run_id"])
+        evidence = _published_source_evidence(deps, processing_run_id=run_id)
+        if evidence is None:
+            report.durable_published_page_count_incomplete += 1
+            continue
+        identity, pages = evidence
+        with deps.uow_factory() as uow:
+            uow.outbox.add(
+                outbox_events.processing_run_publish_evidence_backfilled(
+                    document_id=str(row["document_id"]),
+                    processing_run_id=run_id,
+                    source_identity=identity,
+                    source_page_count=pages,
+                    publish_committed_at=row["publish_committed_at"],
+                    occurred_at=deps.clock(),
+                )
+            )
+            uow.commit()
 
 
 def _project_stage(

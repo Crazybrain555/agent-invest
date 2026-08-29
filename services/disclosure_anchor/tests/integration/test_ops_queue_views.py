@@ -312,6 +312,99 @@ class OpsQueueViewTests(unittest.TestCase):
             rows = queries.pending_publish(conn, limit=500000)
         self.assertIn(run_id, [row["processing_run_id"] for row in rows])
 
+    def test_durable_publish_kpi_query_and_backfill_selection(self) -> None:
+        now = datetime.now(timezone.utc)
+        identity = "sha256:" + "a" * 64
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                document_id = self._insert_document(conn, status="published")
+                run_id = self._insert_run(
+                    conn,
+                    document_id,
+                    status="succeeded",
+                    unit_build_status="succeeded",
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_ops.outbox_event "
+                        "(event_id, event_kind, change_kind, subject_kind, "
+                        " subject_ref, document_id, processing_run_id, payload, "
+                        " occurred_at) VALUES "
+                        "(:event_id, 'processing_run_published', 'materialized', "
+                        " 'processing_run', :run_id, :document_id, :run_id, "
+                        " '{}'::jsonb, :occurred_at)"
+                    ),
+                    {
+                        "event_id": ids.new_outbox_event_id(),
+                        "run_id": run_id,
+                        "document_id": document_id,
+                        "occurred_at": now,
+                    },
+                )
+                pending = queries.pending_publish_kpi_backfill(conn, limit=10)
+                self.assertEqual(
+                    [row["processing_run_id"] for row in pending], [run_id]
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO disclosure_ops.outbox_event "
+                        "(event_id, event_kind, change_kind, subject_kind, "
+                        " subject_ref, document_id, processing_run_id, payload, "
+                        " occurred_at) VALUES "
+                        "(:event_id, "
+                        " 'processing_run_publish_evidence_backfilled', "
+                        " 'observed', 'processing_run', :run_id, :document_id, "
+                        " :run_id, CAST(:payload AS jsonb), :occurred_at)"
+                    ),
+                    {
+                        "event_id": ids.new_outbox_event_id(),
+                        "run_id": run_id,
+                        "document_id": document_id,
+                        "payload": json.dumps(
+                            {
+                                "source_identity": identity,
+                                "source_page_count": 42,
+                                "publish_committed_at": now.isoformat(),
+                            }
+                        ),
+                        "occurred_at": now + timedelta(hours=3),
+                    },
+                )
+                self.assertEqual(
+                    queries.pending_publish_kpi_backfill(conn, limit=10), []
+                )
+                events = queries.durable_publish_kpi_events(
+                    conn,
+                    started_at=now - timedelta(seconds=1),
+                    finished_at=now + timedelta(seconds=1),
+                )
+                self.assertEqual(
+                    [row["event_kind"] for row in events],
+                    [
+                        "processing_run_published",
+                        "processing_run_publish_evidence_backfilled",
+                    ],
+                )
+                public_supplement = conn.execute(
+                    text(
+                        "SELECT contract_version, payload "
+                        "FROM disclosure_public.change_events_v1 "
+                        "WHERE event_kind = "
+                        "'processing_run_publish_evidence_backfilled' "
+                        "AND processing_run_id = :run_id"
+                    ),
+                    {"run_id": run_id},
+                ).mappings().one()
+                self.assertEqual(
+                    public_supplement["contract_version"], "change_event.v1"
+                )
+                self.assertEqual(
+                    public_supplement["payload"]["source_identity"], identity
+                )
+            finally:
+                trans.rollback()
+
     def test_later_success_remediates_old_build_failure_without_hiding_new_one(
         self,
     ) -> None:

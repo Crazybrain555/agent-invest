@@ -180,6 +180,81 @@ class SyncWindowStartTests(unittest.TestCase):
 
 
 class RunOnceSchedulingTests(unittest.TestCase):
+    def test_publish_kpi_backfill_appends_verified_supplement(self) -> None:
+        deps = _deps()
+        uow = mock.MagicMock()
+        uow.__enter__.return_value = uow
+        object.__setattr__(deps, "uow_factory", lambda: uow)
+        report = worker_module.WorkerReport(started_at=deps.clock())
+        identity = "sha256:" + "a" * 64
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_publish_kpi_backfill",
+                return_value=[
+                    {
+                        "processing_run_id": "run_1",
+                        "document_id": "doc_1",
+                        "publish_committed_at": deps.clock(),
+                    }
+                ],
+            ),
+            mock.patch.object(
+                worker_module,
+                "_published_source_evidence",
+                return_value=(identity, 42),
+            ),
+        ):
+            worker_module._backfill_publish_kpi(
+                report,
+                deps,
+                limit=1,
+                should_stop=lambda: False,
+            )
+
+        event = uow.outbox.add.call_args.args[0]
+        self.assertEqual(
+            event.event_kind, "processing_run_publish_evidence_backfilled"
+        )
+        self.assertEqual(event.payload["source_identity"], identity)
+        self.assertEqual(event.payload["source_page_count"], 42)
+        uow.commit.assert_called_once_with()
+
+    def test_publish_kpi_backfill_keeps_missing_artifact_visible(self) -> None:
+        deps = _deps()
+        uow = mock.MagicMock()
+        uow.__enter__.return_value = uow
+        object.__setattr__(deps, "uow_factory", lambda: uow)
+        report = worker_module.WorkerReport(started_at=deps.clock())
+        with (
+            mock.patch.object(
+                worker_module.queries,
+                "pending_publish_kpi_backfill",
+                return_value=[
+                    {
+                        "processing_run_id": "run_1",
+                        "document_id": "doc_1",
+                        "publish_committed_at": deps.clock(),
+                    }
+                ],
+            ),
+            mock.patch.object(
+                worker_module,
+                "_published_source_evidence",
+                return_value=None,
+            ),
+        ):
+            worker_module._backfill_publish_kpi(
+                report,
+                deps,
+                limit=1,
+                should_stop=lambda: False,
+            )
+
+        self.assertEqual(report.durable_published_page_count_incomplete, 1)
+        uow.outbox.add.assert_not_called()
+        uow.commit.assert_not_called()
+
     def test_remote_parser_5xx_closes_parse_refill(self) -> None:
         failure = WorkerFailure(
             stage="parse",
@@ -1928,6 +2003,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ),
             mock.patch.object(worker_module, "_build_stage"),
             mock.patch.object(worker_module, "_publish_stage"),
+            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             thread = threading.Thread(
                 target=worker_module.run_resident_parse,
@@ -2005,6 +2081,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(
                 worker_module, "_publish_stage", side_effect=publish_stage
             ) as publish_mock,
+            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             worker_module.run_resident_parse(
                 deps,
@@ -2065,6 +2142,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 worker_module, "_build_stage", side_effect=recovery_build
             ),
             mock.patch.object(worker_module, "_publish_stage"),
+            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             worker_module.run_resident_parse(
                 deps,
@@ -2116,6 +2194,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 side_effect=recovery_pool_timeout,
             ),
             mock.patch.object(worker_module, "_publish_stage"),
+            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             worker_module.run_resident_parse(
                 deps,

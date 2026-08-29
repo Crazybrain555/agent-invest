@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from disclosure_anchor.application.contracts.provider_document_admission import (
+    AdmittedProviderDocument,
     ProviderDocumentAdmissionError,
 )
 from disclosure_anchor.application.contracts.provider_unit import (
@@ -76,6 +77,9 @@ class PublishRunResult:
     # in-service source of search-projection orphans, so the worker uses
     # this as the per-round "orphans may exist" signal for prune gating.
     superseded_run_id: str | None = None
+    source_identity: str | None = None
+    source_page_count: int | None = None
+    publish_committed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,7 @@ class ProviderDocumentPublicationGuard:
         artifact_owner: e.ProcessingRun,
         security_code: str,
         units: list[e.DocumentUnit],
-    ) -> None:
+    ) -> AdmittedProviderDocument:
         if (
             run.provider_document_relpath is None
             or run.normalized_ir_relpath is not None
@@ -268,6 +272,7 @@ class ProviderDocumentPublicationGuard:
                 run=run,
                 document=document,
             )
+        return admitted
 
     @staticmethod
     def _validate_unit(
@@ -402,7 +407,7 @@ class PublishRun:
                 new_units = uow.document_units.list_by_processing_run(
                     run.processing_run_id
                 )
-                self._publication_guard(
+                admitted = self._publication_guard(
                     run=run,
                     document=document,
                     artifact_owner=artifact_owner,
@@ -526,6 +531,9 @@ class PublishRun:
                     removed_count=len(diff.removed),
                     projection_changed_count=len(diff.projection_changed),
                     allow_empty_reason=command.reason if command.allow_empty else None,
+                    source_identity=admitted.envelope.input_raw_file_hash,
+                    source_page_count=admitted.envelope.source_pdf_page_count,
+                    publish_committed_at=now,
                     occurred_at=now,
                 )
             )
@@ -540,6 +548,9 @@ class PublishRun:
                 superseded_run_id=(
                     old_run.processing_run_id if old_run is not None else None
                 ),
+                source_identity=admitted.envelope.input_raw_file_hash,
+                source_page_count=admitted.envelope.source_pdf_page_count,
+                publish_committed_at=now,
             )
 
 

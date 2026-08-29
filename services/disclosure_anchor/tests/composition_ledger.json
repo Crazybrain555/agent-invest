@@ -38,7 +38,7 @@
   },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 28
   },
   "tests/integration/test_outbox_commit_order.py": {
    "private_imports": [],
@@ -194,6 +194,10 @@
   "tests/unit/test_download_document.py": {
    "private_imports": [],
    "tests": 10
+  },
+  "tests/unit/test_durable_publish_kpi.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_fetch_research_watchlist_inputs.py": {
    "private_imports": [],
@@ -472,7 +476,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 69
+   "tests": 71
   }
  },
  "schema": "test-composition-ledger.v1"

@@ -7,7 +7,7 @@ module writes business state except the pinned stale-run reclaim UPDATE.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -884,6 +884,70 @@ def pending_finalize_pressure(
         "estimated_source_bytes": int(row["estimated_source_bytes"] or 0),
         "unknown_source_bytes": int(row["unknown_source_bytes"] or 0),
     }
+
+
+def durable_publish_kpi_events(
+    conn: Connection,
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        text(
+            f"""
+            WITH target_publish AS (
+                SELECT seq, event_kind, processing_run_id, payload, occurred_at
+                  FROM {OPS_SCHEMA}.outbox_event
+                 WHERE event_kind = 'processing_run_published'
+                   AND occurred_at >= :started_at
+                   AND occurred_at < :finished_at
+            ), evidence AS (
+                SELECT seq, event_kind, processing_run_id, payload, occurred_at
+                  FROM target_publish
+                UNION ALL
+                SELECT supplement.seq, supplement.event_kind,
+                       supplement.processing_run_id, supplement.payload,
+                       supplement.occurred_at
+                  FROM {OPS_SCHEMA}.outbox_event supplement
+                  JOIN target_publish base
+                    ON base.processing_run_id = supplement.processing_run_id
+                 WHERE supplement.event_kind =
+                       'processing_run_publish_evidence_backfilled'
+            )
+            SELECT event_kind, processing_run_id, payload, occurred_at
+              FROM evidence
+             ORDER BY seq
+            """
+        ),
+        {"started_at": started_at, "finished_at": finished_at},
+    ).mappings()
+    return [dict(row) for row in rows]
+
+
+def pending_publish_kpi_backfill(conn: Connection, *, limit: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        text(
+            f"""
+            SELECT base.processing_run_id, base.document_id,
+                   base.occurred_at AS publish_committed_at
+              FROM {OPS_SCHEMA}.outbox_event base
+             WHERE base.event_kind = 'processing_run_published'
+               AND base.processing_run_id IS NOT NULL
+               AND base.document_id IS NOT NULL
+               AND NOT (base.payload ? 'source_identity'
+                        AND base.payload ? 'source_page_count')
+               AND NOT EXISTS (
+                   SELECT 1 FROM {OPS_SCHEMA}.outbox_event supplement
+                    WHERE supplement.event_kind =
+                          'processing_run_publish_evidence_backfilled'
+                      AND supplement.processing_run_id = base.processing_run_id)
+             ORDER BY base.seq
+             LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    ).mappings()
+    return [dict(row) for row in rows]
 
 
 def retrying_build_count(conn: Connection, *, max_retries: int) -> int:

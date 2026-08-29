@@ -163,8 +163,10 @@ def _sync_run_hashes(uow: FakeUnitOfWork, run_id: str) -> None:
     )
 
 
-def _allow_provider_units(**_kwargs: object) -> None:
+def _allow_provider_units(**_kwargs: object) -> AdmittedProviderDocument:
     """Unit tests below isolate publish semantics from artifact I/O."""
+
+    return _admitted(_representative_document())
 
 
 def _publisher(
@@ -419,6 +421,23 @@ class PublishRunTests(unittest.TestCase):
         self.assertEqual(events[0].subject_kind, "document_unit")
         self.assertEqual(events[-1].subject_kind, "processing_run")
         self.assertEqual(events[-1].payload["created_count"], 2)
+        admitted = _admitted(_representative_document())
+        self.assertEqual(
+            events[-1].payload["source_identity"],
+            admitted.envelope.input_raw_file_hash,
+        )
+        self.assertEqual(
+            events[-1].payload["source_page_count"],
+            admitted.envelope.source_pdf_page_count,
+        )
+        self.assertEqual(
+            events[-1].payload["publish_committed_at"],
+            events[-1].occurred_at.isoformat(),
+        )
+        self.assertEqual(result.source_identity, admitted.envelope.input_raw_file_hash)
+        self.assertEqual(
+            result.source_page_count, admitted.envelope.source_pdf_page_count
+        )
 
     def test_idempotent_publish_writes_no_events(self) -> None:
         uow = _uow_with_document()
