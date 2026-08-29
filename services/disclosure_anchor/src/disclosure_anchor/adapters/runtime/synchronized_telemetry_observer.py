@@ -6,7 +6,7 @@ host collectors are injected; no runtime service, database or worker is touched.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 import hashlib
@@ -24,20 +24,20 @@ import uuid
 import disclosure_anchor.application.contracts.synchronized_telemetry as contract_module
 import disclosure_anchor.application.ports.synchronized_telemetry as port_module
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
-    ApiProcessObservation,
-    GpuObservation,
-    HostCgroupObservation,
-    QueueVllmObservation,
+    ApiProcessObservationV2,
+    GpuObservationV2,
+    HostCgroupObservationV2,
+    QueueVllmObservationV2,
     SampleClock,
     SampleQuality,
-    SynchronizedTelemetryFrame,
-    SynchronizedTelemetryReceipt,
-    TelemetryArtifacts,
+    SynchronizedTelemetryFrameV2,
+    SynchronizedTelemetryReceiptV2,
+    SynchronizedTelemetrySealV2,
+    TelemetryArtifactsV2,
     canonical_jsonl_artifact_sha256,
     derive_frame_evidence,
     parse_canonical_json_artifact,
     parse_canonical_jsonl_artifact,
-    validate_frame_sequence,
 )
 from disclosure_anchor.application.ports.synchronized_telemetry import (
     GpuLaneSnapshot,
@@ -45,6 +45,9 @@ from disclosure_anchor.application.ports.synchronized_telemetry import (
     HostLaneSnapshot,
     HostTelemetrySamplerPort,
     TelemetrySampleIdentity,
+    TelemetrySnapshotDeadline,
+    TelemetrySnapshotDeadlineExceeded,
+    TelemetrySnapshotTransportUnavailable,
 )
 
 
@@ -52,8 +55,9 @@ MAX_FRAME_RECORDS = 1_000_000
 MAX_FRAME_FILE_BYTES = 256 * 1024 * 1024
 MAX_FRAME_RECORD_BYTES = 256 * 1024
 MAX_RECEIPT_BYTES = 1024 * 1024
-FRAME_FILENAME = "frames.v1.jsonl"
-RECEIPT_FILENAME = "receipt.v1.json"
+FRAME_FILENAME = "frames.v2.jsonl"
+RECEIPT_FILENAME = "receipt.v2.json"
+SEAL_FILENAME = "seal.v2.json"
 
 
 class ObserverState(str, Enum):
@@ -95,8 +99,15 @@ class SynchronizedObserverLimits:
 class SynchronizedObserverResult:
     state: Literal[ObserverState.SEALED]
     run_directory: Path
-    receipt: SynchronizedTelemetryReceipt
-    frames: tuple[SynchronizedTelemetryFrame, ...]
+    receipt: SynchronizedTelemetryReceiptV2
+    seal: SynchronizedTelemetrySealV2
+    frames: tuple[SynchronizedTelemetryFrameV2, ...]
+
+    @property
+    def evidence_status(self) -> contract_module.RunStatus:
+        """Authoritative final status, including observer-overhead attestation."""
+
+        return self.seal.status
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,10 +117,10 @@ class _PendingSample:
     started_monotonic_ns: int
     finished_monotonic_ns: int
     observed_at_utc: datetime
-    gpu: GpuObservation
-    api_process: ApiProcessObservation
-    host_cgroup: HostCgroupObservation
-    queue_vllm: QueueVllmObservation
+    gpu: GpuObservationV2
+    api_process: ApiProcessObservationV2
+    host_cgroup: HostCgroupObservationV2
+    queue_vllm: QueueVllmObservationV2
 
 
 @dataclass(slots=True)
@@ -117,6 +128,10 @@ class _Mailbox:
     values: queue.Queue[_PendingSample]
     done: threading.Event
     fallback: _PendingSample | None = None
+    started: threading.Event = field(default_factory=threading.Event)
+    watermark_monotonic_ns: int = -1
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    failure: BaseException | None = None
 
 
 class _Termination:
@@ -141,6 +156,26 @@ class _Termination:
     def value(self) -> str:
         with self._lock:
             return self._value
+
+
+class _SafetyDrifts:
+    def __init__(self) -> None:
+        self._values: set[contract_module.SafetyDriftReason] = set()
+        self._lock = threading.Lock()
+
+    def add(self, value: contract_module.SafetyDriftReason) -> None:
+        with self._lock:
+            self._values.add(value)
+
+    def values(self) -> tuple[contract_module.SafetyDriftReason, ...]:
+        with self._lock:
+            return tuple(sorted(self._values))
+
+
+@dataclass(slots=True)
+class _CounterTracker:
+    previous: dict[str, int] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class _FrameWriter:
@@ -187,7 +222,7 @@ class _FrameWriter:
         self._frames_closed = False
         self._closed = False
 
-    def append(self, frame: SynchronizedTelemetryFrame) -> None:
+    def append(self, frame: SynchronizedTelemetryFrameV2) -> None:
         if self._frames_closed:
             raise SynchronizedTelemetryEvidenceError("telemetry frame stream is closed")
         if self._frames_fd is None:
@@ -221,7 +256,7 @@ class _FrameWriter:
         os.fsync(self._run_fd)
         return "sha256:" + self._frame_hash.hexdigest()
 
-    def write_receipt(self, receipt: SynchronizedTelemetryReceipt) -> None:
+    def write_receipt(self, receipt: SynchronizedTelemetryReceiptV2) -> bytes:
         if not self._frames_closed:
             raise SynchronizedTelemetryEvidenceError(
                 "telemetry receipt cannot precede the frame seal"
@@ -234,6 +269,29 @@ class _FrameWriter:
         if len(payload) > self._limits.maximum_receipt_bytes:
             raise _ArtifactBoundExceeded("telemetry receipt exceeds its bound")
         descriptor = _open_new_private_at(self._run_fd, RECEIPT_FILENAME)
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(self._run_fd)
+        os.fsync(self._root_fd)
+        return payload
+
+    def replay_unsealed(
+        self,
+    ) -> tuple[tuple[SynchronizedTelemetryFrameV2, ...], SynchronizedTelemetryReceiptV2]:
+        if self._run_fd is None:
+            raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
+        return _replay_artifacts_at(self._run_fd, expect_seal=False)[:2]
+
+    def write_seal(self, seal: SynchronizedTelemetrySealV2) -> None:
+        if self._run_fd is None or self._root_fd is None:
+            raise SynchronizedTelemetryEvidenceError("telemetry seal descriptors are unavailable")
+        payload = _canonical_json_bytes(seal.model_dump(mode="json"))
+        if len(payload) > self._limits.maximum_receipt_bytes:
+            raise _ArtifactBoundExceeded("telemetry seal exceeds its bound")
+        descriptor = _open_new_private_at(self._run_fd, SEAL_FILENAME)
         try:
             _write_all(descriptor, payload)
             os.fsync(descriptor)
@@ -332,6 +390,8 @@ def run_synchronized_telemetry_observer(
     internal_stop = threading.Event()
     external_cancel = cancel_event or threading.Event()
     termination = _Termination()
+    safety_drifts = _SafetyDrifts()
+    counter_tracker = _CounterTracker()
     condition = threading.Condition()
     mailboxes = {
         "gpu_fast": _Mailbox(
@@ -373,7 +433,7 @@ def run_synchronized_telemetry_observer(
             kwargs={
                 "lane": "gpu_fast",
                 "interval_ns": gpu_interval_ms * 1_000_000,
-                "sampler": gpu_sampler.sample,
+                "sampler": gpu_sampler.snapshot,
                 "mailbox": mailboxes["gpu_fast"],
                 "condition": condition,
                 "expected_identity": expected_identity,
@@ -386,6 +446,8 @@ def run_synchronized_telemetry_observer(
                 "external_cancel": external_cancel,
                 "internal_stop": internal_stop,
                 "termination": termination,
+                "safety_drifts": safety_drifts,
+                "counter_tracker": counter_tracker,
                 "monotonic_ns": monotonic_ns,
                 "utc_now": utc_now,
             },
@@ -397,7 +459,7 @@ def run_synchronized_telemetry_observer(
             kwargs={
                 "lane": "host_slow",
                 "interval_ns": 1_000_000_000,
-                "sampler": host_sampler.sample,
+                "sampler": host_sampler.snapshot,
                 "mailbox": mailboxes["host_slow"],
                 "condition": condition,
                 "expected_identity": expected_identity,
@@ -410,6 +472,8 @@ def run_synchronized_telemetry_observer(
                 "external_cancel": external_cancel,
                 "internal_stop": internal_stop,
                 "termination": termination,
+                "safety_drifts": safety_drifts,
+                "counter_tracker": counter_tracker,
                 "monotonic_ns": monotonic_ns,
                 "utc_now": utc_now,
             },
@@ -417,7 +481,7 @@ def run_synchronized_telemetry_observer(
             daemon=False,
         ),
     ]
-    frames: list[SynchronizedTelemetryFrame] = []
+    frames: list[SynchronizedTelemetryFrameV2] = []
     state = ObserverState.RUNNING
     started_threads: list[threading.Thread] = []
     try:
@@ -445,11 +509,10 @@ def run_synchronized_telemetry_observer(
         )
         finish_wall = utc_now()
         _require_utc(finish_wall)
-        process_cpu_finished = process_cpu_ns()
         frame_digest = writer.close_frames()
         frame_tuple = tuple(frames)
         lane_quality, unsupported_count = derive_frame_evidence(
-            frame_tuple,
+            cast(tuple[contract_module.SynchronizedTelemetryFrame, ...], frame_tuple),
             started_monotonic_ns=start_monotonic,
             finished_monotonic_ns=finish_monotonic,
         )
@@ -474,9 +537,6 @@ def run_synchronized_telemetry_observer(
             "status": (
                 "unsafe"
                 if termination_reason == "identity_drift"
-                or (process_cpu_finished - process_cpu_started)
-                / monotonic_elapsed_ns
-                > 0.02
                 else "incomplete"
                 if termination_reason != "duration_elapsed"
                 or unsupported_count > 0
@@ -490,29 +550,43 @@ def run_synchronized_telemetry_observer(
             ),
             "lane_quality": lane_quality,
             "termination_reason": termination_reason,
-            "observer_process_cpu_started_ns": process_cpu_started,
-            "observer_process_cpu_finished_ns": process_cpu_finished,
-            "observer_cpu_ns": process_cpu_finished - process_cpu_started,
             "observed_clock_divergence_ns": clock_divergence_ns,
-            "epoch_changed": termination_reason == "identity_drift",
+            "epoch_changed": "epoch_drift" in safety_drifts.values(),
+            "safety_drift_reasons": safety_drifts.values(),
             "unsupported_observation_count": unsupported_count,
-            "safety_margin": None,
-            "artifacts": TelemetryArtifacts(
-                frames_sha256=frame_digest,
-                progress_events_sha256=None,
-                vector_events_sha256=None,
+            "artifacts": TelemetryArtifactsV2(
+                frames_jsonl_sha256=frame_digest,
             ),
         }
-        receipt = SynchronizedTelemetryReceipt.model_validate(receipt_payload)
-        validate_frame_sequence(frame_tuple, receipt=receipt)
-        writer.write_receipt(receipt)
-        state = ObserverState.SEALED
-        return SynchronizedObserverResult(
-            state=ObserverState.SEALED,
-            run_directory=writer.run_directory,
-            receipt=receipt,
-            frames=frame_tuple,
+        receipt = SynchronizedTelemetryReceiptV2.model_validate(receipt_payload)
+        validate_synchronized_telemetry_v2(frame_tuple, receipt=receipt)
+        receipt_bytes = writer.write_receipt(receipt)
+        replay_frames, replay_receipt = writer.replay_unsealed()
+        if replay_frames != frame_tuple or replay_receipt != receipt:
+            raise SynchronizedTelemetryEvidenceError("mandatory pre-seal replay drifted")
+        process_cpu_finished = process_cpu_ns()
+        seal = SynchronizedTelemetrySealV2(
+            run_id=resolved_run_id,
+            receipt_sha256="sha256:" + hashlib.sha256(receipt_bytes).hexdigest(),
+            frames_jsonl_sha256=frame_digest,
+            observer_process_cpu_started_ns=process_cpu_started,
+            observer_process_cpu_finished_ns=process_cpu_finished,
+            observer_cpu_ns=process_cpu_finished - process_cpu_started,
+            attested_elapsed_ns=monotonic_elapsed_ns,
+            receipt_status=receipt.status,
+            status=(
+                "unsafe"
+                if receipt.status == "unsafe"
+                or (process_cpu_finished - process_cpu_started) / monotonic_elapsed_ns > 0.02
+                else receipt.status
+            ),
         )
+        writer.write_seal(seal)
+        replay = verify_synchronized_telemetry_observer(
+            artifact_root=artifact_root, run_id=resolved_run_id
+        )
+        state = ObserverState.SEALED
+        return replay
     except BaseException as exc:
         state = ObserverState.FAILED_EVIDENCE
         internal_stop.set()
@@ -543,23 +617,39 @@ def verify_synchronized_telemetry_observer(
         )
         try:
             _validate_private_directory_fd(run_fd, label="telemetry run")
-            names = sorted(os.listdir(run_fd))
-            if names != [FRAME_FILENAME, RECEIPT_FILENAME]:
-                raise ValueError("telemetry run artifacts are incomplete or unexpected")
-            frames_payload = _read_private_file_at(
-                run_fd,
-                FRAME_FILENAME,
-                maximum_bytes=MAX_FRAME_FILE_BYTES,
-            )
-            receipt_payload = _read_private_file_at(
-                run_fd,
-                RECEIPT_FILENAME,
-                maximum_bytes=MAX_RECEIPT_BYTES,
-            )
+            frames, receipt, seal = _replay_artifacts_at(run_fd, expect_seal=True)
         finally:
             os.close(run_fd)
     finally:
         os.close(root_fd)
+    if receipt.run_id != run_id:
+        raise ValueError("telemetry receipt run identity drifted")
+    if receipt.observer_source_sha256 != synchronized_observer_source_sha256():
+        raise ValueError("telemetry observer source identity drifted")
+    assert seal is not None
+    return SynchronizedObserverResult(
+        state=ObserverState.SEALED,
+        run_directory=artifact_root / run_id,
+        receipt=receipt,
+        seal=seal,
+        frames=frames,
+    )
+
+
+def _replay_artifacts_at(
+    run_fd: int, *, expect_seal: bool
+) -> tuple[
+    tuple[SynchronizedTelemetryFrameV2, ...],
+    SynchronizedTelemetryReceiptV2,
+    SynchronizedTelemetrySealV2 | None,
+]:
+    expected = [FRAME_FILENAME, RECEIPT_FILENAME]
+    if expect_seal:
+        expected.append(SEAL_FILENAME)
+    if sorted(os.listdir(run_fd)) != sorted(expected):
+        raise ValueError("telemetry run artifacts are incomplete or unexpected")
+    frames_payload = _read_private_file_at(run_fd, FRAME_FILENAME, maximum_bytes=MAX_FRAME_FILE_BYTES)
+    receipt_payload = _read_private_file_at(run_fd, RECEIPT_FILENAME, maximum_bytes=MAX_RECEIPT_BYTES)
     frame_values = parse_canonical_jsonl_artifact(
         frames_payload,
         label="frames",
@@ -567,38 +657,82 @@ def verify_synchronized_telemetry_observer(
         maximum_record_bytes=MAX_FRAME_RECORD_BYTES,
         maximum_records=MAX_FRAME_RECORDS,
     )
-    frames = tuple(
-        SynchronizedTelemetryFrame.model_validate(value) for value in frame_values
+    frames = tuple(SynchronizedTelemetryFrameV2.model_validate(value) for value in frame_values)
+    receipt = SynchronizedTelemetryReceiptV2.model_validate(
+        parse_canonical_json_artifact(receipt_payload, label="receipt", maximum_bytes=MAX_RECEIPT_BYTES)
     )
-    receipt_value = parse_canonical_json_artifact(
-        receipt_payload,
-        label="receipt",
-        maximum_bytes=MAX_RECEIPT_BYTES,
-    )
-    receipt = SynchronizedTelemetryReceipt.model_validate(receipt_value)
-    if receipt.run_id != run_id:
-        raise ValueError("telemetry receipt run identity drifted")
-    if receipt.observer_source_sha256 != synchronized_observer_source_sha256():
-        raise ValueError("telemetry observer source identity drifted")
-    observed_frames_hash = canonical_jsonl_artifact_sha256(
-        frames_payload, label="frames"
-    )
-    if observed_frames_hash != receipt.artifacts.frames_sha256:
+    frames_hash = canonical_jsonl_artifact_sha256(frames_payload, label="frames")
+    if frames_hash != receipt.artifacts.frames_jsonl_sha256:
         raise ValueError("telemetry frames artifact hash drifted")
-    validate_frame_sequence(frames, receipt=receipt)
-    return SynchronizedObserverResult(
-        state=ObserverState.SEALED,
-        run_directory=artifact_root / run_id,
-        receipt=receipt,
-        frames=frames,
+    validate_synchronized_telemetry_v2(frames, receipt=receipt)
+    seal: SynchronizedTelemetrySealV2 | None = None
+    if expect_seal:
+        seal_payload = _read_private_file_at(run_fd, SEAL_FILENAME, maximum_bytes=MAX_RECEIPT_BYTES)
+        seal = SynchronizedTelemetrySealV2.model_validate(
+            parse_canonical_json_artifact(seal_payload, label="seal", maximum_bytes=MAX_RECEIPT_BYTES)
+        )
+        receipt_hash = "sha256:" + hashlib.sha256(receipt_payload).hexdigest()
+        if seal.run_id != receipt.run_id or seal.receipt_sha256 != receipt_hash or seal.frames_jsonl_sha256 != frames_hash:
+            raise ValueError("telemetry seal artifact identity drifted")
+        if seal.attested_elapsed_ns != receipt.finished_monotonic_ns - receipt.started_monotonic_ns:
+            raise ValueError("telemetry seal elapsed interval drifted")
+        expected_status = "unsafe" if receipt.status == "unsafe" or seal.observer_cpu_ns / seal.attested_elapsed_ns > 0.02 else receipt.status
+        if seal.receipt_status != receipt.status or seal.status != expected_status:
+            raise ValueError("telemetry seal status drifted")
+    return frames, receipt, seal
+
+
+def validate_synchronized_telemetry_v2(
+    frames: tuple[SynchronizedTelemetryFrameV2, ...],
+    *,
+    receipt: SynchronizedTelemetryReceiptV2,
+) -> None:
+    if not frames:
+        raise ValueError("telemetry frame sequence is empty")
+    for sequence, frame in enumerate(frames):
+        if frame.sequence != sequence or frame.run_id != receipt.run_id:
+            raise ValueError("telemetry frame sequence or run identity drifted")
+        if (
+            frame.runtime_bundle_identity_sha256 != receipt.runtime_bundle_identity_sha256
+            or frame.process_profile_sha256 != receipt.process_profile.process_profile_sha256
+            or frame.observer_source_sha256 != receipt.observer_source_sha256
+            or frame.clock.clock_domain_identity_sha256 != receipt.clock_domain_identity_sha256
+        ):
+            raise ValueError("telemetry frame identity drifted")
+        if frame.lane == "gpu_fast":
+            if any(
+                observation.status != "unsupported" or observation.reason != "not_due_at_this_tick"
+                for observation in (frame.api_process, frame.host_cgroup, frame.queue_vllm)
+            ):
+                raise ValueError("GPU lane carries observations owned by the host lane")
+        elif frame.gpu.status != "unsupported" or frame.gpu.reason != "not_due_at_this_tick":
+            raise ValueError("host lane carries an observation owned by the GPU lane")
+    expected_quality, unsupported = derive_frame_evidence(
+        cast(tuple[contract_module.SynchronizedTelemetryFrame, ...], frames),
+        started_monotonic_ns=receipt.started_monotonic_ns,
+        finished_monotonic_ns=receipt.finished_monotonic_ns,
     )
+    if expected_quality != receipt.lane_quality or unsupported != receipt.unsupported_observation_count:
+        raise ValueError("telemetry receipt evidence drifted")
+    required_reasons = {
+        observation.reason
+        for frame in frames
+        for observation in (
+            (frame.gpu,)
+            if frame.lane == "gpu_fast"
+            else (frame.api_process, frame.host_cgroup, frame.queue_vllm)
+        )
+        if observation.status == "unsupported"
+    }
+    if not set(receipt.safety_drift_reasons).issubset(required_reasons):
+        raise ValueError("telemetry safety drift lacks required unsupported evidence")
 
 
 def _run_lane(
     *,
     lane: Literal["gpu_fast", "host_slow"],
     interval_ns: int,
-    sampler: Callable[[], GpuLaneSnapshot | HostLaneSnapshot],
+    sampler: Callable[..., GpuLaneSnapshot | HostLaneSnapshot],
     mailbox: _Mailbox,
     condition: threading.Condition,
     expected_identity: TelemetrySampleIdentity,
@@ -611,6 +745,8 @@ def _run_lane(
     external_cancel: threading.Event,
     internal_stop: threading.Event,
     termination: _Termination,
+    safety_drifts: _SafetyDrifts,
+    counter_tracker: _CounterTracker,
     monotonic_ns: Callable[[], int],
     utc_now: Callable[[], datetime],
 ) -> None:
@@ -635,7 +771,10 @@ def _run_lane(
             observed_at = utc_now()
             _require_utc(observed_at)
             try:
-                snapshot = sampler()
+                snapshot_deadline = min(end_deadline, scheduled + interval_ns)
+                snapshot = sampler(
+                    deadline=TelemetrySnapshotDeadline(monotonic_ns=snapshot_deadline)
+                )
                 finished = monotonic_ns()
                 pending = _project_snapshot(
                     lane=lane,
@@ -649,8 +788,9 @@ def _run_lane(
                     frozen_gpu_identity=frozen_gpu_identity,
                     frozen_cgroup_identity=frozen_cgroup_identity,
                     identity_lock=identity_lock,
+                    counter_tracker=counter_tracker,
                 )
-            except _IdentityDrift:
+            except _SafetyDrift as exc:
                 finished = monotonic_ns()
                 pending = _unsupported_pending(
                     lane=lane,
@@ -658,11 +798,24 @@ def _run_lane(
                     started=started,
                     finished=finished,
                     observed_at=observed_at,
-                    reason="epoch_drift",
+                    reason=exc.reason,
                 )
+                safety_drifts.add(exc.reason)
                 termination.mark("identity_drift")
                 internal_stop.set()
-            except Exception:
+            except TelemetrySnapshotDeadlineExceeded:
+                finished = monotonic_ns()
+                pending = _unsupported_pending(
+                    lane=lane,
+                    scheduled=scheduled,
+                    started=started,
+                    finished=finished,
+                    observed_at=observed_at,
+                    reason="deadline_exceeded",
+                )
+                termination.mark("sampler_or_transport_shutdown")
+                internal_stop.set()
+            except TelemetrySnapshotTransportUnavailable:
                 finished = monotonic_ns()
                 pending = _unsupported_pending(
                     lane=lane,
@@ -682,6 +835,11 @@ def _run_lane(
                 termination.mark("queue_overflow")
             else:
                 emitted = True
+            with mailbox.lock:
+                mailbox.watermark_monotonic_ns = max(
+                    mailbox.watermark_monotonic_ns, pending.finished_monotonic_ns
+                )
+                mailbox.started.set()
             next_deadline = scheduled + interval_ns
             now = monotonic_ns()
             if now >= next_deadline:
@@ -708,13 +866,12 @@ def _run_lane(
                 started=now,
                 finished=now,
                 observed_at=utc_now(),
-                reason=(
-                    "epoch_drift"
-                    if termination.value() == "identity_drift"
-                    else "collector_disabled"
-                ),
+                reason=(safety_drifts.values()[0] if safety_drifts.values() else "collector_disabled"),
             )
             mailbox.fallback = fallback
+    except BaseException as exc:
+        mailbox.failure = exc
+        internal_stop.set()
     finally:
         mailbox.done.set()
         with condition:
@@ -726,7 +883,7 @@ def _merge_lane_mailboxes(
     mailboxes: dict[str, _Mailbox],
     condition: threading.Condition,
     writer: _FrameWriter,
-    frames: list[SynchronizedTelemetryFrame],
+    frames: list[SynchronizedTelemetryFrameV2],
     run_id: str,
     process_profile: contract_module.ProcessProfileLifecycle,
     observer_source_sha256: str,
@@ -740,6 +897,9 @@ def _merge_lane_mailboxes(
     }
     previous_by_lane: dict[str, _PendingSample] = {}
     while True:
+        for mailbox in mailboxes.values():
+            if mailbox.failure is not None:
+                raise mailbox.failure
         for lane, mailbox in mailboxes.items():
             if heads[lane] is None:
                 try:
@@ -756,22 +916,31 @@ def _merge_lane_mailboxes(
             for lane, mailbox in mailboxes.items()
         ):
             break
-        ready = all(
-            heads[lane] is not None or mailboxes[lane].done.is_set()
-            for lane in mailboxes
-        )
         candidates = [value for value in heads.values() if value is not None]
-        if not ready or not candidates:
+        if not candidates:
             with condition:
                 condition.wait(timeout=0.05)
             continue
-        pending = min(
+        candidate = min(
             candidates,
             key=lambda item: (
                 item.started_monotonic_ns,
                 0 if item.lane == "gpu_fast" else 1,
             ),
         )
+        ready = True
+        for lane, mailbox in mailboxes.items():
+            if heads[lane] is not None or mailbox.done.is_set():
+                continue
+            with mailbox.lock:
+                if not mailbox.started.is_set() or mailbox.watermark_monotonic_ns < candidate.started_monotonic_ns:
+                    ready = False
+                    break
+        if not ready:
+            with condition:
+                condition.wait(timeout=0.05)
+            continue
+        pending = candidate
         previous = previous_by_lane.get(pending.lane)
         if previous is None:
             status: Literal["first", "on_time", "late"] = "first"
@@ -794,7 +963,7 @@ def _merge_lane_mailboxes(
             missed = scheduled_ns // nominal_ns - 1
             status = "late" if missed else "on_time"
             observed_interval_ms = observed_ns / 1_000_000
-        frame = SynchronizedTelemetryFrame(
+        frame = SynchronizedTelemetryFrameV2(
             run_id=run_id,
             sequence=len(frames),
             lane=pending.lane,
@@ -858,12 +1027,13 @@ def _project_snapshot(
     frozen_gpu_identity: list[str | None],
     frozen_cgroup_identity: list[str | None],
     identity_lock: threading.Lock,
+    counter_tracker: _CounterTracker,
 ) -> _PendingSample:
     if snapshot.identity != expected_identity:
-        raise _IdentityDrift("sample runtime identity drifted")
+        raise _SafetyDrift("identity_drift", "sample runtime identity drifted")
     if lane == "gpu_fast":
         if not isinstance(snapshot, GpuLaneSnapshot):
-            raise _IdentityDrift("GPU sampler returned the wrong lane")
+            raise AssertionError("GPU sampler returned the wrong lane")
         if snapshot.gpu.status == "supported":
             assert snapshot.gpu.values is not None
             observed_identity = snapshot.gpu.values.device_identity_sha256
@@ -871,24 +1041,24 @@ def _project_snapshot(
                 if frozen_gpu_identity[0] is None:
                     frozen_gpu_identity[0] = observed_identity
                 elif frozen_gpu_identity[0] != observed_identity:
-                    raise _IdentityDrift("GPU device identity drifted")
+                    raise _SafetyDrift("identity_drift", "GPU device identity drifted")
         return _PendingSample(
             lane=lane,
             scheduled_monotonic_ns=scheduled,
             started_monotonic_ns=started,
             finished_monotonic_ns=finished,
             observed_at_utc=observed_at,
-            gpu=snapshot.gpu,
+            gpu=GpuObservationV2.model_validate(snapshot.gpu.model_dump()),
             api_process=_unsupported_process("not_due_at_this_tick"),
             host_cgroup=_unsupported_host("not_due_at_this_tick"),
             queue_vllm=_unsupported_queue("not_due_at_this_tick"),
         )
     if not isinstance(snapshot, HostLaneSnapshot):
-        raise _IdentityDrift("host sampler returned the wrong lane")
+        raise AssertionError("host sampler returned the wrong lane")
     if snapshot.api_process.status == "supported":
         assert snapshot.api_process.values is not None
         if snapshot.api_process.values.process_epoch_sha256 != expected_process_epoch:
-            raise _IdentityDrift("API process epoch drifted")
+            raise _SafetyDrift("epoch_drift", "API process epoch drifted")
     if snapshot.host_cgroup.status == "supported":
         assert snapshot.host_cgroup.values is not None
         observed_identity = snapshot.host_cgroup.values.parent_cgroup_epoch_sha256
@@ -896,7 +1066,8 @@ def _project_snapshot(
             if frozen_cgroup_identity[0] is None:
                 frozen_cgroup_identity[0] = observed_identity
             elif frozen_cgroup_identity[0] != observed_identity:
-                raise _IdentityDrift("parent cgroup epoch drifted")
+                raise _SafetyDrift("epoch_drift", "parent cgroup epoch drifted")
+    _check_cumulative_counters(snapshot, counter_tracker)
     return _PendingSample(
         lane=lane,
         scheduled_monotonic_ns=scheduled,
@@ -904,14 +1075,54 @@ def _project_snapshot(
         finished_monotonic_ns=finished,
         observed_at_utc=observed_at,
         gpu=_unsupported_gpu("not_due_at_this_tick"),
-        api_process=snapshot.api_process,
-        host_cgroup=snapshot.host_cgroup,
-        queue_vllm=snapshot.queue_vllm,
+        api_process=ApiProcessObservationV2.model_validate(snapshot.api_process.model_dump()),
+        host_cgroup=HostCgroupObservationV2.model_validate(snapshot.host_cgroup.model_dump()),
+        queue_vllm=QueueVllmObservationV2.model_validate(snapshot.queue_vllm.model_dump()),
     )
 
 
-class _IdentityDrift(ValueError):
-    pass
+class _SafetyDrift(ValueError):
+    def __init__(self, reason: contract_module.SafetyDriftReason, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _check_cumulative_counters(
+    snapshot: HostLaneSnapshot, tracker: _CounterTracker
+) -> None:
+    counters: dict[str, int] = {}
+    if snapshot.api_process.status == "supported":
+        api_values = snapshot.api_process.values
+        assert api_values is not None
+        counters.update(api_cpu_user=api_values.cpu_user_ns_total, api_cpu_system=api_values.cpu_system_ns_total)
+    if snapshot.host_cgroup.status == "supported":
+        host_values = snapshot.host_cgroup.values
+        assert host_values is not None
+        counters.update(
+            memory_low=host_values.memory_events.low_total,
+            memory_high=host_values.memory_events.high_total,
+            memory_max=host_values.memory_events.max_total,
+            memory_oom=host_values.memory_events.oom_total,
+            memory_oom_kill=host_values.memory_events.oom_kill_total,
+            memory_oom_group_kill=host_values.memory_events.oom_group_kill_total,
+            cpu_usage=host_values.cpu_stat.usage_ns_total,
+            cpu_user=host_values.cpu_stat.user_ns_total,
+            cpu_system=host_values.cpu_stat.system_ns_total,
+            cpu_throttled=host_values.cpu_stat.throttled_ns_total,
+            cpu_throttled_periods=host_values.cpu_stat.throttled_periods_total,
+        )
+    if snapshot.queue_vllm.status == "supported":
+        queue_values = snapshot.queue_vllm.values
+        assert queue_values is not None
+        counters["vllm_preemptions"] = queue_values.vllm_preemptions_total
+    with tracker.lock:
+        for key, value in counters.items():
+            previous = tracker.previous.get(key)
+            if previous is not None and value < previous:
+                raise _SafetyDrift("counter_regression", f"cumulative counter {key} regressed")
+            if key in {"memory_oom", "memory_oom_kill", "memory_oom_group_kill"} and previous is not None and value > previous:
+                raise _SafetyDrift("oom_increment", f"OOM counter {key} increased")
+        tracker.previous.update(counters)
 
 
 def _unsupported_pending(
@@ -921,7 +1132,7 @@ def _unsupported_pending(
     started: int,
     finished: int,
     observed_at: datetime,
-    reason: contract_module.UnsupportedReason,
+    reason: contract_module.UnsupportedReasonV2,
 ) -> _PendingSample:
     return _PendingSample(
         lane=lane,
@@ -952,26 +1163,26 @@ def _unsupported_pending(
     )
 
 
-def _unsupported_gpu(reason: contract_module.UnsupportedReason) -> GpuObservation:
-    return GpuObservation(status="unsupported", reason=reason, values=None)
+def _unsupported_gpu(reason: contract_module.UnsupportedReasonV2) -> GpuObservationV2:
+    return GpuObservationV2(status="unsupported", reason=reason, values=None)
 
 
 def _unsupported_process(
-    reason: contract_module.UnsupportedReason,
-) -> ApiProcessObservation:
-    return ApiProcessObservation(status="unsupported", reason=reason, values=None)
+    reason: contract_module.UnsupportedReasonV2,
+) -> ApiProcessObservationV2:
+    return ApiProcessObservationV2(status="unsupported", reason=reason, values=None)
 
 
 def _unsupported_host(
-    reason: contract_module.UnsupportedReason,
-) -> HostCgroupObservation:
-    return HostCgroupObservation(status="unsupported", reason=reason, values=None)
+    reason: contract_module.UnsupportedReasonV2,
+) -> HostCgroupObservationV2:
+    return HostCgroupObservationV2(status="unsupported", reason=reason, values=None)
 
 
 def _unsupported_queue(
-    reason: contract_module.UnsupportedReason,
-) -> QueueVllmObservation:
-    return QueueVllmObservation(status="unsupported", reason=reason, values=None)
+    reason: contract_module.UnsupportedReasonV2,
+) -> QueueVllmObservationV2:
+    return QueueVllmObservationV2(status="unsupported", reason=reason, values=None)
 
 
 def _publish_pending(
@@ -1138,4 +1349,5 @@ __all__ = [
     "run_synchronized_telemetry_observer",
     "synchronized_observer_source_sha256",
     "verify_synchronized_telemetry_observer",
+    "validate_synchronized_telemetry_v2",
 ]

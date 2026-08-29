@@ -1,0 +1,84 @@
+{
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-telemetry-seal.v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Non-self-referential attestation created after mandatory receipt replay.",
+  "properties": {
+    "attested_elapsed_ns": {
+      "exclusiveMinimum": 0,
+      "title": "Attested Elapsed Ns",
+      "type": "integer"
+    },
+    "contract_version": {
+      "const": "mineru.synchronized-telemetry-seal.v2",
+      "default": "mineru.synchronized-telemetry-seal.v2",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "frames_jsonl_sha256": {
+      "title": "Frames Jsonl Sha256",
+      "type": "string"
+    },
+    "maximum_observer_overhead_ratio": {
+      "default": 0.02,
+      "maximum": 0.02,
+      "minimum": 0.02,
+      "title": "Maximum Observer Overhead Ratio",
+      "type": "number"
+    },
+    "observer_cpu_ns": {
+      "minimum": 0,
+      "title": "Observer Cpu Ns",
+      "type": "integer"
+    },
+    "observer_process_cpu_finished_ns": {
+      "minimum": 0,
+      "title": "Observer Process Cpu Finished Ns",
+      "type": "integer"
+    },
+    "observer_process_cpu_started_ns": {
+      "minimum": 0,
+      "title": "Observer Process Cpu Started Ns",
+      "type": "integer"
+    },
+    "receipt_sha256": {
+      "title": "Receipt Sha256",
+      "type": "string"
+    },
+    "receipt_status": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "unsafe"
+      ],
+      "title": "Receipt Status",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "unsafe"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "receipt_sha256",
+    "frames_jsonl_sha256",
+    "observer_process_cpu_started_ns",
+    "observer_process_cpu_finished_ns",
+    "observer_cpu_ns",
+    "attested_elapsed_ns",
+    "receipt_status",
+    "status"
+  ],
+  "title": "SynchronizedTelemetrySealV2",
+  "type": "object"
+}

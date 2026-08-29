@@ -1,74 +1,5 @@
 {
   "$defs": {
-    "CapacityVector": {
-      "additionalProperties": false,
-      "properties": {
-        "document_owner_bytes": {
-          "minimum": 0,
-          "title": "Document Owner Bytes",
-          "type": "integer"
-        },
-        "model_cpu_bytes": {
-          "minimum": 0,
-          "title": "Model Cpu Bytes",
-          "type": "integer"
-        },
-        "model_gpu_bytes": {
-          "minimum": 0,
-          "title": "Model Gpu Bytes",
-          "type": "integer"
-        },
-        "native_owner_slots": {
-          "minimum": 0,
-          "title": "Native Owner Slots",
-          "type": "integer"
-        },
-        "raster_cpu_bytes": {
-          "minimum": 0,
-          "title": "Raster Cpu Bytes",
-          "type": "integer"
-        },
-        "source_disk_bytes": {
-          "minimum": 0,
-          "title": "Source Disk Bytes",
-          "type": "integer"
-        },
-        "task_slots": {
-          "minimum": 0,
-          "title": "Task Slots",
-          "type": "integer"
-        },
-        "tensor_cpu_bytes": {
-          "minimum": 0,
-          "title": "Tensor Cpu Bytes",
-          "type": "integer"
-        },
-        "tensor_gpu_bytes": {
-          "minimum": 0,
-          "title": "Tensor Gpu Bytes",
-          "type": "integer"
-        },
-        "vllm_sequence_slots": {
-          "minimum": 0,
-          "title": "Vllm Sequence Slots",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "source_disk_bytes",
-        "raster_cpu_bytes",
-        "tensor_cpu_bytes",
-        "tensor_gpu_bytes",
-        "model_cpu_bytes",
-        "model_gpu_bytes",
-        "document_owner_bytes",
-        "task_slots",
-        "native_owner_slots",
-        "vllm_sequence_slots"
-      ],
-      "title": "CapacityVector",
-      "type": "object"
-    },
     "LaneQualitySummary": {
       "additionalProperties": false,
       "properties": {
@@ -122,43 +53,6 @@
         "supported_frame_count"
       ],
       "title": "LaneQualitySummary",
-      "type": "object"
-    },
-    "MeasuredSafetyMargin": {
-      "additionalProperties": false,
-      "properties": {
-        "capacity": {
-          "$ref": "#/$defs/CapacityVector"
-        },
-        "method": {
-          "const": "p99-mad-positive-jump.v1",
-          "default": "p99-mad-positive-jump.v1",
-          "title": "Method",
-          "type": "string"
-        },
-        "model_baseline": {
-          "$ref": "#/$defs/CapacityVector"
-        },
-        "safety_margin": {
-          "$ref": "#/$defs/CapacityVector"
-        },
-        "sample_count": {
-          "minimum": 1,
-          "title": "Sample Count",
-          "type": "integer"
-        },
-        "uncertainty": {
-          "$ref": "#/$defs/CapacityVector"
-        }
-      },
-      "required": [
-        "sample_count",
-        "capacity",
-        "model_baseline",
-        "uncertainty",
-        "safety_margin"
-      ],
-      "title": "MeasuredSafetyMargin",
       "type": "object"
     },
     "ProcessProfileLifecycle": {
@@ -263,72 +157,25 @@
       "title": "ProcessProfileParameters",
       "type": "object"
     },
-    "TelemetryArtifacts": {
+    "TelemetryArtifactsV2": {
       "additionalProperties": false,
       "properties": {
-        "frames_sha256": {
-          "title": "Frames Sha256",
+        "frames_jsonl_sha256": {
+          "title": "Frames Jsonl Sha256",
           "type": "string"
-        },
-        "phase_capture_sha256": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Phase Capture Sha256"
-        },
-        "phase_clock_binding_sha256": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Phase Clock Binding Sha256"
-        },
-        "progress_events_sha256": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Progress Events Sha256"
-        },
-        "vector_events_sha256": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Vector Events Sha256"
         }
       },
       "required": [
-        "frames_sha256",
-        "progress_events_sha256",
-        "vector_events_sha256"
+        "frames_jsonl_sha256"
       ],
-      "title": "TelemetryArtifacts",
+      "title": "TelemetryArtifactsV2",
       "type": "object"
     }
   },
-  "$id": "https://agent-invest.local/contracts/operational/synchronized-telemetry-receipt.v1.schema.json",
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-telemetry-receipt.v2.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "description": "Closed receipt for the default-off resident JSONL observer.",
   "properties": {
     "activation_authorized": {
       "const": false,
@@ -337,15 +184,15 @@
       "type": "boolean"
     },
     "artifacts": {
-      "$ref": "#/$defs/TelemetryArtifacts"
+      "$ref": "#/$defs/TelemetryArtifactsV2"
     },
     "clock_domain_identity_sha256": {
       "title": "Clock Domain Identity Sha256",
       "type": "string"
     },
     "contract_version": {
-      "const": "mineru.synchronized-telemetry-receipt.v1",
-      "default": "mineru.synchronized-telemetry-receipt.v1",
+      "const": "mineru.synchronized-telemetry-receipt.v2",
+      "default": "mineru.synchronized-telemetry-receipt.v2",
       "title": "Contract Version",
       "type": "string"
     },
@@ -389,21 +236,9 @@
       "title": "Maximum Clock Divergence Ppm",
       "type": "integer"
     },
-    "maximum_observer_overhead_ratio": {
-      "default": 0.02,
-      "maximum": 0.02,
-      "minimum": 0.02,
-      "title": "Maximum Observer Overhead Ratio",
-      "type": "number"
-    },
     "observed_clock_divergence_ns": {
       "minimum": 0,
       "title": "Observed Clock Divergence Ns",
-      "type": "integer"
-    },
-    "observer_cpu_ns": {
-      "minimum": 0,
-      "title": "Observer Cpu Ns",
       "type": "integer"
     },
     "observer_source_sha256": {
@@ -421,15 +256,18 @@
       "title": "Runtime Bundle Identity Sha256",
       "type": "string"
     },
-    "safety_margin": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/MeasuredSafetyMargin"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "safety_drift_reasons": {
+      "items": {
+        "enum": [
+          "epoch_drift",
+          "identity_drift",
+          "counter_regression",
+          "oom_increment"
+        ],
+        "type": "string"
+      },
+      "title": "Safety Drift Reasons",
+      "type": "array"
     },
     "started_at_utc": {
       "format": "date-time",
@@ -450,6 +288,18 @@
       "title": "Status",
       "type": "string"
     },
+    "termination_reason": {
+      "enum": [
+        "duration_elapsed",
+        "cancelled",
+        "sampler_or_transport_shutdown",
+        "queue_overflow",
+        "artifact_bound_exceeded",
+        "identity_drift"
+      ],
+      "title": "Termination Reason",
+      "type": "string"
+    },
     "unsupported_observation_count": {
       "minimum": 0,
       "title": "Unsupported Observation Count",
@@ -468,13 +318,13 @@
     "finished_monotonic_ns",
     "status",
     "lane_quality",
-    "observer_cpu_ns",
+    "termination_reason",
     "observed_clock_divergence_ns",
     "epoch_changed",
+    "safety_drift_reasons",
     "unsupported_observation_count",
-    "safety_margin",
     "artifacts"
   ],
-  "title": "SynchronizedTelemetryReceipt",
+  "title": "SynchronizedTelemetryReceiptV2",
   "type": "object"
 }

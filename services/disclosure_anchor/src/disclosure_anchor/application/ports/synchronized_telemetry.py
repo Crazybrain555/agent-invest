@@ -36,12 +36,27 @@ class HostLaneSnapshot:
     queue_vllm: QueueVllmObservation
 
 
+@dataclass(frozen=True, slots=True)
+class TelemetrySnapshotDeadline:
+    """Absolute local deadline for a non-blocking resident snapshot read."""
+
+    monotonic_ns: int
+
+
+class TelemetrySnapshotDeadlineExceeded(TimeoutError):
+    """The resident collector could not return a snapshot by the deadline."""
+
+
+class TelemetrySnapshotTransportUnavailable(ConnectionError):
+    """The already-resident collector transport is unavailable."""
+
+
 class GpuTelemetrySamplerPort(Protocol):
-    def sample(self) -> GpuLaneSnapshot: ...
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot: ...
 
 
 class HostTelemetrySamplerPort(Protocol):
-    def sample(self) -> HostLaneSnapshot: ...
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> HostLaneSnapshot: ...
 
 
 __all__ = [
@@ -50,4 +65,7 @@ __all__ = [
     "HostLaneSnapshot",
     "HostTelemetrySamplerPort",
     "TelemetrySampleIdentity",
+    "TelemetrySnapshotDeadline",
+    "TelemetrySnapshotDeadlineExceeded",
+    "TelemetrySnapshotTransportUnavailable",
 ]

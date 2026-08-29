@@ -18,6 +18,15 @@ TELEMETRY_FRAME_VERSION: Literal["mineru.synchronized-telemetry-frame.v1"] = (
 TELEMETRY_RECEIPT_VERSION: Literal[
     "mineru.synchronized-telemetry-receipt.v1"
 ] = "mineru.synchronized-telemetry-receipt.v1"
+TELEMETRY_FRAME_V2_VERSION: Literal["mineru.synchronized-telemetry-frame.v2"] = (
+    "mineru.synchronized-telemetry-frame.v2"
+)
+TELEMETRY_RECEIPT_V2_VERSION: Literal["mineru.synchronized-telemetry-receipt.v2"] = (
+    "mineru.synchronized-telemetry-receipt.v2"
+)
+TELEMETRY_SEAL_V2_VERSION: Literal["mineru.synchronized-telemetry-seal.v2"] = (
+    "mineru.synchronized-telemetry-seal.v2"
+)
 PROGRESS_EVENT_VERSION: Literal["mineru.capacity-progress-event.v1"] = (
     "mineru.capacity-progress-event.v1"
 )
@@ -48,6 +57,17 @@ UnsupportedReason = Literal[
     "epoch_drift",
     "not_due_at_this_tick",
 ]
+UnsupportedReasonV2 = Literal[
+    "collector_disabled",
+    "collector_unsupported",
+    "deadline_exceeded",
+    "endpoint_unreachable",
+    "epoch_drift",
+    "identity_drift",
+    "counter_regression",
+    "oom_increment",
+    "not_due_at_this_tick",
+]
 RunStatus = Literal["complete", "incomplete", "unsafe"]
 ObserverTerminationReason = Literal[
     "duration_elapsed",
@@ -56,6 +76,12 @@ ObserverTerminationReason = Literal[
     "queue_overflow",
     "artifact_bound_exceeded",
     "identity_drift",
+]
+SafetyDriftReason = Literal[
+    "epoch_drift",
+    "identity_drift",
+    "counter_regression",
+    "oom_increment",
 ]
 ProfileOutcome = Literal["running", "succeeded", "failed", "drained"]
 BlockedReason = Literal[
@@ -726,9 +752,6 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
     finished_monotonic_ns: int = Field(ge=0)
     status: RunStatus
     lane_quality: tuple[LaneQualitySummary, LaneQualitySummary]
-    termination_reason: ObserverTerminationReason
-    observer_process_cpu_started_ns: int = Field(ge=0)
-    observer_process_cpu_finished_ns: int = Field(ge=0)
     observer_cpu_ns: int = Field(ge=0)
     maximum_observer_overhead_ratio: float = Field(default=0.02, ge=0.02, le=0.02)
     maximum_clock_divergence_fixed_ns: Literal[50_000_000] = 50_000_000
@@ -759,16 +782,6 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
             or self.finished_monotonic_ns <= self.started_monotonic_ns
         ):
             raise ValueError("telemetry receipt interval is invalid")
-        if (
-            self.observer_process_cpu_finished_ns
-            < self.observer_process_cpu_started_ns
-        ):
-            raise ValueError("observer CPU interval is invalid")
-        if self.observer_cpu_ns != (
-            self.observer_process_cpu_finished_ns
-            - self.observer_process_cpu_started_ns
-        ):
-            raise ValueError("observer CPU duration disagrees with counters")
         wall_ns = int(
             (self.finished_at_utc - self.started_at_utc).total_seconds()
             * 1_000_000_000
@@ -787,10 +800,8 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
         if lanes != {"gpu_fast", "host_slow"}:
             raise ValueError("receipt requires one quality summary per lane")
         overhead_ratio = self.observer_cpu_ns / monotonic_ns
-        if self.epoch_changed != (self.termination_reason == "identity_drift"):
-            raise ValueError("epoch drift and termination reason disagree")
         unsafe = self.epoch_changed or overhead_ratio > self.maximum_observer_overhead_ratio
-        incomplete = self.termination_reason != "duration_elapsed" or self.unsupported_observation_count > 0 or any(
+        incomplete = self.unsupported_observation_count > 0 or any(
             item.late_sample_count > 0
             or item.missed_deadline_count > 0
             or item.supported_frame_count == 0
@@ -806,6 +817,216 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
             != self.clock_domain_identity_sha256
         ):
             raise ValueError("process profile clock domain drifted")
+        return self
+
+
+class _ObservationV2(_FrozenModel):
+    status: ObservationStatus
+    reason: UnsupportedReasonV2 | None
+
+
+class GpuObservationV2(_ObservationV2):
+    values: GpuTelemetryValues | None
+
+    @model_validator(mode="after")
+    def _check_values(self) -> "GpuObservationV2":
+        return _check_observation(self)
+
+
+class ApiProcessObservationV2(_ObservationV2):
+    values: ApiProcessTelemetryValues | None
+
+    @model_validator(mode="after")
+    def _check_values(self) -> "ApiProcessObservationV2":
+        return _check_observation(self)
+
+
+class HostCgroupObservationV2(_ObservationV2):
+    values: HostCgroupTelemetryValues | None
+
+    @model_validator(mode="after")
+    def _check_values(self) -> "HostCgroupObservationV2":
+        return _check_observation(self)
+
+
+class QueueVllmObservationV2(_ObservationV2):
+    values: QueueVllmTelemetryValues | None
+
+    @model_validator(mode="after")
+    def _check_values(self) -> "QueueVllmObservationV2":
+        return _check_observation(self)
+
+
+class SynchronizedTelemetryFrameV2(_FrozenModel):
+    """Streaming frame contract; v1 remains the original JSON-array contract."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+        json_schema_extra={
+            "$id": _SCHEMA_ROOT + "synchronized-telemetry-frame.v2.schema.json"
+        },
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-frame.v2"] = (
+        TELEMETRY_FRAME_V2_VERSION
+    )
+    run_id: str
+    sequence: int = Field(ge=0)
+    lane: TelemetryLane
+    runtime_bundle_identity_sha256: str
+    process_profile_sha256: str
+    observer_source_sha256: str
+    clock: SampleClock
+    quality: SampleQuality
+    gpu: GpuObservationV2
+    api_process: ApiProcessObservationV2
+    host_cgroup: HostCgroupObservationV2
+    queue_vllm: QueueVllmObservationV2
+
+    @model_validator(mode="after")
+    def _check_frame(self) -> "SynchronizedTelemetryFrameV2":
+        _run_id(self.run_id)
+        for label, value in (
+            ("runtime_bundle_identity_sha256", self.runtime_bundle_identity_sha256),
+            ("process_profile_sha256", self.process_profile_sha256),
+            ("observer_source_sha256", self.observer_source_sha256),
+        ):
+            _sha256(value, label=label)
+        if self.lane == "gpu_fast":
+            if not 250 <= self.quality.nominal_interval_ms <= 500:
+                raise ValueError("GPU telemetry cadence must be 250-500ms")
+        elif self.quality.nominal_interval_ms != 1000:
+            raise ValueError("host telemetry cadence must be 1s")
+        duration_ms = (self.clock.finished_monotonic_ns - self.clock.started_monotonic_ns) / 1_000_000
+        if abs(duration_ms - self.quality.collection_duration_ms) > 0.001:
+            raise ValueError("sample duration differs from monotonic clock")
+        return self
+
+
+class TelemetryArtifactsV2(_FrozenModel):
+    frames_jsonl_sha256: str
+
+    @model_validator(mode="after")
+    def _check_hash(self) -> "TelemetryArtifactsV2":
+        _sha256(self.frames_jsonl_sha256, label="frames_jsonl_sha256")
+        return self
+
+
+class SynchronizedTelemetryReceiptV2(_FrozenModel):
+    """Closed receipt for the default-off resident JSONL observer."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+        json_schema_extra={
+            "$id": _SCHEMA_ROOT + "synchronized-telemetry-receipt.v2.schema.json"
+        },
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-receipt.v2"] = (
+        TELEMETRY_RECEIPT_V2_VERSION
+    )
+    run_id: str
+    runtime_bundle_identity_sha256: str
+    process_profile: ProcessProfileLifecycle
+    observer_source_sha256: str
+    clock_domain_identity_sha256: str
+    started_at_utc: datetime
+    finished_at_utc: datetime
+    started_monotonic_ns: int = Field(ge=0)
+    finished_monotonic_ns: int = Field(ge=0)
+    status: RunStatus
+    lane_quality: tuple[LaneQualitySummary, LaneQualitySummary]
+    termination_reason: ObserverTerminationReason
+    observed_clock_divergence_ns: int = Field(ge=0)
+    epoch_changed: bool
+    safety_drift_reasons: tuple[SafetyDriftReason, ...]
+    unsupported_observation_count: int = Field(ge=0)
+    artifacts: TelemetryArtifactsV2
+    activation_authorized: Literal[False] = False
+    maximum_clock_divergence_fixed_ns: Literal[50_000_000] = 50_000_000
+    maximum_clock_divergence_ppm: Literal[50] = 50
+
+    @model_validator(mode="after")
+    def _check_receipt(self) -> "SynchronizedTelemetryReceiptV2":
+        _run_id(self.run_id)
+        _utc(self.started_at_utc, label="started_at_utc")
+        _utc(self.finished_at_utc, label="finished_at_utc")
+        for label, value in (
+            ("runtime_bundle_identity_sha256", self.runtime_bundle_identity_sha256),
+            ("observer_source_sha256", self.observer_source_sha256),
+            ("clock_domain_identity_sha256", self.clock_domain_identity_sha256),
+        ):
+            _sha256(value, label=label)
+        if self.finished_at_utc <= self.started_at_utc or self.finished_monotonic_ns <= self.started_monotonic_ns:
+            raise ValueError("telemetry receipt interval is invalid")
+        elapsed = self.finished_monotonic_ns - self.started_monotonic_ns
+        wall = int((self.finished_at_utc - self.started_at_utc).total_seconds() * 1_000_000_000)
+        divergence = abs(wall - elapsed)
+        if divergence != self.observed_clock_divergence_ns:
+            raise ValueError("recorded clock divergence disagrees with clocks")
+        if divergence > self.maximum_clock_divergence_fixed_ns + elapsed * self.maximum_clock_divergence_ppm // 1_000_000:
+            raise ValueError("wall and monotonic receipt clocks diverged")
+        if {item.lane for item in self.lane_quality} != {"gpu_fast", "host_slow"}:
+            raise ValueError("receipt requires one quality summary per lane")
+        if len(set(self.safety_drift_reasons)) != len(self.safety_drift_reasons):
+            raise ValueError("safety drift reasons are duplicated")
+        if self.epoch_changed != ("epoch_drift" in self.safety_drift_reasons):
+            raise ValueError("epoch_changed must describe only epoch drift")
+        if bool(self.safety_drift_reasons) != (self.termination_reason == "identity_drift"):
+            raise ValueError("safety drift and termination reason disagree")
+        unsafe = bool(self.safety_drift_reasons)
+        incomplete = self.termination_reason != "duration_elapsed" or self.unsupported_observation_count > 0 or any(
+            item.late_sample_count > 0 or item.missed_deadline_count > 0 or item.supported_frame_count == 0
+            for item in self.lane_quality
+        )
+        expected: RunStatus = "unsafe" if unsafe else "incomplete" if incomplete else "complete"
+        if self.status != expected:
+            raise ValueError("receipt status disagrees with quality evidence")
+        if self.process_profile.runtime_bundle_identity_sha256 != self.runtime_bundle_identity_sha256:
+            raise ValueError("process profile runtime identity drifted")
+        if self.process_profile.clock_domain_identity_sha256 != self.clock_domain_identity_sha256:
+            raise ValueError("process profile clock domain drifted")
+        return self
+
+
+class SynchronizedTelemetrySealV2(_FrozenModel):
+    """Non-self-referential attestation created after mandatory receipt replay."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+        json_schema_extra={
+            "$id": _SCHEMA_ROOT + "synchronized-telemetry-seal.v2.schema.json"
+        },
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-seal.v2"] = TELEMETRY_SEAL_V2_VERSION
+    run_id: str
+    receipt_sha256: str
+    frames_jsonl_sha256: str
+    observer_process_cpu_started_ns: int = Field(ge=0)
+    observer_process_cpu_finished_ns: int = Field(ge=0)
+    observer_cpu_ns: int = Field(ge=0)
+    attested_elapsed_ns: int = Field(gt=0)
+    maximum_observer_overhead_ratio: float = Field(default=0.02, ge=0.02, le=0.02)
+    receipt_status: RunStatus
+    status: RunStatus
+
+    @model_validator(mode="after")
+    def _check_seal(self) -> "SynchronizedTelemetrySealV2":
+        _run_id(self.run_id)
+        _sha256(self.receipt_sha256, label="receipt_sha256")
+        _sha256(self.frames_jsonl_sha256, label="frames_jsonl_sha256")
+        if self.observer_process_cpu_finished_ns < self.observer_process_cpu_started_ns:
+            raise ValueError("observer CPU interval is invalid")
+        if self.observer_cpu_ns != self.observer_process_cpu_finished_ns - self.observer_process_cpu_started_ns:
+            raise ValueError("observer CPU duration disagrees with counters")
+        overhead_unsafe = self.observer_cpu_ns / self.attested_elapsed_ns > self.maximum_observer_overhead_ratio
+        expected: RunStatus = "unsafe" if overhead_unsafe or self.receipt_status == "unsafe" else self.receipt_status
+        if self.status != expected:
+            raise ValueError("seal status disagrees with observer overhead")
         return self
 
 
@@ -917,6 +1138,9 @@ OPERATIONAL_TELEMETRY_SCHEMAS: dict[str, type[BaseModel]] = {
     "capacity-vector-credit-event.v1.schema.json": CapacityVectorCreditEvent,
     "synchronized-telemetry-frame.v1.schema.json": SynchronizedTelemetryFrame,
     "synchronized-telemetry-receipt.v1.schema.json": SynchronizedTelemetryReceipt,
+    "synchronized-telemetry-frame.v2.schema.json": SynchronizedTelemetryFrameV2,
+    "synchronized-telemetry-receipt.v2.schema.json": SynchronizedTelemetryReceiptV2,
+    "synchronized-telemetry-seal.v2.schema.json": SynchronizedTelemetrySealV2,
     "synchronized-phase-summary.v1.schema.json": SynchronizedPhaseSummary,
     "phase-clock-binding.v1.schema.json": PhaseClockBinding,
 }
@@ -1020,7 +1244,9 @@ def parse_canonical_jsonl_artifact(
         raise ValueError(f"{label} JSONL artifact bytes are invalid")
     if not payload.endswith(b"\n"):
         raise ValueError(f"{label} JSONL artifact is not newline terminated")
-    lines = payload.splitlines()
+    if b"\r" in payload:
+        raise ValueError(f"{label} JSONL artifact must use LF only")
+    lines = payload[:-1].split(b"\n")
     if not lines or len(lines) > maximum_records:
         raise ValueError(f"{label} JSONL record count is invalid")
     records: list[object] = []
@@ -1077,12 +1303,8 @@ def validate_telemetry_artifact_hashes(
             continue
         if payload is None:
             raise ValueError(f"missing {field} artifact bytes")
-        observed = (
-            canonical_jsonl_artifact_sha256(payload, label="frames")
-            if field == "frames_sha256"
-            else canonical_json_artifact_sha256(
-                payload, label=field.removesuffix("_sha256")
-            )
+        observed = canonical_json_artifact_sha256(
+            payload, label=field.removesuffix("_sha256")
         )
         if observed != recorded:
             raise ValueError(f"{field} artifact hash drifted")
@@ -1305,8 +1527,14 @@ __all__ = [
     "SampleQuality",
     "SynchronizedPhaseSummary",
     "SynchronizedTelemetryFrame",
+    "SynchronizedTelemetryFrameV2",
     "SynchronizedTelemetryReceipt",
+    "SynchronizedTelemetryReceiptV2",
+    "SynchronizedTelemetrySealV2",
     "TelemetryArtifacts",
+    "TelemetryArtifactsV2",
+    "SafetyDriftReason",
+    "UnsupportedReasonV2",
     "canonical_jsonl_artifact_sha256",
     "canonical_json_artifact_sha256",
     "canonical_json_sha256",

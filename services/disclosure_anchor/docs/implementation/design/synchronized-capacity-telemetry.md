@@ -37,13 +37,25 @@ cancel、sampler/transport shutdown、mailbox overflow 和 artifact bound 是闭
 `incomplete`；runtime/profile/clock/process/GPU/cgroup identity drift 为 `unsafe`。正常结束只有
 `duration_elapsed`。
 
-每个 run 使用 new-only `0700` 目录；frames/receipt 使用 new-only、`0600`、single-link、`O_NOFOLLOW`
-文件，并分别 fsync 文件、run 目录和父目录。frames 是换行结尾的逐行 canonical UTF-8 JSONL，SHA-256
-绑定 exact bytes；receipt 是单个 canonical JSON object。replay 从私有文件重新解析每帧、SHA、全局/
-lane 序列、绝对 schedule、边界 deadline、wall/monotonic divergence、required unsupported 数和 observer
-process CPU 起止计数。旧 JSON array 不是 frames v1 的执行格式。
+每个 run 使用 new-only `0700` 目录；frames/receipt/seal 使用 new-only、`0600`、single-link、`O_NOFOLLOW`
+文件，并分别 fsync 文件、run 目录和父目录。既有 public v1 合同及其 JSON-array artifact 语义保持不变；
+resident runner 发布独立的 v2：`frames.v2.jsonl` 只接受 LF 结尾的逐行 canonical UTF-8 JSONL，
+`receipt.v2.json` 与 `seal.v2.json` 是 canonical JSON object。receipt 写入并 fsync 后，runner 必须从仍锚定的
+私有目录 descriptor 完整 replay；只有 replay 成功才写 non-self-referential seal，随后再次从磁盘 replay，
+且只有最终 replay 对象能够以 `SEALED` 返回。任何篡改、缺失或磁盘失败都进入 `FAILED_EVIDENCE`。
 
-每 lane mailbox 有独立固定上限且 producer 永不因另一 lane 或 writer backpressure 阻塞；overflow 丢弃
+observer CPU 区间从 sampling 前开始，覆盖 frame close/quality derive/receipt validate+write 以及 mandatory
+pre-seal replay，在 seal 中记录 start/finish/delta；2% 比例由 seal 的 exact counters 和 attested elapsed
+机械重算。seal 本身不把自己的 bytes 纳入自引用 attestation。receipt 的 closed safety drift 分别记录
+`epoch_drift`、其他 identity drift、累计计数回退和 OOM/OOM-kill 增量；`epoch_changed` 只代表第一类。
+
+注入端口不是任意远端请求：它只能从一只已经 resident 的 collector 读取有界、非阻塞 snapshot，且每次
+携带绝对 monotonic deadline。只有 typed deadline/transport failure 可投影成 unsupported；assertion、类型错
+误和其他程序缺陷必须传播到 `FAILED_EVIDENCE`。每帧 lane ownership 也是闭合的：GPU lane 的 host/queue
+观测，以及 host lane 的 GPU 观测，必须严格为 `unsupported/not_due_at_this_tick`。
+
+每 lane mailbox 有独立固定上限且 producer 永不因另一 lane 或 writer backpressure 阻塞；显式 start token
+和 monotonic watermark 决定 merge 是否可安全前进，不等待一个尚不存在的未来 head。overflow 丢弃
 该 observation 并令 receipt incomplete，后续 written frame/boundary 会机械暴露缺失 deadline。scheduler
 从前一绝对 deadline 推进，采集过慢时跳过已过期 slot，不补发 catch-up burst。
 

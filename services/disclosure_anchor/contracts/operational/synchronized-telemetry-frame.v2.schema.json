@@ -1,0 +1,819 @@
+{
+  "$defs": {
+    "ApiProcessObservationV2": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "collector_disabled",
+                "collector_unsupported",
+                "deadline_exceeded",
+                "endpoint_unreachable",
+                "epoch_drift",
+                "identity_drift",
+                "counter_regression",
+                "oom_increment",
+                "not_due_at_this_tick"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "status": {
+          "enum": [
+            "supported",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "values": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApiProcessTelemetryValues"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "reason",
+        "values"
+      ],
+      "title": "ApiProcessObservationV2",
+      "type": "object"
+    },
+    "ApiProcessTelemetryValues": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_system_ns_total": {
+          "minimum": 0,
+          "title": "Cpu System Ns Total",
+          "type": "integer"
+        },
+        "cpu_user_ns_total": {
+          "minimum": 0,
+          "title": "Cpu User Ns Total",
+          "type": "integer"
+        },
+        "process_epoch_sha256": {
+          "title": "Process Epoch Sha256",
+          "type": "string"
+        },
+        "rss_bytes": {
+          "minimum": 0,
+          "title": "Rss Bytes",
+          "type": "integer"
+        },
+        "rss_hwm_bytes": {
+          "minimum": 0,
+          "title": "Rss Hwm Bytes",
+          "type": "integer"
+        },
+        "thread_count": {
+          "minimum": 1,
+          "title": "Thread Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "process_epoch_sha256",
+        "cpu_user_ns_total",
+        "cpu_system_ns_total",
+        "rss_bytes",
+        "rss_hwm_bytes",
+        "thread_count"
+      ],
+      "title": "ApiProcessTelemetryValues",
+      "type": "object"
+    },
+    "CgroupCpuStat": {
+      "additionalProperties": false,
+      "properties": {
+        "system_ns_total": {
+          "minimum": 0,
+          "title": "System Ns Total",
+          "type": "integer"
+        },
+        "throttled_ns_total": {
+          "minimum": 0,
+          "title": "Throttled Ns Total",
+          "type": "integer"
+        },
+        "throttled_periods_total": {
+          "minimum": 0,
+          "title": "Throttled Periods Total",
+          "type": "integer"
+        },
+        "usage_ns_total": {
+          "minimum": 0,
+          "title": "Usage Ns Total",
+          "type": "integer"
+        },
+        "user_ns_total": {
+          "minimum": 0,
+          "title": "User Ns Total",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "usage_ns_total",
+        "user_ns_total",
+        "system_ns_total",
+        "throttled_ns_total",
+        "throttled_periods_total"
+      ],
+      "title": "CgroupCpuStat",
+      "type": "object"
+    },
+    "CgroupMemoryEvents": {
+      "additionalProperties": false,
+      "properties": {
+        "high_total": {
+          "minimum": 0,
+          "title": "High Total",
+          "type": "integer"
+        },
+        "low_total": {
+          "minimum": 0,
+          "title": "Low Total",
+          "type": "integer"
+        },
+        "max_total": {
+          "minimum": 0,
+          "title": "Max Total",
+          "type": "integer"
+        },
+        "oom_group_kill_total": {
+          "minimum": 0,
+          "title": "Oom Group Kill Total",
+          "type": "integer"
+        },
+        "oom_kill_total": {
+          "minimum": 0,
+          "title": "Oom Kill Total",
+          "type": "integer"
+        },
+        "oom_total": {
+          "minimum": 0,
+          "title": "Oom Total",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "low_total",
+        "high_total",
+        "max_total",
+        "oom_total",
+        "oom_kill_total",
+        "oom_group_kill_total"
+      ],
+      "title": "CgroupMemoryEvents",
+      "type": "object"
+    },
+    "CgroupMemoryStat": {
+      "additionalProperties": false,
+      "properties": {
+        "anon_bytes": {
+          "minimum": 0,
+          "title": "Anon Bytes",
+          "type": "integer"
+        },
+        "file_bytes": {
+          "minimum": 0,
+          "title": "File Bytes",
+          "type": "integer"
+        },
+        "shmem_bytes": {
+          "minimum": 0,
+          "title": "Shmem Bytes",
+          "type": "integer"
+        },
+        "slab_bytes": {
+          "minimum": 0,
+          "title": "Slab Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "anon_bytes",
+        "file_bytes",
+        "shmem_bytes",
+        "slab_bytes"
+      ],
+      "title": "CgroupMemoryStat",
+      "type": "object"
+    },
+    "GpuObservationV2": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "collector_disabled",
+                "collector_unsupported",
+                "deadline_exceeded",
+                "endpoint_unreachable",
+                "epoch_drift",
+                "identity_drift",
+                "counter_regression",
+                "oom_increment",
+                "not_due_at_this_tick"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "status": {
+          "enum": [
+            "supported",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "values": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GpuTelemetryValues"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "reason",
+        "values"
+      ],
+      "title": "GpuObservationV2",
+      "type": "object"
+    },
+    "GpuTelemetryValues": {
+      "additionalProperties": false,
+      "properties": {
+        "device_identity_sha256": {
+          "title": "Device Identity Sha256",
+          "type": "string"
+        },
+        "framebuffer_free_bytes": {
+          "minimum": 0,
+          "title": "Framebuffer Free Bytes",
+          "type": "integer"
+        },
+        "framebuffer_total_bytes": {
+          "minimum": 1,
+          "title": "Framebuffer Total Bytes",
+          "type": "integer"
+        },
+        "framebuffer_used_bytes": {
+          "minimum": 0,
+          "title": "Framebuffer Used Bytes",
+          "type": "integer"
+        },
+        "power_usage_watts": {
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Power Usage Watts",
+          "type": "number"
+        },
+        "utilization_pct": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Utilization Pct",
+          "type": "number"
+        }
+      },
+      "required": [
+        "device_identity_sha256",
+        "utilization_pct",
+        "framebuffer_used_bytes",
+        "framebuffer_free_bytes",
+        "framebuffer_total_bytes",
+        "power_usage_watts"
+      ],
+      "title": "GpuTelemetryValues",
+      "type": "object"
+    },
+    "HostCgroupObservationV2": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "collector_disabled",
+                "collector_unsupported",
+                "deadline_exceeded",
+                "endpoint_unreachable",
+                "epoch_drift",
+                "identity_drift",
+                "counter_regression",
+                "oom_increment",
+                "not_due_at_this_tick"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "status": {
+          "enum": [
+            "supported",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "values": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostCgroupTelemetryValues"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "reason",
+        "values"
+      ],
+      "title": "HostCgroupObservationV2",
+      "type": "object"
+    },
+    "HostCgroupTelemetryValues": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_psi": {
+          "$ref": "#/$defs/PressureSample"
+        },
+        "cpu_stat": {
+          "$ref": "#/$defs/CgroupCpuStat"
+        },
+        "docker_vm_memory_available_bytes": {
+          "minimum": 0,
+          "title": "Docker Vm Memory Available Bytes",
+          "type": "integer"
+        },
+        "docker_vm_memory_total_bytes": {
+          "minimum": 1,
+          "title": "Docker Vm Memory Total Bytes",
+          "type": "integer"
+        },
+        "io_psi": {
+          "$ref": "#/$defs/PressureSample"
+        },
+        "memory_current_bytes": {
+          "minimum": 0,
+          "title": "Memory Current Bytes",
+          "type": "integer"
+        },
+        "memory_events": {
+          "$ref": "#/$defs/CgroupMemoryEvents"
+        },
+        "memory_max_bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Memory Max Bytes"
+        },
+        "memory_max_status": {
+          "enum": [
+            "bounded",
+            "unbounded"
+          ],
+          "title": "Memory Max Status",
+          "type": "string"
+        },
+        "memory_psi": {
+          "$ref": "#/$defs/PressureSample"
+        },
+        "memory_stat": {
+          "$ref": "#/$defs/CgroupMemoryStat"
+        },
+        "parent_cgroup_epoch_sha256": {
+          "title": "Parent Cgroup Epoch Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_cgroup_epoch_sha256",
+        "docker_vm_memory_total_bytes",
+        "docker_vm_memory_available_bytes",
+        "memory_current_bytes",
+        "memory_max_status",
+        "memory_max_bytes",
+        "memory_stat",
+        "memory_events",
+        "memory_psi",
+        "cpu_stat",
+        "cpu_psi",
+        "io_psi"
+      ],
+      "title": "HostCgroupTelemetryValues",
+      "type": "object"
+    },
+    "PressureLine": {
+      "additionalProperties": false,
+      "properties": {
+        "avg10_pct": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Avg10 Pct",
+          "type": "number"
+        },
+        "avg300_pct": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Avg300 Pct",
+          "type": "number"
+        },
+        "avg60_pct": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Avg60 Pct",
+          "type": "number"
+        },
+        "total_stall_us": {
+          "minimum": 0,
+          "title": "Total Stall Us",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "avg10_pct",
+        "avg60_pct",
+        "avg300_pct",
+        "total_stall_us"
+      ],
+      "title": "PressureLine",
+      "type": "object"
+    },
+    "PressureSample": {
+      "additionalProperties": false,
+      "properties": {
+        "full": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PressureLine"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "collector_disabled",
+                "collector_unsupported",
+                "deadline_exceeded",
+                "endpoint_unreachable",
+                "epoch_drift",
+                "not_due_at_this_tick"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Full Reason"
+        },
+        "full_status": {
+          "enum": [
+            "supported",
+            "unsupported"
+          ],
+          "title": "Full Status",
+          "type": "string"
+        },
+        "some": {
+          "$ref": "#/$defs/PressureLine"
+        }
+      },
+      "required": [
+        "some",
+        "full_status",
+        "full_reason",
+        "full"
+      ],
+      "title": "PressureSample",
+      "type": "object"
+    },
+    "QueueVllmObservationV2": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "collector_disabled",
+                "collector_unsupported",
+                "deadline_exceeded",
+                "endpoint_unreachable",
+                "epoch_drift",
+                "identity_drift",
+                "counter_regression",
+                "oom_increment",
+                "not_due_at_this_tick"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Reason"
+        },
+        "status": {
+          "enum": [
+            "supported",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "values": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueueVllmTelemetryValues"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "reason",
+        "values"
+      ],
+      "title": "QueueVllmObservationV2",
+      "type": "object"
+    },
+    "QueueVllmTelemetryValues": {
+      "additionalProperties": false,
+      "properties": {
+        "api_http_active_requests": {
+          "minimum": 0,
+          "title": "Api Http Active Requests",
+          "type": "integer"
+        },
+        "api_http_pending_requests": {
+          "minimum": 0,
+          "title": "Api Http Pending Requests",
+          "type": "integer"
+        },
+        "api_max_pending_tasks": {
+          "minimum": 1,
+          "title": "Api Max Pending Tasks",
+          "type": "integer"
+        },
+        "api_nonterminal_tasks": {
+          "minimum": 0,
+          "title": "Api Nonterminal Tasks",
+          "type": "integer"
+        },
+        "api_processing_tasks": {
+          "minimum": 0,
+          "title": "Api Processing Tasks",
+          "type": "integer"
+        },
+        "api_queued_tasks": {
+          "minimum": 0,
+          "title": "Api Queued Tasks",
+          "type": "integer"
+        },
+        "vllm_kv_cache_usage_ratio": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Vllm Kv Cache Usage Ratio",
+          "type": "number"
+        },
+        "vllm_preemptions_total": {
+          "minimum": 0,
+          "title": "Vllm Preemptions Total",
+          "type": "integer"
+        },
+        "vllm_requests_running": {
+          "minimum": 0,
+          "title": "Vllm Requests Running",
+          "type": "integer"
+        },
+        "vllm_requests_waiting": {
+          "minimum": 0,
+          "title": "Vllm Requests Waiting",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "api_queued_tasks",
+        "api_processing_tasks",
+        "api_nonterminal_tasks",
+        "api_http_active_requests",
+        "api_http_pending_requests",
+        "api_max_pending_tasks",
+        "vllm_requests_running",
+        "vllm_requests_waiting",
+        "vllm_kv_cache_usage_ratio",
+        "vllm_preemptions_total"
+      ],
+      "title": "QueueVllmTelemetryValues",
+      "type": "object"
+    },
+    "SampleClock": {
+      "additionalProperties": false,
+      "properties": {
+        "clock_domain_identity_sha256": {
+          "title": "Clock Domain Identity Sha256",
+          "type": "string"
+        },
+        "finished_monotonic_ns": {
+          "minimum": 0,
+          "title": "Finished Monotonic Ns",
+          "type": "integer"
+        },
+        "observed_at_utc": {
+          "format": "date-time",
+          "title": "Observed At Utc",
+          "type": "string"
+        },
+        "scheduled_monotonic_ns": {
+          "minimum": 0,
+          "title": "Scheduled Monotonic Ns",
+          "type": "integer"
+        },
+        "started_monotonic_ns": {
+          "minimum": 0,
+          "title": "Started Monotonic Ns",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clock_domain_identity_sha256",
+        "observed_at_utc",
+        "scheduled_monotonic_ns",
+        "started_monotonic_ns",
+        "finished_monotonic_ns"
+      ],
+      "title": "SampleClock",
+      "type": "object"
+    },
+    "SampleQuality": {
+      "additionalProperties": false,
+      "properties": {
+        "collection_duration_ms": {
+          "minimum": 0,
+          "title": "Collection Duration Ms",
+          "type": "number"
+        },
+        "missed_deadlines": {
+          "minimum": 0,
+          "title": "Missed Deadlines",
+          "type": "integer"
+        },
+        "nominal_interval_ms": {
+          "maximum": 1000,
+          "minimum": 250,
+          "title": "Nominal Interval Ms",
+          "type": "integer"
+        },
+        "observed_interval_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observed Interval Ms"
+        },
+        "status": {
+          "enum": [
+            "on_time",
+            "late",
+            "first"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "nominal_interval_ms",
+        "collection_duration_ms",
+        "missed_deadlines",
+        "status"
+      ],
+      "title": "SampleQuality",
+      "type": "object"
+    }
+  },
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-telemetry-frame.v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Streaming frame contract; v1 remains the original JSON-array contract.",
+  "properties": {
+    "api_process": {
+      "$ref": "#/$defs/ApiProcessObservationV2"
+    },
+    "clock": {
+      "$ref": "#/$defs/SampleClock"
+    },
+    "contract_version": {
+      "const": "mineru.synchronized-telemetry-frame.v2",
+      "default": "mineru.synchronized-telemetry-frame.v2",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "gpu": {
+      "$ref": "#/$defs/GpuObservationV2"
+    },
+    "host_cgroup": {
+      "$ref": "#/$defs/HostCgroupObservationV2"
+    },
+    "lane": {
+      "enum": [
+        "gpu_fast",
+        "host_slow"
+      ],
+      "title": "Lane",
+      "type": "string"
+    },
+    "observer_source_sha256": {
+      "title": "Observer Source Sha256",
+      "type": "string"
+    },
+    "process_profile_sha256": {
+      "title": "Process Profile Sha256",
+      "type": "string"
+    },
+    "quality": {
+      "$ref": "#/$defs/SampleQuality"
+    },
+    "queue_vllm": {
+      "$ref": "#/$defs/QueueVllmObservationV2"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime_bundle_identity_sha256": {
+      "title": "Runtime Bundle Identity Sha256",
+      "type": "string"
+    },
+    "sequence": {
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "run_id",
+    "sequence",
+    "lane",
+    "runtime_bundle_identity_sha256",
+    "process_profile_sha256",
+    "observer_source_sha256",
+    "clock",
+    "quality",
+    "gpu",
+    "api_process",
+    "host_cgroup",
+    "queue_vllm"
+  ],
+  "title": "SynchronizedTelemetryFrameV2",
+  "type": "object"
+}

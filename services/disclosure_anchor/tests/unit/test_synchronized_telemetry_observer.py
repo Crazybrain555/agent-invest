@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     SynchronizedTelemetryEvidenceError,
     run_synchronized_telemetry_observer,
     verify_synchronized_telemetry_observer,
+    validate_synchronized_telemetry_v2,
 )
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
     ApiProcessObservation,
@@ -41,6 +43,9 @@ from disclosure_anchor.application.ports.synchronized_telemetry import (
     GpuLaneSnapshot,
     HostLaneSnapshot,
     TelemetrySampleIdentity,
+    TelemetrySnapshotDeadline,
+    TelemetrySnapshotDeadlineExceeded,
+    TelemetrySnapshotTransportUnavailable,
 )
 
 
@@ -187,7 +192,7 @@ class _Sampler:
         self.delay = delay
         self.started: list[int] = []
 
-    def sample(self) -> object:
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> object:
         self.started.append(time.monotonic_ns())
         if self.delay:
             time.sleep(self.delay)
@@ -195,14 +200,36 @@ class _Sampler:
 
 
 class _FailingSampler:
-    def sample(self) -> GpuLaneSnapshot:
-        raise ConnectionError("not evidence-safe to expose")
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        raise TelemetrySnapshotTransportUnavailable("not evidence-safe to expose")
 
 
 class _DelayedFailingSampler:
-    def sample(self) -> GpuLaneSnapshot:
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
         time.sleep(0.3)
-        raise ConnectionError("not evidence-safe to expose")
+        raise TelemetrySnapshotTransportUnavailable("not evidence-safe to expose")
+
+
+class _DeadlineSampler:
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        self.deadline = deadline
+        raise TelemetrySnapshotDeadlineExceeded("resident snapshot deadline")
+
+
+class _ProgrammingErrorSampler:
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        raise AssertionError("collector programming defect")
+
+
+class _HostSequenceSampler:
+    def __init__(self, values: list[HostLaneSnapshot]) -> None:
+        self.values = values
+        self.index = 0
+
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> HostLaneSnapshot:
+        value = self.values[min(self.index, len(self.values) - 1)]
+        self.index += 1
+        return value
 
 
 class SynchronizedTelemetryObserverTests(unittest.TestCase):
@@ -248,7 +275,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             for path in result.run_directory.iterdir():
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                 self.assertEqual(path.stat().st_nlink, 1)
-            frames_bytes = (result.run_directory / "frames.v1.jsonl").read_bytes()
+            frames_bytes = (result.run_directory / "frames.v2.jsonl").read_bytes()
             self.assertTrue(frames_bytes.endswith(b"\n"))
             for line in frames_bytes.splitlines():
                 self.assertEqual(
@@ -260,6 +287,23 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                         separators=(",", ":"),
                     ).encode(),
                 )
+
+    def test_lane_ownership_is_mechanically_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(Path(temporary) / "telemetry", duration=0.3)
+            index = next(index for index, frame in enumerate(result.frames) if frame.lane == "gpu_fast")
+            frame = result.frames[index]
+            invalid = frame.model_copy(
+                update={
+                    "api_process": frame.api_process.model_copy(
+                        update={"reason": "collector_disabled"}
+                    )
+                }
+            )
+            frames = list(result.frames)
+            frames[index] = invalid
+            with self.assertRaisesRegex(ValueError, "owned by the host lane"):
+                validate_synchronized_telemetry_v2(tuple(frames), receipt=result.receipt)
 
     def test_slow_host_lane_does_not_block_gpu_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -322,6 +366,25 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                 artifact_root=Path(temporary) / "telemetry",
                 run_id=result.receipt.run_id,
             )
+
+    def test_deadline_is_typed_incomplete_but_programming_error_fails_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(
+                Path(temporary) / "deadline",
+                gpu_sampler=_DeadlineSampler(),
+                duration=0.4,
+            )
+            self.assertEqual(result.receipt.status, "incomplete")
+            gpu = next(frame for frame in result.frames if frame.lane == "gpu_fast")
+            self.assertEqual(gpu.gpu.reason, "deadline_exceeded")
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(SynchronizedTelemetryEvidenceError) as caught:
+                self._run(
+                    Path(temporary) / "programming-error",
+                    gpu_sampler=_ProgrammingErrorSampler(),
+                    duration=0.4,
+                )
+            self.assertIsInstance(caught.exception.__cause__, AssertionError)
 
     def test_internal_stop_wakes_other_lane_without_extra_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -394,7 +457,51 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
 
             self.assertEqual(result.receipt.status, "unsafe")
             self.assertEqual(result.receipt.termination_reason, "identity_drift")
-            self.assertTrue(result.receipt.epoch_changed)
+            self.assertFalse(result.receipt.epoch_changed)
+            self.assertEqual(result.receipt.safety_drift_reasons, ("identity_drift",))
+
+    def test_counter_regression_and_oom_increment_are_closed_unsafe_drifts(self) -> None:
+        baseline = _host_snapshot()
+        assert baseline.api_process.values is not None
+        regressed = replace(
+            baseline,
+            api_process=baseline.api_process.model_copy(
+                update={
+                    "values": baseline.api_process.values.model_copy(
+                        update={"cpu_user_ns_total": 0}
+                    )
+                }
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(
+                Path(temporary) / "regression",
+                host_sampler=_HostSequenceSampler([baseline, regressed]),
+                duration=1.2,
+            )
+            self.assertEqual(result.receipt.status, "unsafe")
+            self.assertIn("counter_regression", result.receipt.safety_drift_reasons)
+
+        assert baseline.host_cgroup.values is not None
+        events = baseline.host_cgroup.values.memory_events.model_copy(update={"oom_total": 1})
+        oom = replace(
+            baseline,
+            host_cgroup=baseline.host_cgroup.model_copy(
+                update={
+                    "values": baseline.host_cgroup.values.model_copy(
+                        update={"memory_events": events}
+                    )
+                }
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(
+                Path(temporary) / "oom",
+                host_sampler=_HostSequenceSampler([baseline, oom]),
+                duration=1.2,
+            )
+            self.assertEqual(result.receipt.status, "unsafe")
+            self.assertIn("oom_increment", result.receipt.safety_drift_reasons)
 
     def test_mailbox_overflow_never_blocks_gpu_and_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -427,7 +534,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "telemetry"
             result = self._run(root)
-            frames_path = result.run_directory / "frames.v1.jsonl"
+            frames_path = result.run_directory / "frames.v2.jsonl"
             original = frames_path.read_bytes()
             frames_path.write_bytes(original.replace(b'"sequence":0', b'"sequence":9', 1))
             os.chmod(frames_path, 0o600)
@@ -436,6 +543,27 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                     artifact_root=root,
                     run_id=result.receipt.run_id,
                 )
+
+    def test_return_requires_post_receipt_replay_from_anchored_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            original = __import__(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+                fromlist=["_FrameWriter"],
+            )._FrameWriter.replay_unsealed
+
+            def tamper_then_replay(writer):
+                path = writer.run_directory / "frames.v2.jsonl"
+                path.write_bytes(path.read_bytes().replace(b'"sequence":0', b'"sequence":9', 1))
+                os.chmod(path, 0o600)
+                return original(writer)
+
+            with patch(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer._FrameWriter.replay_unsealed",
+                new=tamper_then_replay,
+            ):
+                with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                    self._run(root, duration=0.3)
 
     def test_receipt_write_failure_is_failed_evidence_not_false_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -449,8 +577,8 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                 ):
                     self._run(root, duration=0.3)
             run_dir = root / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-            self.assertTrue((run_dir / "frames.v1.jsonl").exists())
-            self.assertFalse((run_dir / "receipt.v1.json").exists())
+            self.assertTrue((run_dir / "frames.v2.jsonl").exists())
+            self.assertFalse((run_dir / "receipt.v2.json").exists())
 
     def test_frame_fsync_failure_is_failed_evidence_and_does_not_mask_cause(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
