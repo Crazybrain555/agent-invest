@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
@@ -45,6 +44,7 @@ from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.settings import Settings
 
 
@@ -251,10 +251,10 @@ def _load_evidence(
         )
         if final != initial:
             raise MinerUDeploymentGateError(f"{label} changed while being read")
-        payload = json.loads(encoded)
+        payload = strict_json_loads(encoded)
     except MinerUDeploymentGateError:
         raise
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise MinerUDeploymentGateError(f"{label} cannot be read: {exc}") from exc
     finally:
         if descriptor is not None:
@@ -478,7 +478,11 @@ def _verify_heldout_validation(
     earliest_start: datetime | None = None
     latest_finish: datetime | None = None
     for index, item in enumerate(documents):
-        if not isinstance(item, dict) or set(item) != {"receipt_sha256", "receipt"}:
+        if not isinstance(item, dict) or set(item) != {
+            "receipt_sha256",
+            "source_bytes_sha256",
+            "receipt",
+        }:
             raise MinerUDeploymentGateError(
                 f"MinerU held-out document {index} wrapper drifted"
             )
@@ -486,6 +490,7 @@ def _verify_heldout_validation(
         if (
             not isinstance(receipt, dict)
             or item.get("receipt_sha256") != canonical_payload_sha256(receipt)
+            or not _is_prefixed_sha256(item.get("source_bytes_sha256"))
         ):
             raise MinerUDeploymentGateError(
                 f"MinerU held-out document {index} hash drifted"
@@ -537,12 +542,17 @@ def _verify_epoch_wrapper(
     runtime_identity: str,
     label: str,
 ) -> tuple[str, datetime]:
-    if not isinstance(value, dict) or set(value) != {"receipt_sha256", "receipt"}:
+    if not isinstance(value, dict) or set(value) != {
+        "receipt_sha256",
+        "source_bytes_sha256",
+        "receipt",
+    }:
         raise MinerUDeploymentGateError(f"MinerU {label} epoch wrapper drifted")
     receipt = value.get("receipt")
     if (
         not isinstance(receipt, dict)
         or value.get("receipt_sha256") != canonical_payload_sha256(receipt)
+        or not _is_prefixed_sha256(value.get("source_bytes_sha256"))
         or set(receipt)
         != {
             "schema",
@@ -577,6 +587,9 @@ def _verify_epoch_wrapper(
             "runtime_manifest_identity_sha256",
             "collector_sha256",
             "windows_node_identity_sha256",
+            "windows_compose_sha256",
+            "writer_code_sha256",
+            "api_image_digest",
             "container_epoch_sha256",
             "api_container_id",
         }

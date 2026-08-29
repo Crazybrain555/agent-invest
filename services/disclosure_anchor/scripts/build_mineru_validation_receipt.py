@@ -23,6 +23,7 @@ from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
 RECEIPT_SCHEMA = "mineru_heldout_validation_receipt.v1"
@@ -46,7 +47,7 @@ def _canonical_sha256(payload: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
 
-def _load(path: Path) -> dict[str, Any]:
+def _load(path: Path) -> tuple[dict[str, Any], str]:
     descriptor: int | None = None
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -80,15 +81,15 @@ def _load(path: Path) -> dict[str, Any]:
             before.st_mtime_ns,
         ):
             raise ValueError(f"held-out evidence changed while reading: {path}")
-        value = json.loads(encoded)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = strict_json_loads(encoded)
+    except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"held-out evidence cannot be read: {path}") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
     if not isinstance(value, dict):
         raise ValueError(f"held-out smoke receipt root is not an object: {path}")
-    return value
+    return value, "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _positive_int(value: object, *, label: str) -> int:
@@ -188,6 +189,9 @@ def _validate_epoch(
             "runtime_manifest_identity_sha256",
             "collector_sha256",
             "windows_node_identity_sha256",
+            "windows_compose_sha256",
+            "writer_code_sha256",
+            "api_image_digest",
             "container_epoch_sha256",
             "api_container_id",
         }
@@ -212,7 +216,8 @@ def build_receipt(
         raise ValueError(
             f"held-out validation requires {MIN_DOCUMENTS}..{MAX_DOCUMENTS} receipts"
         )
-    payloads = [_load(path) for path in paths]
+    loaded = [_load(path) for path in paths]
+    payloads = [item[0] for item in loaded]
     identities = [_validate_smoke(payload) for payload in payloads]
     source_identities = {value[0] for value in identities}
     if len(source_identities) != len(payloads):
@@ -228,8 +233,8 @@ def build_receipt(
             or payload.get("runtime_manifest") != first.get("runtime_manifest")
         ):
             raise ValueError("held-out validation receipts cross a runtime/epoch boundary")
-    epoch_before = _load(epoch_before_path)
-    epoch_after = _load(epoch_after_path)
+    epoch_before, epoch_before_raw_sha = _load(epoch_before_path)
+    epoch_after, epoch_after_raw_sha = _load(epoch_after_path)
     before_identity, before_time = _validate_epoch(
         epoch_before, runtime_identity=runtime_identity
     )
@@ -256,18 +261,21 @@ def build_receipt(
         "document_count": len(payloads),
         "epoch_before": {
             "receipt_sha256": _canonical_sha256(epoch_before),
+            "source_bytes_sha256": epoch_before_raw_sha,
             "receipt": epoch_before,
         },
         "epoch_after": {
             "receipt_sha256": _canonical_sha256(epoch_after),
+            "source_bytes_sha256": epoch_after_raw_sha,
             "receipt": epoch_after,
         },
         "documents": [
             {
                 "receipt_sha256": _canonical_sha256(payload),
+                "source_bytes_sha256": loaded[index][1],
                 "receipt": payload,
             }
-            for payload in payloads
+            for index, payload in enumerate(payloads)
         ],
     }
 

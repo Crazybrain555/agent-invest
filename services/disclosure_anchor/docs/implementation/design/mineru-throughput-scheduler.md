@@ -35,7 +35,7 @@ distinct(source_sha256, parser_profile_sha256, page_index) / host_hour
 
 2026-08-29 的 legacy trace 证明 348 个 window 的相邻 phase overlap 为 0，VLM interval 仅占 document
 wall 约 15.1%；它没有同步 CPU time 或 GPU kernel-busy，因此只能证明串行和供给间隔，不能单独证明
-GPU 饱和度。旧 A1/A2/B1/B2、固定 4/8/16 和 mandatory ABBA 已退役，不再是探索或授权门槛。
+GPU 饱和度。固定轮次、固定 corpus 与强制交叉重复已退出当前执行面。
 
 当前 C/S API 容器不挂 GPU，MinerU 的 `get_vram(cpu)` Auto 回退为 1 GiB，因此 hybrid batch ratio
 实际为 1；这不是 RTX 5080 容量结论。requested/effective ratio、OCR override 和各 CPU stage batch cap
@@ -164,7 +164,7 @@ WSL/Docker memory 只在证据表明“增加一个已测 owner 能改善供给�
 于全 quiescent 状态调整；每次调整产生新 runtime fingerprint。不得先为 ratio sweep 改内存，也不得
 保留固定 7 GiB。OOM、memory.events、PSI、swap/reclaim、CPU throttle 和 VRAM guard 是独立 stop signals。
 
-## 7. 配置生命周期与 Auto
+## 7. 配置生命周期
 
 ### 7.1 ProcessProfile：仅 QUIESCENT 切换
 
@@ -182,8 +182,8 @@ WSL/Docker memory 只在证据表明“增加一个已测 owner 能改善供给�
 - class/envelope、timeout、soft token share、fallback policy；
 - page/window partition 和 publication/lineage schema。
 
-只可从与当前 ProcessProfile 精确兼容的 validated catalog 选择。失败后换 profile 是新 attempt，先 drain
-旧 owner，再从 page 0 开始。
+只可选择与当前 ProcessProfile 精确兼容且有当前验证 receipt 的 profile。失败后换 profile 是新 attempt，
+先 drain 旧 owner，再从 page 0 开始。
 
 ### 7.3 运行时快环
 
@@ -191,8 +191,8 @@ WSL/Docker memory 只在证据表明“增加一个已测 owner 能改善供给�
 backpressure 和 circuit。降低 budget 不撤销在途 lease；提高只一步邻居、需高低水位 hysteresis、最小
 residence、cooldown 和连续有效样本。observer incomplete 时冻结 actuator并输出原因。
 
-Auto 是已验证 catalog 的 selector，不是在线 hill-climb。机器/runtime/model/config/epoch 漂移后回到
-显式 static 或 fail-closed；不得 warning 后静默选择另一个 profile。
+当前没有在线自调执行面。机器/runtime/model/config/epoch 漂移后回到显式 static 或 fail-closed；
+不得 warning 后静默选择另一个 profile。
 
 ## 8. Readiness、故障与 quiesce
 
@@ -235,13 +235,13 @@ frontend snapshot 2 s；durable heartbeat 10–15 s。缺失/不支持显式 una
 2. 落 final-POST global c7、process credits/A/C gates/model locks、bounded FastAPI admission 和 strict drain；
 3. 落 Mac parse/finalize 解耦，移除 huge 与 finalize Future 人为屏障；
 4. 所有确定性成功/异常/cancel/乱序/epoch 测试通过后，才允许 feature-flagged `task_slots=2`；
-5. 用非 A1 文档做 10–20 分钟 held-out：先 ratio 1/2/4/8 单槽隔离，再 slots/window/C 一次一维粗到细；
+5. 用独立 held-out 文档做 10–20 分钟验证：先 ratio 1/2/4/8 单槽隔离，再 slots/window/C 一次一维粗到细；
 6. correctness、memory、PSI、OOM、restart、preemption、drain 任一失败立即停止该 setting；
 7. 两次相邻提高的 goodput 改善均小于 `max(5%, 2×CV)`，或 GPU 在正 backlog 下持续忙且 ready queue
    为正，即到平台期；
-8. 最终 static winner 才进入真实 backlog + PostgreSQL publication soak；Auto 另行 commissioned。
+8. 最终 static winner 才进入真实 backlog + PostgreSQL publication soak。
 
-探索不要求 mandatory ABBA。legacy 只在新 telemetry 下做一个短 anchor，除非 epoch/measurement path 漂移
+探索只在新 telemetry 下做一个短 anchor，除非 epoch/measurement path 漂移
 或噪声超阈值，否则不重复。验证集必须含 regular/heavy/huge、OCR、table/formula、跨 page/window 表格、
 reading-order edge 和 controlled failure，且全部使用原始完整 PDF。
 
@@ -262,4 +262,3 @@ reading-order edge 和 controlled failure，且全部使用原始完整 PDF。
 - [Ray Data streaming execution](https://docs.ray.io/en/latest/data/data-internals.html)
 - [NVIDIA DALI performance tuning](https://docs.nvidia.com/deeplearning/dali/archives/dali_1_26_0/user-guide/docs/advanced_topics_performance_tuning.html)
 - [WSL resource controls](https://learn.microsoft.com/windows/wsl/wsl-config)
-

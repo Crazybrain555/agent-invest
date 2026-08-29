@@ -89,6 +89,19 @@ class MinerUOrchestratorTests(unittest.TestCase):
                 if expected_message:
                     self.assertIn(expected_message, str(raised.exception))
 
+        for payload in (
+            _payload()[:-1] + b',"status":"healthy"}',
+            _payload()[:-1] + b',"queued_tasks":NaN}',
+        ):
+            with self.subTest(payload=payload), patch(
+                "disclosure_anchor.adapters.runtime.mineru_orchestrator."
+                "ThreadOwnedPersistentHTTPClient",
+                return_value=self._transport(payload),
+            ), self.assertRaises(MinerUOrchestratorError):
+                fetch_mineru_orchestrator_health(
+                    "http://127.0.0.1:30002", expected_task_slots=3
+                )
+
     def test_wait_for_idle_observes_natural_drain_on_one_client(self) -> None:
         client = Mock()
         client.fetch.side_effect = [

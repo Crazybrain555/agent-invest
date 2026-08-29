@@ -25,7 +25,10 @@ class FreezeMineruServiceEpochTests(unittest.TestCase):
                     "windows_collector_sha256": COLLECTOR,
                     "windows_node_identity_sha256": NODE,
                     "ssh_host_key_sha256": "sha256:" + "6" * 64,
+                    "windows_compose_sha256": "sha256:" + "7" * 64,
                 },
+                "client": {"writer_code_sha256": "sha256:" + "8" * 64},
+                "orchestrator": {"container_image_digest": "sha256:" + "9" * 64},
             }
             wrapper = {
                 "identity_sha256": canonical_payload_sha256(manifest),

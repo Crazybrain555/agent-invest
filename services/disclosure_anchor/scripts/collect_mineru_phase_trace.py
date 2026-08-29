@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
-import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 
@@ -23,6 +23,7 @@ from disclosure_anchor.adapters.runtime.mineru_phase_trace_capture import (
     parse_phase_trace_capture,
     summarize_phase_trace_capture,
 )
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from scripts.freeze_mineru_campaign_epoch import _read_private_json
 
 
@@ -31,18 +32,43 @@ _MAX_CAPTURE_BYTES = 268_435_456
 _LOCAL_COLLECTOR = (
     Path(__file__).resolve().parent / "windows" / "collect_mineru_runtime.ps1"
 )
+_SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 
 def _read_regular(path: Path, *, label: str, maximum_bytes: int) -> bytes:
-    metadata = path.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or not 0 < metadata.st_size <= maximum_bytes
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or not 0 < metadata.st_size <= maximum_bytes
+        ):
+            raise ValueError(f"{label} must be one owner-only bounded regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            payload = handle.read(maximum_bytes + 1)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if len(payload) != metadata.st_size or (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_uid,
+        after.st_nlink,
+        after.st_size,
+        after.st_mtime_ns,
     ):
-        raise ValueError(f"{label} must be one bounded regular file")
-    payload = path.read_bytes()
-    if len(payload) != metadata.st_size:
         raise ValueError(f"{label} changed while reading")
     return payload
 
@@ -57,12 +83,17 @@ def _utc(value: object, *, label: str) -> datetime:
 
 
 def _wrapper(value: object, *, label: str) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != {"receipt_sha256", "receipt"}:
+    if not isinstance(value, dict) or set(value) != {
+        "receipt_sha256",
+        "source_bytes_sha256",
+        "receipt",
+    }:
         raise ValueError(f"{label} wrapper drifted")
     receipt = value.get("receipt")
     if (
         not isinstance(receipt, dict)
         or value.get("receipt_sha256") != canonical_payload_sha256(receipt)
+        or not isinstance(value.get("source_bytes_sha256"), str)
     ):
         raise ValueError(f"{label} hash drifted")
     return receipt
@@ -205,6 +236,7 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--validation-receipt", type=Path, required=True)
     parser.add_argument("--runtime-manifest", type=Path, required=True)
     parser.add_argument("--capacity-mode", choices=("legacy", "candidate"), required=True)
+    parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--profile-sha256", required=True)
     parser.add_argument("--ssh-host", required=True)
     parser.add_argument("--ssh-user", required=True)
@@ -217,7 +249,18 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _args(argv)
-    receipt = json.loads(
+    if _SHA256_RE.fullmatch(args.profile_sha256) is None:
+        raise ValueError("profile SHA-256 is not canonical")
+    profile = strict_json_loads(
+        _read_regular(
+            args.profile,
+            label="execution profile",
+            maximum_bytes=1024 * 1024,
+        )
+    )
+    if not isinstance(profile, dict) or canonical_payload_sha256(profile) != args.profile_sha256:
+        raise ValueError("profile SHA-256 does not match canonical execution profile")
+    receipt = strict_json_loads(
         _read_regular(
             args.validation_receipt,
             label="held-out validation receipt",

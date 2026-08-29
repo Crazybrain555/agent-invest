@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,12 +14,53 @@ from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
 )
 from scripts.mineru_smoke import (
     RECEIPT_SCHEMA,
+    _snapshot_pdf,
     _smoke_orchestrator_evidence,
     run_cli,
 )
 
 
 class MinerUSmokeCliReceiptTests(unittest.TestCase):
+    def test_source_pdf_snapshot_is_private_and_stable(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "fixtures/cninfo/sample_announcement.pdf"
+        snapshot_root, snapshot, digest, size, pages = _snapshot_pdf(
+            source, work_root=None
+        )
+        try:
+            self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(size, source.stat().st_size)
+            self.assertEqual(len(digest), 64)
+            self.assertGreaterEqual(pages, 1)
+        finally:
+            snapshot_root.cleanup()
+
+    def test_source_pdf_snapshot_rejects_symlink_and_read_race(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "fixtures/cninfo/sample_announcement.pdf"
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "source.pdf"
+            link.symlink_to(source)
+            with self.assertRaises(OSError):
+                _snapshot_pdf(link, work_root=None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raced = Path(tmp) / "source.pdf"
+            raced.write_bytes(source.read_bytes())
+            real_fstat = os.fstat
+            calls = 0
+
+            def changing_fstat(descriptor: int) -> os.stat_result:
+                nonlocal calls
+                value = real_fstat(descriptor)
+                calls += 1
+                if calls == 1:
+                    with raced.open("ab") as handle:
+                        handle.write(b" ")
+                return value
+
+            with patch("scripts.mineru_smoke.os.fstat", side_effect=changing_fstat):
+                with self.assertRaisesRegex(ValueError, "changed while snapshotting"):
+                    _snapshot_pdf(raced, work_root=None)
+
     def test_v5_evidence_accepts_retained_gauge_cleanup_without_deltas(self) -> None:
         def health(*, completed: int, failed: int) -> MinerUOrchestratorHealth:
             return MinerUOrchestratorHealth(

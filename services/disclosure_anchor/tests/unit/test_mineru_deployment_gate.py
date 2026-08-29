@@ -282,6 +282,9 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "windows_node_identity_sha256": topology[
                 "windows_node_identity_sha256"
             ],
+            "windows_compose_sha256": topology["windows_compose_sha256"],
+            "writer_code_sha256": manifest["client"]["writer_code_sha256"],
+            "api_image_digest": manifest["orchestrator"]["container_image_digest"],
             "container_epoch_sha256": "sha256:" + "8" * 64,
             "api_container_id": "9" * 64,
         }
@@ -307,6 +310,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
         def wrapped(payload: dict[str, object]) -> dict[str, object]:
             return {
                 "receipt_sha256": canonical_payload_sha256(payload),
+                "source_bytes_sha256": "sha256:" + "a" * 64,
                 "receipt": payload,
             }
 

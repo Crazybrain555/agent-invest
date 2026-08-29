@@ -125,6 +125,8 @@ _CREDENTIAL_COMMAND_FLAGS = {
 }
 _WRITER_CODE_RELPATHS = (
     "scripts/build_mineru_validation_receipt.py",
+    "scripts/collect_mineru_phase_trace.py",
+    "scripts/freeze_mineru_campaign_epoch.py",
     "scripts/mineru_smoke.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/artifacts.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/parser.py",
@@ -137,6 +139,8 @@ _WRITER_CODE_RELPATHS = (
     "src/disclosure_anchor/adapters/runtime/mineru_process_isolation.py",
     "src/disclosure_anchor/adapters/storage/provider_document_source.py",
     "src/disclosure_anchor/application/ports/parser.py",
+    "src/disclosure_anchor/application/contracts/mineru_api_health.py",
+    "src/disclosure_anchor/application/contracts/strict_json.py",
 )
 
 

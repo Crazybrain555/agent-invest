@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import threading
 import time
 from typing import Any
@@ -12,6 +11,10 @@ from disclosure_anchor.adapters.runtime.bounded_http import (
     BoundedHTTPProtocolError,
     BoundedHTTPTransportError,
     ThreadOwnedPersistentHTTPClient,
+)
+from disclosure_anchor.application.contracts.mineru_api_health import (
+    parse_mineru_api_health,
+    validate_mineru_api_health,
 )
 
 
@@ -192,15 +195,15 @@ def _decode_mineru_orchestrator_health(
     expected_cleanup_interval_seconds: int | None,
 ) -> MinerUOrchestratorHealth:
     try:
-        decoded = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise MinerUOrchestratorError("MinerU API health response is not JSON") from exc
-    return parse_mineru_orchestrator_health_payload(
-        decoded,
-        expected_task_slots=expected_task_slots,
-        expected_task_retention_seconds=expected_task_retention_seconds,
-        expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
-    )
+        decoded = parse_mineru_api_health(
+            payload,
+            expected_task_slots=expected_task_slots,
+            expected_task_retention_seconds=expected_task_retention_seconds,
+            expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+        )
+    except ValueError as exc:
+        raise MinerUOrchestratorError(str(exc)) from exc
+    return MinerUOrchestratorHealth(**decoded)
 
 
 def parse_mineru_orchestrator_health_payload(
@@ -212,72 +215,16 @@ def parse_mineru_orchestrator_health_payload(
 ) -> MinerUOrchestratorHealth:
     """Validate one already-decoded API health object under the shared contract."""
 
-    if not isinstance(decoded, dict):
-        raise MinerUOrchestratorError("MinerU API health root must be an object")
-    required = {
-        "status",
-        "version",
-        "protocol_version",
-        "queued_tasks",
-        "processing_tasks",
-        "completed_tasks",
-        "failed_tasks",
-        "max_concurrent_requests",
-        "max_pending_tasks_requested",
-        "max_pending_tasks_effective",
-        "processing_window_size",
-        "task_retention_seconds",
-        "task_cleanup_interval_seconds",
-    }
-    if set(decoded) != required:
-        raise MinerUOrchestratorError("MinerU API health fields drifted")
-    for field in required - {"status", "version"}:
-        value = decoded[field]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise MinerUOrchestratorError(f"MinerU API health {field} is invalid")
-    health = MinerUOrchestratorHealth(**decoded)
-    if health.status != "healthy":
-        raise MinerUOrchestratorError("MinerU API reported unhealthy")
-    if health.version != MINERU_API_VERSION:
-        raise MinerUOrchestratorError("MinerU API version drifted")
-    if health.protocol_version != MINERU_API_PROTOCOL_VERSION:
-        raise MinerUOrchestratorError("MinerU API protocol drifted")
-    if not (1 <= health.max_concurrent_requests <= MINERU_API_MAX_SUPPORTED_TASK_SLOTS):
-        raise MinerUOrchestratorError("MinerU API task-slot limit is unsupported")
-    if (
-        expected_task_slots is not None
-        and health.max_concurrent_requests != expected_task_slots
-    ):
-        raise MinerUOrchestratorError("MinerU API task-slot limit drifted")
-    if health.processing_window_size != MINERU_API_PROCESSING_WINDOW_SIZE:
-        raise MinerUOrchestratorError("MinerU API processing window drifted")
-    if health.processing_tasks > health.max_concurrent_requests:
-        raise MinerUOrchestratorError(
-            "MinerU API processing count exceeds its declared limit"
+    try:
+        health = validate_mineru_api_health(
+            decoded,
+            expected_task_slots=expected_task_slots,
+            expected_task_retention_seconds=expected_task_retention_seconds,
+            expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
         )
-    if (
-        health.max_pending_tasks_effective < health.max_concurrent_requests
-        or health.max_pending_tasks_effective < health.max_pending_tasks_requested
-        or health.active_tasks > health.max_pending_tasks_effective
-    ):
-        raise MinerUOrchestratorError(
-            "MinerU API pending-task capacity is invalid"
-        )
-    if health.active_tasks > health.processing_window_size:
-        raise MinerUOrchestratorError(
-            "MinerU API active task count exceeds its declared window"
-        )
-    if (
-        expected_task_retention_seconds is not None
-        and health.task_retention_seconds != expected_task_retention_seconds
-    ):
-        raise MinerUOrchestratorError("MinerU API task retention drifted")
-    if (
-        expected_cleanup_interval_seconds is not None
-        and health.task_cleanup_interval_seconds != expected_cleanup_interval_seconds
-    ):
-        raise MinerUOrchestratorError("MinerU API cleanup interval drifted")
-    return health
+    except ValueError as exc:
+        raise MinerUOrchestratorError(str(exc)) from exc
+    return MinerUOrchestratorHealth(**health)
 
 
 def wait_for_mineru_orchestrator_idle(

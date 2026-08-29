@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ from disclosure_anchor.adapters.runtime.mineru_process_isolation import (
     process_snapshot,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.domain.errors import DisclosureAnchorError
 
 
@@ -77,6 +79,73 @@ def _normalize_sha256(value: str, *, label: str) -> str:
     return match.group(1)
 
 
+def _snapshot_pdf(
+    path: Path, *, work_root: Path | None
+) -> tuple[tempfile.TemporaryDirectory[str], Path, str, int, int]:
+    """Create one stable private PDF snapshot used by hash, page probe and parse."""
+
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    snapshot_root: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_size < 1
+        ):
+            raise ValueError("smoke input must be one owner-owned regular file")
+        snapshot_root = tempfile.TemporaryDirectory(
+            prefix="disclosure-mineru-input-", dir=work_root
+        )
+        snapshot = Path(snapshot_root.name) / "source.pdf"
+        output = os.open(
+            snapshot,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+                copied += len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(output, view)
+                    if written < 1:
+                        raise OSError("short write while snapshotting smoke input")
+                    view = view[written:]
+            os.fsync(output)
+        finally:
+            os.close(output)
+        after = os.fstat(descriptor)
+        def identity(item: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_mode,
+                item.st_uid,
+                item.st_nlink,
+                item.st_size,
+                item.st_mtime_ns,
+            )
+        if copied != before.st_size or identity(before) != identity(after):
+            raise ValueError("smoke input changed while snapshotting")
+        if stat.S_IMODE(snapshot.stat().st_mode) != 0o600:
+            raise ValueError("smoke input snapshot is not owner-only")
+        pages = count_pdf_pages(snapshot)
+        if pages < 1:
+            raise ValueError("smoke input has no pages")
+        return snapshot_root, snapshot, digest.hexdigest(), copied, pages
+    except BaseException:
+        if snapshot_root is not None:
+            snapshot_root.cleanup()
+        raise
+    finally:
+        os.close(descriptor)
+
+
 def _smoke_orchestrator_evidence(
     before: MinerUOrchestratorHealth,
     after: MinerUOrchestratorHealth,
@@ -102,7 +171,7 @@ def _runtime_manifest(
     local_processing_window_size: int,
     local_writer_code_digest: str,
 ) -> tuple[dict[str, Any], str, str]:
-    payload = json.loads(path.read_bytes())
+    payload = strict_json_loads(path.read_bytes())
     verified = verify_runtime_manifest_payload(
         payload,
         configured_identity=configured_identity,
@@ -331,14 +400,12 @@ def main(argv: list[str] | None = None) -> int:
         if output.exists() or output.is_symlink():
             raise SystemExit(f"[abort] output already exists; stale evidence: {output}")
 
-    input_bytes = args.input.read_bytes()
-    input_sha256 = _sha256(input_bytes)
     try:
-        input_page_count = count_pdf_pages(args.input)
+        snapshot_root, input_snapshot, input_sha256, copied, input_page_count = (
+            _snapshot_pdf(args.input, work_root=args.work_root)
+        )
     except (OSError, ValueError) as exc:
-        raise SystemExit(f"[abort] smoke input page count is unavailable: {exc}") from exc
-    if input_page_count < 1:
-        raise SystemExit("[abort] smoke input has no pages")
+        raise SystemExit(f"[abort] smoke input snapshot failed: {exc}") from exc
     expected_input = args.expected_input_sha256
     if expected_input is None and args.input.resolve() == DEFAULT_INPUT.resolve():
         expected_input = DEFAULT_INPUT_SHA256
@@ -442,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
                 server_url=inference_upstream_url,
             )
             source = smoke_path / f"sha256_{input_sha256}.pdf"
-            shutil.copyfile(args.input, source)
+            shutil.copyfile(input_snapshot, source)
             result = document_parser.parse(
                 input_pdf=source,
                 output_dir=smoke_path / "output",
@@ -472,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
             }
     except (DisclosureAnchorError, OSError, ValueError) as exc:
         parse_failure = exc
+    finally:
+        snapshot_root.cleanup()
     cleanup_proved = smoke_path is not None and not smoke_path.exists()
     if not cleanup_proved:
         raise SystemExit("[abort] MinerU smoke temporary tree was not removed")
@@ -531,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "logical_name": args.input.name,
             "sha256": f"sha256:{input_sha256}",
-            "bytes": len(input_bytes),
+            "bytes": copied,
             "page_count": input_page_count,
         },
         "identity": {

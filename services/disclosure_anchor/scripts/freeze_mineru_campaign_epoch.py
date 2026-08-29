@@ -18,6 +18,7 @@ from disclosure_anchor.adapters.runtime.mineru_host_capacity_observer import (
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     canonical_payload_sha256,
 )
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
 FREEZE_SCHEMA = "mineru-service-epoch-freeze.v2"
@@ -53,7 +54,7 @@ def _read_private_json(path: Path) -> dict[str, object]:
             raise ValueError("runtime manifest changed while reading")
     finally:
         os.close(descriptor)
-    decoded = json.loads(payload)
+    decoded = strict_json_loads(payload)
     if not isinstance(decoded, dict):
         raise ValueError("runtime manifest root must be an object")
     return decoded
@@ -74,6 +75,11 @@ def _write_new(path: Path, payload: object) -> None:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        parent = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     except BaseException:
         path.unlink(missing_ok=True)
         raise
@@ -104,14 +110,29 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise ValueError("runtime manifest identity is invalid")
         topology = manifest.get("topology")
-        if not isinstance(topology, dict):
+        local = manifest.get("client")
+        orchestrator = manifest.get("orchestrator")
+        if not all(isinstance(item, dict) for item in (topology, local, orchestrator)):
             raise ValueError("runtime manifest topology is invalid")
+        assert isinstance(topology, dict)
+        assert isinstance(local, dict)
+        assert isinstance(orchestrator, dict)
         collector_sha256 = topology.get("windows_collector_sha256")
         node_sha256 = topology.get("windows_node_identity_sha256")
         host_key_sha256 = topology.get("ssh_host_key_sha256")
+        compose_sha256 = topology.get("windows_compose_sha256")
+        writer_sha256 = local.get("writer_code_sha256")
+        api_image_digest = orchestrator.get("container_image_digest")
         if not all(
             isinstance(item, str)
-            for item in (collector_sha256, node_sha256, host_key_sha256)
+            for item in (
+                collector_sha256,
+                node_sha256,
+                host_key_sha256,
+                compose_sha256,
+                writer_sha256,
+                api_image_digest,
+            )
         ):
             raise ValueError("runtime manifest host identity is invalid")
         ssh = build_host_observer_ssh_command(
@@ -147,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
             "runtime_manifest_identity_sha256": runtime_identity,
             "collector_sha256": collector_sha256,
             "windows_node_identity_sha256": node_sha256,
+            "windows_compose_sha256": compose_sha256,
+            "writer_code_sha256": writer_sha256,
+            "api_image_digest": api_image_digest,
             "container_epoch_sha256": sample.container_epoch_sha256,
             "api_container_id": sample.api_container_id,
         }

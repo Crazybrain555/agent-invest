@@ -245,9 +245,8 @@ deployment ritual。
 `DEGRADED_TRANSPORT`、关闭后续 admission 并继续当前 owner 的自然 drain；恢复后的样本必须原样保留，
 但该阶段仍是 evidence-incomplete。health JSON/identity/slot/window 的严格合同错误仍是 operational failure。
 `completed_tasks`/`failed_tasks` 是保留期内 terminal registry 的人口 gauge，可随 600 秒 retention/30 秒
-cleanup 合法下降；v7 receipt 原样保留 baseline/samples/terminal 与 min/max，但禁止把它们解释为累计任务账。
-修复前缺少 orchestrator observer/sampling-failure 固定字段的旧 v6 receipt 只可用于 RCA；exact-current
-deployment/commissioning verifier 会拒绝其 shape，不能用于 catalog、Auto 或 worker admission。
+cleanup 合法下降，不能把它们解释为累计任务账。当前 deployment gate 只接受 smoke v5 与 held-out
+validation v1；其他历史 receipt 不具备 admission 权限。
 每份输入是否成功改由 exact input SHA、official writer 零退出、完整源/输出页数相等和 provider bundle hash
 逐文档证明；每阶段仍必须自然 drain 到 queued=processing=0。API 没有 cancel endpoint；observer-only
 failure 只能关闭新 admission，不能终止当前本地 CLI 来冒充远端 cancel。文档自身失败或 operator 本地中止
@@ -257,12 +256,10 @@ metrics 持续不可用、waiting≥64 连续 30 秒、preemption counter 任意
 overload、OOM 或 EngineCore failure 都立即 FAIL，清理本地子进程/临时目录且不进入下一阶段。
 每阶段 receipt 除 min/max 外还保留 running/waiting/KV 的 p95；当前只作容量诊断，不在没有现场
 证据时把历史经验阈值升级成正确性门禁。
-receipt 必须是不存在的新路径，按 mode 0600 创建；每一轮 PASS 必须同时有三阶段完整逐文档结果、
-retained-gauge 原始观测和零清理残留；两轮必须是时间上相继、路径不同的完整运行，
-FAIL receipt 不能用于开启 steady state。parse-capable worker/pipeline/admin 会在连 DB 前重算并核验
-这个 PASS 的 runtime/client/code、异构 corpus、逐阶段/逐文档、metrics、时间与 cleanup；路径缺失、
-证据漂移或早于对应 smoke 一律拒绝入场。该命令声明 database/queue access 均为 none；不得与 worker、
-pipeline 或 API producer 并行执行，也不得将其输出目录指向 AgentSSD 的正式 derived root。
+receipt 必须是不存在的新路径，按 mode 0600 创建；FAIL receipt 不能用于开启 steady state。
+parse-capable worker/pipeline/admin 会在连 DB 前重算并核验当前 PASS 的 runtime/client/code、held-out
+逐文档、时间、epoch 与 cleanup；路径缺失或证据漂移一律拒绝入场。该命令声明 database/queue access
+均为 none；不得与 worker、pipeline 或 API producer 并行执行。
 
 ### 1.1b Semantic provider chain
 
@@ -337,12 +334,11 @@ configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 r
 时仅验证“失败证据本身是否完整可信”。详细契约、coverage 和隐私边界见
 `../design/capacity-observation.md`。
 
-### 1.1e Default-off capacity profile commissioning
+### 1.1e 容量探索边界
 
-当前操作真相以 `../design/mineru-throughput-scheduler.md` 为准。旧的固定
-`A1 -> B1 -> B2 -> A2`、固定 4/8/16 capacity search、固定 7 GiB reserve、旧 evaluator 与 catalog
-builder 已从仓库删除；不得从历史提交恢复为操作入口。新同步 telemetry runner 与容量搜索 receipt
-尚未完成前，本节的运行结论是 `STOP`。
+当前操作真相以 `../design/mineru-throughput-scheduler.md` 为准。已退役的固定轮次、固定 corpus、
+固定内存门槛和 catalog builder 不再构成当前操作面。同步 telemetry 与容量搜索尚未形成受支持命令前，
+不得仅凭历史 receipt 改变运行参数。
 
 默认构建和部署仍必须保持 `MINERU_CAPACITY_MODE=legacy`、`MINERU_PHASE_TRACE=0`、
 `MINERU_API_MAX_CONCURRENT_REQUESTS=1`、`MINERU_API_MAX_PENDING_TASKS=1`。合入的调度代码和 candidate
@@ -351,18 +347,18 @@ identity，并重新通过 multimodal canary、epoch、OOM/restart 和 drain 门
 
 新的受控容量搜索必须满足：
 
-- 使用未参与旧 A1 的 held-out 完整真实 PDF，覆盖 regular/heavy/huge、OCR、表格/公式、跨页结构和
+- 使用独立 held-out 完整真实 PDF，覆盖 regular/heavy/huge、OCR、表格/公式、跨页结构和
   controlled failure；单轮目标 10--20 分钟，不机械重复数小时 baseline；
 - 先做一个短 legacy anchor；只有 measurement path/epoch 漂移或噪声超过门槛才重跑；
 - 先在单 task slot 下隔离 sweep effective hybrid ratio `1/2/4/8`，再一次只改变 slots、pending、window、
-  C-stage 或 credit envelope 的一个相邻值；不得预设某个 B1/B2 是局部最优；
+  C-stage 或 credit envelope 的一个相邻值；不得预设某个候选是局部最优；
 - 全程用 synchronized telemetry 记录 GPU 250--500 ms、host/queue 1 s、phase transition 与 durable commit；
   主指标是同一完整 GPU-host wall span 内按 source identity 去重、成功整文档发布的页数/小时；
 - Docker/WSL/CPU/GPU 各资源域使用实测 baseline、active leases 和动态 guard；7 GiB 不是下限或目标；
 - 任一 source/page/structure closure、顺序、fallback、OOM、restart、epoch、credit、drain 或 telemetry
   completeness 失败立即停止该 setting；GPU 峰值或均值本身不能宣告胜出；
 - 连续相邻提高已进入证据定义的平台期，或 backlog-rich 时 GPU/CPU 已稳定工作且没有可调度 ready
-  work 被闲置，即停止搜索并冻结 practical winner。Auto 只能在另行验证的 catalog 内选择，不能在线试错。
+  work 被闲置，即停止搜索并冻结 practical winner。当前没有在线自调执行面。
 
 安装器仍必须以 `--provenance=false` 构建并闭合 base digest、Dockerfile/patcher hash、image
 labels/marker、安装 receipt 与 runtime attestation。复用已发布镜像时，只允许既有

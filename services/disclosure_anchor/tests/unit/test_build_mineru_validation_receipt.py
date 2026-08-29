@@ -68,6 +68,9 @@ def _epoch(created: datetime) -> dict[str, object]:
         "runtime_manifest_identity_sha256": RUNTIME,
         "collector_sha256": "sha256:" + "2" * 64,
         "windows_node_identity_sha256": "sha256:" + "3" * 64,
+        "windows_compose_sha256": "sha256:" + "6" * 64,
+        "writer_code_sha256": "sha256:" + "7" * 64,
+        "api_image_digest": "sha256:" + "8" * 64,
         "container_epoch_sha256": "sha256:" + "4" * 64,
         "api_container_id": "5" * 64,
     }
@@ -120,6 +123,7 @@ class BuildMineruValidationReceiptTests(unittest.TestCase):
             self.assertEqual(
                 wrapper["receipt_sha256"], _canonical_sha256(wrapper["receipt"])
             )
+            self.assertRegex(wrapper["source_bytes_sha256"], r"^sha256:[a-f0-9]{64}$")
 
     def test_rejects_duplicate_page_loss_epoch_drift_and_bad_timeline(self) -> None:
         for tamper in ("duplicate", "page_loss", "epoch", "timeline"):
@@ -180,6 +184,15 @@ class BuildMineruValidationReceiptTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "changed while reading"),
             ):
                 _load(smokes[0])
+
+    def test_input_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
+        for encoded in (b'{"a":1,"a":2}', b'{"a":NaN}'):
+            with self.subTest(encoded=encoded), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "evidence.json"
+                path.write_bytes(encoded)
+                path.chmod(0o600)
+                with self.assertRaises(ValueError):
+                    _load(path)
 
 
 if __name__ == "__main__":

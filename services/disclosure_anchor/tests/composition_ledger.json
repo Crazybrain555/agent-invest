@@ -113,7 +113,7 @@
   },
   "tests/unit/test_build_mineru_validation_receipt.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 4
   },
   "tests/unit/test_build_research_watchlist.py": {
    "private_imports": [],
@@ -316,7 +316,7 @@
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 8
   },
   "tests/unit/test_mineru_ssh_tunnel.py": {
    "private_imports": [],

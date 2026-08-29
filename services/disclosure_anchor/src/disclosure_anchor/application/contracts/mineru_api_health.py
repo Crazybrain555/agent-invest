@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import TypedDict
+
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
 MINERU_API_HEALTH_FIELDS = frozenset(
@@ -41,28 +42,35 @@ class MineruApiHealth(TypedDict):
     task_cleanup_interval_seconds: int
 
 
-def parse_mineru_api_health(
-    payload: bytes,
+def validate_mineru_api_health(
+    decoded: object,
     *,
     expected_task_slots: int | None,
+    expected_task_retention_seconds: int | None = 600,
+    expected_cleanup_interval_seconds: int | None = 30,
 ) -> MineruApiHealth:
-    try:
-        decoded = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("MinerU API health is not valid UTF-8 JSON") from exc
     if not isinstance(decoded, dict) or set(decoded) != MINERU_API_HEALTH_FIELDS:
         raise ValueError("MinerU API health fields are not closed")
+    if (
+        expected_task_slots is not None
+        and decoded.get("max_concurrent_requests") != expected_task_slots
+    ):
+        raise ValueError("MinerU API task-slot limit drifted")
     if (
         decoded.get("status") != "healthy"
         or decoded.get("version") != "3.4.4"
         or decoded.get("protocol_version") != 2
-        or (
-            expected_task_slots is not None
-            and decoded.get("max_concurrent_requests") != expected_task_slots
-        )
         or decoded.get("processing_window_size") != 16
-        or decoded.get("task_retention_seconds") != 600
-        or decoded.get("task_cleanup_interval_seconds") != 30
+        or (
+            expected_task_retention_seconds is not None
+            and decoded.get("task_retention_seconds")
+            != expected_task_retention_seconds
+        )
+        or (
+            expected_cleanup_interval_seconds is not None
+            and decoded.get("task_cleanup_interval_seconds")
+            != expected_cleanup_interval_seconds
+        )
     ):
         raise ValueError("MinerU API identity or health drifted")
     integer_fields = MINERU_API_HEALTH_FIELDS - {"status", "version"}
@@ -92,7 +100,7 @@ def parse_mineru_api_health(
         or decoded["max_pending_tasks_effective"]
         < decoded["max_concurrent_requests"]
     ):
-        raise ValueError("MinerU API health counters exceed declared limits")
+        raise ValueError("MinerU API pending/task counters exceed declared limits")
     return MineruApiHealth(
         status=decoded["status"],
         version=decoded["version"],
@@ -110,4 +118,27 @@ def parse_mineru_api_health(
     )
 
 
-__all__ = ["MINERU_API_HEALTH_FIELDS", "parse_mineru_api_health"]
+def parse_mineru_api_health(
+    payload: bytes,
+    *,
+    expected_task_slots: int | None,
+    expected_task_retention_seconds: int | None = 600,
+    expected_cleanup_interval_seconds: int | None = 30,
+) -> MineruApiHealth:
+    try:
+        decoded = strict_json_loads(payload)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("MinerU API health is not valid strict UTF-8 JSON") from exc
+    return validate_mineru_api_health(
+        decoded,
+        expected_task_slots=expected_task_slots,
+        expected_task_retention_seconds=expected_task_retention_seconds,
+        expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+    )
+
+
+__all__ = [
+    "MINERU_API_HEALTH_FIELDS",
+    "parse_mineru_api_health",
+    "validate_mineru_api_health",
+]
