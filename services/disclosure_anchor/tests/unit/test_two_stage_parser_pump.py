@@ -24,6 +24,65 @@ def _receipt(sequence: int, *, byte_count: int = 1) -> RemoteArtifactReceipt:
 
 
 class TwoStageParserPumpTests(unittest.TestCase):
+    def test_remote_failure_is_acked_only_after_durable_failure_checkpoint(self) -> None:
+        events: list[str] = []
+
+        def remote_failure() -> RemoteArtifactReceipt:
+            raise RuntimeError("remote failed")
+
+        outcome = BoundedTwoStageParserPump[str](
+            remote_workers=1,
+            local_workers=1,
+            max_terminal_receipts=1,
+            max_local_items=1,
+            max_local_bytes=1,
+        ).run(
+            (
+                TwoStageParseWork(
+                    sequence=0,
+                    item_identity="doc-0",
+                    wait_remote_terminal=remote_failure,
+                    persist_local=lambda _value: "unused",
+                    checkpoint_remote_terminal=lambda _value: None,
+                    checkpoint_remote_failure=lambda _error: events.append(
+                        "failure_committed"
+                    ),
+                    acknowledge_remote_failure=lambda: events.append("acked"),
+                ),
+            )
+        )[0]
+        self.assertEqual(outcome.status, "remote_failed")
+        self.assertEqual(events, ["failure_committed", "acked"])
+
+    def test_remote_failure_checkpoint_error_never_acks(self) -> None:
+        acked = threading.Event()
+        outcome = BoundedTwoStageParserPump[str](
+            remote_workers=1,
+            local_workers=1,
+            max_terminal_receipts=1,
+            max_local_items=1,
+            max_local_bytes=1,
+        ).run(
+            (
+                TwoStageParseWork(
+                    sequence=0,
+                    item_identity="doc-0",
+                    wait_remote_terminal=lambda: (_ for _ in ()).throw(
+                        RuntimeError("remote failed")
+                    ),
+                    persist_local=lambda _value: "unused",
+                    checkpoint_remote_terminal=lambda _value: None,
+                    checkpoint_remote_failure=lambda _error: (_ for _ in ()).throw(
+                        OSError("checkpoint failed")
+                    ),
+                    acknowledge_remote_failure=acked.set,
+                ),
+            )
+        )[0]
+        self.assertEqual(outcome.status, "remote_failed")
+        self.assertRegex(str(outcome.error), "checkpoint failed")
+        self.assertFalse(acked.is_set())
+
     def test_remote_refills_while_first_local_persist_is_blocked(self) -> None:
         first_local_started = threading.Event()
         release_first_local = threading.Event()

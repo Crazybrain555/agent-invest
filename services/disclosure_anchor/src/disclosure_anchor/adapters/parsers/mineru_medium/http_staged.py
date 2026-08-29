@@ -543,6 +543,16 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             raise _fail("remote ACK receipt ownership drifted")
         if not self._task.task_protocol_v2:
             return
+        self._ack_terminal()
+
+    def acknowledge_after_failure_committed(self, *, checkpoint_state: str) -> None:
+        if checkpoint_state != "failure_committed":
+            raise _fail("remote failure ACK requires a durable failure_committed checkpoint")
+        if not self._task.task_protocol_v2:
+            return
+        self._ack_terminal()
+
+    def _ack_terminal(self) -> None:
         with self._client(30.0) as client:
             with client.stream(
                 "POST", f"{self._task.base_url}/tasks/{self._task.task_id}/ack"

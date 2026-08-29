@@ -78,6 +78,9 @@ class RemoteProviderParseHandle(Protocol):
     ) -> None:
         """ACK only after the durable DB checkpoint is exactly finish_committed."""
 
+    def acknowledge_after_failure_committed(self, *, checkpoint_state: str) -> None:
+        """ACK a remote failure only after its durable failure checkpoint."""
+
 
 class StagedProviderDocumentParserPort(Protocol):
     """Capability port; absence keeps the existing synchronous parser path."""

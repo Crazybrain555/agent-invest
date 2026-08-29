@@ -30,6 +30,8 @@ class TwoStageParseWork(Generic[LocalResultT]):
     checkpoint_remote_terminal: Callable[[RemoteArtifactReceipt], None]
     recovered_terminal: RemoteArtifactReceipt | None = None
     cancel_and_drain: Callable[[], None] = lambda: None
+    checkpoint_remote_failure: Callable[[BaseException], None] | None = None
+    acknowledge_remote_failure: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.sequence < 0 or not self.item_identity.strip():
@@ -228,6 +230,14 @@ class BoundedTwoStageParserPump(Generic[LocalResultT]):
                             receipt = remote_future.result()
                             item.checkpoint_remote_terminal(receipt)
                         except Exception as exc:  # noqa: BLE001 - stage failure is data
+                            if not stopping and item.checkpoint_remote_failure is not None:
+                                try:
+                                    item.checkpoint_remote_failure(exc)
+                                    if item.acknowledge_remote_failure is not None:
+                                        item.acknowledge_remote_failure()
+                                except Exception as checkpoint_exc:  # noqa: BLE001
+                                    outcome(item, "remote_failed", error=checkpoint_exc)
+                                    continue
                             outcome(
                                 item,
                                 "cancelled" if stopping else "remote_failed",

@@ -449,7 +449,7 @@ class DurableTaskRegistry:
                 digest.update(chunk)
                 total += len(chunk)
             after = os.fstat(descriptor)
-            def identity(value):
+            def identity(value: os.stat_result) -> tuple[int, ...]:
                 return (
                     value.st_dev, value.st_ino, value.st_mode, value.st_uid,
                     value.st_nlink, value.st_size, value.st_mtime_ns,
@@ -742,12 +742,7 @@ class DurableTaskRegistry:
                         record.state,
                         record.consumed_at_unix,
                     )
-                    try:
-                        self._unlink_owned_result(
-                            record, before_unlink=unlink
-                        )
-                    except FileNotFoundError:
-                        pass
+                    self._unlink_owned_result(record, before_unlink=unlink)
                     record.result_path = None
                     record.task_payload = None
                     record.lease_until_unix = None
@@ -783,9 +778,12 @@ class DurableTaskRegistry:
         if not isinstance(protocol, dict) or not isinstance(output_value, str):
             if not self._enforce_key_lifecycle and record.result_path:
                 if before_unlink is None:
-                    Path(record.result_path).unlink()
+                    Path(record.result_path).unlink(missing_ok=True)
                 else:
-                    before_unlink(Path(record.result_path))
+                    try:
+                        before_unlink(Path(record.result_path))
+                    except FileNotFoundError:
+                        pass
                 return
             raise TaskProtocolConflict("cleanup task ownership receipt is absent")
         output = Path(output_value)
@@ -813,12 +811,20 @@ class DurableTaskRegistry:
                     )
             finally:
                 os.close(upload_fd)
-            metadata = os.stat(result.name, dir_fd=task_fd, follow_symlinks=False)
+            try:
+                metadata = os.stat(
+                    result.name, dir_fd=task_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                return
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise TaskProtocolConflict("cleanup result identity is unsafe")
             if before_unlink is not None:
                 before_unlink(result)
-            os.unlink(result.name, dir_fd=task_fd)
+            try:
+                os.unlink(result.name, dir_fd=task_fd)
+            except FileNotFoundError:
+                pass
         finally:
             os.close(task_fd)
             os.close(root_fd)
@@ -856,7 +862,7 @@ class DurableTaskRegistry:
                 remaining -= len(chunk)
             raw = b"".join(chunks)
             after = os.fstat(descriptor)
-            def identity(value):
+            def identity(value: os.stat_result) -> tuple[int, ...]:
                 return (
                     value.st_dev, value.st_ino, value.st_mode, value.st_uid,
                     value.st_nlink, value.st_size, value.st_mtime_ns,
@@ -867,8 +873,8 @@ class DurableTaskRegistry:
         finally:
             os.close(descriptor)
 
-        def closed_object(pairs):
-            value = {}
+        def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            value: dict[str, Any] = {}
             for key, item in pairs:
                 if key in value:
                     raise TaskProtocolConflict(

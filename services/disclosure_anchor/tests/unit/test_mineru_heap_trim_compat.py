@@ -9,6 +9,8 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -677,6 +679,92 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn('"X-MinerU-Result-SHA256"', patched)
         self.assertIn("cleanup_file(task.result_artifact_path)", patched)
         self.assertNotIn("return await build_result_response", patched)
+
+    def test_generated_retained_source_helper_covers_every_member_and_toc(self) -> None:
+        patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
+        start = patched.index("def _retained_result_sources")
+        end = patched.index("def _copy_bounded")
+
+        class AsyncParseTask:
+            def __init__(self, output_dir: str) -> None:
+                self.output_dir = output_dir
+
+        namespace = {
+            "AsyncParseTask": AsyncParseTask,
+            "os": os,
+            "stat": stat,
+        }
+        exec(compile(patched[start:end], "retained-helper.py", "exec"), namespace)
+        observe = namespace["_retained_result_sources"]
+        verify = namespace["_verify_and_close_result_sources"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a").mkdir()
+            (root / "b").mkdir()
+            first = root / "a" / "first"
+            first.write_bytes(b"first")
+            (root / "a" / "last").write_bytes(b"last")
+            (root / "b" / "only").write_bytes(b"only")
+            with patch.dict(
+                os.environ,
+                {"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "10485760"},
+            ):
+                _budget, observations = observe(AsyncParseTask(directory))
+            self.assertEqual(len(observations), 3)
+            first.write_bytes(b"drift")
+            with self.assertRaisesRegex(RuntimeError, "changed"):
+                verify(observations)
+
+    def test_generated_retained_source_helper_rejects_member_4097(self) -> None:
+        patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
+        start = patched.index("def _retained_result_sources")
+        end = patched.index("def _copy_bounded")
+
+        class AsyncParseTask:
+            output_dir = "/owned"
+
+        class FakeMetadata:
+            st_dev = 1
+            st_ino = 1
+            st_mode = stat.S_IFREG | 0o600
+            st_nlink = 1
+            st_size = 0
+            st_mtime_ns = 1
+            st_ctime_ns = 1
+
+        class FakeOS:
+            O_RDONLY = os.O_RDONLY
+            O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+            path = os.path
+            environ = {"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "268435456"}
+
+            def __init__(self) -> None:
+                self.closed = 0
+
+            def getenv(self, key, default=None):
+                return self.environ.get(key, default)
+
+            @staticmethod
+            def walk(_root):
+                yield "/owned", [], [f"f-{index}" for index in range(4097)]
+
+            @staticmethod
+            def open(_path, _flags):
+                return 7
+
+            @staticmethod
+            def fstat(_descriptor):
+                return FakeMetadata()
+
+            def close(self, _descriptor):
+                self.closed += 1
+
+        fake_os = FakeOS()
+        namespace = {"AsyncParseTask": AsyncParseTask, "os": fake_os, "stat": stat}
+        exec(compile(patched[start:end], "retained-cap.py", "exec"), namespace)
+        with self.assertRaisesRegex(RuntimeError, "member/FD"):
+            namespace["_retained_result_sources"](AsyncParseTask())
+        self.assertEqual(fake_os.closed, 4096)
 
     def test_preimages_match_the_reproduced_deployed_344_sources(self) -> None:
         self.assertEqual(

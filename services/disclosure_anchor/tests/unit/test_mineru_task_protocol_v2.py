@@ -326,6 +326,79 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             registry._persist = original_persist
             self.assertEqual(registry.cleanup_consumed(Path.unlink), 1)
 
+    def test_cleanup_only_tolerates_missing_result_leaf(self) -> None:
+        for mutation in ("root", "task", "uploads", "leaf"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                output_root = base / "output"
+                output_root.mkdir()
+                now = 1_000_000.0
+                key = self._lifecycle_key(1, now)
+                registry = DurableTaskRegistry(
+                    base / "registry.json",
+                    max_unacked_result_bytes=100,
+                    output_root=output_root,
+                    tombstone_retention_seconds=7200,
+                    enforce_key_lifecycle=True,
+                    clock=lambda: now,
+                )
+                task_root = output_root / "task-owned"
+                uploads = task_root / "uploads"
+                uploads.mkdir(parents=True)
+                upload = uploads / "input.pdf"
+                upload.write_bytes(b"pdf")
+                registry.reconcile_or_create(
+                    idempotency_key=key,
+                    task_id="task-owned",
+                    attempt_identity="attempt",
+                    fence_identity="fence",
+                )
+                registry.bind_task_payload(
+                    key,
+                    {
+                        "task_id": "task-owned",
+                        "output_dir": str(task_root),
+                        "uploads": [str(upload)],
+                    },
+                )
+                registry.transition(key, "processing")
+                registry.transition(key, "finalizing")
+                registry.reserve_finalizer(key, byte_budget=1)
+                result = task_root / ".retained-result.zip"
+                result.write_bytes(b"x")
+                digest = hashlib.sha256(b"x").hexdigest()
+                registry.complete(
+                    key,
+                    result_path=result,
+                    result_sha256=digest,
+                    result_bytes=1,
+                    result_owner=hashlib.sha256(
+                        f"task-owned\0{digest}\0{1}".encode()
+                    ).hexdigest(),
+                )
+                registry.acknowledge(key)
+                if mutation == "root":
+                    output_root.rename(base / "old-output")
+                    output_root.mkdir()
+                elif mutation == "task":
+                    task_root.rename(output_root / "old-task")
+                    (task_root / "uploads").mkdir(parents=True)
+                elif mutation == "uploads":
+                    uploads.rename(task_root / "old-uploads")
+                    uploads.mkdir()
+                else:
+                    result.unlink()
+                if mutation == "leaf":
+                    self.assertEqual(registry.cleanup_consumed(), 1)
+                else:
+                    with self.assertRaises(
+                        (FileNotFoundError, TaskProtocolConflict)
+                    ):
+                        registry.cleanup_consumed()
+                    self.assertEqual(
+                        registry.get(key).state, "cleanup_pending"  # type: ignore[union-attr]
+                    )
+
     def test_idempotency_reconciles_exact_and_rejects_conflict_before_allocation(
         self,
     ) -> None:
