@@ -448,9 +448,16 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "            observed = (current.st_dev, current.st_ino, current.st_mode, current.st_nlink, current.st_size, current.st_mtime_ns, current.st_ctime_ns)\n"
             "            path_identity = (by_path.st_dev, by_path.st_ino, by_path.st_mode, by_path.st_nlink, by_path.st_size, by_path.st_mtime_ns, by_path.st_ctime_ns)\n"
             "            if observed != expected or path_identity != expected:\n"
-            "                failure = RuntimeError(\"result source changed during ZIP generation\")\n"
+            "                raise RuntimeError(\"result source changed during ZIP generation\")\n"
+            "        except BaseException as exc:\n"
+            "            if failure is None:\n"
+            "                failure = exc\n"
             "        finally:\n"
-            "            os.close(descriptor)\n"
+            "            try:\n"
+            "                os.close(descriptor)\n"
+            "            except BaseException as exc:\n"
+            "                if failure is None:\n"
+            "                    failure = exc\n"
             "    if failure is not None:\n"
             "        raise failure\n\n\n"
             "def _write_retained_zip_from_fds(observations, target: str, budget: int) -> None:\n"
@@ -988,7 +995,9 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        task.status = TASK_COMPLETED\n"
             "        task.completed_at = utc_now_iso()\n"
             "        self._signal_task_event(task.task_id)\n\n"
-            "    def cleanup_expired_tasks(self) -> int:\n",
+            "    def cleanup_expired_tasks(self) -> int:\n"
+            "        if self.task_protocol_v2 is not None:\n"
+            "            return self.task_protocol_v2.cleanup_consumed()\n",
             count=1,
             label="FastAPI task protocol legacy task wrapper",
         )

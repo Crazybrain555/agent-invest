@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 import unittest
@@ -12,6 +13,8 @@ from unittest.mock import patch
 import yaml
 
 from scripts.attest_mineru_remote_runtime import (
+    API_ENV_KEYS,
+    COMPAT_LABEL_KEYS,
     EXPECTED_API_COMPAT_IMAGE,
     EXPECTED_COLLECTOR_PATH,
     EXPECTED_COMPAT_PREIMAGES,
@@ -253,6 +256,89 @@ def _observation() -> dict[str, Any]:
 
 
 class AttestMinerURemoteRuntimeTests(unittest.TestCase):
+    def test_collector_exact_contract_feeds_attester_without_field_drift(self) -> None:
+        collector = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/windows/collect_mineru_runtime.ps1"
+        ).read_text(encoding="utf-8")
+
+        def array_values(variable: str) -> set[str]:
+            block = re.search(
+                rf"\${variable} = @\((.*?)\n\)", collector, flags=re.DOTALL
+            )
+            self.assertIsNotNone(block)
+            assert block is not None
+            return set(re.findall(r'"([A-Za-z0-9_./-]+)"', block.group(1)))
+
+        probe = re.search(
+            r"paths = \((.*?)\n\)", collector, flags=re.DOTALL
+        )
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        probe_paths = set(re.findall(r'"([^\"]+)"', probe.group(1)))
+        compatibility = re.search(
+            r"api_compatibility = \[ordered\]@\{(.*?)\n    \}",
+            collector,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(compatibility)
+        assert compatibility is not None
+        compatibility_fields = set(
+            re.findall(
+                r"^\s*([a-z0-9_]+) =",
+                compatibility.group(1),
+                flags=re.MULTILINE,
+            )
+        )
+
+        self.assertEqual(array_values("apiAllowedEnvironment"), API_ENV_KEYS)
+        self.assertEqual(array_values("compatLabelNames"), COMPAT_LABEL_KEYS)
+        self.assertEqual(probe_paths, set(EXPECTED_COMPAT_PREIMAGES))
+        self.assertEqual(
+            compatibility_fields,
+            {
+                "actual_source_sha256",
+                "capacity_runtime",
+                "heap_trim_enabled",
+                "hybrid_batch_ratio_requested",
+                "image_labels",
+                "marker",
+                "max_pending_tasks_effective",
+                "max_pending_tasks_requested",
+                "phase_trace_enabled",
+                "pipeline_inference_locks_enabled",
+            },
+        )
+
+        observation = _observation()
+        with (
+            patch(
+                "scripts.attest_mineru_remote_runtime.client_bundle_identity",
+                return_value=CLIENT,
+            ),
+            patch(
+                "scripts.attest_mineru_remote_runtime.writer_code_digest",
+                return_value=CODE_DIGEST,
+            ),
+        ):
+            payload = build_manifest(
+                observation,
+                mineru_bin=Path("/private/mineru"),
+                ssh_host_key_sha256="sha256:" + "6" * 64,
+                api_url="http://127.0.0.1:30002",
+                observability_url="http://127.0.0.1:30001/v1",
+                inference_upstream_url="http://mineru-openai-server:30000/v1",
+                expected_compose_sha256="sha256:" + "3" * 64,
+                expected_collector_sha256="sha256:" + "7" * 64,
+                expected_compat_patcher_sha256=PATCHER_DIGEST,
+                expected_compat_dockerfile_sha256=DOCKERFILE_DIGEST,
+                expected_task_protocol_v2_sha256=TASK_PROTOCOL_DIGEST,
+            )
+        self.assertEqual(
+            payload["identity_sha256"],
+            canonical_payload_sha256(payload["manifest"]),
+        )
+
     def test_build_manifest_binds_live_remote_observation(self) -> None:
         observation = _observation()
         with (

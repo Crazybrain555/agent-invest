@@ -590,7 +590,8 @@ $apiAllowedEnvironment = @(
     "MINERU_API_OUTPUT_ROOT", "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_MALLOC_TRIM",
     "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS", "MINERU_HYBRID_BATCH_RATIO",
-    "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE"
+    "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE",
+    "MINERU_TASK_PROTOCOL_V2"
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
 $apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
@@ -619,6 +620,7 @@ from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
 from mineru.cli.fast_api import get_max_pending_tasks
 
 paths = (
+    "mineru/cli/api_request.py",
     "mineru/backend/vlm/vlm_analyze.py",
     "mineru/backend/hybrid/hybrid_analyze.py",
     "mineru/cli/fast_api.py",
@@ -671,7 +673,8 @@ $compatLabelNames = @(
     "io.agent-invest.mineru.capacity-policy",
     "io.agent-invest.mineru.compatibility-policy",
     "io.agent-invest.mineru.compatibility-patcher-sha256",
-    "io.agent-invest.mineru.compatibility-dockerfile-sha256"
+    "io.agent-invest.mineru.compatibility-dockerfile-sha256",
+    "io.agent-invest.mineru.task-protocol-v2-sha256"
 )
 $compatLabels = [ordered]@{}
 foreach ($name in $compatLabelNames) {
@@ -776,6 +779,10 @@ $result = [ordered]@{
         capacity_runtime = $compatProbe.capacity_runtime
         heap_trim_enabled = [bool]$compatProbe.heap_trim_enabled
         phase_trace_enabled = [bool]$compatProbe.phase_trace_enabled
+        hybrid_batch_ratio_requested = [int]$compatProbe.hybrid_batch_ratio_requested
+        max_pending_tasks_requested = [int]$compatProbe.max_pending_tasks_requested
+        max_pending_tasks_effective = [int]$compatProbe.max_pending_tasks_effective
+        pipeline_inference_locks_enabled = [bool]$compatProbe.pipeline_inference_locks_enabled
         image_labels = $compatLabels
     }
     proxy = [ordered]@{

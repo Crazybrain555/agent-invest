@@ -680,6 +680,17 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn('"X-MinerU-Result-SHA256"', patched)
         self.assertIn("cleanup_file(task.result_artifact_path)", patched)
         self.assertNotIn("return await build_result_response", patched)
+        patcher = (
+            Path(__file__).resolve().parents[2]
+            / "scripts/windows/mineru_heap_trim_compat/patch_mineru_344.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"        if self.task_protocol_v2 is not None:\\n"', patcher
+        )
+        self.assertIn(
+            '"            return self.task_protocol_v2.cleanup_consumed()\\n"',
+            patcher,
+        )
 
     def test_generated_retained_source_helper_covers_every_member_and_toc(self) -> None:
         patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
@@ -745,6 +756,76 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             first.write_bytes(b"drift")
             with self.assertRaisesRegex(RuntimeError, "changed"):
                 verify(observations)
+
+    def test_retained_source_verifier_closes_every_fd_without_masking_identity_error(self) -> None:
+        patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
+        start = patched.index("def _retained_result_sources")
+        end = patched.index("async def build_retained_task_result")
+        namespace = {"os": os, "stat": stat}
+        exec(compile(patched[start:end], "retained-helper.py", "exec"), namespace)
+        verify = namespace["_verify_and_close_result_sources"]
+
+        for missing_index in range(3):
+            with self.subTest(missing_index=missing_index), tempfile.TemporaryDirectory() as directory:
+                paths = [Path(directory) / f"member-{index}" for index in range(3)]
+                for path in paths:
+                    path.write_bytes(path.name.encode())
+                observations = []
+                descriptors = []
+                for path in paths:
+                    descriptor = os.open(path, os.O_RDONLY)
+                    descriptors.append(descriptor)
+                    metadata = os.fstat(descriptor)
+                    identity = (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_nlink,
+                        metadata.st_size,
+                        metadata.st_mtime_ns,
+                        metadata.st_ctime_ns,
+                    )
+                    observations.append((str(path), path.name, descriptor, identity))
+                paths[missing_index].unlink()
+                real_close = os.close
+
+                def close_then_report(descriptor: int) -> None:
+                    real_close(descriptor)
+                    if descriptor == descriptors[missing_index]:
+                        raise OSError("synthetic close failure")
+
+                with patch("os.close", side_effect=close_then_report):
+                    with self.assertRaises(FileNotFoundError):
+                        verify(observations)
+                for descriptor in descriptors:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "member"
+            path.write_bytes(b"stable")
+            descriptor = os.open(path, os.O_RDONLY)
+            metadata = os.fstat(descriptor)
+            identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            real_close = os.close
+
+            def close_then_fail(value: int) -> None:
+                real_close(value)
+                raise OSError("synthetic close failure")
+
+            with patch("os.close", side_effect=close_then_fail):
+                with self.assertRaisesRegex(OSError, "synthetic close failure"):
+                    verify([(str(path), path.name, descriptor, identity)])
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
     def test_generated_retained_source_helper_rejects_member_4097(self) -> None:
         patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
@@ -1169,6 +1250,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn(f"FROM mineru@{BASE_IMAGE_DIGEST}", dockerfile)
         self.assertIn("ENV MINERU_MALLOC_TRIM=1", dockerfile)
         self.assertIn("ENV MINERU_PHASE_TRACE=0", dockerfile)
+        self.assertIn("ENV MINERU_TASK_PROTOCOL_V2=0", dockerfile)
         self.assertIn(
             'io.agent-invest.mineru.capacity-policy="single-owner-serial-mineru.v1"',
             dockerfile,
