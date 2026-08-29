@@ -21,10 +21,6 @@ from disclosure_anchor.application.ports.provider_parser import ProviderParserRe
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
-class SubmissionNotAttempted(ParserOutputContractError):
-    """Remote POST was provably never invoked."""
-
-
 class SubmissionAcceptanceAmbiguous(ParserOutputContractError):
     """Remote POST began but its acceptance cannot yet be reconciled."""
 
@@ -201,6 +197,43 @@ class PreparedSubmissionIdentity:
             or self.sha256 != "sha256:" + hashlib.sha256(canonical).hexdigest()
         ):
             raise ValueError("prepared submission exact bytes drifted")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedLocalSubmission:
+    """Attempt-owned immutable upload snapshot completed before remote IO."""
+
+    identity: PreparedSubmissionIdentity
+    snapshot_path: Path = field(repr=False)
+    snapshot_sha256: str
+    snapshot_bytes: int
+    snapshot_device: int
+    snapshot_inode: int
+    snapshot_mode: int
+    snapshot_uid: int
+    snapshot_nlink: int
+    snapshot_mtime_ns: int
+    snapshot_ctime_ns: int
+    upload_filename: str
+
+    def __post_init__(self) -> None:
+        _require_sha256(self.snapshot_sha256, "submission snapshot")
+        for count in (
+            self.snapshot_bytes,
+            self.snapshot_device,
+            self.snapshot_inode,
+            self.snapshot_mode,
+            self.snapshot_uid,
+            self.snapshot_nlink,
+            self.snapshot_mtime_ns,
+            self.snapshot_ctime_ns,
+        ):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("submission snapshot facts are invalid")
+        if self.snapshot_bytes < 1 or self.snapshot_nlink != 1:
+            raise ValueError("submission snapshot identity is unsafe")
+        if self.upload_filename != f"{self.identity.source_pdf_sha256[7:]}.pdf":
+            raise ValueError("submission upload filename drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,14 +435,19 @@ class StagedProviderDocumentParserPort(Protocol):
     def begin_remote_parse(
         self,
         *,
-        input_pdf: Path,
         options: ParserOptions,
-        source_pdf_sha256: str,
-        attempt_identity: str,
-        fence_identity: str,
-        submission_identity: PreparedSubmissionIdentity,
+        prepared_submission: PreparedLocalSubmission,
     ) -> RemoteProviderParseHandle:
         ...
+
+    def prepare_local_submission(
+        self,
+        *,
+        input_pdf: Path,
+        options: ParserOptions,
+        identity: PreparedSubmissionIdentity,
+    ) -> PreparedLocalSubmission:
+        """Complete all local source/snapshot IO before remote reconciliation."""
 
     def resume_remote_parse(
         self,
@@ -432,6 +470,7 @@ __all__ = [
     "RemoteArtifactReceipt",
     "PersistedSubmissionReceipt",
     "PreparedSubmissionIdentity",
+    "PreparedLocalSubmission",
     "PrivateSubmittedTaskResume",
     "PreparedMaterialization",
     "ProviderMaterializationEvidence",
@@ -439,5 +478,4 @@ __all__ = [
     "StagedProviderParserResult",
     "StagedProviderDocumentParserPort",
     "SubmissionAcceptanceAmbiguous",
-    "SubmissionNotAttempted",
 ]
