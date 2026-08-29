@@ -32,14 +32,32 @@ class TwoStageParseWork(Generic[LocalResultT]):
     cancel_and_drain: Callable[[], None] = lambda: None
     checkpoint_remote_failure: Callable[[BaseException], None] | None = None
     acknowledge_remote_failure: Callable[[], None] | None = None
+    recovered_failure_committed: BaseException | None = None
+    acknowledge_recovered_failure: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.sequence < 0 or not self.item_identity.strip():
             raise ValueError("two-stage work identity is invalid")
-        if (self.wait_remote_terminal is None) == (self.recovered_terminal is None):
-            raise ValueError(
-                "work requires exactly one remote waiter or recovered terminal"
+        sources = sum(
+            value is not None
+            for value in (
+                self.wait_remote_terminal,
+                self.recovered_terminal,
+                self.recovered_failure_committed,
             )
+        )
+        if sources != 1:
+            raise ValueError(
+                "work requires exactly one remote waiter, terminal, or durable failure"
+            )
+        if (self.checkpoint_remote_failure is None) != (
+            self.acknowledge_remote_failure is None
+        ):
+            raise ValueError("live failure checkpoint and ACK callbacks must be paired")
+        if (self.recovered_failure_committed is None) != (
+            self.acknowledge_recovered_failure is None
+        ):
+            raise ValueError("recovered durable failure requires its ACK callback")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +147,19 @@ class BoundedTwoStageParserPump(Generic[LocalResultT]):
                 and len(remote) + len(terminal) < self._max_terminal_receipts
             ):
                 item = pending.popleft()
+                if item.recovered_failure_committed is not None:
+                    try:
+                        assert item.acknowledge_recovered_failure is not None
+                        item.acknowledge_recovered_failure()
+                    except Exception as exc:  # noqa: BLE001 - durable recovery remains visible
+                        outcome(item, "remote_failed", error=exc)
+                    else:
+                        outcome(
+                            item,
+                            "remote_failed",
+                            error=item.recovered_failure_committed,
+                        )
+                    continue
                 if item.recovered_terminal is not None:
                     try:
                         item.checkpoint_remote_terminal(item.recovered_terminal)

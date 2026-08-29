@@ -24,6 +24,45 @@ def _receipt(sequence: int, *, byte_count: int = 1) -> RemoteArtifactReceipt:
 
 
 class TwoStageParserPumpTests(unittest.TestCase):
+    def test_failure_checkpoint_and_ack_callbacks_must_be_paired(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be paired"):
+            TwoStageParseWork(
+                sequence=0,
+                item_identity="doc-0",
+                wait_remote_terminal=lambda: _receipt(0),
+                persist_local=lambda _value: "unused",
+                checkpoint_remote_terminal=lambda _value: None,
+                checkpoint_remote_failure=lambda _error: None,
+            )
+
+    def test_recovered_failure_committed_retries_only_remote_ack(self) -> None:
+        events: list[str] = []
+        durable_error = RuntimeError("durable remote failure")
+        outcome = BoundedTwoStageParserPump[str](
+            remote_workers=1,
+            local_workers=1,
+            max_terminal_receipts=1,
+            max_local_items=1,
+            max_local_bytes=1,
+        ).run(
+            (
+                TwoStageParseWork(
+                    sequence=0,
+                    item_identity="doc-0",
+                    wait_remote_terminal=None,
+                    recovered_failure_committed=durable_error,
+                    acknowledge_recovered_failure=lambda: events.append("acked"),
+                    persist_local=lambda _value: "unused",
+                    checkpoint_remote_terminal=lambda _value: events.append(
+                        "unexpected-checkpoint"
+                    ),
+                ),
+            )
+        )[0]
+        self.assertEqual(events, ["acked"])
+        self.assertEqual(outcome.status, "remote_failed")
+        self.assertIs(outcome.error, durable_error)
+
     def test_remote_failure_is_acked_only_after_durable_failure_checkpoint(self) -> None:
         events: list[str] = []
 

@@ -13,6 +13,7 @@ import stat
 import tempfile
 import threading
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime.mineru_phase_trace import (
@@ -683,34 +684,64 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
     def test_generated_retained_source_helper_covers_every_member_and_toc(self) -> None:
         patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
         start = patched.index("def _retained_result_sources")
-        end = patched.index("def _copy_bounded")
+        end = patched.index("async def build_retained_task_result")
 
         class AsyncParseTask:
             def __init__(self, output_dir: str) -> None:
                 self.output_dir = output_dir
+                self.file_names = ["a", "b"]
+                self.backend = "hybrid-http-client"
+                self.parse_method = "auto"
+                self.return_md = True
+                self.return_middle_json = True
+                self.return_model_output = False
+                self.return_content_list = False
+                self.return_images = False
+                self.return_original_file = True
 
         namespace = {
             "AsyncParseTask": AsyncParseTask,
             "os": os,
+            "Path": Path,
             "stat": stat,
+            "get_parse_dir": lambda output, name, _backend, _method: str(
+                Path(output) / name
+            ),
+            "build_zip_arcname": lambda name, _parse, member: f"{name}/{member}",
+            "get_images_dir_image_paths": lambda _path: [],
         }
         exec(compile(patched[start:end], "retained-helper.py", "exec"), namespace)
         observe = namespace["_retained_result_sources"]
         verify = namespace["_verify_and_close_result_sources"]
+        write_zip = namespace["_write_retained_zip_from_fds"]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "a").mkdir()
             (root / "b").mkdir()
-            first = root / "a" / "first"
+            first = root / "a" / "a.md"
             first.write_bytes(b"first")
-            (root / "a" / "last").write_bytes(b"last")
-            (root / "b" / "only").write_bytes(b"only")
+            (root / "a" / "a_middle.json").write_bytes(b"middle")
+            (root / "b" / "b.md").write_bytes(b"only")
             with patch.dict(
                 os.environ,
                 {"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "10485760"},
             ):
                 _budget, observations = observe(AsyncParseTask(directory))
             self.assertEqual(len(observations), 3)
+            # Matching regular and symlink members added after the closed
+            # receipt are never candidates. The regular is removed after the
+            # archive write to exercise add->archive->remove invisibility.
+            transient = root / "b" / "b_middle.json"
+            transient.write_bytes(b"late")
+            (root / "b" / "b_origin.pdf").symlink_to(first)
+            target = root / "result.zip"
+            write_zip(observations, str(target), 10 * 1024 * 1024)
+            transient.unlink()
+            with zipfile.ZipFile(target) as archive:
+                self.assertEqual(
+                    archive.namelist(),
+                    ["a/a.md", "a/a_middle.json", "b/b.md"],
+                )
             first.write_bytes(b"drift")
             with self.assertRaisesRegex(RuntimeError, "changed"):
                 verify(observations)
@@ -718,10 +749,19 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
     def test_generated_retained_source_helper_rejects_member_4097(self) -> None:
         patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
         start = patched.index("def _retained_result_sources")
-        end = patched.index("def _copy_bounded")
+        end = patched.index("async def build_retained_task_result")
 
         class AsyncParseTask:
             output_dir = "/owned"
+            file_names = ["doc"]
+            backend = "hybrid-http-client"
+            parse_method = "auto"
+            return_md = False
+            return_middle_json = False
+            return_model_output = False
+            return_content_list = False
+            return_images = True
+            return_original_file = False
 
         class FakeMetadata:
             st_dev = 1
@@ -745,10 +785,6 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 return self.environ.get(key, default)
 
             @staticmethod
-            def walk(_root):
-                yield "/owned", [], [f"f-{index}" for index in range(4097)]
-
-            @staticmethod
             def open(_path, _flags):
                 return 7
 
@@ -760,11 +796,21 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 self.closed += 1
 
         fake_os = FakeOS()
-        namespace = {"AsyncParseTask": AsyncParseTask, "os": fake_os, "stat": stat}
+        namespace = {
+            "AsyncParseTask": AsyncParseTask,
+            "os": fake_os,
+            "Path": Path,
+            "stat": stat,
+            "get_parse_dir": lambda *_args: "/owned/doc",
+            "build_zip_arcname": lambda _name, _parse, member: member,
+            "get_images_dir_image_paths": lambda _path: [
+                f"/owned/doc/images/f-{index}" for index in range(4097)
+            ],
+        }
         exec(compile(patched[start:end], "retained-cap.py", "exec"), namespace)
         with self.assertRaisesRegex(RuntimeError, "member/FD"):
             namespace["_retained_result_sources"](AsyncParseTask())
-        self.assertEqual(fake_os.closed, 4096)
+        self.assertEqual(fake_os.closed, 0)
 
     def test_preimages_match_the_reproduced_deployed_344_sources(self) -> None:
         self.assertEqual(
