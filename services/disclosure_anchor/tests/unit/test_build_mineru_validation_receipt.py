@@ -16,6 +16,7 @@ from disclosure_anchor.application.contracts.parser_target import (
 from scripts.build_mineru_validation_receipt import (
     _canonical_sha256,
     _load,
+    _write_new,
     build_receipt,
 )
 
@@ -184,6 +185,42 @@ class BuildMineruValidationReceiptTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "changed while reading"),
             ):
                 _load(smokes[0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            smokes, _, _, _ = self._fixture(Path(tmp))
+            real_fstat = os.fstat
+            injected = False
+
+            def overwriting_fstat(descriptor: int) -> os.stat_result:
+                nonlocal injected
+                metadata = real_fstat(descriptor)
+                if not injected:
+                    injected = True
+                    original = smokes[0].read_bytes()
+                    smokes[0].write_bytes(b" " + original[1:])
+                return metadata
+
+            with patch(
+                "scripts.build_mineru_validation_receipt.os.fstat",
+                side_effect=overwriting_fstat,
+            ), self.assertRaisesRegex(ValueError, "changed while reading"):
+                _load(smokes[0])
+
+    def test_output_enforces_exact_sixteen_mib_budget(self) -> None:
+        payload = {"value": "x" * 128}
+        encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch(
+                "scripts.build_mineru_validation_receipt.MAX_OUTPUT_BYTES",
+                len(encoded),
+            ):
+                _write_new(root / "boundary.json", payload)
+            with patch(
+                "scripts.build_mineru_validation_receipt.MAX_OUTPUT_BYTES",
+                len(encoded) - 1,
+            ), self.assertRaisesRegex(ValueError, "16 MiB"):
+                _write_new(root / "oversize.json", payload)
 
     def test_input_rejects_duplicate_keys_and_nonfinite_numbers(self) -> None:
         for encoded in (b'{"a":1,"a":2}', b'{"a":NaN}'):

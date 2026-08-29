@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,11 +12,33 @@ from unittest.mock import patch
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     canonical_payload_sha256,
 )
-from scripts.freeze_mineru_campaign_epoch import main
+from scripts.freeze_mineru_campaign_epoch import _read_private_json, main
 from tests.unit.test_capacity_host_observer import COLLECTOR, NODE, _payload
 
 
 class FreezeMineruServiceEpochTests(unittest.TestCase):
+    def test_manifest_rejects_same_size_overwrite_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+            path.write_text('{"value":"aaaa"}', encoding="utf-8")
+            path.chmod(0o600)
+            real_fstat = os.fstat
+            injected = False
+
+            def overwriting_fstat(descriptor: int) -> os.stat_result:
+                nonlocal injected
+                metadata = real_fstat(descriptor)
+                if not injected:
+                    injected = True
+                    path.write_text('{"value":"bbbb"}', encoding="utf-8")
+                return metadata
+
+            with patch(
+                "scripts.freeze_mineru_campaign_epoch.os.fstat",
+                side_effect=overwriting_fstat,
+            ), self.assertRaisesRegex(ValueError, "changed while reading"):
+                _read_private_json(path)
+
     def test_freeze_records_clean_epoch_without_memory_reserve(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

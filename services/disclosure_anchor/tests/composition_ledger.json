@@ -113,7 +113,7 @@
   },
   "tests/unit/test_build_mineru_validation_receipt.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_build_research_watchlist.py": {
    "private_imports": [],
@@ -241,7 +241,7 @@
   },
   "tests/unit/test_freeze_mineru_campaign_epoch.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 2
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
@@ -292,7 +292,7 @@
   },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 10
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],

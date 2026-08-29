@@ -252,6 +252,8 @@ def _load_evidence(
             metadata.st_uid,
             metadata.st_nlink,
             metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
         )
         final = (
             final_metadata.st_dev,
@@ -260,6 +262,8 @@ def _load_evidence(
             final_metadata.st_uid,
             final_metadata.st_nlink,
             final_metadata.st_size,
+            final_metadata.st_mtime_ns,
+            final_metadata.st_ctime_ns,
         )
         if final != initial:
             raise MinerUDeploymentGateError(f"{label} changed while being read")
@@ -533,11 +537,13 @@ def verify_mineru_heldout_validation(
     before_identity, before_time, before_epoch = _verify_epoch_wrapper(
         value.get("epoch_before"),
         runtime_identity=smoke_contract["runtime_identity"],
+        expected_runtime_manifest=smoke_contract["expected_runtime_manifest"],
         label="before",
     )
     after_identity, after_time, _after_epoch = _verify_epoch_wrapper(
         value.get("epoch_after"),
         runtime_identity=smoke_contract["runtime_identity"],
+        expected_runtime_manifest=smoke_contract["expected_runtime_manifest"],
         label="after",
     )
     if (
@@ -568,6 +574,7 @@ def _verify_epoch_wrapper(
     value: object,
     *,
     runtime_identity: str,
+    expected_runtime_manifest: dict[str, Any],
     label: str,
 ) -> tuple[str, datetime, dict[str, Any]]:
     if not isinstance(value, dict) or set(value) != {
@@ -596,6 +603,9 @@ def _verify_epoch_wrapper(
         raise MinerUDeploymentGateError(f"MinerU {label} epoch receipt drifted")
     epoch = receipt.get("service_epoch")
     safety = receipt.get("safety")
+    topology = expected_runtime_manifest.get("topology")
+    client = expected_runtime_manifest.get("client")
+    orchestrator = expected_runtime_manifest.get("orchestrator")
     expected_safety = {
         "restart_count_total": 0,
         "oom_killed_count": 0,
@@ -609,6 +619,9 @@ def _verify_epoch_wrapper(
         or receipt.get("database_access") != "none"
         or receipt.get("queue_access") != "none"
         or not isinstance(epoch, dict)
+        or not isinstance(topology, dict)
+        or not isinstance(client, dict)
+        or not isinstance(orchestrator, dict)
         or set(epoch)
         != {
             "schema",
@@ -623,6 +636,30 @@ def _verify_epoch_wrapper(
         }
         or epoch.get("schema") != "mineru-service-epoch.v1"
         or epoch.get("runtime_manifest_identity_sha256") != runtime_identity
+        or epoch.get("collector_sha256")
+        != topology.get("windows_collector_sha256")
+        or epoch.get("windows_node_identity_sha256")
+        != topology.get("windows_node_identity_sha256")
+        or epoch.get("windows_compose_sha256")
+        != topology.get("windows_compose_sha256")
+        or epoch.get("writer_code_sha256") != client.get("writer_code_sha256")
+        or epoch.get("api_image_digest")
+        != orchestrator.get("container_image_digest")
+        or any(
+            not _is_prefixed_sha256(epoch.get(field))
+            for field in (
+                "runtime_manifest_identity_sha256",
+                "collector_sha256",
+                "windows_node_identity_sha256",
+                "windows_compose_sha256",
+                "writer_code_sha256",
+                "api_image_digest",
+                "container_epoch_sha256",
+            )
+        )
+        or not isinstance(epoch.get("api_container_id"), str)
+        or len(epoch["api_container_id"]) != 64
+        or any(character not in "0123456789abcdef" for character in epoch["api_container_id"])
         or receipt.get("service_epoch_sha256") != canonical_payload_sha256(epoch)
         or safety != expected_safety
     ):

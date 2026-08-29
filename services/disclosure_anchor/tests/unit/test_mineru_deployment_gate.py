@@ -444,6 +444,13 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "input_profile",
             "restart",
             "oom",
+            "collector_binding",
+            "node_binding",
+            "compose_binding",
+            "writer_binding",
+            "image_binding",
+            "bad_epoch_sha",
+            "bad_container_id",
         ):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
                 settings, client, _ = self._fixture(
@@ -493,7 +500,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     documents[0]["receipt_sha256"] = canonical_payload_sha256(
                         documents[0]["receipt"]
                     )
-                else:
+                elif tamper in {"restart", "oom"}:
                     field = (
                         "restart_count_total"
                         if tamper == "restart"
@@ -503,6 +510,36 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     value["epoch_after"]["receipt_sha256"] = (
                         canonical_payload_sha256(value["epoch_after"]["receipt"])
                     )
+                else:
+                    field = {
+                        "collector_binding": "collector_sha256",
+                        "node_binding": "windows_node_identity_sha256",
+                        "compose_binding": "windows_compose_sha256",
+                        "writer_binding": "writer_code_sha256",
+                        "image_binding": "api_image_digest",
+                        "bad_epoch_sha": "container_epoch_sha256",
+                        "bad_container_id": "api_container_id",
+                    }[tamper]
+                    replacement = (
+                        "not-a-sha"
+                        if tamper == "bad_epoch_sha"
+                        else "7" * 63
+                        if tamper == "bad_container_id"
+                        else "sha256:" + "7" * 64
+                    )
+                    # Keep the two epoch wrappers mutually consistent so these
+                    # cases prove manifest binding and field-shape validation,
+                    # rather than failing only on the before/after comparison.
+                    for wrapper_name in ("epoch_before", "epoch_after"):
+                        wrapper = value[wrapper_name]
+                        epoch = wrapper["receipt"]["service_epoch"]
+                        epoch[field] = replacement
+                        wrapper["receipt"]["service_epoch_sha256"] = (
+                            canonical_payload_sha256(epoch)
+                        )
+                        wrapper["receipt_sha256"] = canonical_payload_sha256(
+                            wrapper["receipt"]
+                        )
                 settings.disclosure_mineru_validation_receipt.write_text(
                     json.dumps(value)
                 )
@@ -543,6 +580,36 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 self.assertRaisesRegex(
                     MinerUDeploymentGateError, "size limit|changed while being read"
                 ),
+            ):
+                require_mineru_deployment_gate(settings)
+
+    def test_evidence_same_size_overwrite_during_read_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, client, _ = self._fixture(Path(tmp), now=datetime.now(UTC))
+            assert settings.disclosure_mineru_smoke_receipt is not None
+            smoke_path = settings.disclosure_mineru_smoke_receipt
+            real_fstat = os.fstat
+            injected = False
+
+            def fstat_with_overwrite(descriptor: int) -> os.stat_result:
+                nonlocal injected
+                metadata = real_fstat(descriptor)
+                if not injected:
+                    injected = True
+                    payload = smoke_path.read_bytes()
+                    smoke_path.write_bytes(b" " + payload[1:])
+                return metadata
+
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                patch(
+                    "disclosure_anchor.adapters.runtime.mineru_deployment_gate."
+                    "os.fstat",
+                    side_effect=fstat_with_overwrite,
+                ),
+                client_patch,
+                code_patch,
+                self.assertRaisesRegex(MinerUDeploymentGateError, "changed"),
             ):
                 require_mineru_deployment_gate(settings)
 

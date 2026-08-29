@@ -43,13 +43,21 @@ def _read_private_json(path: Path) -> dict[str, object]:
         if len(payload) != metadata.st_size or (
             after.st_dev,
             after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
             after.st_size,
             after.st_mtime_ns,
+            after.st_ctime_ns,
         ) != (
             metadata.st_dev,
             metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_nlink,
             metadata.st_size,
             metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
         ):
             raise ValueError("runtime manifest changed while reading")
     finally:

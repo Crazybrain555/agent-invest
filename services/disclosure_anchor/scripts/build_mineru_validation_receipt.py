@@ -32,6 +32,7 @@ POLICY = "operator-held-out-complete-pdf.v1"
 MIN_DOCUMENTS = 2
 MAX_DOCUMENTS = 8
 MAX_INPUT_BYTES = 2 * 1024 * 1024
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 
 
 def _canonical_bytes(payload: object) -> bytes:
@@ -71,6 +72,7 @@ def _load(path: Path) -> tuple[dict[str, Any], str]:
             after.st_nlink,
             after.st_size,
             after.st_mtime_ns,
+            after.st_ctime_ns,
         ) != (
             before.st_dev,
             before.st_ino,
@@ -79,6 +81,7 @@ def _load(path: Path) -> tuple[dict[str, Any], str]:
             before.st_nlink,
             before.st_size,
             before.st_mtime_ns,
+            before.st_ctime_ns,
         ):
             raise ValueError(f"held-out evidence changed while reading: {path}")
         value = strict_json_loads(encoded)
@@ -285,6 +288,8 @@ def _write_new(path: Path, payload: object) -> None:
         raise ValueError(f"output already exists; stale evidence: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
+    if not 0 < len(encoded) <= MAX_OUTPUT_BYTES:
+        raise ValueError("held-out validation receipt exceeds the 16 MiB limit")
     descriptor = os.open(
         path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
