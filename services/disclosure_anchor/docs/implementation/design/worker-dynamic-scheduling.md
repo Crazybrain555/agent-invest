@@ -312,6 +312,10 @@ maintenance thread                 report writer thread
   当前 parse 完成项超过空槽时留在 PostgreSQL `pending_build_v1`，不进入无界 executor queue；
   新 parse admission 由 durable pending build/publish 的 item 数和 archived-source byte 估算双
   水位控制。未知 byte 保持可见并由 item 水位兜底，不制造 0-byte 假估算；
+- 每个不可变 report interval 只在 non-idempotent whole-document publish commit 后，按
+  `raw_file_hash` 去重累计 source pages；同 identity 页数冲突显式失败。interval 输出携带闭合
+  identity/page 条目，跨 interval/host-hour 去重由 telemetry aggregator 完成，不在常驻 worker
+  保存无界全量集合；
 - PostgreSQL QueuePool 不使用 SQLAlchemy 的固定默认 `5+10`。每个 active parse/finalize 在完整
   document producer lease 期间持有一条 session connection，并可能短暂再取一条 transaction
   connection；因此 worker 从当前 `parse_concurrency + finalize_concurrency` 动态派生

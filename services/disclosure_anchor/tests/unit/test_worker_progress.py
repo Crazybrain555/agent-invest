@@ -543,7 +543,7 @@ class WorkerProgressTests(unittest.TestCase):
                 "unknown_source_bytes": 2,
             },
             "durable_publish": {
-                "unique_source_pages": 737,
+                "interval_unique_source_pages": 737,
                 "page_count_incomplete": 1,
             },
             "admission": {
@@ -562,7 +562,8 @@ class WorkerProgressTests(unittest.TestCase):
             unavailable,
         )
         self.assertIn(
-            "durable pages=737 incomplete=1 | finalize pending=64 bytes=4096 "
+            "interval unique durable pages=737 incomplete=1 | "
+            "finalize pending=64 bytes=4096 "
             "unknown_bytes=2 | blocked=downstream_finalize_high_water",
             unavailable,
         )

@@ -886,6 +886,7 @@ class _DocOutcome:
     superseded_run: bool = False
     published_idempotent: bool = False
     durable_published_source_pages: int = 0
+    durable_published_source_identity: str | None = None
     durable_published_page_count_incomplete: bool = False
     build_stats: dict[str, Any] | None = None
     failure: WorkerFailure | None = None
@@ -894,6 +895,7 @@ class _DocOutcome:
 @dataclass(frozen=True)
 class _ParseWorkItem:
     document_id: str
+    source_identity: str | None
     page_count: int | None
     raw_byte_count: int | None
 
@@ -1145,6 +1147,11 @@ def _parse_work_items(
         items.append(
             _ParseWorkItem(
                 document_id=document_id,
+                source_identity=(
+                    str(row["raw_file_hash"])
+                    if isinstance(row.get("raw_file_hash"), str)
+                    else None
+                ),
                 page_count=page_count,
                 raw_byte_count=raw_byte_count,
             )
@@ -1290,6 +1297,7 @@ def _finalize_one_document(
     document_id: str,
     processing_run_id: str,
     source_page_count: int | None = None,
+    source_identity: str | None = None,
 ) -> _DocOutcome:
     """Build and publish one parsed run without occupying a GPU slot."""
 
@@ -1342,12 +1350,16 @@ def _finalize_one_document(
         document_id=document_id,
         processing_run_id=processing_run_id,
         source_page_count=source_page_count,
+        source_identity=source_identity,
     )
     outcome.published = publish_outcome.published
     outcome.superseded_run = publish_outcome.superseded_run
     outcome.published_idempotent = publish_outcome.published_idempotent
     outcome.durable_published_source_pages = (
         publish_outcome.durable_published_source_pages
+    )
+    outcome.durable_published_source_identity = (
+        publish_outcome.durable_published_source_identity
     )
     outcome.durable_published_page_count_incomplete = (
         publish_outcome.durable_published_page_count_incomplete
@@ -1362,6 +1374,7 @@ def _publish_one_document(
     document_id: str,
     processing_run_id: str,
     source_page_count: int | None = None,
+    source_identity: str | None = None,
 ) -> _DocOutcome:
     """Publish an already-built run for resident crash/failure recovery."""
 
@@ -1390,15 +1403,37 @@ def _publish_one_document(
         outcome.published_idempotent = publish_result.idempotent is True
         if not outcome.published_idempotent:
             source_pages = source_page_count
-            if source_pages is None:
-                source_pages = _published_source_page_count(
+            recovered_identity = source_identity
+            if source_pages is None or recovered_identity is None:
+                recovered = _published_source_evidence(
                     deps,
                     processing_run_id=processing_run_id,
                 )
-            if source_pages is None:
+                if recovered is not None:
+                    envelope_identity, envelope_pages = recovered
+                    if source_identity is not None and source_identity != envelope_identity:
+                        outcome.failure = WorkerFailure(
+                            stage="publish",
+                            item_ref=document_id,
+                            error_code="DURABLE_SOURCE_IDENTITY_CONFLICT",
+                            retryable=False,
+                        )
+                        return outcome
+                    if source_pages is not None and source_pages != envelope_pages:
+                        outcome.failure = WorkerFailure(
+                            stage="publish",
+                            item_ref=document_id,
+                            error_code="DURABLE_SOURCE_PAGE_COUNT_CONFLICT",
+                            retryable=False,
+                        )
+                        return outcome
+                    recovered_identity = envelope_identity
+                    source_pages = envelope_pages
+            if source_pages is None or recovered_identity is None:
                 outcome.durable_published_page_count_incomplete = True
             else:
                 outcome.durable_published_source_pages = source_pages
+                outcome.durable_published_source_identity = recovered_identity
     except Exception as exc:
         outcome.failure = _failure_from_exception(
             stage="publish",
@@ -1408,11 +1443,11 @@ def _publish_one_document(
     return outcome
 
 
-def _published_source_page_count(
+def _published_source_evidence(
     deps: WorkerDeps,
     *,
     processing_run_id: str,
-) -> int | None:
+) -> tuple[str, int] | None:
     """Read the canonical parse envelope after publication for KPI evidence.
 
     The DB read is completed before artifact IO, so this metric helper never
@@ -1430,6 +1465,7 @@ def _published_source_page_count(
             expected_hash = run.artifact_hash
             document_id = run.document_id
             artifact_owner_id = run.artifact_owner_processing_run_id
+            input_raw_file_hash = run.input_raw_file_hash
         if not isinstance(relpath, str) or not isinstance(expected_hash, str):
             return None
         record = deps.provider_source.read_provider_document_record(Path(relpath))
@@ -1440,9 +1476,10 @@ def _published_source_page_count(
         if (
             envelope.document_id != document_id
             or envelope.artifact_owner_processing_run_id != artifact_owner_id
+            or envelope.input_raw_file_hash != input_raw_file_hash
         ):
             return None
-        return envelope.source_pdf_page_count
+        return envelope.input_raw_file_hash, envelope.source_pdf_page_count
     except Exception:
         LOGGER.exception(
             "durable publish page evidence unavailable for run=%s",
@@ -1462,11 +1499,33 @@ def _fold_outcome(report: WorkerReport, outcome: _DocOutcome) -> None:
         report.published += 1
         if outcome.superseded_run:
             report.runs_deactivated += 1
-        report.durable_published_source_pages += (
-            outcome.durable_published_source_pages
-        )
         if outcome.durable_published_page_count_incomplete:
             report.durable_published_page_count_incomplete += 1
+        identity = outcome.durable_published_source_identity
+        if identity is not None:
+            previous_pages = report.durable_published_sources.get(identity)
+            if previous_pages is None:
+                report.durable_published_sources[identity] = (
+                    outcome.durable_published_source_pages
+                )
+                report.durable_published_source_pages += (
+                    outcome.durable_published_source_pages
+                )
+            elif previous_pages != outcome.durable_published_source_pages:
+                report.failed += 1
+                report.failures.append(
+                    WorkerFailure(
+                        stage="publish",
+                        item_ref=identity,
+                        error_code="DURABLE_SOURCE_PAGE_COUNT_CONFLICT",
+                        retryable=False,
+                        message=(
+                            f"interval source identity page count changed: "
+                            f"{previous_pages} != "
+                            f"{outcome.durable_published_source_pages}"
+                        ),
+                    )
+                )
     if outcome.failure is not None:
         report.failed += 1
         report.failures.append(outcome.failure)
@@ -2033,7 +2092,9 @@ def _parse_one_batch(
     ):
         parse_futures: dict[Future[_DocOutcome], _InFlightParse] = {}
         finalize_futures: dict[Future[_DocOutcome], _InFlightFinalize] = {}
-        ready_finalize: deque[tuple[_InFlightFinalize, int | None]] = deque()
+        ready_finalize: deque[
+            tuple[_InFlightFinalize, int | None, str | None]
+        ] = deque()
         recent_finalize_ids: deque[str] = deque()
         recent_finalize_set: set[str] = set()
 
@@ -2136,7 +2197,7 @@ def _parse_one_batch(
             if available <= 0:
                 return
             while available > 0 and ready_finalize:
-                item, source_page_count = ready_finalize.popleft()
+                item, source_page_count, source_identity = ready_finalize.popleft()
                 finalize_futures[
                     finalize_pool.submit(
                         _finalize_one_document,
@@ -2144,6 +2205,7 @@ def _parse_one_batch(
                         document_id=item.document_id,
                         processing_run_id=item.processing_run_id,
                         source_page_count=source_page_count,
+                        source_identity=source_identity,
                     )
                 ] = item
                 available -= 1
@@ -2151,7 +2213,9 @@ def _parse_one_batch(
                 return
             active_run_ids = {
                 item.processing_run_id for item in finalize_futures.values()
-            } | {item.processing_run_id for item, _ in ready_finalize} | recent_finalize_set
+            } | {
+                item.processing_run_id for item, _, _ in ready_finalize
+            } | recent_finalize_set
             # A parse thread commits its succeeded run before the coordinator
             # folds the completed Future and submits normal finalization.
             # During that short interval pending_build can already see the
@@ -2161,7 +2225,7 @@ def _parse_one_batch(
             active_document_ids = {
                 admitted.item.document_id for admitted in parse_futures.values()
             } | {item.document_id for item in finalize_futures.values()} | {
-                item.document_id for item, _ in ready_finalize
+                item.document_id for item, _, _ in ready_finalize
             }
             try:
                 build_limit = min(available, resident_hooks.build_recovery_limit)
@@ -2562,11 +2626,16 @@ def _parse_one_batch(
                                 document_id=finalize_item.document_id,
                                 processing_run_id=finalize_item.processing_run_id,
                                 source_page_count=admitted.item.page_count,
+                                source_identity=admitted.item.source_identity,
                             )
                         ] = finalize_item
                     else:
                         ready_finalize.append(
-                            (finalize_item, admitted.item.page_count)
+                            (
+                                finalize_item,
+                                admitted.item.page_count,
+                                admitted.item.source_identity,
+                            )
                         )
                         seed_finalize_recovery()
                     # Keep only a bounded recent-success window. PostgreSQL

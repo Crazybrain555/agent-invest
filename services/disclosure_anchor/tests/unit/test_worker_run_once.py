@@ -1145,7 +1145,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         with (
             mock.patch.object(worker_module, "PublishRun") as publish_cls,
             mock.patch.object(
-                worker_module, "_published_source_page_count"
+                worker_module, "_published_source_evidence"
             ) as recover_count,
         ):
             publish_cls.return_value.execute.return_value = mock.MagicMock(
@@ -1158,6 +1158,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 document_id="doc_1",
                 processing_run_id="run_1",
                 source_page_count=88,
+                source_identity="sha256:" + "b" * 64,
             )
 
         self.assertEqual(outcome.durable_published_source_pages, 88)
@@ -1171,8 +1172,8 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(worker_module, "PublishRun") as publish_cls,
             mock.patch.object(
                 worker_module,
-                "_published_source_page_count",
-                return_value=42,
+                "_published_source_evidence",
+                return_value=("sha256:" + "a" * 64, 42),
             ) as recover_count,
         ):
             publish_cls.return_value.execute.return_value = mock.MagicMock(
@@ -1197,8 +1198,99 @@ class RunOnceSchedulingTests(unittest.TestCase):
             )
 
         self.assertEqual(recovery.durable_published_source_pages, 42)
+        self.assertEqual(
+            recovery.durable_published_source_identity,
+            "sha256:" + "a" * 64,
+        )
         self.assertEqual(repeated.durable_published_source_pages, 0)
         self.assertEqual(recover_count.call_count, 1)
+
+    def test_recovery_evidence_binds_run_identity_to_canonical_envelope(self) -> None:
+        import hashlib
+
+        deps = _deps()
+        identity = "sha256:" + "d" * 64
+        record = b"canonical-provider-envelope"
+        run = mock.MagicMock(
+            provider_document_relpath="provider/run.json",
+            artifact_hash="sha256:" + hashlib.sha256(record).hexdigest(),
+            document_id="doc_1",
+            artifact_owner_processing_run_id="run_1",
+            input_raw_file_hash=identity,
+        )
+        fake_uow = mock.MagicMock()
+        fake_uow.__enter__.return_value.processing_runs.get.return_value = run
+        object.__setattr__(deps, "uow_factory", lambda: fake_uow)
+        deps.provider_source.read_provider_document_record.return_value = record
+        envelope = mock.MagicMock(
+            document_id="doc_1",
+            artifact_owner_processing_run_id="run_1",
+            input_raw_file_hash=identity,
+            source_pdf_page_count=55,
+        )
+        with mock.patch.object(
+            worker_module,
+            "provider_document_envelope_from_bytes",
+            return_value=envelope,
+        ):
+            evidence = worker_module._published_source_evidence(
+                deps,
+                processing_run_id="run_1",
+            )
+            envelope.input_raw_file_hash = "sha256:" + "e" * 64
+            conflict = worker_module._published_source_evidence(
+                deps,
+                processing_run_id="run_1",
+            )
+
+        self.assertEqual(evidence, (identity, 55))
+        self.assertIsNone(conflict)
+
+    def test_interval_durable_kpi_deduplicates_identity_and_exposes_conflict(
+        self,
+    ) -> None:
+        report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
+        identity = "sha256:" + "c" * 64
+        worker_module._fold_outcome(
+            report,
+            worker_module._DocOutcome(
+                published=True,
+                durable_published_source_identity=identity,
+                durable_published_source_pages=100,
+            ),
+        )
+        worker_module._fold_outcome(
+            report,
+            worker_module._DocOutcome(
+                published=True,
+                durable_published_source_identity=identity,
+                durable_published_source_pages=100,
+            ),
+        )
+        self.assertEqual(report.durable_published_source_pages, 100)
+        self.assertEqual(report.durable_published_sources, {identity: 100})
+
+        worker_module._fold_outcome(
+            report,
+            worker_module._DocOutcome(
+                published=True,
+                durable_published_source_identity=identity,
+                durable_published_source_pages=101,
+            ),
+        )
+        self.assertEqual(report.durable_published_source_pages, 100)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(
+            report.failures[0].error_code,
+            "DURABLE_SOURCE_PAGE_COUNT_CONFLICT",
+        )
+        payload = report.as_dict()["durable_publish"]
+        self.assertEqual(payload["interval_unique_source_pages"], 100)
+        self.assertEqual(payload["interval_unique_source_count"], 1)
+        self.assertEqual(
+            payload["interval_unique_sources"],
+            [{"source_identity": identity, "source_pages": 100}],
+        )
 
     def test_rolling_refill_releases_gpu_slots_before_finalize(self) -> None:
         import threading
@@ -1739,8 +1831,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
             document_id: str,
             processing_run_id: str,
             source_page_count: int | None = None,
+            source_identity: str | None = None,
         ) -> worker_module._DocOutcome:
-            del document_id, source_page_count
+            del document_id, source_page_count, source_identity
             with finalized_lock:
                 finalized.append(processing_run_id)
             return worker_module._DocOutcome(built=True, published=True)

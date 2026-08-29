@@ -69,6 +69,7 @@ class WorkerReport:
     # PublishRun commit.  Missing page evidence remains explicitly incomplete.
     durable_published_source_pages: int = 0
     durable_published_page_count_incomplete: int = 0
+    durable_published_sources: dict[str, int] = field(default_factory=dict)
     source_outage_break: bool = False
     deferred_backfill: int = 0
     admission_status: Literal["available", "unavailable"] | None = None
@@ -102,11 +103,19 @@ class WorkerReport:
                 "unknown_source_bytes": self.finalize_unknown_source_bytes,
             },
             "durable_publish": {
-                "unique_source_pages": self.durable_published_source_pages,
+                "interval_unique_source_pages": self.durable_published_source_pages,
+                "interval_unique_source_count": len(self.durable_published_sources),
+                "interval_unique_sources": [
+                    {"source_identity": identity, "source_pages": pages}
+                    for identity, pages in sorted(self.durable_published_sources.items())
+                ],
                 "page_count_incomplete": (
                     self.durable_published_page_count_incomplete
                 ),
-                "counting_boundary": "non_idempotent_whole_document_publish_commit",
+                "counting_boundary": (
+                    "interval_unique_raw_source_non_idempotent_whole_document_"
+                    "publish_commit"
+                ),
             },
             "source_outage_break": self.source_outage_break,
             "deferred_backfill": self.deferred_backfill,

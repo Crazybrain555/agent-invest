@@ -738,8 +738,8 @@ def render_worker_progress(event: dict[str, Any]) -> str:
             durable = durable or {}
             pressure = pressure or {}
             lines.append(
-                "durable pages="
-                f"{durable.get('unique_source_pages', 0)} "
+                "interval unique durable pages="
+                f"{durable.get('interval_unique_source_pages', 0)} "
                 f"incomplete={durable.get('page_count_incomplete', 0)} | "
                 f"finalize pending={pressure.get('pending_items', 0)} "
                 f"bytes={pressure.get('estimated_source_bytes', 0)} "
