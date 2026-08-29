@@ -861,6 +861,28 @@ def operational_telemetry_schema_documents() -> dict[str, dict[str, Any]]:
     return documents
 
 
+def operational_schema_documents() -> dict[str, dict[str, Any]]:
+    """Return the complete operational schema registry for public export.
+
+    Capacity observation schemas predate synchronized telemetry, but both are
+    one tracked ``contracts/operational`` namespace.  Merge them here so every
+    exporter has one exhaustive registry and duplicate filenames fail closed.
+    """
+
+    from disclosure_anchor.application.contracts.capacity import (
+        operational_schema_documents as capacity_schema_documents,
+    )
+
+    documents = capacity_schema_documents()
+    telemetry = operational_telemetry_schema_documents()
+    duplicates = set(documents) & set(telemetry)
+    if duplicates:
+        raise ValueError(
+            "operational schema filenames overlap: " + ", ".join(sorted(duplicates))
+        )
+    return {**documents, **telemetry}
+
+
 def canonical_json_sha256(value: object) -> str:
     payload = json.dumps(
         value,
@@ -1008,6 +1030,7 @@ __all__ = [
     "TelemetryArtifacts",
     "canonical_json_sha256",
     "operational_telemetry_schema_documents",
+    "operational_schema_documents",
     "validate_credit_event_chain",
     "validate_frame_sequence",
 ]

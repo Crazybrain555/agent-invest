@@ -17,7 +17,7 @@ from disclosure_anchor.api.schemas.public import (
     SourceRefV1,
     TrackedCompanyV1,
 )
-from disclosure_anchor.application.contracts.capacity import (
+from disclosure_anchor.application.contracts.synchronized_telemetry import (
     operational_schema_documents,
 )
 from disclosure_anchor.main import create_app

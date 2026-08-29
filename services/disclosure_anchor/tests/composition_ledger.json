@@ -2,7 +2,7 @@
  "files": {
   "tests/contract/test_capacity_json_schemas.py": {
    "private_imports": [],
-   "tests": 2
+   "tests": 3
   },
   "tests/contract/test_filing_api_contracts.py": {
    "private_imports": [],
@@ -131,7 +131,7 @@
   },
   "tests/unit/test_capacity_host_observer.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 7
   },
   "tests/unit/test_capacity_observer.py": {
    "private_imports": [],
@@ -292,7 +292,7 @@
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
-   "tests": 17
+   "tests": 22
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -443,6 +443,10 @@
   "tests/unit/test_sync_disclosure_index.py": {
    "private_imports": [],
    "tests": 12
+  },
+  "tests/unit/test_synchronized_telemetry_contract.py": {
+   "private_imports": [],
+   "tests": 8
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],

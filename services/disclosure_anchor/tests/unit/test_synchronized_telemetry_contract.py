@@ -57,6 +57,54 @@ HASH_C = "sha256:" + "c" * 64
 START = datetime(2026, 8, 29, tzinfo=timezone.utc)
 
 
+def _phase_document_end_event(*, process_epoch: str) -> MineruPhaseEvent:
+    """Build one complete current trace event; production fields stay strict."""
+
+    return MineruPhaseEvent(
+        append_index=None,
+        actual_decoded_bytes=None,
+        backend="hybrid",
+        duration_ns=1_500_000_000,
+        ended_monotonic_ns=1_750_000_000,
+        event="document_end",
+        hybrid_batch_ratio_effective=1,
+        hybrid_batch_ratio_ocr_override=False,
+        hybrid_batch_ratio_requested=1,
+        hybrid_layout_batch_cap=1,
+        hybrid_mfr_batch_cap=1,
+        hybrid_ocr_det_batch_cap=1,
+        hybrid_table_orientation_batch_cap=1,
+        inner_inference_concurrency=7,
+        max_resident_decoded_bytes=1,
+        max_resident_pages=16,
+        max_resident_windows=1,
+        outcome="success",
+        page_count=1,
+        page_end_exclusive=None,
+        page_start=None,
+        phase="document",
+        pipeline_depth=0,
+        pipeline_mode="legacy",
+        process_epoch=process_epoch,
+        profile_id="legacy",
+        profile_sha256=HASH_B,
+        reserved_decoded_bytes=None,
+        reserved_windows=None,
+        resident_decoded_bytes_after_acquire=None,
+        resident_pages_after_acquire=None,
+        resident_windows_after_acquire=None,
+        sequence=1,
+        started_monotonic_ns=250_000_000,
+        source_pdf_bytes=1,
+        total_windows=1,
+        trace_id="e" * 32,
+        window_index=None,
+        window_page_count=None,
+        window_size=16,
+        vllm_max_num_seqs=128,
+    )
+
+
 def _pressure(*, full: bool = True) -> PressureSample:
     line = PressureLine(
         avg10_pct=0,
@@ -503,39 +551,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
 
     def test_phase_summary_rejects_an_unbound_monotonic_clock(self) -> None:
         process_epoch = "d" * 32
-        event = MineruPhaseEvent(
-            append_index=None,
-            actual_decoded_bytes=None,
-            backend="hybrid",
-            duration_ns=1_500_000_000,
-            ended_monotonic_ns=1_750_000_000,
-            event="document_end",
-            inner_inference_concurrency=7,
-            max_resident_decoded_bytes=1,
-            max_resident_pages=16,
-            outcome="success",
-            page_count=1,
-            page_end_exclusive=None,
-            page_start=None,
-            phase="document",
-            pipeline_depth=0,
-            pipeline_mode="legacy",
-            process_epoch=process_epoch,
-            profile_id="legacy",
-            profile_sha256=HASH_B,
-            reserved_decoded_bytes=None,
-            resident_decoded_bytes_after_acquire=None,
-            resident_pages_after_acquire=None,
-            sequence=1,
-            started_monotonic_ns=250_000_000,
-            source_pdf_bytes=1,
-            total_windows=1,
-            trace_id="e" * 32,
-            window_index=None,
-            window_page_count=None,
-            window_size=16,
-            vllm_max_num_seqs=128,
-        )
+        event = _phase_document_end_event(process_epoch=process_epoch)
         capture = MineruPhaseTraceCapture(
             active_profile_sha256=HASH_B,
             capacity_mode="legacy",
@@ -615,39 +631,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
 
     def test_phase_summary_rejects_duplicate_or_unclosed_progress(self) -> None:
         process_epoch = "d" * 32
-        event = MineruPhaseEvent(
-            append_index=None,
-            actual_decoded_bytes=None,
-            backend="hybrid",
-            duration_ns=1_500_000_000,
-            ended_monotonic_ns=1_750_000_000,
-            event="document_end",
-            inner_inference_concurrency=7,
-            max_resident_decoded_bytes=1,
-            max_resident_pages=16,
-            outcome="success",
-            page_count=1,
-            page_end_exclusive=None,
-            page_start=None,
-            phase="document",
-            pipeline_depth=0,
-            pipeline_mode="legacy",
-            process_epoch=process_epoch,
-            profile_id="legacy",
-            profile_sha256=HASH_B,
-            reserved_decoded_bytes=None,
-            resident_decoded_bytes_after_acquire=None,
-            resident_pages_after_acquire=None,
-            sequence=1,
-            started_monotonic_ns=250_000_000,
-            source_pdf_bytes=1,
-            total_windows=1,
-            trace_id="e" * 32,
-            window_index=None,
-            window_page_count=None,
-            window_size=16,
-            vllm_max_num_seqs=128,
-        )
+        event = _phase_document_end_event(process_epoch=process_epoch)
         capture = MineruPhaseTraceCapture(
             active_profile_sha256=HASH_B,
             capacity_mode="legacy",
