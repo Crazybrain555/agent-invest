@@ -1,0 +1,174 @@
+{
+  "$defs": {
+    "BlockedProgressEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "blocked_duration_ns": {
+          "minimum": 0,
+          "title": "Blocked Duration Ns",
+          "type": "integer"
+        },
+        "blocked_reason": {
+          "enum": [
+            "api_pending_limit",
+            "cpu_stage_starved",
+            "durable_publish_backpressure",
+            "gpu_input_starved",
+            "gpu_memory_pressure",
+            "host_memory_pressure",
+            "inference_unavailable",
+            "profile_drain"
+          ],
+          "title": "Blocked Reason",
+          "type": "string"
+        },
+        "contract_version": {
+          "const": "mineru.capacity-progress-event.v1",
+          "default": "mineru.capacity-progress-event.v1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "event_type": {
+          "const": "blocked",
+          "default": "blocked",
+          "title": "Event Type",
+          "type": "string"
+        },
+        "monotonic_ns": {
+          "minimum": 0,
+          "title": "Monotonic Ns",
+          "type": "integer"
+        },
+        "observed_at_utc": {
+          "format": "date-time",
+          "title": "Observed At Utc",
+          "type": "string"
+        },
+        "process_epoch_sha256": {
+          "title": "Process Epoch Sha256",
+          "type": "string"
+        },
+        "process_profile_sha256": {
+          "title": "Process Profile Sha256",
+          "type": "string"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_id",
+        "sequence",
+        "process_epoch_sha256",
+        "process_profile_sha256",
+        "observed_at_utc",
+        "monotonic_ns",
+        "blocked_reason",
+        "blocked_duration_ns"
+      ],
+      "title": "BlockedProgressEvent",
+      "type": "object"
+    },
+    "DurablePageCommitEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_latency_ns": {
+          "minimum": 0,
+          "title": "Commit Latency Ns",
+          "type": "integer"
+        },
+        "committed_source_pages": {
+          "minimum": 1,
+          "title": "Committed Source Pages",
+          "type": "integer"
+        },
+        "contract_version": {
+          "const": "mineru.capacity-progress-event.v1",
+          "default": "mineru.capacity-progress-event.v1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "cumulative_unique_source_pages": {
+          "minimum": 1,
+          "title": "Cumulative Unique Source Pages",
+          "type": "integer"
+        },
+        "event_type": {
+          "const": "unique_durable_pages_committed",
+          "default": "unique_durable_pages_committed",
+          "title": "Event Type",
+          "type": "string"
+        },
+        "monotonic_ns": {
+          "minimum": 0,
+          "title": "Monotonic Ns",
+          "type": "integer"
+        },
+        "observed_at_utc": {
+          "format": "date-time",
+          "title": "Observed At Utc",
+          "type": "string"
+        },
+        "process_epoch_sha256": {
+          "title": "Process Epoch Sha256",
+          "type": "string"
+        },
+        "process_profile_sha256": {
+          "title": "Process Profile Sha256",
+          "type": "string"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "source_identity_sha256": {
+          "title": "Source Identity Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "sequence",
+        "process_epoch_sha256",
+        "process_profile_sha256",
+        "observed_at_utc",
+        "monotonic_ns",
+        "source_identity_sha256",
+        "committed_source_pages",
+        "cumulative_unique_source_pages",
+        "commit_latency_ns"
+      ],
+      "title": "DurablePageCommitEvent",
+      "type": "object"
+    }
+  },
+  "$id": "https://agent-invest.local/contracts/operational/capacity-progress-event.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "discriminator": {
+    "mapping": {
+      "blocked": "#/$defs/BlockedProgressEvent",
+      "unique_durable_pages_committed": "#/$defs/DurablePageCommitEvent"
+    },
+    "propertyName": "event_type"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/BlockedProgressEvent"
+    },
+    {
+      "$ref": "#/$defs/DurablePageCommitEvent"
+    }
+  ],
+  "title": "CapacityProgressEventEnvelope"
+}

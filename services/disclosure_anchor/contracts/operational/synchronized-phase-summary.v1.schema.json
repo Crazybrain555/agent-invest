@@ -1,0 +1,90 @@
+{
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-phase-summary.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "blocked_duration_ns": {
+      "minimum": 0,
+      "title": "Blocked Duration Ns",
+      "type": "integer"
+    },
+    "clock_domain_identity_sha256": {
+      "title": "Clock Domain Identity Sha256",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": "mineru.synchronized-phase-summary.v1",
+      "default": "mineru.synchronized-phase-summary.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "gpu_fast_samples_in_phase": {
+      "minimum": 1,
+      "title": "Gpu Fast Samples In Phase",
+      "type": "integer"
+    },
+    "host_slow_samples_in_phase": {
+      "minimum": 1,
+      "title": "Host Slow Samples In Phase",
+      "type": "integer"
+    },
+    "phase_capture_sha256": {
+      "title": "Phase Capture Sha256",
+      "type": "string"
+    },
+    "phase_finished_monotonic_ns": {
+      "minimum": 0,
+      "title": "Phase Finished Monotonic Ns",
+      "type": "integer"
+    },
+    "phase_started_monotonic_ns": {
+      "minimum": 0,
+      "title": "Phase Started Monotonic Ns",
+      "type": "integer"
+    },
+    "process_profile_sha256": {
+      "title": "Process Profile Sha256",
+      "type": "string"
+    },
+    "runtime_bundle_identity_sha256": {
+      "title": "Runtime Bundle Identity Sha256",
+      "type": "string"
+    },
+    "telemetry_finished_monotonic_ns": {
+      "minimum": 0,
+      "title": "Telemetry Finished Monotonic Ns",
+      "type": "integer"
+    },
+    "telemetry_receipt_sha256": {
+      "title": "Telemetry Receipt Sha256",
+      "type": "string"
+    },
+    "telemetry_started_monotonic_ns": {
+      "minimum": 0,
+      "title": "Telemetry Started Monotonic Ns",
+      "type": "integer"
+    },
+    "unique_durable_source_pages_committed": {
+      "minimum": 0,
+      "title": "Unique Durable Source Pages Committed",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "runtime_bundle_identity_sha256",
+    "process_profile_sha256",
+    "clock_domain_identity_sha256",
+    "phase_capture_sha256",
+    "telemetry_receipt_sha256",
+    "phase_started_monotonic_ns",
+    "phase_finished_monotonic_ns",
+    "telemetry_started_monotonic_ns",
+    "telemetry_finished_monotonic_ns",
+    "gpu_fast_samples_in_phase",
+    "host_slow_samples_in_phase",
+    "blocked_duration_ns",
+    "unique_durable_source_pages_committed"
+  ],
+  "title": "SynchronizedPhaseSummary",
+  "type": "object"
+}

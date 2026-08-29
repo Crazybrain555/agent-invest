@@ -15,6 +15,16 @@ from disclosure_anchor.adapters.runtime.mineru_phase_trace import (
     parse_phase_trace_line,
     summarize_complete_phase_trace,
 )
+from disclosure_anchor.application.contracts.synchronized_telemetry import (
+    BlockedProgressEvent,
+    DurablePageCommitEvent,
+    PhaseClockBinding,
+    ProgressEvent,
+    SynchronizedPhaseSummary,
+    SynchronizedTelemetryFrame,
+    SynchronizedTelemetryReceipt,
+    validate_frame_sequence,
+)
 
 
 PHASE_TRACE_CAPTURE_SCHEMA: Final = "mineru-phase-trace-capture.v1"
@@ -372,10 +382,92 @@ def summarize_phase_trace_capture(
     }
 
 
+def summarize_synchronized_phase_capture(
+    capture: MineruPhaseTraceCapture,
+    *,
+    telemetry_receipt: SynchronizedTelemetryReceipt,
+    telemetry_frames: tuple[SynchronizedTelemetryFrame, ...],
+    progress_events: tuple[ProgressEvent, ...],
+    phase_capture_sha256: str,
+    telemetry_receipt_sha256: str,
+    phase_clock_binding: PhaseClockBinding,
+) -> SynchronizedPhaseSummary:
+    """Bind one complete phase capture to independently sampled host telemetry."""
+
+    for label, value in (
+        ("phase_capture_sha256", phase_capture_sha256),
+        ("telemetry_receipt_sha256", telemetry_receipt_sha256),
+    ):
+        if _SHA256_RE.fullmatch(value) is None:
+            raise ValueError(f"{label} is invalid")
+    validate_frame_sequence(telemetry_frames, receipt=telemetry_receipt)
+    if not capture.events:
+        raise ValueError("phase trace capture contains no event")
+    process_epochs = {event.process_epoch for event in capture.events}
+    if process_epochs != {phase_clock_binding.phase_process_epoch}:
+        raise ValueError("phase trace clock binding process epoch drifted")
+    if (
+        phase_clock_binding.clock_domain_identity_sha256
+        != telemetry_receipt.clock_domain_identity_sha256
+    ):
+        raise ValueError("phase and telemetry clocks are not comparable")
+    phase_start = min(event.started_monotonic_ns for event in capture.events)
+    phase_finish = max(event.ended_monotonic_ns for event in capture.events)
+    in_phase = tuple(
+        frame
+        for frame in telemetry_frames
+        if phase_start
+        <= frame.clock.started_monotonic_ns
+        <= frame.clock.finished_monotonic_ns
+        <= phase_finish
+    )
+    gpu_count = sum(frame.lane == "gpu_fast" for frame in in_phase)
+    host_count = sum(frame.lane == "host_slow" for frame in in_phase)
+    if gpu_count == 0 or host_count == 0:
+        raise ValueError("phase interval lacks synchronized telemetry coverage")
+    blocked_duration = 0
+    committed_pages = 0
+    previous_progress_sequence = -1
+    for event in progress_events:
+        if event.run_id != telemetry_receipt.run_id:
+            raise ValueError("progress event run identity drifted")
+        if event.sequence <= previous_progress_sequence:
+            raise ValueError("progress event sequence is not increasing")
+        previous_progress_sequence = event.sequence
+        if not phase_start <= event.monotonic_ns <= phase_finish:
+            continue
+        if isinstance(event, BlockedProgressEvent):
+            blocked_duration += event.blocked_duration_ns
+        elif isinstance(event, DurablePageCommitEvent):
+            committed_pages += event.committed_source_pages
+    return SynchronizedPhaseSummary(
+        runtime_bundle_identity_sha256=(
+            telemetry_receipt.runtime_bundle_identity_sha256
+        ),
+        process_profile_sha256=(
+            telemetry_receipt.process_profile.process_profile_sha256
+        ),
+        clock_domain_identity_sha256=(
+            telemetry_receipt.clock_domain_identity_sha256
+        ),
+        phase_capture_sha256=phase_capture_sha256,
+        telemetry_receipt_sha256=telemetry_receipt_sha256,
+        phase_started_monotonic_ns=phase_start,
+        phase_finished_monotonic_ns=phase_finish,
+        telemetry_started_monotonic_ns=telemetry_receipt.started_monotonic_ns,
+        telemetry_finished_monotonic_ns=telemetry_receipt.finished_monotonic_ns,
+        gpu_fast_samples_in_phase=gpu_count,
+        host_slow_samples_in_phase=host_count,
+        blocked_duration_ns=blocked_duration,
+        unique_durable_source_pages_committed=committed_pages,
+    )
+
+
 __all__ = [
     "MineruPhaseTraceCapture",
     "PHASE_TRACE_CAPTURE_SCHEMA",
     "PHASE_TRACE_CAPTURE_SUMMARY_SCHEMA",
     "parse_phase_trace_capture",
     "summarize_phase_trace_capture",
+    "summarize_synchronized_phase_capture",
 ]

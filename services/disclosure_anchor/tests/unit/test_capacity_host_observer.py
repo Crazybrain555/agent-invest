@@ -13,6 +13,7 @@ import scripts.mineru_staged_load as staged
 from disclosure_anchor.adapters.runtime.mineru_host_capacity_observer import (
     build_host_observer_ssh_command,
     project_host_capacity_sample,
+    project_synchronized_host_capacity_sample,
 )
 
 
@@ -54,6 +55,72 @@ def _payload(*, available: int = 8192, restart: int = 0) -> dict[str, object]:
         "collector_sha256": COLLECTOR,
         "windows_node_identity_sha256": NODE,
         "containers": containers,
+    }
+
+
+def _psi(*, full_supported: bool = True) -> dict[str, object]:
+    line = {
+        "avg10_pct": 0.0,
+        "avg60_pct": 0.0,
+        "avg300_pct": 0.0,
+        "total_stall_us": 0,
+    }
+    return {
+        "some": line,
+        "full_status": "supported" if full_supported else "unsupported",
+        "full_reason": None if full_supported else "collector_unsupported",
+        "full": line if full_supported else None,
+    }
+
+
+def _synchronized_payload() -> dict[str, object]:
+    return {
+        "schema": "mineru-synchronized-host-capacity-sample.v1",
+        "observed_at_utc": "2026-08-29T00:00:00+00:00",
+        "collector_sha256": COLLECTOR,
+        "windows_node_identity_sha256": NODE,
+        "api_process": {
+            "process_epoch_sha256": "sha256:" + "1" * 64,
+            "cpu_user_ns_total": 100,
+            "cpu_system_ns_total": 50,
+            "rss_bytes": 1000,
+            "rss_hwm_bytes": 1200,
+            "thread_count": 8,
+        },
+        "docker_vm": {
+            "memory_total_bytes": 32_000,
+            "memory_available_bytes": 10_000,
+        },
+        "parent_cgroup": {
+            "epoch_sha256": "sha256:" + "2" * 64,
+            "memory_current_bytes": 20_000,
+            "memory_max_status": "bounded",
+            "memory_max_bytes": 32_000,
+            "memory_stat": {
+                "anon_bytes": 10_000,
+                "file_bytes": 5_000,
+                "shmem_bytes": 100,
+                "slab_bytes": 500,
+            },
+            "memory_events": {
+                "low_total": 0,
+                "high_total": 0,
+                "max_total": 0,
+                "oom_total": 0,
+                "oom_kill_total": 0,
+                "oom_group_kill_total": 0,
+            },
+            "memory_psi": _psi(),
+            "cpu_stat": {
+                "usage_ns_total": 1000,
+                "user_ns_total": 600,
+                "system_ns_total": 300,
+                "throttled_ns_total": 0,
+                "throttled_periods_total": 0,
+            },
+            "cpu_psi": _psi(full_supported=False),
+            "io_psi": _psi(),
+        },
     }
 
 
@@ -179,6 +246,40 @@ class CapacityHostObserverTests(unittest.TestCase):
             docker_memory_reserve_bytes=4096,
         )
         self.assertEqual(projected.docker_vm_memory_available_bytes, 7000)
+
+    def test_synchronized_projection_is_closed_and_has_no_fixed_reserve(self) -> None:
+        observed_at, process, host = project_synchronized_host_capacity_sample(
+            _synchronized_payload(),
+            expected_collector_sha256=COLLECTOR,
+            expected_windows_node_identity_sha256=NODE,
+        )
+
+        self.assertEqual(observed_at.isoformat(), "2026-08-29T00:00:00+00:00")
+        self.assertEqual(process.cpu_user_ns_total, 100)
+        self.assertEqual(host.memory_current_bytes, 20_000)
+        self.assertEqual(host.cpu_psi.full_status, "unsupported")
+        self.assertNotIn(
+            "reserve",
+            json.dumps(host.model_dump(mode="json"), sort_keys=True),
+        )
+
+    def test_synchronized_projection_rejects_missing_or_extra_metrics(self) -> None:
+        for tamper in ("missing", "extra", "identity"):
+            payload = _synchronized_payload()
+            parent = payload["parent_cgroup"]
+            assert isinstance(parent, dict)
+            if tamper == "missing":
+                parent.pop("memory_psi")
+            elif tamper == "extra":
+                parent["raw_process_command"] = "forbidden"
+            else:
+                payload["windows_node_identity_sha256"] = "sha256:" + "9" * 64
+            with self.subTest(tamper=tamper), self.assertRaises(ValueError):
+                project_synchronized_host_capacity_sample(
+                    payload,
+                    expected_collector_sha256=COLLECTOR,
+                    expected_windows_node_identity_sha256=NODE,
+                )
 
 
 if __name__ == "__main__":

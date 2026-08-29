@@ -1,0 +1,132 @@
+{
+  "$defs": {
+    "CapacityVector": {
+      "additionalProperties": false,
+      "properties": {
+        "document_owner_bytes": {
+          "minimum": 0,
+          "title": "Document Owner Bytes",
+          "type": "integer"
+        },
+        "model_cpu_bytes": {
+          "minimum": 0,
+          "title": "Model Cpu Bytes",
+          "type": "integer"
+        },
+        "model_gpu_bytes": {
+          "minimum": 0,
+          "title": "Model Gpu Bytes",
+          "type": "integer"
+        },
+        "native_owner_slots": {
+          "minimum": 0,
+          "title": "Native Owner Slots",
+          "type": "integer"
+        },
+        "raster_cpu_bytes": {
+          "minimum": 0,
+          "title": "Raster Cpu Bytes",
+          "type": "integer"
+        },
+        "source_disk_bytes": {
+          "minimum": 0,
+          "title": "Source Disk Bytes",
+          "type": "integer"
+        },
+        "task_slots": {
+          "minimum": 0,
+          "title": "Task Slots",
+          "type": "integer"
+        },
+        "tensor_cpu_bytes": {
+          "minimum": 0,
+          "title": "Tensor Cpu Bytes",
+          "type": "integer"
+        },
+        "tensor_gpu_bytes": {
+          "minimum": 0,
+          "title": "Tensor Gpu Bytes",
+          "type": "integer"
+        },
+        "vllm_sequence_slots": {
+          "minimum": 0,
+          "title": "Vllm Sequence Slots",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_disk_bytes",
+        "raster_cpu_bytes",
+        "tensor_cpu_bytes",
+        "tensor_gpu_bytes",
+        "model_cpu_bytes",
+        "model_gpu_bytes",
+        "document_owner_bytes",
+        "task_slots",
+        "native_owner_slots",
+        "vllm_sequence_slots"
+      ],
+      "title": "CapacityVector",
+      "type": "object"
+    }
+  },
+  "$id": "https://agent-invest.local/contracts/operational/capacity-vector-credit-event.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "enum": [
+        "reserve",
+        "borrow",
+        "return"
+      ],
+      "title": "Action",
+      "type": "string"
+    },
+    "available_after": {
+      "$ref": "#/$defs/CapacityVector"
+    },
+    "available_before": {
+      "$ref": "#/$defs/CapacityVector"
+    },
+    "contract_version": {
+      "const": "mineru.capacity-vector-credit-event.v1",
+      "default": "mineru.capacity-vector-credit-event.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "delta": {
+      "$ref": "#/$defs/CapacityVector"
+    },
+    "lease_identity_sha256": {
+      "title": "Lease Identity Sha256",
+      "type": "string"
+    },
+    "monotonic_ns": {
+      "minimum": 0,
+      "title": "Monotonic Ns",
+      "type": "integer"
+    },
+    "process_epoch_sha256": {
+      "title": "Process Epoch Sha256",
+      "type": "string"
+    },
+    "sequence": {
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "sequence",
+    "process_epoch_sha256",
+    "lease_identity_sha256",
+    "action",
+    "delta",
+    "available_before",
+    "available_after",
+    "monotonic_ns"
+  ],
+  "title": "CapacityVectorCreditEvent",
+  "type": "object"
+}

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -17,6 +17,15 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_WINDOWS_COLLECTOR_PATH,
 )
 from disclosure_anchor.application.contracts.capacity import HostSampleValues
+from disclosure_anchor.application.contracts.synchronized_telemetry import (
+    ApiProcessTelemetryValues,
+    CgroupCpuStat,
+    CgroupMemoryEvents,
+    CgroupMemoryStat,
+    HostCgroupTelemetryValues,
+    PressureLine,
+    PressureSample,
+)
 
 
 HOST_CONTAINER_NAMES = frozenset(
@@ -25,6 +34,7 @@ HOST_CONTAINER_NAMES = frozenset(
 _SSH_HOST_RE = re.compile(r"^(?!-)[A-Za-z0-9.-]+$")
 _SSH_USER_RE = re.compile(r"^(?!-)[A-Za-z0-9_.-]+$")
 _CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
+_SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 
 def _private_observer_file(path: Path, *, label: str) -> None:
@@ -336,6 +346,190 @@ def project_host_capacity_sample(
     )
 
 
+def _closed_mapping(
+    value: object,
+    *,
+    label: str,
+    fields: frozenset[str],
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"synchronized host {label} fields drifted")
+    return value
+
+
+def _pressure_line(value: object, *, label: str) -> PressureLine:
+    item = _closed_mapping(
+        value,
+        label=label,
+        fields=frozenset({"avg10_pct", "avg60_pct", "avg300_pct", "total_stall_us"}),
+    )
+    return PressureLine.model_validate(item)
+
+
+def _pressure(value: object, *, label: str) -> PressureSample:
+    item = _closed_mapping(
+        value,
+        label=label,
+        fields=frozenset({"some", "full_status", "full_reason", "full"}),
+    )
+    payload = dict(item)
+    payload["some"] = _pressure_line(item["some"], label=f"{label}.some")
+    if item["full"] is not None:
+        payload["full"] = _pressure_line(item["full"], label=f"{label}.full")
+    return PressureSample.model_validate(payload)
+
+
+def project_synchronized_host_capacity_sample(
+    payload: object,
+    *,
+    expected_collector_sha256: str,
+    expected_windows_node_identity_sha256: str,
+) -> tuple[datetime, ApiProcessTelemetryValues, HostCgroupTelemetryValues]:
+    """Project the opt-in v2 host collector without inventing absent metrics."""
+
+    value = _closed_mapping(
+        payload,
+        label="sample",
+        fields=frozenset(
+            {
+                "schema",
+                "observed_at_utc",
+                "collector_sha256",
+                "windows_node_identity_sha256",
+                "api_process",
+                "docker_vm",
+                "parent_cgroup",
+            }
+        ),
+    )
+    if (
+        value["schema"] != "mineru-synchronized-host-capacity-sample.v1"
+        or value["collector_sha256"] != expected_collector_sha256
+        or value["windows_node_identity_sha256"]
+        != expected_windows_node_identity_sha256
+        or _SHA256_RE.fullmatch(expected_collector_sha256) is None
+        or _SHA256_RE.fullmatch(expected_windows_node_identity_sha256) is None
+    ):
+        raise ValueError("synchronized host sample identity drifted")
+    try:
+        observed_at = datetime.fromisoformat(
+            str(value["observed_at_utc"]).replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ValueError("synchronized host timestamp is invalid") from exc
+    if observed_at.tzinfo is None or observed_at.utcoffset() != timezone.utc.utcoffset(
+        observed_at
+    ):
+        raise ValueError("synchronized host timestamp is not UTC")
+
+    process = _closed_mapping(
+        value["api_process"],
+        label="api_process",
+        fields=frozenset(
+            {
+                "process_epoch_sha256",
+                "cpu_user_ns_total",
+                "cpu_system_ns_total",
+                "rss_bytes",
+                "rss_hwm_bytes",
+                "thread_count",
+            }
+        ),
+    )
+    api_process = ApiProcessTelemetryValues.model_validate(process)
+    vm = _closed_mapping(
+        value["docker_vm"],
+        label="docker_vm",
+        fields=frozenset({"memory_total_bytes", "memory_available_bytes"}),
+    )
+    parent = _closed_mapping(
+        value["parent_cgroup"],
+        label="parent_cgroup",
+        fields=frozenset(
+            {
+                "epoch_sha256",
+                "memory_current_bytes",
+                "memory_max_status",
+                "memory_max_bytes",
+                "memory_stat",
+                "memory_events",
+                "memory_psi",
+                "cpu_stat",
+                "cpu_psi",
+                "io_psi",
+            }
+        ),
+    )
+    memory_stat = _closed_mapping(
+        parent["memory_stat"],
+        label="memory_stat",
+        fields=frozenset({"anon_bytes", "file_bytes", "shmem_bytes", "slab_bytes"}),
+    )
+    memory_events = _closed_mapping(
+        parent["memory_events"],
+        label="memory_events",
+        fields=frozenset(
+            {
+                "low_total",
+                "high_total",
+                "max_total",
+                "oom_total",
+                "oom_kill_total",
+                "oom_group_kill_total",
+            }
+        ),
+    )
+    cpu_stat = _closed_mapping(
+        parent["cpu_stat"],
+        label="cpu_stat",
+        fields=frozenset(
+            {
+                "usage_ns_total",
+                "user_ns_total",
+                "system_ns_total",
+                "throttled_ns_total",
+                "throttled_periods_total",
+            }
+        ),
+    )
+    memory_max_status = parent["memory_max_status"]
+    if memory_max_status not in {"bounded", "unbounded"}:
+        raise ValueError("host capacity memory_max_status is invalid")
+    memory_max_bytes = parent["memory_max_bytes"]
+    if memory_max_bytes is not None:
+        memory_max_bytes = _integer(
+            memory_max_bytes,
+            label="parent_cgroup.memory_max_bytes",
+        )
+    host = HostCgroupTelemetryValues(
+        parent_cgroup_epoch_sha256=str(parent["epoch_sha256"]),
+        docker_vm_memory_total_bytes=_integer(
+            vm["memory_total_bytes"], label="docker_vm.memory_total_bytes"
+        ),
+        docker_vm_memory_available_bytes=_integer(
+            vm["memory_available_bytes"],
+            label="docker_vm.memory_available_bytes",
+            allow_zero=True,
+        ),
+        memory_current_bytes=_integer(
+            parent["memory_current_bytes"],
+            label="parent_cgroup.memory_current_bytes",
+            allow_zero=True,
+        ),
+        memory_max_status=(
+            "bounded" if memory_max_status == "bounded" else "unbounded"
+        ),
+        memory_max_bytes=memory_max_bytes,
+        memory_stat=CgroupMemoryStat.model_validate(memory_stat),
+        memory_events=CgroupMemoryEvents.model_validate(memory_events),
+        memory_psi=_pressure(parent["memory_psi"], label="memory_psi"),
+        cpu_stat=CgroupCpuStat.model_validate(cpu_stat),
+        cpu_psi=_pressure(parent["cpu_psi"], label="cpu_psi"),
+        io_psi=_pressure(parent["io_psi"], label="io_psi"),
+    )
+    return observed_at, api_process, host
+
+
 class MineruHostCapacitySampler:
     source = "host"
     cadence_seconds = 5.0
@@ -387,4 +581,5 @@ __all__ = [
     "MineruHostCapacitySampler",
     "build_host_observer_ssh_command",
     "project_host_capacity_sample",
+    "project_synchronized_host_capacity_sample",
 ]
