@@ -300,7 +300,7 @@
   },
   "tests/unit/test_mineru_http_staged.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 13
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -400,7 +400,7 @@
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 2
   },
   "tests/unit/test_retrieval_primary.py": {
    "private_imports": [],

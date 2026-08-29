@@ -52,7 +52,6 @@ def _observation() -> dict[str, Any]:
         "MINERU_MODEL_SOURCE=local",
         "MINERU_MALLOC_TRIM=1",
         "MINERU_PHASE_TRACE=0",
-        "MINERU_TASK_PROTOCOL_V2=0",
         "MINERU_HYBRID_BATCH_RATIO=1",
         "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS=1",
         "MINERU_API_MAX_CONCURRENT_REQUESTS=1",
@@ -150,6 +149,7 @@ def _observation() -> dict[str, Any]:
             "max_pending_tasks_requested": 1,
             "max_pending_tasks_effective": 1,
             "pipeline_inference_locks_enabled": True,
+            "task_protocol_v2_enabled": True,
             "image_labels": {
                 "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
                 "io.agent-invest.mineru.capacity-policy": (

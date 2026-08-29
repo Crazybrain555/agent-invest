@@ -507,20 +507,17 @@ function Capture-OldRuntimeState {
         $oldHealth = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
         Assert-IdleHealth -Health $oldHealth -Label "old MinerU API"
         $oldApi = (Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json
-        if ($script:OldProjectContainers -contains "mineru-api-proxy") {
-            if ($script:OldRunningContainers -notcontains "mineru-api-proxy") {
-                throw "old MinerU API proxy exists but is not running"
-            }
-            $oldProxy = (Invoke-Docker -Arguments @(
-                "inspect", "mineru-api-proxy"
-            )) | ConvertFrom-Json
-            Assert-NoPublishedPort -Container $oldApi -ContainerPort "8000/tcp"
-            Assert-SinglePort -Container $oldProxy -ContainerPort "8000/tcp" -HostPort "30003"
+        if (
+            $script:OldProjectContainers -notcontains "mineru-api-proxy" -or
+            $script:OldRunningContainers -notcontains "mineru-api-proxy"
+        ) {
+            throw "existing MinerU topology is not the exact proxy-isolated topology"
         }
-        else {
-            # One-time migration compatibility for the pre-proxy topology.
-            Assert-SinglePort -Container $oldApi -ContainerPort "8000/tcp" -HostPort "30003"
-        }
+        $oldProxy = (Invoke-Docker -Arguments @(
+            "inspect", "mineru-api-proxy"
+        )) | ConvertFrom-Json
+        Assert-NoPublishedPort -Container $oldApi -ContainerPort "8000/tcp"
+        Assert-SinglePort -Container $oldProxy -ContainerPort "8000/tcp" -HostPort "30003"
     }
     if ($script:OldProjectContainers -contains "mineru-openai-server") {
         if ($script:OldRunningContainers -contains "mineru-openai-server") {
@@ -707,12 +704,14 @@ function Get-ValidatedRuntime {
         "status", "version", "protocol_version", "max_concurrent_requests",
         "max_pending_tasks_requested", "max_pending_tasks_effective",
         "processing_window_size", "task_retention_seconds",
-        "task_cleanup_interval_seconds", "queued_tasks", "processing_tasks"
+        "task_cleanup_interval_seconds", "task_protocol_schema",
+        "queued_tasks", "processing_tasks"
     ) -Label "new MinerU API health"
     Assert-IdleHealth -Health $health -Label "new MinerU API health"
     if (
         [string]$health.version -ne "3.4.4" -or
         [int]$health.protocol_version -ne 2 -or
+        [string]$health.task_protocol_schema -ne "mineru-task-protocol.v2" -or
         [int]$health.max_concurrent_requests -ne $ExpectedApiTaskSlots -or
         [int]$health.max_pending_tasks_requested -ne $ExpectedApiMaxPendingTasks -or
         [int]$health.max_pending_tasks_effective -ne $ExpectedApiMaxPendingTasks -or
@@ -826,7 +825,7 @@ function Get-ValidatedApiCompatImage {
             [string]$BuildIdentity.task_protocol_v2_sha256 -or
         @($image.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1" -or
         @($image.Config.Env) -notcontains "MINERU_PHASE_TRACE=0" -or
-        @($image.Config.Env) -notcontains "MINERU_TASK_PROTOCOL_V2=0"
+        @($image.Config.Env | Where-Object { $_ -like "MINERU_TASK_PROTOCOL_V2=*" }).Count -ne 0
     ) {
         throw "MinerU API compatibility image labels or environment drifted"
     }

@@ -290,23 +290,22 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "    task_manager = get_task_manager()\n"
             "    task_id = str(uuid.uuid4())\n"
             "    protocol_record = None\n"
-            "    if task_manager.task_protocol_v2 is not None:\n"
-            "        identities = (request_options.agent_idempotency_key, request_options.agent_attempt_identity, request_options.agent_fence_identity)\n"
-            "        if not all(isinstance(item, str) and item for item in identities):\n"
-            '            raise HTTPException(status_code=400, detail="Task protocol v2 identities are required")\n'
-            "        try:\n"
-            "            protocol_record, created = task_manager.task_protocol_v2.reconcile_or_create(\n"
-            "                idempotency_key=request_options.agent_idempotency_key, task_id=task_id,\n"
-            "                attempt_identity=request_options.agent_attempt_identity, fence_identity=request_options.agent_fence_identity,\n"
-            "            )\n"
-            "        except TaskProtocolConflict as exc:\n"
-            "            raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
-            "        if not created:\n"
-            "            existing = task_manager.get(protocol_record.task_id)\n"
-            "            if existing is None:\n"
-            '                raise HTTPException(status_code=409, detail="Reconciled task route is unavailable")\n'
-            "            return existing\n"
-            "        task_id = protocol_record.task_id\n"
+            "    identities = (request_options.agent_idempotency_key, request_options.agent_attempt_identity, request_options.agent_fence_identity)\n"
+            "    if not all(isinstance(item, str) and item for item in identities):\n"
+            '        raise HTTPException(status_code=400, detail="Task protocol v2 identities are required")\n'
+            "    try:\n"
+            "        protocol_record, created = task_manager.task_protocol_v2.reconcile_or_create(\n"
+            "            idempotency_key=request_options.agent_idempotency_key, task_id=task_id,\n"
+            "            attempt_identity=request_options.agent_attempt_identity, fence_identity=request_options.agent_fence_identity,\n"
+            "        )\n"
+            "    except TaskProtocolConflict as exc:\n"
+            "        raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+            "    if not created:\n"
+            "        existing = task_manager.get(protocol_record.task_id)\n"
+            "        if existing is None:\n"
+            '            raise HTTPException(status_code=409, detail="Reconciled task route is unavailable")\n'
+            "        return existing\n"
+            "    task_id = protocol_record.task_id\n"
             "    task_output_dir = create_task_output_dir(task_id)\n"
             '    uploads_dir = os.path.join(task_output_dir, "uploads")\n',
             count=1,
@@ -658,13 +657,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        self.active_tasks.clear()\n\n"
             "    async def submit(self, task: AsyncParseTask) -> None:\n",
             "        self.active_tasks.clear()\n"
-            "        if self.task_protocol_v2 is None:\n"
-            "            for task in self.tasks.values():\n"
-            "                if task.result_artifact_path:\n"
-            "                    cleanup_file(task.result_artifact_path)\n"
-            "                    task.result_artifact_path = None\n"
-            "            self.tasks.clear()\n"
-            "            self.task_events.clear()\n\n"
+            "        self.task_protocol_v2.cleanup_consumed()\n\n"
             "    async def submit(self, task: AsyncParseTask) -> None:\n",
             count=1,
             label="FastAPI retained result shutdown cleanup",
@@ -742,14 +735,13 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "    ):\n"
             '        raise HTTPException(status_code=410, detail="Retained task result is unavailable")\n'
             "    result_path = task.result_artifact_path\n"
-            "    if task_manager.task_protocol_v2 is not None:\n"
-            "        if not task.agent_idempotency_key:\n"
-            '            raise HTTPException(status_code=410, detail="Task protocol result owner is absent")\n'
-            "        try:\n"
-            "            result_path = str(task_manager.task_protocol_v2.acquire_result(task.agent_idempotency_key))\n"
-            "        except TaskProtocolConflict as exc:\n"
-            "            raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
-            "        background_tasks.add_task(task_manager.task_protocol_v2.release_result, task.agent_idempotency_key)\n"
+            "    if not task.agent_idempotency_key:\n"
+            '        raise HTTPException(status_code=410, detail="Task protocol result owner is absent")\n'
+            "    try:\n"
+            "        result_path = str(task_manager.task_protocol_v2.acquire_result(task.agent_idempotency_key))\n"
+            "    except TaskProtocolConflict as exc:\n"
+            "        raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+            "    background_tasks.add_task(task_manager.task_protocol_v2.release_result, task.agent_idempotency_key)\n"
             "    return FileResponse(\n"
             "        path=result_path,\n"
             '        media_type="application/zip",\n'
@@ -772,6 +764,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        \"max_concurrent_requests\": get_max_concurrent_requests(),\n"
             "        \"max_pending_tasks_requested\": get_max_pending_tasks(),\n"
             "        \"max_pending_tasks_effective\": task_manager.max_nonterminal_tasks,\n"
+            '        "task_protocol_schema": "mineru-task-protocol.v2",\n'
             "        \"processing_window_size\": strict_processing_window_size(),\n",
             count=1,
             label="FastAPI pending depth health identity",
@@ -786,13 +779,14 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "            request,\n"
             "            queued_ahead=self.get_queued_ahead(task.task_id),\n"
             "        )\n"
-            "        if self.task_protocol_v2 is not None and task.agent_idempotency_key:\n"
-            "            record = self.task_protocol_v2.get(task.agent_idempotency_key)\n"
-            "            if record is None:\n"
-            '                raise RuntimeError("Task protocol route disappeared")\n'
-            '            payload["task_protocol_schema"] = "mineru-task-protocol.v2"\n'
-            '            payload["protocol_state"] = record.state\n'
-            '            payload["idempotency_key"] = record.idempotency_key\n'
+            "        if not task.agent_idempotency_key:\n"
+            '            raise RuntimeError("Task protocol route identity is absent")\n'
+            "        record = self.task_protocol_v2.get(task.agent_idempotency_key)\n"
+            "        if record is None:\n"
+            '            raise RuntimeError("Task protocol route disappeared")\n'
+            '        payload["task_protocol_schema"] = "mineru-task-protocol.v2"\n'
+            '        payload["protocol_state"] = record.state\n'
+            '        payload["idempotency_key"] = record.idempotency_key\n'
             "        return payload\n",
             count=1,
             label="FastAPI task protocol status identity",
@@ -803,8 +797,6 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             '@app.get(path="/tasks/by-idempotency/{idempotency_key}", name="reconcile_async_task")\n'
             "async def reconcile_async_task(idempotency_key: str, request: Request):\n"
             "    task_manager = get_task_manager()\n"
-            "    if task_manager.task_protocol_v2 is None:\n"
-            '        raise HTTPException(status_code=404, detail="Task protocol v2 is disabled")\n'
             "    record = task_manager.task_protocol_v2.get(idempotency_key)\n"
             "    task = None if record is None else task_manager.get(record.task_id)\n"
             "    if task is None:\n"
@@ -813,7 +805,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             '@app.post(path="/tasks/{task_id}/lease", name="lease_async_task_result")\n'
             "async def lease_async_task_result(task_id: str, seconds: int = 300):\n"
             "    task_manager = get_task_manager()\n"
-            "    if task_manager.task_protocol_v2 is None or not 1 <= seconds <= 3600:\n"
+            "    if not 1 <= seconds <= 3600:\n"
             '        raise HTTPException(status_code=400, detail="Task protocol lease is invalid")\n'
             "    record = task_manager.task_protocol_v2.get_by_task_id(task_id)\n"
             "    if record is None:\n"
@@ -826,8 +818,6 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             '@app.post(path="/tasks/{task_id}/ack", name="ack_async_task_result")\n'
             "async def ack_async_task_result(task_id: str):\n"
             "    task_manager = get_task_manager()\n"
-            "    if task_manager.task_protocol_v2 is None:\n"
-            '        raise HTTPException(status_code=404, detail="Task protocol v2 is disabled")\n'
             "    record = task_manager.task_protocol_v2.get_by_task_id(task_id)\n"
             "    if record is None:\n"
             '        raise HTTPException(status_code=404, detail="Task not found")\n'
@@ -886,41 +876,34 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             source,
             "        self._next_submit_order = 1\n",
             "        self._next_submit_order = 1\n"
-            "        self.task_protocol_v2_enabled = (\n"
-            '            os.getenv("MINERU_TASK_PROTOCOL_V2", "0") == "1"\n'
+            '        protocol_root = get_output_root() / ".agent-task-protocol-v2"\n'
+            "        self.task_protocol_v2 = DurableTaskRegistry(\n"
+            '            protocol_root / "registry.json",\n'
+            "            max_unacked_result_bytes=int(\n"
+            '                os.getenv("MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES", "2147483648")\n'
+            "            ),\n"
+            "            output_root=get_output_root(),\n"
+            "            tombstone_retention_seconds=int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_TOMBSTONE_RETENTION_SECONDS\", \"86400\")),\n"
+            "            enforce_key_lifecycle=True,\n"
             "        )\n"
-            "        self.task_protocol_v2 = None\n"
-            "        self.task_protocol_executor = None\n"
-            "        if self.task_protocol_v2_enabled:\n"
-            '            protocol_root = get_output_root() / ".agent-task-protocol-v2"\n'
-            "            self.task_protocol_v2 = DurableTaskRegistry(\n"
-            '                protocol_root / "registry.json",\n'
-            "                max_unacked_result_bytes=int(\n"
-            '                    os.getenv("MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES", "2147483648")\n'
-            "                ),\n"
-            "                output_root=get_output_root(),\n"
-            "                tombstone_retention_seconds=int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_TOMBSTONE_RETENTION_SECONDS\", \"86400\")),\n"
-            "                enforce_key_lifecycle=True,\n"
-            "            )\n"
-            "            self.task_protocol_executor = SplitTaskExecutor(\n"
-            "                parse_slots=get_max_concurrent_requests(), finalizer_slots=1,\n"
-            "                result_reservation_bytes=int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES\", \"268435456\")),\n"
-            "            )\n",
+            "        self.task_protocol_executor = SplitTaskExecutor(\n"
+            "            parse_slots=get_max_concurrent_requests(), finalizer_slots=1,\n"
+            "            result_reservation_bytes=int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES\", \"268435456\")),\n"
+            "        )\n",
             count=1,
             label="FastAPI task protocol manager ownership",
         )
         source = _replace_exact_fixture_optional(
             source,
             "        if self.dispatcher_task is None or self.dispatcher_task.done():\n",
-            "        if self.task_protocol_v2 is not None:\n"
-            "            self.task_protocol_v2.cleanup_consumed()\n"
-            "            for payload in self.task_protocol_v2.recoverable_payloads():\n"
-            "                task = AsyncParseTask(**payload)\n"
-            "                self.tasks[task.task_id] = task\n"
-            "                self.task_events[task.task_id] = asyncio.Event()\n"
-            "                if task.status not in TASK_TERMINAL_STATES:\n"
-            "                    task.status = TASK_PENDING\n"
-            "                    self.queue.put_nowait(task.task_id)\n"
+            "        self.task_protocol_v2.cleanup_consumed()\n"
+            "        for payload in self.task_protocol_v2.recoverable_payloads():\n"
+            "            task = AsyncParseTask(**payload)\n"
+            "            self.tasks[task.task_id] = task\n"
+            "            self.task_events[task.task_id] = asyncio.Event()\n"
+            "            if task.status not in TASK_TERMINAL_STATES:\n"
+            "                task.status = TASK_PENDING\n"
+            "                self.queue.put_nowait(task.task_id)\n"
             "        if self.dispatcher_task is None or self.dispatcher_task.done():\n",
             count=1,
             label="FastAPI task protocol restart recovery",
@@ -937,8 +920,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "            agent_attempt_identity=request_options.agent_attempt_identity,\n"
             "            agent_fence_identity=request_options.agent_fence_identity,\n"
             "        )\n"
-            "        if task_manager.task_protocol_v2 is not None:\n"
-            "            task_manager.task_protocol_v2.bind_task_payload(task.agent_idempotency_key, asdict(task))\n"
+            "        task_manager.task_protocol_v2.bind_task_payload(task.agent_idempotency_key, asdict(task))\n"
             "        await task_manager.submit(task)\n",
             count=1,
             label="FastAPI task protocol pre-submit reconcile",
@@ -952,26 +934,20 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "            else:\n"
             "                await self._run_task(task)\n",
             "        try:\n"
-            "            if self.task_protocol_v2 is not None:\n"
-            "                if not task.agent_idempotency_key or self.task_protocol_executor is None:\n"
-            '                    raise RuntimeError("Task protocol route identity is absent")\n'
-            "                async def parse_stage():\n"
-            "                    await self._run_parse_stage(task)\n"
-            "                async def finalizer_stage():\n"
-            "                    await build_retained_task_result(task)\n"
-            "                    return (Path(task.result_artifact_path), task.result_artifact_sha256, task.result_artifact_bytes, task.result_artifact_owner)\n"
-            "                await self.task_protocol_executor.run(\n"
-            "                    registry=self.task_protocol_v2, key=task.agent_idempotency_key,\n"
-            "                    parse=parse_stage, finalize=finalizer_stage,\n"
-            "                )\n"
-            "                task.status = TASK_COMPLETED\n"
-            "                task.completed_at = utc_now_iso()\n"
-            "                self._signal_task_event(task.task_id)\n"
-            "            elif _request_semaphore is not None:\n"
-            "                async with _request_semaphore:\n"
-            "                    await self._run_task(task)\n"
-            "            else:\n"
-            "                await self._run_task(task)\n",
+            "            if not task.agent_idempotency_key:\n"
+            '                raise RuntimeError("Task protocol route identity is absent")\n'
+            "            async def parse_stage():\n"
+            "                await self._run_parse_stage(task)\n"
+            "            async def finalizer_stage():\n"
+            "                await build_retained_task_result(task)\n"
+            "                return (Path(task.result_artifact_path), task.result_artifact_sha256, task.result_artifact_bytes, task.result_artifact_owner)\n"
+            "            await self.task_protocol_executor.run(\n"
+            "                registry=self.task_protocol_v2, key=task.agent_idempotency_key,\n"
+            "                parse=parse_stage, finalize=finalizer_stage,\n"
+            "            )\n"
+            "            task.status = TASK_COMPLETED\n"
+            "            task.completed_at = utc_now_iso()\n"
+            "            self._signal_task_event(task.task_id)\n",
             count=1,
             label="FastAPI task protocol split parse and finalizer",
         )
@@ -991,25 +967,16 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        task.completed_at = utc_now_iso()\n"
             "        self._signal_task_event(task.task_id)\n\n"
             "    def cleanup_expired_tasks(self) -> int:\n",
-            "\n    async def _run_task(self, task: AsyncParseTask) -> None:\n"
-            "        await self._run_parse_stage(task)\n"
-            "        await build_retained_task_result(task)\n"
-            "        task.status = TASK_COMPLETED\n"
-            "        task.completed_at = utc_now_iso()\n"
-            "        self._signal_task_event(task.task_id)\n\n"
-            "    def _evict_consumed_protocol_tasks(self) -> int:\n"
-            "        if self.task_protocol_v2 is None:\n"
-            "            return 0\n"
+            "\n    def _evict_consumed_protocol_tasks(self) -> int:\n"
             "        return evict_consumed_routes(\n"
             "            self.task_protocol_v2, self.tasks, self.task_events\n"
             "        )\n\n"
             "    def cleanup_expired_tasks(self) -> int:\n"
-            "        if self.task_protocol_v2 is not None:\n"
-            "            cleaned = self.task_protocol_v2.cleanup_consumed()\n"
-            "            self._evict_consumed_protocol_tasks()\n"
-            "            return cleaned\n",
+            "        cleaned = self.task_protocol_v2.cleanup_consumed()\n"
+            "        self._evict_consumed_protocol_tasks()\n"
+            "        return cleaned\n",
             count=1,
-            label="FastAPI task protocol legacy task wrapper",
+            label="FastAPI task protocol cleanup ownership",
         )
         return source
 

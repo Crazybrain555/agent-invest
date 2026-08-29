@@ -61,9 +61,6 @@ services:
       # Content-free timing is enabled only for controlled capacity trials;
       # the normal runtime stays off and its effective value is attested.
       MINERU_PHASE_TRACE: "0"
-      # Protocol v2 bytes are packaged and attested, but activation remains
-      # explicitly disabled until the durable worker checkpoint is wired.
-      MINERU_TASK_PROTOCOL_V2: "0"
       # The C/S API cannot infer this from the remote GPU. Keep the process
       # value explicit, closed and identity-bound; OCR documents resolve to 1.
       MINERU_HYBRID_BATCH_RATIO: "1"
@@ -97,7 +94,12 @@ services:
       mineru-openai-server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:8000/health >/dev/null"]
+      test:
+        - CMD-SHELL
+        - >-
+          /usr/bin/python3.12 -I -c 'import json,urllib.request;
+          value=json.load(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=3));
+          assert value.get("task_protocol_schema")=="mineru-task-protocol.v2"'
       interval: 15s
       timeout: 5s
       retries: 12

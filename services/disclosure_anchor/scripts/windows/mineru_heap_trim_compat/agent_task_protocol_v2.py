@@ -1,4 +1,4 @@
-"""Durable state machine for the default-off MinerU task protocol v2."""
+"""Durable state machine for the sole MinerU staged-task protocol."""
 
 from __future__ import annotations
 

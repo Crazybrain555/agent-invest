@@ -60,6 +60,56 @@ class RetiredMineruCandidateClosureTests(unittest.TestCase):
             )
         self.assertEqual(findings, [])
 
+    def test_active_execution_surface_has_no_retired_task_protocol_compatibility(
+        self,
+    ) -> None:
+        service_root = Path(__file__).resolve().parents[2]
+        staged_client = (
+            service_root
+            / "src/disclosure_anchor/adapters/parsers/mineru_medium/http_staged.py"
+        ).read_text(encoding="utf-8")
+        patcher = (
+            service_root
+            / "scripts/windows/mineru_heap_trim_compat/patch_mineru_344.py"
+        ).read_text(encoding="utf-8")
+        installer = (
+            service_root / "scripts/windows/install_mineru_fixed_api.ps1"
+        ).read_text(encoding="utf-8")
+        compose = (service_root / "config/mineru-windows.compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        dockerfile = (
+            service_root / "scripts/windows/mineru_heap_trim_compat/Dockerfile"
+        ).read_text(encoding="utf-8")
+
+        retired_client_tokens = (
+            "task_protocol_v2: bool = False",
+            "task_protocol_v2=True",
+            'payload.get("task_protocol_v2", False)',
+            'payload.get("v") not in {1, 2, 3}',
+            "_spool_result",
+        )
+        retired_server_tokens = (
+            "task_protocol_v2 is None",
+            "task_protocol_v2 is not None",
+            "if self.task_protocol_v2:",
+            "if task_manager.task_protocol_v2:",
+        )
+        self.assertEqual(
+            [token for token in retired_client_tokens if token in staged_client], []
+        )
+        self.assertEqual(
+            [token for token in retired_server_tokens if token in patcher], []
+        )
+        self.assertNotIn("One-time migration compatibility", installer)
+        self.assertIn(
+            "existing MinerU topology is not the exact proxy-isolated topology",
+            installer,
+        )
+        for artifact in (compose, dockerfile):
+            self.assertNotIn("MINERU_TASK_PROTOCOL_V2:", artifact)
+            self.assertNotIn("MINERU_TASK_PROTOCOL_V2=", artifact)
+
 
 if __name__ == "__main__":
     unittest.main()

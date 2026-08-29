@@ -678,19 +678,13 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("result_path = task.result_artifact_path", patched)
         self.assertIn("path=result_path", patched)
         self.assertIn('"X-MinerU-Result-SHA256"', patched)
-        self.assertIn("cleanup_file(task.result_artifact_path)", patched)
         self.assertNotIn("return await build_result_response", patched)
         patcher = (
             Path(__file__).resolve().parents[2]
             / "scripts/windows/mineru_heap_trim_compat/patch_mineru_344.py"
         ).read_text(encoding="utf-8")
-        self.assertIn(
-            '"        if self.task_protocol_v2 is not None:\\n"', patcher
-        )
-        self.assertIn(
-            '"            cleaned = self.task_protocol_v2.cleanup_consumed()\\n"',
-            patcher,
-        )
+        self.assertNotIn("task_protocol_v2 is None", patcher)
+        self.assertNotIn("task_protocol_v2 is not None", patcher)
         self.assertIn("_evict_consumed_protocol_tasks", patcher)
 
     def test_generated_retained_source_helper_covers_every_member_and_toc(self) -> None:
@@ -1251,7 +1245,14 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn(f"FROM mineru@{BASE_IMAGE_DIGEST}", dockerfile)
         self.assertIn("ENV MINERU_MALLOC_TRIM=1", dockerfile)
         self.assertIn("ENV MINERU_PHASE_TRACE=0", dockerfile)
-        self.assertIn("ENV MINERU_TASK_PROTOCOL_V2=0", dockerfile)
+        self.assertNotIn("MINERU_TASK_PROTOCOL_V2=", dockerfile)
+        self.assertIn(
+            "assert 'self.task_protocol_v2 = DurableTaskRegistry(' in manager_source",
+            dockerfile,
+        )
+        self.assertIn(
+            "assert 'task_protocol_v2_enabled' not in manager_source", dockerfile
+        )
         self.assertIn(
             'io.agent-invest.mineru.capacity-policy="single-owner-serial-mineru.v1"',
             dockerfile,

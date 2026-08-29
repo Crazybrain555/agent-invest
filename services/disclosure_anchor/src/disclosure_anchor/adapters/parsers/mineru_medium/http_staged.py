@@ -90,8 +90,7 @@ class _Task:
     source_pdf_sha256: str
     attempt_identity: str
     fence_identity: str
-    idempotency_key: str = ""
-    task_protocol_v2: bool = False
+    idempotency_key: str
 
     def token(self, *, spool_path: Path | None, artifact_sha256: str) -> str:
         raw = json.dumps(
@@ -107,7 +106,6 @@ class _Task:
                 "idempotency_key": self.idempotency_key,
                 "spool_path": "" if spool_path is None else str(spool_path),
                 "artifact_sha256": artifact_sha256,
-                "task_protocol_v2": self.task_protocol_v2,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -120,7 +118,7 @@ class _Task:
             payload = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
         except (ValueError, json.JSONDecodeError) as exc:
             raise _fail("invalid durable resume token") from exc
-        if not isinstance(payload, dict) or payload.get("v") not in {1, 2, 3}:
+        if not isinstance(payload, dict) or payload.get("v") != 3:
             raise _fail("invalid durable resume token shape")
         expected = {
             "v",
@@ -133,28 +131,19 @@ class _Task:
             "fence_identity",
             "spool_path",
             "artifact_sha256",
+            "idempotency_key",
         }
-        if payload["v"] == 2:
-            expected.add("task_protocol_v2")
-        if payload["v"] == 3:
-            expected.update({"task_protocol_v2", "idempotency_key"})
         if set(payload) != expected:
             raise _fail("invalid durable resume token shape")
         values = {
             key: payload[key]
             for key in payload
             if key not in {
-                "v", "spool_path", "artifact_sha256", "task_protocol_v2",
-                "idempotency_key",
+                "v", "spool_path", "artifact_sha256",
             }
         }
         if not all(isinstance(value, str) for value in values.values()):
             raise _fail("invalid durable resume token values")
-        protocol_v2 = payload.get("task_protocol_v2", False)
-        if not isinstance(protocol_v2, bool):
-            raise _fail("invalid durable resume token values")
-        values["task_protocol_v2"] = protocol_v2
-        values["idempotency_key"] = payload.get("idempotency_key", "")
         task = cls(**values)
         task.validate()
         artifact_sha256 = payload["artifact_sha256"]
@@ -171,15 +160,14 @@ class _Task:
         _identity(self.task_id, "task id")
         _identity(self.attempt_identity, "attempt identity")
         _identity(self.fence_identity, "fence identity")
-        if self.idempotency_key:
-            bucket, separator, digest = self.idempotency_key.partition(".")
-            if (
-                not separator or not bucket
-                or any(char not in "0123456789abcdef" for char in bucket)
-                or len(digest) != 64
-                or any(char not in "0123456789abcdef" for char in digest)
-            ):
-                raise _fail("invalid idempotency key")
+        bucket, separator, digest = self.idempotency_key.partition(".")
+        if (
+            not separator or not bucket
+            or any(char not in "0123456789abcdef" for char in bucket)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise _fail("invalid idempotency key")
         if (
             not self.source_pdf_sha256.startswith("sha256:")
             or len(self.source_pdf_sha256) != 71
@@ -277,10 +265,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                     continue
                 if status_value != "completed":
                     raise _fail(f"remote task terminated as {status_value!r}")
-                retained = self._retained_receipt(payload, client=client)
-                if retained is not None:
-                    return retained
-                return self._spool_result(client)
+                return self._retained_receipt(payload, client=client)
         raise _fail("remote task deadline expired")
 
     def _drain(self, client: httpx.Client, deadline: float) -> RemoteArtifactReceipt:
@@ -295,10 +280,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 payload = _closed_json(response, required={"status"})
             status_value = payload["status"]
             if status_value == "completed":
-                retained = self._retained_receipt(payload, client=client)
-                if retained is not None:
-                    return retained
-                return self._spool_result(client)
+                return self._retained_receipt(payload, client=client)
             if status_value not in {"pending", "processing"}:
                 raise _fail(f"remote task drained as {status_value!r}")
             time.sleep(_POLL_SECONDS)
@@ -309,9 +291,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         payload: dict[str, Any],
         *,
         client: httpx.Client,
-    ) -> RemoteArtifactReceipt | None:
-        if "result_artifact_schema" not in payload:
-            return None
+    ) -> RemoteArtifactReceipt:
         if payload.get("result_artifact_schema") != "mineru-retained-result.v1":
             raise _fail("unsupported retained result schema")
         artifact_sha256 = payload.get("result_artifact_sha256")
@@ -333,33 +313,31 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         ).hexdigest()
         if owner != expected_owner:
             raise _fail("retained result owner is not canonical")
-        if self._task.task_protocol_v2:
-            expected_idempotency = self._task.idempotency_key
-            expected_protocol = {
-                "task_protocol_schema": "mineru-task-protocol.v2",
-                "protocol_state": "completed",
-                "idempotency_key": expected_idempotency,
-                "attempt_identity": self._task.attempt_identity,
-                "fence_identity": self._task.fence_identity,
-            }
-            if any(payload.get(key) != value for key, value in expected_protocol.items()):
-                raise _fail("task protocol v2 status identity drifted")
-            with client.stream(
-                "POST", f"{self._task.base_url}/tasks/{self._task.task_id}/lease"
-            ) as lease:
-                if lease.status_code != 200:
-                    raise _fail(f"result lease returned HTTP {lease.status_code}")
-                lease_payload = _closed_json(
-                    lease,
-                    required={"schema", "task_id", "lease_until_unix"},
-                    allowed={"schema", "task_id", "lease_until_unix"},
-                )
-            if (
-                lease_payload.get("schema") != "mineru-task-protocol.v2"
-                or lease_payload.get("task_id") != self._task.task_id
-                or not isinstance(lease_payload.get("lease_until_unix"), (int, float))
-            ):
-                raise _fail("result lease identity drifted")
+        expected_protocol = {
+            "task_protocol_schema": "mineru-task-protocol.v2",
+            "protocol_state": "completed",
+            "idempotency_key": self._task.idempotency_key,
+            "attempt_identity": self._task.attempt_identity,
+            "fence_identity": self._task.fence_identity,
+        }
+        if any(payload.get(key) != value for key, value in expected_protocol.items()):
+            raise _fail("task protocol v2 status identity drifted")
+        with client.stream(
+            "POST", f"{self._task.base_url}/tasks/{self._task.task_id}/lease"
+        ) as lease:
+            if lease.status_code != 200:
+                raise _fail(f"result lease returned HTTP {lease.status_code}")
+            lease_payload = _closed_json(
+                lease,
+                required={"schema", "task_id", "lease_until_unix"},
+                allowed={"schema", "task_id", "lease_until_unix"},
+            )
+        if (
+            lease_payload.get("schema") != "mineru-task-protocol.v2"
+            or lease_payload.get("task_id") != self._task.task_id
+            or not isinstance(lease_payload.get("lease_until_unix"), (int, float))
+        ):
+            raise _fail("result lease identity drifted")
         return RemoteArtifactReceipt(
             attempt_identity=self._task.attempt_identity,
             fence_identity=self._task.fence_identity,
@@ -369,64 +347,6 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             source_pdf_sha256=self._task.source_pdf_sha256,
             resume_token=self._task.token(
                 spool_path=None,
-                artifact_sha256=artifact_sha256,
-            ),
-        )
-
-    def _spool_result(self, client: httpx.Client) -> RemoteArtifactReceipt:
-        # Exact MinerU 3.4.4 creates a new temporary ZIP for every result GET.
-        # Starlette's FileResponse ETag is therefore not an immutable result
-        # version. Terminal credit is returned only after one result is spooled
-        # and content-addressed locally.
-        self._spool_root.mkdir(parents=True, exist_ok=True)
-        owner_seed = hashlib.sha256(
-            f"{self._task.base_url}\0{self._task.task_id}\0{self._task.source_pdf_sha256}\0"
-            f"{self._task.attempt_identity}\0{self._task.fence_identity}".encode()
-        ).hexdigest()
-        part_fd, part_name = tempfile.mkstemp(
-            prefix=f".{owner_seed}-",
-            suffix=".zip.part",
-            dir=self._spool_root,
-        )
-        os.close(part_fd)
-        part_path = Path(part_name)
-        final_path = self._spool_root / f"{owner_seed}.zip"
-        digest = hashlib.sha256()
-        byte_count = 0
-        try:
-            with client.stream("GET", self._task.result_url) as response:
-                if response.status_code != 200:
-                    raise _fail(f"result returned HTTP {response.status_code}")
-                if "application/zip" not in response.headers.get("content-type", ""):
-                    raise _fail("result is not application/zip")
-                with part_path.open("wb") as sink:
-                    for chunk in response.iter_bytes(chunk_size=64 * 1024):
-                        byte_count += len(chunk)
-                        if byte_count > _MAX_RESULT_BYTES:
-                            raise _fail("result exceeds the closed spool envelope")
-                        digest.update(chunk)
-                        sink.write(chunk)
-                    sink.flush()
-                    os.fsync(sink.fileno())
-        except BaseException:
-            part_path.unlink(missing_ok=True)
-            raise
-        if not 0 < byte_count <= _MAX_RESULT_BYTES:
-            raise _fail("result byte count is outside the closed envelope")
-        artifact_sha256 = digest.hexdigest()
-        os.replace(part_path, final_path)
-        self._terminal_spool = (final_path, artifact_sha256)
-        return RemoteArtifactReceipt(
-            attempt_identity=self._task.attempt_identity,
-            fence_identity=self._task.fence_identity,
-            artifact_owner_identity=hashlib.sha256(
-                f"{self._task.task_id}\0{artifact_sha256}\0{byte_count}".encode()
-            ).hexdigest(),
-            artifact_byte_count=byte_count,
-            artifact_sha256=artifact_sha256,
-            source_pdf_sha256=self._task.source_pdf_sha256,
-            resume_token=self._task.token(
-                spool_path=final_path,
                 artifact_sha256=artifact_sha256,
             ),
         )
@@ -541,15 +461,11 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         task, _spool_path, artifact_sha256 = _Task.from_token(receipt.resume_token)
         if task != self._task or artifact_sha256 != receipt.artifact_sha256:
             raise _fail("remote ACK receipt ownership drifted")
-        if not self._task.task_protocol_v2:
-            return
         self._ack_terminal()
 
     def acknowledge_after_failure_committed(self, *, checkpoint_state: str) -> None:
         if checkpoint_state != "failure_committed":
             raise _fail("remote failure ACK requires a durable failure_committed checkpoint")
-        if not self._task.task_protocol_v2:
-            return
         self._ack_terminal()
 
     def _ack_terminal(self) -> None:
@@ -636,14 +552,12 @@ class MinerUHttpStagedParser:
         spool_root: Path,
         reader: MinerUMediumArtifactReader | None = None,
         transport: httpx.BaseTransport | None = None,
-        task_protocol_v2: bool = False,
     ) -> None:
         self._api_url = api_url.rstrip("/")
         self._server_url = server_url
         self._reader = reader or MinerUMediumArtifactReader()
         self._transport = transport
         self._spool_root = spool_root
-        self._task_protocol_v2 = task_protocol_v2
 
     def begin_remote_parse(
         self,
@@ -657,7 +571,7 @@ class MinerUHttpStagedParser:
     ) -> MinerUHttpRemoteHandle:
         _identity(attempt_identity, "attempt identity")
         _identity(fence_identity, "fence identity")
-        if self._task_protocol_v2 and (
+        if (
             isinstance(submission_epoch_unix, bool)
             or not isinstance(submission_epoch_unix, int)
             or submission_epoch_unix < 0
@@ -744,14 +658,13 @@ class MinerUHttpStagedParser:
             source_pdf_sha256, attempt_identity, fence_identity,
             observed_unix=float(submission_epoch_unix or 0),
         )
-        if self._task_protocol_v2:
-            data.update(
-                {
-                    "agent_idempotency_key": idempotency_key,
-                    "agent_attempt_identity": attempt_identity,
-                    "agent_fence_identity": fence_identity,
-                }
-            )
+        data.update(
+            {
+                "agent_idempotency_key": idempotency_key,
+                "agent_attempt_identity": attempt_identity,
+                "agent_fence_identity": fence_identity,
+            }
+        )
         submit_allowed = {
             "task_id", "status", "backend", "file_names", "created_at",
             "started_at", "completed_at", "error", "status_url", "result_url",
@@ -778,24 +691,19 @@ class MinerUHttpStagedParser:
                     )
                     response = client.send(request, stream=True)
                 except httpx.TransportError:
-                    if not self._task_protocol_v2:
-                        raise
                     request = client.build_request(
                         "GET", f"{self._api_url}/tasks/by-idempotency/{idempotency_key}"
                     )
                     response = client.send(request, stream=True)
                     reconciled = True
-                expected_statuses = (
-                    {200} if reconciled
-                    else ({200, 202} if self._task_protocol_v2 else {202})
-                )
+                expected_statuses = {200} if reconciled else {200, 202}
                 try:
                     if response.status_code not in expected_statuses:
                         raise _fail(f"submit returned HTTP {response.status_code}")
                     payload = _closed_json(
                         response,
                         required={"task_id", "status_url", "result_url"},
-                        allowed=submit_allowed if self._task_protocol_v2 else None,
+                        allowed=submit_allowed,
                     )
                 finally:
                     response.close()
@@ -806,17 +714,14 @@ class MinerUHttpStagedParser:
             for key in ("task_id", "status_url", "result_url")
         ):
             raise _fail("submit identities are not strings")
-        if self._task_protocol_v2:
-            expected_identity = {
-                "task_protocol_schema": "mineru-task-protocol.v2",
-                "idempotency_key": idempotency_key,
-                "attempt_identity": attempt_identity,
-                "fence_identity": fence_identity,
-            }
-            if any(
-                payload.get(key) != value for key, value in expected_identity.items()
-            ):
-                raise _fail("submit/reconcile protocol identity drifted")
+        expected_identity = {
+            "task_protocol_schema": "mineru-task-protocol.v2",
+            "idempotency_key": idempotency_key,
+            "attempt_identity": attempt_identity,
+            "fence_identity": fence_identity,
+        }
+        if any(payload.get(key) != value for key, value in expected_identity.items()):
+            raise _fail("submit/reconcile protocol identity drifted")
         task = _Task(
             base_url=self._api_url,
             task_id=payload["task_id"],
@@ -829,8 +734,7 @@ class MinerUHttpStagedParser:
             source_pdf_sha256=source_pdf_sha256,
             attempt_identity=attempt_identity,
             fence_identity=fence_identity,
-            idempotency_key=idempotency_key if self._task_protocol_v2 else "",
-            task_protocol_v2=self._task_protocol_v2,
+            idempotency_key=idempotency_key,
         )
         return MinerUHttpRemoteHandle(
             task=task,

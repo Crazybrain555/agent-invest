@@ -80,7 +80,6 @@ API_ENV_KEYS = {
     "MINERU_MODEL_SOURCE",
     "MINERU_MALLOC_TRIM",
     "MINERU_PHASE_TRACE",
-    "MINERU_TASK_PROTOCOL_V2",
     "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_API_MAX_PENDING_TASKS",
     "MINERU_PROCESSING_WINDOW_SIZE",
@@ -257,6 +256,7 @@ def _verify_api_compatibility(
         "max_pending_tasks_requested",
         "max_pending_tasks_effective",
         "pipeline_inference_locks_enabled",
+        "task_protocol_v2_enabled",
         "image_labels",
     }:
         raise ValueError("remote API compatibility evidence fields drifted")
@@ -300,6 +300,7 @@ def _verify_api_compatibility(
         or not isinstance(value.get("phase_trace_enabled"), bool)
         or value.get("hybrid_batch_ratio_requested") not in {1, 2, 4, 8}
         or value.get("pipeline_inference_locks_enabled") is not True
+        or value.get("task_protocol_v2_enabled") is not True
     ):
         raise ValueError("remote API heap-return marker or source bytes drifted")
     if labels != {

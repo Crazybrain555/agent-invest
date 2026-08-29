@@ -1,8 +1,9 @@
 """Optional two-stage provider parser contract.
 
-The legacy parser port remains authoritative until an adapter can prove the
-remote task's terminal state and result-artifact ownership independently of
-local download and persistence.
+The production worker keeps its existing synchronous parser integration until
+an adapter can durably prove remote terminal/result ownership and recover the
+local continuation. Any staged adapter implements the sole protocol-v2 wire
+contract; there is no staged-protocol fallback.
 """
 
 from __future__ import annotations

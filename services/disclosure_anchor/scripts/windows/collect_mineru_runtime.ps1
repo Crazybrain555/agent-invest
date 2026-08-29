@@ -590,8 +590,7 @@ $apiAllowedEnvironment = @(
     "MINERU_API_OUTPUT_ROOT", "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_MALLOC_TRIM",
     "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS", "MINERU_HYBRID_BATCH_RATIO",
-    "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE",
-    "MINERU_TASK_PROTOCOL_V2"
+    "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE"
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
 $apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
@@ -617,7 +616,8 @@ from mineru.utils.model_utils import (
     serial_runtime_status,
 )
 from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
-from mineru.cli.fast_api import get_max_pending_tasks
+from mineru.cli.agent_task_protocol_v2 import DurableTaskRegistry, SplitTaskExecutor
+from mineru.cli.fast_api import get_max_pending_tasks, get_task_manager
 
 paths = (
     "mineru/cli/api_request.py",
@@ -629,6 +629,7 @@ paths = (
     "mineru_vl_utils/vlm_client/http_client.py",
 )
 root = Path("/usr/local/lib/python3.12/dist-packages")
+task_manager = get_task_manager()
 marker = json.loads(
     Path("/opt/agent-invest/mineru-serial-v1/compatibility.json")
     .read_text(encoding="utf-8")
@@ -648,6 +649,10 @@ print(json.dumps({
     "max_pending_tasks_requested": int(os.environ["MINERU_API_MAX_PENDING_TASKS"]),
     "max_pending_tasks_effective": get_max_pending_tasks(),
     "pipeline_inference_locks_enabled": PIPELINE_INFERENCE_LOCKS_ENABLED,
+    "task_protocol_v2_enabled": (
+        isinstance(task_manager.task_protocol_v2, DurableTaskRegistry)
+        and isinstance(task_manager.task_protocol_executor, SplitTaskExecutor)
+    ),
     "mineru_version": importlib.metadata.version("mineru"),
     "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),
 }, sort_keys=True, separators=(",", ":")))
