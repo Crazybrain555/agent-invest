@@ -62,6 +62,8 @@ MAX_RECEIPT_BYTES = 1024 * 1024
 FRAME_FILENAME = "frames.v2.jsonl"
 RECEIPT_FILENAME = "receipt.v2.json"
 SEAL_FILENAME = "seal.v2.json"
+_CLOCK_PAIR_ATTEMPTS = 3
+_MAX_CLOCK_PAIR_BRACKET_NS = 10_000_000
 
 
 class ObserverState(str, Enum):
@@ -112,6 +114,50 @@ class SynchronizedObserverResult:
         """Authoritative final status, including observer-overhead attestation."""
 
         return self.seal.status
+
+
+@dataclass(frozen=True, slots=True)
+class _ClockPair:
+    wall: datetime
+    monotonic_ns: int
+    bracket_ns: int
+
+
+def _capture_clock_pair(
+    *,
+    monotonic_ns: Callable[[], int],
+    utc_now: Callable[[], datetime],
+) -> _ClockPair:
+    """Capture the tightest bounded wall/monotonic pair without sleeping."""
+
+    best: _ClockPair | None = None
+    previous_after: int | None = None
+    for _ in range(_CLOCK_PAIR_ATTEMPTS):
+        before = monotonic_ns()
+        if isinstance(before, bool) or not isinstance(before, int) or before < 0:
+            raise ValueError("monotonic clock returned an invalid value")
+        if previous_after is not None and before < previous_after:
+            raise ValueError("monotonic clock regressed between pairing attempts")
+        wall = utc_now()
+        _require_utc(wall)
+        after = monotonic_ns()
+        if isinstance(after, bool) or not isinstance(after, int) or after < before:
+            raise ValueError("monotonic clock regressed during clock pairing")
+        previous_after = after
+        bracket = after - before
+        candidate = _ClockPair(
+            wall=wall,
+            monotonic_ns=before + bracket // 2,
+            bracket_ns=bracket,
+        )
+        if best is None or candidate.bracket_ns < best.bracket_ns:
+            best = candidate
+    assert best is not None
+    if best.bracket_ns > _MAX_CLOCK_PAIR_BRACKET_NS:
+        raise SynchronizedTelemetryEvidenceError(
+            "wall/monotonic clock pair exceeded its sampling bound"
+        )
+    return best
 
 
 @dataclass(frozen=True, slots=True)
@@ -858,9 +904,12 @@ def run_synchronized_telemetry_observer(
             "synchronized telemetry evidence failed in FAILED_EVIDENCE"
         ) from exc
     try:
-        start_wall = utc_now()
-        _require_utc(start_wall)
-        start_monotonic = monotonic_ns()
+        start_clock = _capture_clock_pair(
+            monotonic_ns=monotonic_ns,
+            utc_now=utc_now,
+        )
+        start_wall = start_clock.wall
+        start_monotonic = start_clock.monotonic_ns
         process_cpu_started = process_cpu_ns()
         end_deadline = start_monotonic + int(duration_seconds * 1_000_000_000)
         observer_source = synchronized_observer_source_sha256()
@@ -961,12 +1010,18 @@ def run_synchronized_telemetry_observer(
             thread.join()
         for invocation in invocations:
             invocation.close()
-        finish_monotonic = max(
-            monotonic_ns(),
-            max(frame.clock.finished_monotonic_ns for frame in frames),
+        finish_clock = _capture_clock_pair(
+            monotonic_ns=monotonic_ns,
+            utc_now=utc_now,
         )
-        finish_wall = utc_now()
-        _require_utc(finish_wall)
+        finish_monotonic = finish_clock.monotonic_ns
+        if finish_monotonic < max(
+            frame.clock.finished_monotonic_ns for frame in frames
+        ):
+            raise SynchronizedTelemetryEvidenceError(
+                "finish clock pair precedes collected telemetry"
+            )
+        finish_wall = finish_clock.wall
         frame_digest = writer.close_frames()
         frame_tuple = tuple(frames)
         lane_quality, unsupported_count = derive_frame_evidence(
@@ -1262,9 +1317,12 @@ def _run_lane(
                 break
             if internal_stop.is_set():
                 break
-            started = monotonic_ns()
-            observed_at = utc_now()
-            _require_utc(observed_at)
+            sample_clock = _capture_clock_pair(
+                monotonic_ns=monotonic_ns,
+                utc_now=utc_now,
+            )
+            started = sample_clock.monotonic_ns
+            observed_at = sample_clock.wall
             try:
                 snapshot_deadline = min(end_deadline, scheduled + interval_ns)
                 snapshot = sampler.snapshot(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from dataclasses import replace
 import json
 import multiprocessing
@@ -14,7 +14,7 @@ import threading
 import time
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 import unittest
 from unittest.mock import patch
 
@@ -207,6 +207,54 @@ class _Sampler:
         return self.value
 
 
+class _MainThreadUtcNow:
+    def __init__(
+        self,
+        *,
+        delayed_calls: frozenset[int] = frozenset(),
+        delay_all: bool = False,
+        jump_after_call: int | None = None,
+        failure: BaseException | None = None,
+    ) -> None:
+        self.delayed_calls = delayed_calls
+        self.delay_all = delay_all
+        self.jump_after_call = jump_after_call
+        self.failure = failure
+        self.main_calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> datetime:
+        if threading.current_thread() is not threading.main_thread():
+            return datetime.now(UTC)
+        with self._lock:
+            self.main_calls += 1
+            call = self.main_calls
+        if self.failure is not None:
+            raise self.failure
+        if self.delay_all or call in self.delayed_calls:
+            time.sleep(0.075)
+        observed = datetime.now(UTC)
+        if self.jump_after_call is not None and call > self.jump_after_call:
+            observed += timedelta(milliseconds=100)
+        return observed
+
+
+class _NamedThreadUtcNow:
+    def __init__(self, thread_name: str) -> None:
+        self.thread_name = thread_name
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> datetime:
+        if threading.current_thread().name == self.thread_name:
+            with self._lock:
+                self.calls += 1
+                call = self.calls
+            if call == 1:
+                time.sleep(0.075)
+        return datetime.now(UTC)
+
+
 class _FailingSampler:
     collector_identity_sha256 = COLLECTOR_ID
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
@@ -391,7 +439,9 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         cancel_event: threading.Event | None = None,
         limits: SynchronizedObserverLimits | None = None,
         run_id: str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        utc_now: Callable[[], datetime] | None = None,
     ) -> SynchronizedObserverResult:
+        resolved_utc_now = utc_now or (lambda: datetime.now(UTC))
         return run_synchronized_telemetry_observer(
             artifact_root=root,
             process_profile=_profile(),
@@ -402,6 +452,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             limits=limits,
             run_id=run_id,
             process_cpu_ns=lambda: 0,
+            utc_now=resolved_utc_now,
         )
 
     def test_complete_run_is_private_canonical_jsonl_and_replayable(self) -> None:
@@ -927,19 +978,126 @@ if __name__ == '__main__':
             self.assertEqual(result.receipt.termination_reason, "queue_overflow")
 
     def test_frame_bound_stops_sampling_and_seals_incomplete_receipt(self) -> None:
+        clock = _MainThreadUtcNow(delayed_calls=frozenset({1}))
         with tempfile.TemporaryDirectory() as temporary:
             result = self._run(
                 Path(temporary) / "telemetry",
                 duration=1,
                 limits=SynchronizedObserverLimits(maximum_frame_records=2),
+                utc_now=clock,
             )
 
+            self.assertEqual(clock.main_calls, 6)
             self.assertEqual(len(result.frames), 2)
             self.assertEqual(result.receipt.status, "incomplete")
             self.assertEqual(
                 result.receipt.termination_reason,
                 "artifact_bound_exceeded",
             )
+
+    def test_all_clock_pair_attempts_over_bound_fail_evidence(self) -> None:
+        clock = _MainThreadUtcNow(delay_all=True)
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(
+            SynchronizedTelemetryEvidenceError,
+            "FAILED_EVIDENCE",
+        ):
+            self._run(
+                Path(temporary) / "telemetry",
+                duration=1,
+                limits=SynchronizedObserverLimits(maximum_frame_records=2),
+                utc_now=clock,
+            )
+        self.assertEqual(clock.main_calls, 3)
+
+    def test_frame_clock_pair_recovers_from_first_attempt_preemption(self) -> None:
+        clock = _NamedThreadUtcNow("synchronized-telemetry-gpu-fast")
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._run(
+                Path(temporary) / "telemetry",
+                duration=1,
+                limits=SynchronizedObserverLimits(maximum_frame_records=2),
+                utc_now=clock,
+            )
+        self.assertGreaterEqual(clock.calls, 3)
+        self.assertEqual(result.receipt.termination_reason, "artifact_bound_exceeded")
+
+    def test_clock_pair_rejects_regression_between_attempts(self) -> None:
+        module = __import__(
+            "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+            fromlist=["_capture_clock_pair"],
+        )
+        values = iter((100, 110, 50, 51, 60, 61))
+        with self.assertRaisesRegex(ValueError, "between pairing attempts"):
+            module._capture_clock_pair(
+                monotonic_ns=lambda: next(values),
+                utc_now=lambda: datetime.now(UTC),
+            )
+
+    def test_clock_pair_bracket_and_value_bounds_are_closed(self) -> None:
+        module = __import__(
+            "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+            fromlist=["_capture_clock_pair"],
+        )
+        exact_values = iter(
+            (0, 10_000_000, 10_000_000, 20_000_000, 20_000_000, 30_000_000)
+        )
+        pair = module._capture_clock_pair(
+            monotonic_ns=lambda: next(exact_values),
+            utc_now=lambda: datetime.now(UTC),
+        )
+        self.assertEqual(pair.bracket_ns, 10_000_000)
+
+        over_values = iter(
+            (0, 10_000_001, 10_000_001, 20_000_002, 20_000_002, 30_000_003)
+        )
+        with self.assertRaisesRegex(
+            SynchronizedTelemetryEvidenceError, "sampling bound"
+        ):
+            module._capture_clock_pair(
+                monotonic_ns=lambda: next(over_values),
+                utc_now=lambda: datetime.now(UTC),
+            )
+
+        for invalid in (True, -1, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "invalid value"
+            ):
+                module._capture_clock_pair(
+                    monotonic_ns=lambda value=invalid: value,
+                    utc_now=lambda: datetime.now(UTC),
+                )
+
+    def test_tight_pairs_do_not_hide_persistent_wall_clock_jump(self) -> None:
+        clock = _MainThreadUtcNow(jump_after_call=3)
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(
+            SynchronizedTelemetryEvidenceError,
+            "FAILED_EVIDENCE",
+        ) as raised:
+            self._run(
+                Path(temporary) / "telemetry",
+                duration=1,
+                limits=SynchronizedObserverLimits(maximum_frame_records=2),
+                utc_now=clock,
+            )
+        self.assertIsNotNone(raised.exception.__cause__)
+        self.assertIn(
+            "wall and monotonic receipt clocks diverged",
+            str(raised.exception.__cause__),
+        )
+
+    def test_clock_callable_failure_is_failed_evidence(self) -> None:
+        clock = _MainThreadUtcNow(failure=RuntimeError("clock unavailable"))
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(
+            SynchronizedTelemetryEvidenceError,
+            "FAILED_EVIDENCE",
+        ) as raised:
+            self._run(
+                Path(temporary) / "telemetry",
+                duration=1,
+                limits=SynchronizedObserverLimits(maximum_frame_records=2),
+                utc_now=clock,
+            )
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
 
     def test_replay_rejects_tamper_and_unexpected_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
