@@ -33,6 +33,8 @@ _API_FIELDS = frozenset(
         "completed_tasks",
         "failed_tasks",
         "max_concurrent_requests",
+        "max_pending_tasks_requested",
+        "max_pending_tasks_effective",
         "processing_window_size",
         "task_retention_seconds",
         "task_cleanup_interval_seconds",
@@ -192,6 +194,8 @@ def _api_values(payload: bytes, *, expected_task_slots: int) -> ApiSampleValues:
         "completed_tasks",
         "failed_tasks",
         "max_concurrent_requests",
+        "max_pending_tasks_requested",
+        "max_pending_tasks_effective",
         "processing_window_size",
         "task_retention_seconds",
         "task_cleanup_interval_seconds",
@@ -199,6 +203,8 @@ def _api_values(payload: bytes, *, expected_task_slots: int) -> ApiSampleValues:
     )
     positive = {
         "max_concurrent_requests",
+        "max_pending_tasks_requested",
+        "max_pending_tasks_effective",
         "processing_window_size",
         "task_cleanup_interval_seconds",
         "protocol_version",
@@ -210,12 +216,22 @@ def _api_values(payload: bytes, *, expected_task_slots: int) -> ApiSampleValues:
         for name in integer_fields
     ):
         raise ValueError("MinerU API health numbers are invalid")
+    if (
+        decoded["max_pending_tasks_effective"] < expected_task_slots
+        or decoded["max_pending_tasks_effective"]
+        < decoded["max_pending_tasks_requested"]
+        or decoded["queued_tasks"] + decoded["processing_tasks"]
+        > decoded["max_pending_tasks_effective"]
+    ):
+        raise ValueError("MinerU API pending-task capacity is invalid")
     return ApiSampleValues(
         queued_tasks=decoded["queued_tasks"],
         processing_tasks=decoded["processing_tasks"],
         completed_tasks_gauge=decoded["completed_tasks"],
         failed_tasks_gauge=decoded["failed_tasks"],
         task_slots=decoded["max_concurrent_requests"],
+        max_pending_tasks_requested=decoded["max_pending_tasks_requested"],
+        max_pending_tasks_effective=decoded["max_pending_tasks_effective"],
         processing_window_size=decoded["processing_window_size"],
         task_retention_seconds=decoded["task_retention_seconds"],
         task_cleanup_interval_seconds=decoded["task_cleanup_interval_seconds"],

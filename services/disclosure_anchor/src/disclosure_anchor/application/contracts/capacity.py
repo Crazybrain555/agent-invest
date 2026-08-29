@@ -68,6 +68,8 @@ class ApiSampleValues(_FrozenModel):
     completed_tasks_gauge: int = Field(ge=0)
     failed_tasks_gauge: int = Field(ge=0)
     task_slots: int = Field(ge=1)
+    max_pending_tasks_requested: int = Field(ge=1)
+    max_pending_tasks_effective: int = Field(ge=1)
     processing_window_size: int = Field(ge=1)
     task_retention_seconds: int = Field(ge=1)
     task_cleanup_interval_seconds: int = Field(ge=1)
@@ -77,6 +79,16 @@ class ApiSampleValues(_FrozenModel):
     def _check_declared_limits(self) -> "ApiSampleValues":
         if self.processing_tasks > self.task_slots:
             raise ValueError("processing_tasks exceeds task_slots")
+        if (
+            self.max_pending_tasks_effective < self.task_slots
+            or self.max_pending_tasks_effective < self.max_pending_tasks_requested
+        ):
+            raise ValueError("effective pending capacity is below its declared limits")
+        if (
+            self.queued_tasks + self.processing_tasks
+            > self.max_pending_tasks_effective
+        ):
+            raise ValueError("API population exceeds effective pending capacity")
         if self.queued_tasks + self.processing_tasks > self.processing_window_size:
             raise ValueError("API population exceeds processing window")
         return self

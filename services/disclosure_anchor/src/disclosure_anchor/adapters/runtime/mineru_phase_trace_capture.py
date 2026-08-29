@@ -10,6 +10,8 @@ from pathlib import PureWindowsPath
 import re
 from typing import Final, Iterable
 
+from pydantic import TypeAdapter
+
 from disclosure_anchor.adapters.runtime.mineru_phase_trace import (
     MineruPhaseEvent,
     parse_phase_trace_line,
@@ -17,12 +19,16 @@ from disclosure_anchor.adapters.runtime.mineru_phase_trace import (
 )
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
     BlockedProgressEvent,
+    CapacityProgressEventEnvelope,
     DurablePageCommitEvent,
     PhaseClockBinding,
     ProgressEvent,
     SynchronizedPhaseSummary,
     SynchronizedTelemetryFrame,
     SynchronizedTelemetryReceipt,
+    canonical_json_artifact_sha256,
+    parse_canonical_json_artifact,
+    validate_telemetry_artifact_hashes,
     validate_frame_sequence,
 )
 
@@ -388,24 +394,80 @@ def summarize_synchronized_phase_capture(
     telemetry_receipt: SynchronizedTelemetryReceipt,
     telemetry_frames: tuple[SynchronizedTelemetryFrame, ...],
     progress_events: tuple[ProgressEvent, ...],
-    phase_capture_sha256: str,
-    telemetry_receipt_sha256: str,
-    phase_clock_binding: PhaseClockBinding,
+    phase_capture_artifact: bytes,
+    telemetry_receipt_artifact: bytes,
+    telemetry_frames_artifact: bytes,
+    progress_events_artifact: bytes,
+    phase_clock_binding_artifact: bytes,
+    vector_events_artifact: bytes | None = None,
 ) -> SynchronizedPhaseSummary:
     """Bind one complete phase capture to independently sampled host telemetry."""
 
-    for label, value in (
-        ("phase_capture_sha256", phase_capture_sha256),
-        ("telemetry_receipt_sha256", telemetry_receipt_sha256),
-    ):
-        if _SHA256_RE.fullmatch(value) is None:
-            raise ValueError(f"{label} is invalid")
+    parse_canonical_json_artifact(
+        phase_capture_artifact, label="phase capture"
+    )
+    parsed_capture = parse_phase_trace_capture(phase_capture_artifact)
+    if parsed_capture != capture:
+        raise ValueError("phase capture artifact differs from parsed capture")
+    receipt_value = parse_canonical_json_artifact(
+        telemetry_receipt_artifact, label="telemetry receipt"
+    )
+    parsed_receipt = SynchronizedTelemetryReceipt.model_validate(receipt_value)
+    if parsed_receipt != telemetry_receipt:
+        raise ValueError("telemetry receipt artifact differs from parsed receipt")
+    frames_value = parse_canonical_json_artifact(
+        telemetry_frames_artifact, label="telemetry frames"
+    )
+    parsed_frames = tuple(
+        TypeAdapter(list[SynchronizedTelemetryFrame]).validate_python(frames_value)
+    )
+    if parsed_frames != telemetry_frames:
+        raise ValueError("telemetry frames artifact differs from parsed frames")
+    progress_value = parse_canonical_json_artifact(
+        progress_events_artifact, label="progress events"
+    )
+    parsed_progress = tuple(
+        CapacityProgressEventEnvelope.model_validate(item).root
+        for item in TypeAdapter(list[object]).validate_python(progress_value)
+    )
+    if parsed_progress != progress_events:
+        raise ValueError("progress artifact differs from parsed events")
+    binding_value = parse_canonical_json_artifact(
+        phase_clock_binding_artifact, label="phase clock binding"
+    )
+    phase_clock_binding = PhaseClockBinding.model_validate(binding_value)
+    phase_capture_sha256 = canonical_json_artifact_sha256(
+        phase_capture_artifact, label="phase capture"
+    )
+    telemetry_receipt_sha256 = canonical_json_artifact_sha256(
+        telemetry_receipt_artifact, label="telemetry receipt"
+    )
+    validate_telemetry_artifact_hashes(
+        telemetry_receipt,
+        frames_artifact=telemetry_frames_artifact,
+        progress_events_artifact=progress_events_artifact,
+        vector_events_artifact=vector_events_artifact,
+        phase_capture_artifact=phase_capture_artifact,
+        phase_clock_binding_artifact=phase_clock_binding_artifact,
+    )
     validate_frame_sequence(telemetry_frames, receipt=telemetry_receipt)
     if not capture.events:
         raise ValueError("phase trace capture contains no event")
     process_epochs = {event.process_epoch for event in capture.events}
     if process_epochs != {phase_clock_binding.phase_process_epoch}:
         raise ValueError("phase trace clock binding process epoch drifted")
+    if (
+        phase_clock_binding.runtime_bundle_identity_sha256
+        != telemetry_receipt.runtime_bundle_identity_sha256
+        or phase_clock_binding.observer_process_epoch_sha256
+        != telemetry_receipt.process_profile.process_epoch_sha256
+        or phase_clock_binding.container_id != capture.container_id
+        or phase_clock_binding.container_started_at_utc.isoformat()
+        != capture.container_started_at_utc
+        or phase_clock_binding.phase_node_identity_sha256
+        != capture.windows_node_identity_sha256
+    ):
+        raise ValueError("phase clock binding runtime identity drifted")
     if (
         phase_clock_binding.clock_domain_identity_sha256
         != telemetry_receipt.clock_domain_identity_sha256

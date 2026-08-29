@@ -64,5 +64,18 @@ unsupported observation 数必须从 frames 机械重算。`gpu_fast` 只以 GPU
 `host_slow` 只以 API process、host cgroup 和 queue/vLLM 为 required。其他 lane 上的 `not_due_at_this_tick`
 不计为缺失，避免合法的分频采样被误判为永远 incomplete。
 
+frames、progress、vector、phase capture 与 phase-clock binding 的摘要不得由调用者声明后直接信任。
+验证器只接受 canonical UTF-8 JSON bytes，拒绝重复字段、非 canonical 编码和缺失 artifact，并从实际
+bytes 重算 SHA-256 与 receipt 逐项核对。`phase-clock-binding.v1` 绑定 phase process epoch、runtime
+bundle、container id/start epoch、Windows node、boot identity、observer process epoch、clock domain、
+双方 clock source 与 attestor source。只有同一 Linux boot 下双方明确使用
+`clock_gettime(CLOCK_MONOTONIC)` 且 capture/receipt identity 全部一致时才允许比较 monotonic 数值；
+否则 trace 与 telemetry 只能独立保存和汇总。
+
+API health 的 closed projection 同时要求 `max_pending_tasks_requested` 与
+`max_pending_tasks_effective` 为正整数；effective 必须不小于 active slots 和 requested，且
+`queued+processing` 不得超过 effective。这样部署带 bounded pending queue 的新 API 不会被旧 parser
+误判为字段漂移，同时任何容量降级或伪造零值仍 fail closed。
+
 正式 schema 位于 `contracts/operational/synchronized-*.v1.schema.json`。所有对象 `extra=forbid`，
 新增字段或语义必须发布新版本。

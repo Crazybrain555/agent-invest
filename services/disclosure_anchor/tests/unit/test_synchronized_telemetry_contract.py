@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import asdict
+import hashlib
 import json
 import unittest
 
@@ -11,6 +13,7 @@ from pydantic import ValidationError
 from disclosure_anchor.adapters.runtime.mineru_phase_trace import MineruPhaseEvent
 from disclosure_anchor.adapters.runtime.mineru_phase_trace_capture import (
     MineruPhaseTraceCapture,
+    parse_phase_trace_capture,
     summarize_synchronized_phase_capture,
 )
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
@@ -71,9 +74,9 @@ def _phase_document_end_event(*, process_epoch: str) -> MineruPhaseEvent:
         hybrid_batch_ratio_ocr_override=False,
         hybrid_batch_ratio_requested=1,
         hybrid_layout_batch_cap=1,
-        hybrid_mfr_batch_cap=1,
-        hybrid_ocr_det_batch_cap=1,
-        hybrid_table_orientation_batch_cap=1,
+        hybrid_mfr_batch_cap=16,
+        hybrid_ocr_det_batch_cap=8,
+        hybrid_table_orientation_batch_cap=8,
         inner_inference_concurrency=7,
         max_resident_decoded_bytes=1,
         max_resident_pages=16,
@@ -103,6 +106,113 @@ def _phase_document_end_event(*, process_epoch: str) -> MineruPhaseEvent:
         window_size=16,
         vllm_max_num_seqs=128,
     )
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+
+
+def _digest(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _capture(event: MineruPhaseEvent) -> tuple[MineruPhaseTraceCapture, bytes]:
+    line = "MINERU_PHASE_TRACE " + json.dumps(
+        {"schema": "mineru-phase-trace.v3", **asdict(event)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    trace = f"{line}\n".encode()
+    payload = _canonical(
+        {
+            "active_profile_sha256": HASH_B,
+            "capacity_mode": "legacy",
+            "collected_at_utc": (START + timedelta(seconds=2)).isoformat(),
+            "collector_path": r"C:\collector.ps1",
+            "collector_sha256": HASH,
+            "container": {
+                "health": "healthy",
+                "id": "f" * 64,
+                "image": "mineru-api",
+                "image_id": HASH,
+                "name": "mineru-api",
+                "oom_killed": False,
+                "restart_count": 0,
+                "running": True,
+                "started_at_utc": START.isoformat(),
+                "status": "running",
+            },
+            "line_count": 1,
+            "lines": [line],
+            "schema": "mineru-phase-trace-capture.v1",
+            "since_utc": START.isoformat(),
+            "trace_bytes": len(trace),
+            "trace_lines_sha256": _digest(trace),
+            "until_utc": (START + timedelta(seconds=2)).isoformat(),
+            "windows_node_identity_sha256": HASH,
+        }
+    )
+    return parse_phase_trace_capture(payload), payload
+
+
+def _binding(capture: MineruPhaseTraceCapture) -> PhaseClockBinding:
+    return PhaseClockBinding(
+        phase_process_epoch=capture.events[0].process_epoch,
+        runtime_bundle_identity_sha256=HASH,
+        container_id=capture.container_id,
+        container_started_at_utc=datetime.fromisoformat(
+            capture.container_started_at_utc
+        ),
+        phase_node_identity_sha256=capture.windows_node_identity_sha256,
+        observer_node_identity_sha256=capture.windows_node_identity_sha256,
+        phase_boot_identity_sha256=HASH_B,
+        observer_boot_identity_sha256=HASH_B,
+        phase_clock_source="linux.clock_gettime.CLOCK_MONOTONIC",
+        observer_process_epoch_sha256=HASH_C,
+        clock_domain_identity_sha256=HASH_C,
+        observer_clock_source="linux.clock_gettime.CLOCK_MONOTONIC",
+        attestor_source_sha256=HASH,
+    )
+
+
+def _summary_inputs(
+    capture: MineruPhaseTraceCapture,
+    capture_bytes: bytes,
+    progress_events: tuple[ProgressEvent, ...],
+    binding: PhaseClockBinding,
+) -> dict[str, object]:
+    frames = _complete_frames()
+    frames_bytes = _canonical(
+        [frame.model_dump(mode="json") for frame in frames]
+    )
+    progress_bytes = _canonical(
+        [event.model_dump(mode="json") for event in progress_events]
+    )
+    binding_bytes = _canonical(binding.model_dump(mode="json"))
+    receipt = _receipt().model_copy(
+        update={
+            "artifacts": TelemetryArtifacts(
+                frames_sha256=_digest(frames_bytes),
+                progress_events_sha256=_digest(progress_bytes),
+                vector_events_sha256=None,
+                phase_capture_sha256=_digest(capture_bytes),
+                phase_clock_binding_sha256=_digest(binding_bytes),
+            )
+        }
+    )
+    receipt_bytes = _canonical(receipt.model_dump(mode="json"))
+    return {
+        "telemetry_receipt": receipt,
+        "telemetry_frames": frames,
+        "progress_events": progress_events,
+        "phase_capture_artifact": capture_bytes,
+        "telemetry_receipt_artifact": receipt_bytes,
+        "telemetry_frames_artifact": frames_bytes,
+        "progress_events_artifact": progress_bytes,
+        "phase_clock_binding_artifact": binding_bytes,
+    }
 
 
 def _pressure(*, full: bool = True) -> PressureSample:
@@ -552,40 +662,21 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
     def test_phase_summary_rejects_an_unbound_monotonic_clock(self) -> None:
         process_epoch = "d" * 32
         event = _phase_document_end_event(process_epoch=process_epoch)
-        capture = MineruPhaseTraceCapture(
-            active_profile_sha256=HASH_B,
-            capacity_mode="legacy",
-            collected_at_utc=START.isoformat(),
-            collector_path=r"C:\\collector.ps1",
-            collector_sha256=HASH,
-            container_id="f" * 64,
-            container_image="mineru-api",
-            container_image_id=HASH,
-            container_started_at_utc=START.isoformat(),
-            line_count=1,
-            lines_sha256=HASH,
-            since_utc=START.isoformat(),
-            trace_bytes=1,
-            until_utc=(START + timedelta(seconds=2)).isoformat(),
-            windows_node_identity_sha256=HASH,
-            events=(event,),
+        capture, capture_bytes = _capture(event)
+        binding = _binding(capture).model_copy(
+            update={"clock_domain_identity_sha256": HASH}
         )
-        binding = PhaseClockBinding(
-            phase_process_epoch=process_epoch,
-            clock_domain_identity_sha256=HASH,
-            binding_artifact_sha256=HASH,
-        )
+        with self.assertRaisesRegex(ValidationError, "kernel clock domains differ"):
+            PhaseClockBinding.model_validate(
+                {
+                    **_binding(capture).model_dump(mode="json"),
+                    "observer_boot_identity_sha256": HASH,
+                }
+            )
         with self.assertRaisesRegex(ValueError, "not comparable"):
             summarize_synchronized_phase_capture(
                 capture,
-                telemetry_receipt=_receipt(),
-                telemetry_frames=(
-                    *_complete_frames(),
-                ),
-                progress_events=(),
-                phase_capture_sha256=HASH,
-                telemetry_receipt_sha256=HASH_B,
-                phase_clock_binding=binding,
+                **_summary_inputs(capture, capture_bytes, (), binding),
             )
         correct_binding = binding.model_copy(
             update={"clock_domain_identity_sha256": HASH_C}
@@ -605,12 +696,12 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "progress and phase clocks"):
             summarize_synchronized_phase_capture(
                 capture,
-                telemetry_receipt=_receipt(),
-                telemetry_frames=_complete_frames(),
-                progress_events=(wrong_clock_progress,),
-                phase_capture_sha256=HASH,
-                telemetry_receipt_sha256=HASH_B,
-                phase_clock_binding=correct_binding,
+                **_summary_inputs(
+                    capture,
+                    capture_bytes,
+                    (wrong_clock_progress,),
+                    correct_binding,
+                ),
             )
         wrong_identity_progress = wrong_clock_progress.model_copy(
             update={
@@ -621,50 +712,26 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "process/profile identity"):
             summarize_synchronized_phase_capture(
                 capture,
-                telemetry_receipt=_receipt(),
-                telemetry_frames=_complete_frames(),
-                progress_events=(wrong_identity_progress,),
-                phase_capture_sha256=HASH,
-                telemetry_receipt_sha256=HASH_B,
-                phase_clock_binding=correct_binding,
+                **_summary_inputs(
+                    capture,
+                    capture_bytes,
+                    (wrong_identity_progress,),
+                    correct_binding,
+                ),
             )
 
     def test_phase_summary_rejects_duplicate_or_unclosed_progress(self) -> None:
         process_epoch = "d" * 32
         event = _phase_document_end_event(process_epoch=process_epoch)
-        capture = MineruPhaseTraceCapture(
-            active_profile_sha256=HASH_B,
-            capacity_mode="legacy",
-            collected_at_utc=START.isoformat(),
-            collector_path=r"C:\\collector.ps1",
-            collector_sha256=HASH,
-            container_id="f" * 64,
-            container_image="mineru-api",
-            container_image_id=HASH,
-            container_started_at_utc=START.isoformat(),
-            line_count=1,
-            lines_sha256=HASH,
-            since_utc=START.isoformat(),
-            trace_bytes=1,
-            until_utc=(START + timedelta(seconds=2)).isoformat(),
-            windows_node_identity_sha256=HASH,
-            events=(event,),
-        )
-        binding = PhaseClockBinding(
-            phase_process_epoch=process_epoch,
-            clock_domain_identity_sha256=HASH_C,
-            binding_artifact_sha256=HASH,
-        )
+        capture, capture_bytes = _capture(event)
+        binding = _binding(capture)
 
         def summarize(progress_events: tuple[ProgressEvent, ...]) -> None:
             summarize_synchronized_phase_capture(
                 capture,
-                telemetry_receipt=_receipt(),
-                telemetry_frames=_complete_frames(),
-                progress_events=progress_events,
-                phase_capture_sha256=HASH,
-                telemetry_receipt_sha256=HASH_B,
-                phase_clock_binding=binding,
+                **_summary_inputs(
+                    capture, capture_bytes, progress_events, binding
+                ),
             )
 
         def committed(
@@ -746,6 +813,51 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "intervals overlap"):
             summarize(blocked)
+
+    def test_phase_summary_recomputes_artifacts_and_binding_identity(self) -> None:
+        capture, capture_bytes = _capture(
+            _phase_document_end_event(process_epoch="d" * 32)
+        )
+        binding = _binding(capture)
+        inputs = _summary_inputs(capture, capture_bytes, (), binding)
+        summary = summarize_synchronized_phase_capture(capture, **inputs)
+        self.assertEqual(summary.clock_domain_identity_sha256, HASH_C)
+
+        stale_frames = dict(inputs)
+        stale_frames["telemetry_frames_artifact"] = _canonical([])
+        with self.assertRaisesRegex(ValueError, "differs from parsed frames"):
+            summarize_synchronized_phase_capture(capture, **stale_frames)
+
+        forged_binding = binding.model_copy(
+            update={
+                "phase_boot_identity_sha256": HASH,
+                "observer_boot_identity_sha256": HASH,
+            }
+        )
+        forged = dict(inputs)
+        forged["phase_clock_binding_artifact"] = _canonical(
+            forged_binding.model_dump(mode="json")
+        )
+        with self.assertRaisesRegex(
+            ValueError, "phase_clock_binding_sha256 artifact hash drifted"
+        ):
+            summarize_synchronized_phase_capture(capture, **forged)
+
+        wrong_runtime_binding = binding.model_copy(
+            update={"runtime_bundle_identity_sha256": HASH_B}
+        )
+        wrong_runtime = _summary_inputs(
+            capture, capture_bytes, (), wrong_runtime_binding
+        )
+        with self.assertRaisesRegex(ValueError, "runtime identity drifted"):
+            summarize_synchronized_phase_capture(capture, **wrong_runtime)
+
+        noncanonical = dict(inputs)
+        noncanonical["telemetry_receipt_artifact"] = (
+            inputs["telemetry_receipt_artifact"] + b"\n"  # type: ignore[operator]
+        )
+        with self.assertRaisesRegex(ValueError, "not canonical"):
+            summarize_synchronized_phase_capture(capture, **noncanonical)
 
 
 if __name__ == "__main__":

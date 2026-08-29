@@ -27,6 +27,9 @@ VECTOR_CREDIT_VERSION: Literal["mineru.capacity-vector-credit-event.v1"] = (
 PHASE_SUMMARY_VERSION: Literal["mineru.synchronized-phase-summary.v1"] = (
     "mineru.synchronized-phase-summary.v1"
 )
+PHASE_CLOCK_BINDING_VERSION: Literal["mineru.phase-clock-binding.v1"] = (
+    "mineru.phase-clock-binding.v1"
+)
 
 _SCHEMA_ROOT = "https://agent-invest.local/contracts/operational/"
 _SHA256_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -674,6 +677,8 @@ class TelemetryArtifacts(_FrozenModel):
     frames_sha256: str
     progress_events_sha256: str | None
     vector_events_sha256: str | None
+    phase_capture_sha256: str | None = None
+    phase_clock_binding_sha256: str | None = None
 
     @model_validator(mode="after")
     def _check_artifacts(self) -> "TelemetryArtifacts":
@@ -681,6 +686,8 @@ class TelemetryArtifacts(_FrozenModel):
         for label, value in (
             ("progress_events_sha256", self.progress_events_sha256),
             ("vector_events_sha256", self.vector_events_sha256),
+            ("phase_capture_sha256", self.phase_capture_sha256),
+            ("phase_clock_binding_sha256", self.phase_clock_binding_sha256),
         ):
             if value is not None:
                 _sha256(value, label=label)
@@ -825,21 +832,58 @@ class SynchronizedPhaseSummary(_FrozenModel):
 
 
 class PhaseClockBinding(_FrozenModel):
-    """Attested mapping from one phase process epoch to one monotonic clock."""
+    """Closed observer attestation that both producers use one kernel clock."""
 
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "phase-clock-binding.v1.schema.json"},
+    )
+
+    contract_version: Literal["mineru.phase-clock-binding.v1"] = (
+        PHASE_CLOCK_BINDING_VERSION
+    )
     phase_process_epoch: str
+    runtime_bundle_identity_sha256: str
+    container_id: str
+    container_started_at_utc: datetime
+    phase_node_identity_sha256: str
+    observer_node_identity_sha256: str
+    phase_boot_identity_sha256: str
+    observer_boot_identity_sha256: str
+    phase_clock_source: Literal["linux.clock_gettime.CLOCK_MONOTONIC"]
+    observer_process_epoch_sha256: str
     clock_domain_identity_sha256: str
-    binding_artifact_sha256: str
+    observer_clock_source: Literal["linux.clock_gettime.CLOCK_MONOTONIC"]
+    attestor_source_sha256: str
 
     @model_validator(mode="after")
     def _check_binding(self) -> "PhaseClockBinding":
         if re.fullmatch(r"[a-f0-9]{32}", self.phase_process_epoch) is None:
             raise ValueError("phase process epoch is invalid")
-        _sha256(
-            self.clock_domain_identity_sha256,
-            label="clock_domain_identity_sha256",
-        )
-        _sha256(self.binding_artifact_sha256, label="binding_artifact_sha256")
+        if re.fullmatch(r"[a-f0-9]{64}", self.container_id) is None:
+            raise ValueError("phase container identity is invalid")
+        _utc(self.container_started_at_utc, label="container_started_at_utc")
+        for label, value in (
+            ("runtime_bundle_identity_sha256", self.runtime_bundle_identity_sha256),
+            ("phase_node_identity_sha256", self.phase_node_identity_sha256),
+            ("observer_node_identity_sha256", self.observer_node_identity_sha256),
+            ("phase_boot_identity_sha256", self.phase_boot_identity_sha256),
+            ("observer_boot_identity_sha256", self.observer_boot_identity_sha256),
+            ("observer_process_epoch_sha256", self.observer_process_epoch_sha256),
+            ("clock_domain_identity_sha256", self.clock_domain_identity_sha256),
+            ("attestor_source_sha256", self.attestor_source_sha256),
+        ):
+            _sha256(value, label=label)
+        if self.phase_clock_source != self.observer_clock_source:
+            raise ValueError("phase and observer clock sources differ")
+        if (
+            self.phase_node_identity_sha256 != self.observer_node_identity_sha256
+            or self.phase_boot_identity_sha256
+            != self.observer_boot_identity_sha256
+        ):
+            raise ValueError("phase and observer kernel clock domains differ")
         return self
 
 
@@ -849,6 +893,7 @@ OPERATIONAL_TELEMETRY_SCHEMAS: dict[str, type[BaseModel]] = {
     "synchronized-telemetry-frame.v1.schema.json": SynchronizedTelemetryFrame,
     "synchronized-telemetry-receipt.v1.schema.json": SynchronizedTelemetryReceipt,
     "synchronized-phase-summary.v1.schema.json": SynchronizedPhaseSummary,
+    "phase-clock-binding.v1.schema.json": PhaseClockBinding,
 }
 
 
@@ -891,6 +936,77 @@ def canonical_json_sha256(value: object) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def parse_canonical_json_artifact(
+    payload: bytes, *, label: str, maximum_bytes: int = 268_435_456
+) -> object:
+    """Parse exact canonical JSON bytes, rejecting duplicates and alternate encodings."""
+
+    if not isinstance(payload, bytes) or not payload or len(payload) > maximum_bytes:
+        raise ValueError(f"{label} artifact bytes are invalid")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} artifact contains a duplicate field")
+            result[key] = value
+        return result
+
+    try:
+        decoded = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} artifact is not canonical UTF-8 JSON") from exc
+    canonical = json.dumps(
+        decoded,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if payload != canonical:
+        raise ValueError(f"{label} artifact bytes are not canonical")
+    return decoded
+
+
+def canonical_json_artifact_sha256(payload: bytes, *, label: str) -> str:
+    """Hash only bytes proven to be the canonical encoding of one JSON value."""
+
+    parse_canonical_json_artifact(payload, label=label)
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def validate_telemetry_artifact_hashes(
+    receipt: SynchronizedTelemetryReceipt,
+    *,
+    frames_artifact: bytes,
+    progress_events_artifact: bytes | None,
+    vector_events_artifact: bytes | None,
+    phase_capture_artifact: bytes | None = None,
+    phase_clock_binding_artifact: bytes | None = None,
+) -> None:
+    """Reconcile every receipt digest with its exact canonical artifact bytes."""
+
+    supplied = {
+        "frames_sha256": frames_artifact,
+        "progress_events_sha256": progress_events_artifact,
+        "vector_events_sha256": vector_events_artifact,
+        "phase_capture_sha256": phase_capture_artifact,
+        "phase_clock_binding_sha256": phase_clock_binding_artifact,
+    }
+    for field, payload in supplied.items():
+        recorded = getattr(receipt.artifacts, field)
+        if recorded is None:
+            if payload is not None:
+                raise ValueError(f"unexpected {field} artifact bytes")
+            continue
+        if payload is None:
+            raise ValueError(f"missing {field} artifact bytes")
+        observed = canonical_json_artifact_sha256(
+            payload, label=field.removesuffix("_sha256")
+        )
+        if observed != recorded:
+            raise ValueError(f"{field} artifact hash drifted")
 
 
 def validate_frame_sequence(
@@ -1028,9 +1144,12 @@ __all__ = [
     "SynchronizedTelemetryFrame",
     "SynchronizedTelemetryReceipt",
     "TelemetryArtifacts",
+    "canonical_json_artifact_sha256",
     "canonical_json_sha256",
     "operational_telemetry_schema_documents",
     "operational_schema_documents",
+    "parse_canonical_json_artifact",
     "validate_credit_event_chain",
     "validate_frame_sequence",
+    "validate_telemetry_artifact_hashes",
 ]

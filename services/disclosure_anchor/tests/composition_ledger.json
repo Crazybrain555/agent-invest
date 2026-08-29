@@ -139,7 +139,7 @@
   },
   "tests/unit/test_capacity_sources.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
@@ -438,7 +438,7 @@
   },
   "tests/unit/test_synchronized_telemetry_contract.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],

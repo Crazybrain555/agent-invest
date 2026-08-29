@@ -1,0 +1,86 @@
+{
+  "$id": "https://agent-invest.local/contracts/operational/phase-clock-binding.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Closed observer attestation that both producers use one kernel clock.",
+  "properties": {
+    "attestor_source_sha256": {
+      "title": "Attestor Source Sha256",
+      "type": "string"
+    },
+    "clock_domain_identity_sha256": {
+      "title": "Clock Domain Identity Sha256",
+      "type": "string"
+    },
+    "container_id": {
+      "title": "Container Id",
+      "type": "string"
+    },
+    "container_started_at_utc": {
+      "format": "date-time",
+      "title": "Container Started At Utc",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": "mineru.phase-clock-binding.v1",
+      "default": "mineru.phase-clock-binding.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "observer_boot_identity_sha256": {
+      "title": "Observer Boot Identity Sha256",
+      "type": "string"
+    },
+    "observer_clock_source": {
+      "const": "linux.clock_gettime.CLOCK_MONOTONIC",
+      "title": "Observer Clock Source",
+      "type": "string"
+    },
+    "observer_node_identity_sha256": {
+      "title": "Observer Node Identity Sha256",
+      "type": "string"
+    },
+    "observer_process_epoch_sha256": {
+      "title": "Observer Process Epoch Sha256",
+      "type": "string"
+    },
+    "phase_boot_identity_sha256": {
+      "title": "Phase Boot Identity Sha256",
+      "type": "string"
+    },
+    "phase_clock_source": {
+      "const": "linux.clock_gettime.CLOCK_MONOTONIC",
+      "title": "Phase Clock Source",
+      "type": "string"
+    },
+    "phase_node_identity_sha256": {
+      "title": "Phase Node Identity Sha256",
+      "type": "string"
+    },
+    "phase_process_epoch": {
+      "title": "Phase Process Epoch",
+      "type": "string"
+    },
+    "runtime_bundle_identity_sha256": {
+      "title": "Runtime Bundle Identity Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "phase_process_epoch",
+    "runtime_bundle_identity_sha256",
+    "container_id",
+    "container_started_at_utc",
+    "phase_node_identity_sha256",
+    "observer_node_identity_sha256",
+    "phase_boot_identity_sha256",
+    "observer_boot_identity_sha256",
+    "phase_clock_source",
+    "observer_process_epoch_sha256",
+    "clock_domain_identity_sha256",
+    "observer_clock_source",
+    "attestor_source_sha256"
+  ],
+  "title": "PhaseClockBinding",
+  "type": "object"
+}

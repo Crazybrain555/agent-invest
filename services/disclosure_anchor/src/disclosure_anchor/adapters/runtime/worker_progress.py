@@ -45,6 +45,8 @@ MINERU_API_HEALTH_FIELDS = frozenset(
         "completed_tasks",
         "failed_tasks",
         "max_concurrent_requests",
+        "max_pending_tasks_requested",
+        "max_pending_tasks_effective",
         "processing_window_size",
         "task_retention_seconds",
         "task_cleanup_interval_seconds",
@@ -338,6 +340,8 @@ def mineru_api_health_snapshot(
     )
     positive_fields = (
         "max_concurrent_requests",
+        "max_pending_tasks_requested",
+        "max_pending_tasks_effective",
         "processing_window_size",
         "task_cleanup_interval_seconds",
     )
@@ -356,7 +360,13 @@ def mineru_api_health_snapshot(
     if (
         decoded["processing_tasks"] > decoded["max_concurrent_requests"]
         or decoded["queued_tasks"] + decoded["processing_tasks"]
+        > decoded["max_pending_tasks_effective"]
+        or decoded["queued_tasks"] + decoded["processing_tasks"]
         > decoded["processing_window_size"]
+        or decoded["max_pending_tasks_effective"]
+        < decoded["max_pending_tasks_requested"]
+        or decoded["max_pending_tasks_effective"]
+        < decoded["max_concurrent_requests"]
     ):
         raise ValueError("MinerU API health counters exceed declared limits")
     return {

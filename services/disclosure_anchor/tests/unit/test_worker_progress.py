@@ -83,6 +83,8 @@ def _event() -> dict[str, object]:
             "completed_tasks": 20,
             "failed_tasks": 1,
             "max_concurrent_requests": 3,
+            "max_pending_tasks_requested": 4,
+            "max_pending_tasks_effective": 4,
             "processing_window_size": 16,
             "task_retention_seconds": 600,
             "task_cleanup_interval_seconds": 30,
@@ -120,6 +122,8 @@ def _api_health_payload() -> bytes:
             "completed_tasks": 20,
             "failed_tasks": 1,
             "max_concurrent_requests": 3,
+            "max_pending_tasks_requested": 4,
+            "max_pending_tasks_effective": 4,
             "processing_window_size": 16,
             "task_retention_seconds": 600,
             "task_cleanup_interval_seconds": 30,
@@ -335,6 +339,8 @@ class WorkerProgressTests(unittest.TestCase):
         self.assertEqual(observed["queued_tasks"], 2)
         self.assertEqual(observed["processing_tasks"], 2)
         self.assertEqual(observed["max_concurrent_requests"], 3)
+        self.assertEqual(observed["max_pending_tasks_requested"], 4)
+        self.assertEqual(observed["max_pending_tasks_effective"], 4)
         for task_slots in (1, 2, 3):
             accepted = {
                 **payload,
@@ -362,6 +368,8 @@ class WorkerProgressTests(unittest.TestCase):
             {"queued_tasks": 14, "processing_tasks": 3},
             {"max_concurrent_requests": 0},
             {"max_concurrent_requests": 16},
+            {"max_pending_tasks_requested": 5, "max_pending_tasks_effective": 4},
+            {"max_pending_tasks_requested": 2, "max_pending_tasks_effective": 2},
             {"task_retention_seconds": 3600},
             {"unexpected": 1},
         ):

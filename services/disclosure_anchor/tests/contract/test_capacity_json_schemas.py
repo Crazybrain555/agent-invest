@@ -59,6 +59,7 @@ class CapacityJsonSchemaTests(unittest.TestCase):
             {
                 "capacity-progress-event.v1.schema.json",
                 "capacity-vector-credit-event.v1.schema.json",
+                "phase-clock-binding.v1.schema.json",
                 "synchronized-phase-summary.v1.schema.json",
                 "synchronized-telemetry-frame.v1.schema.json",
                 "synchronized-telemetry-receipt.v1.schema.json",

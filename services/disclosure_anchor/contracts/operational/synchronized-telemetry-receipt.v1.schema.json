@@ -270,6 +270,30 @@
           "title": "Frames Sha256",
           "type": "string"
         },
+        "phase_capture_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phase Capture Sha256"
+        },
+        "phase_clock_binding_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phase Clock Binding Sha256"
+        },
         "progress_events_sha256": {
           "anyOf": [
             {

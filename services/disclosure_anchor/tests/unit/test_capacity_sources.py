@@ -102,6 +102,8 @@ class CapacitySourcesTests(unittest.TestCase):
                 "completed_tasks": 9,
                 "failed_tasks": 0,
                 "max_concurrent_requests": 1,
+                "max_pending_tasks_requested": 1,
+                "max_pending_tasks_effective": 1,
                 "processing_window_size": 16,
                 "task_retention_seconds": 600,
                 "task_cleanup_interval_seconds": 30,
@@ -138,6 +140,8 @@ class CapacitySourcesTests(unittest.TestCase):
             ).sample()
 
         self.assertEqual(api.completed_tasks_gauge, 9)
+        self.assertEqual(api.max_pending_tasks_requested, 1)
+        self.assertEqual(api.max_pending_tasks_effective, 1)
         self.assertEqual(vllm.requests_running, 7)
         progress_api = progress.mineru_api_health_snapshot(
             health,
@@ -150,6 +154,10 @@ class CapacitySourcesTests(unittest.TestCase):
                 expected_device_uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             )
         self.assertEqual(api.queued_tasks, progress_api["queued_tasks"])
+        self.assertEqual(
+            api.max_pending_tasks_effective,
+            progress_api["max_pending_tasks_effective"],
+        )
         self.assertEqual(vllm.requests_waiting, progress_vllm["requests_waiting"])
         self.assertEqual(
             gpu.gpu_utilization_pct,
@@ -165,6 +173,37 @@ class CapacitySourcesTests(unittest.TestCase):
                 b'DCGM_FI_DEV_GPU_UTIL{gpu="0"} 90\n',
                 expected_device_uuid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             )
+
+    def test_capacity_api_rejects_pending_depth_drift(self) -> None:
+        base = {
+            "status": "healthy",
+            "version": "3.4.4",
+            "protocol_version": 2,
+            "queued_tasks": 0,
+            "processing_tasks": 0,
+            "completed_tasks": 0,
+            "failed_tasks": 0,
+            "max_concurrent_requests": 3,
+            "max_pending_tasks_requested": 4,
+            "max_pending_tasks_effective": 4,
+            "processing_window_size": 16,
+            "task_retention_seconds": 600,
+            "task_cleanup_interval_seconds": 30,
+        }
+        accepted = sources._api_values(
+            json.dumps(base).encode(), expected_task_slots=3
+        )
+        self.assertEqual(accepted.max_pending_tasks_effective, 4)
+        for mutation in (
+            {"max_pending_tasks_effective": 2},
+            {"max_pending_tasks_requested": 5},
+            {"max_pending_tasks_effective": True},
+        ):
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                sources._api_values(
+                    json.dumps({**base, **mutation}).encode(),
+                    expected_task_slots=3,
+                )
 
     def test_cross_host_gpu_timestamp_has_bounded_future_skew(self) -> None:
         with patch.object(sources.time, "time", return_value=999.75):

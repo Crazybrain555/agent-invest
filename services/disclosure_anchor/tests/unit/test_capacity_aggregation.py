@@ -38,6 +38,8 @@ def _api(*, completed: int = 10, failed: int = 2) -> ApiSampleValues:
         completed_tasks_gauge=completed,
         failed_tasks_gauge=failed,
         task_slots=1,
+        max_pending_tasks_requested=1,
+        max_pending_tasks_effective=1,
         processing_window_size=16,
         task_retention_seconds=600,
         task_cleanup_interval_seconds=30,
