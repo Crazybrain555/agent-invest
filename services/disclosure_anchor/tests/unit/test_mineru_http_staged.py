@@ -24,7 +24,9 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
+    PreparedSubmissionIdentity,
     RemoteArtifactReceipt,
+    SubmissionAcceptanceAmbiguous,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -49,6 +51,18 @@ class _Reader:
 
 
 class MinerUHttpStagedParserTests(unittest.TestCase):
+    @staticmethod
+    def _prepared_submission(
+        parser: MinerUHttpStagedParser, source_sha256: str
+    ) -> PreparedSubmissionIdentity:
+        return parser.prepare_submission_identity(
+            options=PINNED_OPTIONS,
+            source_pdf_sha256=source_sha256,
+            attempt_identity="attempt-1",
+            fence_identity="fence-1",
+            submission_epoch_unix=1_000_000,
+        )
+
     def test_accept_disconnect_reconciles_and_submitted_checkpoint_resumes(self) -> None:
         posts = 0
         accepted = False
@@ -88,7 +102,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 input_pdf=source, options=PINNED_OPTIONS,
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1", fence_identity="fence-1",
-                client_submit_key=key, submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             public, secret = handle.submission_checkpoint()
             self.assertNotIn(secret.token_bytes, public.exact_bytes)
@@ -97,6 +111,105 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             )
             self.assertEqual(resumed.submission_checkpoint(), (public, secret))
             self.assertEqual(posts, 1)
+
+    def test_prepare_submission_identity_is_pure_and_begin_rejects_drift(self) -> None:
+        calls = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(500)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+            )
+            prepared = self._prepared_submission(parser, source_sha256)
+            self.assertEqual(calls, 0)
+            self.assertEqual(prepared.client_submit_key, _expected_idempotency_key(
+                source_sha256, "attempt-1", "fence-1", 1_000_000
+            ))
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "prepared submission identity drifted"
+            ):
+                parser.begin_remote_parse(
+                    input_pdf=source,
+                    options=replace(
+                        PINNED_OPTIONS,
+                        runtime_bundle_identity_sha256="sha256:" + "b" * 64,
+                    ),
+                    source_pdf_sha256=source_sha256,
+                    attempt_identity="attempt-1",
+                    fence_identity="fence-1",
+                    submission_identity=prepared,
+                )
+            self.assertEqual(calls, 0)
+
+    def test_post_ambiguous_responses_reconcile_delayed_acceptance(self) -> None:
+        for mode in ("500", "truncated", "timeout-delayed"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "input.pdf"
+                source.write_bytes(b"%PDF-stage")
+                source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+                key = _expected_idempotency_key(
+                    source_sha256, "attempt-1", "fence-1", 1_000_000
+                )
+                post_started = False
+                reconcile_gets = 0
+
+                def accepted_payload() -> dict[str, str]:
+                    return {
+                        "task_id": "task-1",
+                        "status_url": "/tasks/task-1",
+                        "result_url": "/tasks/task-1/result",
+                        "task_protocol_schema": "mineru-task-protocol.v2",
+                        "idempotency_key": key,
+                        "attempt_identity": "attempt-1",
+                        "fence_identity": "fence-1",
+                    }
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal post_started, reconcile_gets
+                    if request.url.path.startswith("/tasks/by-idempotency/"):
+                        if not post_started:
+                            return httpx.Response(404)
+                        reconcile_gets += 1
+                        if mode == "timeout-delayed" and reconcile_gets < 3:
+                            return httpx.Response(404)
+                        return httpx.Response(200, json=accepted_payload())
+                    post_started = True
+                    if mode == "500":
+                        return httpx.Response(500)
+                    if mode == "truncated":
+                        return httpx.Response(
+                            200, content=b'{"task_id":',
+                            headers={"content-type": "application/json"},
+                        )
+                    raise httpx.ReadTimeout("accepted", request=request)
+
+                parser = MinerUHttpStagedParser(
+                    api_url="http://mineru.test:30000",
+                    server_url="http://vlm.test:30000/v1",
+                    spool_root=Path(directory) / "spool",
+                    transport=httpx.MockTransport(handler),
+                )
+                handle = parser.begin_remote_parse(
+                    input_pdf=source, options=PINNED_OPTIONS,
+                    source_pdf_sha256=source_sha256,
+                    attempt_identity="attempt-1", fence_identity="fence-1",
+                    submission_identity=self._prepared_submission(
+                        parser, source_sha256
+                    ),
+                )
+                self.assertEqual(
+                    handle.submission_checkpoint()[0].remote_task_identity, "task-1"
+                )
 
     def test_resume_rejects_retired_v1_and_v2_tokens(self) -> None:
         parser = MinerUHttpStagedParser(
@@ -176,8 +289,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
-                client_submit_key=key,
-                submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             with self.assertRaisesRegex(ParserOutputContractError, "failure_committed"):
                 handle.acknowledge_after_failure_committed(
@@ -369,8 +481,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
-                client_submit_key=idempotency_key,
-                submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             receipt = handle.wait_terminal()
             with self.assertRaisesRegex(
@@ -411,7 +522,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 spool_root=Path(directory) / "spool",
                 transport=httpx.MockTransport(handler),
             )
-            with self.assertRaisesRegex(ParserOutputContractError, "duplicate"):
+            with self.assertRaisesRegex(
+                SubmissionAcceptanceAmbiguous, "acceptance remains ambiguous"
+            ):
                 parser.begin_remote_parse(
                     input_pdf=source,
                     options=PINNED_OPTIONS,
@@ -419,11 +532,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
-                    client_submit_key=_expected_idempotency_key(
+                    submission_identity=self._prepared_submission(
+                        parser,
                         "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
-                        "attempt-1", "fence-1", 1_000_000,
                     ),
-                    submission_epoch_unix=1_000_000,
                 )
 
     def test_v2_accepts_identity_bound_existing_post_200(self) -> None:
@@ -456,8 +568,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 input_pdf=source, options=PINNED_OPTIONS,
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1", fence_identity="fence-1",
-                client_submit_key=key,
-                submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             self.assertIsNotNone(handle)
 
@@ -479,16 +590,17 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 spool_root=Path(directory) / "spool",
                 transport=httpx.MockTransport(handler),
             )
-            with self.assertRaisesRegex(ParserOutputContractError, "wire envelope"):
+            with self.assertRaisesRegex(
+                SubmissionAcceptanceAmbiguous, "acceptance remains ambiguous"
+            ):
                 parser.begin_remote_parse(
                     input_pdf=source, options=PINNED_OPTIONS,
                     source_pdf_sha256="sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1", fence_identity="fence-1",
-                    client_submit_key=_expected_idempotency_key(
+                    submission_identity=self._prepared_submission(
+                        parser,
                         "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
-                        "attempt-1", "fence-1", 1_000_000,
                     ),
-                    submission_epoch_unix=1_000_000,
                 )
 
     def test_submit_rejects_cross_origin_result_url(self) -> None:
@@ -536,8 +648,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     + hashlib.sha256(source.read_bytes()).hexdigest(),
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
-                    client_submit_key=idempotency_key,
-                    submission_epoch_unix=1_000_000,
+                    submission_identity=self._prepared_submission(
+                        parser,
+                        "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest(),
+                    ),
                 )
 
     def test_effective_defaults_match_pinned_cli_form(self) -> None:
@@ -552,10 +666,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
-                client_submit_key=_expected_idempotency_key(
-                    source_sha256, "attempt-1", "fence-1", 1_000_000
-                ),
-                submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
         body = submissions[0]
         self.assertIn(b'name="effort"\r\n\r\nmedium', body)
@@ -576,10 +687,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
-                client_submit_key=_expected_idempotency_key(
-                    source_sha256, "attempt-1", "fence-1", 1_000_000
-                ),
-                submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             receipt = handle.wait_terminal()
             output = Path(directory) / "out"
@@ -659,14 +767,11 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             parser, source, source_sha256, _ = self._completed_parser(
                 directory, result_zip
             )
-            key = _expected_idempotency_key(
-                source_sha256, "attempt-1", "fence-1", 1_000_000
-            )
             handle = parser.begin_remote_parse(
                 input_pdf=source, options=PINNED_OPTIONS,
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1", fence_identity="fence-1",
-                client_submit_key=key, submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             receipt = handle.wait_terminal()
             with patch(
@@ -766,8 +871,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
-                client_submit_key=idempotency_key,
-                submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             receipt = handle.wait_terminal()
             self.assertEqual(result_gets, 0)
@@ -857,8 +961,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 source_pdf_sha256=source_sha256,
                 attempt_identity="attempt-1",
                 fence_identity="fence-1",
-                client_submit_key=idempotency_key,
-                submission_epoch_unix=1_000_000,
+                submission_identity=self._prepared_submission(parser, source_sha256),
             )
             with ThreadPoolExecutor(max_workers=2) as pool:
                 wait_future = pool.submit(handle.wait_terminal)
@@ -886,10 +989,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     source_pdf_sha256=source_sha256,
                     attempt_identity="attempt-1",
                     fence_identity="fence-1",
-                    client_submit_key=_expected_idempotency_key(
-                        source_sha256, "attempt-1", "fence-1", 1_000_000
+                    submission_identity=self._prepared_submission(
+                        parser, source_sha256
                     ),
-                    submission_epoch_unix=1_000_000,
                 )
                 receipt = handle.wait_terminal()
                 output = Path(directory) / "out"

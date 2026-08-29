@@ -36,11 +36,14 @@ from disclosure_anchor.application.ports.provider_parser import ProviderParserRe
 from disclosure_anchor.application.ports.staged_provider_parser import (
     PersistedSubmissionReceipt,
     PreparedMaterialization,
+    PreparedSubmissionIdentity,
     PrivateSubmittedTaskResume,
     ProviderMaterializationEvidence,
     RemoteArtifactReceipt,
     RemoteProviderParseHandle,
     StagedProviderParserResult,
+    SubmissionAcceptanceAmbiguous,
+    SubmissionNotAttempted,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -51,6 +54,8 @@ _MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
 _MAX_WIRE_JSON_BYTES = 1024 * 1024
 _MANIFEST_NAME = ".agent-materialization-manifest.v1.json"
 _MAX_DECODED_BYTES = 4 * 1024 * 1024 * 1024
+
+
 def _make_idempotency_key(
     source_pdf_sha256: str,
     attempt_identity: str,
@@ -63,6 +68,80 @@ def _make_idempotency_key(
         f"{epoch:x}\0{source_pdf_sha256}\0{attempt_identity}\0{fence_identity}".encode()
     ).hexdigest()
     return f"{epoch:x}.{digest}"
+
+
+def _submission_form(options: ParserOptions, *, server_url: str) -> dict[str, str]:
+    return {
+        "lang_list": options.language,
+        "backend": options.backend,
+        "effort": options.effective_effort or "medium",
+        "parse_method": options.method,
+        "formula_enable": str(options.formula).lower(),
+        "table_enable": str(options.table).lower(),
+        "image_analysis": str(options.effective_image_analysis).lower(),
+        "return_md": "true",
+        "return_middle_json": "true",
+        "return_model_output": "true",
+        "return_content_list": "true",
+        "return_images": "true",
+        "response_format_zip": "true",
+        "return_original_file": "true",
+        "client_side_output_generation": "false",
+        "start_page_id": "0",
+        "end_page_id": "99999",
+        "server_url": server_url,
+    }
+
+
+def _validate_submission_facts(
+    *,
+    options: ParserOptions,
+    source_pdf_sha256: str,
+    attempt_identity: str,
+    fence_identity: str,
+    submission_epoch_unix: int,
+) -> None:
+    _identity(attempt_identity, "attempt identity")
+    _identity(fence_identity, "fence identity")
+    if (
+        isinstance(submission_epoch_unix, bool)
+        or not isinstance(submission_epoch_unix, int)
+        or submission_epoch_unix < 0
+    ):
+        raise _fail("durable submission epoch is required")
+    if not source_pdf_sha256.startswith("sha256:") or len(source_pdf_sha256) != 71:
+        raise _fail("source identity is not canonical sha256")
+    if (
+        options.backend != "hybrid-http-client"
+        or options.method != "auto"
+        or options.language != "ch"
+        or not options.formula
+        or not options.table
+        or options.effective_effort != "medium"
+        or options.effective_image_analysis
+        or options.start_page is not None
+        or options.end_page is not None
+        or not options.runtime_bundle_identity_sha256
+    ):
+        raise _fail("request is outside the pinned full-PDF Medium profile")
+
+
+def _target_identity(options: ParserOptions) -> ParserTargetIdentity:
+    return ParserTargetIdentity(
+        name="MinerU",
+        package_version="3.4.4",
+        backend=options.backend,
+        method=options.method,
+        language=options.language,
+        formula=options.formula,
+        table=options.table,
+        effort=options.effective_effort,
+        image_analysis=options.effective_image_analysis,
+        full_pdf=True,
+        start_page=None,
+        end_page=None,
+        runtime_bundle_identity_sha256=options.runtime_bundle_identity_sha256 or "",
+    )
 
 
 def _fail(message: str) -> ParserOutputContractError:
@@ -622,22 +701,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         return task, spool_path, artifact_sha256
 
     def _target_identity(self) -> ParserTargetIdentity:
-        return ParserTargetIdentity(
-            name="MinerU",
-            package_version="3.4.4",
-            backend=self._options.backend,
-            method=self._options.method,
-            language=self._options.language,
-            formula=self._options.formula,
-            table=self._options.table,
-            effort=self._options.effective_effort,
-            image_analysis=self._options.effective_image_analysis,
-            full_pdf=True,
-            start_page=None,
-            end_page=None,
-            runtime_bundle_identity_sha256=self._options.runtime_bundle_identity_sha256
-            or "",
-        )
+        return _target_identity(self._options)
 
     def acknowledge_after_finish_committed(
         self, *, receipt: RemoteArtifactReceipt, checkpoint_state: str
@@ -745,6 +809,71 @@ class MinerUHttpStagedParser:
         self._transport = transport
         self._spool_root = spool_root
 
+    def prepare_submission_identity(
+        self,
+        *,
+        options: ParserOptions,
+        source_pdf_sha256: str,
+        attempt_identity: str,
+        fence_identity: str,
+        submission_epoch_unix: int,
+    ) -> PreparedSubmissionIdentity:
+        _validate_submission_facts(
+            options=options,
+            source_pdf_sha256=source_pdf_sha256,
+            attempt_identity=attempt_identity,
+            fence_identity=fence_identity,
+            submission_epoch_unix=submission_epoch_unix,
+        )
+        target = _target_identity(options)
+        target_exact = json.dumps(
+            target.to_payload(), sort_keys=True, separators=(",", ":")
+        ).encode()
+        request_exact = json.dumps(
+            {
+                "schema": "mineru-staged-request.v1",
+                "api_origin": self._api_url,
+                "form": _submission_form(options, server_url=self._server_url),
+                "upload_filename": f"{source_pdf_sha256[7:]}.pdf",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        parser_target_sha256 = "sha256:" + hashlib.sha256(target_exact).hexdigest()
+        request_sha256 = "sha256:" + hashlib.sha256(request_exact).hexdigest()
+        client_submit_key = _make_idempotency_key(
+            source_pdf_sha256,
+            attempt_identity,
+            fence_identity,
+            observed_unix=float(submission_epoch_unix),
+        )
+        projection = {
+            "schema": "mineru-prepared-submission.v1",
+            "attempt_identity": attempt_identity,
+            "fence_identity": fence_identity,
+            "source_pdf_sha256": source_pdf_sha256,
+            "parser_target_identity_sha256": parser_target_sha256,
+            "runtime_bundle_identity_sha256": options.runtime_bundle_identity_sha256,
+            "request_sha256": request_sha256,
+            "client_submit_key": client_submit_key,
+            "submission_epoch_unix": submission_epoch_unix,
+        }
+        exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+        return PreparedSubmissionIdentity(
+            schema="mineru-prepared-submission.v1",
+            attempt_identity=attempt_identity,
+            fence_identity=fence_identity,
+            source_pdf_sha256=source_pdf_sha256,
+            parser_target_identity_sha256=parser_target_sha256,
+            runtime_bundle_identity_sha256=options.runtime_bundle_identity_sha256
+            or "",
+            request_sha256=request_sha256,
+            client_submit_key=client_submit_key,
+            submission_epoch_unix=submission_epoch_unix,
+            exact_bytes=exact,
+            sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
+        )
+
     def begin_remote_parse(
         self,
         *,
@@ -753,32 +882,17 @@ class MinerUHttpStagedParser:
         source_pdf_sha256: str,
         attempt_identity: str,
         fence_identity: str,
-        client_submit_key: str,
-        submission_epoch_unix: int | None = None,
+        submission_identity: PreparedSubmissionIdentity,
     ) -> MinerUHttpRemoteHandle:
-        _identity(attempt_identity, "attempt identity")
-        _identity(fence_identity, "fence identity")
-        if (
-            isinstance(submission_epoch_unix, bool)
-            or not isinstance(submission_epoch_unix, int)
-            or submission_epoch_unix < 0
-        ):
-            raise _fail("durable submission epoch is required")
-        if not source_pdf_sha256.startswith("sha256:") or len(source_pdf_sha256) != 71:
-            raise _fail("source identity is not canonical sha256")
-        if (
-            options.backend != "hybrid-http-client"
-            or options.method != "auto"
-            or options.language != "ch"
-            or not options.formula
-            or not options.table
-            or options.effective_effort != "medium"
-            or options.effective_image_analysis
-            or options.start_page is not None
-            or options.end_page is not None
-            or not options.runtime_bundle_identity_sha256
-        ):
-            raise _fail("request is outside the pinned full-PDF Medium profile")
+        expected_submission = self.prepare_submission_identity(
+            options=options,
+            source_pdf_sha256=source_pdf_sha256,
+            attempt_identity=attempt_identity,
+            fence_identity=fence_identity,
+            submission_epoch_unix=submission_identity.submission_epoch_unix,
+        )
+        if submission_identity != expected_submission:
+            raise _fail("durable prepared submission identity drifted")
         self._spool_root.mkdir(parents=True, exist_ok=True)
         source_fd = os.open(input_pdf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         before = os.fstat(source_fd)
@@ -821,34 +935,8 @@ class MinerUHttpStagedParser:
         if "sha256:" + digest.hexdigest() != source_pdf_sha256:
             snapshot.unlink(missing_ok=True)
             raise _fail("source changed before submission")
-        data: dict[str, Any] = {
-            "lang_list": options.language,
-            "backend": options.backend,
-            "effort": options.effective_effort or "medium",
-            "parse_method": options.method,
-            "formula_enable": str(options.formula).lower(),
-            "table_enable": str(options.table).lower(),
-            "image_analysis": str(options.effective_image_analysis).lower(),
-            "return_md": "true",
-            "return_middle_json": "true",
-            "return_model_output": "true",
-            "return_content_list": "true",
-            "return_images": "true",
-            "response_format_zip": "true",
-            "return_original_file": "true",
-            "client_side_output_generation": "false",
-            "start_page_id": "0",
-            "end_page_id": "99999",
-            "server_url": self._server_url,
-        }
-        expected_idempotency_key = _make_idempotency_key(
-            source_pdf_sha256, attempt_identity, fence_identity,
-            observed_unix=float(submission_epoch_unix or 0),
-        )
-        if client_submit_key != expected_idempotency_key:
-            snapshot.unlink(missing_ok=True)
-            raise _fail("durable client submit key drifted")
-        idempotency_key = client_submit_key
+        data: dict[str, Any] = _submission_form(options, server_url=self._server_url)
+        idempotency_key = submission_identity.client_submit_key
         data.update(
             {
                 "agent_idempotency_key": idempotency_key,
@@ -876,13 +964,18 @@ class MinerUHttpStagedParser:
             ):
                 # Reconcile the durable key before POST. A failed lookup is not
                 # permission to submit: only an exact 404 proves absence.
-                lookup = client.send(
-                    client.build_request(
-                        "GET",
-                        f"{self._api_url}/tasks/by-idempotency/{idempotency_key}",
-                    ),
-                    stream=True,
-                )
+                try:
+                    lookup = client.send(
+                        client.build_request(
+                            "GET",
+                            f"{self._api_url}/tasks/by-idempotency/{idempotency_key}",
+                        ),
+                        stream=True,
+                    )
+                except httpx.TransportError as exc:
+                    raise SubmissionNotAttempted(
+                        "MinerU staged HTTP contract: pre-submit reconcile failed"
+                    ) from exc
                 if lookup.status_code == 200:
                     try:
                         payload = _closed_json(
@@ -896,37 +989,61 @@ class MinerUHttpStagedParser:
                     lookup.close()
                     request = client.build_request(
                         "POST", f"{self._api_url}/tasks", data=data,
-                        files={"files": (input_pdf.name, source, "application/pdf")},
+                        files={
+                            "files": (
+                                f"{source_pdf_sha256[7:]}.pdf",
+                                source,
+                                "application/pdf",
+                            )
+                        },
                     )
                     try:
                         response = client.send(request, stream=True)
                     except httpx.TransportError:
-                        response = client.send(
-                            client.build_request(
-                                "GET",
-                                f"{self._api_url}/tasks/by-idempotency/{idempotency_key}",
-                            ),
-                            stream=True,
-                        )
-                        expected_statuses = {200}
-                    else:
-                        expected_statuses = {200, 202}
-                    try:
-                        if response.status_code not in expected_statuses:
-                            raise _fail(
-                                f"submit/reconcile returned HTTP {response.status_code}"
-                            )
-                        payload = _closed_json(
-                            response,
-                            required={"task_id", "status_url", "result_url"},
+                        payload = _reconcile_ambiguous_submission(
+                            client=client,
+                            api_url=self._api_url,
+                            idempotency_key=idempotency_key,
                             allowed=submit_allowed,
                         )
-                    finally:
-                        response.close()
+                    else:
+                        status = response.status_code
+                        if status in {200, 202}:
+                            try:
+                                payload = _closed_json(
+                                    response,
+                                    required={"task_id", "status_url", "result_url"},
+                                    allowed=submit_allowed,
+                                )
+                            except ParserOutputContractError:
+                                response.close()
+                                payload = _reconcile_ambiguous_submission(
+                                    client=client,
+                                    api_url=self._api_url,
+                                    idempotency_key=idempotency_key,
+                                    allowed=submit_allowed,
+                                )
+                            else:
+                                response.close()
+                        elif status in {408, 429} or 500 <= status <= 599:
+                            response.close()
+                            payload = _reconcile_ambiguous_submission(
+                                client=client,
+                                api_url=self._api_url,
+                                idempotency_key=idempotency_key,
+                                allowed=submit_allowed,
+                            )
+                        else:
+                            response.close()
+                            raise _fail(
+                                f"submission was rejected with HTTP {status}"
+                            )
                 else:
                     status = lookup.status_code
                     lookup.close()
-                    raise _fail(f"idempotency reconcile returned HTTP {status}")
+                    raise SubmissionNotAttempted(
+                        f"MinerU staged HTTP contract: pre-submit reconcile returned HTTP {status}"
+                    )
         finally:
             snapshot.unlink(missing_ok=True)
         if not all(
@@ -955,7 +1072,7 @@ class MinerUHttpStagedParser:
             attempt_identity=attempt_identity,
             fence_identity=fence_identity,
             idempotency_key=idempotency_key,
-            submission_epoch_unix=submission_epoch_unix,
+            submission_epoch_unix=submission_identity.submission_epoch_unix,
         )
         return MinerUHttpRemoteHandle(
             task=task,
@@ -1055,6 +1172,54 @@ def _closed_json(
     if allowed is not None and not set(payload).issubset(allowed):
         raise _fail("response JSON fields are not closed")
     return payload
+
+
+def _reconcile_ambiguous_submission(
+    *,
+    client: httpx.Client,
+    api_url: str,
+    idempotency_key: str,
+    allowed: set[str],
+) -> dict[str, Any]:
+    delays = (0.0, 0.01, 0.02, 0.04, 0.08, 0.16)
+    last_reason = "not yet visible"
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        try:
+            response = client.send(
+                client.build_request(
+                    "GET", f"{api_url}/tasks/by-idempotency/{idempotency_key}"
+                ),
+                stream=True,
+            )
+        except httpx.TransportError:
+            last_reason = "transport failure"
+            continue
+        try:
+            if response.status_code == 404:
+                last_reason = "not yet visible"
+                continue
+            if response.status_code == 200:
+                try:
+                    return _closed_json(
+                        response,
+                        required={"task_id", "status_url", "result_url"},
+                        allowed=allowed,
+                    )
+                except ParserOutputContractError:
+                    last_reason = "invalid reconcile response"
+                    continue
+            if response.status_code in {408, 429} or 500 <= response.status_code <= 599:
+                last_reason = f"HTTP {response.status_code}"
+                continue
+            last_reason = f"unexpected HTTP {response.status_code}"
+        finally:
+            response.close()
+    raise SubmissionAcceptanceAmbiguous(
+        "MinerU staged HTTP contract: submission acceptance remains ambiguous "
+        f"after bounded reconcile ({last_reason})"
+    )
 
 
 def _terminal_receipt_exact(receipt: RemoteArtifactReceipt) -> bytes:

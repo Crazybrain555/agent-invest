@@ -18,6 +18,15 @@ from urllib.parse import urlsplit
 
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.provider_parser import ProviderParserResult
+from disclosure_anchor.domain.errors import ParserOutputContractError
+
+
+class SubmissionNotAttempted(ParserOutputContractError):
+    """Remote POST was provably never invoked."""
+
+
+class SubmissionAcceptanceAmbiguous(ParserOutputContractError):
+    """Remote POST began but its acceptance cannot yet be reconciled."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +138,69 @@ class PersistedSubmissionReceipt:
             "sha256:" + hashlib.sha256(canonical).hexdigest()
         ):
             raise ValueError("submission receipt exact bytes drifted")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSubmissionIdentity:
+    """Pure closed identity persisted before any remote submission IO."""
+
+    schema: str
+    attempt_identity: str
+    fence_identity: str
+    source_pdf_sha256: str
+    parser_target_identity_sha256: str
+    runtime_bundle_identity_sha256: str
+    request_sha256: str
+    client_submit_key: str
+    submission_epoch_unix: int
+    exact_bytes: bytes = field(repr=False)
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "mineru-prepared-submission.v1":
+            raise ValueError("prepared submission schema is unsupported")
+        for value, label in (
+            (self.source_pdf_sha256, "prepared submission source"),
+            (self.parser_target_identity_sha256, "prepared parser target"),
+            (self.runtime_bundle_identity_sha256, "prepared runtime bundle"),
+            (self.request_sha256, "prepared request"),
+            (self.sha256, "prepared submission"),
+        ):
+            _require_sha256(value, label)
+        if (
+            isinstance(self.submission_epoch_unix, bool)
+            or not isinstance(self.submission_epoch_unix, int)
+            or self.submission_epoch_unix < 0
+        ):
+            raise ValueError("prepared submission epoch is invalid")
+        for value in (
+            self.attempt_identity,
+            self.fence_identity,
+            self.client_submit_key,
+        ):
+            if not isinstance(value, str) or not value.strip() or len(value) > 1024:
+                raise ValueError("prepared submission identity is invalid")
+        projection = {
+            "schema": self.schema,
+            "attempt_identity": self.attempt_identity,
+            "fence_identity": self.fence_identity,
+            "source_pdf_sha256": self.source_pdf_sha256,
+            "parser_target_identity_sha256": self.parser_target_identity_sha256,
+            "runtime_bundle_identity_sha256": self.runtime_bundle_identity_sha256,
+            "request_sha256": self.request_sha256,
+            "client_submit_key": self.client_submit_key,
+            "submission_epoch_unix": self.submission_epoch_unix,
+        }
+        canonical = json.dumps(
+            projection, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if (
+            not self.exact_bytes
+            or len(self.exact_bytes) > 65_536
+            or self.exact_bytes != canonical
+            or self.sha256 != "sha256:" + hashlib.sha256(canonical).hexdigest()
+        ):
+            raise ValueError("prepared submission exact bytes drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +388,17 @@ class RemoteProviderParseHandle(Protocol):
 class StagedProviderDocumentParserPort(Protocol):
     """Capability port; absence keeps the existing synchronous parser path."""
 
+    def prepare_submission_identity(
+        self,
+        *,
+        options: ParserOptions,
+        source_pdf_sha256: str,
+        attempt_identity: str,
+        fence_identity: str,
+        submission_epoch_unix: int,
+    ) -> PreparedSubmissionIdentity:
+        """Compute the complete durable submission identity without IO."""
+
     def begin_remote_parse(
         self,
         *,
@@ -324,8 +407,7 @@ class StagedProviderDocumentParserPort(Protocol):
         source_pdf_sha256: str,
         attempt_identity: str,
         fence_identity: str,
-        client_submit_key: str,
-        submission_epoch_unix: int,
+        submission_identity: PreparedSubmissionIdentity,
     ) -> RemoteProviderParseHandle:
         ...
 
@@ -349,10 +431,13 @@ class StagedProviderDocumentParserPort(Protocol):
 __all__ = [
     "RemoteArtifactReceipt",
     "PersistedSubmissionReceipt",
+    "PreparedSubmissionIdentity",
     "PrivateSubmittedTaskResume",
     "PreparedMaterialization",
     "ProviderMaterializationEvidence",
     "RemoteProviderParseHandle",
     "StagedProviderParserResult",
     "StagedProviderDocumentParserPort",
+    "SubmissionAcceptanceAmbiguous",
+    "SubmissionNotAttempted",
 ]
