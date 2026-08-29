@@ -282,12 +282,6 @@ class _ResidentSamplerProcess:
                 self._terminate()
                 raise TelemetrySnapshotDeadlineExceeded("resident snapshot returned late")
             if kind == "ok":
-                unexpected = self._unexpected_process_group_members()
-                if unexpected:
-                    self._terminate()
-                    raise RuntimeError(
-                        f"resident collector capability violation: {unexpected}"
-                    )
                 return cast(GpuLaneSnapshot | HostLaneSnapshot, payload)
             if kind == "deadline":
                 raise TelemetrySnapshotDeadlineExceeded(str(payload))
@@ -301,6 +295,8 @@ class _ResidentSamplerProcess:
             raise RuntimeError(f"resident collector program error: {payload}")
 
     def close(self) -> None:
+        if self._process_closed:
+            return
         connection = self._connection
         if connection is not None and self._started and self._process.is_alive():
             try:
@@ -311,7 +307,11 @@ class _ResidentSamplerProcess:
         if self._started and self._process.is_alive():
             self._terminate()
         else:
-            self._quiesce_process_group()
+            unexpected = self._quiesce_process_group()
+            if unexpected:
+                raise RuntimeError(
+                    f"resident collector capability violation: {unexpected}"
+                )
         if connection is not None:
             connection.close()
             self._connection = None
@@ -353,11 +353,12 @@ class _ResidentSamplerProcess:
             if pid != self._process.pid
         )
 
-    def _quiesce_process_group(self) -> None:
+    def _quiesce_process_group(self) -> tuple[int, ...]:
         if os.name != "posix" or not self._process_group_ready or not self._process.pid:
-            return
+            return ()
         deadline = time.monotonic() + 1.0
         members = _posix_process_group_members(self._process.pid)
+        unexpected = tuple(pid for pid in members if pid != self._process.pid)
         if members:
             _signal_process_group(self._process.pid, signal.SIGTERM)
         while members and time.monotonic() < deadline:
@@ -373,6 +374,7 @@ class _ResidentSamplerProcess:
             raise SynchronizedTelemetryEvidenceError(
                 f"resident collector process group did not quiesce: {members}"
             )
+        return unexpected
 
 
 def _signal_process_group(process_group_id: int, signal_number: int) -> None:
@@ -775,6 +777,18 @@ def synchronized_observer_source_sha256() -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _observer_process_tree_cpu_ns() -> int:
+    """Cumulative parent plus reaped collector CPU for the pre-seal interval."""
+
+    total = time.process_time_ns()
+    if os.name == "posix":
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+        total += int((usage.ru_utime + usage.ru_stime) * 1_000_000_000)
+    return total
+
+
 def run_synchronized_telemetry_observer(
     *,
     artifact_root: Path,
@@ -788,7 +802,7 @@ def run_synchronized_telemetry_observer(
     limits: SynchronizedObserverLimits | None = None,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
-    process_cpu_ns: Callable[[], int] = time.process_time_ns,
+    process_cpu_ns: Callable[[], int] = lambda: _observer_process_tree_cpu_ns(),
 ) -> SynchronizedObserverResult:
     """Run independent absolute-deadline lanes and seal replayable evidence."""
 
@@ -945,6 +959,8 @@ def run_synchronized_telemetry_observer(
         state = ObserverState.DRAINING
         for thread in started_threads:
             thread.join()
+        for invocation in invocations:
+            invocation.close()
         finish_monotonic = max(
             monotonic_ns(),
             max(frame.clock.finished_monotonic_ns for frame in frames),

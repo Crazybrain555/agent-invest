@@ -259,6 +259,16 @@ class _PopenDescendantSampler:
         return _gpu_snapshot()
 
 
+class _CpuBurnSampler:
+    collector_identity_sha256 = COLLECTOR_ID
+
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        stop = time.process_time() + 0.08
+        while time.process_time() < stop:
+            pass
+        return _gpu_snapshot()
+
+
 class _HostSequenceSampler:
     collector_identity_sha256 = COLLECTOR_ID
 
@@ -292,6 +302,8 @@ def _test_collector_factory(config: dict[str, object]) -> object:
         Path(str(config["pid_file"])).write_text(str(popen_child.pid), encoding="ascii")
     if mode == "popen_snapshot_descendant":
         return _PopenDescendantSampler(str(config["pid_file"]))
+    if mode == "cpu_burn":
+        return _CpuBurnSampler()
     if mode == "transport_failure":
         return _FailingSampler()
     if mode == "delayed_transport_failure":
@@ -667,6 +679,72 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         self.assertEqual(
             {child.pid for child in multiprocessing.active_children()}, before_children
         )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+    def test_four_hz_long_run_has_no_per_tick_process_table_churn(self) -> None:
+        module = __import__(
+            "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+            fromlist=["subprocess"],
+        )
+        original = module.subprocess.run
+        calls = 0
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            module.subprocess, "run", new=counted
+        ):
+            result = self._run(Path(temporary) / "telemetry", duration=1.08)
+        self.assertEqual(result.receipt.status, "complete")
+        self.assertLessEqual(calls, 4)
+        self.assertGreaterEqual(
+            len([frame for frame in result.frames if frame.lane == "gpu_fast"]), 4
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+    def test_slow_boundary_scan_cannot_make_late_snapshot_supported(self) -> None:
+        module = __import__(
+            "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+            fromlist=["_posix_process_group_members"],
+        )
+        original = module._posix_process_group_members
+
+        def slow_scan(process_group_id: int) -> tuple[int, ...]:
+            time.sleep(0.15)
+            return original(process_group_id)
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            module, "_posix_process_group_members", new=slow_scan
+        ):
+            result = self._run(
+                Path(temporary) / "telemetry",
+                gpu_sampler=_LateSampler(),
+                duration=0.8,
+            )
+        gpu = [frame for frame in result.frames if frame.lane == "gpu_fast"]
+        self.assertTrue(gpu)
+        self.assertTrue(all(frame.gpu.reason == "deadline_exceeded" for frame in gpu))
+
+    @unittest.skipUnless(os.name == "posix", "child rusage is required")
+    def test_collector_cpu_is_included_in_preseal_overhead(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = run_synchronized_telemetry_observer(
+                artifact_root=Path(temporary) / "telemetry",
+                process_profile=_profile(),
+                gpu_collector=_collector_spec(lane="gpu", mode="cpu_burn"),
+                host_collector=_collector_spec(lane="host"),
+                duration_seconds=1.08,
+                run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            )
+        self.assertGreater(
+            result.seal.preseal_observer_cpu_ns
+            / result.seal.sampling_elapsed_ns_denominator,
+            0.02,
+        )
+        self.assertEqual(result.seal.status, "unsafe")
 
     def test_spawn_safe_main_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
