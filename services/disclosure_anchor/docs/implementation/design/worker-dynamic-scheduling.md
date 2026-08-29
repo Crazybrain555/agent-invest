@@ -312,6 +312,16 @@ maintenance thread                 report writer thread
   当前 parse 完成项超过空槽时留在 PostgreSQL `pending_build_v1`，不进入无界 executor queue；
   新 parse admission 由 durable pending build/publish 的 item 数和 archived-source byte 估算双
   水位控制。未知 byte 保持可见并由 item 水位兜底，不制造 0-byte 假估算；
+- “远端 task terminal”与“parse 成功”是两个不同边界。可选 staged parser adapter 必须先产生
+  含 attempt、fence、result owner 与 byte count 的 durable terminal receipt，remote pump 才能归还
+  whole-document admission credit；Mac download/verify/provider-envelope/atomic write/finish-run 进入独立
+  local pump，并由独立 local item + result-byte credits 背压。receipt checkpoint 失败、local persist
+  失败或 restart 恢复失败都保持可见，绝不能把 remote terminal 提升为 succeeded run；
+- 当前 MinerU 3.4.4 CLI 的 `--api-url` 路径把 submit/status/terminal、result ZIP 下载/解压绑定在
+  同一个 CLI process return 中，没有可证明的提前 terminal/result-owner 回调。因此 production adapter
+  仍走 legacy synchronous port；`BoundedTwoStageParserPump` 只在 adapter 实现
+  `StagedProviderDocumentParserPort` 并能 durable checkpoint/resume 后启用。禁止从 health gauge、stdout
+  片段或队列差值猜 task ownership。这个保守 fallback 不产生吞吐改进，但避免假释放 remote credit；
 - 每个不可变 report interval 只在 non-idempotent whole-document publish commit 后，按
   `raw_file_hash` 去重累计 source pages；同 identity 页数冲突显式失败。interval 输出携带闭合
   identity/page 条目，跨 interval/host-hour 去重由 telemetry aggregator 完成，不在常驻 worker

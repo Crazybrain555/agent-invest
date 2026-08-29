@@ -444,6 +444,10 @@
    "private_imports": [],
    "tests": 15
   },
+  "tests/unit/test_two_stage_parser_pump.py": {
+   "private_imports": [],
+   "tests": 6
+  },
   "tests/unit/test_unit_hashing.py": {
    "private_imports": [],
    "tests": 15
