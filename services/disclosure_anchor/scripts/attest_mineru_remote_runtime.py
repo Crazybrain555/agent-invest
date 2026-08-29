@@ -46,6 +46,9 @@ EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-serial-v1"
 EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v5"
 EXPECTED_CAPACITY_POLICY = "single-owner-serial-mineru.v1"
 EXPECTED_COMPAT_PREIMAGES = {
+    "mineru/cli/api_request.py": (
+        "sha256:16e16ee7fe9d3b1872f6fb43e1f7b2e7d314d2f726311e821813abece0334e77"
+    ),
     "mineru/cli/fast_api.py": (
         "sha256:f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
     ),
@@ -71,11 +74,13 @@ COMPAT_LABEL_KEYS = {
     "io.agent-invest.mineru.compatibility-policy",
     "io.agent-invest.mineru.compatibility-patcher-sha256",
     "io.agent-invest.mineru.compatibility-dockerfile-sha256",
+    "io.agent-invest.mineru.task-protocol-v2-sha256",
 }
 API_ENV_KEYS = {
     "MINERU_MODEL_SOURCE",
     "MINERU_MALLOC_TRIM",
     "MINERU_PHASE_TRACE",
+    "MINERU_TASK_PROTOCOL_V2",
     "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_API_MAX_PENDING_TASKS",
     "MINERU_PROCESSING_WINDOW_SIZE",
@@ -240,6 +245,7 @@ def _verify_api_compatibility(
     *,
     expected_patcher_sha256: str,
     expected_dockerfile_sha256: str,
+    expected_task_protocol_v2_sha256: str,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {
         "marker",
@@ -306,6 +312,9 @@ def _verify_api_compatibility(
         "io.agent-invest.mineru.compatibility-dockerfile-sha256": (
             expected_dockerfile_sha256
         ),
+        "io.agent-invest.mineru.task-protocol-v2-sha256": (
+            expected_task_protocol_v2_sha256
+        ),
     }:
         raise ValueError("remote API compatibility image labels drifted")
     return dict(value)
@@ -323,6 +332,7 @@ def build_manifest(
     expected_collector_sha256: str,
     expected_compat_patcher_sha256: str,
     expected_compat_dockerfile_sha256: str,
+    expected_task_protocol_v2_sha256: str,
     expected_collector_path: str = EXPECTED_COLLECTOR_PATH,
 ) -> dict[str, Any]:
     if observation.get("schema") != "mineru-windows-runtime-observation.v3":
@@ -363,6 +373,7 @@ def build_manifest(
         observation.get("api_compatibility"),
         expected_patcher_sha256=expected_compat_patcher_sha256,
         expected_dockerfile_sha256=expected_compat_dockerfile_sha256,
+        expected_task_protocol_v2_sha256=expected_task_protocol_v2_sha256,
     )
     task_slots = health.get("max_concurrent_requests")
     pending_requested = health.get("max_pending_tasks_requested")
@@ -809,6 +820,14 @@ def main(argv: list[str] | None = None) -> int:
         / "mineru_heap_trim_compat"
         / "Dockerfile",
     )
+    parser.add_argument(
+        "--task-protocol-v2-source",
+        type=Path,
+        default=Path(__file__).resolve().parent
+        / "windows"
+        / "mineru_heap_trim_compat"
+        / "agent_task_protocol_v2.py",
+    )
     args = parser.parse_args(argv)
     remote_collector_path = _canonical_remote_collector_path(
         args.remote_collector_path
@@ -832,6 +851,10 @@ def main(argv: list[str] | None = None) -> int:
     expected_compat_dockerfile_sha256 = (
         "sha256:"
         + hashlib.sha256(args.compat_dockerfile_source.read_bytes()).hexdigest()
+    )
+    expected_task_protocol_v2_sha256 = (
+        "sha256:"
+        + hashlib.sha256(args.task_protocol_v2_source.read_bytes()).hexdigest()
     )
     if _read_remote_file(
         command,
@@ -884,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_collector_sha256=expected_collector_sha256,
         expected_compat_patcher_sha256=expected_compat_patcher_sha256,
         expected_compat_dockerfile_sha256=expected_compat_dockerfile_sha256,
+        expected_task_protocol_v2_sha256=expected_task_protocol_v2_sha256,
         expected_collector_path=remote_collector_path,
     )
     _new_private_json(args.observation_out, observation)

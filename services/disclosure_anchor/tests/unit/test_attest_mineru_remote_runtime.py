@@ -40,6 +40,7 @@ CLIENT = MinerUClientIdentity(
 CODE_DIGEST = "sha256:" + "2" * 64
 PATCHER_DIGEST = "sha256:" + "8" * 64
 DOCKERFILE_DIGEST = "sha256:" + "9" * 64
+TASK_PROTOCOL_DIGEST = "sha256:" + "b" * 64
 API_IMAGE_ID = "sha256:" + "a" * 64
 
 
@@ -48,6 +49,7 @@ def _observation() -> dict[str, Any]:
         "MINERU_MODEL_SOURCE=local",
         "MINERU_MALLOC_TRIM=1",
         "MINERU_PHASE_TRACE=0",
+        "MINERU_TASK_PROTOCOL_V2=0",
         "MINERU_HYBRID_BATCH_RATIO=1",
         "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS=1",
         "MINERU_API_MAX_CONCURRENT_REQUESTS=1",
@@ -125,7 +127,7 @@ def _observation() -> dict[str, Any]:
                     path: "sha256:" + character * 64
                     for path, character in zip(
                         EXPECTED_COMPAT_PREIMAGES,
-                        ("b", "c", "d", "e", "f", "1"),
+                        ("a", "b", "c", "d", "e", "f", "1"),
                         strict=True,
                     )
                 },
@@ -135,7 +137,7 @@ def _observation() -> dict[str, Any]:
                 path: "sha256:" + character * 64
                 for path, character in zip(
                     EXPECTED_COMPAT_PREIMAGES,
-                    ("b", "c", "d", "e", "f", "1"),
+                    ("a", "b", "c", "d", "e", "f", "1"),
                     strict=True,
                 )
             },
@@ -158,6 +160,9 @@ def _observation() -> dict[str, Any]:
                 ),
                 "io.agent-invest.mineru.compatibility-dockerfile-sha256": (
                     DOCKERFILE_DIGEST
+                ),
+                "io.agent-invest.mineru.task-protocol-v2-sha256": (
+                    TASK_PROTOCOL_DIGEST
                 ),
             },
         },
@@ -271,6 +276,7 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                 expected_collector_sha256="sha256:" + "7" * 64,
                 expected_compat_patcher_sha256=PATCHER_DIGEST,
                 expected_compat_dockerfile_sha256=DOCKERFILE_DIGEST,
+                expected_task_protocol_v2_sha256=TASK_PROTOCOL_DIGEST,
             )
 
         self.assertEqual(
@@ -362,6 +368,7 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                         expected_collector_sha256="sha256:" + "7" * 64,
                         expected_compat_patcher_sha256=PATCHER_DIGEST,
                         expected_compat_dockerfile_sha256=DOCKERFILE_DIGEST,
+                        expected_task_protocol_v2_sha256=TASK_PROTOCOL_DIGEST,
                     )
 
     def test_known_hosts_identity_hashes_the_exact_ed25519_blob(self) -> None:

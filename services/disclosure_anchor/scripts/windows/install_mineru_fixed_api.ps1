@@ -767,6 +767,7 @@ function Get-ValidatedRuntime {
 function Get-ApiCompatBuildIdentity {
     $dockerfile = [IO.Path]::GetFullPath($CompatDockerfileSource)
     $patcher = [IO.Path]::GetFullPath($CompatPatcherSource)
+    $taskProtocol = Join-Path (Split-Path -Parent $patcher) "agent_task_protocol_v2.py"
     $context = Split-Path -Parent $dockerfile
     if (
         -not [string]::Equals(
@@ -781,12 +782,14 @@ function Get-ApiCompatBuildIdentity {
     }
     $patcherSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $patcher).Hash.ToLowerInvariant())"
     $dockerfileSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $dockerfile).Hash.ToLowerInvariant())"
+    $taskProtocolSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $taskProtocol).Hash.ToLowerInvariant())"
     return [ordered]@{
         dockerfile = $dockerfile
         patcher = $patcher
         context = $context
         patcher_sha256 = $patcherSha256
         dockerfile_sha256 = $dockerfileSha256
+        task_protocol_v2_sha256 = $taskProtocolSha256
     }
 }
 
@@ -819,8 +822,11 @@ function Get-ValidatedApiCompatImage {
             [string]$BuildIdentity.patcher_sha256 -or
         [string]$image.Config.Labels."io.agent-invest.mineru.compatibility-dockerfile-sha256" -ne
             [string]$BuildIdentity.dockerfile_sha256 -or
+        [string]$image.Config.Labels."io.agent-invest.mineru.task-protocol-v2-sha256" -ne
+            [string]$BuildIdentity.task_protocol_v2_sha256 -or
         @($image.Config.Env) -notcontains "MINERU_MALLOC_TRIM=1" -or
-        @($image.Config.Env) -notcontains "MINERU_PHASE_TRACE=0"
+        @($image.Config.Env) -notcontains "MINERU_PHASE_TRACE=0" -or
+        @($image.Config.Env) -notcontains "MINERU_TASK_PROTOCOL_V2=0"
     ) {
         throw "MinerU API compatibility image labels or environment drifted"
     }
@@ -831,6 +837,7 @@ function Get-ValidatedApiCompatImage {
         capacity_policy = $CapacityPolicy
         patcher_sha256 = [string]$BuildIdentity.patcher_sha256
         dockerfile_sha256 = [string]$BuildIdentity.dockerfile_sha256
+        task_protocol_v2_sha256 = [string]$BuildIdentity.task_protocol_v2_sha256
     }
 }
 
@@ -842,6 +849,7 @@ function Build-ValidatedApiCompatImage {
         "--tag", $ApiCompatBuildTag,
         "--build-arg", "COMPAT_PATCHER_SHA256=$($identity.patcher_sha256)",
         "--build-arg", "COMPAT_DOCKERFILE_SHA256=$($identity.dockerfile_sha256)",
+        "--build-arg", "TASK_PROTOCOL_V2_SHA256=$($identity.task_protocol_v2_sha256)",
         [string]$identity.context
     ) | Out-Null
     $script:CompatBuildTagCreated = $true
