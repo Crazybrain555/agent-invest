@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import re
 import time
@@ -16,6 +15,9 @@ from disclosure_anchor.application.contracts.capacity import (
     GpuSampleValues,
     VllmSampleValues,
 )
+from disclosure_anchor.application.contracts.mineru_api_health import (
+    parse_mineru_api_health,
+)
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
     nvidia_smi_sample_age_seconds,
 )
@@ -23,23 +25,6 @@ from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
 
 MAX_API_HEALTH_BYTES = 64 * 1024
 MAX_METRICS_BYTES = 4 * 1024 * 1024
-_API_FIELDS = frozenset(
-    {
-        "status",
-        "version",
-        "protocol_version",
-        "queued_tasks",
-        "processing_tasks",
-        "completed_tasks",
-        "failed_tasks",
-        "max_concurrent_requests",
-        "max_pending_tasks_requested",
-        "max_pending_tasks_effective",
-        "processing_window_size",
-        "task_retention_seconds",
-        "task_cleanup_interval_seconds",
-    }
-)
 _VLLM_ALIASES = {
     "running": ("vllm:num_requests_running", "vllm_num_requests_running"),
     "waiting": ("vllm:num_requests_waiting", "vllm_num_requests_waiting"),
@@ -172,58 +157,9 @@ def _alias(
 
 
 def _api_values(payload: bytes, *, expected_task_slots: int) -> ApiSampleValues:
-    try:
-        decoded = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("MinerU API health is not valid UTF-8 JSON") from exc
-    if not isinstance(decoded, dict) or set(decoded) != _API_FIELDS:
-        raise ValueError("MinerU API health fields are not closed")
-    if (
-        decoded.get("status") != "healthy"
-        or decoded.get("version") != "3.4.4"
-        or decoded.get("protocol_version") != 2
-        or decoded.get("max_concurrent_requests") != expected_task_slots
-        or decoded.get("processing_window_size") != 16
-        or decoded.get("task_retention_seconds") != 600
-        or decoded.get("task_cleanup_interval_seconds") != 30
-    ):
-        raise ValueError("MinerU API identity or health drifted")
-    integer_fields = (
-        "queued_tasks",
-        "processing_tasks",
-        "completed_tasks",
-        "failed_tasks",
-        "max_concurrent_requests",
-        "max_pending_tasks_requested",
-        "max_pending_tasks_effective",
-        "processing_window_size",
-        "task_retention_seconds",
-        "task_cleanup_interval_seconds",
-        "protocol_version",
+    decoded = parse_mineru_api_health(
+        payload, expected_task_slots=expected_task_slots
     )
-    positive = {
-        "max_concurrent_requests",
-        "max_pending_tasks_requested",
-        "max_pending_tasks_effective",
-        "processing_window_size",
-        "task_cleanup_interval_seconds",
-        "protocol_version",
-    }
-    if any(
-        isinstance(decoded.get(name), bool)
-        or not isinstance(decoded.get(name), int)
-        or int(decoded[name]) < (1 if name in positive else 0)
-        for name in integer_fields
-    ):
-        raise ValueError("MinerU API health numbers are invalid")
-    if (
-        decoded["max_pending_tasks_effective"] < expected_task_slots
-        or decoded["max_pending_tasks_effective"]
-        < decoded["max_pending_tasks_requested"]
-        or decoded["queued_tasks"] + decoded["processing_tasks"]
-        > decoded["max_pending_tasks_effective"]
-    ):
-        raise ValueError("MinerU API pending-task capacity is invalid")
     return ApiSampleValues(
         queued_tasks=decoded["queued_tasks"],
         processing_tasks=decoded["processing_tasks"],

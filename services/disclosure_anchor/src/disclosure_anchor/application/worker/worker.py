@@ -1779,12 +1779,6 @@ def run_resident_parse(
                     limit=publish_recovery_limit,
                     should_stop=should_stop,
                 )
-                _backfill_publish_kpi(
-                    recovery_report,
-                    deps,
-                    limit=publish_recovery_limit,
-                    should_stop=should_stop,
-                )
         except Exception as exc:
             # Queue-read/connection failures sit outside the item-isolating
             # stage loops and therefore prove the recovery probe itself did
@@ -2789,14 +2783,14 @@ def _publish_stage(
             return
 
 
-def _backfill_publish_kpi(
+def backfill_publish_kpi_once(
     report: WorkerReport,
     deps: WorkerDeps,
     *,
     limit: int,
     should_stop: Callable[[], bool],
 ) -> None:
-    """Append missing historical publish evidence without reopening publish."""
+    """Explicitly append one bounded batch of historical publish evidence."""
 
     with deps.engine.connect() as conn:
         pending = queries.pending_publish_kpi_backfill(conn, limit=limit)

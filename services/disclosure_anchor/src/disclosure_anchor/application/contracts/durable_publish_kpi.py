@@ -52,6 +52,7 @@ def replay_durable_publish_kpi(
 ) -> DurablePublishKpiSnapshot:
     bases: dict[str, tuple[datetime, _PublishEvidence | None]] = {}
     supplements: dict[str, _PublishEvidence] = {}
+    conflicted_runs: set[str] = set()
     conflicts = 0
     for row in rows:
         run_id = str(row["processing_run_id"])
@@ -67,15 +68,20 @@ def replay_durable_publish_kpi(
             candidate = (occurred_at, evidence)
             if run_id in bases and bases[run_id] != candidate:
                 conflicts += 1
+                conflicted_runs.add(run_id)
             bases[run_id] = candidate
         elif evidence is not None:
             previous = supplements.get(run_id)
             if previous is not None and previous != evidence:
                 conflicts += 1
+                conflicted_runs.add(run_id)
             supplements[run_id] = evidence
     identities: dict[str, int] = {}
+    conflicted_identities: set[str] = set()
     incomplete = 0
     for run_id, (base_committed_at, base) in bases.items():
+        if run_id in conflicted_runs:
+            continue
         supplement = supplements.get(run_id)
         if base is not None and base.publish_committed_at != base_committed_at:
             conflicts += 1
@@ -85,6 +91,7 @@ def replay_durable_publish_kpi(
             supplement = None
         if base is not None and supplement is not None and base != supplement:
             conflicts += 1
+            continue
         evidence = base or supplement
         if evidence is None:
             incomplete += 1
@@ -92,10 +99,14 @@ def replay_durable_publish_kpi(
         identity = evidence.source_identity
         pages = evidence.source_pages
         previous_pages = identities.get(identity)
+        if identity in conflicted_identities:
+            continue
         if previous_pages is None:
             identities[identity] = pages
         elif previous_pages != pages:
             conflicts += 1
+            conflicted_identities.add(identity)
+            identities.pop(identity, None)
     sources = tuple(sorted(identities.items()))
     return DurablePublishKpiSnapshot(
         started_at=started_at,

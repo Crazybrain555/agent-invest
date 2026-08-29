@@ -18,7 +18,7 @@ from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.engine import Engine
@@ -26,6 +26,9 @@ from sqlalchemy.engine import Engine
 from disclosure_anchor.application.dto.worker_report import WorkerReport
 from disclosure_anchor.application.contracts.durable_publish_kpi import (
     replay_durable_publish_kpi,
+)
+from disclosure_anchor.application.contracts.mineru_api_health import (
+    parse_mineru_api_health,
 )
 from disclosure_anchor.application.worker.queries import (
     durable_publish_kpi_events,
@@ -39,23 +42,6 @@ SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 MAX_METRICS_BYTES = 4 * 1024 * 1024
 MAX_API_HEALTH_BYTES = 64 * 1024
 MAX_GPU_METRICS_BYTES = 64 * 1024
-MINERU_API_HEALTH_FIELDS = frozenset(
-    {
-        "status",
-        "version",
-        "protocol_version",
-        "queued_tasks",
-        "processing_tasks",
-        "completed_tasks",
-        "failed_tasks",
-        "max_concurrent_requests",
-        "max_pending_tasks_requested",
-        "max_pending_tasks_effective",
-        "processing_window_size",
-        "task_retention_seconds",
-        "task_cleanup_interval_seconds",
-    }
-)
 VLLM_METRIC_NAMES = {
     "requests_running": ("vllm:num_requests_running", "vllm_num_requests_running"),
     "requests_waiting": ("vllm:num_requests_waiting", "vllm_num_requests_waiting"),
@@ -314,27 +300,9 @@ def mineru_api_health_snapshot(
 ) -> dict[str, Any]:
     """Parse the exact MinerU 3.4.4 orchestration health contract."""
 
-    try:
-        decoded = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("MinerU API health payload is not valid UTF-8 JSON") from exc
-    if not isinstance(decoded, dict) or set(decoded) != MINERU_API_HEALTH_FIELDS:
-        raise ValueError("MinerU API health fields are not closed")
-    if (
-        decoded.get("status") != "healthy"
-        or decoded.get("version") != "3.4.4"
-        or decoded.get("protocol_version") != 2
-        or not 1 <= decoded.get("max_concurrent_requests", 0) <= 3
-        or (
-            expected_task_slots is not None
-            and decoded.get("max_concurrent_requests") != expected_task_slots
-        )
-        or decoded.get("processing_window_size") != 16
-        or decoded.get("task_retention_seconds") != 600
-        or decoded.get("task_cleanup_interval_seconds") != 30
-    ):
-        raise ValueError("MinerU API identity or health status drifted")
-
+    decoded = parse_mineru_api_health(
+        payload, expected_task_slots=expected_task_slots
+    )
     nonnegative_fields = (
         "queued_tasks",
         "processing_tasks",
@@ -349,37 +317,17 @@ def mineru_api_health_snapshot(
         "processing_window_size",
         "task_cleanup_interval_seconds",
     )
-    if any(
-        isinstance(decoded.get(name), bool)
-        or not isinstance(decoded.get(name), int)
-        or decoded[name] < 0
-        for name in nonnegative_fields
-    ) or any(
-        isinstance(decoded.get(name), bool)
-        or not isinstance(decoded.get(name), int)
-        or decoded[name] < 1
-        for name in positive_fields
-    ):
-        raise ValueError("MinerU API health counters or limits are invalid")
-    if (
-        decoded["processing_tasks"] > decoded["max_concurrent_requests"]
-        or decoded["queued_tasks"] + decoded["processing_tasks"]
-        > decoded["max_pending_tasks_effective"]
-        or decoded["queued_tasks"] + decoded["processing_tasks"]
-        > decoded["processing_window_size"]
-        or decoded["max_pending_tasks_effective"]
-        < decoded["max_pending_tasks_requested"]
-        or decoded["max_pending_tasks_effective"]
-        < decoded["max_concurrent_requests"]
-    ):
-        raise ValueError("MinerU API health counters exceed declared limits")
+    health_values = cast(dict[str, int | str], decoded)
     return {
         "status": "available",
         "source": "mineru_api_health",
         "health_status": decoded["status"],
         "version": decoded["version"],
         "protocol_version": decoded["protocol_version"],
-        **{name: decoded[name] for name in (*nonnegative_fields, *positive_fields)},
+        **{
+            name: health_values[name]
+            for name in (*nonnegative_fields, *positive_fields)
+        },
     }
 
 

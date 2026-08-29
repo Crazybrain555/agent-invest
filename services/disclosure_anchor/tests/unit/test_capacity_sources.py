@@ -205,6 +205,28 @@ class CapacitySourcesTests(unittest.TestCase):
                     expected_task_slots=3,
                 )
 
+    def test_both_api_health_consumers_reject_impossible_slot_state(self) -> None:
+        payload = {
+            "status": "healthy",
+            "version": "3.4.4",
+            "protocol_version": 2,
+            "queued_tasks": 0,
+            "processing_tasks": 2,
+            "completed_tasks": 0,
+            "failed_tasks": 0,
+            "max_concurrent_requests": 1,
+            "max_pending_tasks_requested": 2,
+            "max_pending_tasks_effective": 2,
+            "processing_window_size": 16,
+            "task_retention_seconds": 600,
+            "task_cleanup_interval_seconds": 30,
+        }
+        encoded = json.dumps(payload).encode()
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            sources._api_values(encoded, expected_task_slots=1)
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            progress.mineru_api_health_snapshot(encoded, expected_task_slots=1)
+
     def test_cross_host_gpu_timestamp_has_bounded_future_skew(self) -> None:
         with patch.object(sources.time, "time", return_value=999.75):
             observed = sources._gpu_values(

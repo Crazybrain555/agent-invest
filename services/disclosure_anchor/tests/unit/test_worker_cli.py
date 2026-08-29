@@ -136,6 +136,44 @@ class AdaptiveLoopControllerTests(unittest.TestCase):
 
 
 class ResidentLoopBoundaryTests(unittest.TestCase):
+    def test_explicit_kpi_backfill_is_bounded_and_incomplete_is_nonzero(self) -> None:
+        engine = mock.MagicMock()
+        deps = mock.MagicMock()
+        deps.clock.return_value = datetime(2026, 7, 13, tzinfo=timezone.utc)
+
+        def mark_incomplete(
+            report: WorkerReport,
+            _deps: object,
+            *,
+            limit: int,
+            should_stop: object,
+        ) -> None:
+            self.assertEqual(limit, 17)
+            self.assertFalse(should_stop())  # type: ignore[operator]
+            report.durable_published_page_count_incomplete = 1
+
+        with (
+            mock.patch.object(
+                worker_cli, "_create_worker_db_engine", return_value=engine
+            ),
+            mock.patch.object(worker_cli, "require_runtime_app_engine"),
+            mock.patch.object(worker_cli, "_deps", return_value=deps),
+            mock.patch.object(
+                worker_cli,
+                "backfill_publish_kpi_once",
+                side_effect=mark_incomplete,
+            ) as backfill,
+            mock.patch("builtins.print"),
+        ):
+            result = worker_cli._run_publish_kpi_backfill(
+                mock.MagicMock(), limit=17
+            )
+
+        self.assertEqual(result, 1)
+        backfill.assert_called_once()
+        deps.close_source.assert_called_once_with()
+        engine.dispose.assert_called_once_with()
+
     def test_worker_database_url_never_falls_back_to_migration_owner(self) -> None:
         settings = mock.MagicMock(
             database_url=None,

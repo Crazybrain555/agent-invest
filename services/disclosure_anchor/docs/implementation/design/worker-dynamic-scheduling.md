@@ -330,8 +330,9 @@ maintenance thread                 report writer thread
   identity、source page count、commit instant）。worker progress 以固定 UTC host-hour 查询 base publish，
   并联查这些 publish 在任意后续时刻写入的 supplement；因此 report rotation、同一 host-hour 内的
   worker restart 或跨小时晚到补账都不会重置/漏掉主分子，高频 observer 的查询窗口也不会随进程
-  寿命无界增长。旧事件缺字段时保持 incomplete，并由 resident recovery 校验 canonical envelope 后
-  追加 supplement event，绝不重开或回滚已成功 publish；
+  寿命无界增长。旧事件缺字段时保持 incomplete，并由显式 maintenance 校验 canonical envelope 后
+  追加 supplement event，绝不重开或回滚已成功 publish；历史修复只能由 singleton-owned、显式
+  有界的 `make worker-backfill-publish-kpi LIMIT=<N>` 执行，resident recovery 不扫描完整历史；
 - PostgreSQL QueuePool 不使用 SQLAlchemy 的固定默认 `5+10`。每个 active parse/finalize 在完整
   document producer lease 期间持有一条 session connection，并可能短暂再取一条 transaction
   connection；因此 worker 从当前 `parse_concurrency + finalize_concurrency` 动态派生

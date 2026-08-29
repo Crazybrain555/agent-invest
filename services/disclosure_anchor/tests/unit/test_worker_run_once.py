@@ -205,7 +205,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 return_value=(identity, 42),
             ),
         ):
-            worker_module._backfill_publish_kpi(
+            worker_module.backfill_publish_kpi_once(
                 report,
                 deps,
                 limit=1,
@@ -244,7 +244,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 return_value=None,
             ),
         ):
-            worker_module._backfill_publish_kpi(
+            worker_module.backfill_publish_kpi_once(
                 report,
                 deps,
                 limit=1,
@@ -2003,7 +2003,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ),
             mock.patch.object(worker_module, "_build_stage"),
             mock.patch.object(worker_module, "_publish_stage"),
-            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             thread = threading.Thread(
                 target=worker_module.run_resident_parse,
@@ -2081,7 +2080,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(
                 worker_module, "_publish_stage", side_effect=publish_stage
             ) as publish_mock,
-            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             worker_module.run_resident_parse(
                 deps,
@@ -2142,7 +2140,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 worker_module, "_build_stage", side_effect=recovery_build
             ),
             mock.patch.object(worker_module, "_publish_stage"),
-            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             worker_module.run_resident_parse(
                 deps,
@@ -2194,7 +2191,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 side_effect=recovery_pool_timeout,
             ),
             mock.patch.object(worker_module, "_publish_stage"),
-            mock.patch.object(worker_module, "_backfill_publish_kpi"),
         ):
             worker_module.run_resident_parse(
                 deps,

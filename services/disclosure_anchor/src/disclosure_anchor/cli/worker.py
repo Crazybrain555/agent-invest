@@ -85,6 +85,7 @@ from disclosure_anchor.application.worker.worker import (
     _is_provider_infrastructure_error,
     build_failures_indicate_outage,
     publish_failures_indicate_outage,
+    backfill_publish_kpi_once,
     render_report_section,
     run_once,
     run_resident_parse,
@@ -175,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=("terminal", "json"),
         default="terminal",
     )
+    backfill_parser = subparsers.add_parser("backfill-publish-kpi")
+    backfill_parser.add_argument("--limit", type=int, required=True)
     args = parser.parse_args(argv)
 
     settings = load_settings()
@@ -182,10 +185,16 @@ def main(argv: list[str] | None = None) -> int:
         return _print_worker_status(settings, output_format=args.format)
     if args.command == "loop":
         return run_resident_worker(settings, progress_output=args.progress)
+    if args.command == "backfill-publish-kpi" and args.limit < 1:
+        parser.error("backfill-publish-kpi --limit must be positive")
     # Construction verifies immutable/static deployment evidence before any DB
     # access. The first live probe belongs inside the singleton-owned round so a
     # transient outage becomes a durable admission failure report.
-    mineru_checker = MinerUDeploymentChecker(settings)
+    mineru_checker = (
+        None
+        if args.command == "backfill-publish-kpi"
+        else MinerUDeploymentChecker(settings)
+    )
     _print_version_banner(settings)
     # Singleton lock on a dedicated NullPool connection: a pooled connection
     # would leak the session lock back into the pool on release (08 §2 E6).
@@ -203,6 +212,8 @@ def main(argv: list[str] | None = None) -> int:
         if not acquired:
             print(SKIP_MESSAGE)
             return 0
+        if args.command == "backfill-publish-kpi":
+            return _run_publish_kpi_backfill(settings, limit=args.limit)
         return _run_rounds(
             settings,
             rounds=1,
@@ -212,6 +223,33 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         lock_conn.close()
         lock_engine.dispose()
+
+
+def _run_publish_kpi_backfill(settings: Settings, *, limit: int) -> int:
+    """Run one singleton-owned bounded maintenance batch; never loop implicitly."""
+
+    engine = _create_worker_db_engine(settings)
+    deps: WorkerDeps | None = None
+    try:
+        require_runtime_app_engine(engine)
+        deps = _deps(settings, engine)
+        report = WorkerReport(started_at=deps.clock())
+        backfill_publish_kpi_once(
+            report,
+            deps,
+            limit=limit,
+            should_stop=lambda: False,
+        )
+        print(render_report_section(report))
+        return (
+            1
+            if report.failed or report.durable_published_page_count_incomplete
+            else 0
+        )
+    finally:
+        if deps is not None:
+            deps.close_source()
+        engine.dispose()
 
 
 def _run_rounds(

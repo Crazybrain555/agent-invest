@@ -66,7 +66,7 @@ class DurablePublishKpiTests(unittest.TestCase):
             started_at=NOW,
             finished_at=FINISHED,
         )
-        self.assertEqual(snapshot.unique_source_pages, 20)
+        self.assertEqual(snapshot.unique_source_pages, 0)
         self.assertEqual(snapshot.incomplete_publish_count, 1)
         self.assertEqual(snapshot.conflict_count, 1)
 
@@ -87,7 +87,8 @@ class DurablePublishKpiTests(unittest.TestCase):
             started_at=NOW,
             finished_at=FINISHED,
         )
-        self.assertEqual(snapshot.conflict_count, 2)
+        self.assertEqual(snapshot.conflict_count, 1)
+        self.assertEqual(snapshot.unique_source_pages, 0)
 
     def test_replay_rejects_noncanonical_source_identity(self) -> None:
         snapshot = replay_durable_publish_kpi(

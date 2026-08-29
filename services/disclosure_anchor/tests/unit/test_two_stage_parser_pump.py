@@ -197,6 +197,52 @@ class TwoStageParserPumpTests(unittest.TestCase):
         self.assertFalse(local_started.is_set())
         self.assertEqual(outcomes[0].status, "cancelled")
 
+    def test_cancel_issues_exactly_one_drain_and_preserves_drain_error(self) -> None:
+        stop = threading.Event()
+        remote_started = threading.Event()
+        release_remote = threading.Event()
+        drain_calls = 0
+        drain_error = RuntimeError("drain proof failed")
+
+        def remote() -> RemoteArtifactReceipt:
+            remote_started.set()
+            self.assertTrue(release_remote.wait(timeout=2))
+            time.sleep(0.1)
+            return _receipt(0)
+
+        def drain() -> None:
+            nonlocal drain_calls
+            drain_calls += 1
+            release_remote.set()
+            raise drain_error
+
+        work = (
+            TwoStageParseWork(
+                sequence=0,
+                item_identity="doc-0",
+                wait_remote_terminal=remote,
+                persist_local=lambda _value: "bad",
+                checkpoint_remote_terminal=lambda _value: None,
+                cancel_and_drain=drain,
+            ),
+        )
+        pump = BoundedTwoStageParserPump[str](
+            remote_workers=1,
+            local_workers=1,
+            max_terminal_receipts=1,
+            max_local_items=1,
+            max_local_bytes=1,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            running = executor.submit(pump.run, work, stop_requested=stop.is_set)
+            self.assertTrue(remote_started.wait(timeout=2))
+            stop.set()
+            outcome = running.result(timeout=2)[0]
+
+        self.assertEqual(drain_calls, 1)
+        self.assertEqual(outcome.status, "cancelled")
+        self.assertIs(outcome.error, drain_error)
+
     def test_recovered_terminal_skips_remote_and_resumes_local(self) -> None:
         checkpointed: list[RemoteArtifactReceipt] = []
         receipt = _receipt(0, byte_count=3)

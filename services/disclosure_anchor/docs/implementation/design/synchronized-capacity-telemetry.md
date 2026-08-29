@@ -63,6 +63,10 @@ receipt 的 lane sample count、边界/相邻最大 gap、late、missed deadline
 unsupported observation 数必须从 frames 机械重算。`gpu_fast` 只以 GPU observation 为 required；
 `host_slow` 只以 API process、host cgroup 和 queue/vLLM 为 required。其他 lane 上的 `not_due_at_this_tick`
 不计为缺失，避免合法的分频采样被误判为永远 incomplete。
+每帧 `observed_interval_ns`、`deadline_status` 和 `missed_deadline_count` 必须从相邻 monotonic 时间及
+nominal cadence 重算；首帧和末帧还必须分别覆盖 receipt 起止边界。任意一个 nominal deadline 未被
+覆盖都令 receipt `incomplete`。每帧 UTC wall time 也必须与 receipt 起点加同一 monotonic delta 在
+既定 fixed+ppm 容差内相符，调用者不能用内部自洽但与 receipt 时轴无关的 wall clock 冒充同步证据。
 
 frames、progress、vector、phase capture 与 phase-clock binding 的摘要不得由调用者声明后直接信任。
 验证器只接受 canonical UTF-8 JSON bytes，拒绝重复字段、非 canonical 编码和缺失 artifact，并从实际

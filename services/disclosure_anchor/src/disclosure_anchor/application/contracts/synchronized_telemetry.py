@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -768,7 +768,9 @@ class SynchronizedTelemetryReceipt(_FrozenModel):
         overhead_ratio = self.observer_cpu_ns / monotonic_ns
         unsafe = self.epoch_changed or overhead_ratio > self.maximum_observer_overhead_ratio
         incomplete = self.unsupported_observation_count > 0 or any(
-            item.late_sample_count > 0 or item.supported_frame_count == 0
+            item.late_sample_count > 0
+            or item.missed_deadline_count > 0
+            or item.supported_frame_count == 0
             for item in self.lane_quality
         )
         expected: RunStatus = "unsafe" if unsafe else "incomplete" if incomplete else "complete"
@@ -1049,6 +1051,22 @@ def validate_frame_sequence(
             <= receipt.finished_monotonic_ns
         ):
             raise ValueError("telemetry frame lies outside receipt bounds")
+        expected_wall = receipt.started_at_utc + timedelta(
+            microseconds=(
+                frame.clock.started_monotonic_ns - receipt.started_monotonic_ns
+            )
+            / 1000
+        )
+        wall_error_ns = abs(
+            int((frame.clock.observed_at_utc - expected_wall).total_seconds() * 1e9)
+        )
+        elapsed_ns = frame.clock.started_monotonic_ns - receipt.started_monotonic_ns
+        allowed_wall_error_ns = (
+            receipt.maximum_clock_divergence_fixed_ns
+            + elapsed_ns * receipt.maximum_clock_divergence_ppm // 1_000_000
+        )
+        if wall_error_ns > allowed_wall_error_ns:
+            raise ValueError("telemetry frame wall and monotonic clocks diverged")
         if frame.clock.started_monotonic_ns < previous_started:
             raise ValueError("telemetry frames are not monotonic")
         previous = lane_previous.get(frame.lane)
@@ -1056,16 +1074,25 @@ def validate_frame_sequence(
             if frame.quality.status != "first":
                 raise ValueError("first lane frame is not marked first")
         else:
-            observed_ms = (
+            observed_ns = (
                 frame.clock.started_monotonic_ns
                 - previous.clock.started_monotonic_ns
-            ) / 1_000_000
+            )
+            observed_ms = observed_ns / 1_000_000
             if frame.quality.observed_interval_ms is None or not math.isclose(
                 frame.quality.observed_interval_ms,
                 observed_ms,
                 abs_tol=0.001,
             ):
                 raise ValueError("observed lane interval differs from clock")
+            nominal_ns = frame.quality.nominal_interval_ms * 1_000_000
+            expected_missed = max(0, (observed_ns - 1) // nominal_ns)
+            expected_status = "late" if expected_missed else "on_time"
+            if (
+                frame.quality.missed_deadlines != expected_missed
+                or frame.quality.status != expected_status
+            ):
+                raise ValueError("telemetry lane deadline evidence differs from clock")
         lane_previous[frame.lane] = frame
         lane_frames[frame.lane].append(frame)
         previous_started = frame.clock.started_monotonic_ns
@@ -1099,6 +1126,10 @@ def validate_frame_sequence(
         gaps_ns = [starts[0] - receipt.started_monotonic_ns]
         gaps_ns.extend(right - left for left, right in zip(starts, starts[1:]))
         gaps_ns.append(receipt.finished_monotonic_ns - starts[-1])
+        nominal_ns = frames_in_lane[0].quality.nominal_interval_ms * 1_000_000
+        expected_missed_deadlines = sum(
+            max(0, (gap_ns - 1) // nominal_ns) for gap_ns in gaps_ns
+        )
         expected = LaneQualitySummary(
             lane=lane,
             nominal_interval_ms=frames_in_lane[0].quality.nominal_interval_ms,
@@ -1107,9 +1138,7 @@ def validate_frame_sequence(
             late_sample_count=sum(
                 frame.quality.status == "late" for frame in frames_in_lane
             ),
-            missed_deadline_count=sum(
-                frame.quality.missed_deadlines for frame in frames_in_lane
-            ),
+            missed_deadline_count=expected_missed_deadlines,
             supported_frame_count=supported_frame_count,
         )
         if receipt_quality[lane] != expected:

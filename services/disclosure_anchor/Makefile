@@ -28,7 +28,7 @@ WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISC
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	lint typecheck agent-check api archive pg-init pg-start pg-stop \
 	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
-	worker-status worker-restart mineru-smoke mineru-campaign-epoch-freeze mineru-staged-load mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
+	worker-status worker-restart worker-backfill-publish-kpi mineru-smoke mineru-campaign-epoch-freeze mineru-staged-load mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
 	generate-current-source-replay audit-live-unit-replay capacity-observe capacity-verify capacity-summary
 
 doctor:
@@ -207,6 +207,10 @@ worker-once:
 
 worker-loop:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker loop --progress terminal
+
+worker-backfill-publish-kpi:
+	@test -n "$(LIMIT)" || (echo 'usage: make worker-backfill-publish-kpi LIMIT=<positive bounded batch>' && exit 2)
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker backfill-publish-kpi --limit "$(LIMIT)"
 
 # DB-free deployment gate: repeated multimodal canary + one frozen full-PDF
 # official writer parse. The command removes its temporary parse tree and

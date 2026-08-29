@@ -607,6 +607,47 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported observation count"):
             validate_frame_sequence(frames, receipt=forged_unsupported)
 
+        frame_payload = frames[2].model_dump()
+        frame_payload["clock"]["observed_at_utc"] = START + timedelta(seconds=2)
+        wrong_wall = SynchronizedTelemetryFrame.model_validate(frame_payload)
+        with self.assertRaisesRegex(ValueError, "wall and monotonic"):
+            validate_frame_sequence(
+                (frames[0], frames[1], wrong_wall, *frames[3:]),
+                receipt=_receipt(),
+            )
+
+    def test_receipt_cadence_is_derived_from_internal_and_boundary_gaps(self) -> None:
+        frames = _complete_frames()
+        payload = _receipt().model_dump()
+        payload["status"] = "incomplete"
+        payload["finished_at_utc"] = START + timedelta(seconds=10)
+        payload["finished_monotonic_ns"] = 10_000_000_000
+        payload["lane_quality"][0].update(
+            maximum_gap_ms=8250,
+            missed_deadline_count=32,
+        )
+        payload["lane_quality"][1].update(
+            maximum_gap_ms=9000,
+            missed_deadline_count=8,
+        )
+        receipt = SynchronizedTelemetryReceipt.model_validate(payload)
+        validate_frame_sequence(frames, receipt=receipt)
+
+        forged = payload.copy()
+        forged["lane_quality"] = [dict(item) for item in payload["lane_quality"]]
+        forged["lane_quality"][0]["missed_deadline_count"] = 0
+        forged["lane_quality"][1]["missed_deadline_count"] = 0
+        forged["status"] = "complete"
+        self.assertEqual(
+            SynchronizedTelemetryReceipt.model_validate(forged).status,
+            "complete",
+        )
+        with self.assertRaisesRegex(ValueError, "lane quality receipt drifted"):
+            validate_frame_sequence(
+                frames,
+                receipt=SynchronizedTelemetryReceipt.model_validate(forged),
+            )
+
     def test_progress_and_phase_summary_are_content_free_and_covered(self) -> None:
         blocked = BlockedProgressEvent(
             run_id=RUN_ID,

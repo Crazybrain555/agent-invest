@@ -506,5 +506,8 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
   `document_unit.semantic_key` 时执行 NULL-safe 0047 前置校验；offline SQL 生成不会访问数据，
   因而不能作为跨越 0047 的数据迁移或 losslessness 证明。0047 后的 0050 只验证幸存 plural
   状态，不能重建已删除 scalar；发现 replay 不一致时走正常 rebuild/publish，不手工补 key。
+- 0052 的两个 outbox partial index 使用普通 `CREATE INDEX`，不是 concurrent build。开发库可在
+  worker/API 停写的维护窗口升级；任何已有持续写流量的环境必须先测量 outbox 大小并安排明确停写
+  窗口，不能把 Alembic 事务内的索引创建冒充无阻塞 online migration。
 - admin API 需要 `DISCLOSURE_ADMIN_TOKEN`（Bearer）且仅回环可用；token 在 worker.env，
   轮换用 `openssl rand -hex 32` 换值后 `make worker-restart` + 重启 API。

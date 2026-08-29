@@ -99,6 +99,8 @@ class BoundedTwoStageParserPump(Generic[LocalResultT]):
         ] = {}
         local_bytes_in_use = 0
         stopping = False
+        drain_issued: set[int] = set()
+        drain_errors: dict[int, BaseException] = {}
 
         def outcome(
             item: TwoStageParseWork[LocalResultT],
@@ -194,8 +196,12 @@ class BoundedTwoStageParserPump(Generic[LocalResultT]):
                         if future.cancel():
                             remote.pop(future)
                             outcome(item, "cancelled")
-                        else:
-                            item.cancel_and_drain()
+                        elif item.sequence not in drain_issued:
+                            drain_issued.add(item.sequence)
+                            try:
+                                item.cancel_and_drain()
+                            except Exception as exc:  # noqa: BLE001 - visible drain proof
+                                drain_errors[item.sequence] = exc
 
                 futures = {
                     cast(Future[object], future)
@@ -225,11 +231,17 @@ class BoundedTwoStageParserPump(Generic[LocalResultT]):
                             outcome(
                                 item,
                                 "cancelled" if stopping else "remote_failed",
-                                error=exc,
+                                error=drain_errors.get(item.sequence, exc)
+                                if stopping
+                                else exc,
                             )
                         else:
                             if stopping:
-                                outcome(item, "cancelled")
+                                outcome(
+                                    item,
+                                    "cancelled",
+                                    error=drain_errors.get(item.sequence),
+                                )
                             else:
                                 terminal.append((item, receipt))
                     elif completed_future in local:
