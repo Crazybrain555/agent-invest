@@ -732,6 +732,20 @@ def render_worker_progress(event: dict[str, Any]) -> str:
             f"parse={interval['parsed']} build={interval['built']} "
             f"publish={interval['published']} failed={interval['failed']}"
         )
+        durable = interval.get("durable_publish")
+        pressure = interval.get("finalize_pressure")
+        if durable is not None or pressure is not None or interval.get("blocked_reason"):
+            durable = durable or {}
+            pressure = pressure or {}
+            lines.append(
+                "durable pages="
+                f"{durable.get('unique_source_pages', 0)} "
+                f"incomplete={durable.get('page_count_incomplete', 0)} | "
+                f"finalize pending={pressure.get('pending_items', 0)} "
+                f"bytes={pressure.get('estimated_source_bytes', 0)} "
+                f"unknown_bytes={pressure.get('unknown_source_bytes', 0)} | "
+                f"blocked={interval.get('blocked_reason') or 'none'}"
+            )
         admission = interval.get("admission")
         if admission is not None:
             admission_label = f"admission={admission['status']}"

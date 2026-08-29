@@ -58,6 +58,17 @@ class WorkerReport:
     parse_heavy_dispatched: int = 0
     parse_huge_dispatched: int = 0
     parse_unknown_page_count: int = 0
+    # Content-free scheduler state.  A blocked reason explains why otherwise
+    # eligible parse work was not admitted; it is never inferred from GPU
+    # utilization or page-attempt counters.
+    blocked_reason: str | None = None
+    finalize_pending_items: int = 0
+    finalize_estimated_source_bytes: int = 0
+    finalize_unknown_source_bytes: int = 0
+    # Numerator events are emitted only after a non-idempotent whole-document
+    # PublishRun commit.  Missing page evidence remains explicitly incomplete.
+    durable_published_source_pages: int = 0
+    durable_published_page_count_incomplete: int = 0
     source_outage_break: bool = False
     deferred_backfill: int = 0
     admission_status: Literal["available", "unavailable"] | None = None
@@ -84,6 +95,19 @@ class WorkerReport:
             "parse_heavy_dispatched": self.parse_heavy_dispatched,
             "parse_huge_dispatched": self.parse_huge_dispatched,
             "parse_unknown_page_count": self.parse_unknown_page_count,
+            "blocked_reason": self.blocked_reason,
+            "finalize_pressure": {
+                "pending_items": self.finalize_pending_items,
+                "estimated_source_bytes": self.finalize_estimated_source_bytes,
+                "unknown_source_bytes": self.finalize_unknown_source_bytes,
+            },
+            "durable_publish": {
+                "unique_source_pages": self.durable_published_source_pages,
+                "page_count_incomplete": (
+                    self.durable_published_page_count_incomplete
+                ),
+                "counting_boundary": "non_idempotent_whole_document_publish_commit",
+            },
             "source_outage_break": self.source_outage_break,
             "deferred_backfill": self.deferred_backfill,
             "admission": (

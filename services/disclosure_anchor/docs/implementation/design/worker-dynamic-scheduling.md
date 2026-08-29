@@ -207,7 +207,8 @@ worker 正常稳态 active upper bound: 1 × 7 = 7 < 128
 
 16 是本地候选/线程配置上限，不再等于 API-facing 并发。实际 client outstanding 取 client window
 与 attested task slots 的较小值，当前为 1；API 未提供 cancel，durable backlog 因此只留在
-PostgreSQL，不预先进入 process-local task registry。huge 与未知页数任务独占窗口。
+PostgreSQL，不预先进入 process-local task registry。huge 与未知页数任务使用受限名义份额，
+但不再排空或独占整个窗口；空闲槽始终可由其他 lane 借用。
 该式只证明**单 persistent API identity 的配置上界**：
 
 - `max_num_seqs=128` 仍须在发布时从远端启动配置或等价运营证据复核；当前 metrics
@@ -246,8 +247,10 @@ semaphore。
   `source_access.result_snapshot.byte_count`，旧 `oversized` 键不再影响准入；
 - lane 均有任务时，regular/heavy/huge 保留名义份额；
 - 任一 lane 为空，其他 lane 立即借用其空槽；
-- 同一 lane 内保留 DB 候选顺序；
-- unknown 进入 huge 并独占，避免未知成本冒充普通长公告；
+- 同一 lane 内保留 DB 候选顺序；跨 lane 在名义份额约束内选择最老 head，形成
+  work-conserving quota borrowing + FIFO aging，任何持续有任务的 lane 都不会被新短任务饿死；
+- unknown 进入 huge 的保守成本 lane，由 item/byte durable 高水位限制总下游压力；它不再
+  触发全局 drain，避免一个未知文档让其他可运行任务等待；
 - 不按 document id、发行人、标题或失败样本特判。
 
 若 A/B 观测到候选窗口长期 `regular=0`，再把页数/成本持久化并改为 per-lane keyset
@@ -281,7 +284,7 @@ resident 仍在 acquisition/report deadline 到期时停止 admission 并排空�
   本地候选/线程池（配置上限 16；当前 API-facing 提交窗口 1）
         │ parse 成功即释放 GPU 文档槽
         ▼
-  同一 finalize coordinator / bounded pool
+  独立 finalize pump / bounded pool
         ├─ 新 run: build → publish
         └─ 周期 seed: pending_build / pending_publish crash leftovers
 
@@ -305,8 +308,10 @@ maintenance thread                 report writer thread
 - 同一 startup recovery 在首次 parse admission 前强制完成一次 prune-capable search
   projection；失败则保持 finalize/projection-only backoff。这样即使上一个进程在维护线程停止
   后才完成 deactivation，或提交后立刻崩溃，易失的进程内 prune 信号也不会跨重启丢失；
-- parse 成功即释放 lane/GPU 槽；`parse_futures + finalize_futures` 最多
-  `2 × parse_concurrency`，避免把瓶颈搬成无界 finalize 内存队列；
+- parse 成功并提交 processing run 后立即释放 lane/GPU 槽；finalize pool 只受自身并发限制，
+  当前 parse 完成项超过空槽时留在 PostgreSQL `pending_build_v1`，不进入无界 executor queue；
+  新 parse admission 由 durable pending build/publish 的 item 数和 archived-source byte 估算双
+  水位控制。未知 byte 保持可见并由 item 水位兜底，不制造 0-byte 假估算；
 - PostgreSQL QueuePool 不使用 SQLAlchemy 的固定默认 `5+10`。每个 active parse/finalize 在完整
   document producer lease 期间持有一条 session connection，并可能短暂再取一条 transaction
   connection；因此 worker 从当前 `parse_concurrency + finalize_concurrency` 动态派生
@@ -314,7 +319,7 @@ maintenance thread                 report writer thread
   control 容量覆盖 maintenance 持有 corpus-writer lease 时的嵌套 registration/failure UoW、
   resident coordinator 与 report snapshot 的合法并发；默认 16+2 即 `22+18=40`，overflow 在
   突发结束后释放；改变并发或机器配置时不需要同步修改第二个常量；
-- build/publish 只有**同一个 coordinator**准入：正常 run 直接进入 finalize pool；
+- build/publish 只有**同一个 finalize pump**准入：正常 run 优先进入空闲 finalize 槽；
   周期报告安全点从 DB 有界 seed crash/瞬时失败 leftovers，并按 run id 排除 active future；
   队列尾部则在没有 parse pool 活跃时做一轮有界补漏。不会并行启动第二个 BuildUnits consumer；
 - 成功/终止失败 ID 只保留一个候选窗口大小的进程内防重复历史；可重试失败先让一个固定

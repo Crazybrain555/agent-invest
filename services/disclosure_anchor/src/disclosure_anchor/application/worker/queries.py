@@ -813,6 +813,79 @@ def pending_publish_count(conn: Connection) -> int:
     )
 
 
+def pending_finalize_pressure(
+    conn: Connection,
+    *,
+    max_retries: int,
+) -> dict[str, int]:
+    """Return durable build/publish work and its archived-source byte envelope.
+
+    The resident worker uses this read-only snapshot only for downstream
+    backpressure.  PostgreSQL views remain the durable queues; no process-local
+    item count is treated as pending work.  ``unknown_source_bytes`` stays
+    visible rather than manufacturing a zero-byte estimate.
+    """
+
+    row = conn.execute(
+        text(
+            f"""
+            WITH pending AS (
+                SELECT q.processing_run_id, q.document_id, 'build'::text AS stage
+                  FROM {OPS_SCHEMA}.pending_build_v1 q
+                  JOIN {CORE_SCHEMA}.processing_run r
+                    ON r.processing_run_id = q.processing_run_id
+                 WHERE ({_BUILD_RETRY_ELIGIBLE_SQL})
+                   AND NOT ({_TERMINAL_PUBLISH_QUARANTINE_SQL})
+                UNION ALL
+                SELECT latest.processing_run_id,
+                       latest.document_id,
+                       'publish'::text AS stage
+                  FROM (
+                    SELECT DISTINCT ON (q.document_id)
+                           q.processing_run_id, q.document_id
+                      FROM {OPS_SCHEMA}.pending_publish_v1 q
+                      JOIN {CORE_SCHEMA}.processing_run r
+                        ON r.processing_run_id = q.processing_run_id
+                     WHERE EXISTS (
+                           SELECT 1 FROM {CORE_SCHEMA}.document_unit u
+                            WHERE u.processing_run_id = q.processing_run_id)
+                     ORDER BY q.document_id,
+                              r.started_at DESC,
+                              q.processing_run_id DESC
+                  ) latest
+            ), measured AS (
+                SELECT p.stage,
+                       CASE
+                         WHEN jsonb_typeof(sa.result_snapshot->'byte_count') = 'number'
+                         THEN (sa.result_snapshot->>'byte_count')::numeric::bigint
+                         ELSE NULL
+                       END AS source_bytes
+                  FROM pending p
+                  JOIN {CORE_SCHEMA}.document d ON d.document_id = p.document_id
+                  LEFT JOIN {CORE_SCHEMA}.source_access sa
+                    ON sa.source_access_id = d.source_access_id
+            )
+            SELECT count(*) FILTER (WHERE stage = 'build')::int AS pending_build,
+                   count(*) FILTER (WHERE stage = 'publish')::int AS pending_publish,
+                   COALESCE(sum(source_bytes), 0)::bigint AS estimated_source_bytes,
+                   count(*) FILTER (WHERE source_bytes IS NULL)::int
+                       AS unknown_source_bytes
+              FROM measured
+            """
+        ),
+        {
+            "max_retries": max_retries,
+            "max_retries_ceiling": max_retries * RETRY_CEILING_MULTIPLIER,
+        },
+    ).mappings().one()
+    return {
+        "pending_build": int(row["pending_build"] or 0),
+        "pending_publish": int(row["pending_publish"] or 0),
+        "estimated_source_bytes": int(row["estimated_source_bytes"] or 0),
+        "unknown_source_bytes": int(row["unknown_source_bytes"] or 0),
+    }
+
+
 def retrying_build_count(conn: Connection, *, max_retries: int) -> int:
     """Failed Unit builds that still have a legal automatic retry."""
 

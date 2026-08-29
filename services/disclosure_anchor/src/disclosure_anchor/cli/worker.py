@@ -1171,6 +1171,14 @@ def _deps(
             parse_huge_saturated_share=(settings.worker_parse_huge_saturated_share),
             parse_candidate_window=settings.worker_parse_candidate_window,
             finalize_concurrency=settings.worker_finalize_concurrency,
+            finalize_high_water_items=settings.worker_finalize_high_water_items,
+            finalize_low_water_items=settings.worker_finalize_low_water_items,
+            finalize_high_water_source_bytes=(
+                settings.worker_finalize_high_water_source_bytes
+            ),
+            finalize_low_water_source_bytes=(
+                settings.worker_finalize_low_water_source_bytes
+            ),
             parse_timeout_per_page_seconds=(
                 settings.disclosure_parse_timeout_per_page_seconds
             ),

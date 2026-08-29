@@ -536,6 +536,16 @@ class WorkerProgressTests(unittest.TestCase):
             "built": 0,
             "published": 0,
             "failed": 0,
+            "blocked_reason": "downstream_finalize_high_water",
+            "finalize_pressure": {
+                "pending_items": 64,
+                "estimated_source_bytes": 4096,
+                "unknown_source_bytes": 2,
+            },
+            "durable_publish": {
+                "unique_source_pages": 737,
+                "page_count_incomplete": 1,
+            },
             "admission": {
                 "status": "unavailable",
                 "reason": "MinerU API unreachable",
@@ -549,6 +559,11 @@ class WorkerProgressTests(unittest.TestCase):
             "admission=unavailable consecutive_failures=2 "
             "next_probe=2026-08-24T12:04:00+00:00 "
             "reason=MinerU API unreachable",
+            unavailable,
+        )
+        self.assertIn(
+            "durable pages=737 incomplete=1 | finalize pending=64 bytes=4096 "
+            "unknown_bytes=2 | blocked=downstream_finalize_high_water",
             unavailable,
         )
 

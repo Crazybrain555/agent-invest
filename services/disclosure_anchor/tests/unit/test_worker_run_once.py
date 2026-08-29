@@ -854,7 +854,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         self.assertEqual(result, "halt")
         self.assertTrue(first_failure_reported.is_set())
-        self.assertLess(parse_cls.return_value.execute.call_count, 20)
+        # Finalize no longer consumes parse admission slots. A fast remote
+        # lane may commit this bounded candidate window before the second
+        # downstream failure is observed; durable pressure is the production
+        # backlog bound, not the number of finalize Futures.
+        self.assertEqual(parse_cls.return_value.execute.call_count, 20)
         self.assertGreaterEqual(build_cls.return_value.execute.call_count, 2)
         self.assertGreaterEqual(
             sum(
@@ -982,14 +986,18 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self.assertEqual(report.published, 5)
         self.assertEqual(report.failed, 0)
 
-    def test_huge_document_is_exclusive_against_regular_work(self) -> None:
+    def test_huge_document_does_not_drain_regular_work(self) -> None:
         import threading
 
         deps = _deps()
         object.__setattr__(
             deps,
             "config",
-            replace(deps.config, parse_concurrency=3),
+            replace(
+                deps.config,
+                parse_concurrency=3,
+                mineru_client_outstanding_window=3,
+            ),
         )
         object.__setattr__(
             deps,
@@ -997,13 +1005,13 @@ class RunOnceSchedulingTests(unittest.TestCase):
             lambda path: {"huge.pdf": 600, "regular.pdf": 20}[path.name],
         )
         deps.path_builder.data_path.side_effect = lambda relpath: relpath
-        huge_finished = threading.Event()
+        both_started = threading.Barrier(2)
 
         def execute(command):  # noqa: ANN001, ANN202
             if command.document_id == "doc_huge":
-                huge_finished.set()
-            else:
-                self.assertTrue(huge_finished.is_set())
+                both_started.wait(timeout=2)
+            elif command.document_id == "doc_regular":
+                both_started.wait(timeout=2)
             return mock.MagicMock(
                 status="succeeded",
                 processing_run_id=f"run_{command.document_id}",
@@ -1044,7 +1052,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         self.assertEqual(report.parse_huge_dispatched, 1)
         self.assertEqual(report.parse_regular_dispatched, 1)
-        self.assertEqual(report.parse_peak_inflight, 1)
+        self.assertEqual(report.parse_peak_inflight, 2)
         self.assertEqual(report.parsed, 2)
         self.assertEqual(report.failed, 0)
 
@@ -1086,6 +1094,111 @@ class RunOnceSchedulingTests(unittest.TestCase):
             ),
             {regular: 1, heavy: 1, huge: 1},
         )
+
+    def test_finalize_pressure_gate_uses_hysteretic_item_and_byte_bounds(self) -> None:
+        gate = worker_module._FinalizePressureGate(
+            replace(
+                _deps().config,
+                finalize_low_water_items=2,
+                finalize_high_water_items=4,
+                finalize_low_water_source_bytes=20,
+                finalize_high_water_source_bytes=40,
+            )
+        )
+        pressure = worker_module._FinalizePressure
+        self.assertFalse(gate.observe(pressure(1, 0, 10, 1)))
+        self.assertTrue(gate.observe(pressure(4, 0, 10, 0)))
+        self.assertTrue(gate.observe(pressure(2, 0, 30, 0)))
+        self.assertFalse(gate.observe(pressure(2, 0, 20, 1)))
+        self.assertTrue(gate.observe(pressure(0, 0, 40, 0)))
+
+    def test_finalize_carries_non_idempotent_durable_page_kpi(self) -> None:
+        deps = _deps()
+        with (
+            mock.patch.object(worker_module, "BuildUnits") as build_cls,
+            mock.patch.object(
+                worker_module,
+                "_publish_one_document",
+                return_value=worker_module._DocOutcome(
+                    published=True,
+                    durable_published_source_pages=737,
+                ),
+            ) as publish,
+        ):
+            build_cls.return_value.execute.return_value = mock.MagicMock(
+                status="succeeded", build_stats=None
+            )
+            outcome = worker_module._finalize_one_document(
+                deps,
+                document_id="doc_huge",
+                processing_run_id="run_huge",
+                source_page_count=737,
+            )
+
+        self.assertTrue(outcome.published)
+        self.assertEqual(outcome.durable_published_source_pages, 737)
+        self.assertFalse(outcome.durable_published_page_count_incomplete)
+        self.assertEqual(publish.call_args.kwargs["source_page_count"], 737)
+
+    def test_publish_kpi_uses_known_page_count_without_artifact_reread(self) -> None:
+        deps = _deps()
+        with (
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+            mock.patch.object(
+                worker_module, "_published_source_page_count"
+            ) as recover_count,
+        ):
+            publish_cls.return_value.execute.return_value = mock.MagicMock(
+                status="published",
+                superseded_run_id=None,
+                idempotent=False,
+            )
+            outcome = worker_module._publish_one_document(
+                deps,
+                document_id="doc_1",
+                processing_run_id="run_1",
+                source_page_count=88,
+            )
+
+        self.assertEqual(outcome.durable_published_source_pages, 88)
+        recover_count.assert_not_called()
+
+    def test_publish_recovery_reads_page_evidence_and_skips_idempotent_recount(
+        self,
+    ) -> None:
+        deps = _deps()
+        with (
+            mock.patch.object(worker_module, "PublishRun") as publish_cls,
+            mock.patch.object(
+                worker_module,
+                "_published_source_page_count",
+                return_value=42,
+            ) as recover_count,
+        ):
+            publish_cls.return_value.execute.return_value = mock.MagicMock(
+                status="published",
+                superseded_run_id=None,
+                idempotent=False,
+            )
+            recovery = worker_module._publish_one_document(
+                deps,
+                document_id="doc_1",
+                processing_run_id="run_1",
+            )
+            publish_cls.return_value.execute.return_value = mock.MagicMock(
+                status="published",
+                superseded_run_id=None,
+                idempotent=True,
+            )
+            repeated = worker_module._publish_one_document(
+                deps,
+                document_id="doc_1",
+                processing_run_id="run_1",
+            )
+
+        self.assertEqual(recovery.durable_published_source_pages, 42)
+        self.assertEqual(repeated.durable_published_source_pages, 0)
+        self.assertEqual(recover_count.call_count, 1)
 
     def test_rolling_refill_releases_gpu_slots_before_finalize(self) -> None:
         import threading
@@ -1348,7 +1461,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
 
         real_wait = worker_module.wait
         wait_calls = 0
-
         def controlled_wait(*args: object, **kwargs: object):  # noqa: ANN202
             nonlocal wait_calls
             wait_calls += 1
@@ -1576,6 +1688,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
         release_raced_parse = threading.Event()
         raced_parse_returned = threading.Event()
         wait_calls = 0
+        parsed_runs: set[str] = set()
 
         def pending_parse(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
             nonlocal parse_reads
@@ -1604,6 +1717,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
                     ("doc_old", "run_old"),
                 )
                 if run_id not in done
+                and (run_id == "run_old" or run_id in parsed_runs)
             ]
 
         def parse_one(
@@ -1612,9 +1726,11 @@ class RunOnceSchedulingTests(unittest.TestCase):
             if item.document_id == "doc_race":
                 self.assertTrue(release_raced_parse.wait(timeout=1))
                 raced_parse_returned.set()
+            run_id = f"run_{item.document_id.removeprefix('doc_')}"
+            parsed_runs.add(run_id)
             return worker_module._DocOutcome(
                 parsed=True,
-                processing_run_id=f"run_{item.document_id.removeprefix('doc_')}",
+                processing_run_id=run_id,
             )
 
         def finalize_one(
@@ -1622,8 +1738,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
             *,
             document_id: str,
             processing_run_id: str,
+            source_page_count: int | None = None,
         ) -> worker_module._DocOutcome:
-            del document_id
+            del document_id, source_page_count
             with finalized_lock:
                 finalized.append(processing_run_id)
             return worker_module._DocOutcome(built=True, published=True)

@@ -696,6 +696,36 @@ class Settings(BaseSettings):
             "WORKER_FINALIZE_CONCURRENCY", "worker_finalize_concurrency"
         ),
     )
+    worker_finalize_high_water_items: int = Field(
+        default=64,
+        ge=2,
+        validation_alias=AliasChoices(
+            "WORKER_FINALIZE_HIGH_WATER_ITEMS", "worker_finalize_high_water_items"
+        ),
+    )
+    worker_finalize_low_water_items: int = Field(
+        default=32,
+        ge=0,
+        validation_alias=AliasChoices(
+            "WORKER_FINALIZE_LOW_WATER_ITEMS", "worker_finalize_low_water_items"
+        ),
+    )
+    worker_finalize_high_water_source_bytes: int = Field(
+        default=8 * 1024 * 1024 * 1024,
+        ge=1,
+        validation_alias=AliasChoices(
+            "WORKER_FINALIZE_HIGH_WATER_SOURCE_BYTES",
+            "worker_finalize_high_water_source_bytes",
+        ),
+    )
+    worker_finalize_low_water_source_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        ge=0,
+        validation_alias=AliasChoices(
+            "WORKER_FINALIZE_LOW_WATER_SOURCE_BYTES",
+            "worker_finalize_low_water_source_bytes",
+        ),
+    )
     worker_batch_build: int = Field(
         default=10,
         ge=0,

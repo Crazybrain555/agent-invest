@@ -8,6 +8,7 @@ round continues.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
@@ -30,6 +31,9 @@ from disclosure_anchor.application.dto.worker_report import (
     WorkerFailure,
     WorkerLimits,
     WorkerReport,
+)
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    provider_document_envelope_from_bytes,
 )
 from disclosure_anchor.application.ports.disclosure_source import (
     DisclosureSourcePort,
@@ -231,6 +235,12 @@ class WorkerConfig:
     parse_huge_saturated_share: int = 1
     parse_candidate_window: int = 200
     finalize_concurrency: int = 2
+    # Durable downstream watermarks. These gate only new parse admission;
+    # finalization continues to drain PostgreSQL while the gate is closed.
+    finalize_high_water_items: int = 64
+    finalize_low_water_items: int = 32
+    finalize_high_water_source_bytes: int = 8 * 1024 * 1024 * 1024
+    finalize_low_water_source_bytes: int = 4 * 1024 * 1024 * 1024
     # Page-aware expected-duration envelope. It drives one soft warning only;
     # it must never terminate a healthy whole-document parse.
     parse_timeout_per_page_seconds: int = 12
@@ -874,6 +884,9 @@ class _DocOutcome:
     built: bool = False
     published: bool = False
     superseded_run: bool = False
+    published_idempotent: bool = False
+    durable_published_source_pages: int = 0
+    durable_published_page_count_incomplete: bool = False
     build_stats: dict[str, Any] | None = None
     failure: WorkerFailure | None = None
 
@@ -924,6 +937,50 @@ class _ResidentParseHooks:
     admission_backoff_max_seconds: float = 1800.0
     admission_ready: Callable[[], bool] = lambda: True
     admission_retry_remaining: Callable[[], float] = lambda: 0.0
+    finalize_pressure: Callable[[], dict[str, int]] | None = None
+
+
+@dataclass(frozen=True)
+class _FinalizePressure:
+    pending_build: int
+    pending_publish: int
+    estimated_source_bytes: int
+    unknown_source_bytes: int
+
+    @property
+    def pending_items(self) -> int:
+        return self.pending_build + self.pending_publish
+
+
+class _FinalizePressureGate:
+    """Hysteretic admission gate over the durable downstream queue."""
+
+    def __init__(self, config: WorkerConfig) -> None:
+        if not 0 <= config.finalize_low_water_items < config.finalize_high_water_items:
+            raise ValueError("finalize item watermarks must satisfy 0 <= low < high")
+        if not (
+            0
+            <= config.finalize_low_water_source_bytes
+            < config.finalize_high_water_source_bytes
+        ):
+            raise ValueError("finalize byte watermarks must satisfy 0 <= low < high")
+        self._config = config
+        self.blocked = False
+
+    def observe(self, pressure: _FinalizePressure) -> bool:
+        if self.blocked:
+            self.blocked = not (
+                pressure.pending_items <= self._config.finalize_low_water_items
+                and pressure.estimated_source_bytes
+                <= self._config.finalize_low_water_source_bytes
+            )
+        else:
+            self.blocked = (
+                pressure.pending_items >= self._config.finalize_high_water_items
+                or pressure.estimated_source_bytes
+                >= self._config.finalize_high_water_source_bytes
+            )
+        return self.blocked
 
 
 def _failure_from_exception(
@@ -1232,6 +1289,7 @@ def _finalize_one_document(
     *,
     document_id: str,
     processing_run_id: str,
+    source_page_count: int | None = None,
 ) -> _DocOutcome:
     """Build and publish one parsed run without occupying a GPU slot."""
 
@@ -1283,9 +1341,17 @@ def _finalize_one_document(
         deps,
         document_id=document_id,
         processing_run_id=processing_run_id,
+        source_page_count=source_page_count,
     )
     outcome.published = publish_outcome.published
     outcome.superseded_run = publish_outcome.superseded_run
+    outcome.published_idempotent = publish_outcome.published_idempotent
+    outcome.durable_published_source_pages = (
+        publish_outcome.durable_published_source_pages
+    )
+    outcome.durable_published_page_count_incomplete = (
+        publish_outcome.durable_published_page_count_incomplete
+    )
     outcome.failure = publish_outcome.failure
     return outcome
 
@@ -1295,6 +1361,7 @@ def _publish_one_document(
     *,
     document_id: str,
     processing_run_id: str,
+    source_page_count: int | None = None,
 ) -> _DocOutcome:
     """Publish an already-built run for resident crash/failure recovery."""
 
@@ -1320,6 +1387,18 @@ def _publish_one_document(
             return outcome
         outcome.published = True
         outcome.superseded_run = publish_result.superseded_run_id is not None
+        outcome.published_idempotent = publish_result.idempotent is True
+        if not outcome.published_idempotent:
+            source_pages = source_page_count
+            if source_pages is None:
+                source_pages = _published_source_page_count(
+                    deps,
+                    processing_run_id=processing_run_id,
+                )
+            if source_pages is None:
+                outcome.durable_published_page_count_incomplete = True
+            else:
+                outcome.durable_published_source_pages = source_pages
     except Exception as exc:
         outcome.failure = _failure_from_exception(
             stage="publish",
@@ -1327,6 +1406,49 @@ def _publish_one_document(
             exc=exc,
         )
     return outcome
+
+
+def _published_source_page_count(
+    deps: WorkerDeps,
+    *,
+    processing_run_id: str,
+) -> int | None:
+    """Read the canonical parse envelope after publication for KPI evidence.
+
+    The DB read is completed before artifact IO, so this metric helper never
+    keeps a transaction open across the filesystem. Publication has already
+    committed; unavailable evidence marks the interval incomplete rather than
+    rewriting a successful publish as failure.
+    """
+
+    try:
+        with deps.uow_factory() as uow:
+            run = uow.processing_runs.get(processing_run_id)
+            if run is None:
+                return None
+            relpath = run.provider_document_relpath
+            expected_hash = run.artifact_hash
+            document_id = run.document_id
+            artifact_owner_id = run.artifact_owner_processing_run_id
+        if not isinstance(relpath, str) or not isinstance(expected_hash, str):
+            return None
+        record = deps.provider_source.read_provider_document_record(Path(relpath))
+        actual_hash = "sha256:" + hashlib.sha256(record).hexdigest()
+        if actual_hash != expected_hash:
+            return None
+        envelope = provider_document_envelope_from_bytes(record)
+        if (
+            envelope.document_id != document_id
+            or envelope.artifact_owner_processing_run_id != artifact_owner_id
+        ):
+            return None
+        return envelope.source_pdf_page_count
+    except Exception:
+        LOGGER.exception(
+            "durable publish page evidence unavailable for run=%s",
+            processing_run_id,
+        )
+        return None
 
 
 def _fold_outcome(report: WorkerReport, outcome: _DocOutcome) -> None:
@@ -1340,6 +1462,11 @@ def _fold_outcome(report: WorkerReport, outcome: _DocOutcome) -> None:
         report.published += 1
         if outcome.superseded_run:
             report.runs_deactivated += 1
+        report.durable_published_source_pages += (
+            outcome.durable_published_source_pages
+        )
+        if outcome.durable_published_page_count_incomplete:
+            report.durable_published_page_count_incomplete += 1
     if outcome.failure is not None:
         report.failed += 1
         report.failures.append(outcome.failure)
@@ -1365,6 +1492,12 @@ def _report_has_observations(report: WorkerReport) -> bool:
             report.parse_heavy_dispatched,
             report.parse_huge_dispatched,
             report.parse_unknown_page_count,
+            report.blocked_reason,
+            report.finalize_pending_items,
+            report.finalize_estimated_source_bytes,
+            report.finalize_unknown_source_bytes,
+            report.durable_published_source_pages,
+            report.durable_published_page_count_incomplete,
             report.admission_status,
             report.failures,
             report.build_stats,
@@ -1596,6 +1729,13 @@ def run_resident_parse(
             or publish_failures_indicate_outage(recovery_report.failures)
         )
 
+    def finalize_pressure() -> dict[str, int]:
+        with deps.engine.connect() as conn:
+            return queries.pending_finalize_pressure(
+                conn,
+                max_retries=deps.config.max_build_retries,
+            )
+
     while not should_stop():
         # Clear before the queue read. A download committed after this point
         # sets the event and either appears in the read or wakes the empty
@@ -1628,6 +1768,7 @@ def run_resident_parse(
                 admission_backoff_max_seconds=outage_backoff_max_seconds,
                 admission_ready=admission.ready,
                 admission_retry_remaining=admission.retry_remaining,
+                finalize_pressure=finalize_pressure,
             ),
         )
         if should_stop():
@@ -1742,6 +1883,7 @@ def _parse_one_batch(
         scan_start = candidate_cursor
         wrapped = scan_start is None
         while len(selected) < candidate_limit:
+            page_after = candidate_cursor
             with deps.engine.connect() as conn:
                 page = queries.pending_parse(
                     conn,
@@ -1769,6 +1911,10 @@ def _parse_one_batch(
                     break
             if last_examined_id is not None:
                 candidate_cursor = last_examined_id
+            if last_examined_id == page_after:
+                # A non-advancing keyset source is an explicit empty edge,
+                # not permission to spin while remote/finalize work runs.
+                break
             if (
                 wrapped
                 and scan_start is not None
@@ -1867,7 +2013,6 @@ def _parse_one_batch(
             queued[_parse_lane(item, deps.config)].append(item)
 
     enqueue(work_items)
-    finalize_backlog_limit = max(2, concurrency * 2)
     halt_refill = False
     report.parse_concurrency_limit = concurrency
     report_started_monotonic = time.monotonic()
@@ -1888,6 +2033,17 @@ def _parse_one_batch(
     ):
         parse_futures: dict[Future[_DocOutcome], _InFlightParse] = {}
         finalize_futures: dict[Future[_DocOutcome], _InFlightFinalize] = {}
+        ready_finalize: deque[tuple[_InFlightFinalize, int | None]] = deque()
+        recent_finalize_ids: deque[str] = deque()
+        recent_finalize_set: set[str] = set()
+
+        def remember_finalize(run_id: str) -> None:
+            if run_id in recent_finalize_set:
+                return
+            recent_finalize_ids.append(run_id)
+            recent_finalize_set.add(run_id)
+            while len(recent_finalize_ids) > candidate_limit:
+                recent_finalize_set.discard(recent_finalize_ids.popleft())
         expected_duration_warned: set[Future[_DocOutcome]] = set()
         runaway_duration_warned: set[Future[_DocOutcome]] = set()
         lane_inflight = {lane: 0 for lane in _ParseLane}
@@ -1895,12 +2051,17 @@ def _parse_one_batch(
         # Two nearby unknown downstream failures may straddle a report
         # rotation and still establish shared-infrastructure evidence.
         control_failures: deque[tuple[float, WorkerFailure]] = deque()
+        pressure_gate = _FinalizePressureGate(deps.config)
+        downstream_deferred = False
+        pressure_snapshot: _FinalizePressure | None = None
 
         def halt_admission() -> None:
             nonlocal halt_refill, readiness_deferred, admission_deferred
+            nonlocal downstream_deferred
             halt_refill = True
             readiness_deferred = False
             admission_deferred = False
+            downstream_deferred = False
 
         def record_direct_admission_unavailable(
             exc: WorkerAdmissionUnavailableError,
@@ -1971,15 +2132,26 @@ def _parse_one_batch(
 
             if resident_hooks is None or halt_refill or should_stop():
                 return
-            available = max(
-                0,
-                finalize_backlog_limit - len(parse_futures) - len(finalize_futures),
-            )
+            available = max(0, deps.config.finalize_concurrency - len(finalize_futures))
+            if available <= 0:
+                return
+            while available > 0 and ready_finalize:
+                item, source_page_count = ready_finalize.popleft()
+                finalize_futures[
+                    finalize_pool.submit(
+                        _finalize_one_document,
+                        deps,
+                        document_id=item.document_id,
+                        processing_run_id=item.processing_run_id,
+                        source_page_count=source_page_count,
+                    )
+                ] = item
+                available -= 1
             if available <= 0:
                 return
             active_run_ids = {
                 item.processing_run_id for item in finalize_futures.values()
-            }
+            } | {item.processing_run_id for item, _ in ready_finalize} | recent_finalize_set
             # A parse thread commits its succeeded run before the coordinator
             # folds the completed Future and submits normal finalization.
             # During that short interval pending_build can already see the
@@ -1988,7 +2160,9 @@ def _parse_one_batch(
             # registered in either pool.
             active_document_ids = {
                 admitted.item.document_id for admitted in parse_futures.values()
-            } | {item.document_id for item in finalize_futures.values()}
+            } | {item.document_id for item in finalize_futures.values()} | {
+                item.document_id for item, _ in ready_finalize
+            }
             try:
                 build_limit = min(available, resident_hooks.build_recovery_limit)
                 with deps.engine.connect() as conn:
@@ -2020,6 +2194,7 @@ def _parse_one_batch(
                         processing_run_id=run_id,
                     )
                     active_run_ids.add(run_id)
+                    remember_finalize(run_id)
                     active_document_ids.add(document_id)
                     available -= 1
                     build_limit -= 1
@@ -2053,6 +2228,7 @@ def _parse_one_batch(
                         processing_run_id=run_id,
                     )
                     active_run_ids.add(run_id)
+                    remember_finalize(run_id)
                     active_document_ids.add(document_id)
                     available -= 1
                     publish_limit -= 1
@@ -2068,7 +2244,7 @@ def _parse_one_batch(
                 halt_admission()
 
         def submit_one() -> bool:
-            nonlocal dispatched, halt_refill
+            nonlocal dispatched, halt_refill, downstream_deferred
             if should_stop():
                 return False
             # Direct/once mode has a count bound. Resident mode is
@@ -2084,20 +2260,6 @@ def _parse_one_batch(
                 new_items = dequeue()
                 enqueue(new_items)
                 ready = tuple(lane for lane in allowed_lanes if queued[lane])
-            if lane_inflight[_ParseLane.HUGE] > 0:
-                return False
-            if ready:
-                oldest_lane = min(
-                    ready,
-                    key=lambda candidate: input_order[
-                        queued[candidate][0].document_id
-                    ],
-                )
-                # Huge and unknown PDFs are exclusive. If one is next in FIFO
-                # order, drain already admitted regular/heavy work rather than
-                # continually bypassing it with newer cheap documents.
-                if oldest_lane == _ParseLane.HUGE and parse_futures:
-                    return False
             occupied_elsewhere = sum(
                 lane_inflight[lane] for lane in _ParseLane if lane not in ready
             )
@@ -2115,8 +2277,28 @@ def _parse_one_batch(
                 eligible,
                 key=lambda candidate: input_order[queued[candidate][0].document_id],
             )
-            if lane == _ParseLane.HUGE and parse_futures:
-                return False
+            item = queued[lane][0]
+            if pressure_snapshot is not None:
+                projected_items = (
+                    pressure_snapshot.pending_items + len(parse_futures) + 1
+                )
+                projected_bytes = (
+                    pressure_snapshot.estimated_source_bytes
+                    + sum(
+                        admitted.item.raw_byte_count or 0
+                        for admitted in parse_futures.values()
+                    )
+                    + (item.raw_byte_count or 0)
+                )
+                if (
+                    projected_items > deps.config.finalize_high_water_items
+                    or projected_bytes
+                    > deps.config.finalize_high_water_source_bytes
+                ):
+                    downstream_deferred = True
+                    pressure_gate.blocked = True
+                    report.blocked_reason = "downstream_finalize_high_water"
+                    return False
             item = queued[lane].popleft()
             input_order.pop(item.document_id, None)
             expected_seconds = _parse_expected_seconds(deps, item)
@@ -2147,7 +2329,8 @@ def _parse_one_batch(
             return True
 
         def refill() -> None:
-            nonlocal readiness_deferred, admission_deferred
+            nonlocal readiness_deferred, admission_deferred, downstream_deferred
+            nonlocal pressure_snapshot
             if (
                 halt_refill
                 or should_stop()
@@ -2160,6 +2343,25 @@ def _parse_one_batch(
                 readiness_deferred = False
                 admission_deferred = False
                 return
+            seed_finalize_recovery()
+            if resident_hooks is not None and resident_hooks.finalize_pressure:
+                snapshot = resident_hooks.finalize_pressure()
+                pressure = _FinalizePressure(
+                    pending_build=int(snapshot["pending_build"]),
+                    pending_publish=int(snapshot["pending_publish"]),
+                    estimated_source_bytes=int(snapshot["estimated_source_bytes"]),
+                    unknown_source_bytes=int(snapshot["unknown_source_bytes"]),
+                )
+                pressure_snapshot = pressure
+                report.finalize_pending_items = pressure.pending_items
+                report.finalize_estimated_source_bytes = pressure.estimated_source_bytes
+                report.finalize_unknown_source_bytes = pressure.unknown_source_bytes
+                downstream_deferred = pressure_gate.observe(pressure)
+                report.blocked_reason = (
+                    "downstream_finalize_high_water" if downstream_deferred else None
+                )
+                if downstream_deferred:
+                    return
             if resident_hooks is not None:
                 if not resident_hooks.admission_ready():
                     admission_deferred = True
@@ -2191,7 +2393,6 @@ def _parse_one_batch(
             while (
                 not halt_refill
                 and len(parse_futures) < concurrency
-                and len(parse_futures) + len(finalize_futures) < finalize_backlog_limit
                 and submit_one()
             ):
                 pass
@@ -2202,9 +2403,10 @@ def _parse_one_batch(
             or finalize_futures
             or readiness_deferred
             or admission_deferred
+            or downstream_deferred
         ):
             if (
-                (readiness_deferred or admission_deferred)
+                (readiness_deferred or admission_deferred or downstream_deferred)
                 and not parse_futures
                 and not finalize_futures
             ):
@@ -2224,6 +2426,8 @@ def _parse_one_batch(
                     remaining_candidates.append(
                         resident_hooks.admission_retry_remaining()
                     )
+                if downstream_deferred:
+                    remaining_candidates.append(0.5)
                 remaining = min(remaining_candidates, default=0.0)
                 if remaining > 0:
                     deps.ownership_guard()
@@ -2246,6 +2450,8 @@ def _parse_one_batch(
                     wait_timeout,
                     resident_hooks.admission_retry_remaining(),
                 )
+            if downstream_deferred:
+                wait_timeout = min(wait_timeout, 0.5)
             completed, _ = wait(
                 futures,
                 timeout=wait_timeout,
@@ -2314,6 +2520,8 @@ def _parse_one_batch(
                     and now >= readiness_retry_at
                 ):
                     refill()
+                if downstream_deferred:
+                    refill()
                 if any(
                     now < admitted.runaway_until_monotonic
                     for admitted in parse_futures.values()
@@ -2341,17 +2549,26 @@ def _parse_one_batch(
                 deps.heartbeat()
                 if outcome.parsed and outcome.processing_run_id is not None:
                     processing_run_id = outcome.processing_run_id
-                    finalize_futures[
-                        finalize_pool.submit(
-                            _finalize_one_document,
-                            deps,
-                            document_id=admitted.item.document_id,
-                            processing_run_id=processing_run_id,
-                        )
-                    ] = _InFlightFinalize(
-                        document_id=admitted.item.document_id,
-                        processing_run_id=processing_run_id,
+                    remember_finalize(processing_run_id)
+                    finalize_item = _InFlightFinalize(
+                                document_id=admitted.item.document_id,
+                                processing_run_id=processing_run_id,
                     )
+                    if resident_hooks is None:
+                        finalize_futures[
+                            finalize_pool.submit(
+                                _finalize_one_document,
+                                deps,
+                                document_id=finalize_item.document_id,
+                                processing_run_id=finalize_item.processing_run_id,
+                                source_page_count=admitted.item.page_count,
+                            )
+                        ] = finalize_item
+                    else:
+                        ready_finalize.append(
+                            (finalize_item, admitted.item.page_count)
+                        )
+                        seed_finalize_recovery()
                     # Keep only a bounded recent-success window. PostgreSQL
                     # has already committed the status transition, so this
                     # protects against one lagging/fake read without turning
@@ -2391,6 +2608,7 @@ def _parse_one_batch(
                         )
                     )
                 _fold_outcome(report, outcome)
+                remember_finalize(finalized.processing_run_id)
                 deps.heartbeat()
                 if outcome_halts_admission(outcome):
                     halt_admission()
@@ -2470,46 +2688,18 @@ def _publish_stage(
 ) -> None:
     with deps.engine.connect() as conn:
         pending = queries.pending_publish(conn, limit=limit)
-    use_case = PublishRun(
-        uow_factory=deps.uow_factory,
-        publication_guard=ProviderDocumentPublicationGuard(
-            ProviderDocumentAdmission(
-                path_builder=deps.path_builder,
-                source=deps.provider_source,
-            ),
-            semantic_router=deps.semantic_router,
-            semantic_receipts=deps.semantic_receipts,
-        ),
-    )
     for row in pending:
         if should_stop():
             return
         run_id = str(row["processing_run_id"])
-        try:
-            result = use_case.execute(PublishRunCommand(processing_run_id=run_id))
-        except Exception as exc:
-            # Continue with the rest of the batch: a single deterministically
-            # failing run must not head-of-line block every other document's
-            # publish round after round (round23).
-            report.failed += 1
-            report.failures.append(
-                _failure_from_exception(stage="publish", item_ref=run_id, exc=exc)
-            )
-            if publish_failures_indicate_outage(report.failures):
-                return
-            continue
-        if result.status == "published":
-            report.published += 1
-            if result.superseded_run_id is not None:
-                report.runs_deactivated += 1
-        else:
-            report.failed += 1
-            report.failures.append(
-                WorkerFailure(
-                    stage="publish", item_ref=run_id, error_code=str(result.status)
-                )
-            )
-            continue
+        outcome = _publish_one_document(
+            deps,
+            document_id=str(row.get("document_id", run_id)),
+            processing_run_id=run_id,
+        )
+        _fold_outcome(report, outcome)
+        if publish_failures_indicate_outage(report.failures):
+            return
 
 
 def _project_stage(

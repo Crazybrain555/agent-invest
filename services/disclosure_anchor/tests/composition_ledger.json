@@ -472,7 +472,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 63
+   "tests": 67
   }
  },
  "schema": "test-composition-ledger.v1"
