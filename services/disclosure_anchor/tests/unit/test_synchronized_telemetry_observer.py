@@ -247,6 +247,18 @@ class _LateSampler:
         return _gpu_snapshot()
 
 
+class _PopenDescendantSampler:
+    collector_identity_sha256 = COLLECTOR_ID
+
+    def __init__(self, pid_file: str) -> None:
+        self.pid_file = pid_file
+
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        Path(self.pid_file).write_text(str(child.pid), encoding="ascii")
+        return _gpu_snapshot()
+
+
 class _HostSequenceSampler:
     collector_identity_sha256 = COLLECTOR_ID
 
@@ -273,6 +285,13 @@ def _test_collector_factory(config: dict[str, object]) -> object:
     if mode == "spawn_descendant":
         child = multiprocessing.get_context("spawn").Process(target=_descendant_sleep)
         child.start()
+    if mode == "popen_factory_descendant":
+        popen_child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+        Path(str(config["pid_file"])).write_text(str(popen_child.pid), encoding="ascii")
+    if mode == "popen_snapshot_descendant":
+        return _PopenDescendantSampler(str(config["pid_file"]))
     if mode == "transport_failure":
         return _FailingSampler()
     if mode == "delayed_transport_failure":
@@ -571,6 +590,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
 
     def test_factory_and_pickle_startup_failures_cleanup_all_children(self) -> None:
         baseline = {child.pid for child in multiprocessing.active_children()}
+        before_fds = len(os.listdir("/dev/fd"))
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
                 self._run(
@@ -585,15 +605,17 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         object.__setattr__(invalid, "expected_collector_identity_sha256", COLLECTOR_ID)
         object.__setattr__(invalid, "descendants_capability", "forbidden")
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
-                self._run(
-                    Path(temporary) / "pickle",
-                    gpu_sampler=invalid,
-                    duration=0.1,
-                )
+            for index in range(50):
+                with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                    self._run(
+                        Path(temporary) / f"pickle-{index}",
+                        gpu_sampler=invalid,
+                        duration=0.1,
+                    )
         self.assertEqual(
             {child.pid for child in multiprocessing.active_children()}, baseline
         )
+        self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
 
     def test_descendant_capability_violation_is_failed_evidence(self) -> None:
         baseline = {child.pid for child in multiprocessing.active_children()}
@@ -607,6 +629,27 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
         self.assertEqual(
             {child.pid for child in multiprocessing.active_children()}, baseline
         )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
+    def test_popen_descendants_are_detected_and_process_group_is_quiescent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            for mode in ("popen_factory_descendant", "popen_snapshot_descendant"):
+                with self.subTest(mode=mode):
+                    pid_file = temporary_path / f"{mode}.pid"
+                    with self.assertRaisesRegex(
+                        SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"
+                    ):
+                        self._run(
+                            temporary_path / mode,
+                            gpu_sampler=_collector_spec(
+                                lane="gpu", mode=mode, pid_file=str(pid_file)
+                            ),
+                            duration=0.1,
+                        )
+                    descendant_pid = int(pid_file.read_text(encoding="ascii"))
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(descendant_pid, 0)
 
     def test_twenty_runs_do_not_leak_file_descriptors_or_children(self) -> None:
         before_fds = len(os.listdir("/dev/fd"))
@@ -943,6 +986,34 @@ if __name__ == '__main__':
                     with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
                         self._run(root, duration=0.3)
 
+    def test_anchor_replacement_after_replay_before_return_is_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            module = __import__(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+                fromlist=["_FrameWriter"],
+            )
+            original = module._FrameWriter._replay_open_descriptors
+
+            def replay_then_replace(writer: Any, *, expect_seal: bool) -> Any:
+                replay = original(writer, expect_seal=expect_seal)
+                if expect_seal:
+                    moved = root.with_name("telemetry-after-replay")
+                    root.rename(moved)
+                    root.mkdir(mode=0o700)
+                    (root / writer.run_directory.name).mkdir(mode=0o700)
+                return replay
+
+            with patch.object(
+                module._FrameWriter,
+                "_replay_open_descriptors",
+                new=replay_then_replace,
+            ):
+                with self.assertRaisesRegex(
+                    SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"
+                ):
+                    self._run(root, duration=0.3)
+
     def test_receipt_write_failure_is_failed_evidence_not_false_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "telemetry"
@@ -957,6 +1028,35 @@ if __name__ == '__main__':
             run_dir = root / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
             self.assertTrue((run_dir / "frames.v2.jsonl").exists())
             self.assertFalse((run_dir / "receipt.v2.json").exists())
+
+    def test_partial_receipt_and_seal_writes_close_fds_and_preserve_primary_error(self) -> None:
+        module = __import__(
+            "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+            fromlist=["_write_all"],
+        )
+        original = module._write_all
+        markers = {
+            "receipt": b'"contract_version":"mineru.synchronized-telemetry-receipt.v2"',
+            "seal": b'"contract_version":"mineru.synchronized-telemetry-seal.v2"',
+        }
+        for label, marker in markers.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                before_fds = len(os.listdir("/dev/fd"))
+
+                def partial_then_fail(descriptor: int, payload: bytes) -> None:
+                    if marker in payload:
+                        os.write(descriptor, payload[: max(1, len(payload) // 2)])
+                        raise OSError(f"{label} partial write")
+                    original(descriptor, payload)
+
+                with patch.object(module, "_write_all", new=partial_then_fail):
+                    with self.assertRaisesRegex(
+                        SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"
+                    ) as caught:
+                        self._run(Path(temporary) / "telemetry", duration=0.08)
+                self.assertIsInstance(caught.exception.__cause__, OSError)
+                self.assertIn(f"{label} partial write", str(caught.exception.__cause__))
+                self.assertEqual(len(os.listdir("/dev/fd")), before_fds)
 
     def test_frame_fsync_failure_is_failed_evidence_and_does_not_mask_cause(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

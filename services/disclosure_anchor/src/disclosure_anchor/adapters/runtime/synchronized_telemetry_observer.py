@@ -20,6 +20,7 @@ from pathlib import Path
 import queue
 import signal
 import stat
+import subprocess
 import threading
 import time
 from typing import Callable, Literal, cast
@@ -237,7 +238,7 @@ class _ResidentSamplerProcess:
                 raise TelemetrySnapshotTransportUnavailable(
                     "resident collector identity handshake drifted"
                 )
-            if descendants:
+            if descendants or self._unexpected_process_group_members():
                 raise TelemetrySnapshotTransportUnavailable(
                     "resident collector violated no-descendants capability"
                 )
@@ -246,6 +247,7 @@ class _ResidentSamplerProcess:
             self._terminate()
             parent.close()
             self._connection = None
+            self._close_process_handle()
             raise
 
     def snapshot(
@@ -280,6 +282,12 @@ class _ResidentSamplerProcess:
                 self._terminate()
                 raise TelemetrySnapshotDeadlineExceeded("resident snapshot returned late")
             if kind == "ok":
+                unexpected = self._unexpected_process_group_members()
+                if unexpected:
+                    self._terminate()
+                    raise RuntimeError(
+                        f"resident collector capability violation: {unexpected}"
+                    )
                 return cast(GpuLaneSnapshot | HostLaneSnapshot, payload)
             if kind == "deadline":
                 raise TelemetrySnapshotDeadlineExceeded(str(payload))
@@ -302,6 +310,8 @@ class _ResidentSamplerProcess:
             self._process.join(timeout=0.25)
         if self._started and self._process.is_alive():
             self._terminate()
+        else:
+            self._quiesce_process_group()
         if connection is not None:
             connection.close()
             self._connection = None
@@ -310,32 +320,87 @@ class _ResidentSamplerProcess:
     def _terminate(self) -> None:
         if not self._started:
             return
+        if os.name == "posix" and self._process_group_ready and self._process.pid:
+            _signal_process_group(self._process.pid, signal.SIGTERM)
+        elif self._process.is_alive():
+            self._process.terminate()
         if self._process.is_alive():
-            if os.name == "posix" and self._process_group_ready and self._process.pid:
-                try:
-                    os.killpg(self._process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
-                self._process.terminate()
             self._process.join(timeout=1)
+        self._quiesce_process_group()
         if self._process.is_alive():
             if os.name == "posix" and self._process_group_ready and self._process.pid:
-                try:
-                    os.killpg(self._process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _signal_process_group(self._process.pid, signal.SIGKILL)
             else:
                 self._process.kill()
             self._process.join(timeout=1)
+            self._quiesce_process_group()
         if self._process.is_alive():
             raise SynchronizedTelemetryEvidenceError("resident collector did not terminate")
 
     def _close_process_handle(self) -> None:
-        if self._process_closed or not self._started or self._process.is_alive():
+        if self._process_closed:
+            return
+        if self._started and self._process.is_alive():
             return
         self._process.close()
         self._process_closed = True
+
+    def _unexpected_process_group_members(self) -> tuple[int, ...]:
+        if os.name != "posix" or not self._process_group_ready or not self._process.pid:
+            return ()
+        return tuple(
+            pid for pid in _posix_process_group_members(self._process.pid)
+            if pid != self._process.pid
+        )
+
+    def _quiesce_process_group(self) -> None:
+        if os.name != "posix" or not self._process_group_ready or not self._process.pid:
+            return
+        deadline = time.monotonic() + 1.0
+        members = _posix_process_group_members(self._process.pid)
+        if members:
+            _signal_process_group(self._process.pid, signal.SIGTERM)
+        while members and time.monotonic() < deadline:
+            time.sleep(0.02)
+            members = _posix_process_group_members(self._process.pid)
+        if members:
+            _signal_process_group(self._process.pid, signal.SIGKILL)
+            deadline = time.monotonic() + 1.0
+            while members and time.monotonic() < deadline:
+                time.sleep(0.02)
+                members = _posix_process_group_members(self._process.pid)
+        if members:
+            raise SynchronizedTelemetryEvidenceError(
+                f"resident collector process group did not quiesce: {members}"
+            )
+
+
+def _signal_process_group(process_group_id: int, signal_number: int) -> None:
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        pass
+
+
+def _posix_process_group_members(process_group_id: int) -> tuple[int, ...]:
+    """Return live non-zombie members without creating a process in the target group."""
+
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,pgid=,stat="],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=1,
+    )
+    members: list[int] = []
+    for line in completed.stdout.splitlines():
+        columns = line.split()
+        if len(columns) < 3:
+            continue
+        pid_text, pgid_text, state = columns[:3]
+        if int(pgid_text) == process_group_id and not state.startswith("Z"):
+            members.append(int(pid_text))
+    return tuple(sorted(members))
 
 
 def _resident_sampler_main(
@@ -506,9 +571,9 @@ class _FrameWriter:
         if len(payload) > self._limits.maximum_receipt_bytes:
             raise _ArtifactBoundExceeded("telemetry receipt exceeds its bound")
         descriptor = _open_new_private_at(self._run_fd, RECEIPT_FILENAME)
+        self._artifact_fds[RECEIPT_FILENAME] = descriptor
         _write_all(descriptor, payload)
         os.fsync(descriptor)
-        self._artifact_fds[RECEIPT_FILENAME] = descriptor
         os.fsync(self._run_fd)
         os.fsync(self._root_fd)
         observed, metadata = self._bind_written_descriptor(
@@ -536,9 +601,9 @@ class _FrameWriter:
         if len(payload) > self._limits.maximum_receipt_bytes:
             raise _ArtifactBoundExceeded("telemetry seal exceeds its bound")
         descriptor = _open_new_private_at(self._run_fd, SEAL_FILENAME)
+        self._artifact_fds[SEAL_FILENAME] = descriptor
         _write_all(descriptor, payload)
         os.fsync(descriptor)
-        self._artifact_fds[SEAL_FILENAME] = descriptor
         os.fsync(self._run_fd)
         os.fsync(self._root_fd)
         observed, metadata = self._bind_written_descriptor(
@@ -560,6 +625,7 @@ class _FrameWriter:
             raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
         self._validate_anchors()
         frames, receipt, seal = self._replay_open_descriptors(expect_seal=True)
+        self._validate_anchors()
         if seal is None:
             raise SynchronizedTelemetryEvidenceError("telemetry seal is missing")
         if receipt.run_id != self._run_id:

@@ -44,7 +44,9 @@ resident runner 发布独立的 v2：`frames.v2.jsonl` 只接受 LF 结尾的逐
 私有目录 descriptor 完整 replay；只有 replay 成功才写 non-self-referential seal，随后保持 parent/root/run
 三个 descriptor 打开并再次 replay，逐文件核对 exact `dev/ino/mode/nlink/size/mtime/ctime` 和目录清单，
 同时确认 parent→root 与 root→run 名称仍指向原 inode。不得按 pathname 重新打开，
-且只有最终 replay 对象能够以 `SEALED` 返回。任何篡改、缺失或磁盘失败都进入 `FAILED_EVIDENCE`。
+并在 replay 后再次核验目录锚点，且只有最终 replay 对象能够以 `SEALED` 返回。返回值中的
+`run_directory` 仅是事后定位器，不是已验证证据来源；证据完全来自仍打开的原始 write/directory FD。
+任何篡改、缺失或磁盘失败都进入 `FAILED_EVIDENCE`。
 
 seal 中的 CPU 字段明确命名为 `preseal_observer_*`：区间从 sampling 前开始，覆盖 frame close、quality
 derive、receipt validate/write 以及 mandatory pre-seal replay，但不声称覆盖 seal write 或最终 anchored replay。
@@ -64,8 +66,9 @@ start wall/monotonic/end deadline。任一 pickle、spawn、pipe、factory 或 R
 误和其他程序缺陷必须传播到 `FAILED_EVIDENCE`。每帧 lane ownership 也是闭合的：GPU lane 的 host/queue
 观测，以及 host lane 的 GPU 观测，必须严格为 `unsupported/not_due_at_this_tick`。
 
-collector factory 合同禁止创建任何 descendant。core 在 READY 与每次 snapshot 后检查 Python child 集合；
-POSIX child 进入独立 process group，失败/cancel/deadline 时整组终止以覆盖 native descendant。该检测不是
+collector factory 合同禁止创建任何 descendant。core 在 READY 与每次 snapshot 后同时检查 Python child
+集合和 POSIX 独立 process group 的 OS 进程成员；close、失败、cancel、deadline 均在返回前验证整组
+quiescent，必要时依次 TERM/KILL，以覆盖 `subprocess`/native descendant。该检测不是
 Windows Job Object 的替代：真实 Windows/PowerShell 5.1 collector 接入前必须有 Job Object 硬门禁和真实
 spawn smoke；本地纯 Python spawn smoke 只证明当前 core/factory wire contract 可重建。
 
