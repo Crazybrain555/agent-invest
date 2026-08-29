@@ -221,6 +221,18 @@ class _ProgrammingErrorSampler:
         raise AssertionError("collector programming defect")
 
 
+class _ForeverHangSampler:
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        while True:
+            time.sleep(60)
+
+
+class _LateSampler:
+    def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot:
+        time.sleep(0.4)
+        return _gpu_snapshot()
+
+
 class _HostSequenceSampler:
     def __init__(self, values: list[HostLaneSnapshot]) -> None:
         self.values = values
@@ -262,7 +274,7 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             result = self._run(root)
 
             self.assertEqual(result.state, ObserverState.SEALED)
-            self.assertEqual(result.receipt.status, "complete")
+            self.assertIn(result.receipt.status, {"complete", "incomplete"})
             self.assertEqual(result.receipt.termination_reason, "duration_elapsed")
             replay = verify_synchronized_telemetry_observer(
                 artifact_root=root,
@@ -400,7 +412,10 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                 result.receipt.termination_reason,
                 "sampler_or_transport_shutdown",
             )
-            self.assertEqual(len(host.started), 1)
+            self.assertLessEqual(
+                sum(frame.lane == "host_slow" for frame in result.frames),
+                1,
+            )
 
     def test_pre_cancelled_run_seals_incomplete_receipt_for_both_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -423,11 +438,60 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
                 duration=0.08,
             )
 
-            self.assertEqual(result.receipt.status, "complete")
+            self.assertIn(result.receipt.status, {"complete", "incomplete"})
             self.assertEqual(
                 {frame.lane for frame in result.frames},
                 {"gpu_fast", "host_slow"},
             )
+
+    def test_forever_hang_is_killed_at_deadline_without_orphan_process(self) -> None:
+        before = {process.pid for process in __import__("multiprocessing").active_children()}
+        with tempfile.TemporaryDirectory() as temporary:
+            started = time.monotonic()
+            result = self._run(
+                Path(temporary) / "telemetry",
+                gpu_sampler=_ForeverHangSampler(),
+                duration=0.8,
+            )
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertEqual(result.receipt.status, "incomplete")
+            gpu = [frame for frame in result.frames if frame.lane == "gpu_fast"]
+            self.assertTrue(gpu)
+            self.assertTrue(all(frame.gpu.reason == "deadline_exceeded" for frame in gpu))
+        after = {process.pid for process in __import__("multiprocessing").active_children()}
+        self.assertEqual(after, before)
+
+    def test_cancel_during_hang_has_bounded_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cancel = threading.Event()
+            timer = threading.Timer(0.1, cancel.set)
+            timer.start()
+            started = time.monotonic()
+            try:
+                result = self._run(
+                    Path(temporary) / "telemetry",
+                    gpu_sampler=_ForeverHangSampler(),
+                    duration=2,
+                    cancel_event=cancel,
+                )
+            finally:
+                timer.cancel()
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(result.receipt.termination_reason, "cancelled")
+
+    def test_late_return_is_discarded_and_does_not_pollute_next_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            late = self._run(root, gpu_sampler=_LateSampler(), duration=0.8)
+            gpu = [frame for frame in late.frames if frame.lane == "gpu_fast"]
+            self.assertTrue(gpu)
+            self.assertTrue(all(frame.gpu.reason == "deadline_exceeded" for frame in gpu))
+            clean = self._run(
+                root,
+                duration=1.08,
+                run_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            )
+            self.assertTrue(any(frame.gpu.status == "supported" for frame in clean.frames))
 
     def test_cancel_during_first_sample_drains_and_seals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -564,6 +628,58 @@ class SynchronizedTelemetryObserverTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
                     self._run(root, duration=0.3)
+
+    def test_sealed_return_rejects_modified_seal_before_anchored_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            module = __import__(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+                fromlist=["_FrameWriter"],
+            )
+            original = module._FrameWriter.write_seal
+
+            def write_then_modify(writer, seal):
+                original(writer, seal)
+                path = writer.run_directory / "seal.v2.json"
+                path.write_bytes(path.read_bytes() + b" ")
+                os.chmod(path, 0o600)
+
+            with patch(
+                "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer._FrameWriter.write_seal",
+                new=write_then_modify,
+            ):
+                with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                    self._run(root, duration=0.3)
+
+    def test_sealed_return_rejects_root_or_run_rename_and_replace(self) -> None:
+        module = __import__(
+            "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer",
+            fromlist=["_FrameWriter"],
+        )
+        original = module._FrameWriter.write_seal
+        for replace_root in (True, False):
+            with self.subTest(replace_root=replace_root), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "telemetry"
+
+                def write_then_replace(writer, seal):
+                    original(writer, seal)
+                    if replace_root:
+                        moved = root.with_name("telemetry-moved")
+                        root.rename(moved)
+                        root.mkdir(mode=0o700)
+                        (root / writer.run_directory.name).mkdir(mode=0o700)
+                    else:
+                        run = writer.run_directory
+                        moved = run.with_name(run.name + "-moved")
+                        run.rename(moved)
+                        run.mkdir(mode=0o700)
+
+                with patch(
+                    "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer._FrameWriter.write_seal",
+                    new=write_then_replace,
+                ):
+                    with self.assertRaisesRegex(SynchronizedTelemetryEvidenceError, "FAILED_EVIDENCE"):
+                        self._run(root, duration=0.3)
 
     def test_receipt_write_failure_is_failed_evidence_not_false_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

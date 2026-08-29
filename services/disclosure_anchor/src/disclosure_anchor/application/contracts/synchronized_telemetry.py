@@ -1006,10 +1006,10 @@ class SynchronizedTelemetrySealV2(_FrozenModel):
     run_id: str
     receipt_sha256: str
     frames_jsonl_sha256: str
-    observer_process_cpu_started_ns: int = Field(ge=0)
-    observer_process_cpu_finished_ns: int = Field(ge=0)
-    observer_cpu_ns: int = Field(ge=0)
-    attested_elapsed_ns: int = Field(gt=0)
+    preseal_observer_process_cpu_started_ns: int = Field(ge=0)
+    preseal_observer_process_cpu_finished_ns: int = Field(ge=0)
+    preseal_observer_cpu_ns: int = Field(ge=0)
+    sampling_elapsed_ns_denominator: int = Field(gt=0)
     maximum_observer_overhead_ratio: float = Field(default=0.02, ge=0.02, le=0.02)
     receipt_status: RunStatus
     status: RunStatus
@@ -1019,11 +1019,11 @@ class SynchronizedTelemetrySealV2(_FrozenModel):
         _run_id(self.run_id)
         _sha256(self.receipt_sha256, label="receipt_sha256")
         _sha256(self.frames_jsonl_sha256, label="frames_jsonl_sha256")
-        if self.observer_process_cpu_finished_ns < self.observer_process_cpu_started_ns:
+        if self.preseal_observer_process_cpu_finished_ns < self.preseal_observer_process_cpu_started_ns:
             raise ValueError("observer CPU interval is invalid")
-        if self.observer_cpu_ns != self.observer_process_cpu_finished_ns - self.observer_process_cpu_started_ns:
+        if self.preseal_observer_cpu_ns != self.preseal_observer_process_cpu_finished_ns - self.preseal_observer_process_cpu_started_ns:
             raise ValueError("observer CPU duration disagrees with counters")
-        overhead_unsafe = self.observer_cpu_ns / self.attested_elapsed_ns > self.maximum_observer_overhead_ratio
+        overhead_unsafe = self.preseal_observer_cpu_ns / self.sampling_elapsed_ns_denominator > self.maximum_observer_overhead_ratio
         expected: RunStatus = "unsafe" if overhead_unsafe or self.receipt_status == "unsafe" else self.receipt_status
         if self.status != expected:
             raise ValueError("seal status disagrees with observer overhead")

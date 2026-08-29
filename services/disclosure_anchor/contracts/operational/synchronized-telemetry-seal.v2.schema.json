@@ -4,11 +4,6 @@
   "additionalProperties": false,
   "description": "Non-self-referential attestation created after mandatory receipt replay.",
   "properties": {
-    "attested_elapsed_ns": {
-      "exclusiveMinimum": 0,
-      "title": "Attested Elapsed Ns",
-      "type": "integer"
-    },
     "contract_version": {
       "const": "mineru.synchronized-telemetry-seal.v2",
       "default": "mineru.synchronized-telemetry-seal.v2",
@@ -26,19 +21,19 @@
       "title": "Maximum Observer Overhead Ratio",
       "type": "number"
     },
-    "observer_cpu_ns": {
+    "preseal_observer_cpu_ns": {
       "minimum": 0,
-      "title": "Observer Cpu Ns",
+      "title": "Preseal Observer Cpu Ns",
       "type": "integer"
     },
-    "observer_process_cpu_finished_ns": {
+    "preseal_observer_process_cpu_finished_ns": {
       "minimum": 0,
-      "title": "Observer Process Cpu Finished Ns",
+      "title": "Preseal Observer Process Cpu Finished Ns",
       "type": "integer"
     },
-    "observer_process_cpu_started_ns": {
+    "preseal_observer_process_cpu_started_ns": {
       "minimum": 0,
-      "title": "Observer Process Cpu Started Ns",
+      "title": "Preseal Observer Process Cpu Started Ns",
       "type": "integer"
     },
     "receipt_sha256": {
@@ -58,6 +53,11 @@
       "title": "Run Id",
       "type": "string"
     },
+    "sampling_elapsed_ns_denominator": {
+      "exclusiveMinimum": 0,
+      "title": "Sampling Elapsed Ns Denominator",
+      "type": "integer"
+    },
     "status": {
       "enum": [
         "complete",
@@ -72,10 +72,10 @@
     "run_id",
     "receipt_sha256",
     "frames_jsonl_sha256",
-    "observer_process_cpu_started_ns",
-    "observer_process_cpu_finished_ns",
-    "observer_cpu_ns",
-    "attested_elapsed_ns",
+    "preseal_observer_process_cpu_started_ns",
+    "preseal_observer_process_cpu_finished_ns",
+    "preseal_observer_cpu_ns",
+    "sampling_elapsed_ns_denominator",
     "receipt_status",
     "status"
   ],

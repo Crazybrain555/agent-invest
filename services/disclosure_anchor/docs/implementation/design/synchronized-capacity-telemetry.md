@@ -41,16 +41,21 @@ cancel、sampler/transport shutdown、mailbox overflow 和 artifact bound 是闭
 文件，并分别 fsync 文件、run 目录和父目录。既有 public v1 合同及其 JSON-array artifact 语义保持不变；
 resident runner 发布独立的 v2：`frames.v2.jsonl` 只接受 LF 结尾的逐行 canonical UTF-8 JSONL，
 `receipt.v2.json` 与 `seal.v2.json` 是 canonical JSON object。receipt 写入并 fsync 后，runner 必须从仍锚定的
-私有目录 descriptor 完整 replay；只有 replay 成功才写 non-self-referential seal，随后再次从磁盘 replay，
+私有目录 descriptor 完整 replay；只有 replay 成功才写 non-self-referential seal，随后保持 parent/root/run
+三个 descriptor 打开并再次 replay，逐文件核对 exact `dev/ino/mode/nlink/size/mtime/ctime` 和目录清单，
+同时确认 parent→root 与 root→run 名称仍指向原 inode。不得按 pathname 重新打开，
 且只有最终 replay 对象能够以 `SEALED` 返回。任何篡改、缺失或磁盘失败都进入 `FAILED_EVIDENCE`。
 
-observer CPU 区间从 sampling 前开始，覆盖 frame close/quality derive/receipt validate+write 以及 mandatory
-pre-seal replay，在 seal 中记录 start/finish/delta；2% 比例由 seal 的 exact counters 和 attested elapsed
-机械重算。seal 本身不把自己的 bytes 纳入自引用 attestation。receipt 的 closed safety drift 分别记录
+seal 中的 CPU 字段明确命名为 `preseal_observer_*`：区间从 sampling 前开始，覆盖 frame close、quality
+derive、receipt validate/write 以及 mandatory pre-seal replay，但不声称覆盖 seal write 或最终 anchored replay。
+2% 比例以该 pre-seal CPU delta 除以 sampling elapsed denominator 机械重算；它不是 full-run CPU 指标。
+seal 本身不把自己的 bytes 纳入自引用 attestation。receipt 的 closed safety drift 分别记录
 `epoch_drift`、其他 identity drift、累计计数回退和 OOM/OOM-kill 增量；`epoch_changed` 只代表第一类。
 
-注入端口不是任意远端请求：它只能从一只已经 resident 的 collector 读取有界、非阻塞 snapshot，且每次
-携带绝对 monotonic deadline。只有 typed deadline/transport failure 可投影成 unsupported；assertion、类型错
+注入 sampler 不是在 lane 中直接调用的任意远端请求。每 lane 由一个单 owner、跨 tick 常驻的 collector
+subprocess 和一条 duplex transport 承载；外层携带绝对 monotonic deadline 并可关闭 transport、terminate
+并 join 整个 collector。忽略 deadline、永久 hang、late return 或 cancel 都必须 bounded return，且不得遗留
+每 tick thread/process。只有 typed deadline/transport failure 可投影成 unsupported；assertion、类型错
 误和其他程序缺陷必须传播到 `FAILED_EVIDENCE`。每帧 lane ownership 也是闭合的：GPU lane 的 host/queue
 观测，以及 host lane 的 GPU 观测，必须严格为 `unsupported/not_due_at_this_tick`。
 
