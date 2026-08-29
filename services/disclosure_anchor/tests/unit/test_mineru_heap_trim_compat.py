@@ -654,6 +654,17 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         fixture_root = (
             Path(__file__).parents[1] / "fixtures" / "mineru_344_preimages"
         )
+        service_root = Path(__file__).parents[2]
+        attributes = (service_root / ".gitattributes").read_text(encoding="utf-8")
+        whitespace_rules = [
+            line.strip()
+            for line in attributes.splitlines()
+            if "whitespace" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            whitespace_rules,
+            ["tests/fixtures/mineru_344_preimages/** -whitespace"],
+        )
         patched_sources: dict[str, str] = {}
         for relative_path, expected_sha256 in TARGET_PREIMAGE_SHA256.items():
             with self.subTest(relative_path=relative_path):

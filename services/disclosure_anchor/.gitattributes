@@ -30,6 +30,10 @@
 *.cfg text eol=lf
 *.ini text eol=lf
 
+# SHA-locked upstream source preimages retain their exact bytes, including
+# upstream trailing whitespace. Keep this exception scoped to this fixture tree.
+tests/fixtures/mineru_344_preimages/** -whitespace
+
 # ============================================================
 # 二进制文件：不做任何转换
 # ============================================================
@@ -67,4 +71,3 @@
 *.docx binary
 *.ppt binary
 *.pptx binary
-

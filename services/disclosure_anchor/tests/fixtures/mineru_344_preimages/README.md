@@ -13,3 +13,8 @@ These files are exact upstream source preimages used by the SHA-pinned MinerU
 `TARGET_PREIMAGE_SHA256`, applies the real patch, and compiles every generated
 source. Updating a fixture therefore requires an explicit source-identity and
 patch-contract change.
+
+The sources are byte-exact and intentionally preserve any upstream trailing
+whitespace. The service `.gitattributes` disables Git's whitespace diagnostic
+only for this fixture tree; changing or broadening that exception is guarded by
+the same unit test that verifies the source hashes.
