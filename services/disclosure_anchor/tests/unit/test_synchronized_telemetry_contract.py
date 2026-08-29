@@ -48,6 +48,7 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     SynchronizedTelemetryFrame,
     SynchronizedTelemetryReceipt,
     TelemetryArtifacts,
+    parse_canonical_json_artifact,
     validate_credit_event_chain,
     validate_frame_sequence,
 )
@@ -141,7 +142,7 @@ def _capture(event: MineruPhaseEvent) -> tuple[MineruPhaseTraceCapture, bytes]:
                 "oom_killed": False,
                 "restart_count": 0,
                 "running": True,
-                "started_at_utc": START.isoformat(),
+                "started_at_utc": START.isoformat().replace("+00:00", "Z"),
                 "status": "running",
             },
             "line_count": 1,
@@ -472,6 +473,10 @@ def _receipt(*, status: str = "complete") -> SynchronizedTelemetryReceipt:
 
 
 class SynchronizedTelemetryContractTests(unittest.TestCase):
+    def test_canonical_artifact_rejects_nonfinite_json_numbers(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-finite JSON number"):
+            parse_canonical_json_artifact(b'{"value":NaN}', label="test")
+
     def test_frames_require_explicit_coverage_and_cadence(self) -> None:
         fast = _frame(sequence=0, lane="gpu_fast", started_ns=0, first=True)
         slow = _frame(sequence=1, lane="host_slow", started_ns=0, first=True)

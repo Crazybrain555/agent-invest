@@ -954,8 +954,15 @@ def parse_canonical_json_artifact(
             result[key] = value
         return result
 
+    def reject_nonfinite_constant(value: str) -> object:
+        raise ValueError(f"{label} artifact contains non-finite JSON number: {value}")
+
     try:
-        decoded = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+        decoded = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_nonfinite_constant,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{label} artifact is not canonical UTF-8 JSON") from exc
     canonical = json.dumps(

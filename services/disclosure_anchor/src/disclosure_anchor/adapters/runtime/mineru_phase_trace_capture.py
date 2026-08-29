@@ -462,8 +462,8 @@ def summarize_synchronized_phase_capture(
         or phase_clock_binding.observer_process_epoch_sha256
         != telemetry_receipt.process_profile.process_epoch_sha256
         or phase_clock_binding.container_id != capture.container_id
-        or phase_clock_binding.container_started_at_utc.isoformat()
-        != capture.container_started_at_utc
+        or phase_clock_binding.container_started_at_utc
+        != _utc(capture.container_started_at_utc, label="container.started_at_utc")
         or phase_clock_binding.phase_node_identity_sha256
         != capture.windows_node_identity_sha256
     ):
