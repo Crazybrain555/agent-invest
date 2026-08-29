@@ -325,6 +325,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "from mineru.cli.api_request import ParseRequestOptions, parse_request_form\n"
             "from mineru.cli.agent_task_protocol_v2 import (\n"
             "    DurableTaskRegistry, SplitTaskExecutor, TaskProtocolConflict,\n"
+            "    evict_consumed_routes,\n"
             ")\n",
             count=1,
             label="FastAPI task protocol v2 import",
@@ -835,7 +836,8 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "            task_manager.task_protocol_v2.acknowledge_failed(record.idempotency_key)\n"
             "        else:\n"
             "            task_manager.task_protocol_v2.acknowledge(record.idempotency_key)\n"
-            "            task_manager.task_protocol_v2.cleanup_consumed()\n"
+            "        task_manager.task_protocol_v2.cleanup_consumed()\n"
+            "        task_manager._evict_consumed_protocol_tasks()\n"
             "    except TaskProtocolConflict as exc:\n"
             "        raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
             '    return {"schema": "mineru-task-protocol.v2", "task_id": task_id, "status": "consumed"}\n\n'
@@ -995,9 +997,17 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        task.status = TASK_COMPLETED\n"
             "        task.completed_at = utc_now_iso()\n"
             "        self._signal_task_event(task.task_id)\n\n"
+            "    def _evict_consumed_protocol_tasks(self) -> int:\n"
+            "        if self.task_protocol_v2 is None:\n"
+            "            return 0\n"
+            "        return evict_consumed_routes(\n"
+            "            self.task_protocol_v2, self.tasks, self.task_events\n"
+            "        )\n\n"
             "    def cleanup_expired_tasks(self) -> int:\n"
             "        if self.task_protocol_v2 is not None:\n"
-            "            return self.task_protocol_v2.cleanup_consumed()\n",
+            "            cleaned = self.task_protocol_v2.cleanup_consumed()\n"
+            "            self._evict_consumed_protocol_tasks()\n"
+            "            return cleaned\n",
             count=1,
             label="FastAPI task protocol legacy task wrapper",
         )

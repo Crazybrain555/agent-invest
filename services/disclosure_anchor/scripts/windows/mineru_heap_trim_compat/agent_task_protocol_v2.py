@@ -20,6 +20,7 @@ TaskState = Literal[
     "pending", "processing", "finalizing", "completed", "failed",
     "cleanup_pending", "consumed"
 ]
+CleanupKind = Literal["result", "task_tree"]
 _MAX_REGISTRY_BYTES = 16 * 1024 * 1024
 _MAX_RECORDS = 128
 _MAX_TOMBSTONES = 8192
@@ -49,6 +50,7 @@ class DurableTaskRecord:
     reserved_result_bytes: int = 0
     recovery_generation: int = 1
     consumed_at_unix: float | None = None
+    cleanup_kind: CleanupKind | None = None
 
     def __post_init__(self) -> None:
         for value in (
@@ -121,11 +123,25 @@ class DurableTaskRecord:
                 self.result_owner,
             )
         )
-        if self.state in {"completed", "cleanup_pending"} and not has_result_identity:
+        if self.state == "completed" and not has_result_identity:
             raise TaskProtocolConflict("terminal task result identity is incomplete")
+        if self.state == "cleanup_pending" and self.cleanup_kind not in {
+            "result", "task_tree"
+        }:
+            raise TaskProtocolConflict("cleanup intent kind is absent")
+        if self.state != "cleanup_pending" and self.cleanup_kind is not None:
+            raise TaskProtocolConflict("cleanup intent escaped pending state")
+        if self.cleanup_kind == "result" and not has_result_identity:
+            raise TaskProtocolConflict("result cleanup identity is incomplete")
+        if self.cleanup_kind == "task_tree" and (
+            has_result_identity or self.result_path is not None
+        ):
+            raise TaskProtocolConflict("task-tree cleanup carried result identity")
         if self.state == "consumed" and any(value is not None for value in identities) != has_result_identity:
             raise TaskProtocolConflict("consumed result identity is incomplete")
-        if self.state in {"completed", "cleanup_pending"} and not isinstance(self.result_path, str):
+        if (
+            self.state == "completed" or self.cleanup_kind == "result"
+        ) and not isinstance(self.result_path, str):
             raise TaskProtocolConflict("completed task result path is absent")
         if self.state not in {"completed", "cleanup_pending", "consumed"} and any(
             value is not None
@@ -574,10 +590,12 @@ class DurableTaskRegistry:
             if record.state != "failed":
                 raise TaskProtocolConflict("only failed tasks can use failed ACK")
             record.state = "cleanup_pending"
+            record.cleanup_kind = "task_tree"
             try:
                 self._persist()
             except BaseException:
                 record.state = "failed"
+                record.cleanup_kind = None
                 raise
             self.cleanup_consumed()
 
@@ -716,10 +734,12 @@ class DurableTaskRegistry:
                     "result cannot be ACKed while unavailable/in use"
                 )
             record.state = "cleanup_pending"
+            record.cleanup_kind = "result"
             try:
                 self._persist()
             except BaseException:
                 record.state = "completed"
+                record.cleanup_kind = None
                 raise
 
     def cleanup_consumed(
@@ -742,6 +762,7 @@ class DurableTaskRegistry:
                     record.reserved_result_bytes,
                     record.state,
                     record.consumed_at_unix,
+                    record.cleanup_kind,
                 )
                 self._unlink_owned_result(record, before_unlink=unlink)
                 record.result_path = None
@@ -751,6 +772,7 @@ class DurableTaskRegistry:
                 record.reserved_result_bytes = 0
                 record.state = "consumed"
                 record.consumed_at_unix = self._clock()
+                record.cleanup_kind = None
                 try:
                     self._persist()
                 except BaseException:
@@ -762,6 +784,7 @@ class DurableTaskRegistry:
                         record.reserved_result_bytes,
                         record.state,
                         record.consumed_at_unix,
+                        record.cleanup_kind,
                     ) = previous
                     raise
                 cleaned += 1
@@ -792,7 +815,10 @@ class DurableTaskRegistry:
             raise TaskProtocolConflict("cleanup task ownership receipt is absent")
         output = Path(output_value)
         result = Path(record.result_path or "")
-        if result.parent.resolve() != output.resolve() or result.name in {"", ".", ".."}:
+        if record.cleanup_kind == "result" and (
+            result.parent.resolve() != output.resolve()
+            or result.name in {"", ".", ".."}
+        ):
             raise TaskProtocolConflict("cleanup result escaped task root")
         try:
             root_fd, task_fd = self._open_task_dir(record.task_id)
@@ -811,6 +837,23 @@ class DurableTaskRegistry:
                     root_meta.st_mode,
                 ) != self._output_root_identity:
                     raise TaskProtocolConflict("configured output root identity drifted")
+                expected = protocol.get("task_root_identity")
+                if not isinstance(expected, dict):
+                    raise TaskProtocolConflict("cleanup task identity is absent")
+                entries = os.listdir(root_fd)
+                if len(entries) > _MAX_RECORDS + _MAX_TOMBSTONES:
+                    raise TaskProtocolConflict("cleanup output-root scan exceeded bound")
+                for entry in entries:
+                    metadata = os.stat(
+                        entry, dir_fd=root_fd, follow_symlinks=False
+                    )
+                    if (
+                        metadata.st_dev == expected.get("device")
+                        and metadata.st_ino == expected.get("inode")
+                    ):
+                        raise TaskProtocolConflict(
+                            "owned task directory was renamed during cleanup"
+                        )
             finally:
                 os.close(root_fd)
             return
@@ -834,18 +877,20 @@ class DurableTaskRegistry:
                     )
             finally:
                 os.close(upload_fd)
-            if record.result_path:
+            if record.cleanup_kind == "result":
+                result_metadata: os.stat_result | None
                 try:
-                    metadata = os.stat(
+                    result_metadata = os.stat(
                         result.name, dir_fd=task_fd, follow_symlinks=False
                     )
                 except FileNotFoundError:
-                    metadata = None
-                if metadata is not None and (
-                    not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    result_metadata = None
+                if result_metadata is not None and (
+                    not stat.S_ISREG(result_metadata.st_mode)
+                    or result_metadata.st_nlink != 1
                 ):
                     raise TaskProtocolConflict("cleanup result identity is unsafe")
-                if before_unlink is not None and metadata is not None:
+                if before_unlink is not None and result_metadata is not None:
                     before_unlink(result)
             for child in os.listdir(task_fd):
                 self._remove_at(task_fd, child)
@@ -1094,9 +1139,26 @@ class SplitTaskExecutor:
             raise
 
 
+def evict_consumed_routes(
+    registry: DurableTaskRegistry,
+    tasks: dict[str, Any],
+    task_events: dict[str, Any],
+) -> int:
+    """Remove only routes whose durable terminal was compacted to consumed."""
+    evicted = 0
+    for task_id in tuple(tasks):
+        record = registry.get_by_task_id(task_id)
+        if record is not None and record.state == "consumed":
+            tasks.pop(task_id, None)
+            task_events.pop(task_id, None)
+            evicted += 1
+    return evicted
+
+
 __all__ = [
     "DurableTaskRecord",
     "DurableTaskRegistry",
     "SplitTaskExecutor",
     "TaskProtocolConflict",
+    "evict_consumed_routes",
 ]

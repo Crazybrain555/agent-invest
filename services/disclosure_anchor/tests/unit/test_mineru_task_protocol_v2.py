@@ -22,9 +22,29 @@ _SPEC.loader.exec_module(_MODULE)
 DurableTaskRegistry = _MODULE.DurableTaskRegistry
 SplitTaskExecutor = _MODULE.SplitTaskExecutor
 TaskProtocolConflict = _MODULE.TaskProtocolConflict
+evict_consumed_routes = _MODULE.evict_consumed_routes
 
 
 class MinerUTaskProtocolV2Tests(unittest.TestCase):
+    def test_consumed_route_eviction_bounds_success_and_failure_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = self._registry(Path(directory), limit=1024)
+            tasks: dict[str, object] = {}
+            events: dict[str, object] = {}
+            for index in range(128):
+                key = f"key-{index}"
+                self._create(registry, key)
+                registry.fail(key, error='{"code":"failed"}')
+                registry.acknowledge_failed(key)
+                tasks[f"task-{key}"] = object()
+                events[f"task-{key}"] = object()
+            self._create(registry, "live")
+            tasks["task-live"] = object()
+            events["task-live"] = object()
+
+            self.assertEqual(evict_consumed_routes(registry, tasks, events), 128)
+            self.assertEqual(set(tasks), {"task-live"})
+            self.assertEqual(set(events), {"task-live"})
     def _registry(self, root: Path, *, limit: int = 100) -> DurableTaskRegistry:
         return DurableTaskRegistry(
             root / "registry.json", max_unacked_result_bytes=limit
@@ -444,6 +464,80 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             record = restarted.get("key")
             self.assertIsNotNone(record)
             self.assertEqual(record.state, "consumed")  # type: ignore[union-attr]
+
+    def test_bound_failed_ack_uses_restart_safe_task_tree_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            task_root = root / "task-key"
+            uploads = task_root / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"pdf")
+            registry.bind_task_payload(
+                "key",
+                {
+                    "task_id": "task-key",
+                    "output_dir": str(task_root),
+                    "uploads": [str(upload)],
+                },
+            )
+            registry.transition("key", "processing")
+            registry.fail("key", error='{"code":"failed"}')
+            original_persist = registry._persist
+            calls = 0
+
+            def fail_after_tree_delete() -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("persist after unlink")
+                original_persist()
+
+            registry._persist = fail_after_tree_delete
+            with self.assertRaisesRegex(OSError, "persist after unlink"):
+                registry.acknowledge_failed("key")
+            self.assertFalse(task_root.exists())
+
+            restarted = self._registry(root)
+            pending = restarted.get("key")
+            self.assertIsNotNone(pending)
+            self.assertEqual(pending.state, "cleanup_pending")  # type: ignore[union-attr]
+            self.assertEqual(pending.cleanup_kind, "task_tree")  # type: ignore[union-attr]
+            self.assertEqual(restarted.cleanup_consumed(), 1)
+            self.assertEqual(restarted.get("key").state, "consumed")  # type: ignore[union-attr]
+
+    def test_missing_task_name_rejects_renamed_owned_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self._registry(root)
+            self._create(registry)
+            task_root = root / "task-key"
+            uploads = task_root / "uploads"
+            uploads.mkdir(parents=True)
+            upload = uploads / "input.pdf"
+            upload.write_bytes(b"pdf")
+            registry.bind_task_payload(
+                "key",
+                {
+                    "task_id": "task-key",
+                    "output_dir": str(task_root),
+                    "uploads": [str(upload)],
+                },
+            )
+            registry.transition("key", "processing")
+            registry.fail("key", error='{"code":"failed"}')
+            original_unlink = registry._unlink_owned_result
+            registry._unlink_owned_result = lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("pause"))
+            with self.assertRaisesRegex(OSError, "pause"):
+                registry.acknowledge_failed("key")
+            registry._unlink_owned_result = original_unlink
+            task_root.rename(root / "renamed-task")
+
+            with self.assertRaisesRegex(TaskProtocolConflict, "renamed"):
+                registry.cleanup_consumed()
+            self.assertEqual(registry.get("key").state, "cleanup_pending")  # type: ignore[union-attr]
 
     def test_cleanup_only_tolerates_missing_result_leaf(self) -> None:
         for mutation in ("root", "task", "uploads", "leaf"):

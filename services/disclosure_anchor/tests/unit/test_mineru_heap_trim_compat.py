@@ -688,9 +688,10 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             '"        if self.task_protocol_v2 is not None:\\n"', patcher
         )
         self.assertIn(
-            '"            return self.task_protocol_v2.cleanup_consumed()\\n"',
+            '"            cleaned = self.task_protocol_v2.cleanup_consumed()\\n"',
             patcher,
         )
+        self.assertIn("_evict_consumed_protocol_tasks", patcher)
 
     def test_generated_retained_source_helper_covers_every_member_and_toc(self) -> None:
         patched = patch_source("mineru/cli/fast_api.py", _retained_fast_api_fixture())
