@@ -216,14 +216,12 @@ class Settings(BaseSettings):
     # These are service-side limits of the attested Windows orchestrator.
     # They are not CLI fan-out controls: MinerU ignores the CLI's unknown
     # --max-concurrency option when --api-url selects an existing API.  The
-    # task-slot value is machine-profile configuration, but it is accepted
-    # only when the exact runtime manifest, live health and load receipts bind
-    # the same value.  The 30 GiB Windows Docker profile defaults to one after
-    # a real mixed annual-report run proved that three can OOM the API.
+    # The current serial contract has one and only one owner. A future scheduler
+    # requires a new versioned runtime contract rather than widening this field.
     disclosure_mineru_api_task_slots: int = Field(
         default=1,
         ge=1,
-        le=3,
+        le=1,
         validation_alias=AliasChoices(
             "DISCLOSURE_MINERU_API_TASK_SLOTS",
             "disclosure_mineru_api_task_slots",

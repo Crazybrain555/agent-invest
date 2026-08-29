@@ -134,7 +134,7 @@ make mineru-smoke \
 固定页窗口与 writer code digest，以及远端 immutable
 API image/config/env/mount/network、inference image/model/config/env、live served model ID、唯一出现的
 `max_num_seqs=128` 与 `mm_processor_cache_gb=0`，并要求 API health 固定为 MinerU 3.4.4/protocol 2、
-task slots 必须等于 manifest/worker profile（当前 30 GiB Windows profile 为 1）、window=16、retention=600s、cleanup=30s。它连续三次走 96×48 `M7` PNG 的精确 OCR
+task slots 与 pending 必须同时等于 versioned serial manifest/worker profile 的 1，window=16、retention=600s、cleanup=30s；2/2、3/3 与 1/3 均 fail-closed。它连续三次走 96×48 `M7` PNG 的精确 OCR
 多模态请求，再通过固定 API 对冻结单页 PDF 跑一次官方 full-PDF Hybrid-medium writer/artifact reader。
 API before/after 必须原样保留 retained terminal gauges 且两端 queued=processing=0；smoke 成功由
 official writer、ProviderDocument 和清理证据证明，不对 completed/failed 人口 gauge 做差值推断。独立 `TMPDIR`、MinerU 进程和

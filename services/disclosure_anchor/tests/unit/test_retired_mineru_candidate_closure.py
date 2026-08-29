@@ -12,6 +12,8 @@ class RetiredMineruCandidateClosureTests(unittest.TestCase):
         active_paths = (
             service_root / "Makefile",
             service_root / "config/mineru-windows.compose.yaml",
+            service_root / "config/README.md",
+            service_root / "docs/implementation/runbooks/production-operations.md",
             service_root / "scripts/attest_mineru_remote_runtime.py",
             service_root / "scripts/collect_mineru_phase_trace.py",
             service_root / "scripts/windows/collect_mineru_runtime.ps1",
@@ -22,6 +24,14 @@ class RetiredMineruCandidateClosureTests(unittest.TestCase):
             / "src/disclosure_anchor/adapters/runtime/mineru_phase_trace.py",
             service_root
             / "src/disclosure_anchor/adapters/runtime/mineru_phase_trace_capture.py",
+            service_root / "src/disclosure_anchor/settings.py",
+            service_root / "src/disclosure_anchor/adapters/runtime/mineru_identity.py",
+            service_root
+            / "src/disclosure_anchor/adapters/runtime/mineru_deployment_gate.py",
+            service_root
+            / "src/disclosure_anchor/application/contracts/mineru_api_health.py",
+            service_root
+            / "src/disclosure_anchor/adapters/runtime/mineru_orchestrator.py",
         )
         retired_tokens = (
             "MINERU_" + "CAPACITY_PROFILE_JSON",
@@ -35,6 +45,8 @@ class RetiredMineruCandidateClosureTests(unittest.TestCase):
             "window_" + "release",
             "trace_ready_" + "ns",
             "process_stage_" + "gates",
+            "MINERU_API_MAX_SUPPORTED_" + "TASK_SLOTS",
+            "MINERU_API_MAX_SUPPORTED_" + "PENDING_TASKS",
             '"legacy", "' + "candidate" + '"',
             '"legacy"' + "|" + '"candidate"',
         )

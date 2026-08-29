@@ -341,19 +341,33 @@ class WorkerProgressTests(unittest.TestCase):
         self.assertEqual(observed["max_concurrent_requests"], 3)
         self.assertEqual(observed["max_pending_tasks_requested"], 4)
         self.assertEqual(observed["max_pending_tasks_effective"], 4)
-        for task_slots in (1, 2, 3):
-            accepted = {
-                **payload,
+        serial = {
+            **payload,
+            "queued_tasks": 0,
+            "processing_tasks": 1,
+            "max_concurrent_requests": 1,
+            "max_pending_tasks_requested": 1,
+            "max_pending_tasks_effective": 1,
+        }
+        self.assertEqual(
+            mineru_api_health_snapshot(
+                json.dumps(serial).encode(), expected_task_slots=1
+            )["max_concurrent_requests"],
+            1,
+        )
+        for task_slots, pending in ((2, 2), (3, 3), (1, 3)):
+            rejected = {
+                **serial,
                 "max_concurrent_requests": task_slots,
-                "processing_tasks": min(2, task_slots),
+                "max_pending_tasks_requested": pending,
+                "max_pending_tasks_effective": pending,
             }
-            self.assertEqual(
+            with self.subTest(slots=task_slots, pending=pending), self.assertRaises(
+                ValueError
+            ):
                 mineru_api_health_snapshot(
-                    json.dumps(accepted).encode(),
-                    expected_task_slots=task_slots,
-                )["max_concurrent_requests"],
-                task_slots,
-            )
+                    json.dumps(rejected).encode(), expected_task_slots=1
+                )
         with self.assertRaises(ValueError):
             mineru_api_health_snapshot(
                 _api_health_payload(),
@@ -429,7 +443,16 @@ class WorkerProgressTests(unittest.TestCase):
             },
         ), patch(
             "disclosure_anchor.adapters.runtime.worker_progress._fetch_api_health",
-            return_value=_api_health_payload(),
+            return_value=json.dumps(
+                {
+                    **json.loads(_api_health_payload()),
+                    "queued_tasks": 0,
+                    "processing_tasks": 1,
+                    "max_concurrent_requests": 1,
+                    "max_pending_tasks_requested": 1,
+                    "max_pending_tasks_effective": 1,
+                }
+            ).encode(),
         ) as fetch_api, patch(
             "disclosure_anchor.adapters.runtime.worker_progress._fetch_metrics",
             side_effect=[RuntimeError("offline")],
@@ -441,8 +464,8 @@ class WorkerProgressTests(unittest.TestCase):
             base_settings = _settings(
                 Path(tmp),
                 disclosure_gpu_metrics_url="http://127.0.0.1:30004/metrics",
-                disclosure_mineru_api_task_slots=3,
-                worker_gpu_request_budget=21,
+                disclosure_mineru_api_task_slots=1,
+                worker_gpu_request_budget=7,
             )
             settings = self._with_progress_urls(
                 base_settings,
@@ -457,7 +480,7 @@ class WorkerProgressTests(unittest.TestCase):
             )
 
         self.assertEqual(event["orchestration"]["status"], "available")
-        self.assertEqual(event["orchestration"]["queued_tasks"], 2)
+        self.assertEqual(event["orchestration"]["queued_tasks"], 0)
         self.assertEqual(event["inference"]["reason"], "endpoint_unreachable")
         self.assertEqual(event["gpu"]["reason"], "metric_contract_unsatisfied")
         fetch_api.assert_called_once_with(

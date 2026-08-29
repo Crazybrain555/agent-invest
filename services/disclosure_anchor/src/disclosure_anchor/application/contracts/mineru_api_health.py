@@ -51,11 +51,13 @@ def validate_mineru_api_health(
 ) -> MineruApiHealth:
     if not isinstance(decoded, dict) or set(decoded) != MINERU_API_HEALTH_FIELDS:
         raise ValueError("MinerU API health fields are not closed")
-    if (
-        expected_task_slots is not None
-        and decoded.get("max_concurrent_requests") != expected_task_slots
+    if expected_task_slots is not None and (
+        expected_task_slots != 1
+        or decoded.get("max_concurrent_requests") != 1
+        or decoded.get("max_pending_tasks_requested") != 1
+        or decoded.get("max_pending_tasks_effective") != 1
     ):
-        raise ValueError("MinerU API task-slot limit drifted")
+        raise ValueError("MinerU API task-slot/pending limit drifted")
     if (
         decoded.get("status") != "healthy"
         or decoded.get("version") != "3.4.4"

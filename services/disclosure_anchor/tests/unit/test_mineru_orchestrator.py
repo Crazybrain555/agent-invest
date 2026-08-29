@@ -23,9 +23,9 @@ def _payload(**overrides: object) -> bytes:
         "processing_tasks": 0,
         "completed_tasks": 1,
         "failed_tasks": 0,
-        "max_concurrent_requests": 3,
-        "max_pending_tasks_requested": 3,
-        "max_pending_tasks_effective": 3,
+        "max_concurrent_requests": 1,
+        "max_pending_tasks_requested": 1,
+        "max_pending_tasks_effective": 1,
         "processing_window_size": 16,
         "task_retention_seconds": 600,
         "task_cleanup_interval_seconds": 30,
@@ -50,24 +50,24 @@ class MinerUOrchestratorTests(unittest.TestCase):
         ):
             health = fetch_mineru_orchestrator_health(
                 "http://127.0.0.1:30002",
-                expected_task_slots=3,
+                expected_task_slots=1,
                 expected_task_retention_seconds=600,
                 expected_cleanup_interval_seconds=30,
             )
         self.assertEqual(health.active_tasks, 0)
-        self.assertEqual(health.max_concurrent_requests, 3)
+        self.assertEqual(health.max_concurrent_requests, 1)
         transport.close.assert_called_once()
 
         cases = (
-            ({"max_concurrent_requests": 2}, "task-slot limit drifted"),
+            ({"max_concurrent_requests": 2}, "task-slot/pending limit drifted"),
             ({"version": "3.4.5"}, None),
             ({"protocol_version": 1}, None),
-            ({"max_concurrent_requests": 4}, None),
+            ({"max_concurrent_requests": 3}, None),
             ({"processing_window_size": 64}, None),
             ({"queued_tasks": -1}, None),
-            ({"processing_tasks": 4}, None),
-            ({"max_pending_tasks_requested": 4}, None),
-            ({"max_pending_tasks_effective": 2}, None),
+            ({"processing_tasks": 2}, None),
+            ({"max_pending_tasks_requested": 3}, None),
+            ({"max_pending_tasks_effective": 3}, "task-slot/pending limit drifted"),
             ({"queued_tasks": 14, "processing_tasks": 3}, None),
             ({"extra": 1}, None),
         )
@@ -99,7 +99,7 @@ class MinerUOrchestratorTests(unittest.TestCase):
                 return_value=self._transport(payload),
             ), self.assertRaises(MinerUOrchestratorError):
                 fetch_mineru_orchestrator_health(
-                    "http://127.0.0.1:30002", expected_task_slots=3
+                    "http://127.0.0.1:30002", expected_task_slots=1
                 )
 
     def test_wait_for_idle_observes_natural_drain_on_one_client(self) -> None:

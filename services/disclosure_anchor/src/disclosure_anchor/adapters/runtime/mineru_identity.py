@@ -16,9 +16,7 @@ RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v8"
 MINERU_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_PROTOCOL_VERSION = 2
 MINERU_API_DEFAULT_TASK_SLOTS = 1
-MINERU_API_MAX_SUPPORTED_TASK_SLOTS = 3
 MINERU_API_DEFAULT_MAX_PENDING_TASKS = 1
-MINERU_API_MAX_SUPPORTED_PENDING_TASKS = 8
 MINERU_API_INFERENCE_MAX_CONCURRENCY = 7
 MINERU_HYBRID_BATCH_RATIO = 1
 MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED = True
@@ -364,11 +362,10 @@ def _verify_orchestrator_manifest(
     if (
         isinstance(task_slots, bool)
         or not isinstance(task_slots, int)
-        or not 1 <= task_slots <= MINERU_API_MAX_SUPPORTED_TASK_SLOTS
+        or task_slots != 1
     ):
         raise ValueError(
-            "runtime manifest orchestrator max_concurrent_requests must be "
-            f"between 1 and {MINERU_API_MAX_SUPPORTED_TASK_SLOTS}"
+            "runtime manifest orchestrator max_concurrent_requests must be 1"
         )
     pending_requested = orchestrator.get("max_pending_tasks_requested")
     pending_effective = orchestrator.get("max_pending_tasks_effective")
@@ -377,9 +374,8 @@ def _verify_orchestrator_manifest(
         or not isinstance(pending_requested, int)
         or isinstance(pending_effective, bool)
         or not isinstance(pending_effective, int)
-        or pending_requested != pending_effective
-        or pending_effective < task_slots
-        or pending_effective > MINERU_API_MAX_SUPPORTED_PENDING_TASKS
+        or pending_requested != 1
+        or pending_effective != 1
     ):
         raise ValueError("runtime manifest orchestrator pending task depth drifted")
     fixed_values = {
@@ -576,8 +572,6 @@ __all__ = [
     "MINERU_API_INFERENCE_MAX_CONCURRENCY",
     "MINERU_API_DEFAULT_TASK_SLOTS",
     "MINERU_API_DEFAULT_MAX_PENDING_TASKS",
-    "MINERU_API_MAX_SUPPORTED_PENDING_TASKS",
-    "MINERU_API_MAX_SUPPORTED_TASK_SLOTS",
     "MINERU_API_OUTPUT_ROOT_POLICY",
     "MINERU_API_PROTOCOL_VERSION",
     "MINERU_API_TASK_RETENTION_SECONDS",

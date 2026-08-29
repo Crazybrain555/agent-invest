@@ -191,7 +191,7 @@ class CapacitySourcesTests(unittest.TestCase):
             "task_cleanup_interval_seconds": 30,
         }
         accepted = sources._api_values(
-            json.dumps(base).encode(), expected_task_slots=3
+            json.dumps(base).encode(), expected_task_slots=None
         )
         self.assertEqual(accepted.max_pending_tasks_effective, 4)
         for mutation in (
@@ -202,7 +202,7 @@ class CapacitySourcesTests(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 sources._api_values(
                     json.dumps({**base, **mutation}).encode(),
-                    expected_task_slots=3,
+                    expected_task_slots=None,
                 )
 
     def test_both_api_health_consumers_reject_impossible_slot_state(self) -> None:
@@ -222,9 +222,9 @@ class CapacitySourcesTests(unittest.TestCase):
             "task_cleanup_interval_seconds": 30,
         }
         encoded = json.dumps(payload).encode()
-        with self.assertRaisesRegex(ValueError, "exceed"):
+        with self.assertRaisesRegex(ValueError, "task-slot/pending"):
             sources._api_values(encoded, expected_task_slots=1)
-        with self.assertRaisesRegex(ValueError, "exceed"):
+        with self.assertRaisesRegex(ValueError, "task-slot/pending"):
             progress.mineru_api_health_snapshot(encoded, expected_task_slots=1)
 
     def test_cross_host_gpu_timestamp_has_bounded_future_skew(self) -> None:

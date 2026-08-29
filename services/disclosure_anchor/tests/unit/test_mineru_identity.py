@@ -228,23 +228,25 @@ class MinerURuntimeIdentityV6Tests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _verify(manifest)
 
-        for task_slots in (1, 2, 3):
+        for task_slots in (2, 3):
             manifest = _manifest()
             orchestrator = manifest["orchestrator"]
             assert isinstance(orchestrator, dict)
             orchestrator["max_concurrent_requests"] = task_slots
             orchestrator["max_pending_tasks_requested"] = task_slots
             orchestrator["max_pending_tasks_effective"] = task_slots
-            self.assertEqual(_verify(manifest).max_concurrent_requests, task_slots)
+            with self.assertRaisesRegex(ValueError, "must be 1"):
+                _verify(manifest)
 
         manifest = _manifest()
         orchestrator = manifest["orchestrator"]
         assert isinstance(orchestrator, dict)
         orchestrator["max_pending_tasks_requested"] = 3
         orchestrator["max_pending_tasks_effective"] = 3
-        self.assertEqual(_verify(manifest).max_pending_tasks, 3)
+        with self.assertRaisesRegex(ValueError, "pending task depth"):
+            _verify(manifest)
 
-        for requested, effective in ((0, 0), (2, 3), (9, 9)):
+        for requested, effective in ((0, 0), (1, 3), (2, 2), (9, 9)):
             with self.subTest(pending=(requested, effective)):
                 manifest = _manifest()
                 orchestrator = manifest["orchestrator"]

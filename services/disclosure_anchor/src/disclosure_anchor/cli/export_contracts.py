@@ -81,6 +81,7 @@ def _contract_settings() -> Settings:
         disclosure_shared_root=shared_root,
         disclosure_runtime_root=data_root / "runtime",
         mineru_model_cache=shared_root / "model_cache" / "mineru",
+        mineru_processing_window_size=16,
         hf_home=shared_root / "model_cache" / "huggingface",
         modelscope_cache=shared_root / "model_cache" / "modelscope",
     )

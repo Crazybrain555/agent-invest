@@ -18,6 +18,7 @@ def _env(root: Path) -> dict[str, str]:
         "DISCLOSURE_SHARED_ROOT": str(shared_root),
         "DISCLOSURE_RUNTIME_ROOT": str(data_root / "runtime"),
         "MINERU_MODEL_CACHE": str(shared_root / "model_cache" / "mineru"),
+        "MINERU_PROCESSING_WINDOW_SIZE": "16",
         "HF_HOME": str(shared_root / "model_cache" / "huggingface"),
         "MODELSCOPE_CACHE": str(shared_root / "model_cache" / "modelscope"),
     }
@@ -119,9 +120,8 @@ class SettingsTests(unittest.TestCase):
             },
             clear=True,
         ):
-            two_slot = load_settings()
-        self.assertEqual(two_slot.disclosure_mineru_api_task_slots, 2)
-        self.assertEqual(two_slot.mineru_effective_inference_request_upper_bound, 14)
+            with self.assertRaises(ValidationError):
+                load_settings()
 
     def test_loads_required_environment(self) -> None:
         with (

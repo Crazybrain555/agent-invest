@@ -24,7 +24,6 @@ from disclosure_anchor.adapters.runtime.mineru_canary import (
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
-    MINERU_API_MAX_SUPPORTED_TASK_SLOTS,
     MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_SMOKE_INPUT_NAME,
     MINERU_SMOKE_INPUT_SHA256,
@@ -293,16 +292,18 @@ def verify_mineru_deployment_gate(
     )
     if not enabled:
         return None
-    if settings.mineru_processing_window_size != MINERU_PROCESSING_WINDOW_SIZE:
+    if (
+        "mineru_processing_window_size" not in settings.model_fields_set
+        or settings.mineru_processing_window_size != MINERU_PROCESSING_WINDOW_SIZE
+    ):
         raise MinerUDeploymentGateError(
-            "MINERU_PROCESSING_WINDOW_SIZE drifted from the deployment contract"
+            "MINERU_PROCESSING_WINDOW_SIZE is required and must equal the deployment contract"
         )
     if (
         settings.worker_parse_concurrency > MINERU_PROCESSING_WINDOW_SIZE
         or settings.worker_mineru_client_outstanding_window
         > settings.disclosure_mineru_api_task_slots
-        or settings.disclosure_mineru_api_task_slots
-        > MINERU_API_MAX_SUPPORTED_TASK_SLOTS
+        or settings.disclosure_mineru_api_task_slots != 1
         or settings.disclosure_mineru_api_inference_concurrency
         != MINERU_API_INFERENCE_MAX_CONCURRENCY
         or settings.worker_gpu_request_budget

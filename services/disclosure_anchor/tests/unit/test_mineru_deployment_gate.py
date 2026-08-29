@@ -343,6 +343,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             mineru_model_cache=shared / "mineru-cache",
             hf_home=shared / "hf",
             modelscope_cache=shared / "modelscope",
+            mineru_processing_window_size=16,
             disclosure_mineru_bin=mineru,
             disclosure_mineru_api_url=api_url,
             disclosure_mineru_observability_url=observability_url,

@@ -234,7 +234,7 @@ frontend snapshot 2 s；durable heartbeat 10–15 s。缺失/不支持显式 una
 1. 先落 closed schema、同步 telemetry、真实 durable-page KPI、ratio requested/effective identity；
 2. 落 final-POST global c7、process credits/A/C gates/model locks、bounded FastAPI admission 和 strict drain；
 3. 落 Mac parse/finalize 解耦，移除 huge 与 finalize Future 人为屏障；
-4. 所有确定性成功/异常/cancel/乱序/epoch 测试通过后，才允许 feature-flagged `task_slots=2`；
+4. 当前 serial v1 始终保持 `task_slots=pending=1`；任何多 owner 调度都必须另起版本化执行合同和验证面；
 5. 用独立 held-out 文档做 10–20 分钟验证：先 ratio 1/2/4/8 单槽隔离，再 slots/window/C 一次一维粗到细；
 6. correctness、memory、PSI、OOM、restart、preemption、drain 任一失败立即停止该 setting；
 7. 两次相邻提高的 goodput 改善均小于 `max(5%, 2×CV)`，或 GPU 在正 backlog 下持续忙且 ready queue

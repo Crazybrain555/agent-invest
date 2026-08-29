@@ -217,6 +217,13 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
     if relative_path == "mineru/cli/fast_api.py":
         source = _replace_exact(
             source,
+            "from mineru.utils.config_reader import get_processing_window_size\n",
+            "from mineru.utils.model_utils import strict_processing_window_size\n",
+            count=1,
+            label="FastAPI strict processing window import",
+        )
+        source = _replace_exact(
+            source,
             "def get_max_concurrent_requests() -> int:\n"
             "    return _configured_max_concurrent_requests\n\n\n"
             "def get_task_retention_seconds() -> int:\n",
@@ -373,11 +380,13 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         return _replace_exact(
             source,
             "        \"max_concurrent_requests\": get_max_concurrent_requests(),\n"
-            "        \"processing_window_size\": get_processing_window_size(\n",
+            "        \"processing_window_size\": get_processing_window_size(\n"
+            "            default=16\n"
+            "        ),\n",
             "        \"max_concurrent_requests\": get_max_concurrent_requests(),\n"
             "        \"max_pending_tasks_requested\": get_max_pending_tasks(),\n"
             "        \"max_pending_tasks_effective\": task_manager.max_nonterminal_tasks,\n"
-            "        \"processing_window_size\": get_processing_window_size(\n",
+            "        \"processing_window_size\": strict_processing_window_size(),\n",
             count=1,
             label="FastAPI pending depth health identity",
         )
@@ -419,6 +428,7 @@ _PHASE_TRACE_PHASES = frozenset({
 _PHASE_TRACE_OUTPUT_LOCK = threading.Lock()
 _PHASE_TRACE_PROCESS_EPOCH = uuid.uuid4().hex
 _SERIAL_PROFILE_SCHEMA = "mineru-serial-execution-profile.v1"
+_SERIAL_PROCESSING_WINDOW_SIZE = 16
 
 
 def is_phase_trace_enabled() -> bool:
@@ -432,6 +442,19 @@ def is_phase_trace_enabled() -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise RuntimeError("MINERU_PHASE_TRACE has an invalid value")
+
+
+def strict_processing_window_size() -> int:
+    """Require the versioned serial window without an implicit fallback."""
+    raw = os.getenv("MINERU_PROCESSING_WINDOW_SIZE")
+    if raw is None or not raw.isdigit() or str(int(raw)) != raw:
+        raise RuntimeError(
+            "MINERU_PROCESSING_WINDOW_SIZE must be a canonical positive integer"
+        )
+    value = int(raw)
+    if value != _SERIAL_PROCESSING_WINDOW_SIZE:
+        raise RuntimeError("MINERU_PROCESSING_WINDOW_SIZE must equal 16")
+    return value
 
 
 class _DisabledPhaseTrace:
@@ -994,12 +1017,20 @@ def trim_process_heap() -> bool:
             "from ...utils.model_utils import (\n"
             "    drain_owned_awaitable,\n"
             "    serial_execution_profile,\n"
+            "    strict_processing_window_size,\n"
             "    new_phase_trace,\n"
             "    trim_process_heap,\n"
             ")\n\n"
             "from ...utils.enum_class import ImageType\n",
             count=1,
             label="VLM import",
+        )
+        source = _replace_exact(
+            source,
+            "        configured_window_size = get_processing_window_size(default=64)\n",
+            "        configured_window_size = strict_processing_window_size()\n",
+            count=2,
+            label="VLM strict processing window",
         )
         source = _replace_exact(
             source,
@@ -1304,6 +1335,7 @@ def trim_process_heap() -> bool:
             "    crop_img,\n"
             "    get_vram,\n"
             "    serial_execution_profile,\n"
+            "    strict_processing_window_size,\n"
             "    new_phase_trace,\n"
             "    run_async_owned,\n"
             "    run_native_owned,\n"
@@ -1475,7 +1507,7 @@ def trim_process_heap() -> bool:
             source,
             "        configured_window_size = get_processing_window_size(default=64)\n"
             "        effective_window_size = min(page_count, configured_window_size) if page_count else 0\n",
-            "        configured_window_size = get_processing_window_size(default=64)\n"
+            "        configured_window_size = strict_processing_window_size()\n"
             "        execution_profile = serial_execution_profile(\n"
             "            configured_window_size\n"
             "        )\n"
@@ -1489,7 +1521,7 @@ def trim_process_heap() -> bool:
             source,
             "        configured_window_size = get_processing_window_size(default=64)\n"
             "        effective_window_size = min(page_count, configured_window_size) if page_count else 0\n",
-            "        configured_window_size = get_processing_window_size(default=64)\n"
+            "        configured_window_size = strict_processing_window_size()\n"
             "        execution_profile = serial_execution_profile(\n"
             "            configured_window_size\n"
             "        )\n"

@@ -67,7 +67,7 @@
 | DISCLOSURE_MINERU_API_URL | — | Mac→固定 MinerU API；只接受 loopback SSH forward，API 不得暴露到 Funnel/LAN |
 | DISCLOSURE_MINERU_OBSERVABILITY_URL | — | Mac→vLLM `/v1` observation/canary/metrics endpoint；与 API URL 分离 |
 | DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL | — | Windows API container→vLLM 的内部 Docker URL；Mac 不直接探测该 hostname |
-| DISCLOSURE_MINERU_API_TASK_SLOTS / API_INFERENCE_CONCURRENCY | 1 / 7 | 当前 30 GiB Windows profile 的 whole-PDF task 上限与每 task inference cap；1–3 可配置但必须重新 attestation + 两轮异构验证，不能只改 env |
+| DISCLOSURE_MINERU_API_TASK_SLOTS / API_INFERENCE_CONCURRENCY | 1 / 7 | 当前 versioned serial profile 只接受一个 whole-PDF owner；2/2、3/3 或 1/3 均不属于受支持执行面，未来调度器必须升版而非改 env |
 | DISCLOSURE_GPU_METRICS_URL | — | 可选真实 GPU exporter `/metrics`；Linux 用 DCGM，Windows 用受限 SSH loopback 的 pinned nvidia-smi exporter；未配置时明确 unavailable |
 | DISCLOSURE_GPU_EXPECTED_UUID | — | Windows exporter 观测到的唯一 GPU UUID；与安装 receipt 绑定，跨 UUID 指标或换卡会降级为 unavailable |
 | DISCLOSURE_DCGM_METRICS_URL | — | 旧 DCGM-only 兼容别名；若与通用 URL 同时配置必须完全相同 |

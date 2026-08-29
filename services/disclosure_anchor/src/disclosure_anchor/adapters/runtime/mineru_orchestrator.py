@@ -16,14 +16,16 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
     parse_mineru_api_health,
     validate_mineru_api_health,
 )
+from disclosure_anchor.adapters.runtime.mineru_identity import (
+    MINERU_PROCESSING_WINDOW_SIZE,
+)
 
 
 MINERU_API_VERSION = "3.4.4"
 MINERU_API_PROTOCOL_VERSION = 2
 MINERU_API_DEFAULT_TASK_SLOTS = 1
-MINERU_API_MAX_SUPPORTED_TASK_SLOTS = 3
 MINERU_API_INFERENCE_CONCURRENCY = 7
-MINERU_API_PROCESSING_WINDOW_SIZE = 16
+MINERU_API_PROCESSING_WINDOW_SIZE = MINERU_PROCESSING_WINDOW_SIZE
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_CLEANUP_INTERVAL_SECONDS = 30
 MAX_HEALTH_BYTES = 64 * 1024
@@ -54,7 +56,7 @@ class MinerUOrchestratorHealthClient:
         self,
         *,
         timeout_seconds: float = 15.0,
-        expected_task_slots: int | None = None,
+        expected_task_slots: int | None = MINERU_API_DEFAULT_TASK_SLOTS,
         expected_task_retention_seconds: int | None = (
             MINERU_API_TASK_RETENTION_SECONDS
         ),
@@ -170,7 +172,7 @@ def fetch_mineru_orchestrator_health(
     api_url: str,
     *,
     timeout_seconds: float = 15.0,
-    expected_task_slots: int | None = None,
+    expected_task_slots: int | None = MINERU_API_DEFAULT_TASK_SLOTS,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
 ) -> MinerUOrchestratorHealth:
@@ -209,7 +211,7 @@ def _decode_mineru_orchestrator_health(
 def parse_mineru_orchestrator_health_payload(
     decoded: object,
     *,
-    expected_task_slots: int | None = None,
+    expected_task_slots: int | None = MINERU_API_DEFAULT_TASK_SLOTS,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
 ) -> MinerUOrchestratorHealth:
@@ -232,7 +234,7 @@ def wait_for_mineru_orchestrator_idle(
     *,
     timeout_seconds: float,
     poll_seconds: float = 1.0,
-    expected_task_slots: int | None = None,
+    expected_task_slots: int | None = MINERU_API_DEFAULT_TASK_SLOTS,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
 ) -> tuple[MinerUOrchestratorHealth, float]:
@@ -286,7 +288,6 @@ __all__ = [
     "MINERU_API_PROCESSING_WINDOW_SIZE",
     "MINERU_API_PROTOCOL_VERSION",
     "MINERU_API_DEFAULT_TASK_SLOTS",
-    "MINERU_API_MAX_SUPPORTED_TASK_SLOTS",
     "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_API_CLEANUP_INTERVAL_SECONDS",
     "MINERU_API_VERSION",

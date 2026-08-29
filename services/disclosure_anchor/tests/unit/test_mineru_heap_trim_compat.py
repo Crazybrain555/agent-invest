@@ -134,7 +134,9 @@ async def aio_detect_cross_page_cell_merge(results, aio_batch_predict_fn):
 
 
 def _fast_api_fixture() -> str:
-    return '''_configured_max_concurrent_requests = 1
+    return '''from mineru.utils.config_reader import get_processing_window_size
+
+_configured_max_concurrent_requests = 1
 
 
 def get_max_concurrent_requests() -> int:
@@ -288,6 +290,7 @@ def _vlm_document_fixture(*, asynchronous: bool) -> str:
     )
     return (
         "    results = []\n    doc_closed = False\n    try:\n"
+        "        configured_window_size = get_processing_window_size(default=64)\n"
         "        logger.info(\n"
         "            f'VLM processing-window run. page_count={page_count}, '\n"
         "            f'window_size={configured_window_size}, total_windows={total_windows}'\n"
@@ -540,6 +543,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
 
     def test_fast_api_bounds_nonterminal_admission_and_drains_to_terminal(self) -> None:
         patched = patch_source("mineru/cli/fast_api.py", _fast_api_fixture())
+        patched = patched.split("\n", 1)[1]
 
         class HTTPExceptionStub(Exception):
             def __init__(self, *, status_code: int, detail: str) -> None:
@@ -566,6 +570,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             "utc_now_iso": lambda: "now",
             "logger": LoggerStub(),
             "os": os,
+            "strict_processing_window_size": lambda: 16,
         }
         with patch.dict(os.environ, {"MINERU_API_MAX_PENDING_TASKS": "2"}):
             exec(compile(patched, "fast-api.py", "exec"), namespace)
@@ -656,6 +661,35 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "anchor count drifted"):
             patch_source("mineru/utils/model_utils.py", patched)
 
+    def test_processing_window_is_required_canonical_and_versioned(self) -> None:
+        source = (
+            "import math\nimport os\nimport time\nimport gc\n"
+            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                patch_source("mineru/utils/model_utils.py", source),
+                "patched-model-utils.py",
+                "exec",
+            ),
+            namespace,
+        )
+        strict = namespace["strict_processing_window_size"]
+        for environment in ({}, {"MINERU_PROCESSING_WINDOW_SIZE": "016"}):
+            with self.subTest(environment=environment), patch.dict(
+                os.environ, environment, clear=True
+            ), self.assertRaisesRegex(RuntimeError, "canonical positive integer"):
+                strict()
+        with patch.dict(
+            os.environ, {"MINERU_PROCESSING_WINDOW_SIZE": "32"}, clear=True
+        ), self.assertRaisesRegex(RuntimeError, "must equal 16"):
+            strict()
+        with patch.dict(
+            os.environ, {"MINERU_PROCESSING_WINDOW_SIZE": "16"}, clear=True
+        ):
+            self.assertEqual(strict(), 16)
+
     def test_vlm_and_hybrid_trim_every_window_and_document(self) -> None:
         vlm = (
             "from ...utils.config_reader import get_device, get_processing_window_size\n\n"
@@ -684,6 +718,8 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertEqual(patched_hybrid.count('"window_postprocess",'), 2)
         self.assertEqual(patched_hybrid.count('"window_total",'), 2)
         self.assertIn("serial_execution_profile", patched_hybrid)
+        self.assertNotIn("get_processing_window_size(default=64)", patched_vlm)
+        self.assertNotIn("get_processing_window_size(default=64)", patched_hybrid)
 
     def test_phase_trace_is_default_off_content_free_and_strictly_closed(self) -> None:
         source = (
