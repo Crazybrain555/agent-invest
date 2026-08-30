@@ -243,13 +243,36 @@ def upgrade() -> None:
         RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE a {OPS_SCHEMA}.remote_parse_attempt%ROWTYPE;
         DECLARE target_attempt text;
+        DECLARE prepared_secret {OPS_SCHEMA}.remote_parse_v3_resume_secret%ROWTYPE;
+        DECLARE prepared_json jsonb;
+        DECLARE prepared_canonical text;
         BEGIN
           target_attempt := CASE WHEN TG_OP='DELETE' THEN OLD.attempt_id ELSE NEW.attempt_id END;
           SELECT * INTO a FROM {OPS_SCHEMA}.remote_parse_attempt
            WHERE attempt_id=target_attempt;
           IF NOT FOUND THEN IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END IF;
           IF a.checkpoint_contract_version=3 THEN
-            IF NOT EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='prepared_reconcile') THEN RAISE EXCEPTION 'v3 attempt lacks prepared secret'; END IF;
+            SELECT * INTO prepared_secret FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='prepared_reconcile';
+            IF NOT FOUND THEN RAISE EXCEPTION 'v3 attempt lacks prepared secret'; END IF;
+            BEGIN prepared_json := convert_from(prepared_secret.token_bytes,'UTF8')::jsonb; EXCEPTION WHEN others THEN RAISE EXCEPTION 'v3 prepared secret is not JSON'; END;
+            IF jsonb_typeof(prepared_json)<>'object' OR (SELECT count(*) FROM jsonb_object_keys(prepared_json))<>9 OR
+               prepared_json->>'schema'<>'remote_parse_prepared_reconcile.v1' OR
+               prepared_json->>'attempt_identity'<>a.attempt_id OR prepared_json->>'fence_identity'<>a.fence_identity OR
+               prepared_json->>'source_pdf_sha256'<>a.source_pdf_sha256 OR prepared_json->>'client_submit_key'<>a.client_submit_key OR
+               prepared_json->>'parser_target_sha256'<>a.parser_target_sha256 OR prepared_json->>'request_sha256'<>a.request_sha256 OR
+               prepared_json->>'runtime_epoch_sha256'<>a.runtime_epoch_sha256 OR
+               jsonb_typeof(prepared_json->'submission_epoch_unix')<>'number' OR
+               (prepared_json->>'submission_epoch_unix') !~ '^(0|[1-9][0-9]*)$'
+            THEN RAISE EXCEPTION 'v3 prepared secret projection drift'; END IF;
+            prepared_canonical := '{{"attempt_identity":' || to_jsonb(a.attempt_id)::text ||
+              ',"client_submit_key":' || to_jsonb(a.client_submit_key)::text ||
+              ',"fence_identity":' || to_jsonb(a.fence_identity)::text ||
+              ',"parser_target_sha256":' || to_jsonb(a.parser_target_sha256)::text ||
+              ',"request_sha256":' || to_jsonb(a.request_sha256)::text ||
+              ',"runtime_epoch_sha256":' || to_jsonb(a.runtime_epoch_sha256)::text ||
+              ',"schema":"remote_parse_prepared_reconcile.v1","source_pdf_sha256":' || to_jsonb(a.source_pdf_sha256)::text ||
+              ',"submission_epoch_unix":' || (prepared_json->'submission_epoch_unix')::text || '}}';
+            IF convert_from(prepared_secret.token_bytes,'UTF8')<>prepared_canonical THEN RAISE EXCEPTION 'v3 prepared secret is not canonical'; END IF;
             IF (a.state NOT IN ('prepared','reconciling','pre_submission_failed','superseded')) <> EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='accepted_submission') THEN RAISE EXCEPTION 'v3 accepted secret drift'; END IF;
             IF a.submitted_receipt_bytes IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='accepted_submission' AND s.token_sha256=(convert_from(a.submitted_receipt_bytes,'UTF8')::jsonb->>'resume_token_sha256')) THEN RAISE EXCEPTION 'v3 accepted token drift'; END IF;
             IF (a.terminal_receipt_bytes IS NOT NULL) <> EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='terminal') THEN RAISE EXCEPTION 'v3 terminal secret drift'; END IF;

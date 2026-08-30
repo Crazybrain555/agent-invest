@@ -83,7 +83,16 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             **{f"reservation_{name}": getattr(envelope.reservation, name) for name in credits},
             **{f"current_{name}": getattr(current, name) for name in credits},
         }
-        token = b"v3-prepared-secret"
+        token = encode_checkpoint_receipt(PreparedReconcileReceipt(
+            attempt_identity=self.attempt_id,
+            fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"),
+            client_submit_key="submit-" + self.attempt_id,
+            submission_epoch_unix=100,
+            parser_target_sha256=_PARSER_TARGET_SHA,
+            request_sha256=_sha("c"),
+            runtime_epoch_sha256=_sha("d"),
+        )).exact_bytes
         return models.RemoteParseAttempt(**values), models.RemoteParseV3ResumeSecret(
             attempt_id=self.attempt_id,
             secret_kind="prepared_reconcile",
@@ -104,10 +113,33 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         with self.engine.begin() as conn:
             conn.execute(text("DELETE FROM disclosure_ops.remote_parse_v3_resume_secret WHERE attempt_id=:a"), {"a": self.attempt_id})
             conn.execute(text("DELETE FROM disclosure_ops.remote_parse_attempt WHERE attempt_id=:a"), {"a": self.attempt_id})
-        for mutation in ("missing_secret", "partial_current", "extra_secret"):
+        for mutation in (
+            "missing_secret", "partial_current", "extra_secret",
+            "arbitrary_prepared", "wrong_prepared_field", "noncanonical_prepared",
+        ):
             parent, secret = self._v3_rows()
             if mutation == "partial_current":
                 parent.current_documents = None
+            if mutation == "arbitrary_prepared":
+                secret.token_bytes = b"{}"
+                secret.token_sha256 = "sha256:" + hashlib.sha256(b"{}").hexdigest()
+                secret.token_byte_count = 2
+            elif mutation == "wrong_prepared_field":
+                wrong = encode_checkpoint_receipt(PreparedReconcileReceipt(
+                    attempt_identity=self.attempt_id, fence_identity="wrong-fence",
+                    source_pdf_sha256=_sha("a"),
+                    client_submit_key="submit-" + self.attempt_id,
+                    submission_epoch_unix=100, parser_target_sha256=_PARSER_TARGET_SHA,
+                    request_sha256=_sha("c"), runtime_epoch_sha256=_sha("d"),
+                )).exact_bytes
+                secret.token_bytes = wrong
+                secret.token_sha256 = "sha256:" + hashlib.sha256(wrong).hexdigest()
+                secret.token_byte_count = len(wrong)
+            elif mutation == "noncanonical_prepared":
+                noncanonical = b" " + bytes(secret.token_bytes)
+                secret.token_bytes = noncanonical
+                secret.token_sha256 = "sha256:" + hashlib.sha256(noncanonical).hexdigest()
+                secret.token_byte_count = len(noncanonical)
             with self.subTest(mutation=mutation), Session(self.engine) as session:
                 session.add(parent)
                 if mutation != "missing_secret":
