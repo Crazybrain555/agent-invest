@@ -296,15 +296,15 @@ class _Backend:
                 credit_reservation=work.credit_reservation,
             )
         target = _work(work.attempt_id, "materializing", work.row_version + 1)
-        if not target.credits.fits(credit_allowance):
-            raise RetryStage("local credits unavailable", retry_after_seconds=0.001)
-        return replace(
+        updated = replace(
             target,
             claim_generation=work.claim_generation,
             claim_owner_identity=work.claim_owner_identity,
             lease_expires_monotonic=work.lease_expires_monotonic,
             credit_reservation=work.credit_reservation,
         )
+        self._assert_credit_grant(work, updated, credit_allowance)
+        return updated
 
     def run_local(
         self,

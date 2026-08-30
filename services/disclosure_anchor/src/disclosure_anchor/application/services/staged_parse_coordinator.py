@@ -695,7 +695,11 @@ class StagedParseCoordinator:
         ) -> CreditVector:
             names_by_lane = {
                 CoordinatorLane.PREFLIGHT: {"remote_waits"},
-                CoordinatorLane.REMOTE: {"retained_results", "retained_bytes"},
+                CoordinatorLane.REMOTE: {
+                    "retained_results",
+                    "retained_bytes",
+                    "ack_items",
+                },
                 CoordinatorLane.LOCAL_PREPARE: {
                     "local_items",
                     "compressed_bytes",
@@ -703,7 +707,11 @@ class StagedParseCoordinator:
                     "temp_disk_bytes",
                     "ack_items",
                 },
-                CoordinatorLane.LOCAL: {"db_stage_items", "unpublished_pages"},
+                CoordinatorLane.LOCAL: {
+                    "db_stage_items",
+                    "unpublished_pages",
+                    "ack_items",
+                },
                 CoordinatorLane.COMMIT: {"ack_items"},
                 CoordinatorLane.ACK: set(),
             }
@@ -983,12 +991,7 @@ class StagedParseCoordinator:
                             future = pools[lane].submit(
                                 self._backend.prepare_local_io,
                                 work,
-                                credit_allowance=(
-                                    work.credit_reservation
-                                    if work.attempt_id in oversubscribed_recovery
-                                    else ledger.limit
-                                    - (ledger.in_use - work.credits + provisional_local_total)
-                                ),
+                                credit_allowance=local_hold,
                                 stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.LOCAL:
