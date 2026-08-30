@@ -55,6 +55,16 @@ class RemoteParseCheckpointContractTests(unittest.TestCase):
         )
         self.assertTrue(grant.permits(CreditVector(documents=1, retained_results=1, retained_bytes=10)))
         self.assertFalse(grant.permits(CreditVector(documents=1, retained_results=1, retained_bytes=11)))
+        for dimension in CreditVector.__dataclass_fields__:
+            with self.subTest(dimension=dimension):
+                one = CreditVector(**{dimension: 1})
+                two = CreditVector(**{dimension: 2})
+                exact = CreditTransitionGrant(
+                    expected_current=CreditVector(),
+                    maximum_positive_delta=one,
+                )
+                self.assertTrue(exact.permits(one))
+                self.assertFalse(exact.permits(two))
         with self.assertRaisesRegex(ValueError, "exact vectors"):
             CreditTransitionGrant(  # type: ignore[arg-type]
                 expected_current={}, maximum_positive_delta=CreditVector()

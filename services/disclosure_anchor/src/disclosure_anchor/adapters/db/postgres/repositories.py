@@ -37,10 +37,16 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     decode_terminal_receipt,
 )
 from disclosure_anchor.application.contracts.staged_credit import (
+    CreditShapeFacts,
     CreditVector,
     DatabaseLeaseSnapshot,
+    STAGED_STATE_TRANSITIONS,
+    credit_shape,
 )
-from disclosure_anchor.application.ports.repositories import ClaimedAttemptSnapshot
+from disclosure_anchor.application.ports.repositories import (
+    ClaimedAttemptSnapshot,
+    CreditTransitionGrant,
+)
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
     encode_durable_checkpoint_witness,
@@ -1413,6 +1419,359 @@ class RemoteParseAttemptRepository:
         result = self._session.execute(statement).one_or_none()
         if result is None:
             raise RemoteParseCheckpointConflict("v3 recovery reload lost exact live claim")
+        return self._claimed_snapshot(result[0], result[1], result[2])
+
+    @staticmethod
+    def _validate_expected_v3_attempt(attempt: RemoteParseAttempt) -> None:
+        if not (
+            type(attempt) is RemoteParseAttempt
+            and attempt.checkpoint_contract_version == 3
+            and attempt.is_current
+            and 0 <= attempt.row_version < _MAX_SIGNED_BIGINT
+            and attempt.claim_generation >= 1
+            and attempt.claim_owner_identity is not None
+            and attempt.claim_lease_until is not None
+            and type(attempt.current_credits) is CreditVector
+            and type(attempt.reservation) is CreditVector
+        ):
+            raise ValueError("v3 lifecycle CAS requires an exact claimed attempt")
+
+    @staticmethod
+    def _v3_secret_row(
+        secret: RemoteParseResumeSecret,
+        *, attempt_id: str,
+        kind: str,
+        token_sha256: str,
+    ) -> models.RemoteParseV3ResumeSecret:
+        if not (
+            isinstance(secret, RemoteParseResumeSecret)
+            and secret.secret_contract_version == 3
+            and secret.attempt_id == attempt_id
+            and secret.secret_kind == kind
+            and secret.token_sha256 == token_sha256
+        ):
+            raise ValueError(f"v3 {kind} secret drifted from lifecycle receipt")
+        return models.RemoteParseV3ResumeSecret(
+            attempt_id=secret.attempt_id,
+            secret_kind=secret.secret_kind,
+            token_bytes=secret.token_bytes,
+            token_sha256=secret.token_sha256,
+            token_byte_count=secret.token_byte_count,
+        )
+
+    def _transition_v3_lifecycle(
+        self,
+        *,
+        expected: RemoteParseAttempt,
+        next_state: str,
+        candidate_current: CreditVector,
+        grant: CreditTransitionGrant,
+        extra_values: Mapping[str, Any] | None = None,
+        secret_row: models.RemoteParseV3ResumeSecret | None = None,
+    ) -> ClaimedAttemptSnapshot:
+        self._validate_expected_v3_attempt(expected)
+        assert isinstance(expected.current_credits, CreditVector)
+        assert isinstance(expected.reservation, CreditVector)
+        if next_state not in STAGED_STATE_TRANSITIONS.get(expected.state, frozenset()):
+            raise ValueError("v3 lifecycle transition is not in the closed state graph")
+        if type(grant) is not CreditTransitionGrant or (
+            grant.expected_current != expected.current_credits
+        ):
+            raise ValueError("v3 lifecycle credit grant drifted from expected attempt")
+        if type(candidate_current) is not CreditVector or not candidate_current.fits(
+            expected.reservation
+        ):
+            raise ValueError("v3 lifecycle candidate exceeds immutable reservation")
+        if not grant.permits(candidate_current):
+            raise ValueError("v3 lifecycle candidate exceeds positive credit grant")
+        clock = self._database_clock()
+        remaining = sa.cast(
+            sa.func.floor(
+                sa.extract(
+                    "epoch",
+                    models.RemoteParseAttempt.claim_lease_until
+                    - clock.c.database_observed_at,
+                ) * 1_000_000
+            ),
+            sa.BigInteger,
+        ).label("remaining_microseconds")
+        values: dict[str, Any] = {
+            "state": next_state,
+            "row_version": expected.row_version + 1,
+            "updated_at": clock.c.database_observed_at,
+            **{
+                f"current_{name}": getattr(candidate_current, name)
+                for name in candidate_current.__dataclass_fields__
+            },
+        }
+        if extra_values:
+            values.update(extra_values)
+        statement = (
+            sa.update(models.RemoteParseAttempt)
+            .where(
+                models.RemoteParseAttempt.attempt_id == expected.attempt_id,
+                models.RemoteParseAttempt.fence_identity == expected.fence_identity,
+                models.RemoteParseAttempt.checkpoint_contract_version == 3,
+                models.RemoteParseAttempt.is_current.is_(True),
+                models.RemoteParseAttempt.state == expected.state,
+                models.RemoteParseAttempt.row_version == expected.row_version,
+                models.RemoteParseAttempt.claim_owner_identity
+                == expected.claim_owner_identity,
+                models.RemoteParseAttempt.claim_generation
+                == expected.claim_generation,
+                models.RemoteParseAttempt.claim_lease_until
+                > clock.c.database_observed_at,
+                *self._v3_current_predicates(expected.current_credits),
+            )
+            .values(**values)
+            .returning(
+                models.RemoteParseAttempt,
+                clock.c.database_observed_at,
+                remaining,
+            )
+        )
+        with self._session.begin_nested():
+            if secret_row is not None:
+                self._session.execute(
+                    pg_insert(models.RemoteParseV3ResumeSecret)
+                    .values(
+                        attempt_id=secret_row.attempt_id,
+                        secret_kind=secret_row.secret_kind,
+                        token_bytes=secret_row.token_bytes,
+                        token_sha256=secret_row.token_sha256,
+                        token_byte_count=secret_row.token_byte_count,
+                    )
+                    .on_conflict_do_nothing()
+                )
+            result = self._session.execute(statement).one_or_none()
+            if result is None:
+                raise RemoteParseCheckpointConflict("v3 lifecycle transition lost exact CAS")
+            snapshot = self._claimed_snapshot(result[0], result[1], result[2])
+        return snapshot
+
+    def transition_v3_reconciling(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant,
+    ) -> ClaimedAttemptSnapshot:
+        if expected_attempt.state != "prepared":
+            raise ValueError("v3 reconciling transition requires prepared state")
+        return self._transition_v3_lifecycle(
+            expected=expected_attempt,
+            next_state="reconciling",
+            candidate_current=credit_shape("reconciling", CreditShapeFacts()),
+            grant=grant,
+        )
+
+    def checkpoint_v3_submitted(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+        accepted_secret: RemoteParseResumeSecret,
+    ) -> ClaimedAttemptSnapshot:
+        validated = decode_checkpoint_receipt(receipt.exact_bytes)
+        accepted = validated.receipt
+        if validated != receipt or not isinstance(accepted, AcceptedSubmissionReceipt):
+            raise ValueError("v3 submitted receipt is not canonical accepted evidence")
+        if not (
+            expected_attempt.state == "reconciling"
+            and accepted.attempt_identity == expected_attempt.attempt_id
+            and accepted.fence_identity == expected_attempt.fence_identity
+            and accepted.source_pdf_sha256 == expected_attempt.source_pdf_sha256
+            and accepted.client_submit_key == expected_attempt.client_submit_key
+        ):
+            raise ValueError("v3 accepted receipt drifted from expected attempt")
+        prepared_secret = self._session.get(
+            models.RemoteParseV3ResumeSecret,
+            (expected_attempt.attempt_id, "prepared_reconcile"),
+        )
+        if prepared_secret is None:
+            raise RemoteParseCheckpointConflict("v3 prepared secret is absent")
+        prepared = decode_checkpoint_receipt(bytes(prepared_secret.token_bytes)).receipt
+        if not isinstance(prepared, PreparedReconcileReceipt) or (
+            prepared.submission_epoch_unix != accepted.submission_epoch_unix
+            or prepared.attempt_identity != accepted.attempt_identity
+            or prepared.fence_identity != accepted.fence_identity
+            or prepared.source_pdf_sha256 != accepted.source_pdf_sha256
+            or prepared.client_submit_key != accepted.client_submit_key
+        ):
+            raise ValueError("v3 accepted receipt drifted from prepared evidence")
+        secret_row = self._v3_secret_row(
+            accepted_secret,
+            attempt_id=expected_attempt.attempt_id,
+            kind="accepted_submission",
+            token_sha256=accepted.resume_token_sha256,
+        )
+        return self._transition_v3_lifecycle(
+            expected=expected_attempt,
+            next_state="submitted",
+            candidate_current=credit_shape("submitted", CreditShapeFacts()),
+            grant=grant,
+            extra_values={
+                "remote_task_identity": accepted.remote_task_identity,
+                "submitted_receipt_sha256": validated.sha256,
+                "submitted_receipt_bytes": validated.exact_bytes,
+                "submitted_receipt_byte_count": validated.byte_count,
+            },
+            secret_row=secret_row,
+        )
+
+    def checkpoint_v3_terminal(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedTerminalReceipt,
+        terminal_secret: RemoteParseResumeSecret,
+    ) -> ClaimedAttemptSnapshot:
+        validated = decode_terminal_receipt(receipt.exact_bytes)
+        terminal = validated.receipt
+        if validated != receipt or not (
+            expected_attempt.state == "submitted"
+            and terminal.attempt_identity == expected_attempt.attempt_id
+            and terminal.fence_identity == expected_attempt.fence_identity
+            and terminal.source_pdf_sha256 == expected_attempt.source_pdf_sha256
+        ):
+            raise ValueError("v3 terminal receipt drifted from expected attempt")
+        secret_row = self._v3_secret_row(
+            terminal_secret,
+            attempt_id=expected_attempt.attempt_id,
+            kind="terminal",
+            token_sha256=terminal.resume_token_sha256,
+        )
+        candidate = credit_shape(
+            "remote_terminal",
+            CreditShapeFacts(terminal_byte_count=terminal.artifact_byte_count),
+        )
+        return self._transition_v3_lifecycle(
+            expected=expected_attempt,
+            next_state="remote_terminal",
+            candidate_current=candidate,
+            grant=grant,
+            extra_values={
+                "terminal_receipt_sha256": validated.sha256,
+                "terminal_receipt_bytes": validated.exact_bytes,
+                "terminal_receipt_byte_count": validated.byte_count,
+                "result_owner_identity": terminal.artifact_owner_identity,
+                "result_artifact_sha256": terminal.artifact_sha256,
+                "result_artifact_bytes": terminal.artifact_byte_count,
+            },
+            secret_row=secret_row,
+        )
+
+    def prepare_v3_materialization(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+        materialization_secret: RemoteParseResumeSecret,
+    ) -> ClaimedAttemptSnapshot:
+        validated = decode_checkpoint_receipt(receipt.exact_bytes)
+        materialization = validated.receipt
+        if validated != receipt or not isinstance(
+            materialization, PreparedMaterializationReceiptV2
+        ):
+            raise ValueError("v3 materialization receipt is not canonical")
+        if not (
+            expected_attempt.state == "remote_terminal"
+            and materialization.attempt_identity == expected_attempt.attempt_id
+            and materialization.fence_identity == expected_attempt.fence_identity
+            and materialization.source_pdf_sha256 == expected_attempt.source_pdf_sha256
+            and materialization.source_page_count
+            == expected_attempt.reservation_source_page_count
+            and materialization.terminal_receipt_sha256
+            == expected_attempt.terminal_receipt_sha256
+            and materialization.process_profile_sha256
+            == expected_attempt.process_profile_sha256
+            and materialization.credit_policy_sha256
+            == expected_attempt.credit_policy_sha256
+            and materialization.reservation_input_sha256
+            == expected_attempt.reservation_input_sha256
+            and materialization.spool_byte_count
+            == expected_attempt.result_artifact_bytes
+            and materialization.spool_sha256
+            == expected_attempt.result_artifact_sha256
+            and materialization.compressed_byte_count
+            == expected_attempt.result_artifact_bytes
+        ):
+            raise ValueError("v3 materialization receipt drifted from terminal attempt")
+        secret_row = self._v3_secret_row(
+            materialization_secret,
+            attempt_id=expected_attempt.attempt_id,
+            kind="materialization",
+            token_sha256=materialization.private_token_sha256,
+        )
+        candidate = credit_shape(
+            "materializing",
+            CreditShapeFacts(
+                terminal_byte_count=expected_attempt.result_artifact_bytes or 0,
+                compressed_byte_count=materialization.compressed_byte_count,
+                uncompressed_byte_count=materialization.uncompressed_byte_count,
+                decoded_byte_count=materialization.decoded_byte_count,
+                temporary_disk_byte_count=materialization.temporary_disk_byte_count,
+                source_page_count=materialization.source_page_count,
+                materialization_prepared=True,
+            ),
+        )
+        return self._transition_v3_lifecycle(
+            expected=expected_attempt,
+            next_state="materializing",
+            candidate_current=candidate,
+            grant=grant,
+            extra_values={
+                "materialization_receipt_sha256": validated.sha256,
+                "materialization_receipt_bytes": validated.exact_bytes,
+                "materialization_receipt_byte_count": validated.byte_count,
+                "materialization_source_page_count": materialization.source_page_count,
+                "materialization_spool_relpath": materialization.spool_relpath,
+                "materialization_spool_sha256": materialization.spool_sha256,
+                "materialization_spool_byte_count": materialization.spool_byte_count,
+                "materialization_compressed_byte_count": materialization.compressed_byte_count,
+                "materialization_uncompressed_byte_count": materialization.uncompressed_byte_count,
+                "materialization_temp_disk_byte_count": materialization.temporary_disk_byte_count,
+                "materialization_decoded_byte_count": materialization.decoded_byte_count,
+                "materialization_member_count": materialization.member_count,
+                "materialization_token_sha256": materialization.private_token_sha256,
+            },
+            secret_row=secret_row,
+        )
+
+    def reconcile_v3_claim_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+        next_state: str, next_current: CreditVector,
+    ) -> ClaimedAttemptSnapshot:
+        self._validate_expected_v3_attempt(expected_attempt)
+        assert isinstance(expected_attempt.current_credits, CreditVector)
+        if next_state not in STAGED_STATE_TRANSITIONS.get(
+            expected_attempt.state, frozenset()
+        ) or type(next_current) is not CreditVector:
+            raise ValueError("v3 race reconciliation next projection is invalid")
+        clock = self._database_clock()
+        remaining = sa.cast(sa.func.floor(sa.extract(
+            "epoch", models.RemoteParseAttempt.claim_lease_until
+            - clock.c.database_observed_at
+        ) * 1_000_000), sa.BigInteger).label("remaining_microseconds")
+        old_projection = sa.and_(
+            models.RemoteParseAttempt.state == expected_attempt.state,
+            models.RemoteParseAttempt.row_version == expected_attempt.row_version,
+            *self._v3_current_predicates(expected_attempt.current_credits),
+        )
+        next_projection = sa.and_(
+            models.RemoteParseAttempt.state == next_state,
+            models.RemoteParseAttempt.row_version == expected_attempt.row_version + 1,
+            *self._v3_current_predicates(next_current),
+        )
+        statement = sa.select(
+            models.RemoteParseAttempt, clock.c.database_observed_at, remaining,
+        ).where(
+            models.RemoteParseAttempt.attempt_id == expected_attempt.attempt_id,
+            models.RemoteParseAttempt.fence_identity == expected_attempt.fence_identity,
+            models.RemoteParseAttempt.checkpoint_contract_version == 3,
+            models.RemoteParseAttempt.is_current.is_(True),
+            models.RemoteParseAttempt.claim_owner_identity
+            == expected_attempt.claim_owner_identity,
+            models.RemoteParseAttempt.claim_generation
+            == expected_attempt.claim_generation,
+            models.RemoteParseAttempt.claim_lease_until
+            > clock.c.database_observed_at,
+            sa.or_(old_projection, next_projection),
+        )
+        result = self._session.execute(statement).one_or_none()
+        if result is None:
+            raise RemoteParseCheckpointConflict("v3 race reconciliation lost exact projection")
         return self._claimed_snapshot(result[0], result[1], result[2])
 
     def claim_recovery(

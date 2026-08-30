@@ -6,6 +6,7 @@ import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -32,10 +33,12 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     encode_terminal_receipt,
 )
 from disclosure_anchor.application.contracts.staged_credit import (
+    CreditVector,
     CreditShapeFacts,
     build_staged_credit_envelope,
     credit_shape,
 )
+from disclosure_anchor.application.ports.repositories import CreditTransitionGrant
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
 from tests.unit.test_mineru_process_profile import _profile
@@ -590,6 +593,254 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 engine=self.engine
             ) as uow, self.assertRaises(ValueError):
                 call(uow.remote_parse_attempts)
+
+    def test_v3_lifecycle_receipts_grants_and_race_reconciliation(self) -> None:
+        attempt, secret = self._v3_attempt_and_secret()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+            assert created.current_credits is not None
+            claimed = uow.remote_parse_attempts.claim_v3_recovery(
+                attempt_id=self.attempt_id, fence_identity="fence-1",
+                expected_state="prepared", expected_version=0,
+                expected_current=created.current_credits,
+                owner_identity="worker-v3-a", lease_seconds=60,
+            ).attempt
+            assert claimed.reservation is not None
+            reconciling_current = credit_shape("reconciling", CreditShapeFacts())
+            reconciling = uow.remote_parse_attempts.transition_v3_reconciling(
+                expected_attempt=claimed,
+                grant=CreditTransitionGrant(
+                    expected_current=claimed.current_credits,
+                    maximum_positive_delta=claimed.reservation,
+                ),
+            ).attempt
+            uow.commit()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            replay = uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+                expected_attempt=claimed,
+                next_state="reconciling",
+                next_current=reconciling_current,
+            )
+        self.assertEqual(replay.attempt, reconciling)
+
+        accepted_token = b"v3-accepted-token"
+        accepted_receipt = encode_checkpoint_receipt(AcceptedSubmissionReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"),
+            client_submit_key="submit-" + self.attempt_id,
+            submission_epoch_unix=100, remote_task_identity="task-v3",
+            status_url="http://private/tasks/task-v3",
+            result_url="http://private/tasks/task-v3/result",
+            resume_token_sha256="sha256:" + hashlib.sha256(accepted_token).hexdigest(),
+        ))
+        accepted_secret = RemoteParseResumeSecret(
+            attempt_id=self.attempt_id, secret_kind="accepted_submission",
+            token_bytes=accepted_token,
+            token_sha256="sha256:" + hashlib.sha256(accepted_token).hexdigest(),
+            token_byte_count=len(accepted_token), secret_contract_version=3,
+        )
+        assert reconciling.reservation is not None
+        wrong_accepted = encode_checkpoint_receipt(replace(
+            accepted_receipt.receipt, source_pdf_sha256=_sha("f")
+        ))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            ValueError, "drifted from expected attempt"
+        ):
+            uow.remote_parse_attempts.checkpoint_v3_submitted(
+                expected_attempt=reconciling,
+                grant=CreditTransitionGrant(
+                    expected_current=reconciling.current_credits,
+                    maximum_positive_delta=reconciling.reservation,
+                ), receipt=wrong_accepted, accepted_secret=accepted_secret,
+            )
+        race_barrier = threading.Barrier(2)
+
+        def renew_or_submit(action: str) -> str:
+            race_barrier.wait()
+            try:
+                with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                    if action == "renew":
+                        result = uow.remote_parse_attempts.renew_v3_claim(
+                            attempt_id=self.attempt_id, fence_identity="fence-1",
+                            expected_state="reconciling",
+                            expected_version=reconciling.row_version,
+                            expected_current=reconciling.current_credits,
+                            owner_identity="worker-v3-a",
+                            claim_generation=reconciling.claim_generation,
+                            lease_seconds=60,
+                        ).attempt
+                    else:
+                        result = uow.remote_parse_attempts.checkpoint_v3_submitted(
+                            expected_attempt=reconciling,
+                            grant=CreditTransitionGrant(
+                                expected_current=reconciling.current_credits,
+                                maximum_positive_delta=reconciling.reservation,
+                            ), receipt=accepted_receipt,
+                            accepted_secret=accepted_secret,
+                        ).attempt
+                    uow.commit()
+                    return result.state
+            except RemoteParseCheckpointConflict:
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            race_outcomes = tuple(pool.map(renew_or_submit, ("renew", "submit")))
+        self.assertIn("submitted", race_outcomes)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            submitted = uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+                expected_attempt=reconciling,
+                next_state="submitted",
+                next_current=credit_shape("submitted", CreditShapeFacts()),
+            ).attempt
+
+        terminal_token = b"v3-terminal-token"
+        terminal_receipt = encode_terminal_receipt(TerminalReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"), artifact_owner_identity="owner-v3",
+            artifact_byte_count=10, artifact_sha256=_sha("e"),
+            resume_token_sha256="sha256:" + hashlib.sha256(terminal_token).hexdigest(),
+        ))
+        terminal_secret = RemoteParseResumeSecret(
+            attempt_id=self.attempt_id, secret_kind="terminal",
+            token_bytes=terminal_token,
+            token_sha256="sha256:" + hashlib.sha256(terminal_token).hexdigest(),
+            token_byte_count=len(terminal_token), secret_contract_version=3,
+        )
+        wrong_terminal = encode_terminal_receipt(replace(
+            terminal_receipt.receipt, source_pdf_sha256=_sha("f")
+        ))
+        assert submitted.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            ValueError, "drifted from expected attempt"
+        ):
+            uow.remote_parse_attempts.checkpoint_v3_terminal(
+                expected_attempt=submitted,
+                grant=CreditTransitionGrant(
+                    expected_current=submitted.current_credits,
+                    maximum_positive_delta=submitted.reservation,
+                ), receipt=wrong_terminal, terminal_secret=terminal_secret,
+            )
+        too_small = CreditTransitionGrant(
+            expected_current=submitted.current_credits,
+            maximum_positive_delta=CreditVector(
+                retained_results=1, retained_bytes=9
+            ),
+        )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            ValueError, "positive credit grant"
+        ):
+            uow.remote_parse_attempts.checkpoint_v3_terminal(
+                expected_attempt=submitted, grant=too_small,
+                receipt=terminal_receipt, terminal_secret=terminal_secret,
+            )
+        with self.engine.connect() as conn:
+            self.assertEqual(conn.execute(text(
+                "SELECT state FROM disclosure_ops.remote_parse_attempt WHERE attempt_id=:a"
+            ), {"a": self.attempt_id}).scalar_one(), "submitted")
+            self.assertEqual(conn.execute(text(
+                "SELECT count(*) FROM disclosure_ops.remote_parse_v3_resume_secret WHERE attempt_id=:a AND secret_kind='terminal'"
+            ), {"a": self.attempt_id}).scalar_one(), 0)
+
+        assert submitted.reservation is not None
+        terminal_grant = CreditTransitionGrant(
+            expected_current=submitted.current_credits,
+            maximum_positive_delta=submitted.reservation,
+        )
+        stale_submitted = replace(submitted, row_version=submitted.row_version - 1)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict, "lost exact CAS"
+        ):
+            uow.remote_parse_attempts.checkpoint_v3_terminal(
+                expected_attempt=stale_submitted, grant=CreditTransitionGrant(
+                    expected_current=stale_submitted.current_credits,
+                    maximum_positive_delta=submitted.reservation,
+                ), receipt=terminal_receipt, terminal_secret=terminal_secret,
+            )
+        with self.engine.connect() as conn:
+            self.assertEqual(conn.execute(text(
+                "SELECT count(*) FROM disclosure_ops.remote_parse_v3_resume_secret WHERE attempt_id=:a AND secret_kind='terminal'"
+            ), {"a": self.attempt_id}).scalar_one(), 0)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            remote_terminal = uow.remote_parse_attempts.checkpoint_v3_terminal(
+                expected_attempt=submitted, grant=terminal_grant,
+                receipt=terminal_receipt, terminal_secret=terminal_secret,
+            ).attempt
+            uow.commit()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(
+                uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+                    expected_attempt=submitted,
+                    next_state="remote_terminal",
+                    next_current=remote_terminal.current_credits,
+                ).attempt,
+                remote_terminal,
+            )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict, "lost exact CAS"
+        ):
+            uow.remote_parse_attempts.checkpoint_v3_terminal(
+                expected_attempt=submitted, grant=terminal_grant,
+                receipt=terminal_receipt, terminal_secret=terminal_secret,
+            )
+
+        materialization_token = b"v3-materialization-token"
+        materialization_receipt = encode_checkpoint_receipt(
+            PreparedMaterializationReceiptV2(
+                attempt_identity=self.attempt_id, fence_identity="fence-1",
+                source_pdf_sha256=_sha("a"), source_page_count=2,
+                terminal_receipt_sha256=terminal_receipt.sha256,
+                process_profile_sha256=remote_terminal.process_profile_sha256,
+                credit_policy_sha256=remote_terminal.credit_policy_sha256,
+                reservation_input_sha256=remote_terminal.reservation_input_sha256,
+                spool_relpath="attempt/spool.zip", spool_sha256=_sha("e"),
+                spool_byte_count=10, compressed_byte_count=10,
+                uncompressed_byte_count=20, member_count=1,
+                temporary_disk_byte_count=30, decoded_byte_count=20,
+                private_token_sha256="sha256:" + hashlib.sha256(materialization_token).hexdigest(),
+            )
+        )
+        materialization_secret = RemoteParseResumeSecret(
+            attempt_id=self.attempt_id, secret_kind="materialization",
+            token_bytes=materialization_token,
+            token_sha256="sha256:" + hashlib.sha256(materialization_token).hexdigest(),
+            token_byte_count=len(materialization_token), secret_contract_version=3,
+        )
+        assert remote_terminal.reservation is not None
+        wrong_materialization = encode_checkpoint_receipt(replace(
+            materialization_receipt.receipt, spool_sha256=_sha("f")
+        ))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            ValueError, "drifted from terminal attempt"
+        ):
+            uow.remote_parse_attempts.prepare_v3_materialization(
+                expected_attempt=remote_terminal,
+                grant=CreditTransitionGrant(
+                    expected_current=remote_terminal.current_credits,
+                    maximum_positive_delta=remote_terminal.reservation,
+                ), receipt=wrong_materialization,
+                materialization_secret=materialization_secret,
+            )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            materializing = uow.remote_parse_attempts.prepare_v3_materialization(
+                expected_attempt=remote_terminal,
+                grant=CreditTransitionGrant(
+                    expected_current=remote_terminal.current_credits,
+                    maximum_positive_delta=remote_terminal.reservation,
+                ), receipt=materialization_receipt,
+                materialization_secret=materialization_secret,
+            ).attempt
+            uow.commit()
+        self.assertEqual(materializing.state, "materializing")
+        self.assertEqual(materializing.materialization_receipt_sha256, materialization_receipt.sha256)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(
+                uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+                    expected_attempt=remote_terminal,
+                    next_state="materializing",
+                    next_current=materializing.current_credits,
+                ).attempt,
+                materializing,
+            )
 
     def test_v3_claim_foreign_live_expiry_takeover_and_atomic_add_rollback(self) -> None:
         attempt, secret = self._v3_attempt_and_secret()

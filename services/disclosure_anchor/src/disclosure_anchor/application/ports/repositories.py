@@ -203,6 +203,29 @@ class RemoteParseAttemptRepository(Protocol):
         expected_version: int, expected_current: CreditVector,
         owner_identity: str, claim_generation: int,
     ) -> ClaimedAttemptSnapshot: ...
+    def reconcile_v3_claim_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+        next_state: str, next_current: CreditVector,
+    ) -> ClaimedAttemptSnapshot: ...
+    def transition_v3_reconciling(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant,
+    ) -> ClaimedAttemptSnapshot: ...
+    def checkpoint_v3_submitted(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+        accepted_secret: RemoteParseResumeSecret,
+    ) -> ClaimedAttemptSnapshot: ...
+    def checkpoint_v3_terminal(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedTerminalReceipt,
+        terminal_secret: RemoteParseResumeSecret,
+    ) -> ClaimedAttemptSnapshot: ...
+    def prepare_v3_materialization(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+        materialization_secret: RemoteParseResumeSecret,
+    ) -> ClaimedAttemptSnapshot: ...
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
         owner_identity: str, lease_seconds: int,
