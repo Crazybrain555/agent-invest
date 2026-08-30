@@ -451,8 +451,66 @@ class CreditVectorTests(unittest.TestCase):
         )
         self.assertEqual(unknown.state, "future_state")
 
+    def test_nonfinite_and_non_numeric_work_leases_fail_closed(self) -> None:
+        work = _work("attempt-1", "submitted")
+        for invalid in (float("nan"), float("inf"), float("-inf"), True, "1"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "claim projection"
+            ):
+                replace(work, lease_expires_monotonic=invalid)  # type: ignore[arg-type]
+
+    def test_nonfinite_and_non_numeric_retry_delays_fail_closed(self) -> None:
+        work = _work("attempt-1", "submitted")
+        for invalid in (float("nan"), float("inf"), float("-inf"), True, "1"):
+            with self.subTest(kind="recovery", invalid=invalid), self.assertRaisesRegex(
+                ValueError, "retry delay"
+            ):
+                RecoveryDeferred(
+                    "held", retry_after_seconds=invalid, durable_work=work  # type: ignore[arg-type]
+                )
+            with self.subTest(kind="stage", invalid=invalid), self.assertRaisesRegex(
+                ValueError, "retry delay"
+            ):
+                RetryStage("retry", retry_after_seconds=invalid)  # type: ignore[arg-type]
+
+    def test_nonfinite_and_non_numeric_timing_limits_fail_closed(self) -> None:
+        fields_to_check = (
+            "poll_seconds",
+            "idle_open_circuit_seconds",
+            "claim_renew_margin_seconds",
+            "max_stage_step_seconds",
+            "retry_initial_backoff_seconds",
+            "retry_max_backoff_seconds",
+            "retry_stuck_seconds",
+        )
+        for field_name in fields_to_check:
+            for invalid in (float("nan"), float("inf"), float("-inf"), True, "1"):
+                with self.subTest(
+                    field=field_name, invalid=invalid
+                ), self.assertRaisesRegex(ValueError, "finite and positive"):
+                    _limits(**{field_name: invalid})
+
 
 class StagedParseCoordinatorTests(unittest.TestCase):
+    def test_stage_guard_rejects_nonfinite_deadline_and_clock(self) -> None:
+        for invalid in (float("nan"), float("inf"), float("-inf"), True, "1"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "deadline"
+            ):
+                StageLeaseGuard(
+                    deadline_monotonic=invalid,  # type: ignore[arg-type]
+                    _revoked=threading.Event(),
+                    _monotonic=time.monotonic,
+                )
+        for invalid in (float("nan"), float("inf"), float("-inf"), True, "1"):
+            guard = StageLeaseGuard(
+                deadline_monotonic=time.monotonic() + 60,
+                _revoked=threading.Event(),
+                _monotonic=lambda invalid=invalid: invalid,  # type: ignore[return-value]
+            )
+            with self.subTest(clock=invalid), self.assertRaises(StageLeaseLost):
+                guard.checkpoint()
+
     def test_stage_guard_uses_the_coordinator_clock_domain(self) -> None:
         clock = [9.0]
         guard = StageLeaseGuard(

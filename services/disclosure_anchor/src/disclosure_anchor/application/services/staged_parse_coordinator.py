@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields
 from enum import Enum
+from math import isfinite
 from threading import Event
 import time
 from typing import Protocol
@@ -134,6 +135,9 @@ class CoordinatorWork:
             not self.claim_owner_identity.strip()
             or len(self.claim_owner_identity) > 128
             or self.lease_expires_monotonic is None
+            or isinstance(self.lease_expires_monotonic, bool)
+            or not isinstance(self.lease_expires_monotonic, (int, float))
+            or not isfinite(self.lease_expires_monotonic)
             or self.lease_expires_monotonic <= 0
         ):
             raise ValueError("coordinator claim projection is invalid")
@@ -172,7 +176,12 @@ class RecoveryDeferred(RuntimeError):
         durable_work: CoordinatorWork,
     ) -> None:
         super().__init__(message)
-        if retry_after_seconds <= 0:
+        if (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, (int, float))
+            or not isfinite(retry_after_seconds)
+            or retry_after_seconds <= 0
+        ):
             raise ValueError("recovery retry delay must be positive")
         self.retry_after_seconds = float(retry_after_seconds)
         self.durable_work = durable_work
@@ -183,7 +192,12 @@ class RetryStage(RuntimeError):
 
     def __init__(self, message: str, *, retry_after_seconds: float) -> None:
         super().__init__(message)
-        if retry_after_seconds <= 0:
+        if (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, (int, float))
+            or not isfinite(retry_after_seconds)
+            or retry_after_seconds <= 0
+        ):
             raise ValueError("stage retry delay must be positive")
         self.retry_after_seconds = float(retry_after_seconds)
 
@@ -200,8 +214,24 @@ class StageLeaseGuard:
     _revoked: Event
     _monotonic: Callable[[], float]
 
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.deadline_monotonic, bool)
+            or not isinstance(self.deadline_monotonic, (int, float))
+            or not isfinite(self.deadline_monotonic)
+            or self.deadline_monotonic <= 0
+        ):
+            raise ValueError("stage lease deadline must be finite and positive")
+
     def checkpoint(self) -> None:
-        if self._revoked.is_set() or self._monotonic() > self.deadline_monotonic:
+        observed = self._monotonic()
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, (int, float))
+            or not isfinite(observed)
+            or self._revoked.is_set()
+            or observed > self.deadline_monotonic
+        ):
             raise StageLeaseLost("bounded stage lease expired")
 
     def revoke(self) -> None:
@@ -331,6 +361,22 @@ class CoordinatorLimits:
                 raise ValueError(f"{label} must be a positive integer")
         if not 1 <= self.claim_lease_seconds <= 300:
             raise ValueError("claim lease seconds must fit the DB 1..300 contract")
+        for timing_value, label in (
+            (self.poll_seconds, "poll seconds"),
+            (self.idle_open_circuit_seconds, "idle open-circuit seconds"),
+            (self.claim_renew_margin_seconds, "claim renewal margin seconds"),
+            (self.max_stage_step_seconds, "maximum stage step seconds"),
+            (self.retry_initial_backoff_seconds, "initial retry backoff seconds"),
+            (self.retry_max_backoff_seconds, "maximum retry backoff seconds"),
+            (self.retry_stuck_seconds, "retry stuck seconds"),
+        ):
+            if (
+                isinstance(timing_value, bool)
+                or not isinstance(timing_value, (int, float))
+                or not isfinite(timing_value)
+                or timing_value <= 0
+            ):
+                raise ValueError(f"{label} must be finite and positive")
         if not 0 < self.claim_renew_margin_seconds < self.claim_lease_seconds:
             raise ValueError("claim renewal margin must be inside the lease")
         if (
