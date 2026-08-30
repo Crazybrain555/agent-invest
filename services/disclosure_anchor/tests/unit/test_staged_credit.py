@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -24,8 +24,8 @@ from tests.unit.test_mineru_process_profile import _profile
 
 
 SHA_A = "sha256:" + "a" * 64
-POLICY_SHA = "sha256:4b30f8207cdb9503543c9ae38da7dd92be2b55754217b976a7dd262519f90866"
-INPUT_SHA = "sha256:de5c94c2076cbd94da9c936efe52a72c047c6a56fa4bb80908b438e7f945f01f"
+POLICY_SHA = "sha256:a92195b6ab56b7d515c3f5094095244617e4fcb3e403eb37beafcb512f964099"
+INPUT_SHA = "sha256:4b831c6b38577a677d16fdaca916168b1be006da7ec947ce919417a5fe17fadc"
 
 
 class StagedCreditContractTests(unittest.TestCase):
@@ -36,6 +36,11 @@ class StagedCreditContractTests(unittest.TestCase):
         self.assertIn(b'"state_credit_shapes"', exact)
         self.assertIn(b'"temp_disk_bytes":"temporary_disk_byte_count"', exact)
         self.assertIn(b'"db_staged_bytes":"db_staged_byte_count"', exact)
+        policy = json.loads(exact)
+        self.assertEqual(
+            set(policy["reservation_mechanics"]),
+            {item.name for item in fields(CreditVector)},
+        )
 
     def test_each_executable_policy_section_changes_policy_identity(self) -> None:
         original = json.loads(STAGED_CREDIT_POLICY_V1.exact_bytes)
@@ -280,6 +285,10 @@ class StagedCreditContractTests(unittest.TestCase):
         self.assertEqual(credit_shape("local_materialized", completed).unpublished_pages, 4)
         self.assertEqual(credit_shape("local_materialized", completed).db_staged_bytes, 15)
         self.assertEqual(
+            credit_shape("local_failure_committed", completed).unpublished_pages,
+            4,
+        )
+        self.assertEqual(
             credit_shape("local_failure_committed", facts).local_items, 1
         )
         self.assertEqual(credit_shape("local_failed", facts), CreditVector())
@@ -288,6 +297,13 @@ class StagedCreditContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prepared facts"):
             credit_shape(
                 "local_failure_committed", replace(facts, source_page_count=0)
+            )
+        with self.assertRaisesRegex(ValueError, "requires prepared"):
+            CreditShapeFacts(local_materialization_completed=True)
+        with self.assertRaisesRegex(ValueError, "completed local materialization"):
+            credit_shape(
+                "local_failure_committed",
+                replace(completed, db_staged_byte_count=0),
             )
         with self.assertRaisesRegex(ValueError, "stale facts"):
             credit_shape("prepared", replace(facts, materialization_prepared=False))
@@ -343,6 +359,12 @@ class StagedCreditContractTests(unittest.TestCase):
                 snapshot,
                 monotonic_before=-1e308,
                 monotonic_after=1e308,
+            )
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            conservative_monotonic_deadline(
+                snapshot,
+                monotonic_before=-(10**10_000),
+                monotonic_after=10**10_000,
             )
 
 

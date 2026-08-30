@@ -50,7 +50,7 @@ _RESERVATION_MECHANICS = MappingProxyType(
         "remote_waits": "literal:1",
         "retained_bytes": "min(profile.result_reservation_bytes*bucket.result_reservation_multiplier,profile.terminal_output_bytes_limit,profile.max_unacked_result_bytes)",
         "retained_results": "literal:1",
-        "temporary_disk_bytes": "min(profile.temporary_disk_bytes_limit,retained_bytes+min(decoded_bytes,retained_bytes*bucket.temp_expansion_multiplier))",
+        "temp_disk_bytes": "min(profile.temporary_disk_bytes_limit,retained_bytes+min(decoded_bytes,retained_bytes*bucket.temp_expansion_multiplier))",
         "unpublished_pages": "source_page_count",
     }
 )
@@ -126,6 +126,7 @@ _LOCAL_FAILURE_COMPLETED_SHAPE = MappingProxyType(
         **dict(_LOCAL_FAILURE_POST_MATERIALIZATION_SHAPE),
         "db_stage_items": "one",
         "db_staged_bytes": "db_staged_byte_count",
+        "unpublished_pages": "source_page_count",
     }
 )
 
@@ -347,6 +348,8 @@ class CreditShapeFacts:
                     raise ValueError("materialization prepared must be boolean")
             elif isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_INT:
                 raise ValueError(f"credit shape fact {item.name} is invalid")
+        if self.local_materialization_completed and not self.materialization_prepared:
+            raise ValueError("completed local materialization requires prepared facts")
 
 
 def credit_shape(state: str, facts: CreditShapeFacts) -> CreditVector:
@@ -369,7 +372,10 @@ def credit_shape(state: str, facts: CreditShapeFacts) -> CreditVector:
     elif state == "local_failure_committed":
         _require_terminal_facts(facts)
         if facts.materialization_prepared:
-            _require_materialization_facts(facts)
+            if facts.local_materialization_completed:
+                _require_local_facts(facts)
+            else:
+                _require_materialization_facts(facts)
         elif any(
             (
                 facts.compressed_byte_count,
@@ -427,12 +433,12 @@ def conservative_monotonic_deadline(
     monotonic_after: float,
 ) -> float:
     for value in (monotonic_before, monotonic_after):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+        if not _is_finite_number(value):
             raise ValueError("monotonic lease bracket is invalid")
     if monotonic_after < monotonic_before:
         raise ValueError("monotonic lease bracket moved backwards")
     bracket_seconds = monotonic_after - monotonic_before
-    if not isfinite(bracket_seconds) or bracket_seconds > _MAX_INT / 1_000_000:
+    if not _is_finite_number(bracket_seconds) or bracket_seconds > _MAX_INT / 1_000_000:
         raise ValueError("monotonic lease bracket is outside the closed range")
     bracket_us = ceil(bracket_seconds * 1_000_000)
     safe_us = max(0, snapshot.remaining_microseconds - bracket_us)
@@ -652,6 +658,15 @@ def _floor_fraction(value: int, numerator: int, denominator: int) -> int:
 def _require_positive_int(value: object, label: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_INT:
         raise ValueError(f"{label} must be a positive bounded integer")
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _require_sha(value: object, label: str) -> None:
