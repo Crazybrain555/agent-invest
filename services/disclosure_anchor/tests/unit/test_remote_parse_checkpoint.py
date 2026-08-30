@@ -10,6 +10,7 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     LocalMaterializationReceiptV2,
     PreparedMaterializationReceiptV2,
     EncodedTerminalReceipt,
+    RemoteParseAttempt,
     RemoteParseResumeSecret,
     TerminalReceipt,
     decode_terminal_receipt,
@@ -17,6 +18,12 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     decode_checkpoint_receipt,
     encode_checkpoint_receipt,
 )
+from disclosure_anchor.application.contracts.staged_credit import (
+    CreditShapeFacts,
+    build_staged_credit_envelope,
+    credit_shape,
+)
+from tests.unit.test_mineru_process_profile import _profile
 
 SHA_A = "sha256:" + "a" * 64
 SHA_B = "sha256:" + "b" * 64
@@ -36,6 +43,45 @@ def _receipt() -> TerminalReceipt:
 
 
 class RemoteParseCheckpointContractTests(unittest.TestCase):
+    def test_v3_attempt_binds_reservation_and_exact_current_shape(self) -> None:
+        envelope = build_staged_credit_envelope(
+            profile=_profile(),
+            source_pdf_sha256=SHA_A,
+            source_byte_count=1024,
+            source_page_count=2,
+        )
+        attempt = RemoteParseAttempt(
+            attempt_id="attempt_1",
+            processing_run_id="run_1",
+            document_id="document_1",
+            attempt_generation=1,
+            fence_identity="fence_1",
+            source_pdf_sha256=SHA_A,
+            parser_target_sha256=SHA_B,
+            request_sha256=SHA_C,
+            runtime_epoch_sha256=SHA_A,
+            client_submit_key="submit_1",
+            checkpoint_contract_version=3,
+            process_profile_sha256=envelope.process_profile_sha256,
+            credit_policy_sha256=envelope.credit_policy_sha256,
+            reservation_input_bytes=envelope.reservation_input.exact_bytes,
+            reservation_input_sha256=envelope.reservation_input.sha256,
+            reservation_input_byte_count=envelope.reservation_input.byte_count,
+            reservation_source_byte_count=1024,
+            reservation_source_page_count=2,
+            reservation_bucket=envelope.reservation_input.value.bucket,
+            reservation=envelope.reservation,
+            current_credits=credit_shape("prepared", CreditShapeFacts()),
+        )
+        self.assertEqual(attempt.current_credits.documents, 1)
+        with self.assertRaisesRegex(ValueError, "current credit projection"):
+            replace(
+                attempt,
+                current_credits=replace(attempt.current_credits, remote_waits=1),
+            )
+        with self.assertRaisesRegex(ValueError, "reservation evidence"):
+            replace(attempt, reservation_source_page_count=3)
+
     def test_v2_materialization_receipts_are_closed_replayable_evidence(self) -> None:
         prepared = PreparedMaterializationReceiptV2(
             attempt_identity="attempt_1",

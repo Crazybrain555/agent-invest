@@ -7,8 +7,10 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session
 
+from disclosure_anchor.adapters.db.postgres import models
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.db.postgres.schema import (
     APP_ROLE,
@@ -27,8 +29,14 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     encode_checkpoint_receipt,
     encode_terminal_receipt,
 )
+from disclosure_anchor.application.contracts.staged_credit import (
+    CreditShapeFacts,
+    build_staged_credit_envelope,
+    credit_shape,
+)
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
+from tests.unit.test_mineru_process_profile import _profile
 
 
 def _sha(char: str) -> str:
@@ -42,6 +50,79 @@ _PARSER_TARGET_SHA = "sha256:" + hashlib.sha256(
 
 
 class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
+    def _v3_rows(self) -> tuple[models.RemoteParseAttempt, models.RemoteParseV3ResumeSecret]:
+        envelope = build_staged_credit_envelope(
+            profile=_profile(), source_pdf_sha256=_sha("a"),
+            source_byte_count=1024, source_page_count=2,
+        )
+        current = credit_shape("prepared", CreditShapeFacts())
+        credits = tuple(current.__dataclass_fields__)
+        values = {
+            "attempt_id": self.attempt_id,
+            "processing_run_id": self.run_id,
+            "document_id": self.document_id,
+            "attempt_generation": 1,
+            "fence_identity": "fence-1",
+            "source_pdf_sha256": _sha("a"),
+            "parser_target_sha256": _PARSER_TARGET_SHA,
+            "request_sha256": _sha("c"),
+            "runtime_epoch_sha256": _sha("d"),
+            "client_submit_key": "submit-" + self.attempt_id,
+            "checkpoint_contract_version": 3,
+            "state": "prepared",
+            "is_current": True,
+            "process_profile_sha256": envelope.process_profile_sha256,
+            "credit_policy_sha256": envelope.credit_policy_sha256,
+            "reservation_input_sha256": envelope.reservation_input.sha256,
+            "reservation_input_bytes": envelope.reservation_input.exact_bytes,
+            "reservation_input_byte_count": envelope.reservation_input.byte_count,
+            "reservation_source_byte_count": 1024,
+            "reservation_source_page_count": 2,
+            "reservation_bucket": envelope.reservation_input.value.bucket,
+            **{f"reservation_{name}": getattr(envelope.reservation, name) for name in credits},
+            **{f"current_{name}": getattr(current, name) for name in credits},
+        }
+        token = b"v3-prepared-secret"
+        return models.RemoteParseAttempt(**values), models.RemoteParseV3ResumeSecret(
+            attempt_id=self.attempt_id,
+            secret_kind="prepared_reconcile",
+            token_bytes=token,
+            token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+            token_byte_count=len(token),
+        )
+
+    def test_v3_parent_requires_exact_secret_and_closed_credit_shape(self) -> None:
+        parent, secret = self._v3_rows()
+        with Session(self.engine) as session:
+            session.add_all((parent, secret))
+            session.commit()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            loaded = uow.remote_parse_attempts.get(self.attempt_id)
+            self.assertEqual(loaded.checkpoint_contract_version, 3)
+            self.assertEqual(loaded.current_credits.documents, 1)
+        with self.engine.begin() as conn:
+            conn.execute(text("DELETE FROM disclosure_ops.remote_parse_v3_resume_secret WHERE attempt_id=:a"), {"a": self.attempt_id})
+            conn.execute(text("DELETE FROM disclosure_ops.remote_parse_attempt WHERE attempt_id=:a"), {"a": self.attempt_id})
+        for mutation in ("missing_secret", "partial_current", "extra_secret"):
+            parent, secret = self._v3_rows()
+            if mutation == "partial_current":
+                parent.current_documents = None
+            with self.subTest(mutation=mutation), Session(self.engine) as session:
+                session.add(parent)
+                if mutation != "missing_secret":
+                    session.add(secret)
+                if mutation == "extra_secret":
+                    token = b"unexpected-accepted-secret"
+                    session.add(models.RemoteParseV3ResumeSecret(
+                        attempt_id=self.attempt_id,
+                        secret_kind="accepted_submission",
+                        token_bytes=token,
+                        token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+                        token_byte_count=len(token),
+                    ))
+                with self.assertRaises(SQLAlchemyError):
+                    session.commit()
+
     def setUp(self) -> None:
         self.engine = engine_or_skip()
         self.document_id = ids.new_document_id()
@@ -623,7 +704,9 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         with self.engine.connect() as conn:
             for role in (READER_ROLE, FUTURE_L2_READER_ROLE):
                 self.assertFalse(conn.execute(text("SELECT has_table_privilege(:r,'disclosure_ops.remote_parse_attempt','SELECT')"), {"r": role}).scalar_one())
+                self.assertFalse(conn.execute(text("SELECT has_table_privilege(:r,'disclosure_ops.remote_parse_v3_resume_secret','SELECT')"), {"r": role}).scalar_one())
             self.assertTrue(conn.execute(text("SELECT has_table_privilege(:r,'disclosure_ops.remote_parse_attempt','SELECT,INSERT,UPDATE,DELETE')"), {"r": APP_ROLE}).scalar_one())
+            self.assertTrue(conn.execute(text("SELECT has_table_privilege(:r,'disclosure_ops.remote_parse_v3_resume_secret','SELECT,INSERT,UPDATE,DELETE')"), {"r": APP_ROLE}).scalar_one())
         with self.assertRaises(IntegrityError), self.engine.begin() as conn:
             conn.execute(text("INSERT INTO disclosure_ops.remote_parse_attempt (attempt_id,processing_run_id,document_id,attempt_generation,fence_identity,source_pdf_sha256,parser_target_sha256,request_sha256,runtime_epoch_sha256,client_submit_key,checkpoint_contract_version,state,is_current,row_version) VALUES (:a,:r,:d,2,'fence-2',:s,:p,:q,:e,:k,2,'prepared',true,0)"), {"a": "rpa_" + ids.new_ulid(), "r": self.run_id, "d": self.document_id, "s": _sha("a"), "p": _sha("b"), "q": _sha("c"), "e": _sha("d"), "k": "duplicate-current"})
         with self.engine.begin() as conn:

@@ -45,9 +45,102 @@ durable_publish_ledger_seq = Sequence(
 
 _V1_REMOTE_TERMINAL = "(state IN ('remote_terminal','materializing','local_materialized','finish_committed','acked','local_failed') AND remote_task_identity IS NOT NULL AND terminal_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND terminal_receipt_bytes IS NOT NULL AND terminal_receipt_byte_count=octet_length(terminal_receipt_bytes) AND terminal_receipt_byte_count BETWEEN 1 AND 65536 AND result_owner_identity IS NOT NULL AND result_artifact_sha256 ~ '^sha256:[0-9a-f]{64}$' AND result_artifact_bytes>0) OR (state IN ('prepared','submitted','remote_failed') AND terminal_receipt_sha256 IS NULL AND terminal_receipt_bytes IS NULL AND terminal_receipt_byte_count IS NULL AND result_owner_identity IS NULL AND result_artifact_sha256 IS NULL AND result_artifact_bytes IS NULL) OR (state='superseded' AND ((terminal_receipt_sha256 IS NULL AND terminal_receipt_bytes IS NULL AND terminal_receipt_byte_count IS NULL AND result_owner_identity IS NULL AND result_artifact_sha256 IS NULL AND result_artifact_bytes IS NULL) OR (remote_task_identity IS NOT NULL AND terminal_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND terminal_receipt_bytes IS NOT NULL AND terminal_receipt_byte_count=octet_length(terminal_receipt_bytes) AND terminal_receipt_byte_count BETWEEN 1 AND 65536 AND result_owner_identity IS NOT NULL AND result_artifact_sha256 ~ '^sha256:[0-9a-f]{64}$' AND result_artifact_bytes>0)))"
 _V2_REMOTE_TERMINAL = "(state IN ('remote_terminal','materializing','local_materialized','finish_committed','local_failure_committed','acked','local_failed') AND remote_task_identity IS NOT NULL AND terminal_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND terminal_receipt_bytes IS NOT NULL AND terminal_receipt_byte_count=octet_length(terminal_receipt_bytes) AND terminal_receipt_byte_count BETWEEN 1 AND 65536 AND result_owner_identity IS NOT NULL AND result_artifact_sha256 ~ '^sha256:[0-9a-f]{64}$' AND result_artifact_bytes>0) OR (state IN ('prepared','reconciling','submitted','remote_failure_committed','remote_failed','pre_submission_failed') AND terminal_receipt_sha256 IS NULL AND terminal_receipt_bytes IS NULL AND terminal_receipt_byte_count IS NULL AND result_owner_identity IS NULL AND result_artifact_sha256 IS NULL AND result_artifact_bytes IS NULL AND ((state IN ('remote_failure_committed','remote_failed') AND remote_task_identity IS NOT NULL) OR (state NOT IN ('remote_failure_committed','remote_failed') AND (remote_task_identity IS NULL OR state='submitted')))) OR (state='superseded' AND remote_task_identity IS NULL AND terminal_receipt_sha256 IS NULL AND terminal_receipt_bytes IS NULL AND terminal_receipt_byte_count IS NULL AND result_owner_identity IS NULL AND result_artifact_sha256 IS NULL AND result_artifact_bytes IS NULL)"
+_V3_REMOTE_TERMINAL = _V2_REMOTE_TERMINAL.replace(
+    "terminal_receipt_sha256 ~", "terminal_receipt_sha256 IS NOT NULL AND terminal_receipt_sha256 ~"
+).replace(
+    "terminal_receipt_byte_count=", "terminal_receipt_byte_count IS NOT NULL AND terminal_receipt_byte_count="
+).replace(
+    "result_artifact_sha256 ~", "result_artifact_sha256 IS NOT NULL AND result_artifact_sha256 ~"
+).replace("result_artifact_bytes>0", "result_artifact_bytes IS NOT NULL AND result_artifact_bytes>0")
 _REMOTE_PARSE_TERMINAL_SHAPE = (
     f"(checkpoint_contract_version=1 AND ({_V1_REMOTE_TERMINAL})) OR "
-    f"(checkpoint_contract_version=2 AND ({_V2_REMOTE_TERMINAL}))"
+    f"(checkpoint_contract_version=2 AND ({_V2_REMOTE_TERMINAL})) OR "
+    f"(checkpoint_contract_version=3 AND ({_V3_REMOTE_TERMINAL}))"
+)
+_V3_CREDITS = (
+    "documents", "remote_waits", "retained_results", "retained_bytes",
+    "local_items", "compressed_bytes", "decoded_bytes", "temp_disk_bytes",
+    "db_stage_items", "db_staged_bytes", "ack_items", "unpublished_pages",
+)
+_V3_IDENTITY_COLUMNS = (
+    "process_profile_sha256", "credit_policy_sha256", "reservation_input_sha256",
+    "reservation_input_bytes", "reservation_input_byte_count",
+    "reservation_source_byte_count", "reservation_source_page_count",
+    "reservation_bucket",
+)
+_V3_MATERIALIZATION_COLUMNS = (
+    "materialization_receipt_sha256", "materialization_receipt_bytes",
+    "materialization_receipt_byte_count", "materialization_source_page_count",
+    "materialization_spool_relpath", "materialization_spool_sha256",
+    "materialization_spool_byte_count", "materialization_compressed_byte_count",
+    "materialization_uncompressed_byte_count", "materialization_temp_disk_byte_count",
+    "materialization_decoded_byte_count", "materialization_member_count",
+    "materialization_token_sha256",
+)
+_V3_COLUMNS = (
+    *_V3_IDENTITY_COLUMNS,
+    *(f"reservation_{name}" for name in _V3_CREDITS),
+    *(f"current_{name}" for name in _V3_CREDITS),
+    *_V3_MATERIALIZATION_COLUMNS,
+    "local_db_staged_byte_count",
+)
+_V3_NULL = " AND ".join(f"{name} IS NULL" for name in _V3_COLUMNS)
+_V3_PRESENT = " AND ".join(
+    f"{name} IS NOT NULL"
+    for name in (
+        *_V3_IDENTITY_COLUMNS,
+        *(f"reservation_{name}" for name in _V3_CREDITS),
+        *(f"current_{name}" for name in _V3_CREDITS),
+    )
+)
+_V3_CONTRACT_SHAPE = (
+    "checkpoint_contract_version IN (1,2,3) AND ((checkpoint_contract_version<3 AND "
+    f"{_V3_NULL}) OR (checkpoint_contract_version=3 AND {_V3_PRESENT} AND "
+    "process_profile_sha256 ~ '^sha256:[0-9a-f]{64}$' AND credit_policy_sha256 ~ '^sha256:[0-9a-f]{64}$' AND reservation_input_sha256 ~ '^sha256:[0-9a-f]{64}$' AND reservation_input_byte_count=octet_length(reservation_input_bytes) AND reservation_input_byte_count BETWEEN 1 AND 65536 AND reservation_source_byte_count>0 AND reservation_source_page_count>0 AND reservation_bucket IN ('regular','heavy','huge')))"
+)
+_V3_CREDIT_BOUNDS = "checkpoint_contract_version<3 OR (" + " AND ".join(
+    f"reservation_{name}>=0 AND current_{name}>=0 AND current_{name}<=reservation_{name}"
+    for name in _V3_CREDITS
+) + ")"
+def _v3_zero() -> str:
+    return " AND ".join(f"current_{name}=0" for name in _V3_CREDITS)
+
+
+def _v3_shape(**values: str) -> str:
+    return " AND ".join(
+        f"current_{name}={values.get(name, '0')}" for name in _V3_CREDITS
+    )
+
+
+_V3_MATERIALIZATION_PRESENT = (
+    "materialization_receipt_sha256 IS NOT NULL AND materialization_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND "
+    "materialization_receipt_bytes IS NOT NULL AND materialization_receipt_byte_count IS NOT NULL AND "
+    "materialization_receipt_byte_count=octet_length(materialization_receipt_bytes) AND materialization_receipt_byte_count BETWEEN 1 AND 65536 AND "
+    + " AND ".join(f"{name} IS NOT NULL" for name in _V3_MATERIALIZATION_COLUMNS[3:])
+    + " AND materialization_source_page_count>0 AND materialization_spool_byte_count>0 AND "
+    "materialization_compressed_byte_count=materialization_spool_byte_count AND materialization_uncompressed_byte_count>0 AND "
+    "materialization_decoded_byte_count>0 AND materialization_temp_disk_byte_count=materialization_spool_byte_count+materialization_uncompressed_byte_count AND "
+    "materialization_member_count>0 AND materialization_spool_relpath !~ '(^/|(^|/)\\.\\.?(/|$)|\\\\)' AND "
+    "materialization_spool_sha256 ~ '^sha256:[0-9a-f]{64}$' AND materialization_token_sha256 ~ '^sha256:[0-9a-f]{64}$'"
+)
+_V3_MATERIALIZATION_SHAPE = (
+    "checkpoint_contract_version<3 OR ((state IN ('prepared','reconciling','submitted','remote_terminal','remote_failure_committed','remote_failed','pre_submission_failed','superseded') AND "
+    + " AND ".join(f"{name} IS NULL" for name in _V3_MATERIALIZATION_COLUMNS)
+    + f") OR (state IN ('materializing','local_materialized','finish_committed','acked') AND {_V3_MATERIALIZATION_PRESENT}) OR "
+    + f"(state IN ('local_failure_committed','local_failed') AND (({' AND '.join(f'{name} IS NULL' for name in _V3_MATERIALIZATION_COLUMNS)}) OR ({_V3_MATERIALIZATION_PRESENT}))))"
+)
+_V3_STATE_CREDIT = (
+    "checkpoint_contract_version<3 OR (("
+    + f"state='prepared' AND {_v3_shape(documents='1')}) OR (state IN ('reconciling','submitted') AND {_v3_shape(documents='1', remote_waits='1')}) OR "
+    + f"(state='remote_terminal' AND {_v3_shape(documents='1', retained_results='1', retained_bytes='result_artifact_bytes')}) OR "
+    + f"(state='materializing' AND {_v3_shape(documents='1', retained_results='1', retained_bytes='result_artifact_bytes', local_items='1', compressed_bytes='materialization_compressed_byte_count', decoded_bytes='materialization_decoded_byte_count', temp_disk_bytes='materialization_temp_disk_byte_count')}) OR "
+    + f"(state='local_materialized' AND {_v3_shape(documents='1', retained_results='1', retained_bytes='result_artifact_bytes', db_stage_items='1', db_staged_bytes='local_db_staged_byte_count', unpublished_pages='reservation_source_page_count')}) OR "
+    + f"(state='finish_committed' AND {_v3_shape(documents='1', retained_results='1', retained_bytes='result_artifact_bytes', ack_items='1')}) OR "
+    + f"(state='remote_failure_committed' AND {_v3_shape(documents='1', retained_results='1', ack_items='1')}) OR "
+    + f"(state='local_failure_committed' AND materialization_receipt_bytes IS NULL AND {_v3_shape(documents='1', retained_results='1', retained_bytes='result_artifact_bytes', ack_items='1')}) OR "
+    + f"(state='local_failure_committed' AND materialization_receipt_bytes IS NOT NULL AND local_receipt_bytes IS NULL AND {_v3_shape(documents='1', retained_results='1', retained_bytes='result_artifact_bytes', local_items='1', compressed_bytes='materialization_compressed_byte_count', decoded_bytes='materialization_decoded_byte_count', temp_disk_bytes='materialization_temp_disk_byte_count', ack_items='1')}) OR "
+    + f"(state='local_failure_committed' AND local_receipt_bytes IS NOT NULL AND {_v3_shape(documents='1', retained_results='1', retained_bytes='result_artifact_bytes', local_items='1', compressed_bytes='materialization_compressed_byte_count', decoded_bytes='materialization_decoded_byte_count', temp_disk_bytes='materialization_temp_disk_byte_count', db_stage_items='1', db_staged_bytes='local_db_staged_byte_count', ack_items='1', unpublished_pages='reservation_source_page_count')}) OR "
+    + f"(state IN ('acked','remote_failed','local_failed','pre_submission_failed','superseded') AND {_v3_zero()}))"
 )
 
 
@@ -55,15 +148,27 @@ class RemoteParseAttempt(Base):
     __tablename__ = "remote_parse_attempt"
     __table_args__ = (
         CheckConstraint("attempt_generation >= 1 AND row_version >= 0", name="ck_remote_parse_attempt_versions"),
-        CheckConstraint("checkpoint_contract_version IN (1,2) AND (checkpoint_contract_version=2 OR (claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL AND submitted_receipt_sha256 IS NULL AND submitted_receipt_bytes IS NULL AND submitted_receipt_byte_count IS NULL AND local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL AND failure_receipt_sha256 IS NULL AND failure_receipt_bytes IS NULL AND failure_receipt_byte_count IS NULL AND failure_stage IS NULL AND state NOT IN ('remote_failure_committed','local_failure_committed','pre_submission_failed')))", name="ck_remote_parse_attempt_contract_version"),
+        CheckConstraint(_V3_CONTRACT_SHAPE, name="ck_remote_parse_attempt_contract_version"),
+        CheckConstraint(_V3_CREDIT_BOUNDS, name="ck_remote_parse_attempt_v3_credit_bounds"),
+        CheckConstraint(
+            "checkpoint_contract_version<3 OR state NOT IN ('acked','remote_failed','local_failed','pre_submission_failed','superseded') OR ("
+            + _v3_zero() + ")",
+            name="ck_remote_parse_attempt_v3_final_zero",
+        ),
+        CheckConstraint(_V3_MATERIALIZATION_SHAPE, name="ck_remote_parse_attempt_v3_materialization"),
+        CheckConstraint(
+            "checkpoint_contract_version<3 OR ((local_receipt_bytes IS NULL AND local_db_staged_byte_count IS NULL) OR (local_receipt_bytes IS NOT NULL AND local_db_staged_byte_count>0))",
+            name="ck_remote_parse_attempt_v3_local_projection",
+        ),
+        CheckConstraint(_V3_STATE_CREDIT, name="ck_remote_parse_attempt_v3_state_credit"),
         CheckConstraint("source_pdf_sha256 ~ '^sha256:[0-9a-f]{64}$' AND parser_target_sha256 ~ '^sha256:[0-9a-f]{64}$' AND request_sha256 ~ '^sha256:[0-9a-f]{64}$' AND runtime_epoch_sha256 ~ '^sha256:[0-9a-f]{64}$'", name="ck_remote_parse_attempt_hashes"),
         CheckConstraint("state IN ('prepared','reconciling','submitted','remote_terminal','materializing','local_materialized','finish_committed','remote_failure_committed','local_failure_committed','acked','remote_failed','local_failed','pre_submission_failed','superseded')", name="ck_remote_parse_attempt_state"),
         CheckConstraint("(state IN ('prepared','reconciling','submitted','remote_terminal','materializing','local_materialized','finish_committed','remote_failure_committed','local_failure_committed') AND is_current) OR (state IN ('acked','remote_failed','local_failed','pre_submission_failed','superseded') AND NOT is_current)", name="ck_remote_parse_attempt_lifecycle_shape"),
-        CheckConstraint("(checkpoint_contract_version=1 AND ((state='prepared' AND row_version=0 AND remote_task_identity IS NULL) OR (state<>'prepared' AND row_version>=1))) OR (checkpoint_contract_version=2 AND ((state IN ('prepared','reconciling') AND remote_task_identity IS NULL) OR (state NOT IN ('prepared','reconciling') AND row_version>=1)))", name="ck_remote_parse_attempt_initial_shape"),
-        CheckConstraint("(checkpoint_contract_version=1 AND (state <> 'submitted' OR remote_task_identity IS NOT NULL)) OR (checkpoint_contract_version=2 AND ((state IN ('prepared','reconciling','pre_submission_failed','superseded') AND submitted_receipt_sha256 IS NULL AND submitted_receipt_bytes IS NULL AND submitted_receipt_byte_count IS NULL) OR (state NOT IN ('prepared','reconciling','pre_submission_failed','superseded') AND remote_task_identity IS NOT NULL AND submitted_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND submitted_receipt_bytes IS NOT NULL AND submitted_receipt_byte_count=octet_length(submitted_receipt_bytes) AND submitted_receipt_byte_count BETWEEN 1 AND 65536)))", name="ck_remote_parse_attempt_submitted_shape"),
-        CheckConstraint("(checkpoint_contract_version=1 AND claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (checkpoint_contract_version=2 AND state='prepared' AND ((claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (claim_generation>=1 AND claim_owner_identity IS NOT NULL AND claim_lease_until IS NOT NULL))) OR (checkpoint_contract_version=2 AND state IN ('reconciling','submitted','remote_terminal','materializing','local_materialized','finish_committed','remote_failure_committed','local_failure_committed') AND claim_generation>=1 AND claim_owner_identity IS NOT NULL AND claim_lease_until IS NOT NULL) OR (checkpoint_contract_version=2 AND state IN ('acked','remote_failed','local_failed','pre_submission_failed','superseded') AND claim_generation>=1 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL)", name="ck_remote_parse_attempt_claim_shape"),
-        CheckConstraint("checkpoint_contract_version=1 OR ((state IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536) OR (state NOT IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL))", name="ck_remote_parse_attempt_local_receipt"),
-        CheckConstraint("checkpoint_contract_version=1 OR ((state IN ('remote_failure_committed','remote_failed','pre_submission_failed') AND failure_stage='remote' AND failure_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND failure_receipt_bytes IS NOT NULL AND failure_receipt_byte_count=octet_length(failure_receipt_bytes) AND failure_receipt_byte_count BETWEEN 1 AND 65536) OR (state IN ('local_failure_committed','local_failed') AND failure_stage='local' AND failure_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND failure_receipt_bytes IS NOT NULL AND failure_receipt_byte_count=octet_length(failure_receipt_bytes) AND failure_receipt_byte_count BETWEEN 1 AND 65536) OR (state NOT IN ('remote_failure_committed','remote_failed','pre_submission_failed','local_failure_committed','local_failed') AND failure_receipt_sha256 IS NULL AND failure_receipt_bytes IS NULL AND failure_receipt_byte_count IS NULL AND failure_stage IS NULL))", name="ck_remote_parse_attempt_failure_receipt"),
+        CheckConstraint("(checkpoint_contract_version=1 AND ((state='prepared' AND row_version=0 AND remote_task_identity IS NULL) OR (state<>'prepared' AND row_version>=1))) OR (checkpoint_contract_version IN (2,3) AND ((state IN ('prepared','reconciling') AND remote_task_identity IS NULL) OR (state NOT IN ('prepared','reconciling') AND row_version>=1)))", name="ck_remote_parse_attempt_initial_shape"),
+        CheckConstraint("(checkpoint_contract_version=1 AND (state <> 'submitted' OR remote_task_identity IS NOT NULL)) OR (checkpoint_contract_version=2 AND ((state IN ('prepared','reconciling','pre_submission_failed','superseded') AND submitted_receipt_sha256 IS NULL AND submitted_receipt_bytes IS NULL AND submitted_receipt_byte_count IS NULL) OR (state NOT IN ('prepared','reconciling','pre_submission_failed','superseded') AND remote_task_identity IS NOT NULL AND submitted_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND submitted_receipt_bytes IS NOT NULL AND submitted_receipt_byte_count=octet_length(submitted_receipt_bytes) AND submitted_receipt_byte_count BETWEEN 1 AND 65536))) OR (checkpoint_contract_version=3 AND ((state IN ('prepared','reconciling','pre_submission_failed','superseded') AND submitted_receipt_sha256 IS NULL AND submitted_receipt_bytes IS NULL AND submitted_receipt_byte_count IS NULL) OR (state NOT IN ('prepared','reconciling','pre_submission_failed','superseded') AND remote_task_identity IS NOT NULL AND submitted_receipt_sha256 IS NOT NULL AND submitted_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND submitted_receipt_bytes IS NOT NULL AND submitted_receipt_byte_count IS NOT NULL AND submitted_receipt_byte_count=octet_length(submitted_receipt_bytes) AND submitted_receipt_byte_count BETWEEN 1 AND 65536)))", name="ck_remote_parse_attempt_submitted_shape"),
+        CheckConstraint("(checkpoint_contract_version=1 AND claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (checkpoint_contract_version IN (2,3) AND state='prepared' AND ((claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (claim_generation>=1 AND claim_owner_identity IS NOT NULL AND claim_lease_until IS NOT NULL))) OR (checkpoint_contract_version IN (2,3) AND state IN ('reconciling','submitted','remote_terminal','materializing','local_materialized','finish_committed','remote_failure_committed','local_failure_committed') AND claim_generation>=1 AND claim_owner_identity IS NOT NULL AND claim_lease_until IS NOT NULL) OR (checkpoint_contract_version IN (2,3) AND state IN ('acked','remote_failed','local_failed','pre_submission_failed','superseded') AND claim_generation>=1 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL)", name="ck_remote_parse_attempt_claim_shape"),
+        CheckConstraint("checkpoint_contract_version=1 OR (checkpoint_contract_version=2 AND ((state IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536) OR (state NOT IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL))) OR (checkpoint_contract_version=3 AND ((state IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 IS NOT NULL AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536 AND local_db_staged_byte_count IS NOT NULL AND local_db_staged_byte_count>0) OR (state IN ('local_failure_committed','local_failed') AND ((local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL AND local_db_staged_byte_count IS NULL) OR (local_receipt_sha256 IS NOT NULL AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536 AND local_db_staged_byte_count IS NOT NULL AND local_db_staged_byte_count>0))) OR (state NOT IN ('local_materialized','finish_committed','acked','local_failure_committed','local_failed') AND local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL AND local_db_staged_byte_count IS NULL)))", name="ck_remote_parse_attempt_local_receipt"),
+        CheckConstraint("checkpoint_contract_version=1 OR (checkpoint_contract_version=2 AND ((state IN ('remote_failure_committed','remote_failed','pre_submission_failed') AND failure_stage='remote' AND failure_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND failure_receipt_bytes IS NOT NULL AND failure_receipt_byte_count=octet_length(failure_receipt_bytes) AND failure_receipt_byte_count BETWEEN 1 AND 65536) OR (state IN ('local_failure_committed','local_failed') AND failure_stage='local' AND failure_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND failure_receipt_bytes IS NOT NULL AND failure_receipt_byte_count=octet_length(failure_receipt_bytes) AND failure_receipt_byte_count BETWEEN 1 AND 65536) OR (state NOT IN ('remote_failure_committed','remote_failed','pre_submission_failed','local_failure_committed','local_failed') AND failure_receipt_sha256 IS NULL AND failure_receipt_bytes IS NULL AND failure_receipt_byte_count IS NULL AND failure_stage IS NULL))) OR (checkpoint_contract_version=3 AND ((state IN ('remote_failure_committed','remote_failed','pre_submission_failed') AND failure_stage='remote' AND failure_receipt_sha256 IS NOT NULL AND failure_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND failure_receipt_bytes IS NOT NULL AND failure_receipt_byte_count IS NOT NULL AND failure_receipt_byte_count=octet_length(failure_receipt_bytes) AND failure_receipt_byte_count BETWEEN 1 AND 65536) OR (state IN ('local_failure_committed','local_failed') AND failure_stage='local' AND failure_receipt_sha256 IS NOT NULL AND failure_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND failure_receipt_bytes IS NOT NULL AND failure_receipt_byte_count IS NOT NULL AND failure_receipt_byte_count=octet_length(failure_receipt_bytes) AND failure_receipt_byte_count BETWEEN 1 AND 65536) OR (state NOT IN ('remote_failure_committed','remote_failed','pre_submission_failed','local_failure_committed','local_failed') AND failure_receipt_sha256 IS NULL AND failure_receipt_bytes IS NULL AND failure_receipt_byte_count IS NULL AND failure_stage IS NULL)))", name="ck_remote_parse_attempt_failure_receipt"),
         CheckConstraint(_REMOTE_PARSE_TERMINAL_SHAPE, name="ck_remote_parse_attempt_terminal_shape"),
         UniqueConstraint("document_id", "attempt_generation", name="uq_remote_parse_attempt_document_generation"),
         ForeignKeyConstraint(
@@ -115,6 +220,52 @@ class RemoteParseAttempt(Base):
     failure_receipt_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
     failure_receipt_byte_count: Mapped[Optional[int]] = mapped_column(Integer)
     failure_stage: Mapped[Optional[str]] = mapped_column(String(16))
+    process_profile_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    credit_policy_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    reservation_input_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    reservation_input_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    reservation_input_byte_count: Mapped[Optional[int]] = mapped_column(Integer)
+    reservation_source_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_source_page_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_bucket: Mapped[Optional[str]] = mapped_column(String(16))
+    reservation_documents: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_remote_waits: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_retained_results: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_retained_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_local_items: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_compressed_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_decoded_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_temp_disk_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_db_stage_items: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_db_staged_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_ack_items: Mapped[Optional[int]] = mapped_column(BigInteger)
+    reservation_unpublished_pages: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_documents: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_remote_waits: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_retained_results: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_retained_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_local_items: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_compressed_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_decoded_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_temp_disk_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_db_stage_items: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_db_staged_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_ack_items: Mapped[Optional[int]] = mapped_column(BigInteger)
+    current_unpublished_pages: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_receipt_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    materialization_receipt_bytes: Mapped[Optional[bytes]] = mapped_column(LargeBinary)
+    materialization_receipt_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_source_page_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_spool_relpath: Mapped[Optional[str]] = mapped_column(String(1024))
+    materialization_spool_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    materialization_spool_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_compressed_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_uncompressed_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_temp_disk_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_decoded_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_member_count: Mapped[Optional[int]] = mapped_column(BigInteger)
+    materialization_token_sha256: Mapped[Optional[str]] = mapped_column(String(71))
+    local_db_staged_byte_count: Mapped[Optional[int]] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
@@ -208,6 +359,32 @@ class ProgressRelayHead(Base):
     checkpoint_bytes: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     checkpoint_byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class RemoteParseV3ResumeSecret(Base):
+    __tablename__ = "remote_parse_v3_resume_secret"
+    __table_args__ = (
+        CheckConstraint(
+            "secret_kind IN ('prepared_reconcile','accepted_submission','terminal','materialization')",
+            name="ck_remote_parse_v3_resume_secret_kind",
+        ),
+        CheckConstraint(
+            "token_sha256 ~ '^sha256:[0-9a-f]{64}$' AND token_byte_count=octet_length(token_bytes) AND token_byte_count BETWEEN 1 AND 65536",
+            name="ck_remote_parse_v3_resume_secret_identity",
+        ),
+        {"schema": OPS_SCHEMA},
+    )
+    attempt_id: Mapped[str] = mapped_column(
+        ForeignKey(f"{OPS_SCHEMA}.remote_parse_attempt.attempt_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    secret_kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    token_bytes: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    token_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    token_byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class Company(Base):

@@ -29,10 +29,13 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     RemoteParseResumeSecret,
     FailureReceipt,
     LocalMaterializationReceipt,
+    LocalMaterializationReceiptV2,
+    PreparedMaterializationReceiptV2,
     PreparedReconcileReceipt,
     decode_checkpoint_receipt,
     decode_terminal_receipt,
 )
+from disclosure_anchor.application.contracts.staged_credit import CreditVector
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
     encode_durable_checkpoint_witness,
@@ -653,6 +656,39 @@ class _ProcessingRunRepositoryBase:
 
 
 def _remote_attempt_entity(row: models.RemoteParseAttempt) -> RemoteParseAttempt:
+    if row.materialization_receipt_bytes is not None:
+        encoded_materialization = decode_checkpoint_receipt(
+            bytes(row.materialization_receipt_bytes)
+        )
+        materialization = encoded_materialization.receipt
+        if not isinstance(materialization, PreparedMaterializationReceiptV2) or (
+            encoded_materialization.sha256 != row.materialization_receipt_sha256
+            or encoded_materialization.byte_count != row.materialization_receipt_byte_count
+            or materialization.attempt_identity != row.attempt_id
+            or materialization.fence_identity != row.fence_identity
+            or materialization.source_pdf_sha256 != row.source_pdf_sha256
+            or materialization.source_page_count != row.materialization_source_page_count
+            or materialization.process_profile_sha256 != row.process_profile_sha256
+            or materialization.credit_policy_sha256 != row.credit_policy_sha256
+            or materialization.reservation_input_sha256 != row.reservation_input_sha256
+            or materialization.spool_relpath != row.materialization_spool_relpath
+            or materialization.spool_sha256 != row.materialization_spool_sha256
+            or materialization.spool_byte_count != row.materialization_spool_byte_count
+            or materialization.compressed_byte_count
+            != row.materialization_compressed_byte_count
+            or materialization.uncompressed_byte_count
+            != row.materialization_uncompressed_byte_count
+            or materialization.temporary_disk_byte_count
+            != row.materialization_temp_disk_byte_count
+            or materialization.decoded_byte_count
+            != row.materialization_decoded_byte_count
+            or materialization.member_count != row.materialization_member_count
+            or materialization.private_token_sha256
+            != row.materialization_token_sha256
+        ):
+            raise RemoteParseCheckpointConflict(
+                "stored prepared materialization projection drifted"
+            )
     if row.submitted_receipt_bytes is not None:
         encoded_submission = decode_checkpoint_receipt(
             bytes(row.submitted_receipt_bytes)
@@ -687,7 +723,7 @@ def _remote_attempt_entity(row: models.RemoteParseAttempt) -> RemoteParseAttempt
     if row.local_receipt_bytes is not None:
         encoded_local = decode_checkpoint_receipt(bytes(row.local_receipt_bytes))
         local = encoded_local.receipt
-        if not isinstance(local, LocalMaterializationReceipt) or (
+        if not isinstance(local, (LocalMaterializationReceipt, LocalMaterializationReceiptV2)) or (
             encoded_local.sha256 != row.local_receipt_sha256
             or encoded_local.byte_count != row.local_receipt_byte_count
             or local.attempt_identity != row.attempt_id
@@ -701,6 +737,15 @@ def _remote_attempt_entity(row: models.RemoteParseAttempt) -> RemoteParseAttempt
             or local.artifact_byte_count != row.result_artifact_bytes
         ):
             raise RemoteParseCheckpointConflict("stored local receipt identity drifted")
+        if isinstance(local, LocalMaterializationReceiptV2) and (
+            local.db_staged_byte_count != row.local_db_staged_byte_count
+            or local.process_profile_sha256 != row.process_profile_sha256
+            or local.credit_policy_sha256 != row.credit_policy_sha256
+            or local.reservation_input_sha256 != row.reservation_input_sha256
+            or local.prepared_materialization_sha256
+            != row.materialization_receipt_sha256
+        ):
+            raise RemoteParseCheckpointConflict("stored v2 local credit evidence drifted")
     if row.failure_receipt_bytes is not None:
         encoded_failure = decode_checkpoint_receipt(bytes(row.failure_receipt_bytes))
         failure = encoded_failure.receipt
@@ -718,6 +763,21 @@ def _remote_attempt_entity(row: models.RemoteParseAttempt) -> RemoteParseAttempt
             )
         ):
             raise RemoteParseCheckpointConflict("stored failure receipt identity drifted")
+    credit_names = (
+        "documents", "remote_waits", "retained_results", "retained_bytes",
+        "local_items", "compressed_bytes", "decoded_bytes", "temp_disk_bytes",
+        "db_stage_items", "db_staged_bytes", "ack_items", "unpublished_pages",
+    )
+    reservation = (
+        None if row.checkpoint_contract_version < 3 else CreditVector(
+            **{name: getattr(row, f"reservation_{name}") for name in credit_names}
+        )
+    )
+    current_credits = (
+        None if row.checkpoint_contract_version < 3 else CreditVector(
+            **{name: getattr(row, f"current_{name}") for name in credit_names}
+        )
+    )
     return RemoteParseAttempt(
         attempt_id=row.attempt_id, processing_run_id=row.processing_run_id,
         document_id=row.document_id, attempt_generation=row.attempt_generation,
@@ -749,6 +809,26 @@ def _remote_attempt_entity(row: models.RemoteParseAttempt) -> RemoteParseAttempt
         failure_receipt_bytes=None if row.failure_receipt_bytes is None else bytes(row.failure_receipt_bytes),
         failure_receipt_byte_count=row.failure_receipt_byte_count,
         failure_stage=cast(Any, row.failure_stage),
+        process_profile_sha256=row.process_profile_sha256,
+        credit_policy_sha256=row.credit_policy_sha256,
+        reservation_input_sha256=row.reservation_input_sha256,
+        reservation_input_bytes=(
+            None if row.reservation_input_bytes is None
+            else bytes(row.reservation_input_bytes)
+        ),
+        reservation_input_byte_count=row.reservation_input_byte_count,
+        reservation_source_byte_count=row.reservation_source_byte_count,
+        reservation_source_page_count=row.reservation_source_page_count,
+        reservation_bucket=row.reservation_bucket,
+        reservation=reservation,
+        current_credits=current_credits,
+        materialization_receipt_sha256=row.materialization_receipt_sha256,
+        materialization_receipt_bytes=(
+            None if row.materialization_receipt_bytes is None
+            else bytes(row.materialization_receipt_bytes)
+        ),
+        materialization_receipt_byte_count=row.materialization_receipt_byte_count,
+        local_db_staged_byte_count=row.local_db_staged_byte_count,
         created_at=row.created_at, updated_at=row.updated_at,
     )
 

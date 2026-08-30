@@ -9,6 +9,13 @@ import json
 import re
 from typing import Any, Literal
 
+from disclosure_anchor.application.contracts.staged_credit import (
+    CreditShapeFacts,
+    CreditVector,
+    credit_shape,
+    decode_reservation_input,
+)
+
 
 AttemptState = Literal[
     "prepared",
@@ -543,6 +550,20 @@ class RemoteParseAttempt:
     failure_receipt_bytes: bytes | None = field(default=None, repr=False)
     failure_receipt_byte_count: int | None = None
     failure_stage: Literal["remote", "local"] | None = None
+    process_profile_sha256: str | None = None
+    credit_policy_sha256: str | None = None
+    reservation_input_bytes: bytes | None = field(default=None, repr=False)
+    reservation_input_sha256: str | None = None
+    reservation_input_byte_count: int | None = None
+    reservation_source_byte_count: int | None = None
+    reservation_source_page_count: int | None = None
+    reservation_bucket: str | None = None
+    reservation: CreditVector | None = None
+    current_credits: CreditVector | None = None
+    materialization_receipt_bytes: bytes | None = field(default=None, repr=False)
+    materialization_receipt_sha256: str | None = None
+    materialization_receipt_byte_count: int | None = None
+    local_db_staged_byte_count: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -566,7 +587,7 @@ class RemoteParseAttempt:
                 raise ValueError("remote parse attempt hash is not canonical")
         if isinstance(self.attempt_generation, bool) or self.attempt_generation < 1:
             raise ValueError("attempt generation must be a positive exact integer")
-        if self.checkpoint_contract_version not in {1, 2} or isinstance(
+        if self.checkpoint_contract_version not in {1, 2, 3} or isinstance(
             self.checkpoint_contract_version, bool
         ):
             raise ValueError("checkpoint contract version is unsupported")
@@ -590,6 +611,27 @@ class RemoteParseAttempt:
             "failure", self.failure_receipt_sha256, self.failure_receipt_bytes,
             self.failure_receipt_byte_count,
         )
+        if self.checkpoint_contract_version < 3:
+            if any(
+                value is not None
+                for value in (
+                    self.process_profile_sha256,
+                    self.credit_policy_sha256,
+                    self.reservation_input_bytes,
+                    self.reservation_input_sha256,
+                    self.reservation_input_byte_count,
+                    self.reservation_source_byte_count,
+                    self.reservation_source_page_count,
+                    self.reservation_bucket,
+                    self.reservation,
+                    self.current_credits,
+                    self.materialization_receipt_bytes,
+                    self.materialization_receipt_sha256,
+                    self.materialization_receipt_byte_count,
+                    self.local_db_staged_byte_count,
+                )
+            ):
+                raise ValueError("v1/v2 checkpoint cannot contain v3 evidence")
         if self.checkpoint_contract_version == 1:
             if any(
                 value is not None
@@ -602,6 +644,113 @@ class RemoteParseAttempt:
             ) or self.claim_generation != 0:
                 raise ValueError("v1 checkpoint cannot contain v2 recovery evidence")
             return
+        if self.checkpoint_contract_version == 3:
+            if not all(
+                isinstance(value, str) and _SHA.fullmatch(value)
+                for value in (self.process_profile_sha256, self.credit_policy_sha256)
+            ) or type(self.reservation_input_bytes) is not bytes:
+                raise ValueError("v3 checkpoint lacks closed profile/reservation evidence")
+            encoded_input = decode_reservation_input(self.reservation_input_bytes)
+            if (
+                encoded_input.sha256 != self.reservation_input_sha256
+                or encoded_input.byte_count != self.reservation_input_byte_count
+                or encoded_input.value.process_profile_sha256 != self.process_profile_sha256
+                or encoded_input.value.credit_policy_sha256 != self.credit_policy_sha256
+                or encoded_input.value.source_pdf_sha256 != self.source_pdf_sha256
+                or encoded_input.value.source_byte_count
+                != self.reservation_source_byte_count
+                or encoded_input.value.source_page_count
+                != self.reservation_source_page_count
+                or encoded_input.value.bucket != self.reservation_bucket
+                or encoded_input.value.reservation != self.reservation
+                or type(self.current_credits) is not CreditVector
+                or not self.current_credits.fits(encoded_input.value.reservation)
+            ):
+                raise ValueError("v3 reservation evidence drifted from attempt")
+            if self.materialization_receipt_bytes is not None:
+                encoded_materialization = decode_checkpoint_receipt(
+                    self.materialization_receipt_bytes
+                )
+                prepared_projection = encoded_materialization.receipt
+                if not isinstance(prepared_projection, PreparedMaterializationReceiptV2) or (
+                    encoded_materialization.sha256 != self.materialization_receipt_sha256
+                    or encoded_materialization.byte_count
+                    != self.materialization_receipt_byte_count
+                    or prepared_projection.attempt_identity != self.attempt_id
+                    or prepared_projection.fence_identity != self.fence_identity
+                    or prepared_projection.source_pdf_sha256 != self.source_pdf_sha256
+                    or prepared_projection.process_profile_sha256
+                    != self.process_profile_sha256
+                    or prepared_projection.credit_policy_sha256 != self.credit_policy_sha256
+                    or prepared_projection.reservation_input_sha256
+                    != self.reservation_input_sha256
+                ):
+                    raise ValueError("v3 materialization evidence drifted from attempt")
+            decoded_materialization = (
+                None
+                if self.materialization_receipt_bytes is None
+                else decode_checkpoint_receipt(self.materialization_receipt_bytes).receipt
+            )
+            local_v2 = (
+                None
+                if self.local_receipt_bytes is None
+                else decode_checkpoint_receipt(self.local_receipt_bytes).receipt
+            )
+            if local_v2 is not None and not isinstance(
+                local_v2, LocalMaterializationReceiptV2
+            ):
+                raise ValueError("v3 local receipt must use the v2 credit contract")
+            materialization = (
+                decoded_materialization
+                if isinstance(decoded_materialization, PreparedMaterializationReceiptV2)
+                else None
+            )
+            materialization_required = self.state in {
+                "materializing", "local_materialized", "finish_committed", "acked"
+            }
+            if materialization_required != (materialization is not None):
+                raise ValueError(
+                    "materialization receipt presence disagrees with v3 state"
+                )
+            if self.state in {"local_failure_committed", "local_failed"}:
+                if local_v2 is not None and materialization is None:
+                    raise ValueError("completed local failure lacks prepared evidence")
+            elif self.state not in {"local_materialized", "finish_committed", "acked"}:
+                if local_v2 is not None:
+                    raise ValueError("v3 local receipt is stale for attempt state")
+            facts = CreditShapeFacts(
+                terminal_byte_count=self.result_artifact_bytes or 0,
+                compressed_byte_count=(
+                    materialization.compressed_byte_count
+                    if isinstance(materialization, PreparedMaterializationReceiptV2)
+                    else 0
+                ),
+                uncompressed_byte_count=(
+                    materialization.uncompressed_byte_count
+                    if isinstance(materialization, PreparedMaterializationReceiptV2)
+                    else 0
+                ),
+                decoded_byte_count=(
+                    materialization.decoded_byte_count
+                    if isinstance(materialization, PreparedMaterializationReceiptV2)
+                    else 0
+                ),
+                temporary_disk_byte_count=(
+                    materialization.temporary_disk_byte_count
+                    if isinstance(materialization, PreparedMaterializationReceiptV2)
+                    else 0
+                ),
+                db_staged_byte_count=self.local_db_staged_byte_count or 0,
+                source_page_count=(
+                    self.reservation_source_page_count or 0
+                    if materialization is not None
+                    else 0
+                ),
+                materialization_prepared=materialization is not None,
+                local_materialization_completed=local_v2 is not None,
+            )
+            if credit_shape(self.state, facts) != self.current_credits:
+                raise ValueError("v3 current credit projection drifted from state evidence")
         submitted_required = self.state not in {
             "prepared", "reconciling", "pre_submission_failed", "superseded"
         }
