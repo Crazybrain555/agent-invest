@@ -11,6 +11,10 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
+from disclosure_anchor.application.contracts.mineru_process_profile import (
+    MineruProcessProfile,
+)
+
 
 TELEMETRY_FRAME_VERSION: Literal["mineru.synchronized-telemetry-frame.v1"] = (
     "mineru.synchronized-telemetry-frame.v1"
@@ -396,21 +400,32 @@ class SynchronizedTelemetryFrame(_FrozenModel):
 
 
 class ProcessProfileParameters(_FrozenModel):
+    contract_version: Literal["mineru.process-profile.v1"] = (
+        "mineru.process-profile.v1"
+    )
     requested_hybrid_batch_ratio: int = Field(ge=1)
     effective_hybrid_batch_ratio: int = Field(ge=1)
+    hybrid_ocr_override: bool
     api_task_slots: int = Field(ge=1)
     api_max_pending_tasks: int = Field(ge=1)
     inference_concurrency: int = Field(ge=1)
     processing_window_size: int = Field(ge=1)
     vllm_max_num_seqs: int = Field(ge=1)
+    vllm_max_model_len: int = Field(ge=1)
+    pipeline_inference_locks: bool
+    finalizer_slots: int = Field(ge=1)
+    result_reservation_bytes: int = Field(ge=1)
+    max_unacked_result_bytes: int = Field(ge=1)
+    task_retention_seconds: int = Field(ge=1)
+    task_cleanup_interval_seconds: int = Field(ge=1)
 
     @model_validator(mode="after")
     def _check_profile(self) -> "ProcessProfileParameters":
-        if self.api_task_slots > self.api_max_pending_tasks:
-            raise ValueError("task slots exceed pending-task admission")
-        if self.inference_concurrency > self.vllm_max_num_seqs:
-            raise ValueError("inference concurrency exceeds vLLM sequence limit")
+        self.as_contract()
         return self
+
+    def as_contract(self) -> MineruProcessProfile:
+        return MineruProcessProfile(**self.model_dump())
 
 
 class ProcessProfileLifecycle(_FrozenModel):
@@ -433,6 +448,8 @@ class ProcessProfileLifecycle(_FrozenModel):
             ("clock_domain_identity_sha256", self.clock_domain_identity_sha256),
         ):
             _sha256(value, label=label)
+        if self.process_profile_sha256 != self.parameters.as_contract().sha256:
+            raise ValueError("process profile hash differs from its parameters")
         return self
 
 
