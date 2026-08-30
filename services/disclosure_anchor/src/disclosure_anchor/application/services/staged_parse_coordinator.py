@@ -607,6 +607,8 @@ class StagedParseCoordinator:
             ):
                 oversubscribed_recovery.add(work.attempt_id)
             ledger.replace(work, allow_oversubscribed=True)
+            if not ledger.in_use.fits(ledger.limit):
+                oversubscribed_recovery.update(known)
 
         def preserve_contract_violation(
             prior: CoordinatorWork,

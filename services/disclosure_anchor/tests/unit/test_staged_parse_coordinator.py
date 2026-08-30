@@ -896,6 +896,46 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "foreign or final"):
             StagedParseCoordinator(backend=backend, limits=_limits()).run()
 
+    def test_deferred_row_causing_aggregate_overage_does_not_strand_releaser(self) -> None:
+        rows = tuple(
+            replace(
+                _work(f"attempt-{suffix}", "remote_terminal", 4),
+                credit_reservation=replace(
+                    _LIFECYCLE_RESERVATION, retained_bytes=6_000
+                ),
+                credits=CreditVector(
+                    documents=1, retained_results=1, retained_bytes=6_000
+                ),
+            )
+            for suffix in ("a", "b")
+        )
+        backend = _Backend(recoverable=rows)
+        backend.defer_claim_ids.add("attempt-b")
+        result_box: list[object] = []
+        thread = threading.Thread(
+            target=lambda: result_box.append(
+                StagedParseCoordinator(
+                    backend=backend,
+                    limits=_limits(credits=replace(_LIMIT, retained_bytes=10_000)),
+                ).run()
+            )
+        )
+        thread.start()
+        deadline = time.monotonic() + 1
+        while (
+            "local_prepare:attempt-a" not in backend.calls
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        self.assertIn("local_prepare:attempt-a", backend.calls)
+        self.assertNotIn("local_prepare:attempt-b", backend.calls)
+        backend.defer_claim_ids.clear()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
+        )
+
     def test_stage_renews_near_expiry_claim_before_side_effect(self) -> None:
         near_expiry = replace(
             _work("attempt-1", "prepared"),
