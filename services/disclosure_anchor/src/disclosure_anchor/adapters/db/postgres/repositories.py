@@ -67,6 +67,8 @@ from disclosure_anchor.domain.errors import (
     SubjectIdentityRaceError,
 )
 
+_MAX_SIGNED_BIGINT = (1 << 63) - 1
+
 
 class CompanyRepository:
     def __init__(self, session: Session) -> None:
@@ -936,11 +938,26 @@ class RemoteParseAttemptRepository:
             and attempt.claim_owner_identity is None
             and attempt.claim_lease_until is None
             and attempt.remote_task_identity is None
+            and attempt.submitted_receipt_sha256 is None
             and attempt.submitted_receipt_bytes is None
+            and attempt.submitted_receipt_byte_count is None
+            and attempt.terminal_receipt_sha256 is None
             and attempt.terminal_receipt_bytes is None
+            and attempt.terminal_receipt_byte_count is None
+            and attempt.result_owner_identity is None
+            and attempt.result_artifact_sha256 is None
+            and attempt.result_artifact_bytes is None
+            and attempt.local_receipt_sha256 is None
             and attempt.local_receipt_bytes is None
+            and attempt.local_receipt_byte_count is None
+            and attempt.local_db_staged_byte_count is None
+            and attempt.failure_receipt_sha256 is None
             and attempt.failure_receipt_bytes is None
+            and attempt.failure_receipt_byte_count is None
+            and attempt.failure_stage is None
+            and attempt.materialization_receipt_sha256 is None
             and attempt.materialization_receipt_bytes is None
+            and attempt.materialization_receipt_byte_count is None
             and type(attempt.reservation) is CreditVector
             and type(attempt.current_credits) is CreditVector
         ):
@@ -1136,6 +1153,15 @@ class RemoteParseAttemptRepository:
     ) -> list[RemoteParseAttempt]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise ValueError("v3 recovery page limit is outside 1..1000")
+        unsupported = self._session.query(models.RemoteParseAttempt).filter(
+            models.RemoteParseAttempt.is_current.is_(True),
+            models.RemoteParseAttempt.checkpoint_contract_version != 3,
+        ).order_by(models.RemoteParseAttempt.attempt_id).first()
+        if unsupported is not None:
+            raise RemoteParseCheckpointConflict(
+                "non-v3 current checkpoint blocks v3 staged activation: "
+                f"{unsupported.attempt_id}/{unsupported.state}"
+            )
         query = self._session.query(models.RemoteParseAttempt).filter(
             models.RemoteParseAttempt.checkpoint_contract_version == 3,
             models.RemoteParseAttempt.is_current.is_(True),
@@ -1148,7 +1174,10 @@ class RemoteParseAttemptRepository:
     @staticmethod
     def _validate_v3_claim_request(
         *, owner_identity: str, lease_seconds: int, expected_current: CreditVector,
+        expected_version: int, allow_version_increment: bool,
+        claim_generation: int | None = None,
     ) -> None:
+        maximum_version = _MAX_SIGNED_BIGINT - int(allow_version_increment)
         if (
             not isinstance(owner_identity, str)
             or not owner_identity.strip()
@@ -1157,6 +1186,17 @@ class RemoteParseAttemptRepository:
             or not isinstance(lease_seconds, int)
             or not 1 <= lease_seconds <= 300
             or type(expected_current) is not CreditVector
+            or isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or not 0 <= expected_version <= maximum_version
+            or (
+                claim_generation is not None
+                and (
+                    isinstance(claim_generation, bool)
+                    or not isinstance(claim_generation, int)
+                    or not 1 <= claim_generation <= _MAX_SIGNED_BIGINT
+                )
+            )
         ):
             raise ValueError("v3 recovery claim request is invalid")
 
@@ -1214,14 +1254,18 @@ class RemoteParseAttemptRepository:
             owner_identity=owner_identity,
             lease_seconds=lease_seconds,
             expected_current=expected_current,
+            expected_version=expected_version,
+            allow_version_increment=True,
         )
         clock = self._database_clock()
         live_same_owner = sa.and_(
             models.RemoteParseAttempt.claim_owner_identity == owner_identity,
             models.RemoteParseAttempt.claim_lease_until > clock.c.database_observed_at,
+            models.RemoteParseAttempt.row_version == expected_version + 1,
         )
         acquirable = sa.and_(
             models.RemoteParseAttempt.row_version == expected_version,
+            models.RemoteParseAttempt.claim_generation < _MAX_SIGNED_BIGINT,
             sa.or_(
                 models.RemoteParseAttempt.claim_owner_identity.is_(None),
                 models.RemoteParseAttempt.claim_lease_until
@@ -1281,6 +1325,9 @@ class RemoteParseAttemptRepository:
             owner_identity=owner_identity,
             lease_seconds=lease_seconds,
             expected_current=expected_current,
+            expected_version=expected_version,
+            allow_version_increment=False,
+            claim_generation=claim_generation,
         )
         clock = self._database_clock()
         lease_until = clock.c.database_observed_at + sa.func.make_interval(
@@ -1327,8 +1374,14 @@ class RemoteParseAttemptRepository:
         expected_version: int, expected_current: CreditVector,
         owner_identity: str, claim_generation: int,
     ) -> ClaimedAttemptSnapshot:
-        if type(expected_current) is not CreditVector:
-            raise ValueError("v3 reload requires exact current credits")
+        self._validate_v3_claim_request(
+            owner_identity=owner_identity,
+            lease_seconds=1,
+            expected_current=expected_current,
+            expected_version=expected_version,
+            allow_version_increment=False,
+            claim_generation=claim_generation,
+        )
         clock = self._database_clock()
         remaining = sa.cast(
             sa.func.floor(
