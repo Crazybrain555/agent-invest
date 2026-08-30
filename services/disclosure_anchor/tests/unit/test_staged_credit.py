@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import math
 import unittest
 
@@ -22,8 +24,8 @@ from tests.unit.test_mineru_process_profile import _profile
 
 
 SHA_A = "sha256:" + "a" * 64
-POLICY_SHA = "sha256:6ca42b3507deb651a4dcc9381214c8e83b4be0cbbb32f322138da475b5d49817"
-INPUT_SHA = "sha256:090c5ceb8e3bc5093f4e0967ab506d3aa7db8458fb5666baca03d77bcd3c333b"
+POLICY_SHA = "sha256:4b30f8207cdb9503543c9ae38da7dd92be2b55754217b976a7dd262519f90866"
+INPUT_SHA = "sha256:de5c94c2076cbd94da9c936efe52a72c047c6a56fa4bb80908b438e7f945f01f"
 
 
 class StagedCreditContractTests(unittest.TestCase):
@@ -33,6 +35,44 @@ class StagedCreditContractTests(unittest.TestCase):
         self.assertIn(b'"source_fraction_denominator":8', exact)
         self.assertIn(b'"state_credit_shapes"', exact)
         self.assertIn(b'"temp_disk_bytes":"temporary_disk_byte_count"', exact)
+        self.assertIn(b'"db_staged_bytes":"db_staged_byte_count"', exact)
+
+    def test_each_executable_policy_section_changes_policy_identity(self) -> None:
+        original = json.loads(STAGED_CREDIT_POLICY_V1.exact_bytes)
+        mutations = (
+            ("ordered_bucket_selection", lambda value: value.reverse()),
+            (
+                "reservation_mechanics",
+                lambda value: value.__setitem__("compressed_bytes", "literal:0"),
+            ),
+            (
+                "state_credit_shapes",
+                lambda value: value["submitted"].__setitem__("ack_items", "one"),
+            ),
+            (
+                "state_variants",
+                lambda value: value["local_failure_committed"][
+                    "post_materialization"
+                ].pop("local_items"),
+            ),
+            (
+                "state_transitions",
+                lambda value: value["submitted"].remove("remote_terminal"),
+            ),
+            ("credit_dimensions", lambda value: value.remove("db_staged_bytes")),
+        )
+        for section, mutate in mutations:
+            with self.subTest(section=section):
+                candidate = json.loads(json.dumps(original))
+                mutate(candidate[section])
+                exact = json.dumps(
+                    candidate,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                self.assertNotEqual(
+                    "sha256:" + hashlib.sha256(exact).hexdigest(), POLICY_SHA
+                )
 
     def test_regular_heavy_huge_are_exact_profile_relative_envelopes(self) -> None:
         profile = _profile()
@@ -105,6 +145,39 @@ class StagedCreditContractTests(unittest.TestCase):
         )
         self.assertEqual(envelope.reservation_input.value.bucket, "heavy")
 
+    def test_int64_profile_boundaries_use_capped_arithmetic(self) -> None:
+        maximum = (1 << 63) - 1
+        profile = replace(
+            _profile(),
+            api_task_slots=1,
+            api_max_pending_tasks=1,
+            finalizer_slots=1,
+            source_pdf_bytes_limit=maximum,
+            result_reservation_bytes=maximum,
+            max_unacked_result_bytes=maximum,
+            terminal_output_bytes_limit=maximum,
+            rasterized_page_bytes_limit=maximum,
+            decoded_payload_bytes_limit=maximum,
+            temporary_disk_bytes_limit=maximum,
+            db_staged_bytes_limit=maximum,
+        )
+        for source_bytes, pages, bucket in (
+            (maximum // 8, 512, "regular"),
+            (maximum // 4, 1000, "heavy"),
+            (maximum, profile.unpublished_pages_limit, "huge"),
+        ):
+            with self.subTest(bucket=bucket):
+                envelope = build_staged_credit_envelope(
+                    profile=profile,
+                    source_pdf_sha256=SHA_A,
+                    source_byte_count=source_bytes,
+                    source_page_count=pages,
+                )
+                self.assertEqual(envelope.reservation_input.value.bucket, bucket)
+                self.assertTrue(envelope.reservation.fits(CreditVector(**{
+                    item: maximum for item in envelope.reservation.nonzero()
+                })))
+
     def test_input_replay_rejects_duplicate_noncanonical_and_nested_drift(self) -> None:
         envelope = build_staged_credit_envelope(
             profile=_profile(),
@@ -114,7 +187,7 @@ class StagedCreditContractTests(unittest.TestCase):
         )
         exact = envelope.reservation_input.exact_bytes
         self.assertEqual(envelope.reservation_input.sha256, INPUT_SHA)
-        self.assertEqual(envelope.reservation_input.byte_count, 661)
+        self.assertEqual(envelope.reservation_input.byte_count, 690)
         with self.assertRaisesRegex(ValueError, "duplicate"):
             decode_reservation_input(exact[:-1] + b',"bucket":"regular"}')
         with self.assertRaisesRegex(ValueError, "canonical"):
@@ -199,11 +272,15 @@ class StagedCreditContractTests(unittest.TestCase):
                 temp_disk_bytes=50,
             ),
         )
-        self.assertEqual(
-            credit_shape("local_materialized", facts).unpublished_pages, 4
+        completed = replace(
+            facts,
+            local_materialization_completed=True,
+            db_staged_byte_count=15,
         )
+        self.assertEqual(credit_shape("local_materialized", completed).unpublished_pages, 4)
+        self.assertEqual(credit_shape("local_materialized", completed).db_staged_bytes, 15)
         self.assertEqual(
-            credit_shape("local_failure_committed", facts).ack_items, 1
+            credit_shape("local_failure_committed", facts).local_items, 1
         )
         self.assertEqual(credit_shape("local_failed", facts), CreditVector())
         with self.assertRaisesRegex(ValueError, "prepared facts"):
@@ -221,7 +298,15 @@ class StagedCreditContractTests(unittest.TestCase):
         )
         self.assertEqual(
             credit_shape("local_failure_committed", facts),
-            CreditVector(documents=1, retained_results=1, retained_bytes=10, ack_items=1),
+            CreditVector(
+                documents=1, retained_results=1, retained_bytes=10,
+                local_items=1, compressed_bytes=10, decoded_bytes=20,
+                temp_disk_bytes=50, ack_items=1,
+            ),
+        )
+        self.assertEqual(
+            credit_shape("local_failure_committed", completed).db_staged_bytes,
+            15,
         )
 
     def test_database_lease_bridge_is_exact_and_conservative(self) -> None:
@@ -253,6 +338,12 @@ class StagedCreditContractTests(unittest.TestCase):
                     monotonic_before=invalid,  # type: ignore[arg-type]
                     monotonic_after=11.0,
                 )
+        with self.assertRaisesRegex(ValueError, "outside the closed range"):
+            conservative_monotonic_deadline(
+                snapshot,
+                monotonic_before=-1e308,
+                monotonic_after=1e308,
+            )
 
 
 if __name__ == "__main__":

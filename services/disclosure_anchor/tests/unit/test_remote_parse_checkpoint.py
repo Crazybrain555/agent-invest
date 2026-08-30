@@ -87,6 +87,7 @@ class RemoteParseCheckpointContractTests(unittest.TestCase):
             member_count=2,
             temporary_disk_byte_count=50,
             decoded_byte_count=60,
+            db_staged_byte_count=30,
         )
         encoded_local = encode_checkpoint_receipt(local)
         self.assertEqual(decode_checkpoint_receipt(encoded_local.exact_bytes), encoded_local)
@@ -138,7 +139,7 @@ class RemoteParseCheckpointContractTests(unittest.TestCase):
             provider_envelope_sha256=SHA_A, provider_envelope_byte_count=30,
             compressed_byte_count=10, uncompressed_byte_count=40,
             member_count=2, temporary_disk_byte_count=50,
-            decoded_byte_count=60,
+            decoded_byte_count=60, db_staged_byte_count=30,
         )
         with self.assertRaisesRegex(ValueError, "temporary disk peak drifted"):
             replace(local, temporary_disk_byte_count=51)

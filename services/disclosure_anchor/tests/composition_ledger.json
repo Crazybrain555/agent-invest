@@ -478,11 +478,11 @@
   },
   "tests/unit/test_staged_credit.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 11
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
-   "tests": 37
+   "tests": 38
   },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],

@@ -38,9 +38,18 @@ _BUCKETS: tuple[tuple[CreditBucket, int, int, int, int], ...] = (
     ("heavy", 1, 2, 2, 3),
     ("huge", 1, 1, 4, 4),
 )
-_RESERVATION_FORMULAS = MappingProxyType(
+_RESERVATION_MECHANICS = MappingProxyType(
     {
+        "ack_items": "literal:1",
+        "compressed_bytes": "retained_bytes",
+        "db_stage_items": "literal:1",
+        "db_staged_bytes": "profile.db_staged_bytes_limit (right-sized only by exact LocalMaterializationReceiptV2.db_staged_byte_count)",
         "decoded_bytes": "min(profile.decoded_payload_bytes_limit,source_page_count*ceil(profile.rasterized_page_bytes_limit/profile.resident_pages_limit))",
+        "documents": "literal:1",
+        "local_items": "literal:1",
+        "remote_waits": "literal:1",
+        "retained_bytes": "min(profile.result_reservation_bytes*bucket.result_reservation_multiplier,profile.terminal_output_bytes_limit,profile.max_unacked_result_bytes)",
+        "retained_results": "literal:1",
         "temporary_disk_bytes": "min(profile.temporary_disk_bytes_limit,retained_bytes+min(decoded_bytes,retained_bytes*bucket.temp_expansion_multiplier))",
         "unpublished_pages": "source_page_count",
     }
@@ -80,6 +89,7 @@ _STATE_CREDIT_SHAPES = _freeze_shapes({
         "retained_results": "one",
         "retained_bytes": "terminal_byte_count",
         "db_stage_items": "one",
+        "db_staged_bytes": "db_staged_byte_count",
         "unpublished_pages": "source_page_count",
     },
     "finish_committed": {
@@ -105,6 +115,19 @@ _STATE_CREDIT_SHAPES = _freeze_shapes({
     "pre_submission_failed": {},
     "superseded": {},
 })
+_LOCAL_FAILURE_POST_MATERIALIZATION_SHAPE = MappingProxyType(
+    {
+        **dict(_STATE_CREDIT_SHAPES["materializing"]),
+        "ack_items": "one",
+    }
+)
+_LOCAL_FAILURE_COMPLETED_SHAPE = MappingProxyType(
+    {
+        **dict(_LOCAL_FAILURE_POST_MATERIALIZATION_SHAPE),
+        "db_stage_items": "one",
+        "db_staged_bytes": "db_staged_byte_count",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +141,7 @@ class CreditVector:
     decoded_bytes: int = 0
     temp_disk_bytes: int = 0
     db_stage_items: int = 0
+    db_staged_bytes: int = 0
     ack_items: int = 0
     unpublished_pages: int = 0
 
@@ -177,8 +201,9 @@ class StagedCreditPolicy:
     @property
     def exact_bytes(self) -> bytes:
         payload = {
-            "bucket_thresholds": {
-                name: {
+            "ordered_bucket_selection": [
+                {
+                    "bucket": name,
                     "source_fraction_denominator": denominator,
                     "source_fraction_numerator": numerator,
                     "result_reservation_multiplier": result_multiplier,
@@ -186,11 +211,11 @@ class StagedCreditPolicy:
                 }
                 for name, numerator, denominator, result_multiplier, temp_multiplier
                 in _BUCKETS
-            },
+            ],
             "contract_version": self.contract_version,
             "credit_dimensions": [item.name for item in fields(CreditVector)],
             "max_integer": _MAX_INT,
-            "reservation_formulas": dict(_RESERVATION_FORMULAS),
+            "reservation_mechanics": dict(_RESERVATION_MECHANICS),
             "state_credit_shapes": {
                 state: dict(shape)
                 for state, shape in sorted(_STATE_CREDIT_SHAPES.items())
@@ -198,6 +223,19 @@ class StagedCreditPolicy:
             "state_transitions": {
                 state: sorted(next_states)
                 for state, next_states in sorted(STAGED_STATE_TRANSITIONS.items())
+            },
+            "state_variants": {
+                "local_failure_committed": {
+                    "local_materialization_completed": dict(
+                        _LOCAL_FAILURE_COMPLETED_SHAPE
+                    ),
+                    "post_materialization": dict(
+                        _LOCAL_FAILURE_POST_MATERIALIZATION_SHAPE
+                    ),
+                    "pre_materialization": dict(
+                        _STATE_CREDIT_SHAPES["local_failure_committed"]
+                    ),
+                }
             },
         }
         return _canonical_json(payload)
@@ -293,13 +331,18 @@ class CreditShapeFacts:
     uncompressed_byte_count: int = 0
     decoded_byte_count: int = 0
     temporary_disk_byte_count: int = 0
+    db_staged_byte_count: int = 0
     source_page_count: int = 0
     materialization_prepared: bool = False
+    local_materialization_completed: bool = False
 
     def __post_init__(self) -> None:
         for item in fields(self):
             value = getattr(self, item.name)
-            if item.name == "materialization_prepared":
+            if item.name in {
+                "materialization_prepared",
+                "local_materialization_completed",
+            }:
                 if type(value) is not bool:
                     raise ValueError("materialization prepared must be boolean")
             elif isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_INT:
@@ -315,6 +358,8 @@ def credit_shape(state: str, facts: CreditShapeFacts) -> CreditVector:
         _require_terminal_facts(facts)
     elif state == "materializing":
         _require_materialization_facts(facts)
+        if facts.local_materialization_completed:
+            raise ValueError("materializing state has completed local facts")
     elif state == "local_materialized":
         _require_local_facts(facts)
     elif state == "finish_committed":
@@ -337,7 +382,13 @@ def credit_shape(state: str, facts: CreditShapeFacts) -> CreditVector:
             raise ValueError("pre-materialization local failure has stale facts")
     elif state not in _STATE_CREDIT_SHAPES:
         raise ValueError("credit shape state is unsupported")
-    shape = _STATE_CREDIT_SHAPES[state]
+    shape = (
+        _LOCAL_FAILURE_COMPLETED_SHAPE
+        if state == "local_failure_committed" and facts.local_materialization_completed
+        else _LOCAL_FAILURE_POST_MATERIALIZATION_SHAPE
+        if state == "local_failure_committed" and facts.materialization_prepared
+        else _STATE_CREDIT_SHAPES[state]
+    )
     values: dict[str, int] = {}
     for dimension, source in shape.items():
         values[dimension] = 1 if source == "one" else getattr(facts, source)
@@ -380,11 +431,17 @@ def conservative_monotonic_deadline(
             raise ValueError("monotonic lease bracket is invalid")
     if monotonic_after < monotonic_before:
         raise ValueError("monotonic lease bracket moved backwards")
-    bracket_us = ceil((monotonic_after - monotonic_before) * 1_000_000)
+    bracket_seconds = monotonic_after - monotonic_before
+    if not isfinite(bracket_seconds) or bracket_seconds > _MAX_INT / 1_000_000:
+        raise ValueError("monotonic lease bracket is outside the closed range")
+    bracket_us = ceil(bracket_seconds * 1_000_000)
     safe_us = max(0, snapshot.remaining_microseconds - bracket_us)
     if safe_us <= 0:
         raise ValueError("database lease is not safely runnable")
-    return monotonic_after + safe_us / 1_000_000
+    deadline = monotonic_after + safe_us / 1_000_000
+    if not isfinite(deadline):
+        raise ValueError("monotonic lease deadline is outside the closed range")
+    return deadline
 
 
 def encode_reservation_input(value: ReservationInput) -> EncodedReservationInput:
@@ -433,45 +490,56 @@ def build_staged_credit_envelope(
     for candidate in _BUCKETS:
         _, numerator, denominator, _, _ = candidate
         if (
-            _checked_mul(source_byte_count, denominator)
-            <= _checked_mul(profile.source_pdf_bytes_limit, numerator)
-            and _checked_mul(source_page_count, denominator)
-            <= _checked_mul(page_ceiling, numerator)
+            source_byte_count
+            <= _floor_fraction(profile.source_pdf_bytes_limit, numerator, denominator)
+            and source_page_count
+            <= _floor_fraction(page_ceiling, numerator, denominator)
         ):
             selected = candidate
             break
     if selected is None:
         raise ValueError("source facts do not fit a staged credit bucket")
     bucket, numerator, denominator, result_multiplier, temp_multiplier = selected
-    retained_cap = min(
-        _checked_mul(profile.result_reservation_bytes, result_multiplier),
-        profile.terminal_output_bytes_limit,
-        profile.max_unacked_result_bytes,
+    retained_global_cap = min(
+        profile.terminal_output_bytes_limit, profile.max_unacked_result_bytes
+    )
+    retained_cap = _capped_mul(
+        profile.result_reservation_bytes,
+        result_multiplier,
+        retained_global_cap,
     )
     raster_per_page = _ceil_div(
         profile.rasterized_page_bytes_limit, profile.resident_pages_limit
     )
     decoded_cap = min(
         profile.decoded_payload_bytes_limit,
-        _checked_mul(source_page_count, raster_per_page),
+        _capped_mul(
+            source_page_count, raster_per_page, profile.decoded_payload_bytes_limit
+        ),
     )
     uncompressed_staging_cap = min(
-        decoded_cap, _checked_mul(retained_cap, temp_multiplier)
+        decoded_cap,
+        _capped_mul(retained_cap, temp_multiplier, decoded_cap),
     )
     temp_cap = min(
         profile.temporary_disk_bytes_limit,
-        _checked_add(retained_cap, uncompressed_staging_cap),
+        _capped_add(
+            retained_cap,
+            uncompressed_staging_cap,
+            profile.temporary_disk_bytes_limit,
+        ),
     )
     reservation = CreditVector(
         documents=1,
         remote_waits=1,
-        retained_results=1,
+    retained_results=1,
         retained_bytes=retained_cap,
         local_items=1,
         compressed_bytes=retained_cap,
         decoded_bytes=decoded_cap,
         temp_disk_bytes=temp_cap,
         db_stage_items=1,
+        db_staged_bytes=profile.db_staged_bytes_limit,
         ack_items=1,
         unpublished_pages=source_page_count,
     )
@@ -528,6 +596,8 @@ def _require_materialization_facts(facts: CreditShapeFacts) -> None:
         != _checked_add(facts.compressed_byte_count, facts.uncompressed_byte_count)
     ):
         raise ValueError("materializing credit shape lacks exact prepared facts")
+    if facts.local_materialization_completed and facts.db_staged_byte_count < 1:
+        raise ValueError("completed local materialization lacks exact DB staged bytes")
 
 
 def _require_empty_facts(facts: CreditShapeFacts) -> None:
@@ -537,6 +607,8 @@ def _require_empty_facts(facts: CreditShapeFacts) -> None:
 
 def _require_local_facts(facts: CreditShapeFacts) -> None:
     _require_materialization_facts(facts)
+    if not facts.local_materialization_completed or facts.db_staged_byte_count < 1:
+        raise ValueError("local credit shape requires completed materialization")
     if facts.source_page_count < 1:
         raise ValueError("local credit shape requires exact source pages")
 
@@ -555,12 +627,26 @@ def _checked_mul(left: int, right: int) -> int:
     return result
 
 
+def _capped_mul(value: int, multiplier: int, cap: int) -> int:
+    if cap == 0 or value > cap // multiplier:
+        return cap
+    return value * multiplier
+
+
+def _capped_add(left: int, right: int, cap: int) -> int:
+    if left >= cap or right > cap - left:
+        return cap
+    return left + right
+
+
 def _ceil_div(value: int, denominator: int) -> int:
-    return _checked_add(value, denominator - 1) // denominator
+    quotient, remainder = divmod(value, denominator)
+    return quotient + int(remainder != 0)
 
 
-def _floor_ratio(value: int, numerator: int, denominator: int) -> int:
-    return _checked_mul(value, numerator) // denominator
+def _floor_fraction(value: int, numerator: int, denominator: int) -> int:
+    quotient, remainder = divmod(value, denominator)
+    return quotient * numerator + (remainder * numerator) // denominator
 
 
 def _require_positive_int(value: object, label: str) -> None:

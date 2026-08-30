@@ -744,6 +744,7 @@ class StagedParseCoordinator:
                 },
                 CoordinatorLane.LOCAL: {
                     "db_stage_items",
+                    "db_staged_bytes",
                     "unpublished_pages",
                     "ack_items",
                 },

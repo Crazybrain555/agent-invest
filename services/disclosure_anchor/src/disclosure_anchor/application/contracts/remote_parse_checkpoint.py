@@ -269,6 +269,7 @@ class LocalMaterializationReceiptV2:
     member_count: int
     temporary_disk_byte_count: int
     decoded_byte_count: int
+    db_staged_byte_count: int
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -309,6 +310,7 @@ class LocalMaterializationReceiptV2:
             (self.member_count, "member count", 1),
             (self.temporary_disk_byte_count, "temporary disk bytes", 1),
             (self.decoded_byte_count, "decoded bytes", 1),
+            (self.db_staged_byte_count, "DB staged bytes", 1),
         ):
             if (
                 isinstance(numeric_value, bool)

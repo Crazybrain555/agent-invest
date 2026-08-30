@@ -28,6 +28,7 @@ _LIMIT = CreditVector(
     decoded_bytes=20_000,
     temp_disk_bytes=30_000,
     db_stage_items=4,
+    db_staged_bytes=20_000,
     ack_items=4,
     unpublished_pages=1_000,
 )
@@ -41,6 +42,7 @@ _LIFECYCLE_RESERVATION = CreditVector(
     decoded_bytes=400,
     temp_disk_bytes=500,
     db_stage_items=1,
+    db_staged_bytes=400,
     ack_items=1,
     unpublished_pages=10,
 )
@@ -64,7 +66,7 @@ def _work(attempt_id: str, state: str, version: int = 0) -> CoordinatorWork:
         ),
         "local_materialized": CreditVector(
             documents=1, retained_results=1, retained_bytes=100,
-            db_stage_items=1, unpublished_pages=10,
+            db_stage_items=1, db_staged_bytes=400, unpublished_pages=10,
         ),
         "finish_committed": CreditVector(
             documents=1, retained_results=1, retained_bytes=100, ack_items=1
@@ -130,6 +132,7 @@ class _Backend:
         self.local_release = threading.Event()
         self.retry_local_once = False
         self.local_calls = 0
+        self.fail_local_attempts: set[str] = set()
 
     @staticmethod
     def _assert_credit_grant(
@@ -346,6 +349,30 @@ class _Backend:
                 stage_guard.checkpoint()
         if self.retry_local_once and self.local_calls == 1:
             raise RetryStage("local transient", retry_after_seconds=0.005)
+        if work.attempt_id in self.fail_local_attempts:
+            updated = replace(
+                _work(
+                    work.attempt_id,
+                    "local_failure_committed",
+                    work.row_version + 1,
+                ),
+                claim_generation=work.claim_generation,
+                claim_owner_identity=work.claim_owner_identity,
+                lease_expires_monotonic=work.lease_expires_monotonic,
+                credit_reservation=work.credit_reservation,
+                credits=CreditVector(
+                    documents=1,
+                    retained_results=1,
+                    retained_bytes=100,
+                    local_items=1,
+                    compressed_bytes=100,
+                    decoded_bytes=400,
+                    temp_disk_bytes=500,
+                    ack_items=1,
+                ),
+            )
+            self._assert_credit_grant(work, updated, credit_allowance)
+            return updated
         target = _work(work.attempt_id, "local_materialized", work.row_version + 1)
         updated = replace(
             target,
@@ -532,6 +559,33 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
         self.assertEqual(result.final_states, (("attempt-1", "local_failed"),))
         self.assertIn("ack:attempt-1:local_failure_committed", backend.calls)
+
+    def test_post_materialization_failure_holds_local_credit_until_ack(self) -> None:
+        backend = _Backend(
+            recoverable=(
+                _work("attempt-1", "remote_terminal", 4),
+                _work("attempt-2", "remote_terminal", 4),
+            )
+        )
+        backend.fail_local_attempts.add("attempt-1")
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(
+                credits=replace(
+                    _LIMIT,
+                    local_items=1,
+                    compressed_bytes=100,
+                    decoded_bytes=400,
+                    temp_disk_bytes=500,
+                )
+            ),
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        ack_index = backend.calls.index(
+            "ack:attempt-1:local_failure_committed"
+        )
+        second_prepare_index = backend.calls.index("local_prepare:attempt-2")
+        self.assertLess(ack_index, second_prepare_index)
 
     def test_recovery_barrier_precedes_new_admission_and_full_lifecycle_acks(self) -> None:
         backend = _Backend(
