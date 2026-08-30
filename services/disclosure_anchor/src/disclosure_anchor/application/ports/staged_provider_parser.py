@@ -40,6 +40,7 @@ _DURABLE_CHECKPOINT_STATES = frozenset(
         "finish_committed",
     }
 )
+_PROVIDER_ACK_ISSUER = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +56,11 @@ class ProviderAckCompletionWitness:
     http_status: int
     exact_bytes: bytes = field(repr=False)
     sha256: str
+    _issuer: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self._issuer is not _PROVIDER_ACK_ISSUER:
+            raise ValueError("provider ACK witness was not issued by the adapter")
         if self.schema != "provider-ack-completion.v1":
             raise ValueError("provider ACK witness schema is unsupported")
         if self.committed_state not in {
@@ -102,7 +106,7 @@ class ProviderAckCompletionWitness:
             raise ValueError("provider ACK witness canonical bytes drifted")
 
 
-def encode_provider_ack_completion_witness(
+def _issue_provider_ack_completion_witness(
     *, attempt_identity: str, fence_identity: str, remote_task_identity: str,
     source_pdf_sha256: str, committed_state: str,
     terminal_receipt_sha256: str | None,
@@ -132,6 +136,14 @@ def encode_provider_ack_completion_witness(
         http_status=http_status,
         exact_bytes=canonical,
         sha256="sha256:" + hashlib.sha256(canonical).hexdigest(),
+        _issuer=_PROVIDER_ACK_ISSUER,
+    )
+
+
+def is_issued_provider_ack_completion_witness(value: object) -> bool:
+    return (
+        type(value) is ProviderAckCompletionWitness
+        and value._issuer is _PROVIDER_ACK_ISSUER
     )
 
 
@@ -822,7 +834,7 @@ __all__ = [
     "PreparedMaterialization",
     "ProviderMaterializationEvidence",
     "ProviderAckCompletionWitness",
-    "encode_provider_ack_completion_witness",
+    "is_issued_provider_ack_completion_witness",
     "RemoteProviderParseHandle",
     "StagedProviderParserResult",
     "StagedProviderDocumentParserPort",

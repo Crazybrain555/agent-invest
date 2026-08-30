@@ -51,6 +51,7 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
     ProviderAckCompletionWitness,
     encode_durable_checkpoint_witness,
+    is_issued_provider_ack_completion_witness,
     prepared_submission_identity_from_reconcile,
 )
 from disclosure_anchor.application.contracts.publish_evidence_ledger import (
@@ -2116,7 +2117,7 @@ class RemoteParseAttemptRepository:
         witness: ProviderAckCompletionWitness,
     ) -> RemoteParseAttempt:
         self._validate_expected_v3_attempt(expected_attempt)
-        if type(witness) is not ProviderAckCompletionWitness:
+        if not is_issued_provider_ack_completion_witness(witness):
             raise ValueError("v3 final ACK requires a typed provider witness")
         final_state = {
             "finish_committed": "acked",

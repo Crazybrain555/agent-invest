@@ -41,7 +41,7 @@ from disclosure_anchor.application.contracts.staged_credit import (
 )
 from disclosure_anchor.application.ports.repositories import CreditTransitionGrant
 from disclosure_anchor.application.ports.staged_provider_parser import (
-    encode_provider_ack_completion_witness,
+    _issue_provider_ack_completion_witness,
 )
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
@@ -1039,7 +1039,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 ).attempt,
                 finish_committed,
             )
-        ack = encode_provider_ack_completion_witness(
+        ack = _issue_provider_ack_completion_witness(
             attempt_identity=self.attempt_id, fence_identity="fence-1",
             remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
             committed_state="finish_committed",
@@ -1138,7 +1138,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             uow.remote_parse_attempts.reconcile_v3_remote_failure_after_race(
                 expected_attempt=submitted, receipt=conflicting,
             )
-        witness = encode_provider_ack_completion_witness(
+        witness = _issue_provider_ack_completion_witness(
             attempt_identity=self.attempt_id, fence_identity="fence-1",
             remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
             committed_state="remote_failure_committed",
@@ -1178,7 +1178,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         self.assertEqual(committed.state, "local_failure_committed")
         assert committed.current_credits is not None
         self.assertGreater(committed.current_credits.local_items, 0)
-        witness = encode_provider_ack_completion_witness(
+        witness = _issue_provider_ack_completion_witness(
             attempt_identity=self.attempt_id, fence_identity="fence-1",
             remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
             committed_state="local_failure_committed",
@@ -1218,7 +1218,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             ).attempt
             uow.commit()
         self.assertIsNone(committed.materialization_receipt_bytes)
-        witness = encode_provider_ack_completion_witness(
+        witness = _issue_provider_ack_completion_witness(
             attempt_identity=self.attempt_id, fence_identity="fence-1",
             remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
             committed_state="local_failure_committed",

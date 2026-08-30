@@ -50,7 +50,7 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     RemoteProviderParseHandle,
     StagedProviderParserResult,
     SubmissionAcceptanceAmbiguous,
-    encode_provider_ack_completion_witness,
+    _issue_provider_ack_completion_witness,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -899,7 +899,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         if task != self._task or artifact_sha256 != receipt.artifact_sha256:
             raise _fail("remote ACK receipt ownership drifted")
         status = self._ack_terminal()
-        return encode_provider_ack_completion_witness(
+        return _issue_provider_ack_completion_witness(
             attempt_identity=receipt.attempt_identity,
             fence_identity=receipt.fence_identity,
             remote_task_identity=self._task.task_id,
@@ -948,7 +948,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         ):
             raise _fail("local failure terminal receipt drifted")
         status = self._ack_terminal()
-        return encode_provider_ack_completion_witness(
+        return _issue_provider_ack_completion_witness(
             attempt_identity=failure.attempt_identity,
             fence_identity=failure.fence_identity,
             remote_task_identity=self._task.task_id,

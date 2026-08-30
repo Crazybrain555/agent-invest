@@ -61,7 +61,9 @@
    "tests": 13
   },
   "tests/integration/test_remote_parse_checkpoint.py": {
-   "private_imports": [],
+   "private_imports": [
+    "_issue_provider_ack_completion_witness"
+   ],
    "tests": 26
   },
   "tests/integration/test_repository_uow.py": {
