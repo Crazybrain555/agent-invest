@@ -33,6 +33,11 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     decode_checkpoint_receipt,
     decode_terminal_receipt,
 )
+from disclosure_anchor.application.ports.staged_provider_parser import (
+    DurableCheckpointWitness,
+    encode_durable_checkpoint_witness,
+    prepared_submission_identity_from_reconcile,
+)
 from disclosure_anchor.application.contracts.publish_evidence_ledger import (
     DurablePublishBaseEvidence,
     DurablePublishSupplementEvidence,
@@ -817,6 +822,92 @@ class RemoteParseAttemptRepository:
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]:
         row = self._session.get(models.RemoteParseAttempt, attempt_id)
         return None if row is None else _remote_attempt_entity(row)
+
+    def durable_checkpoint_witness(
+        self, attempt_id: str
+    ) -> DurableCheckpointWitness:
+        row = self._session.get(models.RemoteParseAttempt, attempt_id)
+        if row is None or row.checkpoint_contract_version != 2:
+            raise RemoteParseCheckpointConflict(
+                "durable witness requires an existing v2 attempt"
+            )
+        # Decode and cross-bind every state-owned receipt before projecting a
+        # destructive-operation witness. This is the single repository trust
+        # boundary; callers cannot manufacture receipt hashes.
+        _remote_attempt_entity(row)
+        prepared_secret = self._session.get(
+            models.RemoteParseResumeSecret,
+            (attempt_id, "prepared_reconcile"),
+        )
+        if prepared_secret is None:
+            raise RemoteParseCheckpointConflict(
+                "durable witness lacks prepared reconcile evidence"
+            )
+        prepared_encoded = decode_checkpoint_receipt(
+            bytes(prepared_secret.token_bytes)
+        )
+        prepared = prepared_encoded.receipt
+        if not isinstance(prepared, PreparedReconcileReceipt) or (
+            prepared.attempt_identity != row.attempt_id
+            or prepared.fence_identity != row.fence_identity
+            or prepared.source_pdf_sha256 != row.source_pdf_sha256
+            or prepared.parser_target_sha256 != row.parser_target_sha256
+            or prepared.request_sha256 != row.request_sha256
+            or prepared.runtime_epoch_sha256 != row.runtime_epoch_sha256
+            or prepared.client_submit_key != row.client_submit_key
+        ):
+            raise RemoteParseCheckpointConflict(
+                "prepared reconcile evidence drifted from attempt"
+            )
+        prepared_identity = prepared_submission_identity_from_reconcile(prepared)
+
+        if row.submitted_receipt_bytes is not None:
+            submitted = decode_checkpoint_receipt(
+                bytes(row.submitted_receipt_bytes)
+            )
+            if (
+                not isinstance(submitted.receipt, AcceptedSubmissionReceipt)
+                or submitted.sha256 != row.submitted_receipt_sha256
+                or submitted.receipt.attempt_identity != row.attempt_id
+                or submitted.receipt.fence_identity != row.fence_identity
+                or submitted.receipt.source_pdf_sha256
+                != prepared.source_pdf_sha256
+                or submitted.receipt.client_submit_key
+                != prepared.client_submit_key
+                or submitted.receipt.submission_epoch_unix
+                != prepared.submission_epoch_unix
+                or submitted.receipt.remote_task_identity
+                != row.remote_task_identity
+            ):
+                raise RemoteParseCheckpointConflict(
+                    "accepted submission evidence drifted from prepared attempt"
+                )
+        if row.failure_receipt_bytes is not None:
+            failure = decode_checkpoint_receipt(bytes(row.failure_receipt_bytes))
+            if (
+                not isinstance(failure.receipt, FailureReceipt)
+                or failure.sha256 != row.failure_receipt_sha256
+                or failure.receipt.attempt_identity != row.attempt_id
+                or failure.receipt.fence_identity != row.fence_identity
+                or failure.receipt.remote_task_identity
+                != row.remote_task_identity
+            ):
+                raise RemoteParseCheckpointConflict(
+                    "failure evidence drifted from durable attempt"
+                )
+        return encode_durable_checkpoint_witness(
+            attempt_identity=row.attempt_id,
+            fence_identity=row.fence_identity,
+            checkpoint_contract_version=row.checkpoint_contract_version,
+            row_version=row.row_version,
+            claim_generation=row.claim_generation,
+            state=row.state,
+            prepared_identity=prepared_identity,
+            accepted_submission_receipt_sha256=row.submitted_receipt_sha256,
+            terminal_receipt_sha256=row.terminal_receipt_sha256,
+            failure_receipt_sha256=row.failure_receipt_sha256,
+            remote_task_identity=row.remote_task_identity,
+        )
 
     def get_current_for_document(self, document_id: str) -> Optional[RemoteParseAttempt]:
         row = self._session.query(models.RemoteParseAttempt).filter(

@@ -21,6 +21,9 @@ from disclosure_anchor.application.contracts.publish_evidence_ledger import (
     DurablePublishSupplementEvidence,
     EncodedProgressRelayCheckpoint,
 )
+from disclosure_anchor.application.ports.staged_provider_parser import (
+    DurableCheckpointWitness,
+)
 
 from disclosure_anchor.domain.entities import (
     Company,
@@ -120,6 +123,9 @@ class RemoteParseAttemptRepository(Protocol):
         submission_secret: RemoteParseResumeSecret,
     ) -> RemoteParseAttempt: ...
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]: ...
+    def durable_checkpoint_witness(
+        self, attempt_id: str
+    ) -> DurableCheckpointWitness: ...
     def get_current_for_document(
         self, document_id: str
     ) -> Optional[RemoteParseAttempt]: ...

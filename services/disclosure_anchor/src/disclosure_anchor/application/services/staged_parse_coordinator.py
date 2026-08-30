@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields
 from enum import Enum
+from threading import Event
 import time
 from typing import Protocol
 
@@ -171,7 +172,34 @@ class RetryStage(RuntimeError):
         self.retry_after_seconds = float(retry_after_seconds)
 
 
+class StageLeaseLost(RuntimeError):
+    """A bounded backend step lost its execution fence before a side effect."""
+
+
+@dataclass(frozen=True, slots=True)
+class StageLeaseGuard:
+    """Cooperative hard boundary checked around every backend IO chunk."""
+
+    deadline_monotonic: float
+    _revoked: Event
+
+    def checkpoint(self, monotonic: Callable[[], float] = time.monotonic) -> None:
+        if self._revoked.is_set() or monotonic() > self.deadline_monotonic:
+            raise StageLeaseLost("bounded stage lease expired")
+
+    def revoke(self) -> None:
+        self._revoked.set()
+
+
 class StagedCoordinatorBackend(Protocol):
+    """Bounded staged operations owned by the durable coordinator.
+
+    Every implementation must call ``stage_guard.checkpoint()`` immediately
+    before and after each network, filesystem, or database IO chunk.  A single
+    chunk must itself be bounded by the guard deadline; returning after lease
+    loss is a contract violation and cannot authorize another side effect.
+    """
+
     """Durable operations used by the scheduling core.
 
     Every method must either return the exact reloaded durable projection,
@@ -200,12 +228,12 @@ class StagedCoordinatorBackend(Protocol):
         """Reload exact durable state after a renewal/commit response race."""
 
     def prepare_remote_io(
-        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
     ) -> CoordinatorWork:
         """Run local-only preflight, then durably enter reconciling."""
 
     def run_remote(
-        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
     ) -> CoordinatorWork: ...
 
     def prepare_local_io(
@@ -213,20 +241,20 @@ class StagedCoordinatorBackend(Protocol):
         work: CoordinatorWork,
         *,
         credit_allowance: CreditVector,
-        step_deadline_monotonic: float,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         """Durably enter materializing and reserve exact local projections."""
 
     def run_local(
-        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
     ) -> CoordinatorWork: ...
 
     def commit(
-        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
     ) -> CoordinatorWork: ...
 
     def acknowledge(
-        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
     ) -> CoordinatorWork: ...
 
 
@@ -454,10 +482,13 @@ class StagedParseCoordinator:
             for lane in CoordinatorLane
         }
         in_flight: dict[
-            Future[CoordinatorWork], tuple[CoordinatorLane, CoordinatorWork, float]
+            Future[CoordinatorWork],
+            tuple[CoordinatorLane, CoordinatorWork, StageLeaseGuard],
         ] = {}
         reconciled_results: dict[Future[CoordinatorWork], CoordinatorWork] = {}
         in_flight_failures: set[Future[CoordinatorWork]] = set()
+        provisional_local: dict[Future[CoordinatorWork], CreditVector] = {}
+        provisional_local_total = CreditVector()
 
         def emit() -> None:
             self._progress(
@@ -477,7 +508,7 @@ class StagedParseCoordinator:
                         )
                         for lane in CoordinatorLane
                     ),
-                    credits_in_use=ledger.in_use,
+                    credits_in_use=ledger.in_use + provisional_local_total,
                     credits_limit=ledger.limit,
                     completed=completed,
                     blocked_reason=blocked_reason,
@@ -496,6 +527,8 @@ class StagedParseCoordinator:
             if recovery and not ledger.can_add(work):
                 oversubscribed_recovery.add(work.attempt_id)
             ledger.replace(work, allow_oversubscribed=recovery)
+            if oversubscribed_recovery and ledger.in_use.fits(ledger.limit):
+                oversubscribed_recovery.clear()
             if work.state in _FINAL_STATES:
                 ledger.release(work.attempt_id)
                 final[work.attempt_id] = work.state
@@ -631,12 +664,34 @@ class StagedParseCoordinator:
                 + self._limits.claim_renew_margin_seconds
             )
 
+        def local_prepare_hold(work: CoordinatorWork) -> CreditVector:
+            names = {
+                "local_items",
+                "compressed_bytes",
+                "decoded_bytes",
+                "temp_disk_bytes",
+            }
+            return CreditVector(
+                **{
+                    item.name: (
+                        max(
+                            0,
+                            getattr(work.credit_reservation, item.name)
+                            - getattr(work.credits, item.name),
+                        )
+                        if item.name in names
+                        else 0
+                    )
+                    for item in fields(CreditVector)
+                }
+            )
+
         def guard_in_flight(now: float) -> None:
             nonlocal circuit_open, admission_open, blocked_reason
-            for future, (lane, work, deadline) in tuple(in_flight.items()):
-                if future.done() or future in reconciled_results:
+            for future, (lane, work, stage_guard) in tuple(in_flight.items()):
+                if future.done():
                     continue
-                if now > deadline:
+                if now > stage_guard.deadline_monotonic:
                     if future not in in_flight_failures:
                         circuit_open = True
                         admission_open = False
@@ -645,9 +700,12 @@ class StagedParseCoordinator:
                             f"{work.attempt_id}:{lane.value}:stage deadline exceeded"
                         )
                         in_flight_failures.add(future)
+                        stage_guard.revoke()
                     # Stop extending ownership after the backend broke its
                     # bounded-step contract. Its lease/fence checks must then
                     # prevent any further side effect.
+                    continue
+                if future in reconciled_results:
                     continue
                 if not needs_renewal(work, now):
                     continue
@@ -675,13 +733,21 @@ class StagedParseCoordinator:
                         and durable.claim_owner_identity == work.claim_owner_identity
                         and durable.state == work.state
                         and durable.row_version == work.row_version
+                        and durable.credits == work.credits
+                        and durable.credit_reservation == work.credit_reservation
                         and durable.lease_expires_monotonic is not None
                         and work.lease_expires_monotonic is not None
                         and durable.lease_expires_monotonic
                         > work.lease_expires_monotonic
                     ):
                         known[work.attempt_id] = durable
-                        in_flight[future] = (lane, durable, deadline)
+                        ledger.replace(
+                            durable,
+                            allow_oversubscribed=(
+                                durable.attempt_id in oversubscribed_recovery
+                            ),
+                        )
+                        in_flight[future] = (lane, durable, stage_guard)
                     elif (
                         durable.attempt_id == work.attempt_id
                         and durable.claim_generation == work.claim_generation
@@ -703,7 +769,7 @@ class StagedParseCoordinator:
                         )
                         in_flight_failures.add(future)
                 else:
-                    in_flight[future] = (lane, renewed, deadline)
+                    in_flight[future] = (lane, renewed, stage_guard)
 
         try:
             # Startup is an exhaustive keyset recovery barrier.  No new work
@@ -830,6 +896,17 @@ class StagedParseCoordinator:
                     )
                     while queues[lane] and active < lane_limits[lane]:
                         work = queues[lane].popleft()
+                        local_hold = CreditVector()
+                        if lane == CoordinatorLane.LOCAL_PREPARE:
+                            if work.attempt_id not in oversubscribed_recovery:
+                                local_hold = local_prepare_hold(work)
+                                if not (
+                                    ledger.in_use
+                                    + provisional_local_total
+                                    + local_hold
+                                ).fits(ledger.limit):
+                                    queues[lane].appendleft(work)
+                                    break
                         try:
                             if needs_renewal(work, now):
                                 work = renew(work, lane)
@@ -841,45 +918,60 @@ class StagedParseCoordinator:
                                 f"{work.attempt_id}:{lane.value}:claim:{type(exc).__name__}:{exc}"
                             )
                             break
-                        deadline = now + self._limits.max_stage_step_seconds
+                        stage_guard = StageLeaseGuard(
+                            deadline_monotonic=(
+                                now + self._limits.max_stage_step_seconds
+                            ),
+                            _revoked=Event(),
+                        )
                         if lane == CoordinatorLane.PREFLIGHT:
                             future = pools[lane].submit(
                                 self._backend.prepare_remote_io,
                                 work,
-                                step_deadline_monotonic=deadline,
+                                stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.REMOTE:
                             future = pools[lane].submit(
                                 self._backend.run_remote,
                                 work,
-                                step_deadline_monotonic=deadline,
+                                stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.LOCAL_PREPARE:
                             future = pools[lane].submit(
                                 self._backend.prepare_local_io,
                                 work,
-                                credit_allowance=ledger.allowance_for(work.attempt_id),
-                                step_deadline_monotonic=deadline,
+                                credit_allowance=(
+                                    work.credit_reservation
+                                    if work.attempt_id in oversubscribed_recovery
+                                    else ledger.limit
+                                    - (ledger.in_use - work.credits + provisional_local_total)
+                                ),
+                                stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.LOCAL:
                             future = pools[lane].submit(
                                 self._backend.run_local,
                                 work,
-                                step_deadline_monotonic=deadline,
+                                stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.COMMIT:
                             future = pools[lane].submit(
                                 self._backend.commit,
                                 work,
-                                step_deadline_monotonic=deadline,
+                                stage_guard=stage_guard,
                             )
                         else:
                             future = pools[lane].submit(
                                 self._backend.acknowledge,
                                 work,
-                                step_deadline_monotonic=deadline,
+                                stage_guard=stage_guard,
                             )
-                        in_flight[future] = (lane, work, deadline)
+                        in_flight[future] = (lane, work, stage_guard)
+                        if lane == CoordinatorLane.LOCAL_PREPARE:
+                            provisional_local[future] = local_hold
+                            provisional_local_total = (
+                                provisional_local_total + local_hold
+                            )
                         active += 1
 
                 if not in_flight:
@@ -929,7 +1021,16 @@ class StagedParseCoordinator:
                     emit()
                     continue
                 for future in done:
-                    lane, work, step_deadline = in_flight.pop(future)
+                    lane, work, stage_guard = in_flight.pop(future)
+                    released_local_hold = (
+                        provisional_local.pop(future)
+                        if future in provisional_local
+                        else None
+                    )
+                    if released_local_hold is not None:
+                        provisional_local_total = (
+                            provisional_local_total - released_local_hold
+                        )
                     try:
                         if future in reconciled_results:
                             # Observe the future exception/result only to drain
@@ -979,6 +1080,14 @@ class StagedParseCoordinator:
                             retry_degraded = True
                             admission_open = False
                             blocked_reason = "retry_degraded"
+                    except StageLeaseLost as exc:
+                        circuit_open = True
+                        admission_open = False
+                        blocked_reason = "bounded_stage_deadline_exceeded"
+                        errors.append(
+                            f"{work.attempt_id}:{lane.value}:stage deadline exceeded:{exc}"
+                        )
+                        in_flight_failures.add(future)
                     except Exception as exc:  # noqa: BLE001 - opens the circuit visibly
                         circuit_open = True
                         admission_open = False
@@ -987,7 +1096,7 @@ class StagedParseCoordinator:
                             f"{work.attempt_id}:{lane.value}:{type(exc).__name__}:{exc}"
                         )
                     else:
-                        if self._monotonic() > step_deadline:
+                        if self._monotonic() > stage_guard.deadline_monotonic:
                             preserve_contract_violation(
                                 work, updated, lane, "bounded stage exceeded deadline"
                             )
@@ -997,6 +1106,7 @@ class StagedParseCoordinator:
                             consecutive_retries = 0
                             retry_degraded = False
                             last_progress = self._monotonic()
+                guard_in_flight(self._monotonic())
                 emit()
         finally:
             # Running IO is never cancelled.  Executor shutdown waits for every
@@ -1015,6 +1125,8 @@ __all__ = [
     "CreditVector",
     "RecoveryDeferred",
     "RetryStage",
+    "StageLeaseGuard",
+    "StageLeaseLost",
     "StagedCoordinatorBackend",
     "StagedParseCoordinator",
 ]

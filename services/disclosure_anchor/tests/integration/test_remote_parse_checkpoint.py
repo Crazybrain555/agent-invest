@@ -296,6 +296,32 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 )
             )
 
+    def test_repository_witness_maps_prepared_and_accepted_evidence_exactly(self) -> None:
+        claimed = self._add_claim()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            prepared = uow.remote_parse_attempts.durable_checkpoint_witness(
+                self.attempt_id
+            )
+        self.assertEqual(prepared.state, "prepared")
+        self.assertEqual(prepared.source_pdf_sha256, _sha("a"))
+        self.assertEqual(prepared.parser_target_identity_sha256, _PARSER_TARGET_SHA)
+        self.assertEqual(prepared.runtime_bundle_identity_sha256, _sha("d"))
+        self.assertEqual(prepared.request_sha256, _sha("c"))
+        self.assertEqual(prepared.client_submit_key, "submit-" + self.attempt_id)
+        self.assertEqual(prepared.submission_epoch_unix, 100)
+
+        submitted = self._submitted(claimed)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            witness = uow.remote_parse_attempts.durable_checkpoint_witness(
+                self.attempt_id
+            )
+        self.assertEqual(witness.state, "submitted")
+        self.assertEqual(
+            witness.accepted_submission_receipt_sha256,
+            submitted.submitted_receipt_sha256,
+        )
+        self.assertEqual(witness.remote_task_identity, "task-1")
+
     def test_success_finish_updates_run_document_and_checkpoint_atomically(self) -> None:
         current = self._local_materialized()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:

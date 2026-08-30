@@ -18,6 +18,10 @@ from urllib.parse import urlsplit
 
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.provider_parser import ProviderParserResult
+from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    EncodedCheckpointReceipt,
+    PreparedReconcileReceipt,
+)
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
@@ -38,59 +42,6 @@ _DURABLE_CHECKPOINT_STATES = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class DurableFailureReceipt:
-    """Closed failure projection persisted before destructive remote cleanup."""
-
-    schema: str
-    attempt_identity: str
-    fence_identity: str
-    failure_kind: str
-    remote_task_identity: str | None
-    terminal_receipt_sha256: str | None
-    exact_bytes: bytes = field(repr=False)
-    sha256: str
-
-    def __post_init__(self) -> None:
-        if self.schema != "durable-parse-failure.v1":
-            raise ValueError("durable failure receipt schema is unsupported")
-        if self.failure_kind not in {
-            "pre_submission_failed",
-            "remote_failure_committed",
-            "local_failure_committed",
-        }:
-            raise ValueError("durable failure kind is unsupported")
-        for identity in (self.attempt_identity, self.fence_identity):
-            if not identity.strip() or len(identity) > 1024:
-                raise ValueError("durable failure identity is invalid")
-        if self.failure_kind == "pre_submission_failed":
-            if self.remote_task_identity is not None or self.terminal_receipt_sha256 is not None:
-                raise ValueError("pre-submission failure cannot bind remote facts")
-        else:
-            if not self.remote_task_identity or len(self.remote_task_identity) > 1024:
-                raise ValueError("remote failure must bind its task")
-            if self.failure_kind == "remote_failure_committed":
-                if self.terminal_receipt_sha256 is not None:
-                    raise ValueError("remote failure cannot bind a terminal receipt")
-            elif self.terminal_receipt_sha256 is None:
-                raise ValueError("local failure must bind its terminal receipt")
-        if self.terminal_receipt_sha256 is not None:
-            _require_sha256(self.terminal_receipt_sha256, "failure terminal receipt")
-        projection = {
-            "schema": self.schema,
-            "attempt_identity": self.attempt_identity,
-            "fence_identity": self.fence_identity,
-            "failure_kind": self.failure_kind,
-            "remote_task_identity": self.remote_task_identity,
-            "terminal_receipt_sha256": self.terminal_receipt_sha256,
-        }
-        canonical = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
-        if self.exact_bytes != canonical or self.sha256 != (
-            "sha256:" + hashlib.sha256(canonical).hexdigest()
-        ):
-            raise ValueError("durable failure receipt exact bytes drifted")
-
-
-@dataclass(frozen=True, slots=True)
 class DurableCheckpointWitness:
     """State-discriminated projection returned after repository CAS/commit."""
 
@@ -101,7 +52,13 @@ class DurableCheckpointWitness:
     row_version: int
     claim_generation: int
     state: str
-    prepared_submission_sha256: str | None
+    prepared_submission_sha256: str
+    source_pdf_sha256: str
+    parser_target_identity_sha256: str
+    runtime_bundle_identity_sha256: str
+    request_sha256: str
+    client_submit_key: str
+    submission_epoch_unix: int
     accepted_submission_receipt_sha256: str | None
     terminal_receipt_sha256: str | None
     failure_receipt_sha256: str | None
@@ -129,22 +86,35 @@ class DurableCheckpointWitness:
         ):
             if isinstance(count, bool) or not isinstance(count, int) or count < 1:
                 raise ValueError(f"durable {label} must be positive")
-        hashes = (
+        for value in (
             self.prepared_submission_sha256,
+            self.source_pdf_sha256,
+            self.parser_target_identity_sha256,
+            self.runtime_bundle_identity_sha256,
+            self.request_sha256,
+        ):
+            _require_sha256(value, "prepared checkpoint identity")
+        if not self.client_submit_key.strip() or len(self.client_submit_key) > 128:
+            raise ValueError("durable checkpoint submit key is invalid")
+        if type(self.submission_epoch_unix) is not int or self.submission_epoch_unix < 0:
+            raise ValueError("durable checkpoint submission epoch is invalid")
+        hashes = (
             self.accepted_submission_receipt_sha256,
             self.terminal_receipt_sha256,
             self.failure_receipt_sha256,
         )
-        for value in hashes:
-            if value is not None:
-                _require_sha256(value, "state-discriminated checkpoint receipt")
+        for receipt_hash in hashes:
+            if receipt_hash is not None:
+                _require_sha256(
+                    receipt_hash, "state-discriminated checkpoint receipt"
+                )
         expected_presence = {
-            "prepared": (True, False, False, False, False),
-            "submitted": (False, True, False, False, True),
-            "pre_submission_failed": (False, False, False, True, False),
-            "remote_failure_committed": (False, False, False, True, True),
-            "local_failure_committed": (False, False, True, True, True),
-            "finish_committed": (False, False, True, False, True),
+            "prepared": (False, False, False, False),
+            "submitted": (True, False, False, True),
+            "pre_submission_failed": (False, False, True, False),
+            "remote_failure_committed": (False, False, True, True),
+            "local_failure_committed": (False, True, True, True),
+            "finish_committed": (False, True, False, True),
         }[self.state]
         actual_presence = tuple(value is not None for value in (*hashes, self.remote_task_identity))
         if actual_presence != expected_presence:
@@ -162,6 +132,12 @@ class DurableCheckpointWitness:
             "claim_generation": self.claim_generation,
             "state": self.state,
             "prepared_submission_sha256": self.prepared_submission_sha256,
+            "source_pdf_sha256": self.source_pdf_sha256,
+            "parser_target_identity_sha256": self.parser_target_identity_sha256,
+            "runtime_bundle_identity_sha256": self.runtime_bundle_identity_sha256,
+            "request_sha256": self.request_sha256,
+            "client_submit_key": self.client_submit_key,
+            "submission_epoch_unix": self.submission_epoch_unix,
             "accepted_submission_receipt_sha256": self.accepted_submission_receipt_sha256,
             "terminal_receipt_sha256": self.terminal_receipt_sha256,
             "failure_receipt_sha256": self.failure_receipt_sha256,
@@ -174,6 +150,71 @@ class DurableCheckpointWitness:
             "sha256:" + hashlib.sha256(canonical).hexdigest()
         ):
             raise ValueError("durable checkpoint witness exact bytes drifted")
+
+
+def encode_durable_checkpoint_witness(
+    *,
+    attempt_identity: str,
+    fence_identity: str,
+    checkpoint_contract_version: int,
+    row_version: int,
+    claim_generation: int,
+    state: str,
+    prepared_identity: PreparedSubmissionIdentity,
+    accepted_submission_receipt_sha256: str | None,
+    terminal_receipt_sha256: str | None,
+    failure_receipt_sha256: str | None,
+    remote_task_identity: str | None,
+) -> DurableCheckpointWitness:
+    projection = {
+        "schema": "durable-checkpoint-witness.v1",
+        "attempt_identity": attempt_identity,
+        "fence_identity": fence_identity,
+        "checkpoint_contract_version": checkpoint_contract_version,
+        "row_version": row_version,
+        "claim_generation": claim_generation,
+        "state": state,
+        "prepared_submission_sha256": prepared_identity.sha256,
+        "source_pdf_sha256": prepared_identity.source_pdf_sha256,
+        "parser_target_identity_sha256": (
+            prepared_identity.parser_target_identity_sha256
+        ),
+        "runtime_bundle_identity_sha256": (
+            prepared_identity.runtime_bundle_identity_sha256
+        ),
+        "request_sha256": prepared_identity.request_sha256,
+        "client_submit_key": prepared_identity.client_submit_key,
+        "submission_epoch_unix": prepared_identity.submission_epoch_unix,
+        "accepted_submission_receipt_sha256": (
+            accepted_submission_receipt_sha256
+        ),
+        "terminal_receipt_sha256": terminal_receipt_sha256,
+        "failure_receipt_sha256": failure_receipt_sha256,
+        "remote_task_identity": remote_task_identity,
+    }
+    exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+    return DurableCheckpointWitness(
+        schema="durable-checkpoint-witness.v1",
+        attempt_identity=attempt_identity,
+        fence_identity=fence_identity,
+        checkpoint_contract_version=checkpoint_contract_version,
+        row_version=row_version,
+        claim_generation=claim_generation,
+        state=state,
+        prepared_submission_sha256=prepared_identity.sha256,
+        source_pdf_sha256=prepared_identity.source_pdf_sha256,
+        parser_target_identity_sha256=prepared_identity.parser_target_identity_sha256,
+        runtime_bundle_identity_sha256=prepared_identity.runtime_bundle_identity_sha256,
+        request_sha256=prepared_identity.request_sha256,
+        client_submit_key=prepared_identity.client_submit_key,
+        submission_epoch_unix=prepared_identity.submission_epoch_unix,
+        accepted_submission_receipt_sha256=accepted_submission_receipt_sha256,
+        terminal_receipt_sha256=terminal_receipt_sha256,
+        failure_receipt_sha256=failure_receipt_sha256,
+        remote_task_identity=remote_task_identity,
+        exact_bytes=exact,
+        sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +389,38 @@ class PreparedSubmissionIdentity:
             or self.sha256 != "sha256:" + hashlib.sha256(canonical).hexdigest()
         ):
             raise ValueError("prepared submission exact bytes drifted")
+
+
+def prepared_submission_identity_from_reconcile(
+    receipt: PreparedReconcileReceipt,
+) -> PreparedSubmissionIdentity:
+    """Map the DB canonical prepared receipt to the provider identity exactly."""
+
+    projection = {
+        "schema": "mineru-prepared-submission.v1",
+        "attempt_identity": receipt.attempt_identity,
+        "fence_identity": receipt.fence_identity,
+        "source_pdf_sha256": receipt.source_pdf_sha256,
+        "parser_target_identity_sha256": receipt.parser_target_sha256,
+        "runtime_bundle_identity_sha256": receipt.runtime_epoch_sha256,
+        "request_sha256": receipt.request_sha256,
+        "client_submit_key": receipt.client_submit_key,
+        "submission_epoch_unix": receipt.submission_epoch_unix,
+    }
+    exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+    return PreparedSubmissionIdentity(
+        schema="mineru-prepared-submission.v1",
+        attempt_identity=receipt.attempt_identity,
+        fence_identity=receipt.fence_identity,
+        source_pdf_sha256=receipt.source_pdf_sha256,
+        parser_target_identity_sha256=receipt.parser_target_sha256,
+        runtime_bundle_identity_sha256=receipt.runtime_epoch_sha256,
+        request_sha256=receipt.request_sha256,
+        client_submit_key=receipt.client_submit_key,
+        submission_epoch_unix=receipt.submission_epoch_unix,
+        exact_bytes=exact,
+        sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,7 +650,7 @@ class RemoteProviderParseHandle(Protocol):
         self,
         *,
         witness: DurableCheckpointWitness,
-        failure_receipt: DurableFailureReceipt,
+        failure_receipt: EncodedCheckpointReceipt,
     ) -> None:
         """ACK only after remote_failure_committed/local_failure_committed."""
 
@@ -617,10 +690,10 @@ class StagedProviderDocumentParserPort(Protocol):
     def discard_local_submission(
         self,
         *,
-        prepared_submission: PreparedLocalSubmission,
+        prepared_submission: PreparedLocalSubmission | PreparedSubmissionIdentity,
         witness: DurableCheckpointWitness,
         submission_receipt: PersistedSubmissionReceipt | None = None,
-        failure_receipt: DurableFailureReceipt | None = None,
+        failure_receipt: EncodedCheckpointReceipt | None = None,
     ) -> None:
         """Discard only after a DB state proves POST replay no longer needs it."""
 
@@ -642,9 +715,12 @@ class StagedProviderDocumentParserPort(Protocol):
 
 
 __all__ = [
+    "DurableCheckpointWitness",
+    "encode_durable_checkpoint_witness",
     "RemoteArtifactReceipt",
     "PersistedSubmissionReceipt",
     "PreparedSubmissionIdentity",
+    "prepared_submission_identity_from_reconcile",
     "PreparedLocalSubmission",
     "PrivateSubmittedTaskResume",
     "PreparedMaterialization",

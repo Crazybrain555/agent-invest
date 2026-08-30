@@ -23,14 +23,17 @@ from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import (
     MinerUHttpStagedParser,
 )
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    EncodedCheckpointReceipt,
+    FailureReceipt,
     TerminalReceipt,
+    encode_checkpoint_receipt,
     encode_terminal_receipt,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
-    DurableFailureReceipt,
     PreparedLocalSubmission,
+    PreparedSubmissionIdentity,
     RemoteArtifactReceipt,
     SubmissionAcceptanceAmbiguous,
 )
@@ -57,11 +60,16 @@ def _witness(
     row_version: int = 1,
     claim_generation: int = 1,
     prepared_submission_sha256: str | None = None,
+    prepared_identity: PreparedSubmissionIdentity | None = None,
     accepted_submission_receipt_sha256: str | None = None,
     terminal_receipt_sha256: str | None = None,
     failure_receipt_sha256: str | None = None,
     remote_task_identity: str | None = None,
 ) -> DurableCheckpointWitness:
+    if prepared_identity is not None:
+        prepared_submission_sha256 = prepared_identity.sha256
+    if prepared_submission_sha256 is None:
+        prepared_submission_sha256 = "sha256:" + "e" * 64
     projection = {
         "schema": "durable-checkpoint-witness.v1",
         "attempt_identity": attempt,
@@ -71,6 +79,30 @@ def _witness(
         "claim_generation": claim_generation,
         "state": state,
         "prepared_submission_sha256": prepared_submission_sha256,
+        "source_pdf_sha256": (
+            prepared_identity.source_pdf_sha256
+            if prepared_identity is not None else "sha256:" + "b" * 64
+        ),
+        "parser_target_identity_sha256": (
+            prepared_identity.parser_target_identity_sha256
+            if prepared_identity is not None else "sha256:" + "c" * 64
+        ),
+        "runtime_bundle_identity_sha256": (
+            prepared_identity.runtime_bundle_identity_sha256
+            if prepared_identity is not None else "sha256:" + "a" * 64
+        ),
+        "request_sha256": (
+            prepared_identity.request_sha256
+            if prepared_identity is not None else "sha256:" + "d" * 64
+        ),
+        "client_submit_key": (
+            prepared_identity.client_submit_key
+            if prepared_identity is not None else "submit-key"
+        ),
+        "submission_epoch_unix": (
+            prepared_identity.submission_epoch_unix
+            if prepared_identity is not None else 1_000_000
+        ),
         "accepted_submission_receipt_sha256": accepted_submission_receipt_sha256,
         "terminal_receipt_sha256": terminal_receipt_sha256,
         "failure_receipt_sha256": failure_receipt_sha256,
@@ -91,21 +123,29 @@ def _failure_receipt(
     fence: str = "fence-1",
     remote_task_identity: str | None = None,
     terminal_receipt_sha256: str | None = None,
-) -> DurableFailureReceipt:
-    projection = {
-        "schema": "durable-parse-failure.v1",
-        "attempt_identity": attempt,
-        "fence_identity": fence,
-        "failure_kind": failure_kind,
-        "remote_task_identity": remote_task_identity,
-        "terminal_receipt_sha256": terminal_receipt_sha256,
-    }
-    exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
-    return DurableFailureReceipt(
-        **projection,
-        exact_bytes=exact,
-        sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
-    )
+) -> EncodedCheckpointReceipt:
+    shape = {
+        "pre_submission_failed": ("remote", False, False, False, "pre_submission"),
+        "remote_failure_committed": ("remote", True, True, True, "remote_terminal"),
+        "local_failure_committed": ("local", True, True, True, "local_materialization"),
+    }[failure_kind]
+    return encode_checkpoint_receipt(FailureReceipt(
+        attempt_identity=attempt,
+        fence_identity=fence,
+        stage=shape[0],  # type: ignore[arg-type]
+        accepted=shape[1],
+        ack_required=shape[2],
+        submission_was_attempted=shape[3],
+        remote_task_identity=remote_task_identity,
+        claim_generation=1,
+        terminal_receipt_sha256=terminal_receipt_sha256,
+        error_code="test_failure",
+        error_stage="test",
+        error_class=shape[4],  # type: ignore[arg-type]
+        retryable=True,
+        retry_budget_class="neutral",
+        message="test failure",
+    ))
 
 
 def _terminal_exact_for_test(receipt: RemoteArtifactReceipt) -> bytes:
@@ -148,7 +188,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             options=PINNED_OPTIONS,
             identity=identity,
             witness=_witness(
-                "prepared", prepared_submission_sha256=identity.sha256
+                "prepared", prepared_identity=identity
             ),
         )
 
@@ -206,16 +246,24 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     prepared_submission=prepared,
                     witness=_witness(
                         "submitted",
+                        prepared_identity=prepared.identity,
                         accepted_submission_receipt_sha256="sha256:" + "d" * 64,
                         remote_task_identity=public.remote_task_identity,
                     ),
                     submission_receipt=public,
                 )
             self.assertTrue(prepared.snapshot_path.exists())
-            parser.discard_local_submission(
-                prepared_submission=prepared,
+            restarted = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+            )
+            restarted.discard_local_submission(
+                prepared_submission=prepared.identity,
                 witness=_witness(
                     "submitted",
+                    prepared_identity=prepared.identity,
                     accepted_submission_receipt_sha256=public.sha256,
                     remote_task_identity=public.remote_task_identity,
                 ),
@@ -225,6 +273,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 prepared_submission=prepared,
                 witness=_witness(
                     "submitted",
+                    prepared_identity=prepared.identity,
                     accepted_submission_receipt_sha256=public.sha256,
                     remote_task_identity=public.remote_task_identity,
                 ),
@@ -271,14 +320,14 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 _witness(
                     "prepared",
                     checkpoint_contract_version=1,
-                    prepared_submission_sha256=identity.sha256,
+                    prepared_identity=identity,
                 )
             prepared = parser.prepare_local_submission(
                 input_pdf=source,
                 options=PINNED_OPTIONS,
                 identity=identity,
                 witness=_witness(
-                    "prepared", prepared_submission_sha256=identity.sha256
+                    "prepared", prepared_identity=identity
                 ),
             )
             self.assertEqual(calls, 0)
@@ -394,7 +443,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     identity=prepared.identity,
                     witness=_witness(
                         "prepared",
-                        prepared_submission_sha256=prepared.identity.sha256,
+                        prepared_identity=prepared.identity,
                     ),
                 )
                 self.assertEqual(prepared_again.snapshot_path, prepared.snapshot_path)
@@ -444,13 +493,19 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     options=PINNED_OPTIONS,
                     identity=identity,
                     witness=_witness(
-                        "prepared", prepared_submission_sha256=identity.sha256
+                        "prepared", prepared_identity=identity
                     ),
                 )
-                parser.discard_local_submission(
-                    prepared_submission=prepared,
+                restarted = MinerUHttpStagedParser(
+                    api_url="http://mineru.test:30000",
+                    server_url="http://vlm.test:30000/v1",
+                    spool_root=Path(directory) / "spool",
+                )
+                restarted.discard_local_submission(
+                    prepared_submission=identity,
                     witness=_witness(
                         reason,
+                        prepared_identity=identity,
                         failure_receipt_sha256=failure.sha256,
                         terminal_receipt_sha256=terminal_sha,
                         remote_task_identity=task_id,
@@ -464,7 +519,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 options=PINNED_OPTIONS,
                 identity=identity,
                 witness=_witness(
-                    "prepared", prepared_submission_sha256=identity.sha256
+                    "prepared", prepared_identity=identity
                 ),
             )
             with self.assertRaisesRegex(
@@ -487,7 +542,8 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     prepared_submission=prepared,
                     witness=_witness(
                         "pre_submission_failed",
-                        claim_generation=2,
+                        prepared_identity=identity,
+                        attempt="other-attempt",
                         failure_receipt_sha256=failure.sha256,
                     ),
                     failure_receipt=failure,
@@ -499,6 +555,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 prepared_submission=prepared,
                 witness=_witness(
                     "pre_submission_failed",
+                    prepared_identity=identity,
                     failure_receipt_sha256=failure.sha256,
                 ),
                 failure_receipt=failure,
@@ -510,7 +567,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     options=PINNED_OPTIONS,
                     identity=identity,
                     witness=_witness(
-                        "prepared", prepared_submission_sha256=identity.sha256
+                        "prepared", prepared_identity=identity
                     ),
                 )
             self.assertTrue(snapshot_path.is_symlink())
@@ -527,7 +584,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     options=PINNED_OPTIONS,
                     identity=identity,
                     witness=_witness(
-                        "prepared", prepared_submission_sha256=identity.sha256
+                        "prepared", prepared_identity=identity
                     ),
                 )
             self.assertTrue(snapshot_path.exists())
@@ -559,7 +616,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     options=PINNED_OPTIONS,
                     identity=identity,
                     witness=_witness(
-                        "prepared", prepared_submission_sha256=identity.sha256
+                        "prepared", prepared_identity=identity
                     ),
                 )
             self.assertEqual(
@@ -571,7 +628,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 options=PINNED_OPTIONS,
                 identity=identity,
                     witness=_witness(
-                        "prepared", prepared_submission_sha256=identity.sha256
+                        "prepared", prepared_identity=identity
                     ),
             )
 
@@ -593,13 +650,11 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 from disclosure_anchor.adapters.parsers.mineru_medium import http_staged
                 from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import MinerUHttpStagedParser
                 from disclosure_anchor.application.ports.parser import ParserOptions
-                from disclosure_anchor.application.ports.staged_provider_parser import DurableCheckpointWitness
+                from disclosure_anchor.application.ports.staged_provider_parser import encode_durable_checkpoint_witness
                 parser = MinerUHttpStagedParser(api_url='http://mineru.test:30000', server_url='http://vlm.test:30000/v1', spool_root=Path({str(root)!r}))
                 options = ParserOptions(runtime_bundle_identity_sha256='sha256:' + 'a' * 64)
                 identity = parser.prepare_submission_identity(options=options, source_pdf_sha256={source_sha256!r}, attempt_identity='attempt-1', fence_identity='fence-1', submission_epoch_unix=1000000)
-                projection = {{'schema':'durable-checkpoint-witness.v1','attempt_identity':'attempt-1','fence_identity':'fence-1','checkpoint_contract_version':2,'row_version':1,'claim_generation':1,'state':'prepared','prepared_submission_sha256':identity.sha256,'accepted_submission_receipt_sha256':None,'terminal_receipt_sha256':None,'failure_receipt_sha256':None,'remote_task_identity':None}}
-                exact = json.dumps(projection, sort_keys=True, separators=(',', ':')).encode()
-                witness = DurableCheckpointWitness(**projection, exact_bytes=exact, sha256='sha256:' + hashlib.sha256(exact).hexdigest())
+                witness = encode_durable_checkpoint_witness(attempt_identity='attempt-1', fence_identity='fence-1', checkpoint_contract_version=2, row_version=1, claim_generation=1, state='prepared', prepared_identity=identity, accepted_submission_receipt_sha256=None, terminal_receipt_sha256=None, failure_receipt_sha256=None, remote_task_identity=None)
                 original = http_staged._write_snapshot_from_source
                 def crash(**kwargs):
                     original(**kwargs)
@@ -635,7 +690,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 options=PINNED_OPTIONS,
                 identity=identity,
                 witness=_witness(
-                    "prepared", prepared_submission_sha256=identity.sha256
+                    "prepared", prepared_identity=identity
                 ),
             )
             self.assertEqual(list(root.glob(".upload-*.tmp-*")), [])
@@ -672,7 +727,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                         options=PINNED_OPTIONS,
                         identity=identity,
                     witness=_witness(
-                        "prepared", prepared_submission_sha256=identity.sha256
+                        "prepared", prepared_identity=identity
                     ),
                     )
                     for parser in (first_parser, second_parser)
@@ -877,19 +932,16 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 remote_task_identity="task-1",
                 terminal_receipt_sha256=local_terminal,
             )
-            with self.assertRaisesRegex(
-                ParserOutputContractError, "exact terminal receipt"
-            ):
-                handle.acknowledge_after_failure_committed(
-                    witness=_witness(
-                        "local_failure_committed",
-                        terminal_receipt_sha256=local_terminal,
-                        failure_receipt_sha256=local_failure.sha256,
-                        remote_task_identity="task-1",
-                    ),
-                    failure_receipt=local_failure,
-                )
-            self.assertEqual(ack_calls, 1)
+            handle.acknowledge_after_failure_committed(
+                witness=_witness(
+                    "local_failure_committed",
+                    terminal_receipt_sha256=local_terminal,
+                    failure_receipt_sha256=local_failure.sha256,
+                    remote_task_identity="task-1",
+                ),
+                failure_receipt=local_failure,
+            )
+            self.assertEqual(ack_calls, 2)
 
     @staticmethod
     def _zip(entries: list[tuple[str, bytes]], *, symlink: bool = False) -> bytes:
