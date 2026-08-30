@@ -20,9 +20,13 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     encode_checkpoint_receipt,
 )
 from disclosure_anchor.application.contracts.staged_credit import (
+    CreditVector,
     CreditShapeFacts,
     build_staged_credit_envelope,
     credit_shape,
+)
+from disclosure_anchor.application.ports.repositories import (
+    CreditTransitionGrant,
 )
 from tests.unit.test_mineru_process_profile import _profile
 
@@ -44,6 +48,18 @@ def _receipt() -> TerminalReceipt:
 
 
 class RemoteParseCheckpointContractTests(unittest.TestCase):
+    def test_credit_transition_grant_is_closed_and_checks_positive_delta(self) -> None:
+        grant = CreditTransitionGrant(
+            expected_current=CreditVector(documents=1, remote_waits=1),
+            maximum_positive_delta=CreditVector(retained_results=1, retained_bytes=10),
+        )
+        self.assertTrue(grant.permits(CreditVector(documents=1, retained_results=1, retained_bytes=10)))
+        self.assertFalse(grant.permits(CreditVector(documents=1, retained_results=1, retained_bytes=11)))
+        with self.assertRaisesRegex(ValueError, "exact vectors"):
+            CreditTransitionGrant(  # type: ignore[arg-type]
+                expected_current={}, maximum_positive_delta=CreditVector()
+            )
+
     def test_v3_attempt_binds_reservation_and_exact_current_shape(self) -> None:
         local_projection = next(
             constraint

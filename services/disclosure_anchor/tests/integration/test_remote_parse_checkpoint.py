@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -373,6 +374,207 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             request_sha256=_sha("c"), runtime_epoch_sha256=_sha("d"),
         ))
         return self._secret("prepared_reconcile", encoded.exact_bytes)
+
+    def _v3_attempt_and_secret(
+        self,
+    ) -> tuple[RemoteParseAttempt, RemoteParseResumeSecret]:
+        envelope = build_staged_credit_envelope(
+            profile=_profile(),
+            source_pdf_sha256=_sha("a"),
+            source_byte_count=1024,
+            source_page_count=2,
+        )
+        attempt = RemoteParseAttempt(
+            attempt_id=self.attempt_id,
+            processing_run_id=self.run_id,
+            document_id=self.document_id,
+            attempt_generation=1,
+            fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"),
+            parser_target_sha256=_PARSER_TARGET_SHA,
+            request_sha256=_sha("c"),
+            runtime_epoch_sha256=_sha("d"),
+            client_submit_key="submit-" + self.attempt_id,
+            checkpoint_contract_version=3,
+            process_profile_sha256=envelope.process_profile_sha256,
+            credit_policy_sha256=envelope.credit_policy_sha256,
+            reservation_input_bytes=envelope.reservation_input.exact_bytes,
+            reservation_input_sha256=envelope.reservation_input.sha256,
+            reservation_input_byte_count=envelope.reservation_input.byte_count,
+            reservation_source_byte_count=1024,
+            reservation_source_page_count=2,
+            reservation_bucket=envelope.reservation_input.value.bucket,
+            reservation=envelope.reservation,
+            current_credits=credit_shape("prepared", CreditShapeFacts()),
+        )
+        encoded = encode_checkpoint_receipt(PreparedReconcileReceipt(
+            attempt_identity=self.attempt_id,
+            fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"),
+            client_submit_key="submit-" + self.attempt_id,
+            submission_epoch_unix=100,
+            parser_target_sha256=_PARSER_TARGET_SHA,
+            request_sha256=_sha("c"),
+            runtime_epoch_sha256=_sha("d"),
+        ))
+        return attempt, RemoteParseResumeSecret(
+            attempt_id=self.attempt_id,
+            secret_kind="prepared_reconcile",
+            token_bytes=encoded.exact_bytes,
+            token_sha256=encoded.sha256,
+            token_byte_count=encoded.byte_count,
+            secret_contract_version=3,
+        )
+
+    def test_v3_repository_add_list_claim_renew_reload_and_response_loss(self) -> None:
+        attempt, secret = self._v3_attempt_and_secret()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+            uow.commit()
+        self.assertEqual(created.checkpoint_contract_version, 3)
+        assert created.current_credits is not None
+
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            page = uow.remote_parse_attempts.list_v3_recoverable(
+                after_attempt_id=None, limit=10
+            )
+            self.assertEqual([item.attempt_id for item in page], [self.attempt_id])
+            claimed = uow.remote_parse_attempts.claim_v3_recovery(
+                attempt_id=self.attempt_id,
+                fence_identity="fence-1",
+                expected_state="prepared",
+                expected_version=0,
+                expected_current=created.current_credits,
+                owner_identity="worker-v3-a",
+                lease_seconds=30,
+            )
+            uow.commit()
+        self.assertEqual(claimed.attempt.row_version, 1)
+        self.assertEqual(claimed.attempt.claim_generation, 1)
+        self.assertEqual(claimed.database_lease.remaining_microseconds, 30_000_000)
+
+        # A committed claim whose response was lost is replayable with the old
+        # expected version without advancing either semantic fence.
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            replayed = uow.remote_parse_attempts.claim_v3_recovery(
+                attempt_id=self.attempt_id,
+                fence_identity="fence-1",
+                expected_state="prepared",
+                expected_version=0,
+                expected_current=created.current_credits,
+                owner_identity="worker-v3-a",
+                lease_seconds=30,
+            )
+            renewed = uow.remote_parse_attempts.renew_v3_claim(
+                attempt_id=self.attempt_id,
+                fence_identity="fence-1",
+                expected_state="prepared",
+                expected_version=1,
+                expected_current=created.current_credits,
+                owner_identity="worker-v3-a",
+                claim_generation=1,
+                lease_seconds=40,
+            )
+            reloaded = uow.remote_parse_attempts.reload_v3_claim(
+                attempt_id=self.attempt_id,
+                fence_identity="fence-1",
+                expected_state="prepared",
+                expected_version=1,
+                expected_current=created.current_credits,
+                owner_identity="worker-v3-a",
+                claim_generation=1,
+            )
+            uow.commit()
+        self.assertEqual((replayed.attempt.row_version, replayed.attempt.claim_generation), (1, 1))
+        self.assertEqual(renewed.attempt.row_version, 1)
+        self.assertGreater(renewed.database_lease.remaining_microseconds, 39_000_000)
+        self.assertGreater(reloaded.database_lease.remaining_microseconds, 0)
+
+    def test_v3_claim_foreign_live_expiry_takeover_and_atomic_add_rollback(self) -> None:
+        attempt, secret = self._v3_attempt_and_secret()
+        wrong_encoded = encode_checkpoint_receipt(PreparedReconcileReceipt(
+            attempt_identity=self.attempt_id, fence_identity="wrong-fence",
+            source_pdf_sha256=_sha("a"),
+            client_submit_key="submit-" + self.attempt_id,
+            submission_epoch_unix=100, parser_target_sha256=_PARSER_TARGET_SHA,
+            request_sha256=_sha("c"), runtime_epoch_sha256=_sha("d"),
+        ))
+        wrong = RemoteParseResumeSecret(
+            attempt_id=secret.attempt_id,
+            secret_kind=secret.secret_kind,
+            token_bytes=wrong_encoded.exact_bytes,
+            token_sha256=wrong_encoded.sha256,
+            token_byte_count=wrong_encoded.byte_count,
+            secret_contract_version=3,
+        )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaises(ValueError):
+            uow.remote_parse_attempts.add_v3_prepared(attempt, wrong)
+        with self.engine.connect() as conn:
+            self.assertIsNone(conn.execute(text(
+                "SELECT attempt_id FROM disclosure_ops.remote_parse_attempt WHERE attempt_id=:a"
+            ), {"a": self.attempt_id}).scalar_one_or_none())
+
+        with self.assertRaisesRegex(RuntimeError, "rollback seam"):
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+                raise RuntimeError("rollback seam")
+        with self.engine.connect() as conn:
+            self.assertIsNone(conn.execute(text(
+                "SELECT attempt_id FROM disclosure_ops.remote_parse_attempt WHERE attempt_id=:a"
+            ), {"a": self.attempt_id}).scalar_one_or_none())
+
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+            assert created.current_credits is not None
+            uow.commit()
+        barrier = threading.Barrier(2)
+
+        def competing_claim(owner: str) -> object:
+            barrier.wait()
+            try:
+                with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                    result = uow.remote_parse_attempts.claim_v3_recovery(
+                        attempt_id=self.attempt_id, fence_identity="fence-1",
+                        expected_state="prepared", expected_version=0,
+                        expected_current=created.current_credits,
+                        owner_identity=owner, lease_seconds=30,
+                    )
+                    uow.commit()
+                    return result
+            except RemoteParseCheckpointConflict as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(competing_claim, ("worker-v3-a", "worker-v3-b")))
+        winners = [item for item in outcomes if not isinstance(item, Exception)]
+        self.assertEqual(len(winners), 1)
+        first = winners[0]
+        assert hasattr(first, "attempt")
+        first_owner = first.attempt.claim_owner_identity
+        foreign_owner = "worker-v3-b" if first_owner == "worker-v3-a" else "worker-v3-a"
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict, "exact CAS"
+        ):
+            uow.remote_parse_attempts.claim_v3_recovery(
+                attempt_id=self.attempt_id, fence_identity="fence-1",
+                expected_state="prepared", expected_version=first.attempt.row_version,
+                expected_current=created.current_credits,
+                owner_identity=foreign_owner, lease_seconds=30,
+            )
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE disclosure_ops.remote_parse_attempt SET claim_lease_until=clock_timestamp()-interval '1 second' WHERE attempt_id=:a"
+            ), {"a": self.attempt_id})
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            takeover = uow.remote_parse_attempts.claim_v3_recovery(
+                attempt_id=self.attempt_id, fence_identity="fence-1",
+                expected_state="prepared", expected_version=first.attempt.row_version,
+                expected_current=created.current_credits,
+                owner_identity=foreign_owner, lease_seconds=30,
+            )
+            uow.commit()
+        self.assertEqual(takeover.attempt.claim_generation, 2)
+        self.assertEqual(takeover.attempt.row_version, 2)
 
     def _add_claim(self) -> RemoteParseAttempt:
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:

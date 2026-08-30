@@ -8,6 +8,7 @@ the transaction boundary.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -35,7 +36,11 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     decode_checkpoint_receipt,
     decode_terminal_receipt,
 )
-from disclosure_anchor.application.contracts.staged_credit import CreditVector
+from disclosure_anchor.application.contracts.staged_credit import (
+    CreditVector,
+    DatabaseLeaseSnapshot,
+)
+from disclosure_anchor.application.ports.repositories import ClaimedAttemptSnapshot
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
     encode_durable_checkpoint_witness,
@@ -917,6 +922,96 @@ class RemoteParseAttemptRepository:
             self._put_secret(submission_secret)
         return _remote_attempt_entity(row)
 
+    def add_v3_prepared(
+        self,
+        attempt: RemoteParseAttempt,
+        prepared_secret: RemoteParseResumeSecret,
+    ) -> RemoteParseAttempt:
+        if not (
+            attempt.checkpoint_contract_version == 3
+            and attempt.state == "prepared"
+            and attempt.is_current
+            and attempt.row_version == 0
+            and attempt.claim_generation == 0
+            and attempt.claim_owner_identity is None
+            and attempt.claim_lease_until is None
+            and attempt.remote_task_identity is None
+            and attempt.submitted_receipt_bytes is None
+            and attempt.terminal_receipt_bytes is None
+            and attempt.local_receipt_bytes is None
+            and attempt.failure_receipt_bytes is None
+            and attempt.materialization_receipt_bytes is None
+            and type(attempt.reservation) is CreditVector
+            and type(attempt.current_credits) is CreditVector
+        ):
+            raise ValueError("new v3 attempt must have canonical unclaimed prepared shape")
+        if not (
+            isinstance(prepared_secret, RemoteParseResumeSecret)
+            and prepared_secret.secret_contract_version == 3
+            and prepared_secret.secret_kind == "prepared_reconcile"
+            and prepared_secret.attempt_id == attempt.attempt_id
+        ):
+            raise ValueError("v3 prepared attempt requires its exact private secret")
+        encoded = decode_checkpoint_receipt(prepared_secret.token_bytes)
+        prepared = encoded.receipt
+        if not isinstance(prepared, PreparedReconcileReceipt) or (
+            prepared_secret.token_sha256 != encoded.sha256
+            or prepared_secret.token_byte_count != encoded.byte_count
+            or prepared.attempt_identity != attempt.attempt_id
+            or prepared.fence_identity != attempt.fence_identity
+            or prepared.source_pdf_sha256 != attempt.source_pdf_sha256
+            or prepared.client_submit_key != attempt.client_submit_key
+            or prepared.parser_target_sha256 != attempt.parser_target_sha256
+            or prepared.request_sha256 != attempt.request_sha256
+            or prepared.runtime_epoch_sha256 != attempt.runtime_epoch_sha256
+        ):
+            raise ValueError("v3 prepared reconcile evidence drifted from attempt")
+        values = {
+            name: getattr(attempt, name)
+            for name in (
+                "attempt_id", "processing_run_id", "document_id",
+                "attempt_generation", "fence_identity", "source_pdf_sha256",
+                "parser_target_sha256", "request_sha256", "runtime_epoch_sha256",
+                "client_submit_key", "checkpoint_contract_version", "state",
+                "is_current", "row_version", "remote_task_identity",
+                "submitted_receipt_sha256", "submitted_receipt_bytes",
+                "submitted_receipt_byte_count", "terminal_receipt_sha256",
+                "terminal_receipt_bytes", "terminal_receipt_byte_count",
+                "result_owner_identity", "result_artifact_sha256",
+                "result_artifact_bytes", "claim_generation",
+                "claim_owner_identity", "claim_lease_until",
+                "local_receipt_sha256", "local_receipt_bytes",
+                "local_receipt_byte_count", "failure_receipt_sha256",
+                "failure_receipt_bytes", "failure_receipt_byte_count",
+                "failure_stage", "process_profile_sha256", "credit_policy_sha256",
+                "reservation_input_sha256", "reservation_input_bytes",
+                "reservation_input_byte_count", "reservation_source_byte_count",
+                "reservation_source_page_count", "reservation_bucket",
+                "materialization_receipt_sha256", "materialization_receipt_bytes",
+                "materialization_receipt_byte_count", "local_db_staged_byte_count",
+            )
+        }
+        for prefix, vector in (
+            ("reservation", attempt.reservation),
+            ("current", attempt.current_credits),
+        ):
+            assert isinstance(vector, CreditVector)
+            for name in vector.__dataclass_fields__:
+                values[f"{prefix}_{name}"] = getattr(vector, name)
+        row = models.RemoteParseAttempt(**values)
+        secret_row = models.RemoteParseV3ResumeSecret(
+            attempt_id=prepared_secret.attempt_id,
+            secret_kind=prepared_secret.secret_kind,
+            token_bytes=prepared_secret.token_bytes,
+            token_sha256=prepared_secret.token_sha256,
+            token_byte_count=prepared_secret.token_byte_count,
+        )
+        with self._session.begin_nested():
+            self._session.add(row)
+            self._session.add(secret_row)
+            self._session.flush()
+        return _remote_attempt_entity(row)
+
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]:
         row = self._session.get(models.RemoteParseAttempt, attempt_id)
         return None if row is None else _remote_attempt_entity(row)
@@ -1035,6 +1130,237 @@ class RemoteParseAttemptRepository:
             query = query.filter(models.RemoteParseAttempt.attempt_id > after_attempt_id)
         rows = query.order_by(models.RemoteParseAttempt.attempt_id).limit(limit).all()
         return [_remote_attempt_entity(row) for row in rows]
+
+    def list_v3_recoverable(
+        self, *, after_attempt_id: str | None, limit: int
+    ) -> list[RemoteParseAttempt]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("v3 recovery page limit is outside 1..1000")
+        query = self._session.query(models.RemoteParseAttempt).filter(
+            models.RemoteParseAttempt.checkpoint_contract_version == 3,
+            models.RemoteParseAttempt.is_current.is_(True),
+        )
+        if after_attempt_id is not None:
+            query = query.filter(models.RemoteParseAttempt.attempt_id > after_attempt_id)
+        rows = query.order_by(models.RemoteParseAttempt.attempt_id).limit(limit).all()
+        return [_remote_attempt_entity(row) for row in rows]
+
+    @staticmethod
+    def _validate_v3_claim_request(
+        *, owner_identity: str, lease_seconds: int, expected_current: CreditVector,
+    ) -> None:
+        if (
+            not isinstance(owner_identity, str)
+            or not owner_identity.strip()
+            or len(owner_identity) > 128
+            or isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or not 1 <= lease_seconds <= 300
+            or type(expected_current) is not CreditVector
+        ):
+            raise ValueError("v3 recovery claim request is invalid")
+
+    @staticmethod
+    def _v3_current_predicates(expected_current: CreditVector) -> tuple[Any, ...]:
+        return tuple(
+            getattr(models.RemoteParseAttempt, f"current_{name}")
+            == getattr(expected_current, name)
+            for name in expected_current.__dataclass_fields__
+        )
+
+    @staticmethod
+    def _database_clock() -> Any:
+        return sa.select(
+            sa.cast(
+                sa.func.clock_timestamp(), sa.DateTime(timezone=True)
+            ).label("database_observed_at")
+        ).cte("database_clock").prefix_with("MATERIALIZED")
+
+    @staticmethod
+    def _claimed_snapshot(
+        attempt: models.RemoteParseAttempt,
+        database_observed_at: datetime,
+        remaining_microseconds: int,
+    ) -> ClaimedAttemptSnapshot:
+        entity = _remote_attempt_entity(attempt)
+        if entity.claim_lease_until is None:
+            raise RemoteParseCheckpointConflict("v3 claim returned without a lease")
+        observed_utc = (
+            database_observed_at.replace(tzinfo=timezone.utc)
+            if database_observed_at.tzinfo is None
+            else database_observed_at.astimezone(timezone.utc)
+        )
+        lease_utc = (
+            entity.claim_lease_until.replace(tzinfo=timezone.utc)
+            if entity.claim_lease_until.tzinfo is None
+            else entity.claim_lease_until.astimezone(timezone.utc)
+        )
+        entity = replace(entity, claim_lease_until=lease_utc)
+        return ClaimedAttemptSnapshot(
+            attempt=entity,
+            database_lease=DatabaseLeaseSnapshot(
+                database_observed_at_utc=observed_utc,
+                lease_until_utc=lease_utc,
+                remaining_microseconds=remaining_microseconds,
+            ),
+        )
+
+    def claim_v3_recovery(
+        self, *, attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, expected_current: CreditVector,
+        owner_identity: str, lease_seconds: int,
+    ) -> ClaimedAttemptSnapshot:
+        self._validate_v3_claim_request(
+            owner_identity=owner_identity,
+            lease_seconds=lease_seconds,
+            expected_current=expected_current,
+        )
+        clock = self._database_clock()
+        live_same_owner = sa.and_(
+            models.RemoteParseAttempt.claim_owner_identity == owner_identity,
+            models.RemoteParseAttempt.claim_lease_until > clock.c.database_observed_at,
+        )
+        acquirable = sa.and_(
+            models.RemoteParseAttempt.row_version == expected_version,
+            sa.or_(
+                models.RemoteParseAttempt.claim_owner_identity.is_(None),
+                models.RemoteParseAttempt.claim_lease_until
+                <= clock.c.database_observed_at,
+            ),
+        )
+        lease_until = clock.c.database_observed_at + sa.func.make_interval(
+            0, 0, 0, 0, 0, 0, lease_seconds
+        )
+        statement = (
+            sa.update(models.RemoteParseAttempt)
+            .where(
+                models.RemoteParseAttempt.attempt_id == attempt_id,
+                models.RemoteParseAttempt.fence_identity == fence_identity,
+                models.RemoteParseAttempt.checkpoint_contract_version == 3,
+                models.RemoteParseAttempt.is_current.is_(True),
+                models.RemoteParseAttempt.state == expected_state,
+                *self._v3_current_predicates(expected_current),
+                sa.or_(live_same_owner, acquirable),
+            )
+            .values(
+                claim_generation=sa.case(
+                    (live_same_owner, models.RemoteParseAttempt.claim_generation),
+                    else_=models.RemoteParseAttempt.claim_generation + 1,
+                ),
+                claim_owner_identity=owner_identity,
+                claim_lease_until=lease_until,
+                row_version=sa.case(
+                    (live_same_owner, models.RemoteParseAttempt.row_version),
+                    else_=models.RemoteParseAttempt.row_version + 1,
+                ),
+                updated_at=clock.c.database_observed_at,
+            )
+            .returning(
+                models.RemoteParseAttempt,
+                clock.c.database_observed_at,
+                sa.cast(
+                    sa.func.floor(
+                        sa.extract("epoch", lease_until - clock.c.database_observed_at)
+                        * 1_000_000
+                    ),
+                    sa.BigInteger,
+                ).label("remaining_microseconds"),
+            )
+        )
+        result = self._session.execute(statement).one_or_none()
+        if result is None:
+            raise RemoteParseCheckpointConflict("v3 recovery claim lost exact CAS")
+        return self._claimed_snapshot(result[0], result[1], result[2])
+
+    def renew_v3_claim(
+        self, *, attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, expected_current: CreditVector,
+        owner_identity: str, claim_generation: int, lease_seconds: int,
+    ) -> ClaimedAttemptSnapshot:
+        self._validate_v3_claim_request(
+            owner_identity=owner_identity,
+            lease_seconds=lease_seconds,
+            expected_current=expected_current,
+        )
+        clock = self._database_clock()
+        lease_until = clock.c.database_observed_at + sa.func.make_interval(
+            0, 0, 0, 0, 0, 0, lease_seconds
+        )
+        statement = (
+            sa.update(models.RemoteParseAttempt)
+            .where(
+                models.RemoteParseAttempt.attempt_id == attempt_id,
+                models.RemoteParseAttempt.fence_identity == fence_identity,
+                models.RemoteParseAttempt.checkpoint_contract_version == 3,
+                models.RemoteParseAttempt.is_current.is_(True),
+                models.RemoteParseAttempt.state == expected_state,
+                models.RemoteParseAttempt.row_version == expected_version,
+                models.RemoteParseAttempt.claim_owner_identity == owner_identity,
+                models.RemoteParseAttempt.claim_generation == claim_generation,
+                models.RemoteParseAttempt.claim_lease_until
+                > clock.c.database_observed_at,
+                *self._v3_current_predicates(expected_current),
+            )
+            .values(
+                claim_lease_until=lease_until,
+                updated_at=clock.c.database_observed_at,
+            )
+            .returning(
+                models.RemoteParseAttempt,
+                clock.c.database_observed_at,
+                sa.cast(
+                    sa.func.floor(
+                        sa.extract("epoch", lease_until - clock.c.database_observed_at)
+                        * 1_000_000
+                    ),
+                    sa.BigInteger,
+                ).label("remaining_microseconds"),
+            )
+        )
+        result = self._session.execute(statement).one_or_none()
+        if result is None:
+            raise RemoteParseCheckpointConflict("v3 recovery renewal lost exact live claim")
+        return self._claimed_snapshot(result[0], result[1], result[2])
+
+    def reload_v3_claim(
+        self, *, attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, expected_current: CreditVector,
+        owner_identity: str, claim_generation: int,
+    ) -> ClaimedAttemptSnapshot:
+        if type(expected_current) is not CreditVector:
+            raise ValueError("v3 reload requires exact current credits")
+        clock = self._database_clock()
+        remaining = sa.cast(
+            sa.func.floor(
+                sa.extract(
+                    "epoch",
+                    models.RemoteParseAttempt.claim_lease_until
+                    - clock.c.database_observed_at,
+                ) * 1_000_000
+            ),
+            sa.BigInteger,
+        ).label("remaining_microseconds")
+        statement = sa.select(
+            models.RemoteParseAttempt,
+            clock.c.database_observed_at,
+            remaining,
+        ).where(
+            models.RemoteParseAttempt.attempt_id == attempt_id,
+            models.RemoteParseAttempt.fence_identity == fence_identity,
+            models.RemoteParseAttempt.checkpoint_contract_version == 3,
+            models.RemoteParseAttempt.is_current.is_(True),
+            models.RemoteParseAttempt.state == expected_state,
+            models.RemoteParseAttempt.row_version == expected_version,
+            models.RemoteParseAttempt.claim_owner_identity == owner_identity,
+            models.RemoteParseAttempt.claim_generation == claim_generation,
+            models.RemoteParseAttempt.claim_lease_until
+            > clock.c.database_observed_at,
+            *self._v3_current_predicates(expected_current),
+        )
+        result = self._session.execute(statement).one_or_none()
+        if result is None:
+            raise RemoteParseCheckpointConflict("v3 recovery reload lost exact live claim")
+        return self._claimed_snapshot(result[0], result[1], result[2])
 
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,

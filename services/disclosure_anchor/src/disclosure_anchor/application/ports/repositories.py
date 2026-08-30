@@ -7,6 +7,7 @@ Repositories persist and load domain entities. Concrete implementations live in
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, fields
 
 from typing import Optional, Protocol
 
@@ -15,6 +16,10 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     EncodedTerminalReceipt,
     RemoteParseAttempt,
     RemoteParseResumeSecret,
+)
+from disclosure_anchor.application.contracts.staged_credit import (
+    CreditVector,
+    DatabaseLeaseSnapshot,
 )
 from disclosure_anchor.application.contracts.publish_evidence_ledger import (
     DurablePublishBaseEvidence,
@@ -117,10 +122,58 @@ class ProcessingRunRepository(Protocol):
     def update(self, run: ProcessingRun) -> ProcessingRun: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ClaimedAttemptSnapshot:
+    attempt: RemoteParseAttempt
+    database_lease: DatabaseLeaseSnapshot
+
+    def __post_init__(self) -> None:
+        if type(self.attempt) is not RemoteParseAttempt:
+            raise ValueError("claimed snapshot requires an exact attempt")
+        if type(self.database_lease) is not DatabaseLeaseSnapshot:
+            raise ValueError("claimed snapshot requires an exact database lease")
+        if (
+            self.attempt.claim_owner_identity is None
+            or self.attempt.claim_lease_until != self.database_lease.lease_until_utc
+        ):
+            raise ValueError("claimed snapshot lease drifted from attempt")
+
+
+@dataclass(frozen=True, slots=True)
+class CreditTransitionGrant:
+    expected_current: CreditVector
+    maximum_positive_delta: CreditVector
+
+    def __post_init__(self) -> None:
+        if type(self.expected_current) is not CreditVector or type(
+            self.maximum_positive_delta
+        ) is not CreditVector:
+            raise ValueError("credit transition grant requires exact vectors")
+
+    def permits(self, candidate: CreditVector) -> bool:
+        if type(candidate) is not CreditVector:
+            raise ValueError("candidate credits require an exact vector")
+        positive_delta = CreditVector(
+            **{
+                item.name: max(
+                    0,
+                    getattr(candidate, item.name)
+                    - getattr(self.expected_current, item.name),
+                )
+                for item in fields(self.expected_current)
+            }
+        )
+        return positive_delta.fits(self.maximum_positive_delta)
+
+
 class RemoteParseAttemptRepository(Protocol):
     def add(
         self, attempt: RemoteParseAttempt,
         submission_secret: RemoteParseResumeSecret,
+    ) -> RemoteParseAttempt: ...
+    def add_v3_prepared(
+        self, attempt: RemoteParseAttempt,
+        prepared_secret: RemoteParseResumeSecret,
     ) -> RemoteParseAttempt: ...
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]: ...
     def durable_checkpoint_witness(
@@ -132,6 +185,24 @@ class RemoteParseAttemptRepository(Protocol):
     def list_recoverable(
         self, *, after_attempt_id: str | None, limit: int
     ) -> list[RemoteParseAttempt]: ...
+    def list_v3_recoverable(
+        self, *, after_attempt_id: str | None, limit: int,
+    ) -> list[RemoteParseAttempt]: ...
+    def claim_v3_recovery(
+        self, *, attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, expected_current: CreditVector,
+        owner_identity: str, lease_seconds: int,
+    ) -> ClaimedAttemptSnapshot: ...
+    def renew_v3_claim(
+        self, *, attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, expected_current: CreditVector,
+        owner_identity: str, claim_generation: int, lease_seconds: int,
+    ) -> ClaimedAttemptSnapshot: ...
+    def reload_v3_claim(
+        self, *, attempt_id: str, fence_identity: str, expected_state: str,
+        expected_version: int, expected_current: CreditVector,
+        owner_identity: str, claim_generation: int,
+    ) -> ClaimedAttemptSnapshot: ...
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
         owner_identity: str, lease_seconds: int,
