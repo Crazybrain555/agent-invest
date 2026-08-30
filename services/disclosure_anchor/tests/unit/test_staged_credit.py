@@ -22,8 +22,8 @@ from tests.unit.test_mineru_process_profile import _profile
 
 
 SHA_A = "sha256:" + "a" * 64
-POLICY_SHA = "sha256:db36b9962f22c24772a6f551a16c4ca936d2aa1a5dff39dab93fdc2011b28b4e"
-INPUT_SHA = "sha256:54b631521ae34e61306766e7170f9c84d345b2f333112afe8a62a59df7574902"
+POLICY_SHA = "sha256:6ca42b3507deb651a4dcc9381214c8e83b4be0cbbb32f322138da475b5d49817"
+INPUT_SHA = "sha256:090c5ceb8e3bc5093f4e0967ab506d3aa7db8458fb5666baca03d77bcd3c333b"
 
 
 class StagedCreditContractTests(unittest.TestCase):
@@ -70,6 +70,30 @@ class StagedCreditContractTests(unittest.TestCase):
                 )
                 validate_staged_credit_envelope(envelope, profile=profile)
 
+    def test_same_bucket_exact_pages_scale_page_and_decoded_reservations(self) -> None:
+        profile = _profile()
+        two_pages = build_staged_credit_envelope(
+            profile=profile,
+            source_pdf_sha256=SHA_A,
+            source_byte_count=1024,
+            source_page_count=2,
+        )
+        five_pages = build_staged_credit_envelope(
+            profile=profile,
+            source_pdf_sha256=SHA_A,
+            source_byte_count=1024,
+            source_page_count=5,
+        )
+        self.assertEqual(two_pages.reservation_input.value.bucket, "regular")
+        self.assertEqual(five_pages.reservation_input.value.bucket, "regular")
+        self.assertEqual(two_pages.reservation.unpublished_pages, 2)
+        self.assertEqual(five_pages.reservation.unpublished_pages, 5)
+        raster_per_page = (
+            profile.rasterized_page_bytes_limit + profile.resident_pages_limit - 1
+        ) // profile.resident_pages_limit
+        self.assertEqual(two_pages.reservation.decoded_bytes, 2 * raster_per_page)
+        self.assertEqual(five_pages.reservation.decoded_bytes, 5 * raster_per_page)
+
     def test_long_document_does_not_use_resident_window_as_page_cap(self) -> None:
         profile = _profile()
         pages = max(profile.resident_pages_limit + 1, 600)
@@ -90,7 +114,7 @@ class StagedCreditContractTests(unittest.TestCase):
         )
         exact = envelope.reservation_input.exact_bytes
         self.assertEqual(envelope.reservation_input.sha256, INPUT_SHA)
-        self.assertEqual(envelope.reservation_input.byte_count, 665)
+        self.assertEqual(envelope.reservation_input.byte_count, 661)
         with self.assertRaisesRegex(ValueError, "duplicate"):
             decode_reservation_input(exact[:-1] + b',"bucket":"regular"}')
         with self.assertRaisesRegex(ValueError, "canonical"):
@@ -184,6 +208,10 @@ class StagedCreditContractTests(unittest.TestCase):
         self.assertEqual(credit_shape("local_failed", facts), CreditVector())
         with self.assertRaisesRegex(ValueError, "prepared facts"):
             credit_shape("materializing", replace(facts, materialization_prepared=False))
+        with self.assertRaisesRegex(ValueError, "prepared facts"):
+            credit_shape(
+                "local_failure_committed", replace(facts, source_page_count=0)
+            )
         with self.assertRaisesRegex(ValueError, "stale facts"):
             credit_shape("prepared", replace(facts, materialization_prepared=False))
         pre_materialization_failure = CreditShapeFacts(terminal_byte_count=10)

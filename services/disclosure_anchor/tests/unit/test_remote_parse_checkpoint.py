@@ -112,6 +112,36 @@ class RemoteParseCheckpointContractTests(unittest.TestCase):
             replace(base, source_page_count=True)
         with self.assertRaisesRegex(ValueError, "spool/compressed"):
             replace(base, compressed_byte_count=11)
+        with self.assertRaisesRegex(ValueError, "temporary disk peak drifted"):
+            replace(base, temporary_disk_byte_count=49)
+        with self.assertRaisesRegex(ValueError, "overflowed"):
+            replace(
+                base,
+                spool_byte_count=(1 << 63) - 1,
+                compressed_byte_count=(1 << 63) - 1,
+                uncompressed_byte_count=1,
+                temporary_disk_byte_count=(1 << 63) - 1,
+            )
+
+        local = LocalMaterializationReceiptV2(
+            attempt_identity="attempt_1", fence_identity="fence_1",
+            claim_generation=1, source_pdf_sha256=SHA_A, source_page_count=4,
+            parser_target_sha256=SHA_B, terminal_receipt_sha256=SHA_C,
+            process_profile_sha256=SHA_A, credit_policy_sha256=SHA_B,
+            reservation_input_sha256=SHA_C,
+            prepared_materialization_sha256=SHA_A,
+            artifact_owner_identity="owner_1", artifact_sha256=SHA_B,
+            artifact_byte_count=10, output_manifest_sha256=SHA_C,
+            output_manifest_relpath="run/manifest.json",
+            output_manifest_byte_count=20, artifact_root_relpath="run/artifacts",
+            provider_envelope_relpath="run/provider.json",
+            provider_envelope_sha256=SHA_A, provider_envelope_byte_count=30,
+            compressed_byte_count=10, uncompressed_byte_count=40,
+            member_count=2, temporary_disk_byte_count=50,
+            decoded_byte_count=60,
+        )
+        with self.assertRaisesRegex(ValueError, "temporary disk peak drifted"):
+            replace(local, temporary_disk_byte_count=51)
 
     def test_v3_secret_kinds_are_closed_and_materialization_is_private(self) -> None:
         token = b"private-materialization-token"

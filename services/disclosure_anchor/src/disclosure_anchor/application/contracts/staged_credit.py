@@ -38,6 +38,13 @@ _BUCKETS: tuple[tuple[CreditBucket, int, int, int, int], ...] = (
     ("heavy", 1, 2, 2, 3),
     ("huge", 1, 1, 4, 4),
 )
+_RESERVATION_FORMULAS = MappingProxyType(
+    {
+        "decoded_bytes": "min(profile.decoded_payload_bytes_limit,source_page_count*ceil(profile.rasterized_page_bytes_limit/profile.resident_pages_limit))",
+        "temporary_disk_bytes": "min(profile.temporary_disk_bytes_limit,retained_bytes+min(decoded_bytes,retained_bytes*bucket.temp_expansion_multiplier))",
+        "unpublished_pages": "source_page_count",
+    }
+)
 
 STAGED_STATE_TRANSITIONS = MappingProxyType({
     "prepared": frozenset({"reconciling", "pre_submission_failed"}),
@@ -183,6 +190,7 @@ class StagedCreditPolicy:
             "contract_version": self.contract_version,
             "credit_dimensions": [item.name for item in fields(CreditVector)],
             "max_integer": _MAX_INT,
+            "reservation_formulas": dict(_RESERVATION_FORMULAS),
             "state_credit_shapes": {
                 state: dict(shape)
                 for state, shape in sorted(_STATE_CREDIT_SHAPES.items())
@@ -435,7 +443,6 @@ def build_staged_credit_envelope(
     if selected is None:
         raise ValueError("source facts do not fit a staged credit bucket")
     bucket, numerator, denominator, result_multiplier, temp_multiplier = selected
-    page_cap = _floor_ratio(page_ceiling, numerator, denominator)
     retained_cap = min(
         _checked_mul(profile.result_reservation_bytes, result_multiplier),
         profile.terminal_output_bytes_limit,
@@ -446,7 +453,7 @@ def build_staged_credit_envelope(
     )
     decoded_cap = min(
         profile.decoded_payload_bytes_limit,
-        _checked_mul(page_cap, raster_per_page),
+        _checked_mul(source_page_count, raster_per_page),
     )
     uncompressed_staging_cap = min(
         decoded_cap, _checked_mul(retained_cap, temp_multiplier)
@@ -466,7 +473,7 @@ def build_staged_credit_envelope(
         temp_disk_bytes=temp_cap,
         db_stage_items=1,
         ack_items=1,
-        unpublished_pages=page_cap,
+        unpublished_pages=source_page_count,
     )
     reservation_input = encode_reservation_input(
         ReservationInput(
@@ -516,6 +523,7 @@ def _require_materialization_facts(facts: CreditShapeFacts) -> None:
         or facts.compressed_byte_count != facts.terminal_byte_count
         or facts.uncompressed_byte_count < 1
         or facts.decoded_byte_count < 1
+        or facts.source_page_count < 1
         or facts.temporary_disk_byte_count
         != _checked_add(facts.compressed_byte_count, facts.uncompressed_byte_count)
     ):

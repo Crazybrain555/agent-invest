@@ -478,7 +478,7 @@
   },
   "tests/unit/test_staged_credit.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
