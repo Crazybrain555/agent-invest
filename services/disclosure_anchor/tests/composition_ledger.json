@@ -420,7 +420,7 @@
   },
   "tests/unit/test_remote_parse_checkpoint.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 9
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
@@ -475,6 +475,10 @@
   "tests/unit/test_settings.py": {
    "private_imports": [],
    "tests": 7
+  },
+  "tests/unit/test_staged_credit.py": {
+   "private_imports": [],
+   "tests": 8
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],

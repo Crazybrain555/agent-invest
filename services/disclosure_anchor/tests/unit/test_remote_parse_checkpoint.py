@@ -7,6 +7,8 @@ from dataclasses import replace
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     FailureReceipt,
     LocalMaterializationReceipt,
+    LocalMaterializationReceiptV2,
+    PreparedMaterializationReceiptV2,
     EncodedTerminalReceipt,
     RemoteParseResumeSecret,
     TerminalReceipt,
@@ -34,6 +36,100 @@ def _receipt() -> TerminalReceipt:
 
 
 class RemoteParseCheckpointContractTests(unittest.TestCase):
+    def test_v2_materialization_receipts_are_closed_replayable_evidence(self) -> None:
+        prepared = PreparedMaterializationReceiptV2(
+            attempt_identity="attempt_1",
+            fence_identity="fence_1",
+            source_pdf_sha256=SHA_A,
+            source_page_count=4,
+            terminal_receipt_sha256=SHA_B,
+            process_profile_sha256=SHA_C,
+            credit_policy_sha256=SHA_A,
+            reservation_input_sha256=SHA_B,
+            spool_relpath="attempt_1/result.zip",
+            spool_sha256=SHA_C,
+            spool_byte_count=10,
+            compressed_byte_count=10,
+            uncompressed_byte_count=40,
+            member_count=2,
+            temporary_disk_byte_count=50,
+            decoded_byte_count=60,
+            private_token_sha256=SHA_A,
+        )
+        encoded_prepared = encode_checkpoint_receipt(prepared)
+        self.assertEqual(
+            decode_checkpoint_receipt(encoded_prepared.exact_bytes), encoded_prepared
+        )
+        local = LocalMaterializationReceiptV2(
+            attempt_identity="attempt_1",
+            fence_identity="fence_1",
+            claim_generation=2,
+            source_pdf_sha256=SHA_A,
+            source_page_count=4,
+            parser_target_sha256=SHA_B,
+            terminal_receipt_sha256=SHA_C,
+            process_profile_sha256=SHA_A,
+            credit_policy_sha256=SHA_B,
+            reservation_input_sha256=SHA_C,
+            prepared_materialization_sha256=encoded_prepared.sha256,
+            artifact_owner_identity="owner_1",
+            artifact_sha256=SHA_A,
+            artifact_byte_count=10,
+            output_manifest_sha256=SHA_B,
+            output_manifest_relpath="run/manifest.json",
+            output_manifest_byte_count=20,
+            artifact_root_relpath="run/artifacts",
+            provider_envelope_relpath="run/provider.json",
+            provider_envelope_sha256=SHA_C,
+            provider_envelope_byte_count=30,
+            compressed_byte_count=10,
+            uncompressed_byte_count=40,
+            member_count=2,
+            temporary_disk_byte_count=50,
+            decoded_byte_count=60,
+        )
+        encoded_local = encode_checkpoint_receipt(local)
+        self.assertEqual(decode_checkpoint_receipt(encoded_local.exact_bytes), encoded_local)
+
+    def test_v2_materialization_receipts_reject_unsafe_paths_and_bool_counts(self) -> None:
+        base = PreparedMaterializationReceiptV2(
+            attempt_identity="attempt_1", fence_identity="fence_1",
+            source_pdf_sha256=SHA_A, source_page_count=4,
+            terminal_receipt_sha256=SHA_B, process_profile_sha256=SHA_C,
+            credit_policy_sha256=SHA_A, reservation_input_sha256=SHA_B,
+            spool_relpath="attempt_1/result.zip", spool_sha256=SHA_C,
+            spool_byte_count=10, compressed_byte_count=10,
+            uncompressed_byte_count=40, member_count=2,
+            temporary_disk_byte_count=50,
+            decoded_byte_count=60, private_token_sha256=SHA_A,
+        )
+        for relpath in ("/tmp/result.zip", "../result.zip", "a\\result.zip", "a//b"):
+            with self.subTest(relpath=relpath), self.assertRaisesRegex(
+                ValueError, "relpath"
+            ):
+                replace(base, spool_relpath=relpath)
+        with self.assertRaisesRegex(ValueError, "source pages"):
+            replace(base, source_page_count=True)
+        with self.assertRaisesRegex(ValueError, "spool/compressed"):
+            replace(base, compressed_byte_count=11)
+
+    def test_v3_secret_kinds_are_closed_and_materialization_is_private(self) -> None:
+        token = b"private-materialization-token"
+        common = dict(
+            attempt_id="attempt_1",
+            token_bytes=token,
+            token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+            token_byte_count=len(token),
+            secret_contract_version=3,
+        )
+        for kind in (
+            "prepared_reconcile", "accepted_submission", "terminal", "materialization"
+        ):
+            secret = RemoteParseResumeSecret(secret_kind=kind, **common)  # type: ignore[arg-type]
+            self.assertNotIn(token.decode(), repr(secret))
+        with self.assertRaisesRegex(ValueError, "secret kind"):
+            RemoteParseResumeSecret(secret_kind="ack", **common)  # type: ignore[arg-type]
+
     def test_local_and_failure_receipts_are_closed_canonical_evidence(self) -> None:
         local = LocalMaterializationReceipt(
             attempt_identity="attempt_1", fence_identity="fence_1",

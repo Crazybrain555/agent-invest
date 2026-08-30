@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 import hashlib
 import json
@@ -43,6 +43,7 @@ ALLOWED_TRANSITIONS = frozenset(
     }
 )
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MAX_EVIDENCE_INT = (1 << 63) - 1
 _RECEIPT_KEYS = frozenset(
     {
         "schema",
@@ -176,6 +177,151 @@ class LocalMaterializationReceipt:
                 raise ValueError(f"local receipt {label} is invalid")
         if self.compressed_byte_count != self.artifact_byte_count:
             raise ValueError("local receipt compressed/artifact byte counts differ")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedMaterializationReceiptV2:
+    attempt_identity: str
+    fence_identity: str
+    source_pdf_sha256: str
+    source_page_count: int
+    terminal_receipt_sha256: str
+    process_profile_sha256: str
+    credit_policy_sha256: str
+    reservation_input_sha256: str
+    spool_relpath: str
+    spool_sha256: str
+    spool_byte_count: int
+    compressed_byte_count: int
+    uncompressed_byte_count: int
+    member_count: int
+    temporary_disk_byte_count: int
+    decoded_byte_count: int
+    private_token_sha256: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.attempt_identity, "attempt identity"),
+            (self.fence_identity, "fence identity"),
+        ):
+            if not isinstance(value, str) or not value.strip() or len(value) > 128:
+                raise ValueError(f"invalid prepared materialization {label}")
+        _validate_safe_relpath(self.spool_relpath, "prepared spool relpath")
+        for value in (
+            self.source_pdf_sha256,
+            self.terminal_receipt_sha256,
+            self.process_profile_sha256,
+            self.credit_policy_sha256,
+            self.reservation_input_sha256,
+            self.spool_sha256,
+            self.private_token_sha256,
+        ):
+            if not isinstance(value, str) or _SHA.fullmatch(value) is None:
+                raise ValueError("prepared materialization hash is not canonical")
+        for numeric_value, label, minimum in (
+            (self.source_page_count, "source pages", 1),
+            (self.spool_byte_count, "spool bytes", 1),
+            (self.compressed_byte_count, "compressed bytes", 1),
+            (self.uncompressed_byte_count, "uncompressed bytes", 1),
+            (self.member_count, "member count", 1),
+            (self.temporary_disk_byte_count, "temporary disk bytes", 1),
+            (self.decoded_byte_count, "decoded bytes", 1),
+        ):
+            if (
+                isinstance(numeric_value, bool)
+                or not isinstance(numeric_value, int)
+                or not minimum <= numeric_value <= _MAX_EVIDENCE_INT
+            ):
+                raise ValueError(f"prepared materialization {label} is invalid")
+        if self.spool_byte_count != self.compressed_byte_count:
+            raise ValueError("prepared materialization spool/compressed bytes differ")
+        if self.temporary_disk_byte_count != _checked_temporary_disk_peak(
+            self.spool_byte_count, self.uncompressed_byte_count
+        ):
+            raise ValueError("prepared materialization temporary disk peak drifted")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalMaterializationReceiptV2:
+    attempt_identity: str
+    fence_identity: str
+    claim_generation: int
+    source_pdf_sha256: str
+    source_page_count: int
+    parser_target_sha256: str
+    terminal_receipt_sha256: str
+    process_profile_sha256: str
+    credit_policy_sha256: str
+    reservation_input_sha256: str
+    prepared_materialization_sha256: str
+    artifact_owner_identity: str
+    artifact_sha256: str
+    artifact_byte_count: int
+    output_manifest_sha256: str
+    output_manifest_relpath: str
+    output_manifest_byte_count: int
+    artifact_root_relpath: str
+    provider_envelope_relpath: str
+    provider_envelope_sha256: str
+    provider_envelope_byte_count: int
+    compressed_byte_count: int
+    uncompressed_byte_count: int
+    member_count: int
+    temporary_disk_byte_count: int
+    decoded_byte_count: int
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.attempt_identity, "attempt identity"),
+            (self.fence_identity, "fence identity"),
+            (self.artifact_owner_identity, "artifact owner identity"),
+        ):
+            if not isinstance(value, str) or not value.strip() or len(value) > 1024:
+                raise ValueError(f"invalid v2 local receipt {label}")
+        for value, label in (
+            (self.output_manifest_relpath, "output manifest relpath"),
+            (self.artifact_root_relpath, "artifact root relpath"),
+            (self.provider_envelope_relpath, "provider envelope relpath"),
+        ):
+            _validate_safe_relpath(value, label)
+        for value in (
+            self.source_pdf_sha256,
+            self.parser_target_sha256,
+            self.terminal_receipt_sha256,
+            self.process_profile_sha256,
+            self.credit_policy_sha256,
+            self.reservation_input_sha256,
+            self.prepared_materialization_sha256,
+            self.artifact_sha256,
+            self.output_manifest_sha256,
+            self.provider_envelope_sha256,
+        ):
+            if not isinstance(value, str) or _SHA.fullmatch(value) is None:
+                raise ValueError("v2 local receipt hash is not canonical")
+        for numeric_value, label, minimum in (
+            (self.claim_generation, "claim generation", 1),
+            (self.source_page_count, "source pages", 1),
+            (self.artifact_byte_count, "artifact bytes", 1),
+            (self.output_manifest_byte_count, "manifest bytes", 1),
+            (self.provider_envelope_byte_count, "provider envelope bytes", 1),
+            (self.compressed_byte_count, "compressed bytes", 1),
+            (self.uncompressed_byte_count, "uncompressed bytes", 1),
+            (self.member_count, "member count", 1),
+            (self.temporary_disk_byte_count, "temporary disk bytes", 1),
+            (self.decoded_byte_count, "decoded bytes", 1),
+        ):
+            if (
+                isinstance(numeric_value, bool)
+                or not isinstance(numeric_value, int)
+                or not minimum <= numeric_value <= _MAX_EVIDENCE_INT
+            ):
+                raise ValueError(f"v2 local receipt {label} is invalid")
+        if self.compressed_byte_count != self.artifact_byte_count:
+            raise ValueError("v2 local receipt compressed/artifact bytes differ")
+        if self.temporary_disk_byte_count != _checked_temporary_disk_peak(
+            self.compressed_byte_count, self.uncompressed_byte_count
+        ):
+            raise ValueError("v2 local receipt temporary disk peak drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,7 +487,8 @@ class FailureReceipt:
 class EncodedCheckpointReceipt:
     receipt: (
         PreparedReconcileReceipt | AcceptedSubmissionReceipt
-        | LocalMaterializationReceipt | FailureReceipt
+        | PreparedMaterializationReceiptV2 | LocalMaterializationReceipt
+        | LocalMaterializationReceiptV2 | FailureReceipt
     )
     exact_bytes: bytes = field(repr=False)
     sha256: str
@@ -501,7 +648,8 @@ class RemoteParseAttempt:
 class RemoteParseResumeSecret:
     attempt_id: str
     secret_kind: Literal[
-        "submission", "prepared_reconcile", "accepted_submission", "terminal", "ack"
+        "submission", "prepared_reconcile", "accepted_submission", "terminal", "ack",
+        "materialization",
     ]
     token_bytes: bytes = field(repr=False)
     token_sha256: str
@@ -511,15 +659,18 @@ class RemoteParseResumeSecret:
     def __post_init__(self) -> None:
         if not isinstance(self.attempt_id, str) or not self.attempt_id.strip():
             raise ValueError("invalid resume token attempt id")
-        if self.secret_contract_version not in {1, 2} or isinstance(
+        if self.secret_contract_version not in {1, 2, 3} or isinstance(
             self.secret_contract_version, bool
         ):
             raise ValueError("invalid resume token contract version")
-        allowed = (
-            {"submission", "terminal", "ack"}
-            if self.secret_contract_version == 1
-            else {"prepared_reconcile", "accepted_submission", "terminal"}
-        )
+        allowed = {
+            1: {"submission", "terminal", "ack"},
+            2: {"prepared_reconcile", "accepted_submission", "terminal"},
+            3: {
+                "prepared_reconcile", "accepted_submission", "terminal",
+                "materialization",
+            },
+        }[self.secret_contract_version]
         if self.secret_kind not in allowed:
             raise ValueError("invalid resume token secret kind")
         if type(self.token_bytes) is not bytes or not self.token_bytes or len(self.token_bytes) > 65536:
@@ -551,33 +702,47 @@ def _canonical_terminal_receipt_bytes(receipt: TerminalReceipt) -> bytes:
 
 
 def _canonical_checkpoint_receipt_bytes(
-    receipt: PreparedReconcileReceipt | AcceptedSubmissionReceipt | LocalMaterializationReceipt | FailureReceipt,
+    receipt: (
+        PreparedReconcileReceipt | AcceptedSubmissionReceipt
+        | PreparedMaterializationReceiptV2 | LocalMaterializationReceipt
+        | LocalMaterializationReceiptV2 | FailureReceipt
+    ),
 ) -> bytes:
     payload: dict[str, object]
     if isinstance(receipt, PreparedReconcileReceipt):
         payload = {
             "schema": "remote_parse_prepared_reconcile.v1",
-            **{name: getattr(receipt, name) for name in receipt.__dataclass_fields__},
+            **{item.name: getattr(receipt, item.name) for item in fields(receipt)},
         }
     elif isinstance(receipt, AcceptedSubmissionReceipt):
         payload = {
             "schema": "remote_parse_accepted_submission.v1",
-            **{name: getattr(receipt, name) for name in receipt.__dataclass_fields__},
+            **{item.name: getattr(receipt, item.name) for item in fields(receipt)},
+        }
+    elif isinstance(receipt, PreparedMaterializationReceiptV2):
+        payload = {
+            "schema": "remote_parse_prepared_materialization.v2",
+            **{item.name: getattr(receipt, item.name) for item in fields(receipt)},
+        }
+    elif isinstance(receipt, LocalMaterializationReceiptV2):
+        payload = {
+            "schema": "remote_parse_local_receipt.v2",
+            **{item.name: getattr(receipt, item.name) for item in fields(receipt)},
         }
     elif isinstance(receipt, LocalMaterializationReceipt):
         payload = {
             "schema": "remote_parse_local_receipt.v1",
             **{
-                name: getattr(receipt, name)
-                for name in receipt.__dataclass_fields__
+                item.name: getattr(receipt, item.name)
+                for item in fields(receipt)
             },
         }
     else:
         payload = {
             "schema": "remote_parse_failure_receipt.v1",
             **{
-                name: getattr(receipt, name)
-                for name in receipt.__dataclass_fields__
+                item.name: getattr(receipt, item.name)
+                for item in fields(receipt)
             },
         }
     return json.dumps(
@@ -586,7 +751,11 @@ def _canonical_checkpoint_receipt_bytes(
 
 
 def encode_checkpoint_receipt(
-    receipt: PreparedReconcileReceipt | AcceptedSubmissionReceipt | LocalMaterializationReceipt | FailureReceipt,
+    receipt: (
+        PreparedReconcileReceipt | AcceptedSubmissionReceipt
+        | PreparedMaterializationReceiptV2 | LocalMaterializationReceipt
+        | LocalMaterializationReceiptV2 | FailureReceipt
+    ),
 ) -> EncodedCheckpointReceipt:
     exact = _canonical_checkpoint_receipt_bytes(receipt)
     return EncodedCheckpointReceipt(
@@ -625,20 +794,26 @@ def decode_checkpoint_receipt(exact_bytes: bytes) -> EncodedCheckpointReceipt:
     receipt_type: (
         type[PreparedReconcileReceipt]
         | type[AcceptedSubmissionReceipt]
+        | type[PreparedMaterializationReceiptV2]
         | type[LocalMaterializationReceipt]
+        | type[LocalMaterializationReceiptV2]
         | type[FailureReceipt]
     )
     if schema == "remote_parse_prepared_reconcile.v1":
         receipt_type = PreparedReconcileReceipt
     elif schema == "remote_parse_accepted_submission.v1":
         receipt_type = AcceptedSubmissionReceipt
+    elif schema == "remote_parse_prepared_materialization.v2":
+        receipt_type = PreparedMaterializationReceiptV2
     elif schema == "remote_parse_local_receipt.v1":
         receipt_type = LocalMaterializationReceipt
+    elif schema == "remote_parse_local_receipt.v2":
+        receipt_type = LocalMaterializationReceiptV2
     elif schema == "remote_parse_failure_receipt.v1":
         receipt_type = FailureReceipt
     else:
         raise ValueError("checkpoint receipt schema is unsupported")
-    expected = frozenset(receipt_type.__dataclass_fields__)
+    expected = frozenset(item.name for item in fields(receipt_type))
     if frozenset(payload) != expected:
         raise ValueError("checkpoint receipt fields are not closed")
     receipt = receipt_type(**payload)
@@ -646,6 +821,25 @@ def decode_checkpoint_receipt(exact_bytes: bytes) -> EncodedCheckpointReceipt:
     if encoded.exact_bytes != exact_bytes:
         raise ValueError("checkpoint receipt JSON is not canonical")
     return encoded
+
+
+def _validate_safe_relpath(value: object, label: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 1024
+        or value.startswith("/")
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError(f"invalid {label}")
+
+
+def _checked_temporary_disk_peak(compressed: int, uncompressed: int) -> int:
+    peak = compressed + uncompressed
+    if peak > _MAX_EVIDENCE_INT:
+        raise ValueError("materialization temporary disk peak overflowed")
+    return peak
 
 
 def encode_terminal_receipt(receipt: TerminalReceipt) -> EncodedTerminalReceipt:
@@ -712,6 +906,8 @@ __all__ = [
     "RemoteParseCheckpointConflict",
     "RemoteParseResumeSecret",
     "LocalMaterializationReceipt",
+    "LocalMaterializationReceiptV2",
+    "PreparedMaterializationReceiptV2",
     "PreparedReconcileReceipt",
     "TerminalReceipt",
     "decode_terminal_receipt",

@@ -22,6 +22,11 @@ from threading import Event
 import time
 from typing import Protocol
 
+from disclosure_anchor.application.contracts.staged_credit import (
+    CreditVector,
+    STAGED_STATE_TRANSITIONS,
+)
+
 
 class CoordinatorLane(str, Enum):
     PREFLIGHT = "preflight"
@@ -35,63 +40,6 @@ class CoordinatorLane(str, Enum):
 class CoordinatorTerminal(str, Enum):
     QUIESCENT = "quiescent"
     STUCK_OPEN_CIRCUIT = "stuck_open_circuit"
-
-
-@dataclass(frozen=True, slots=True)
-class CreditVector:
-    """Non-fungible process credits held by durable work.
-
-    A byte in one dimension can never pay for another dimension.  Values are
-    exact ownership projections, not utilization estimates.
-    """
-
-    documents: int = 0
-    remote_waits: int = 0
-    retained_results: int = 0
-    retained_bytes: int = 0
-    local_items: int = 0
-    compressed_bytes: int = 0
-    decoded_bytes: int = 0
-    temp_disk_bytes: int = 0
-    db_stage_items: int = 0
-    ack_items: int = 0
-    unpublished_pages: int = 0
-
-    def __post_init__(self) -> None:
-        for item in fields(self):
-            value = getattr(self, item.name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"credit {item.name} must be a non-negative integer")
-
-    def __add__(self, other: CreditVector) -> CreditVector:
-        return CreditVector(
-            **{
-                item.name: getattr(self, item.name) + getattr(other, item.name)
-                for item in fields(self)
-            }
-        )
-
-    def __sub__(self, other: CreditVector) -> CreditVector:
-        values = {
-            item.name: getattr(self, item.name) - getattr(other, item.name)
-            for item in fields(self)
-        }
-        if any(value < 0 for value in values.values()):
-            raise ValueError("credit release would make ownership negative")
-        return CreditVector(**values)
-
-    def fits(self, limit: CreditVector) -> bool:
-        return all(
-            getattr(self, item.name) <= getattr(limit, item.name)
-            for item in fields(self)
-        )
-
-    def nonzero(self) -> dict[str, int]:
-        return {
-            item.name: getattr(self, item.name)
-            for item in fields(self)
-            if getattr(self, item.name)
-        }
 
 
 def _positive_credit_delta(before: CreditVector, after: CreditVector) -> CreditVector:
@@ -443,36 +391,33 @@ _LANE_PRIORITY = (
 )
 _ALLOWED_LANE_TRANSITIONS = {
     CoordinatorLane.PREFLIGHT: frozenset(
-        {("prepared", "reconciling"), ("prepared", "pre_submission_failed")}
+        ("prepared", target) for target in STAGED_STATE_TRANSITIONS["prepared"]
     ),
     CoordinatorLane.REMOTE: frozenset(
-        {
-            ("reconciling", "submitted"),
-            ("submitted", "remote_terminal"),
-            ("submitted", "remote_failure_committed"),
-        }
+        (source, target)
+        for source in ("reconciling", "submitted")
+        for target in STAGED_STATE_TRANSITIONS[source]
     ),
     CoordinatorLane.LOCAL_PREPARE: frozenset(
-        {
-            ("remote_terminal", "materializing"),
-            ("remote_terminal", "local_failure_committed"),
-        }
+        ("remote_terminal", target)
+        for target in STAGED_STATE_TRANSITIONS["remote_terminal"]
     ),
     CoordinatorLane.LOCAL: frozenset(
-        {
-            ("materializing", "local_materialized"),
-            ("materializing", "local_failure_committed"),
-        }
+        ("materializing", target)
+        for target in STAGED_STATE_TRANSITIONS["materializing"]
     ),
     CoordinatorLane.COMMIT: frozenset(
-        {("local_materialized", "finish_committed")}
+        ("local_materialized", target)
+        for target in STAGED_STATE_TRANSITIONS["local_materialized"]
     ),
     CoordinatorLane.ACK: frozenset(
-        {
-            ("finish_committed", "acked"),
-            ("remote_failure_committed", "remote_failed"),
-            ("local_failure_committed", "local_failed"),
-        }
+        (source, target)
+        for source in (
+            "finish_committed",
+            "remote_failure_committed",
+            "local_failure_committed",
+        )
+        for target in STAGED_STATE_TRANSITIONS[source]
     ),
 }
 
