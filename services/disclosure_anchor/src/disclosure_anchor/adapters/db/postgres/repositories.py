@@ -656,26 +656,36 @@ class _ProcessingRunRepositoryBase:
 
 
 def _remote_attempt_entity(row: models.RemoteParseAttempt) -> RemoteParseAttempt:
+    materialization: PreparedMaterializationReceiptV2 | None = None
     if row.materialization_receipt_bytes is not None:
         encoded_materialization = decode_checkpoint_receipt(
             bytes(row.materialization_receipt_bytes)
         )
-        materialization = encoded_materialization.receipt
-        if not isinstance(materialization, PreparedMaterializationReceiptV2) or (
+        raw_materialization = encoded_materialization.receipt
+        if not isinstance(raw_materialization, PreparedMaterializationReceiptV2):
+            raise RemoteParseCheckpointConflict(
+                "stored prepared materialization projection drifted"
+            )
+        materialization = raw_materialization
+        if (
             encoded_materialization.sha256 != row.materialization_receipt_sha256
             or encoded_materialization.byte_count != row.materialization_receipt_byte_count
             or materialization.attempt_identity != row.attempt_id
             or materialization.fence_identity != row.fence_identity
             or materialization.source_pdf_sha256 != row.source_pdf_sha256
             or materialization.source_page_count != row.materialization_source_page_count
+            or materialization.source_page_count != row.reservation_source_page_count
+            or materialization.terminal_receipt_sha256 != row.terminal_receipt_sha256
             or materialization.process_profile_sha256 != row.process_profile_sha256
             or materialization.credit_policy_sha256 != row.credit_policy_sha256
             or materialization.reservation_input_sha256 != row.reservation_input_sha256
             or materialization.spool_relpath != row.materialization_spool_relpath
             or materialization.spool_sha256 != row.materialization_spool_sha256
             or materialization.spool_byte_count != row.materialization_spool_byte_count
+            or materialization.spool_byte_count != row.result_artifact_bytes
             or materialization.compressed_byte_count
             != row.materialization_compressed_byte_count
+            or materialization.compressed_byte_count != row.result_artifact_bytes
             or materialization.uncompressed_byte_count
             != row.materialization_uncompressed_byte_count
             or materialization.temporary_disk_byte_count
@@ -744,6 +754,14 @@ def _remote_attempt_entity(row: models.RemoteParseAttempt) -> RemoteParseAttempt
             or local.reservation_input_sha256 != row.reservation_input_sha256
             or local.prepared_materialization_sha256
             != row.materialization_receipt_sha256
+            or materialization is None
+            or local.source_page_count != materialization.source_page_count
+            or local.compressed_byte_count != materialization.compressed_byte_count
+            or local.uncompressed_byte_count != materialization.uncompressed_byte_count
+            or local.member_count != materialization.member_count
+            or local.temporary_disk_byte_count
+            != materialization.temporary_disk_byte_count
+            or local.decoded_byte_count != materialization.decoded_byte_count
         ):
             raise RemoteParseCheckpointConflict("stored v2 local credit evidence drifted")
     if row.failure_receipt_bytes is not None:

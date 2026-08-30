@@ -684,12 +684,25 @@ class RemoteParseAttempt:
                     or prepared_projection.credit_policy_sha256 != self.credit_policy_sha256
                     or prepared_projection.reservation_input_sha256
                     != self.reservation_input_sha256
+                    or prepared_projection.terminal_receipt_sha256
+                    != self.terminal_receipt_sha256
+                    or prepared_projection.source_page_count
+                    != self.reservation_source_page_count
+                    or prepared_projection.spool_byte_count
+                    != self.result_artifact_bytes
+                    or prepared_projection.compressed_byte_count
+                    != self.result_artifact_bytes
                 ):
                     raise ValueError("v3 materialization evidence drifted from attempt")
             decoded_materialization = (
                 None
                 if self.materialization_receipt_bytes is None
                 else decode_checkpoint_receipt(self.materialization_receipt_bytes).receipt
+            )
+            materialization = (
+                decoded_materialization
+                if isinstance(decoded_materialization, PreparedMaterializationReceiptV2)
+                else None
             )
             local_v2 = (
                 None
@@ -700,11 +713,19 @@ class RemoteParseAttempt:
                 local_v2, LocalMaterializationReceiptV2
             ):
                 raise ValueError("v3 local receipt must use the v2 credit contract")
-            materialization = (
-                decoded_materialization
-                if isinstance(decoded_materialization, PreparedMaterializationReceiptV2)
-                else None
-            )
+            if isinstance(local_v2, LocalMaterializationReceiptV2) and (
+                materialization is None
+                or local_v2.source_page_count != materialization.source_page_count
+                or local_v2.compressed_byte_count
+                != materialization.compressed_byte_count
+                or local_v2.uncompressed_byte_count
+                != materialization.uncompressed_byte_count
+                or local_v2.member_count != materialization.member_count
+                or local_v2.temporary_disk_byte_count
+                != materialization.temporary_disk_byte_count
+                or local_v2.decoded_byte_count != materialization.decoded_byte_count
+            ):
+                raise ValueError("v3 local receipt drifted from prepared materialization")
             materialization_required = self.state in {
                 "materializing", "local_materialized", "finish_committed", "acked"
             }

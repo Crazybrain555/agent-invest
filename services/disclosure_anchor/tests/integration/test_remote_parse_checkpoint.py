@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import unittest
@@ -21,6 +21,7 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     AcceptedSubmissionReceipt,
     FailureReceipt,
     LocalMaterializationReceipt,
+    PreparedMaterializationReceiptV2,
     PreparedReconcileReceipt,
     RemoteParseAttempt,
     RemoteParseCheckpointConflict,
@@ -122,6 +123,180 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                     ))
                 with self.assertRaises(SQLAlchemyError):
                     session.commit()
+
+    def test_v3_accepted_and_terminal_secrets_bind_receipt_token_sha(self) -> None:
+        for stage in ("submitted", "remote_terminal"):
+            parent, prepared_secret = self._v3_rows()
+            accepted_token = b"accepted-v3-token"
+            accepted = encode_checkpoint_receipt(AcceptedSubmissionReceipt(
+                attempt_identity=self.attempt_id,
+                fence_identity="fence-1",
+                source_pdf_sha256=_sha("a"),
+                client_submit_key="submit-" + self.attempt_id,
+                submission_epoch_unix=100,
+                remote_task_identity="task-v3",
+                status_url="http://private/tasks/task-v3",
+                result_url="http://private/tasks/task-v3/result",
+                resume_token_sha256="sha256:" + hashlib.sha256(accepted_token).hexdigest(),
+            ))
+            parent.state = stage
+            parent.row_version = 2 if stage == "remote_terminal" else 1
+            parent.claim_generation = 1
+            parent.claim_owner_identity = "worker-v3"
+            parent.claim_lease_until = datetime.now(timezone.utc) + timedelta(minutes=1)
+            parent.remote_task_identity = "task-v3"
+            parent.submitted_receipt_sha256 = accepted.sha256
+            parent.submitted_receipt_bytes = accepted.exact_bytes
+            parent.submitted_receipt_byte_count = accepted.byte_count
+            parent.current_remote_waits = 1 if stage == "submitted" else 0
+            accepted_secret = models.RemoteParseV3ResumeSecret(
+                attempt_id=self.attempt_id,
+                secret_kind="accepted_submission",
+                token_bytes=b"wrong-accepted-token",
+                token_sha256="sha256:" + hashlib.sha256(b"wrong-accepted-token").hexdigest(),
+                token_byte_count=len(b"wrong-accepted-token"),
+            )
+            secrets = [prepared_secret, accepted_secret]
+            if stage == "remote_terminal":
+                terminal_token = b"terminal-v3-token"
+                terminal = encode_terminal_receipt(TerminalReceipt(
+                    attempt_identity=self.attempt_id,
+                    fence_identity="fence-1",
+                    source_pdf_sha256=_sha("a"),
+                    artifact_owner_identity="owner-v3",
+                    artifact_byte_count=10,
+                    artifact_sha256=_sha("e"),
+                    resume_token_sha256="sha256:" + hashlib.sha256(terminal_token).hexdigest(),
+                ))
+                parent.terminal_receipt_sha256 = terminal.sha256
+                parent.terminal_receipt_bytes = terminal.exact_bytes
+                parent.terminal_receipt_byte_count = terminal.byte_count
+                parent.result_owner_identity = "owner-v3"
+                parent.result_artifact_sha256 = _sha("e")
+                parent.result_artifact_bytes = 10
+                parent.current_retained_results = 1
+                parent.current_retained_bytes = 10
+                secrets.append(models.RemoteParseV3ResumeSecret(
+                    attempt_id=self.attempt_id,
+                    secret_kind="terminal",
+                    token_bytes=b"wrong-terminal-token",
+                    token_sha256="sha256:" + hashlib.sha256(b"wrong-terminal-token").hexdigest(),
+                    token_byte_count=len(b"wrong-terminal-token"),
+                ))
+            with self.subTest(stage=stage), Session(self.engine) as session:
+                session.add(parent)
+                session.add_all(secrets)
+                with self.assertRaises(SQLAlchemyError):
+                    session.commit()
+
+    def test_v3_materialization_partial_null_is_rejected_by_database(self) -> None:
+        parent, prepared_secret = self._v3_rows()
+        accepted_token = b"accepted-v3-token"
+        terminal_token = b"terminal-v3-token"
+        materialization_token = b"materialization-v3-token"
+        accepted = encode_checkpoint_receipt(AcceptedSubmissionReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"),
+            client_submit_key="submit-" + self.attempt_id,
+            submission_epoch_unix=100, remote_task_identity="task-v3",
+            status_url="http://private/tasks/task-v3",
+            result_url="http://private/tasks/task-v3/result",
+            resume_token_sha256="sha256:" + hashlib.sha256(accepted_token).hexdigest(),
+        ))
+        terminal = encode_terminal_receipt(TerminalReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"), artifact_owner_identity="owner-v3",
+            artifact_byte_count=10, artifact_sha256=_sha("e"),
+            resume_token_sha256="sha256:" + hashlib.sha256(terminal_token).hexdigest(),
+        ))
+        materialization = encode_checkpoint_receipt(PreparedMaterializationReceiptV2(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"), source_page_count=2,
+            terminal_receipt_sha256=terminal.sha256,
+            process_profile_sha256=parent.process_profile_sha256 or "",
+            credit_policy_sha256=parent.credit_policy_sha256 or "",
+            reservation_input_sha256=parent.reservation_input_sha256 or "",
+            spool_relpath="attempt/result.zip", spool_sha256=_sha("e"),
+            spool_byte_count=10, compressed_byte_count=10,
+            uncompressed_byte_count=20, member_count=1,
+            temporary_disk_byte_count=30, decoded_byte_count=20,
+            private_token_sha256="sha256:" + hashlib.sha256(materialization_token).hexdigest(),
+        ))
+        parent.state = "materializing"
+        parent.row_version = 3
+        parent.claim_generation = 1
+        parent.claim_owner_identity = "worker-v3"
+        parent.claim_lease_until = datetime.now(timezone.utc) + timedelta(minutes=1)
+        parent.remote_task_identity = "task-v3"
+        parent.submitted_receipt_sha256 = accepted.sha256
+        parent.submitted_receipt_bytes = accepted.exact_bytes
+        parent.submitted_receipt_byte_count = accepted.byte_count
+        parent.terminal_receipt_sha256 = terminal.sha256
+        parent.terminal_receipt_bytes = terminal.exact_bytes
+        parent.terminal_receipt_byte_count = terminal.byte_count
+        parent.result_owner_identity = "owner-v3"
+        parent.result_artifact_sha256 = _sha("e")
+        parent.result_artifact_bytes = 10
+        parent.materialization_receipt_sha256 = materialization.sha256
+        parent.materialization_receipt_bytes = materialization.exact_bytes
+        parent.materialization_receipt_byte_count = materialization.byte_count
+        parent.materialization_source_page_count = 2
+        parent.materialization_spool_relpath = "attempt/result.zip"
+        parent.materialization_spool_sha256 = _sha("e")
+        parent.materialization_spool_byte_count = 10
+        parent.materialization_compressed_byte_count = 10
+        parent.materialization_uncompressed_byte_count = 20
+        parent.materialization_temp_disk_byte_count = 30
+        parent.materialization_decoded_byte_count = 20
+        parent.materialization_member_count = 1
+        parent.materialization_token_sha256 = "sha256:" + hashlib.sha256(materialization_token).hexdigest()
+        shape = credit_shape("materializing", CreditShapeFacts(
+            terminal_byte_count=10, compressed_byte_count=10,
+            uncompressed_byte_count=20, decoded_byte_count=20,
+            temporary_disk_byte_count=30, source_page_count=2,
+            materialization_prepared=True,
+        ))
+        for name in shape.__dataclass_fields__:
+            setattr(parent, f"current_{name}", getattr(shape, name))
+        secrets = [prepared_secret]
+        for kind, token in (
+            ("accepted_submission", accepted_token),
+            ("terminal", terminal_token),
+            ("materialization", materialization_token),
+        ):
+            secrets.append(models.RemoteParseV3ResumeSecret(
+                attempt_id=self.attempt_id, secret_kind=kind,
+                token_bytes=token,
+                token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+                token_byte_count=len(token),
+            ))
+        with Session(self.engine) as session:
+            session.add(parent)
+            session.add_all(secrets)
+            session.commit()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(
+                uow.remote_parse_attempts.get(self.attempt_id).state,
+                "materializing",
+            )
+        with self.assertRaises(SQLAlchemyError), self.engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE disclosure_ops.remote_parse_attempt SET materialization_receipt_sha256=NULL WHERE attempt_id=:a"
+            ), {"a": self.attempt_id})
+        drift_updates = ("materialization_source_page_count=3",)
+        for update in drift_updates:
+            with self.subTest(update=update), self.engine.begin() as conn:
+                conn.execute(text(
+                    f"UPDATE disclosure_ops.remote_parse_attempt SET {update} WHERE attempt_id=:a"
+                ), {"a": self.attempt_id})
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+                RemoteParseCheckpointConflict, "prepared materialization projection"
+            ):
+                uow.remote_parse_attempts.get(self.attempt_id)
+            with self.engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE disclosure_ops.remote_parse_attempt SET materialization_source_page_count=2, materialization_spool_byte_count=10, materialization_compressed_byte_count=10, current_compressed_bytes=10 WHERE attempt_id=:a"
+                ), {"a": self.attempt_id})
 
     def setUp(self) -> None:
         self.engine = engine_or_skip()

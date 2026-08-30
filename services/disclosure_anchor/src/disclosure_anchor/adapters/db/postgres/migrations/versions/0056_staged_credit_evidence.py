@@ -74,12 +74,11 @@ _NON_V3_COLUMNS = (
     "local_db_staged_byte_count",
 )
 _MATERIALIZATION_PRESENT = (
-    "materialization_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND "
-    "materialization_receipt_bytes IS NOT NULL AND "
+    _all_present(_MATERIALIZATION_COLUMNS)
+    + " AND materialization_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND "
     "materialization_receipt_byte_count=octet_length(materialization_receipt_bytes) AND "
     "materialization_receipt_byte_count BETWEEN 1 AND 65536 AND "
-    + _all_present(_MATERIALIZATION_COLUMNS[3:])
-    + " AND materialization_source_page_count>0 AND materialization_spool_byte_count>0 "
+    "materialization_source_page_count>0 AND materialization_spool_byte_count>0 "
     "AND materialization_compressed_byte_count=materialization_spool_byte_count "
     "AND materialization_uncompressed_byte_count>0 AND materialization_decoded_byte_count>0 "
     "AND materialization_temp_disk_byte_count="
@@ -191,7 +190,7 @@ def upgrade() -> None:
         batch.create_check_constraint(
             "ck_remote_parse_attempt_v3_local_projection",
             "checkpoint_contract_version<3 OR ((local_receipt_bytes IS NULL AND local_db_staged_byte_count IS NULL) "
-            "OR (local_receipt_bytes IS NOT NULL AND local_db_staged_byte_count>0))",
+            "OR (local_receipt_bytes IS NOT NULL AND local_db_staged_byte_count IS NOT NULL AND local_db_staged_byte_count>0))",
         )
         batch.create_check_constraint(
             "ck_remote_parse_attempt_v3_state_credit",
@@ -224,7 +223,7 @@ def upgrade() -> None:
             "ck_remote_parse_attempt_local_receipt",
             "checkpoint_contract_version=1 OR "
             "(checkpoint_contract_version=2 AND ((state IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536) OR (state NOT IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL))) OR "
-            "(checkpoint_contract_version=3 AND ((state IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536 AND local_db_staged_byte_count>0) OR (state IN ('local_failure_committed','local_failed') AND ((local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL AND local_db_staged_byte_count IS NULL) OR (local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536 AND local_db_staged_byte_count>0))) OR (state NOT IN ('local_materialized','finish_committed','acked','local_failure_committed','local_failed') AND local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL AND local_db_staged_byte_count IS NULL)))",
+            "(checkpoint_contract_version=3 AND ((state IN ('local_materialized','finish_committed','acked') AND local_receipt_sha256 IS NOT NULL AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536 AND local_db_staged_byte_count IS NOT NULL AND local_db_staged_byte_count>0) OR (state IN ('local_failure_committed','local_failed') AND ((local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL AND local_db_staged_byte_count IS NULL) OR (local_receipt_sha256 IS NOT NULL AND local_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND local_receipt_bytes IS NOT NULL AND local_receipt_byte_count IS NOT NULL AND local_receipt_byte_count=octet_length(local_receipt_bytes) AND local_receipt_byte_count BETWEEN 1 AND 65536 AND local_db_staged_byte_count IS NOT NULL AND local_db_staged_byte_count>0))) OR (state NOT IN ('local_materialized','finish_committed','acked','local_failure_committed','local_failed') AND local_receipt_sha256 IS NULL AND local_receipt_bytes IS NULL AND local_receipt_byte_count IS NULL AND local_db_staged_byte_count IS NULL)))",
         )
         batch.create_check_constraint(
             "ck_remote_parse_attempt_submitted_shape",
@@ -252,7 +251,9 @@ def upgrade() -> None:
           IF a.checkpoint_contract_version=3 THEN
             IF NOT EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='prepared_reconcile') THEN RAISE EXCEPTION 'v3 attempt lacks prepared secret'; END IF;
             IF (a.state NOT IN ('prepared','reconciling','pre_submission_failed','superseded')) <> EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='accepted_submission') THEN RAISE EXCEPTION 'v3 accepted secret drift'; END IF;
+            IF a.submitted_receipt_bytes IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='accepted_submission' AND s.token_sha256=(convert_from(a.submitted_receipt_bytes,'UTF8')::jsonb->>'resume_token_sha256')) THEN RAISE EXCEPTION 'v3 accepted token drift'; END IF;
             IF (a.terminal_receipt_bytes IS NOT NULL) <> EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='terminal') THEN RAISE EXCEPTION 'v3 terminal secret drift'; END IF;
+            IF a.terminal_receipt_bytes IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='terminal' AND s.token_sha256=(convert_from(a.terminal_receipt_bytes,'UTF8')::jsonb->>'resume_token_sha256')) THEN RAISE EXCEPTION 'v3 terminal token drift'; END IF;
             IF (a.materialization_receipt_bytes IS NOT NULL) <> EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='materialization') THEN RAISE EXCEPTION 'v3 materialization secret drift'; END IF;
             IF a.materialization_receipt_bytes IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {OPS_SCHEMA}.remote_parse_v3_resume_secret s WHERE s.attempt_id=a.attempt_id AND s.secret_kind='materialization' AND s.token_sha256=a.materialization_token_sha256) THEN RAISE EXCEPTION 'v3 materialization token drift'; END IF;
           END IF;
