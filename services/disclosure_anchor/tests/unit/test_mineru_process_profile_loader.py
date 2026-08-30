@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 import tempfile
+from unittest import mock
 import unittest
 
 from disclosure_anchor.adapters.runtime.mineru_process_profile import (
@@ -75,11 +77,12 @@ class MineruProcessProfileLoaderTests(unittest.TestCase):
     def test_load_preserves_exact_bytes_and_expected_hash(self) -> None:
         profile = _profile()
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "profile.json"
+            path = Path(directory).resolve() / "profile.json"
             path.write_bytes(profile.exact_bytes)
             loaded = load_mineru_process_profile(
                 path,
                 expected_sha256=profile.sha256,
+                expected_owner_uid=os.getuid(),
             )
         self.assertEqual(loaded.profile, profile)
         self.assertEqual(loaded.exact_bytes, profile.exact_bytes)
@@ -88,31 +91,104 @@ class MineruProcessProfileLoaderTests(unittest.TestCase):
     def test_hash_mismatch_and_noncanonical_bytes_fail_closed(self) -> None:
         profile = _profile()
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "profile.json"
+            path = Path(directory).resolve() / "profile.json"
             path.write_bytes(profile.exact_bytes)
             with self.assertRaisesRegex(ValueError, "differs"):
                 load_mineru_process_profile(
                     path,
                     expected_sha256=replace(profile, api_task_slots=1).sha256,
+                    expected_owner_uid=os.getuid(),
                 )
             path.write_bytes(profile.exact_bytes.replace(b'":', b'": ', 1))
             with self.assertRaisesRegex(ValueError, "not canonical"):
-                load_mineru_process_profile(path)
+                load_mineru_process_profile(
+                    path,
+                    expected_sha256=profile.sha256,
+                    expected_owner_uid=os.getuid(),
+                )
 
     def test_symlink_and_oversized_file_fail_closed(self) -> None:
         profile = _profile()
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             target = root / "target.json"
             target.write_bytes(profile.exact_bytes)
             link = root / "profile.json"
             link.symlink_to(target)
             with self.assertRaisesRegex(ValueError, "opened safely"):
-                load_mineru_process_profile(link)
+                load_mineru_process_profile(
+                    link,
+                    expected_sha256=profile.sha256,
+                    expected_owner_uid=os.getuid(),
+                )
             oversized = root / "oversized.json"
             oversized.write_bytes(b"x" * (64 * 1024 + 1))
             with self.assertRaisesRegex(ValueError, "closed envelope"):
-                load_mineru_process_profile(oversized)
+                load_mineru_process_profile(
+                    oversized,
+                    expected_sha256=profile.sha256,
+                    expected_owner_uid=os.getuid(),
+                )
+
+    def test_same_size_in_place_change_during_read_fails_closed(self) -> None:
+        initial = _profile()
+        final = replace(initial, api_task_slots=3, raster_stage_slots=3)
+        self.assertEqual(len(initial.exact_bytes), len(final.exact_bytes))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "profile.json"
+            path.write_bytes(initial.exact_bytes)
+            real_read = os.read
+            changed = False
+
+            def mutate_after_read(descriptor: int, count: int) -> bytes:
+                nonlocal changed
+                result = real_read(descriptor, count)
+                if not changed:
+                    changed = True
+                    path.write_bytes(final.exact_bytes)
+                return result
+
+            with mock.patch("os.read", side_effect=mutate_after_read):
+                with self.assertRaisesRegex(ValueError, "changed while"):
+                    load_mineru_process_profile(
+                        path,
+                        expected_sha256=initial.sha256,
+                        expected_owner_uid=os.getuid(),
+                    )
+
+    def test_parent_symlink_hardlink_and_writable_mode_fail_closed(self) -> None:
+        profile = _profile()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            real_parent = root / "real"
+            real_parent.mkdir()
+            profile_path = real_parent / "profile.json"
+            profile_path.write_bytes(profile.exact_bytes)
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "traversed safely"):
+                load_mineru_process_profile(
+                    linked_parent / "profile.json",
+                    expected_sha256=profile.sha256,
+                    expected_owner_uid=os.getuid(),
+                )
+
+            hardlink = real_parent / "hardlink.json"
+            hardlink.hardlink_to(profile_path)
+            with self.assertRaisesRegex(ValueError, "one hard link"):
+                load_mineru_process_profile(
+                    profile_path,
+                    expected_sha256=profile.sha256,
+                    expected_owner_uid=os.getuid(),
+                )
+            hardlink.unlink()
+            profile_path.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                load_mineru_process_profile(
+                    profile_path,
+                    expected_sha256=profile.sha256,
+                    expected_owner_uid=os.getuid(),
+                )
 
 
 if __name__ == "__main__":

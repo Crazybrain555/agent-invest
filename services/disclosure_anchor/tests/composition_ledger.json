@@ -336,7 +336,7 @@
   },
   "tests/unit/test_mineru_process_profile_loader.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 5
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
