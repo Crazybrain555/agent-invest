@@ -107,6 +107,10 @@ class _Backend:
         self.defer_claim = False
         self.defer_claim_ids: set[str] = set()
         self.foreign_deferred_projection = False
+        self.deferred_projection_overrides: dict[str, CoordinatorWork] = {}
+        self.deferred_projection_sequences: dict[str, list[CoordinatorWork]] = {}
+        self.deferred_retry_after_seconds = 0.001
+        self.duplicate_recovery_page = False
         self.claim_attempts: dict[str, int] = {}
         self.violate_admission_credit = False
         self.retry_remote_remaining = 0
@@ -155,7 +159,10 @@ class _Backend:
             for work in self.recoverable
             if after_attempt_id is None or work.attempt_id > after_attempt_id
         ]
-        return tuple(rows[:limit])
+        page = tuple(rows[:limit])
+        if self.duplicate_recovery_page and page:
+            return (page[0], page[0])
+        return page
 
     def claim_recovery(self, work: CoordinatorWork) -> CoordinatorWork:
         self.calls.append(f"claim:{work.attempt_id}")
@@ -163,13 +170,20 @@ class _Backend:
             self.claim_attempts.get(work.attempt_id, 0) + 1
         )
         if self.defer_claim or work.attempt_id in self.defer_claim_ids:
+            projections = self.deferred_projection_sequences.get(work.attempt_id)
             durable = (
                 replace(work, attempt_id="foreign-attempt")
                 if self.foreign_deferred_projection
-                else work
+                else (
+                    projections.pop(0)
+                    if projections
+                    else self.deferred_projection_overrides.get(work.attempt_id, work)
+                )
             )
             raise RecoveryDeferred(
-                "held", retry_after_seconds=0.001, durable_work=durable
+                "held",
+                retry_after_seconds=self.deferred_retry_after_seconds,
+                durable_work=durable,
             )
         return replace(
             work,
@@ -935,6 +949,52 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         self.assertEqual(
             result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
         )
+
+    def test_deferred_shrink_clears_emergency_before_other_dimension_growth(self) -> None:
+        backend = _Backend(
+            recoverable=(
+                _work("attempt-a", "materializing", 5),
+                _work("attempt-b", "materializing", 5),
+            )
+        )
+        backend.defer_claim_ids.add("attempt-b")
+        backend.deferred_retry_after_seconds = 0.001
+        backend.deferred_projection_sequences["attempt-b"] = [
+            _work("attempt-b", "materializing", 5),
+            _work("attempt-b", "local_materialized", 6),
+        ]
+        clock_value = [time.monotonic()]
+
+        def advancing_monotonic() -> float:
+            clock_value[0] += 0.01
+            return clock_value[0]
+
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(
+                credits=replace(
+                    _LIMIT,
+                    local_items=1,
+                    db_stage_items=1,
+                    unpublished_pages=10,
+                ),
+                idle_open_circuit_seconds=0.02,
+            ),
+            monotonic=advancing_monotonic,
+        ).run(
+            stop_requested=lambda: backend.claim_attempts.get("attempt-b", 0) >= 2
+        )
+        # B's refreshed durable db-stage ownership makes the aggregate fit,
+        # so A must lose emergency status and may not create a second db item.
+        self.assertNotIn("local:attempt-a", backend.calls)
+        self.assertEqual(result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
+
+    def test_duplicate_attempt_id_in_recovery_page_fails_closed(self) -> None:
+        backend = _Backend(recoverable=(_work("attempt-a", "submitted", 2),))
+        backend.duplicate_recovery_page = True
+        with self.assertRaisesRegex(RuntimeError, "strictly ordered"):
+            StagedParseCoordinator(backend=backend, limits=_limits()).run()
+        self.assertNotIn("remote:attempt-a", backend.calls)
 
     def test_stage_renews_near_expiry_claim_before_side_effect(self) -> None:
         near_expiry = replace(

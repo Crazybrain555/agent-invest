@@ -609,6 +609,12 @@ class StagedParseCoordinator:
             ledger.replace(work, allow_oversubscribed=True)
             if not ledger.in_use.fits(ledger.limit):
                 oversubscribed_recovery.update(known)
+            else:
+                oversubscribed_recovery.intersection_update(
+                    attempt_id
+                    for attempt_id, durable in known.items()
+                    if not durable.credit_reservation.fits(ledger.limit)
+                )
 
         def preserve_contract_violation(
             prior: CoordinatorWork,
@@ -870,7 +876,11 @@ class StagedParseCoordinator:
                 if not page:
                     break
                 ids = [work.attempt_id for work in page]
-                if ids != sorted(ids) or (after is not None and ids[0] <= after):
+                if (
+                    ids != sorted(ids)
+                    or len(ids) != len(set(ids))
+                    or (after is not None and ids[0] <= after)
+                ):
                     raise RuntimeError("recovery keyset page is not strictly ordered")
                 for work in page:
                     try:
