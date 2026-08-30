@@ -532,7 +532,7 @@ def build_staged_credit_envelope(
     reservation = CreditVector(
         documents=1,
         remote_waits=1,
-    retained_results=1,
+        retained_results=1,
         retained_bytes=retained_cap,
         local_items=1,
         compressed_bytes=retained_cap,
