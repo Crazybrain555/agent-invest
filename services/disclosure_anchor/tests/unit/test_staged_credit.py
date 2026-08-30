@@ -312,6 +312,11 @@ class StagedCreditContractTests(unittest.TestCase):
             credit_shape("local_failure_committed", pre_materialization_failure),
             CreditVector(documents=1, retained_results=1, retained_bytes=10, ack_items=1),
         )
+        with self.assertRaisesRegex(ValueError, "stale facts"):
+            credit_shape(
+                "local_failure_committed",
+                replace(pre_materialization_failure, db_staged_byte_count=7),
+            )
         self.assertEqual(
             credit_shape("local_failure_committed", facts),
             CreditVector(

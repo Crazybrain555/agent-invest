@@ -382,6 +382,7 @@ def credit_shape(state: str, facts: CreditShapeFacts) -> CreditVector:
                 facts.uncompressed_byte_count,
                 facts.decoded_byte_count,
                 facts.temporary_disk_byte_count,
+                facts.db_staged_byte_count,
                 facts.source_page_count,
             )
         ):
