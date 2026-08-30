@@ -86,18 +86,7 @@ class ProviderAckCompletionWitness:
             self.failure_receipt_sha256 is not None,
         ) != expected or self.http_status not in {200, 204}:
             raise ValueError("provider ACK witness shape is invalid")
-        projection = {
-            "schema": self.schema,
-            "attempt_identity": self.attempt_identity,
-            "fence_identity": self.fence_identity,
-            "remote_task_identity": self.remote_task_identity,
-            "source_pdf_sha256": self.source_pdf_sha256,
-            "committed_state": self.committed_state,
-            "terminal_receipt_sha256": self.terminal_receipt_sha256,
-            "failure_receipt_sha256": self.failure_receipt_sha256,
-            "http_status": self.http_status,
-        }
-        canonical = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+        canonical = _provider_ack_canonical_bytes(self)
         if self.exact_bytes != canonical or self.sha256 != (
             "sha256:" + hashlib.sha256(canonical).hexdigest()
         ):
@@ -145,12 +134,36 @@ def _issue_provider_ack_completion_witness(
 def verify_provider_ack_completion_witness(
     value: object, *, accepted_secret: bytes,
 ) -> bool:
-    return type(value) is ProviderAckCompletionWitness and hmac.compare_digest(
-        value.mac_sha256,
-        "sha256:" + hmac.new(
-            accepted_secret, value.exact_bytes, hashlib.sha256
-        ).hexdigest(),
+    if type(value) is not ProviderAckCompletionWitness:
+        return False
+    try:
+        canonical = _provider_ack_canonical_bytes(value)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    expected_sha = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    expected_mac = "sha256:" + hmac.new(
+        accepted_secret, canonical, hashlib.sha256
+    ).hexdigest()
+    return (
+        value.exact_bytes == canonical
+        and hmac.compare_digest(value.sha256, expected_sha)
+        and hmac.compare_digest(value.mac_sha256, expected_mac)
     )
+
+
+def _provider_ack_canonical_bytes(value: ProviderAckCompletionWitness) -> bytes:
+    projection = {
+        "schema": value.schema,
+        "attempt_identity": value.attempt_identity,
+        "fence_identity": value.fence_identity,
+        "remote_task_identity": value.remote_task_identity,
+        "source_pdf_sha256": value.source_pdf_sha256,
+        "committed_state": value.committed_state,
+        "terminal_receipt_sha256": value.terminal_receipt_sha256,
+        "failure_receipt_sha256": value.failure_receipt_sha256,
+        "http_status": value.http_status,
+    }
+    return json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
 
 
 @dataclass(frozen=True, slots=True)

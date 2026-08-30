@@ -2158,6 +2158,30 @@ class RemoteParseAttemptRepository:
             "updated_at": clock.c.database_observed_at,
             **{f"current_{name}": 0 for name in CreditVector.__dataclass_fields__},
         }
+        resource_free_predicates: tuple[Any, ...] = ()
+        if expected_attempt.state == "local_failure_committed":
+            resource_free_predicates = (
+                models.RemoteParseAttempt.materialization_receipt_bytes.is_(None),
+                models.RemoteParseAttempt.local_receipt_bytes.is_(None),
+                models.RemoteParseAttempt.local_db_staged_byte_count.is_(None),
+            )
+        authorization_predicates = (
+            models.RemoteParseAttempt.source_pdf_sha256 == witness.source_pdf_sha256,
+            models.RemoteParseAttempt.remote_task_identity
+            == witness.remote_task_identity,
+            (
+                models.RemoteParseAttempt.terminal_receipt_sha256.is_(None)
+                if witness.terminal_receipt_sha256 is None
+                else models.RemoteParseAttempt.terminal_receipt_sha256
+                == witness.terminal_receipt_sha256
+            ),
+            (
+                models.RemoteParseAttempt.failure_receipt_sha256.is_(None)
+                if witness.failure_receipt_sha256 is None
+                else models.RemoteParseAttempt.failure_receipt_sha256
+                == witness.failure_receipt_sha256
+            ),
+        )
         result = self._session.execute(sa.update(models.RemoteParseAttempt).where(
             models.RemoteParseAttempt.attempt_id == expected_attempt.attempt_id,
             models.RemoteParseAttempt.fence_identity == expected_attempt.fence_identity,
@@ -2169,6 +2193,8 @@ class RemoteParseAttemptRepository:
             models.RemoteParseAttempt.claim_generation == expected_attempt.claim_generation,
             models.RemoteParseAttempt.claim_lease_until > clock.c.database_observed_at,
             *self._v3_current_predicates(expected_attempt.current_credits),
+            *resource_free_predicates,
+            *authorization_predicates,
         ).values(**values).returning(models.RemoteParseAttempt)).scalar_one_or_none()
         if result is not None:
             return _remote_attempt_entity(result)
@@ -2191,6 +2217,8 @@ class RemoteParseAttemptRepository:
             .is_(None) if expected_attempt.failure_receipt_sha256 is None else
             models.RemoteParseAttempt.failure_receipt_sha256
             == expected_attempt.failure_receipt_sha256,
+            *resource_free_predicates,
+            *authorization_predicates,
             *(
                 getattr(models.RemoteParseAttempt, f"current_{name}") == 0
                 for name in CreditVector.__dataclass_fields__

@@ -880,6 +880,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
 
     def test_failed_remote_ack_requires_exact_database_failure_checkpoint(self) -> None:
         ack_calls = 0
+        ack_status = 200
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input.pdf"
             source.write_bytes(b"%PDF-stage")
@@ -894,8 +895,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     return httpx.Response(404)
                 if request.url.path.endswith("/ack"):
                     ack_calls += 1
+                    if ack_status == 204:
+                        return httpx.Response(204)
                     return httpx.Response(
-                        200,
+                        ack_status,
                         json={
                             "schema": "mineru-task-protocol.v2",
                             "task_id": "task-1",
@@ -974,7 +977,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     failure_receipt=wrong_task_failure,
                 )
             self.assertEqual(ack_calls, 0)
-            handle.acknowledge_after_failure_committed(
+            remote_ack = handle.acknowledge_after_failure_committed(
                 witness=_witness(
                     "remote_failure_committed",
                     prepared_identity=prepared_submission.identity,
@@ -983,14 +986,16 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 ),
                 failure_receipt=remote_failure,
             )
+            self.assertEqual(remote_ack.http_status, 200)
             self.assertEqual(ack_calls, 1)
+            ack_status = 204
             local_terminal = "sha256:" + "e" * 64
             local_failure = _failure_receipt(
                 "local_failure_committed",
                 remote_task_identity="task-1",
                 terminal_receipt_sha256=local_terminal,
             )
-            handle.acknowledge_after_failure_committed(
+            local_ack = handle.acknowledge_after_failure_committed(
                 witness=_witness(
                     "local_failure_committed",
                     prepared_identity=prepared_submission.identity,
@@ -1000,6 +1005,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 ),
                 failure_receipt=local_failure,
             )
+            self.assertEqual(local_ack.http_status, 204)
             self.assertEqual(ack_calls, 2)
 
     @staticmethod

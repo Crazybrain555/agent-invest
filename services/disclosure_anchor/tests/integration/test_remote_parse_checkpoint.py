@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import copy
 import hashlib
 import json
 import threading
@@ -1154,6 +1155,24 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 expected_attempt=committed,
                 witness=replace(witness, mac_sha256=_sha("0")),
             )
+        mutations = {
+            "attempt_identity": "other-attempt",
+            "committed_state": "finish_committed",
+            "failure_receipt_sha256": _sha("2"),
+            "http_status": 200 if witness.http_status == 204 else 204,
+            "exact_bytes": b"{}",
+            "sha256": _sha("3"),
+            "mac_sha256": _sha("4"),
+        }
+        for field_name, field_value in mutations.items():
+            forged = copy.copy(witness)
+            object.__setattr__(forged, field_name, field_value)
+            with self.subTest(field=field_name), SqlAlchemyUnitOfWork(
+                engine=self.engine
+            ) as uow, self.assertRaisesRegex(ValueError, "typed provider witness"):
+                uow.remote_parse_attempts.finalize_v3_ack(
+                    expected_attempt=committed, witness=forged,
+                )
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             final = uow.remote_parse_attempts.finalize_v3_ack(
                 expected_attempt=committed, witness=witness,
@@ -1200,6 +1219,16 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         ):
             uow.remote_parse_attempts.finalize_v3_ack(
                 expected_attempt=committed, witness=witness,
+            )
+        forged_resource_free = copy.copy(committed)
+        object.__setattr__(forged_resource_free, "materialization_receipt_bytes", None)
+        object.__setattr__(forged_resource_free, "materialization_receipt_sha256", None)
+        object.__setattr__(forged_resource_free, "materialization_receipt_byte_count", None)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict, "lost exact CAS"
+        ):
+            uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=forged_resource_free, witness=witness,
             )
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             reloaded = uow.remote_parse_attempts.get(self.attempt_id)
