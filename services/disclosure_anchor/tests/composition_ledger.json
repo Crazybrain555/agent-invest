@@ -478,7 +478,7 @@
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 30
   },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],

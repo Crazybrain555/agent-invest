@@ -106,6 +106,7 @@ class _Backend:
         self.fail_remote = False
         self.defer_claim = False
         self.defer_claim_ids: set[str] = set()
+        self.foreign_deferred_projection = False
         self.claim_attempts: dict[str, int] = {}
         self.violate_admission_credit = False
         self.retry_remote_remaining = 0
@@ -162,7 +163,14 @@ class _Backend:
             self.claim_attempts.get(work.attempt_id, 0) + 1
         )
         if self.defer_claim or work.attempt_id in self.defer_claim_ids:
-            raise RecoveryDeferred("held", retry_after_seconds=0.001)
+            durable = (
+                replace(work, attempt_id="foreign-attempt")
+                if self.foreign_deferred_projection
+                else work
+            )
+            raise RecoveryDeferred(
+                "held", retry_after_seconds=0.001, durable_work=durable
+            )
         return replace(
             work,
             claim_generation=work.claim_generation + 1,
@@ -763,6 +771,30 @@ class StagedParseCoordinatorTests(unittest.TestCase):
             result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
         )
 
+    def test_aggregate_only_recovery_overage_marks_every_releasing_owner(self) -> None:
+        recoverable = tuple(
+            replace(
+                _work(f"attempt-{index}", "remote_terminal", 5),
+                credit_reservation=replace(
+                    _LIFECYCLE_RESERVATION, retained_bytes=6_000
+                ),
+                credits=CreditVector(
+                    documents=1, retained_results=1, retained_bytes=6_000
+                ),
+            )
+            for index in range(2)
+        )
+        backend = _Backend(recoverable=recoverable)
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(credits=replace(_LIMIT, retained_bytes=10_000)),
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(result.completed, 2)
+        self.assertEqual(
+            sum(call.startswith("local_prepare:") for call in backend.calls), 2
+        )
+
     def test_stop_during_unclaimable_recovery_never_reports_quiescent(self) -> None:
         backend = _Backend(recoverable=(_work("attempt-0", "submitted"),))
         backend.defer_claim = True
@@ -823,6 +855,46 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         self.assertEqual(
             result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
         )
+
+    def test_deferred_recovery_credits_block_conflicting_claimed_growth(self) -> None:
+        backend = _Backend(
+            recoverable=(
+                _work("attempt-claimed", "remote_terminal", 4),
+                _work("attempt-deferred", "materializing", 5),
+            )
+        )
+        backend.defer_claim_ids.add("attempt-deferred")
+        result_box: list[object] = []
+        thread = threading.Thread(
+            target=lambda: result_box.append(
+                StagedParseCoordinator(
+                    backend=backend,
+                    limits=_limits(credits=replace(_LIMIT, local_items=1)),
+                ).run()
+            )
+        )
+        thread.start()
+        deadline = time.monotonic() + 1
+        while (
+            backend.claim_attempts.get("attempt-deferred", 0) < 2
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        self.assertEqual(backend.local_prepare_entered, 0)
+        backend.defer_claim_ids.clear()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
+        )
+        self.assertEqual(backend.local_prepare_entered, 1)
+
+    def test_deferred_recovery_rejects_a_foreign_durable_projection(self) -> None:
+        backend = _Backend(recoverable=(_work("attempt-1", "submitted", 2),))
+        backend.defer_claim = True
+        backend.foreign_deferred_projection = True
+        with self.assertRaisesRegex(RuntimeError, "foreign or final"):
+            StagedParseCoordinator(backend=backend, limits=_limits()).run()
 
     def test_stage_renews_near_expiry_claim_before_side_effect(self) -> None:
         near_expiry = replace(

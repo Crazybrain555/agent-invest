@@ -164,11 +164,18 @@ class CoordinatorWork:
 class RecoveryDeferred(RuntimeError):
     """A live durable claim cannot be taken until its lease becomes available."""
 
-    def __init__(self, message: str, *, retry_after_seconds: float) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float,
+        durable_work: CoordinatorWork,
+    ) -> None:
         super().__init__(message)
         if retry_after_seconds <= 0:
             raise ValueError("recovery retry delay must be positive")
         self.retry_after_seconds = float(retry_after_seconds)
+        self.durable_work = durable_work
 
 
 class RetryStage(RuntimeError):
@@ -556,6 +563,11 @@ class StagedParseCoordinator:
             ):
                 oversubscribed_recovery.add(work.attempt_id)
             ledger.replace(work, allow_oversubscribed=recovery)
+            if recovery and not ledger.in_use.fits(ledger.limit):
+                # Aggregate recovery overage is owned collectively: marking
+                # only the row that crossed the limit can strand an earlier
+                # FIFO owner that must run to release the saturated dimension.
+                oversubscribed_recovery.update(known)
             if oversubscribed_recovery and ledger.in_use.fits(ledger.limit):
                 oversubscribed_recovery.intersection_update(
                     attempt_id
@@ -578,6 +590,23 @@ class StagedParseCoordinator:
                 errors.append(f"{work.attempt_id}:unsupported state:{work.state}")
                 return
             queues[lane].append(work)
+
+        def reserve_deferred(work: CoordinatorWork) -> None:
+            """Account durable ownership without making the live claim runnable."""
+
+            previous = known.get(work.attempt_id)
+            if previous is not None and (
+                work.claim_generation < previous.claim_generation
+                or work.row_version < previous.row_version
+            ):
+                raise RuntimeError("deferred recovery projection moved backwards")
+            known[work.attempt_id] = work
+            if (
+                not ledger.can_add(work)
+                or not work.credit_reservation.fits(ledger.limit)
+            ):
+                oversubscribed_recovery.add(work.attempt_id)
+            ledger.replace(work, allow_oversubscribed=True)
 
         def preserve_contract_violation(
             prior: CoordinatorWork,
@@ -845,9 +874,18 @@ class StagedParseCoordinator:
                     try:
                         place(self._backend.claim_recovery(work), recovery=True)
                     except RecoveryDeferred as exc:
+                        if (
+                            exc.durable_work.attempt_id != work.attempt_id
+                            or exc.durable_work.state in _FINAL_STATES
+                            or exc.durable_work.claim_owner_identity is None
+                        ):
+                            raise RuntimeError(
+                                "deferred recovery returned a foreign or final projection"
+                            )
+                        reserve_deferred(exc.durable_work)
                         deferred_claims[work.attempt_id] = (
                             self._monotonic() + exc.retry_after_seconds,
-                            work,
+                            exc.durable_work,
                         )
                 after = ids[-1]
                 if len(page) < self._limits.recovery_page_size:
@@ -872,9 +910,18 @@ class StagedParseCoordinator:
                     try:
                         claimed = self._backend.claim_recovery(work)
                     except RecoveryDeferred as exc:
+                        if (
+                            exc.durable_work.attempt_id != work.attempt_id
+                            or exc.durable_work.state in _FINAL_STATES
+                            or exc.durable_work.claim_owner_identity is None
+                        ):
+                            raise RuntimeError(
+                                "deferred recovery returned a foreign or final projection"
+                            )
+                        reserve_deferred(exc.durable_work)
                         deferred_claims[attempt_id] = (
                             now + exc.retry_after_seconds,
-                            work,
+                            exc.durable_work,
                         )
                     else:
                         deferred_claims.pop(attempt_id, None)
