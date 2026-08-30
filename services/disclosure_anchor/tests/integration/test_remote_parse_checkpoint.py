@@ -1045,6 +1045,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             committed_state="finish_committed",
             terminal_receipt_sha256=terminal_receipt.sha256,
             failure_receipt_sha256=None, http_status=204,
+            accepted_secret=accepted_token,
         )
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
             ValueError, "drifted"
@@ -1144,7 +1145,15 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             committed_state="remote_failure_committed",
             terminal_receipt_sha256=None,
             failure_receipt_sha256=receipt.sha256, http_status=204,
+            accepted_secret=b"v3-accepted-helper",
         )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            ValueError, "typed provider witness"
+        ):
+            uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=committed,
+                witness=replace(witness, mac_sha256=_sha("0")),
+            )
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             final = uow.remote_parse_attempts.finalize_v3_ack(
                 expected_attempt=committed, witness=witness,
@@ -1184,6 +1193,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             committed_state="local_failure_committed",
             terminal_receipt_sha256=committed.terminal_receipt_sha256,
             failure_receipt_sha256=receipt.sha256, http_status=204,
+            accepted_secret=b"v3-accepted-helper",
         )
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
             RemoteParseCheckpointConflict, "durable cleanup"
@@ -1224,6 +1234,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             committed_state="local_failure_committed",
             terminal_receipt_sha256=committed.terminal_receipt_sha256,
             failure_receipt_sha256=receipt.sha256, http_status=204,
+            accepted_secret=b"v3-accepted-helper",
         )
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             final = uow.remote_parse_attempts.finalize_v3_ack(

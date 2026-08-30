@@ -359,6 +359,7 @@ class _Task:
     fence_identity: str
     idempotency_key: str
     submission_epoch_unix: int
+    ack_nonce_hex: str
 
     def token(self, *, spool_path: Path | None, artifact_sha256: str) -> str:
         raw = json.dumps(
@@ -373,6 +374,7 @@ class _Task:
                 "fence_identity": self.fence_identity,
                 "idempotency_key": self.idempotency_key,
                 "submission_epoch_unix": self.submission_epoch_unix,
+                "ack_nonce_hex": self.ack_nonce_hex,
                 "spool_path": "" if spool_path is None else str(spool_path),
                 "artifact_sha256": artifact_sha256,
             },
@@ -402,6 +404,7 @@ class _Task:
             "artifact_sha256",
             "idempotency_key",
             "submission_epoch_unix",
+            "ack_nonce_hex",
         }
         if set(payload) != expected:
             raise _fail("invalid durable resume token shape")
@@ -453,6 +456,10 @@ class _Task:
         _same_origin_url(self.base_url, self.result_url, "result URL")
         if self.submission_epoch_unix < 0:
             raise _fail("invalid submission epoch")
+        if len(self.ack_nonce_hex) != 64 or any(
+            char not in "0123456789abcdef" for char in self.ack_nonce_hex
+        ):
+            raise _fail("invalid ACK nonce")
 
     def submission_checkpoint(
         self,
@@ -908,6 +915,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             terminal_receipt_sha256=witness.terminal_receipt_sha256,
             failure_receipt_sha256=None,
             http_status=status,
+            accepted_secret=self._task.submission_checkpoint()[1].token_bytes,
         )
 
     def acknowledge_after_failure_committed(
@@ -957,6 +965,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             terminal_receipt_sha256=witness.terminal_receipt_sha256,
             failure_receipt_sha256=witness.failure_receipt_sha256,
             http_status=status,
+            accepted_secret=self._task.submission_checkpoint()[1].token_bytes,
         )
 
     def _ack_terminal(self) -> int:
@@ -1796,6 +1805,7 @@ def _task_from_submission_payload(
         fence_identity=fence_identity,
         idempotency_key=idempotency_key,
         submission_epoch_unix=submission_epoch_unix,
+        ack_nonce_hex=os.urandom(32).hex(),
     )
 
 
