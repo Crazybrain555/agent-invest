@@ -1033,7 +1033,12 @@ class StagedParseCoordinator:
                         active += 1
 
                 if not in_flight:
-                    if any(queues.values()) and not circuit_open:
+                    if (
+                        any(queues.values())
+                        and not circuit_open
+                        and not retry_at
+                        and not deferred_claims
+                    ):
                         circuit_open = True
                         admission_open = False
                         blocked_reason = "resource_credit_grant_unavailable"

@@ -123,6 +123,8 @@ class _Backend:
         self.block_local = False
         self.local_entered = 0
         self.local_release = threading.Event()
+        self.retry_local_once = False
+        self.local_calls = 0
 
     @staticmethod
     def _assert_credit_grant(
@@ -315,10 +317,13 @@ class _Backend:
     ) -> CoordinatorWork:
         stage_guard.checkpoint()
         self.calls.append(f"local:{work.attempt_id}")
+        self.local_calls += 1
         self.local_entered += 1
         if self.block_local:
             while not self.local_release.wait(timeout=0.001):
                 stage_guard.checkpoint()
+        if self.retry_local_once and self.local_calls == 1:
+            raise RetryStage("local transient", retry_after_seconds=0.005)
         target = _work(work.attempt_id, "local_materialized", work.row_version + 1)
         updated = replace(
             target,
@@ -599,6 +604,27 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         self.assertEqual(
             result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
         )
+
+    def test_queued_credit_waits_for_retrying_downstream_owner_to_release(self) -> None:
+        backend = _Backend(
+            recoverable=(
+                _work("attempt-downstream", "materializing", 5),
+                _work("attempt-upstream", "remote_terminal", 4),
+            )
+        )
+        backend.retry_local_once = True
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(
+                credits=replace(_LIMIT, local_items=1),
+                retry_initial_backoff_seconds=0.001,
+                retry_max_backoff_seconds=0.005,
+            ),
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(result.errors, ())
+        self.assertGreaterEqual(backend.local_calls, 3)
+        self.assertIn("local_prepare:attempt-upstream", backend.calls)
 
     def test_transient_remote_retry_preserves_work_and_then_completes(self) -> None:
         backend = _Backend(new=(_work("attempt-1", "prepared"),))
