@@ -7,6 +7,7 @@ The opaque resume token is private checkpoint data; callers must not log it.
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.provider_parser import ProviderParserResult
 from disclosure_anchor.application.ports.staged_provider_parser import (
+    DurableCheckpointWitness,
     PersistedSubmissionReceipt,
     PreparedLocalSubmission,
     PreparedMaterialization,
@@ -185,6 +187,36 @@ def _derived_snapshot_name(identity: PreparedSubmissionIdentity) -> str:
         ).encode()
     ).hexdigest()
     return f".upload-{digest}.pdf"
+
+
+def _freeze_private_spool_root(path: Path) -> Path:
+    configured = path.expanduser().absolute()
+    parent = configured.parent.resolve(strict=True)
+    absolute = parent / configured.name
+    if not parent.exists():
+        raise _fail("submission spool parent does not exist")
+    for candidate in (parent, absolute):
+        if candidate.exists() and candidate.is_symlink():
+            raise _fail("submission spool path cannot contain a symlink endpoint")
+    parent_stat = parent.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.getuid()
+        or stat.S_IMODE(parent_stat.st_mode) & 0o022
+    ):
+        raise _fail("submission spool parent is not private")
+    try:
+        absolute.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    observed = absolute.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or stat.S_IMODE(observed.st_mode) & 0o077
+    ):
+        raise _fail("submission spool root is not private")
+    return absolute.resolve(strict=True)
 
 
 def _verify_snapshot_fd(
@@ -827,20 +859,35 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         return _target_identity(self._options)
 
     def acknowledge_after_finish_committed(
-        self, *, receipt: RemoteArtifactReceipt, checkpoint_state: str
+        self,
+        *,
+        receipt: RemoteArtifactReceipt,
+        witness: DurableCheckpointWitness,
     ) -> None:
-        if checkpoint_state != "finish_committed":
+        if (
+            witness.state != "finish_committed"
+            or witness.attempt_identity != receipt.attempt_identity
+            or witness.fence_identity != receipt.fence_identity
+            or witness.receipt_sha256
+            != "sha256:" + hashlib.sha256(_terminal_receipt_exact(receipt)).hexdigest()
+        ):
             raise _fail("remote ACK requires a durable finish_committed checkpoint")
         task, _spool_path, artifact_sha256 = _Task.from_token(receipt.resume_token)
         if task != self._task or artifact_sha256 != receipt.artifact_sha256:
             raise _fail("remote ACK receipt ownership drifted")
         self._ack_terminal()
 
-    def acknowledge_after_failure_committed(self, *, checkpoint_state: str) -> None:
-        if checkpoint_state not in {
+    def acknowledge_after_failure_committed(
+        self, *, witness: DurableCheckpointWitness
+    ) -> None:
+        if (
+            witness.state not in {
             "remote_failure_committed",
             "local_failure_committed",
-        }:
+            }
+            or witness.attempt_identity != self._task.attempt_identity
+            or witness.fence_identity != self._task.fence_identity
+        ):
             raise _fail(
                 "remote failure ACK requires a durable remote_failure_committed "
                 "or local_failure_committed checkpoint"
@@ -936,7 +983,7 @@ class MinerUHttpStagedParser:
         self._server_url = server_url
         self._reader = reader or MinerUMediumArtifactReader()
         self._transport = transport
-        self._spool_root = spool_root
+        self._spool_root = _freeze_private_spool_root(spool_root)
 
     def prepare_submission_identity(
         self,
@@ -1009,6 +1056,7 @@ class MinerUHttpStagedParser:
         input_pdf: Path,
         options: ParserOptions,
         identity: PreparedSubmissionIdentity,
+        witness: DurableCheckpointWitness,
     ) -> PreparedLocalSubmission:
         expected = self.prepare_submission_identity(
             options=options,
@@ -1019,7 +1067,12 @@ class MinerUHttpStagedParser:
         )
         if identity != expected:
             raise _fail("durable prepared submission identity drifted")
-        self._spool_root.mkdir(parents=True, exist_ok=True)
+        if (
+            witness.state != "prepared"
+            or witness.attempt_identity != identity.attempt_identity
+            or witness.fence_identity != identity.fence_identity
+        ):
+            raise _fail("local submission requires its durable prepared checkpoint")
         source_fd = os.open(input_pdf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         before = os.fstat(source_fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -1035,76 +1088,74 @@ class MinerUHttpStagedParser:
         ):
             os.close(source_fd)
             raise _fail("source differs from prepared submission")
-        os.lseek(source_fd, 0, os.SEEK_SET)
         snapshot = self._spool_root / _derived_snapshot_name(identity)
-        created = False
+        lock_path = snapshot.with_suffix(".lock")
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=snapshot.stem + ".tmp-", dir=self._spool_root
+        )
+        temp_path: Path | None = Path(temp_name)
         try:
             try:
-                snapshot_fd = os.open(
-                    snapshot,
-                    os.O_RDWR
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    0o600,
+                _write_snapshot_from_source(
+                    source_fd=source_fd,
+                    snapshot_fd=temp_fd,
+                    expected_sha256=identity.source_pdf_sha256,
                 )
-            except FileExistsError:
-                snapshot_fd = os.open(
-                    snapshot, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                )
-                try:
-                    _validate_snapshot_stat(os.fstat(snapshot_fd))
+                after = os.fstat(source_fd)
+                if _stat_identity(before) != _stat_identity(after):
+                    raise _fail("source changed while preparing upload snapshot")
+            finally:
+                os.close(temp_fd)
+
+            lock_fd = os.open(
+                lock_path,
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                _validate_snapshot_stat(os.fstat(lock_fd))
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                if snapshot.exists():
+                    snapshot_fd = os.open(
+                        snapshot, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    )
                     try:
                         snapshot_stat, _ = _verify_snapshot_fd(
                             snapshot_fd,
                             expected_sha256=identity.source_pdf_sha256,
                         )
-                    except _SnapshotContentDrift:
+                    except _SnapshotContentDrift as exc:
+                        raise _fail("published submission snapshot drifted") from exc
+                    finally:
                         os.close(snapshot_fd)
-                        snapshot_fd = -1
-                        _unlink_owned_snapshot(snapshot, expected=None)
-                        _fsync_directory(self._spool_root)
-                        snapshot_fd = os.open(
-                            snapshot,
-                            os.O_RDWR
-                            | os.O_CREAT
-                            | os.O_EXCL
-                            | getattr(os, "O_NOFOLLOW", 0),
-                            0o600,
-                        )
-                        created = True
-                        snapshot_stat = _write_snapshot_from_source(
-                            source_fd=source_fd,
-                            snapshot_fd=snapshot_fd,
+                else:
+                    if temp_path is None:
+                        raise _fail("submission snapshot temporary path disappeared")
+                    os.replace(temp_path, snapshot)
+                    temp_path = None
+                    _fsync_directory(self._spool_root)
+                    snapshot_fd = os.open(
+                        snapshot, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    try:
+                        snapshot_stat, _ = _verify_snapshot_fd(
+                            snapshot_fd,
                             expected_sha256=identity.source_pdf_sha256,
                         )
-                finally:
-                    if snapshot_fd >= 0:
+                    finally:
                         os.close(snapshot_fd)
-            else:
-                created = True
-                try:
-                    snapshot_stat = _write_snapshot_from_source(
-                        source_fd=source_fd,
-                        snapshot_fd=snapshot_fd,
-                        expected_sha256=identity.source_pdf_sha256,
-                    )
-                except BaseException:
-                    os.close(snapshot_fd)
-                    _unlink_owned_snapshot(snapshot, expected=None)
-                    raise
-                else:
-                    os.close(snapshot_fd)
-            after = os.fstat(source_fd)
+            finally:
+                os.close(lock_fd)
         finally:
             os.close(source_fd)
-        if _stat_identity(before) != _stat_identity(after):
-            if created:
-                _unlink_owned_snapshot(snapshot, expected=None)
-            raise _fail("source changed while preparing upload snapshot")
-        _fsync_directory(self._spool_root)
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         return PreparedLocalSubmission(
             identity=identity,
+            checkpoint_version=witness.checkpoint_version,
+            claim_generation=witness.claim_generation,
             snapshot_path=snapshot,
             snapshot_sha256=identity.source_pdf_sha256,
             snapshot_bytes=snapshot_stat.st_size,
@@ -1122,14 +1173,22 @@ class MinerUHttpStagedParser:
         self,
         *,
         prepared_submission: PreparedLocalSubmission,
-        checkpoint_state: str,
+        witness: DurableCheckpointWitness,
     ) -> None:
-        if checkpoint_state not in {
+        if (
+            witness.state not in {
             "submitted",
             "pre_submission_failed",
             "remote_failure_committed",
             "local_failure_committed",
-        }:
+            }
+            or witness.attempt_identity
+            != prepared_submission.identity.attempt_identity
+            or witness.fence_identity != prepared_submission.identity.fence_identity
+            or witness.checkpoint_version
+            < prepared_submission.checkpoint_version
+            or witness.claim_generation != prepared_submission.claim_generation
+        ):
             raise _fail("snapshot discard requires an exact durable checkpoint state")
         expected_path = self._spool_root / _derived_snapshot_name(
             prepared_submission.identity

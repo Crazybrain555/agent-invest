@@ -13,7 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Literal, Protocol
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from disclosure_anchor.application.ports.parser import ParserOptions
@@ -23,6 +23,78 @@ from disclosure_anchor.domain.errors import ParserOutputContractError
 
 class SubmissionAcceptanceAmbiguous(ParserOutputContractError):
     """Remote POST began but its acceptance cannot yet be reconciled."""
+
+
+_DURABLE_CHECKPOINT_STATES = frozenset(
+    {
+        "prepared",
+        "submitted",
+        "pre_submission_failed",
+        "remote_failure_committed",
+        "local_failure_committed",
+        "finish_committed",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DurableCheckpointWitness:
+    """Closed projection returned only after the repository commits its CAS."""
+
+    schema: str
+    attempt_identity: str
+    fence_identity: str
+    checkpoint_version: int
+    claim_generation: int
+    state: str
+    receipt_sha256: str | None
+    exact_bytes: bytes = field(repr=False)
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "durable-checkpoint-witness.v1":
+            raise ValueError("durable checkpoint witness schema is unsupported")
+        if self.state not in _DURABLE_CHECKPOINT_STATES:
+            raise ValueError("durable checkpoint witness state is unsupported")
+        for identity in (self.attempt_identity, self.fence_identity):
+            if (
+                not isinstance(identity, str)
+                or not identity.strip()
+                or len(identity) > 1024
+            ):
+                raise ValueError("durable checkpoint identity is invalid")
+        for count, label in (
+            (self.checkpoint_version, "checkpoint version"),
+            (self.claim_generation, "claim generation"),
+        ):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError(f"durable {label} must be positive")
+        if self.receipt_sha256 is not None:
+            _require_sha256(self.receipt_sha256, "durable checkpoint receipt")
+        if self.state in {"prepared", "pre_submission_failed"} and (
+            self.receipt_sha256 is not None
+        ):
+            raise ValueError("pre-remote checkpoint cannot bind a remote receipt")
+        if self.state not in {"prepared", "pre_submission_failed"} and (
+            self.receipt_sha256 is None
+        ):
+            raise ValueError("durable checkpoint must bind its committed receipt")
+        projection = {
+            "schema": self.schema,
+            "attempt_identity": self.attempt_identity,
+            "fence_identity": self.fence_identity,
+            "checkpoint_version": self.checkpoint_version,
+            "claim_generation": self.claim_generation,
+            "state": self.state,
+            "receipt_sha256": self.receipt_sha256,
+        }
+        canonical = json.dumps(
+            projection, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if self.exact_bytes != canonical or self.sha256 != (
+            "sha256:" + hashlib.sha256(canonical).hexdigest()
+        ):
+            raise ValueError("durable checkpoint witness exact bytes drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +276,8 @@ class PreparedLocalSubmission:
     """Attempt-owned immutable upload snapshot completed before remote IO."""
 
     identity: PreparedSubmissionIdentity
+    checkpoint_version: int
+    claim_generation: int
     snapshot_path: Path = field(repr=False)
     snapshot_sha256: str
     snapshot_bytes: int
@@ -218,6 +292,9 @@ class PreparedLocalSubmission:
 
     def __post_init__(self) -> None:
         _require_sha256(self.snapshot_sha256, "submission snapshot")
+        for count in (self.checkpoint_version, self.claim_generation):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise ValueError("submission checkpoint facts are invalid")
         for count in (
             self.snapshot_bytes,
             self.snapshot_device,
@@ -410,11 +487,13 @@ class RemoteProviderParseHandle(Protocol):
         """Close admission and prove the accepted remote task terminal."""
 
     def acknowledge_after_finish_committed(
-        self, *, receipt: RemoteArtifactReceipt, checkpoint_state: str
+        self, *, receipt: RemoteArtifactReceipt, witness: DurableCheckpointWitness
     ) -> None:
         """ACK only after the durable DB checkpoint is exactly finish_committed."""
 
-    def acknowledge_after_failure_committed(self, *, checkpoint_state: str) -> None:
+    def acknowledge_after_failure_committed(
+        self, *, witness: DurableCheckpointWitness
+    ) -> None:
         """ACK only after remote_failure_committed/local_failure_committed."""
 
 
@@ -446,6 +525,7 @@ class StagedProviderDocumentParserPort(Protocol):
         input_pdf: Path,
         options: ParserOptions,
         identity: PreparedSubmissionIdentity,
+        witness: DurableCheckpointWitness,
     ) -> PreparedLocalSubmission:
         """Complete all local source/snapshot IO before remote reconciliation."""
 
@@ -453,12 +533,7 @@ class StagedProviderDocumentParserPort(Protocol):
         self,
         *,
         prepared_submission: PreparedLocalSubmission,
-        checkpoint_state: Literal[
-            "submitted",
-            "pre_submission_failed",
-            "remote_failure_committed",
-            "local_failure_committed",
-        ],
+        witness: DurableCheckpointWitness,
     ) -> None:
         """Discard only after a DB state proves POST replay no longer needs it."""
 

@@ -312,7 +312,7 @@
   },
   "tests/unit/test_mineru_http_staged.py": {
    "private_imports": [],
-   "tests": 21
+   "tests": 23
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
