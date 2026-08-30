@@ -157,7 +157,7 @@ class RemoteParseAttempt(Base):
         ),
         CheckConstraint(_V3_MATERIALIZATION_SHAPE, name="ck_remote_parse_attempt_v3_materialization"),
         CheckConstraint(
-            "checkpoint_contract_version<3 OR ((local_receipt_bytes IS NULL AND local_db_staged_byte_count IS NULL) OR (local_receipt_bytes IS NOT NULL AND local_db_staged_byte_count>0))",
+            "checkpoint_contract_version<3 OR ((local_receipt_bytes IS NULL AND local_db_staged_byte_count IS NULL) OR (local_receipt_bytes IS NOT NULL AND local_db_staged_byte_count IS NOT NULL AND local_db_staged_byte_count>0))",
             name="ck_remote_parse_attempt_v3_local_projection",
         ),
         CheckConstraint(_V3_STATE_CREDIT, name="ck_remote_parse_attempt_v3_state_credit"),

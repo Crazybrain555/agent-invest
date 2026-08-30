@@ -4,6 +4,7 @@ import hashlib
 import unittest
 from dataclasses import replace
 
+from disclosure_anchor.adapters.db.postgres import models
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     FailureReceipt,
     LocalMaterializationReceipt,
@@ -44,6 +45,15 @@ def _receipt() -> TerminalReceipt:
 
 class RemoteParseCheckpointContractTests(unittest.TestCase):
     def test_v3_attempt_binds_reservation_and_exact_current_shape(self) -> None:
+        local_projection = next(
+            constraint
+            for constraint in models.RemoteParseAttempt.__table__.constraints
+            if constraint.name == "ck_remote_parse_attempt_v3_local_projection"
+        )
+        self.assertIn(
+            "local_db_staged_byte_count IS NOT NULL",
+            str(local_projection.sqltext),
+        )
         envelope = build_staged_credit_envelope(
             profile=_profile(),
             source_pdf_sha256=SHA_A,
