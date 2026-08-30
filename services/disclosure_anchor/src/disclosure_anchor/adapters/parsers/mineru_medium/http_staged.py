@@ -926,6 +926,9 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             or witness.attempt_identity != self._task.attempt_identity
             or witness.fence_identity != self._task.fence_identity
             or witness.remote_task_identity != self._task.task_id
+            or witness.source_pdf_sha256 != self._task.source_pdf_sha256
+            or witness.client_submit_key != self._task.idempotency_key
+            or witness.submission_epoch_unix != self._task.submission_epoch_unix
             or failure.attempt_identity != self._task.attempt_identity
             or failure.fence_identity != self._task.fence_identity
             or failure.remote_task_identity != self._task.task_id

@@ -1124,6 +1124,20 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         self.assertEqual(committed.state, "remote_failure_committed")
         assert committed.current_credits is not None
         self.assertEqual(committed.current_credits.ack_items, 1)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            reconciled = uow.remote_parse_attempts.reconcile_v3_remote_failure_after_race(
+                expected_attempt=submitted, receipt=receipt,
+            )
+        self.assertEqual(reconciled.attempt, committed)
+        conflicting = encode_checkpoint_receipt(replace(
+            receipt.receipt, message="different intended failure"
+        ))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict, "different committed receipt"
+        ):
+            uow.remote_parse_attempts.reconcile_v3_remote_failure_after_race(
+                expected_attempt=submitted, receipt=conflicting,
+            )
         witness = encode_provider_ack_completion_witness(
             attempt_identity=self.attempt_id, fence_identity="fence-1",
             remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),

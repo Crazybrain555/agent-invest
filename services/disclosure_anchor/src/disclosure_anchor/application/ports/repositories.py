@@ -224,12 +224,16 @@ class RemoteParseAttemptRepository(Protocol):
     ) -> ClaimedAttemptSnapshot: ...
     def reconcile_v3_remote_failure_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
     ) -> ClaimedAttemptSnapshot: ...
     def reconcile_v3_local_failure_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
+        local_receipt: EncodedCheckpointReceipt | None = None,
     ) -> ClaimedAttemptSnapshot: ...
     def reconcile_v3_pre_submission_failure_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
     ) -> RemoteParseAttempt: ...
     def transition_v3_reconciling(
         self, *, expected_attempt: RemoteParseAttempt,

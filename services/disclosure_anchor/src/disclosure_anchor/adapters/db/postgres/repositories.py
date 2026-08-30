@@ -2365,26 +2365,34 @@ class RemoteParseAttemptRepository:
 
     def reconcile_v3_remote_failure_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
     ) -> ClaimedAttemptSnapshot:
-        return self._reconcile_v3_operation_after_race(
+        result = self._reconcile_v3_operation_after_race(
             expected_attempt=expected_attempt,
             required_state="submitted",
             next_state="remote_failure_committed",
         )
+        self._assert_reconciled_failure(result.attempt, receipt, None)
+        return result
 
     def reconcile_v3_local_failure_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
+        local_receipt: EncodedCheckpointReceipt | None = None,
     ) -> ClaimedAttemptSnapshot:
         if expected_attempt.state not in {"remote_terminal", "materializing"}:
             raise ValueError("v3 local failure race source is invalid")
-        return self._reconcile_v3_operation_after_race(
+        result = self._reconcile_v3_operation_after_race(
             expected_attempt=expected_attempt,
             required_state=expected_attempt.state,
             next_state="local_failure_committed",
         )
+        self._assert_reconciled_failure(result.attempt, receipt, local_receipt)
+        return result
 
     def reconcile_v3_pre_submission_failure_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
     ) -> RemoteParseAttempt:
         self._validate_expected_v3_attempt(expected_attempt)
         if expected_attempt.state != "prepared":
@@ -2408,7 +2416,36 @@ class RemoteParseAttemptRepository:
             raise RemoteParseCheckpointConflict(
                 "v3 pre-submission failure race lost exact final projection"
             )
-        return _remote_attempt_entity(row)
+        result = _remote_attempt_entity(row)
+        self._assert_reconciled_failure(result, receipt, None)
+        return result
+
+    @staticmethod
+    def _assert_reconciled_failure(
+        attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
+        local_receipt: EncodedCheckpointReceipt | None,
+    ) -> None:
+        canonical = decode_checkpoint_receipt(receipt.exact_bytes)
+        if canonical != receipt or not isinstance(canonical.receipt, FailureReceipt):
+            raise ValueError("v3 failure reconcile receipt is not canonical")
+        if attempt.failure_receipt_sha256 != canonical.sha256:
+            raise RemoteParseCheckpointConflict(
+                "v3 failure reconcile observed a different committed receipt"
+            )
+        expected_local = None
+        if local_receipt is not None:
+            expected_local = decode_checkpoint_receipt(local_receipt.exact_bytes)
+            if expected_local != local_receipt or not isinstance(
+                expected_local.receipt, LocalMaterializationReceiptV2
+            ):
+                raise ValueError("v3 local reconcile receipt is not canonical")
+        if attempt.local_receipt_sha256 != (
+            None if expected_local is None else expected_local.sha256
+        ):
+            raise RemoteParseCheckpointConflict(
+                "v3 failure reconcile observed a different local receipt"
+            )
 
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,

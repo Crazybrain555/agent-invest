@@ -921,11 +921,12 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 spool_root=Path(directory) / "spool",
                 transport=httpx.MockTransport(handler),
             )
+            prepared_submission = self._prepared_submission(
+                parser, source, source_sha256
+            )
             handle = parser.begin_remote_parse(
                 options=PINNED_OPTIONS,
-                prepared_submission=self._prepared_submission(
-                    parser, source, source_sha256
-                ),
+                prepared_submission=prepared_submission,
             )
             remote_failure = _failure_receipt(
                 "remote_failure_committed", remote_task_identity="task-1"
@@ -976,6 +977,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             handle.acknowledge_after_failure_committed(
                 witness=_witness(
                     "remote_failure_committed",
+                    prepared_identity=prepared_submission.identity,
                     failure_receipt_sha256=remote_failure.sha256,
                     remote_task_identity="task-1",
                 ),
@@ -991,6 +993,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             handle.acknowledge_after_failure_committed(
                 witness=_witness(
                     "local_failure_committed",
+                    prepared_identity=prepared_submission.identity,
                     terminal_receipt_sha256=local_terminal,
                     failure_receipt_sha256=local_failure.sha256,
                     remote_task_identity="task-1",
