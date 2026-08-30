@@ -64,38 +64,29 @@ COLLECTOR_ID = "sha256:" + "e" * 64
 
 
 def _profile() -> ProcessProfileLifecycle:
-    parameters = ProcessProfileParameters(
-        requested_hybrid_batch_ratio=1,
-        effective_hybrid_batch_ratio=1,
-        hybrid_ocr_override=False,
-        api_task_slots=1,
-        api_max_pending_tasks=2,
-        inference_concurrency=7,
-        processing_window_size=16,
-        vllm_max_num_seqs=128,
-        vllm_max_model_len=8192,
-        pipeline_inference_locks=True,
-        finalizer_slots=1,
-        result_reservation_bytes=256 * 1024 * 1024,
-        max_unacked_result_bytes=2 * 1024 * 1024 * 1024,
-        task_retention_seconds=600,
-        task_cleanup_interval_seconds=30,
-    )
     return ProcessProfileLifecycle(
         runtime_bundle_identity_sha256=HASH_A,
         process_epoch_sha256=HASH_B,
-        process_profile_sha256=parameters.as_contract().sha256,
+        process_profile_sha256=HASH_C,
         clock_domain_identity_sha256=HASH_D,
         started_at_utc=datetime(2026, 8, 30, tzinfo=UTC),
         started_monotonic_ns=1,
-        parameters=parameters,
+        parameters=ProcessProfileParameters(
+            requested_hybrid_batch_ratio=1,
+            effective_hybrid_batch_ratio=1,
+            api_task_slots=1,
+            api_max_pending_tasks=2,
+            inference_concurrency=7,
+            processing_window_size=16,
+            vllm_max_num_seqs=128,
+        ),
     )
 
 
 def _identity(*, runtime: str = HASH_A) -> TelemetrySampleIdentity:
     return TelemetrySampleIdentity(
         runtime_bundle_identity_sha256=runtime,
-        process_profile_sha256=_profile().process_profile_sha256,
+        process_profile_sha256=HASH_C,
         clock_domain_identity_sha256=HASH_D,
     )
 

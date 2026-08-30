@@ -345,7 +345,7 @@ def _frame(
         sequence=sequence,
         lane=lane,
         runtime_bundle_identity_sha256=HASH,
-        process_profile_sha256=_process_profile().process_profile_sha256,
+        process_profile_sha256=HASH_B,
         observer_source_sha256=HASH_C,
         clock=SampleClock(
             clock_domain_identity_sha256=HASH_C,
@@ -407,31 +407,22 @@ def _vector(value: int) -> CapacityVector:
 
 
 def _process_profile() -> ProcessProfileLifecycle:
-    parameters = ProcessProfileParameters(
-        requested_hybrid_batch_ratio=4,
-        effective_hybrid_batch_ratio=4,
-        hybrid_ocr_override=False,
-        api_task_slots=2,
-        api_max_pending_tasks=4,
-        inference_concurrency=7,
-        processing_window_size=16,
-        vllm_max_num_seqs=128,
-        vllm_max_model_len=8192,
-        pipeline_inference_locks=True,
-        finalizer_slots=2,
-        result_reservation_bytes=256 * 1024 * 1024,
-        max_unacked_result_bytes=2 * 1024 * 1024 * 1024,
-        task_retention_seconds=600,
-        task_cleanup_interval_seconds=30,
-    )
     return ProcessProfileLifecycle(
         runtime_bundle_identity_sha256=HASH,
         process_epoch_sha256=HASH_C,
-        process_profile_sha256=parameters.as_contract().sha256,
+        process_profile_sha256=HASH_B,
         clock_domain_identity_sha256=HASH_C,
         started_at_utc=START,
         started_monotonic_ns=0,
-        parameters=parameters,
+        parameters=ProcessProfileParameters(
+            requested_hybrid_batch_ratio=4,
+            effective_hybrid_batch_ratio=4,
+            api_task_slots=2,
+            api_max_pending_tasks=4,
+            inference_concurrency=7,
+            processing_window_size=16,
+            vllm_max_num_seqs=128,
+        ),
     )
 
 
@@ -683,7 +674,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
             run_id=RUN_ID,
             sequence=0,
             process_epoch_sha256=HASH,
-            process_profile_sha256=_process_profile().process_profile_sha256,
+            process_profile_sha256=HASH_B,
             clock_domain_identity_sha256=HASH_C,
             observed_at_utc=START,
             monotonic_ns=10,
@@ -695,7 +686,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
             run_id=RUN_ID,
             sequence=1,
             process_epoch_sha256=HASH,
-            process_profile_sha256=_process_profile().process_profile_sha256,
+            process_profile_sha256=HASH_B,
             clock_domain_identity_sha256=HASH_C,
             observed_at_utc=START,
             monotonic_ns=20,
@@ -706,7 +697,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
         )
         summary = SynchronizedPhaseSummary(
             runtime_bundle_identity_sha256=HASH,
-            process_profile_sha256=_process_profile().process_profile_sha256,
+            process_profile_sha256=HASH_B,
             clock_domain_identity_sha256=HASH_C,
             phase_capture_sha256=HASH,
             telemetry_receipt_sha256=HASH_C,
@@ -761,7 +752,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
             run_id=RUN_ID,
             sequence=0,
             process_epoch_sha256=HASH_C,
-            process_profile_sha256=_process_profile().process_profile_sha256,
+            process_profile_sha256=HASH_B,
             clock_domain_identity_sha256=HASH,
             observed_at_utc=START,
             monotonic_ns=1_000_000_000,
@@ -817,7 +808,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
                 run_id=RUN_ID,
                 sequence=sequence,
                 process_epoch_sha256=HASH_C,
-                process_profile_sha256=_process_profile().process_profile_sha256,
+                process_profile_sha256=HASH_B,
                 clock_domain_identity_sha256=HASH_C,
                 observed_at_utc=START,
                 monotonic_ns=monotonic_ns,
@@ -866,7 +857,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
                 run_id=RUN_ID,
                 sequence=0,
                 process_epoch_sha256=HASH_C,
-                process_profile_sha256=_process_profile().process_profile_sha256,
+                process_profile_sha256=HASH_B,
                 clock_domain_identity_sha256=HASH_C,
                 observed_at_utc=START,
                 monotonic_ns=600_000_000,
@@ -878,7 +869,7 @@ class SynchronizedTelemetryContractTests(unittest.TestCase):
                 run_id=RUN_ID,
                 sequence=1,
                 process_epoch_sha256=HASH_C,
-                process_profile_sha256=_process_profile().process_profile_sha256,
+                process_profile_sha256=HASH_B,
                 clock_domain_identity_sha256=HASH_C,
                 observed_at_utc=START,
                 monotonic_ns=700_000_000,
