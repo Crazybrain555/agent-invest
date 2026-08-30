@@ -372,7 +372,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                         prepared_submission_sha256="sha256:" + "d" * 64,
                     ),
                 )
-            with self.assertRaisesRegex(ValueError, "exactly 2"):
+            with self.assertRaisesRegex(ValueError, "2 or 3"):
                 _witness(
                     "prepared",
                     checkpoint_contract_version=1,

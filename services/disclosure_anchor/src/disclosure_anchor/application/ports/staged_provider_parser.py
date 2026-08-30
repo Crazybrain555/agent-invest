@@ -172,8 +172,8 @@ class DurableCheckpointWitness:
                 or len(identity) > 1024
             ):
                 raise ValueError("durable checkpoint identity is invalid")
-        if self.checkpoint_contract_version != 2:
-            raise ValueError("checkpoint contract version must be exactly 2")
+        if self.checkpoint_contract_version not in {2, 3}:
+            raise ValueError("checkpoint contract version must be 2 or 3")
         for count, label in (
             (self.row_version, "row version"),
             (self.claim_generation, "claim generation"),

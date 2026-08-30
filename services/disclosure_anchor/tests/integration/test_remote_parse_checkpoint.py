@@ -1139,6 +1139,48 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         self.assertEqual(final.state, "remote_failed")
         self.assertEqual(final.current_credits, CreditVector())
 
+    def test_v3_local_failure_ack_cannot_release_unproven_cleanup_credits(self) -> None:
+        materializing = self._v3_materializing_attempt()
+        receipt = encode_checkpoint_receipt(FailureReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            stage="local", accepted=True, ack_required=True,
+            submission_was_attempted=True, remote_task_identity="task-v3",
+            claim_generation=materializing.claim_generation,
+            terminal_receipt_sha256=materializing.terminal_receipt_sha256,
+            error_code="local_materialization", error_stage="local_materialization",
+            error_class="local_materialization", retryable=False,
+            retry_budget_class="item", message="deterministic local failure",
+        ))
+        assert materializing.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            committed = uow.remote_parse_attempts.fail_v3_local(
+                expected_attempt=materializing,
+                grant=CreditTransitionGrant(
+                    expected_current=materializing.current_credits,
+                    maximum_positive_delta=materializing.reservation,
+                ), receipt=receipt,
+            ).attempt
+            uow.commit()
+        self.assertEqual(committed.state, "local_failure_committed")
+        assert committed.current_credits is not None
+        self.assertGreater(committed.current_credits.local_items, 0)
+        witness = encode_provider_ack_completion_witness(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
+            committed_state="local_failure_committed",
+            terminal_receipt_sha256=committed.terminal_receipt_sha256,
+            failure_receipt_sha256=receipt.sha256, http_status=204,
+        )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict, "durable cleanup"
+        ):
+            uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=committed, witness=witness,
+            )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            reloaded = uow.remote_parse_attempts.get(self.attempt_id)
+        self.assertEqual(reloaded, committed)
+
 
     def test_v3_claim_foreign_live_expiry_takeover_and_atomic_add_rollback(self) -> None:
         attempt, secret = self._v3_attempt_and_secret()

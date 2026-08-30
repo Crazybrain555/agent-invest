@@ -729,7 +729,9 @@ class RemoteParseAttempt:
             materialization_required = self.state in {
                 "materializing", "local_materialized", "finish_committed", "acked"
             }
-            if materialization_required != (materialization is not None):
+            if self.state not in {"local_failure_committed", "local_failed"} and (
+                materialization_required != (materialization is not None)
+            ):
                 raise ValueError(
                     "materialization receipt presence disagrees with v3 state"
                 )
@@ -778,7 +780,8 @@ class RemoteParseAttempt:
         if submitted_required != (self.submitted_receipt_bytes is not None):
             raise ValueError("submitted receipt presence disagrees with attempt state")
         local_required = self.state in {"local_materialized", "finish_committed", "acked"}
-        if local_required != (self.local_receipt_bytes is not None):
+        local_optional = self.state in {"local_failure_committed", "local_failed"}
+        if (local_required != (self.local_receipt_bytes is not None)) and not local_optional:
             raise ValueError("local receipt presence disagrees with attempt state")
         failure_required = self.state in {
             "remote_failure_committed", "local_failure_committed",

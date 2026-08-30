@@ -1044,16 +1044,21 @@ class RemoteParseAttemptRepository:
         self, attempt_id: str
     ) -> DurableCheckpointWitness:
         row = self._session.get(models.RemoteParseAttempt, attempt_id)
-        if row is None or row.checkpoint_contract_version != 2:
+        if row is None or row.checkpoint_contract_version not in {2, 3}:
             raise RemoteParseCheckpointConflict(
-                "durable witness requires an existing v2 attempt"
+                "durable witness requires an existing v2/v3 attempt"
             )
         # Decode and cross-bind every state-owned receipt before projecting a
         # destructive-operation witness. This is the single repository trust
         # boundary; callers cannot manufacture receipt hashes.
         _remote_attempt_entity(row)
-        prepared_secret = self._session.get(
-            models.RemoteParseResumeSecret,
+        secret_model = (
+            models.RemoteParseV3ResumeSecret
+            if row.checkpoint_contract_version == 3
+            else models.RemoteParseResumeSecret
+        )
+        prepared_secret: Any = self._session.get(
+            secret_model,
             (attempt_id, "prepared_reconcile"),
         )
         if prepared_secret is None:
@@ -1512,6 +1517,8 @@ class RemoteParseAttemptRepository:
             .where(
                 models.RemoteParseAttempt.attempt_id == expected.attempt_id,
                 models.RemoteParseAttempt.fence_identity == expected.fence_identity,
+                models.RemoteParseAttempt.document_id == expected.document_id,
+                models.RemoteParseAttempt.processing_run_id == expected.processing_run_id,
                 models.RemoteParseAttempt.checkpoint_contract_version == 3,
                 models.RemoteParseAttempt.is_current.is_(True),
                 models.RemoteParseAttempt.state == expected.state,
@@ -1837,6 +1844,8 @@ class RemoteParseAttemptRepository:
         ).with_for_update()).scalar_one_or_none()
         if document is None or run is None or current is None or run.status != "running":
             raise RemoteParseCheckpointConflict("v3 finish lost first-terminal lock")
+        durable = _remote_attempt_entity(current)
+        self._assert_v3_aggregate_expected(expected_attempt, durable)
         candidate = credit_shape(
             "finish_committed",
             CreditShapeFacts(terminal_byte_count=expected_attempt.result_artifact_bytes or 0),
@@ -1913,6 +1922,8 @@ class RemoteParseAttemptRepository:
         ).with_for_update()).scalar_one_or_none()
         if document is None or run is None or current is None or run.status != "running":
             raise RemoteParseCheckpointConflict("v3 failure lost first-terminal lock")
+        durable = _remote_attempt_entity(current)
+        self._assert_v3_aggregate_expected(expected, durable)
         error = {
             "stage": failure.error_stage,
             "error_code": failure.error_code,
@@ -2047,6 +2058,21 @@ class RemoteParseAttemptRepository:
                 )
         return final if operation == "pre_submission" else snapshot
 
+    @staticmethod
+    def _assert_v3_aggregate_expected(
+        expected: RemoteParseAttempt, durable: RemoteParseAttempt,
+    ) -> None:
+        """Reject caller-spliced aggregate ownership before any aggregate write."""
+        normalized = replace(
+            durable,
+            claim_lease_until=expected.claim_lease_until,
+            updated_at=expected.updated_at,
+        )
+        if normalized != expected:
+            raise RemoteParseCheckpointConflict(
+                "v3 aggregate expected projection drifted from locked attempt"
+            )
+
     def fail_v3_pre_submission(
         self, *, expected_attempt: RemoteParseAttempt,
         receipt: EncodedCheckpointReceipt,
@@ -2095,8 +2121,11 @@ class RemoteParseAttemptRepository:
         final_state = {
             "finish_committed": "acked",
             "remote_failure_committed": "remote_failed",
-            "local_failure_committed": "local_failed",
         }.get(expected_attempt.state)
+        if expected_attempt.state == "local_failure_committed":
+            raise RemoteParseCheckpointConflict(
+                "v3 local failure ACK cannot release credits before durable cleanup"
+            )
         if final_state is None or not (
             witness.committed_state == expected_attempt.state
             and witness.attempt_identity == expected_attempt.attempt_id
@@ -2139,6 +2168,8 @@ class RemoteParseAttemptRepository:
             models.RemoteParseAttempt.state == final_state,
             models.RemoteParseAttempt.is_current.is_(False),
             models.RemoteParseAttempt.row_version == expected_attempt.row_version + 1,
+            models.RemoteParseAttempt.claim_generation
+            == expected_attempt.claim_generation,
             models.RemoteParseAttempt.remote_task_identity
             == expected_attempt.remote_task_identity,
             models.RemoteParseAttempt.terminal_receipt_sha256
@@ -2192,6 +2223,42 @@ class RemoteParseAttemptRepository:
                 "retained_bytes": models.RemoteParseAttempt.result_artifact_bytes,
                 "ack_items": 1,
             })
+        elif next_state == "remote_failure_committed":
+            values.update({"retained_results": 1, "ack_items": 1})
+        elif next_state == "local_failure_committed":
+            values.update({
+                "retained_results": 1,
+                "retained_bytes": models.RemoteParseAttempt.result_artifact_bytes,
+                "ack_items": 1,
+            })
+            # Optional prepared/completed evidence is cross-checked by the
+            # entity mapper; SQL additionally selects its exact durable shape.
+            values["local_items"] = sa.case(
+                (models.RemoteParseAttempt.materialization_receipt_bytes.is_not(None), 1),
+                else_=0,
+            )
+            values["compressed_bytes"] = sa.func.coalesce(
+                models.RemoteParseAttempt.materialization_compressed_byte_count, 0
+            )
+            values["decoded_bytes"] = sa.func.coalesce(
+                models.RemoteParseAttempt.materialization_decoded_byte_count, 0
+            )
+            values["temp_disk_bytes"] = sa.func.coalesce(
+                models.RemoteParseAttempt.materialization_temp_disk_byte_count, 0
+            )
+            values["db_stage_items"] = sa.case(
+                (models.RemoteParseAttempt.local_receipt_bytes.is_not(None), 1), else_=0
+            )
+            values["db_staged_bytes"] = sa.func.coalesce(
+                models.RemoteParseAttempt.local_db_staged_byte_count, 0
+            )
+            values["unpublished_pages"] = sa.case(
+                (
+                    models.RemoteParseAttempt.local_receipt_bytes.is_not(None),
+                    models.RemoteParseAttempt.reservation_source_page_count,
+                ),
+                else_=0,
+            )
         else:
             raise ValueError("v3 race operation target is unsupported")
         return tuple(
@@ -2295,6 +2362,53 @@ class RemoteParseAttemptRepository:
             required_state="local_materialized",
             next_state="finish_committed",
         )
+
+    def reconcile_v3_remote_failure_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state="submitted",
+            next_state="remote_failure_committed",
+        )
+
+    def reconcile_v3_local_failure_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        if expected_attempt.state not in {"remote_terminal", "materializing"}:
+            raise ValueError("v3 local failure race source is invalid")
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state=expected_attempt.state,
+            next_state="local_failure_committed",
+        )
+
+    def reconcile_v3_pre_submission_failure_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> RemoteParseAttempt:
+        self._validate_expected_v3_attempt(expected_attempt)
+        if expected_attempt.state != "prepared":
+            raise ValueError("v3 pre-submission race source is invalid")
+        row = self._session.execute(sa.select(models.RemoteParseAttempt).where(
+            models.RemoteParseAttempt.attempt_id == expected_attempt.attempt_id,
+            models.RemoteParseAttempt.fence_identity == expected_attempt.fence_identity,
+            models.RemoteParseAttempt.document_id == expected_attempt.document_id,
+            models.RemoteParseAttempt.processing_run_id == expected_attempt.processing_run_id,
+            models.RemoteParseAttempt.checkpoint_contract_version == 3,
+            models.RemoteParseAttempt.state == "pre_submission_failed",
+            models.RemoteParseAttempt.row_version == expected_attempt.row_version + 1,
+            models.RemoteParseAttempt.claim_generation == expected_attempt.claim_generation,
+            models.RemoteParseAttempt.is_current.is_(False),
+            *(
+                getattr(models.RemoteParseAttempt, f"current_{name}") == 0
+                for name in CreditVector.__dataclass_fields__
+            ),
+        )).scalar_one_or_none()
+        if row is None:
+            raise RemoteParseCheckpointConflict(
+                "v3 pre-submission failure race lost exact final projection"
+            )
+        return _remote_attempt_entity(row)
 
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
