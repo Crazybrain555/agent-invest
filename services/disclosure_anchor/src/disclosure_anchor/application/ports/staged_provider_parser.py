@@ -38,16 +38,74 @@ _DURABLE_CHECKPOINT_STATES = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class DurableCheckpointWitness:
-    """Closed projection returned only after the repository commits its CAS."""
+class DurableFailureReceipt:
+    """Closed failure projection persisted before destructive remote cleanup."""
 
     schema: str
     attempt_identity: str
     fence_identity: str
-    checkpoint_version: int
+    failure_kind: str
+    remote_task_identity: str | None
+    terminal_receipt_sha256: str | None
+    exact_bytes: bytes = field(repr=False)
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "durable-parse-failure.v1":
+            raise ValueError("durable failure receipt schema is unsupported")
+        if self.failure_kind not in {
+            "pre_submission_failed",
+            "remote_failure_committed",
+            "local_failure_committed",
+        }:
+            raise ValueError("durable failure kind is unsupported")
+        for identity in (self.attempt_identity, self.fence_identity):
+            if not identity.strip() or len(identity) > 1024:
+                raise ValueError("durable failure identity is invalid")
+        if self.failure_kind == "pre_submission_failed":
+            if self.remote_task_identity is not None or self.terminal_receipt_sha256 is not None:
+                raise ValueError("pre-submission failure cannot bind remote facts")
+        else:
+            if not self.remote_task_identity or len(self.remote_task_identity) > 1024:
+                raise ValueError("remote failure must bind its task")
+            if self.failure_kind == "remote_failure_committed":
+                if self.terminal_receipt_sha256 is not None:
+                    raise ValueError("remote failure cannot bind a terminal receipt")
+            elif self.terminal_receipt_sha256 is None:
+                raise ValueError("local failure must bind its terminal receipt")
+        if self.terminal_receipt_sha256 is not None:
+            _require_sha256(self.terminal_receipt_sha256, "failure terminal receipt")
+        projection = {
+            "schema": self.schema,
+            "attempt_identity": self.attempt_identity,
+            "fence_identity": self.fence_identity,
+            "failure_kind": self.failure_kind,
+            "remote_task_identity": self.remote_task_identity,
+            "terminal_receipt_sha256": self.terminal_receipt_sha256,
+        }
+        canonical = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+        if self.exact_bytes != canonical or self.sha256 != (
+            "sha256:" + hashlib.sha256(canonical).hexdigest()
+        ):
+            raise ValueError("durable failure receipt exact bytes drifted")
+
+
+@dataclass(frozen=True, slots=True)
+class DurableCheckpointWitness:
+    """State-discriminated projection returned after repository CAS/commit."""
+
+    schema: str
+    attempt_identity: str
+    fence_identity: str
+    checkpoint_contract_version: int
+    row_version: int
     claim_generation: int
     state: str
-    receipt_sha256: str | None
+    prepared_submission_sha256: str | None
+    accepted_submission_receipt_sha256: str | None
+    terminal_receipt_sha256: str | None
+    failure_receipt_sha256: str | None
+    remote_task_identity: str | None
     exact_bytes: bytes = field(repr=False)
     sha256: str
 
@@ -63,30 +121,51 @@ class DurableCheckpointWitness:
                 or len(identity) > 1024
             ):
                 raise ValueError("durable checkpoint identity is invalid")
+        if self.checkpoint_contract_version != 2:
+            raise ValueError("checkpoint contract version must be exactly 2")
         for count, label in (
-            (self.checkpoint_version, "checkpoint version"),
+            (self.row_version, "row version"),
             (self.claim_generation, "claim generation"),
         ):
             if isinstance(count, bool) or not isinstance(count, int) or count < 1:
                 raise ValueError(f"durable {label} must be positive")
-        if self.receipt_sha256 is not None:
-            _require_sha256(self.receipt_sha256, "durable checkpoint receipt")
-        if self.state in {"prepared", "pre_submission_failed"} and (
-            self.receipt_sha256 is not None
+        hashes = (
+            self.prepared_submission_sha256,
+            self.accepted_submission_receipt_sha256,
+            self.terminal_receipt_sha256,
+            self.failure_receipt_sha256,
+        )
+        for value in hashes:
+            if value is not None:
+                _require_sha256(value, "state-discriminated checkpoint receipt")
+        expected_presence = {
+            "prepared": (True, False, False, False, False),
+            "submitted": (False, True, False, False, True),
+            "pre_submission_failed": (False, False, False, True, False),
+            "remote_failure_committed": (False, False, False, True, True),
+            "local_failure_committed": (False, False, True, True, True),
+            "finish_committed": (False, False, True, False, True),
+        }[self.state]
+        actual_presence = tuple(value is not None for value in (*hashes, self.remote_task_identity))
+        if actual_presence != expected_presence:
+            raise ValueError("durable checkpoint fields do not match its state")
+        if self.remote_task_identity is not None and (
+            not self.remote_task_identity.strip() or len(self.remote_task_identity) > 1024
         ):
-            raise ValueError("pre-remote checkpoint cannot bind a remote receipt")
-        if self.state not in {"prepared", "pre_submission_failed"} and (
-            self.receipt_sha256 is None
-        ):
-            raise ValueError("durable checkpoint must bind its committed receipt")
+            raise ValueError("durable checkpoint remote task is invalid")
         projection = {
             "schema": self.schema,
             "attempt_identity": self.attempt_identity,
             "fence_identity": self.fence_identity,
-            "checkpoint_version": self.checkpoint_version,
+            "checkpoint_contract_version": self.checkpoint_contract_version,
+            "row_version": self.row_version,
             "claim_generation": self.claim_generation,
             "state": self.state,
-            "receipt_sha256": self.receipt_sha256,
+            "prepared_submission_sha256": self.prepared_submission_sha256,
+            "accepted_submission_receipt_sha256": self.accepted_submission_receipt_sha256,
+            "terminal_receipt_sha256": self.terminal_receipt_sha256,
+            "failure_receipt_sha256": self.failure_receipt_sha256,
+            "remote_task_identity": self.remote_task_identity,
         }
         canonical = json.dumps(
             projection, sort_keys=True, separators=(",", ":")
@@ -276,7 +355,8 @@ class PreparedLocalSubmission:
     """Attempt-owned immutable upload snapshot completed before remote IO."""
 
     identity: PreparedSubmissionIdentity
-    checkpoint_version: int
+    checkpoint_contract_version: int
+    row_version: int
     claim_generation: int
     snapshot_path: Path = field(repr=False)
     snapshot_sha256: str
@@ -292,7 +372,9 @@ class PreparedLocalSubmission:
 
     def __post_init__(self) -> None:
         _require_sha256(self.snapshot_sha256, "submission snapshot")
-        for count in (self.checkpoint_version, self.claim_generation):
+        if self.checkpoint_contract_version != 2:
+            raise ValueError("submission checkpoint contract must be version 2")
+        for count in (self.row_version, self.claim_generation):
             if isinstance(count, bool) or not isinstance(count, int) or count < 1:
                 raise ValueError("submission checkpoint facts are invalid")
         for count in (
@@ -492,7 +574,10 @@ class RemoteProviderParseHandle(Protocol):
         """ACK only after the durable DB checkpoint is exactly finish_committed."""
 
     def acknowledge_after_failure_committed(
-        self, *, witness: DurableCheckpointWitness
+        self,
+        *,
+        witness: DurableCheckpointWitness,
+        failure_receipt: DurableFailureReceipt,
     ) -> None:
         """ACK only after remote_failure_committed/local_failure_committed."""
 
@@ -534,6 +619,8 @@ class StagedProviderDocumentParserPort(Protocol):
         *,
         prepared_submission: PreparedLocalSubmission,
         witness: DurableCheckpointWitness,
+        submission_receipt: PersistedSubmissionReceipt | None = None,
+        failure_receipt: DurableFailureReceipt | None = None,
     ) -> None:
         """Discard only after a DB state proves POST replay no longer needs it."""
 

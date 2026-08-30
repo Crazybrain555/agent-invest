@@ -7,8 +7,10 @@ import io
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
-import threading
+import textwrap
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +22,6 @@ import httpx
 from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import (
     MinerUHttpStagedParser,
 )
-from disclosure_anchor.adapters.parsers.mineru_medium import http_staged
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     TerminalReceipt,
     encode_terminal_receipt,
@@ -28,6 +29,7 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
+    DurableFailureReceipt,
     PreparedLocalSubmission,
     RemoteArtifactReceipt,
     SubmissionAcceptanceAmbiguous,
@@ -51,23 +53,55 @@ def _witness(
     *,
     attempt: str = "attempt-1",
     fence: str = "fence-1",
-    checkpoint_version: int = 1,
+    checkpoint_contract_version: int = 2,
+    row_version: int = 1,
     claim_generation: int = 1,
-    receipt_sha256: str | None = "sha256:" + "c" * 64,
+    prepared_submission_sha256: str | None = None,
+    accepted_submission_receipt_sha256: str | None = None,
+    terminal_receipt_sha256: str | None = None,
+    failure_receipt_sha256: str | None = None,
+    remote_task_identity: str | None = None,
 ) -> DurableCheckpointWitness:
-    if state in {"prepared", "pre_submission_failed"}:
-        receipt_sha256 = None
     projection = {
         "schema": "durable-checkpoint-witness.v1",
         "attempt_identity": attempt,
         "fence_identity": fence,
-        "checkpoint_version": checkpoint_version,
+        "checkpoint_contract_version": checkpoint_contract_version,
+        "row_version": row_version,
         "claim_generation": claim_generation,
         "state": state,
-        "receipt_sha256": receipt_sha256,
+        "prepared_submission_sha256": prepared_submission_sha256,
+        "accepted_submission_receipt_sha256": accepted_submission_receipt_sha256,
+        "terminal_receipt_sha256": terminal_receipt_sha256,
+        "failure_receipt_sha256": failure_receipt_sha256,
+        "remote_task_identity": remote_task_identity,
     }
     exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
     return DurableCheckpointWitness(
+        **projection,
+        exact_bytes=exact,
+        sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
+    )
+
+
+def _failure_receipt(
+    failure_kind: str,
+    *,
+    attempt: str = "attempt-1",
+    fence: str = "fence-1",
+    remote_task_identity: str | None = None,
+    terminal_receipt_sha256: str | None = None,
+) -> DurableFailureReceipt:
+    projection = {
+        "schema": "durable-parse-failure.v1",
+        "attempt_identity": attempt,
+        "fence_identity": fence,
+        "failure_kind": failure_kind,
+        "remote_task_identity": remote_task_identity,
+        "terminal_receipt_sha256": terminal_receipt_sha256,
+    }
+    exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+    return DurableFailureReceipt(
         **projection,
         exact_bytes=exact,
         sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
@@ -113,7 +147,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             input_pdf=source,
             options=PINNED_OPTIONS,
             identity=identity,
-            witness=_witness("prepared"),
+            witness=_witness(
+                "prepared", prepared_submission_sha256=identity.sha256
+            ),
         )
 
     def test_accept_disconnect_reconciles_and_submitted_checkpoint_resumes(self) -> None:
@@ -163,13 +199,36 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             )
             self.assertEqual(resumed.submission_checkpoint(), (public, secret))
             self.assertEqual(posts, 1)
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "submitted snapshot discard receipt drifted"
+            ):
+                parser.discard_local_submission(
+                    prepared_submission=prepared,
+                    witness=_witness(
+                        "submitted",
+                        accepted_submission_receipt_sha256="sha256:" + "d" * 64,
+                        remote_task_identity=public.remote_task_identity,
+                    ),
+                    submission_receipt=public,
+                )
+            self.assertTrue(prepared.snapshot_path.exists())
             parser.discard_local_submission(
                 prepared_submission=prepared,
-                witness=_witness("submitted", receipt_sha256=public.sha256),
+                witness=_witness(
+                    "submitted",
+                    accepted_submission_receipt_sha256=public.sha256,
+                    remote_task_identity=public.remote_task_identity,
+                ),
+                submission_receipt=public,
             )
             parser.discard_local_submission(
                 prepared_submission=prepared,
-                witness=_witness("submitted", receipt_sha256=public.sha256),
+                witness=_witness(
+                    "submitted",
+                    accepted_submission_receipt_sha256=public.sha256,
+                    remote_task_identity=public.remote_task_identity,
+                ),
+                submission_receipt=public,
             )
             self.assertFalse(prepared.snapshot_path.exists())
 
@@ -196,11 +255,31 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 attempt_identity="attempt-1", fence_identity="fence-1",
                 submission_epoch_unix=1_000_000,
             )
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "durable prepared checkpoint"
+            ):
+                parser.prepare_local_submission(
+                    input_pdf=source,
+                    options=PINNED_OPTIONS,
+                    identity=identity,
+                    witness=_witness(
+                        "prepared",
+                        prepared_submission_sha256="sha256:" + "d" * 64,
+                    ),
+                )
+            with self.assertRaisesRegex(ValueError, "exactly 2"):
+                _witness(
+                    "prepared",
+                    checkpoint_contract_version=1,
+                    prepared_submission_sha256=identity.sha256,
+                )
             prepared = parser.prepare_local_submission(
                 input_pdf=source,
                 options=PINNED_OPTIONS,
                 identity=identity,
-                witness=_witness("prepared"),
+                witness=_witness(
+                    "prepared", prepared_submission_sha256=identity.sha256
+                ),
             )
             self.assertEqual(calls, 0)
             self.assertEqual(prepared.identity.client_submit_key, _expected_idempotency_key(
@@ -313,7 +392,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     input_pdf=source,
                     options=PINNED_OPTIONS,
                     identity=prepared.identity,
-                    witness=_witness("prepared"),
+                    witness=_witness(
+                        "prepared",
+                        prepared_submission_sha256=prepared.identity.sha256,
+                    ),
                 )
                 self.assertEqual(prepared_again.snapshot_path, prepared.snapshot_path)
                 self.assertEqual(prepared_again.snapshot_inode, prepared.snapshot_inode)
@@ -346,14 +428,34 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 "remote_failure_committed",
                 "local_failure_committed",
             ):
+                terminal_sha = (
+                    "sha256:" + "d" * 64
+                    if reason == "local_failure_committed"
+                    else None
+                )
+                task_id = None if reason == "pre_submission_failed" else "task-1"
+                failure = _failure_receipt(
+                    reason,
+                    remote_task_identity=task_id,
+                    terminal_receipt_sha256=terminal_sha,
+                )
                 prepared = parser.prepare_local_submission(
                     input_pdf=source,
                     options=PINNED_OPTIONS,
                     identity=identity,
-                    witness=_witness("prepared"),
+                    witness=_witness(
+                        "prepared", prepared_submission_sha256=identity.sha256
+                    ),
                 )
                 parser.discard_local_submission(
-                    prepared_submission=prepared, witness=_witness(reason)
+                    prepared_submission=prepared,
+                    witness=_witness(
+                        reason,
+                        failure_receipt_sha256=failure.sha256,
+                        terminal_receipt_sha256=terminal_sha,
+                        remote_task_identity=task_id,
+                    ),
+                    failure_receipt=failure,
                 )
                 self.assertFalse(prepared.snapshot_path.exists())
 
@@ -361,30 +463,45 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 input_pdf=source,
                 options=PINNED_OPTIONS,
                 identity=identity,
-                witness=_witness("prepared"),
+                witness=_witness(
+                    "prepared", prepared_submission_sha256=identity.sha256
+                ),
             )
             with self.assertRaisesRegex(
                 ParserOutputContractError, "exact durable checkpoint state"
             ):
                 parser.discard_local_submission(
                     prepared_submission=prepared,
-                    witness=_witness("finish_committed"),
+                    witness=_witness(
+                        "finish_committed",
+                        terminal_receipt_sha256="sha256:" + "d" * 64,
+                        remote_task_identity="task-1",
+                    ),
                 )
             self.assertTrue(prepared.snapshot_path.exists())
             with self.assertRaisesRegex(
                 ParserOutputContractError, "exact durable checkpoint state"
             ):
+                failure = _failure_receipt("pre_submission_failed")
                 parser.discard_local_submission(
                     prepared_submission=prepared,
                     witness=_witness(
-                        "pre_submission_failed", claim_generation=2
+                        "pre_submission_failed",
+                        claim_generation=2,
+                        failure_receipt_sha256=failure.sha256,
                     ),
+                    failure_receipt=failure,
                 )
             self.assertTrue(prepared.snapshot_path.exists())
             snapshot_path = prepared.snapshot_path
+            failure = _failure_receipt("pre_submission_failed")
             parser.discard_local_submission(
                 prepared_submission=prepared,
-                witness=_witness("pre_submission_failed"),
+                witness=_witness(
+                    "pre_submission_failed",
+                    failure_receipt_sha256=failure.sha256,
+                ),
+                failure_receipt=failure,
             )
             snapshot_path.symlink_to(source)
             with self.assertRaises((OSError, ParserOutputContractError)):
@@ -392,7 +509,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     input_pdf=source,
                     options=PINNED_OPTIONS,
                     identity=identity,
-                    witness=_witness("prepared"),
+                    witness=_witness(
+                        "prepared", prepared_submission_sha256=identity.sha256
+                    ),
                 )
             self.assertTrue(snapshot_path.is_symlink())
             snapshot_path.unlink()
@@ -407,7 +526,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     input_pdf=source,
                     options=PINNED_OPTIONS,
                     identity=identity,
-                    witness=_witness("prepared"),
+                    witness=_witness(
+                        "prepared", prepared_submission_sha256=identity.sha256
+                    ),
                 )
             self.assertTrue(snapshot_path.exists())
 
@@ -437,7 +558,9 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     input_pdf=source,
                     options=PINNED_OPTIONS,
                     identity=identity,
-                    witness=_witness("prepared"),
+                    witness=_witness(
+                        "prepared", prepared_submission_sha256=identity.sha256
+                    ),
                 )
             self.assertEqual(
                 list((Path(directory) / "spool").glob(".upload-*.pdf")), []
@@ -447,13 +570,76 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 input_pdf=source,
                 options=PINNED_OPTIONS,
                 identity=identity,
-                witness=_witness("prepared"),
+                    witness=_witness(
+                        "prepared", prepared_submission_sha256=identity.sha256
+                    ),
             )
 
             self.assertEqual(recovered.snapshot_path.read_bytes(), source.read_bytes())
             self.assertEqual(
                 len(list((Path(directory) / "spool").glob(".upload-*.pdf"))), 1
             )
+
+    def test_sigkill_stale_temp_is_reclaimed_under_attempt_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage" * 4096)
+            source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            root = Path(directory) / "spool"
+            script = textwrap.dedent(
+                f"""
+                import hashlib, json, os, signal
+                from pathlib import Path
+                from disclosure_anchor.adapters.parsers.mineru_medium import http_staged
+                from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import MinerUHttpStagedParser
+                from disclosure_anchor.application.ports.parser import ParserOptions
+                from disclosure_anchor.application.ports.staged_provider_parser import DurableCheckpointWitness
+                parser = MinerUHttpStagedParser(api_url='http://mineru.test:30000', server_url='http://vlm.test:30000/v1', spool_root=Path({str(root)!r}))
+                options = ParserOptions(runtime_bundle_identity_sha256='sha256:' + 'a' * 64)
+                identity = parser.prepare_submission_identity(options=options, source_pdf_sha256={source_sha256!r}, attempt_identity='attempt-1', fence_identity='fence-1', submission_epoch_unix=1000000)
+                projection = {{'schema':'durable-checkpoint-witness.v1','attempt_identity':'attempt-1','fence_identity':'fence-1','checkpoint_contract_version':2,'row_version':1,'claim_generation':1,'state':'prepared','prepared_submission_sha256':identity.sha256,'accepted_submission_receipt_sha256':None,'terminal_receipt_sha256':None,'failure_receipt_sha256':None,'remote_task_identity':None}}
+                exact = json.dumps(projection, sort_keys=True, separators=(',', ':')).encode()
+                witness = DurableCheckpointWitness(**projection, exact_bytes=exact, sha256='sha256:' + hashlib.sha256(exact).hexdigest())
+                original = http_staged._write_snapshot_from_source
+                def crash(**kwargs):
+                    original(**kwargs)
+                    os.kill(os.getpid(), signal.SIGKILL)
+                http_staged._write_snapshot_from_source = crash
+                parser.prepare_local_submission(input_pdf=Path({str(source)!r}), options=options, identity=identity, witness=witness)
+                """
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", script],
+                env={**os.environ, "PYTHONPATH": "src"},
+                cwd=Path(__file__).parents[2],
+                check=False,
+            )
+            self.assertLess(completed.returncode, 0)
+            self.assertEqual(len(list(root.glob(".upload-*.tmp-*"))), 1)
+            self.assertEqual(list(root.glob(".upload-*.pdf")), [])
+
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=root,
+            )
+            identity = parser.prepare_submission_identity(
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
+            )
+            prepared = parser.prepare_local_submission(
+                input_pdf=source,
+                options=PINNED_OPTIONS,
+                identity=identity,
+                witness=_witness(
+                    "prepared", prepared_submission_sha256=identity.sha256
+                ),
+            )
+            self.assertEqual(list(root.glob(".upload-*.tmp-*")), [])
+            self.assertEqual(prepared.snapshot_path.read_bytes(), source.read_bytes())
 
     def test_concurrent_snapshot_publish_returns_one_immutable_inode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -478,26 +664,16 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 fence_identity="fence-1",
                 submission_epoch_unix=1_000_000,
             )
-            barrier = threading.Barrier(2)
-            original = http_staged._write_snapshot_from_source
-
-            def synchronized_copy(**kwargs: object) -> os.stat_result:
-                result = original(**kwargs)  # type: ignore[arg-type]
-                barrier.wait(timeout=5)
-                return result
-
-            with patch.object(
-                http_staged,
-                "_write_snapshot_from_source",
-                side_effect=synchronized_copy,
-            ), ThreadPoolExecutor(max_workers=2) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [
                     executor.submit(
                         parser.prepare_local_submission,
                         input_pdf=source,
                         options=PINNED_OPTIONS,
                         identity=identity,
-                        witness=_witness("prepared"),
+                    witness=_witness(
+                        "prepared", prepared_submission_sha256=identity.sha256
+                    ),
                     )
                     for parser in (first_parser, second_parser)
                 ]
@@ -640,14 +816,21 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     parser, source, source_sha256
                 ),
             )
-            for invalid in ("submitted", "finish_committed"):
-                with self.subTest(invalid=invalid), self.assertRaisesRegex(
-                    ParserOutputContractError,
-                    "remote_failure_committed or local_failure_committed",
-                ):
-                    handle.acknowledge_after_failure_committed(
-                        witness=_witness(invalid)
-                    )
+            remote_failure = _failure_receipt(
+                "remote_failure_committed", remote_task_identity="task-1"
+            )
+            submitted = _witness(
+                "submitted",
+                accepted_submission_receipt_sha256="sha256:" + "d" * 64,
+                remote_task_identity="task-1",
+            )
+            with self.assertRaisesRegex(
+                ParserOutputContractError,
+                "remote_failure_committed or local_failure_committed",
+            ):
+                handle.acknowledge_after_failure_committed(
+                    witness=submitted, failure_receipt=remote_failure
+                )
             with self.assertRaisesRegex(ValueError, "state is unsupported"):
                 _witness("failure_committed")
             with self.assertRaisesRegex(
@@ -656,18 +839,57 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             ):
                 handle.acknowledge_after_failure_committed(
                     witness=_witness(
-                        "remote_failure_committed", attempt="other-attempt"
-                    )
+                        "remote_failure_committed",
+                        attempt="other-attempt",
+                        failure_receipt_sha256=remote_failure.sha256,
+                        remote_task_identity="task-1",
+                    ),
+                    failure_receipt=remote_failure,
                 )
-            self.assertEqual(ack_calls, 0)
-            for committed in (
-                "remote_failure_committed",
-                "local_failure_committed",
+            wrong_task_failure = _failure_receipt(
+                "remote_failure_committed", remote_task_identity="task-other"
+            )
+            with self.assertRaisesRegex(
+                ParserOutputContractError,
+                "remote_failure_committed or local_failure_committed",
             ):
                 handle.acknowledge_after_failure_committed(
-                    witness=_witness(committed)
+                    witness=_witness(
+                        "remote_failure_committed",
+                        failure_receipt_sha256=wrong_task_failure.sha256,
+                        remote_task_identity="task-other",
+                    ),
+                    failure_receipt=wrong_task_failure,
                 )
-            self.assertEqual(ack_calls, 2)
+            self.assertEqual(ack_calls, 0)
+            handle.acknowledge_after_failure_committed(
+                witness=_witness(
+                    "remote_failure_committed",
+                    failure_receipt_sha256=remote_failure.sha256,
+                    remote_task_identity="task-1",
+                ),
+                failure_receipt=remote_failure,
+            )
+            self.assertEqual(ack_calls, 1)
+            local_terminal = "sha256:" + "e" * 64
+            local_failure = _failure_receipt(
+                "local_failure_committed",
+                remote_task_identity="task-1",
+                terminal_receipt_sha256=local_terminal,
+            )
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "exact terminal receipt"
+            ):
+                handle.acknowledge_after_failure_committed(
+                    witness=_witness(
+                        "local_failure_committed",
+                        terminal_receipt_sha256=local_terminal,
+                        failure_receipt_sha256=local_failure.sha256,
+                        remote_task_identity="task-1",
+                    ),
+                    failure_receipt=local_failure,
+                )
+            self.assertEqual(ack_calls, 1)
 
     @staticmethod
     def _zip(entries: list[tuple[str, bytes]], *, symlink: bool = False) -> bytes:
@@ -855,22 +1077,39 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             ):
                 handle.acknowledge_after_finish_committed(
                     receipt=receipt,
-                    witness=_witness("local_failure_committed"),
+                    witness=_witness(
+                        "submitted",
+                        accepted_submission_receipt_sha256="sha256:" + "d" * 64,
+                        remote_task_identity="task-1",
+                    ),
+                )
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "finish_committed"
+            ):
+                handle.acknowledge_after_finish_committed(
+                    receipt=receipt,
+                    witness=_witness(
+                        "finish_committed",
+                        terminal_receipt_sha256="sha256:" + "d" * 64,
+                        remote_task_identity="task-other",
+                    ),
                 )
             handle.acknowledge_after_finish_committed(
                 receipt=receipt,
                 witness=_witness(
                     "finish_committed",
-                    receipt_sha256="sha256:"
+                    terminal_receipt_sha256="sha256:"
                     + hashlib.sha256(_terminal_exact_for_test(receipt)).hexdigest(),
+                    remote_task_identity="task-1",
                 ),
             )
             handle.acknowledge_after_finish_committed(
                 receipt=receipt,
                 witness=_witness(
                     "finish_committed",
-                    receipt_sha256="sha256:"
+                    terminal_receipt_sha256="sha256:"
                     + hashlib.sha256(_terminal_exact_for_test(receipt)).hexdigest(),
+                    remote_task_identity="task-1",
                 ),
             )
         self.assertEqual(receipt.artifact_sha256, artifact_sha256)
