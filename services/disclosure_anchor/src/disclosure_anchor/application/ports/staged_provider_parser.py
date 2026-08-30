@@ -13,7 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
 from disclosure_anchor.application.ports.parser import ParserOptions
@@ -415,7 +415,7 @@ class RemoteProviderParseHandle(Protocol):
         """ACK only after the durable DB checkpoint is exactly finish_committed."""
 
     def acknowledge_after_failure_committed(self, *, checkpoint_state: str) -> None:
-        """ACK a remote failure only after its durable failure checkpoint."""
+        """ACK only after remote_failure_committed/local_failure_committed."""
 
 
 class StagedProviderDocumentParserPort(Protocol):
@@ -448,6 +448,19 @@ class StagedProviderDocumentParserPort(Protocol):
         identity: PreparedSubmissionIdentity,
     ) -> PreparedLocalSubmission:
         """Complete all local source/snapshot IO before remote reconciliation."""
+
+    def discard_local_submission(
+        self,
+        *,
+        prepared_submission: PreparedLocalSubmission,
+        checkpoint_state: Literal[
+            "submitted",
+            "pre_submission_failed",
+            "remote_failure_committed",
+            "local_failure_committed",
+        ],
+    ) -> None:
+        """Discard only after a DB state proves POST replay no longer needs it."""
 
     def resume_remote_parse(
         self,

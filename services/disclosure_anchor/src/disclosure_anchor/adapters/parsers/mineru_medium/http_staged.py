@@ -174,8 +174,101 @@ def _prepared_snapshot_identity(value: PreparedLocalSubmission) -> tuple[int, ..
     )
 
 
+def _derived_snapshot_name(identity: PreparedSubmissionIdentity) -> str:
+    digest = hashlib.sha256(
+        (
+            identity.attempt_identity
+            + "\0"
+            + identity.fence_identity
+            + "\0"
+            + identity.source_pdf_sha256
+        ).encode()
+    ).hexdigest()
+    return f".upload-{digest}.pdf"
+
+
+def _verify_snapshot_fd(
+    fd: int, *, expected_sha256: str
+) -> tuple[os.stat_result, int]:
+    observed = os.fstat(fd)
+    _validate_snapshot_stat(observed)
+    digest = hashlib.sha256()
+    total = 0
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        total += len(chunk)
+        digest.update(chunk)
+    if "sha256:" + digest.hexdigest() != expected_sha256:
+        raise _SnapshotContentDrift
+    return observed, total
+
+
+def _validate_snapshot_stat(observed: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or observed.st_uid != os.getuid()
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        raise _fail("submission snapshot identity is unsafe")
+
+
+def _write_snapshot_from_source(
+    *, source_fd: int, snapshot_fd: int, expected_sha256: str
+) -> os.stat_result:
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    while chunk := os.read(source_fd, 1024 * 1024):
+        _write_all(snapshot_fd, chunk)
+    os.fsync(snapshot_fd)
+    observed, _ = _verify_snapshot_fd(
+        snapshot_fd, expected_sha256=expected_sha256
+    )
+    return observed
+
+
+def _unlink_owned_snapshot(
+    path: Path, *, expected: PreparedLocalSubmission | None
+) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return
+    try:
+        observed = os.fstat(fd)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            raise _fail("snapshot discard refused unsafe identity")
+        if expected is not None and _stat_identity(observed) != (
+            _prepared_snapshot_identity(expected)
+        ):
+            raise _fail("snapshot discard identity drifted")
+        current = path.stat(follow_symlinks=False)
+        if _stat_identity(current) != _stat_identity(observed):
+            raise _fail("snapshot discard path changed during verification")
+        path.unlink()
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, chunk: bytes) -> None:
+    remaining = memoryview(chunk)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written < 1:
+            raise OSError("snapshot write made no progress")
+        remaining = remaining[written:]
+
+
 def _fail(message: str) -> ParserOutputContractError:
     return ParserOutputContractError(f"MinerU staged HTTP contract: {message}")
+
+
+class _SnapshotContentDrift(Exception):
+    """A safely-owned deterministic snapshot is incomplete or corrupt."""
 
 
 def _identity(value: str, label: str) -> str:
@@ -744,8 +837,14 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         self._ack_terminal()
 
     def acknowledge_after_failure_committed(self, *, checkpoint_state: str) -> None:
-        if checkpoint_state != "failure_committed":
-            raise _fail("remote failure ACK requires a durable failure_committed checkpoint")
+        if checkpoint_state not in {
+            "remote_failure_committed",
+            "local_failure_committed",
+        }:
+            raise _fail(
+                "remote failure ACK requires a durable remote_failure_committed "
+                "or local_failure_committed checkpoint"
+            )
         self._ack_terminal()
 
     def _ack_terminal(self) -> None:
@@ -926,31 +1025,84 @@ class MinerUHttpStagedParser:
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             os.close(source_fd)
             raise _fail("source PDF identity is unsafe")
-        digest = hashlib.sha256()
-        snapshot_fd, snapshot_name = tempfile.mkstemp(
-            prefix=".upload-", suffix=".pdf", dir=self._spool_root
-        )
-        snapshot = Path(snapshot_name)
+        source_digest = hashlib.sha256()
+        while chunk := os.read(source_fd, 1024 * 1024):
+            source_digest.update(chunk)
+        after_hash = os.fstat(source_fd)
+        if (
+            _stat_identity(before) != _stat_identity(after_hash)
+            or "sha256:" + source_digest.hexdigest() != identity.source_pdf_sha256
+        ):
+            os.close(source_fd)
+            raise _fail("source differs from prepared submission")
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        snapshot = self._spool_root / _derived_snapshot_name(identity)
+        created = False
         try:
-            with os.fdopen(snapshot_fd, "wb") as target:
-                while chunk := os.read(source_fd, 1024 * 1024):
-                    digest.update(chunk)
-                    target.write(chunk)
-                target.flush()
-                os.fsync(target.fileno())
-                snapshot_stat = os.fstat(target.fileno())
+            try:
+                snapshot_fd = os.open(
+                    snapshot,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            except FileExistsError:
+                snapshot_fd = os.open(
+                    snapshot, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    _validate_snapshot_stat(os.fstat(snapshot_fd))
+                    try:
+                        snapshot_stat, _ = _verify_snapshot_fd(
+                            snapshot_fd,
+                            expected_sha256=identity.source_pdf_sha256,
+                        )
+                    except _SnapshotContentDrift:
+                        os.close(snapshot_fd)
+                        snapshot_fd = -1
+                        _unlink_owned_snapshot(snapshot, expected=None)
+                        _fsync_directory(self._spool_root)
+                        snapshot_fd = os.open(
+                            snapshot,
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            0o600,
+                        )
+                        created = True
+                        snapshot_stat = _write_snapshot_from_source(
+                            source_fd=source_fd,
+                            snapshot_fd=snapshot_fd,
+                            expected_sha256=identity.source_pdf_sha256,
+                        )
+                finally:
+                    if snapshot_fd >= 0:
+                        os.close(snapshot_fd)
+            else:
+                created = True
+                try:
+                    snapshot_stat = _write_snapshot_from_source(
+                        source_fd=source_fd,
+                        snapshot_fd=snapshot_fd,
+                        expected_sha256=identity.source_pdf_sha256,
+                    )
+                except BaseException:
+                    os.close(snapshot_fd)
+                    _unlink_owned_snapshot(snapshot, expected=None)
+                    raise
+                else:
+                    os.close(snapshot_fd)
             after = os.fstat(source_fd)
-        except BaseException:
-            snapshot.unlink(missing_ok=True)
-            raise
         finally:
             os.close(source_fd)
         if _stat_identity(before) != _stat_identity(after):
-            snapshot.unlink(missing_ok=True)
+            if created:
+                _unlink_owned_snapshot(snapshot, expected=None)
             raise _fail("source changed while preparing upload snapshot")
-        if "sha256:" + digest.hexdigest() != identity.source_pdf_sha256:
-            snapshot.unlink(missing_ok=True)
-            raise _fail("source hash differs from prepared submission")
+        _fsync_directory(self._spool_root)
         return PreparedLocalSubmission(
             identity=identity,
             snapshot_path=snapshot,
@@ -965,6 +1117,27 @@ class MinerUHttpStagedParser:
             snapshot_ctime_ns=snapshot_stat.st_ctime_ns,
             upload_filename=f"{identity.source_pdf_sha256[7:]}.pdf",
         )
+
+    def discard_local_submission(
+        self,
+        *,
+        prepared_submission: PreparedLocalSubmission,
+        checkpoint_state: str,
+    ) -> None:
+        if checkpoint_state not in {
+            "submitted",
+            "pre_submission_failed",
+            "remote_failure_committed",
+            "local_failure_committed",
+        }:
+            raise _fail("snapshot discard requires an exact durable checkpoint state")
+        expected_path = self._spool_root / _derived_snapshot_name(
+            prepared_submission.identity
+        )
+        if prepared_submission.snapshot_path != expected_path:
+            raise _fail("snapshot discard path drifted")
+        _unlink_owned_snapshot(expected_path, expected=prepared_submission)
+        _fsync_directory(self._spool_root)
 
     def begin_remote_parse(
         self,
@@ -1163,9 +1336,6 @@ class MinerUHttpStagedParser:
             raise SubmissionAcceptanceAmbiguous(
                 "MinerU staged HTTP contract: submission outcome remains ambiguous"
             ) from exc
-        finally:
-            if "task" in locals():
-                snapshot.unlink(missing_ok=True)
         return MinerUHttpRemoteHandle(
             task=task,
             options=options,

@@ -5,6 +5,7 @@ from dataclasses import replace
 import hashlib
 import io
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -101,11 +102,10 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 spool_root=Path(directory) / "spool",
                 transport=httpx.MockTransport(handler),
             )
+            prepared = self._prepared_submission(parser, source, source_sha256)
             handle = parser.begin_remote_parse(
                 options=PINNED_OPTIONS,
-                prepared_submission=self._prepared_submission(
-                    parser, source, source_sha256
-                ),
+                prepared_submission=prepared,
             )
             public, secret = handle.submission_checkpoint()
             self.assertNotIn(secret.token_bytes, public.exact_bytes)
@@ -114,6 +114,15 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
             )
             self.assertEqual(resumed.submission_checkpoint(), (public, secret))
             self.assertEqual(posts, 1)
+            parser.discard_local_submission(
+                prepared_submission=prepared,
+                checkpoint_state="submitted",
+            )
+            parser.discard_local_submission(
+                prepared_submission=prepared,
+                checkpoint_state="submitted",
+            )
+            self.assertFalse(prepared.snapshot_path.exists())
 
     def test_prepare_submission_identity_is_pure_and_begin_rejects_drift(self) -> None:
         calls = 0
@@ -248,11 +257,119 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     parser.begin_remote_parse(
                         options=PINNED_OPTIONS, prepared_submission=prepared
                     )
+                prepared_again = parser.prepare_local_submission(
+                    input_pdf=source,
+                    options=PINNED_OPTIONS,
+                    identity=prepared.identity,
+                )
+                self.assertEqual(prepared_again.snapshot_path, prepared.snapshot_path)
+                self.assertEqual(prepared_again.snapshot_inode, prepared.snapshot_inode)
+                self.assertEqual(
+                    len(list((Path(directory) / "spool").glob(".upload-*.pdf"))), 1
+                )
                 phase = "restart"
                 with self.assertRaises(SubmissionAcceptanceAmbiguous):
                     parser.begin_remote_parse(
-                        options=PINNED_OPTIONS, prepared_submission=prepared
+                        options=PINNED_OPTIONS, prepared_submission=prepared_again
                     )
+
+    def test_snapshot_discard_policy_and_unsafe_reuse_are_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+            )
+            identity = parser.prepare_submission_identity(
+                options=PINNED_OPTIONS, source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1", fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
+            )
+            for reason in (
+                "pre_submission_failed",
+                "remote_failure_committed",
+                "local_failure_committed",
+            ):
+                prepared = parser.prepare_local_submission(
+                    input_pdf=source, options=PINNED_OPTIONS, identity=identity
+                )
+                parser.discard_local_submission(
+                    prepared_submission=prepared, checkpoint_state=reason
+                )
+                self.assertFalse(prepared.snapshot_path.exists())
+
+            prepared = parser.prepare_local_submission(
+                input_pdf=source, options=PINNED_OPTIONS, identity=identity
+            )
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "exact durable checkpoint state"
+            ):
+                parser.discard_local_submission(
+                    prepared_submission=prepared,
+                    checkpoint_state="accepted_checkpoint_committed",
+                )
+            self.assertTrue(prepared.snapshot_path.exists())
+            snapshot_path = prepared.snapshot_path
+            parser.discard_local_submission(
+                prepared_submission=prepared,
+                checkpoint_state="pre_submission_failed",
+            )
+            snapshot_path.symlink_to(source)
+            with self.assertRaises((OSError, ParserOutputContractError)):
+                parser.prepare_local_submission(
+                    input_pdf=source, options=PINNED_OPTIONS, identity=identity
+                )
+            self.assertTrue(snapshot_path.is_symlink())
+            snapshot_path.unlink()
+            seed = Path(directory) / "seed"
+            seed.write_bytes(b"%PDF-stage")
+            seed.chmod(0o600)
+            hardlink_peer = Path(directory) / "peer"
+            os.link(seed, hardlink_peer)
+            os.link(seed, snapshot_path)
+            with self.assertRaisesRegex(ParserOutputContractError, "unsafe"):
+                parser.prepare_local_submission(
+                    input_pdf=source, options=PINNED_OPTIONS, identity=identity
+                )
+            self.assertTrue(snapshot_path.exists())
+
+    def test_safe_partial_snapshot_is_reclaimed_at_deterministic_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.pdf"
+            source.write_bytes(b"%PDF-stage")
+            source_sha256 = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+            )
+            identity = parser.prepare_submission_identity(
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
+            )
+            first = parser.prepare_local_submission(
+                input_pdf=source, options=PINNED_OPTIONS, identity=identity
+            )
+            first_inode = first.snapshot_inode
+            first.snapshot_path.write_bytes(b"")
+            first.snapshot_path.chmod(0o600)
+
+            recovered = parser.prepare_local_submission(
+                input_pdf=source, options=PINNED_OPTIONS, identity=identity
+            )
+
+            self.assertEqual(recovered.snapshot_path, first.snapshot_path)
+            self.assertNotEqual(recovered.snapshot_inode, first_inode)
+            self.assertEqual(recovered.snapshot_path.read_bytes(), source.read_bytes())
+            self.assertEqual(
+                len(list((Path(directory) / "spool").glob(".upload-*.pdf"))), 1
+            )
 
     def test_every_post_started_http_rejection_remains_ambiguous(self) -> None:
         for post_status in (301, 400, 401, 403, 404, 409, 422):
@@ -311,7 +428,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                         options=PINNED_OPTIONS,
                     )
 
-    def test_failed_remote_ack_requires_failure_committed_checkpoint(self) -> None:
+    def test_failed_remote_ack_requires_exact_database_failure_checkpoint(self) -> None:
         ack_calls = 0
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input.pdf"
@@ -360,15 +477,23 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     parser, source, source_sha256
                 ),
             )
-            with self.assertRaisesRegex(ParserOutputContractError, "failure_committed"):
-                handle.acknowledge_after_failure_committed(
-                    checkpoint_state="remote_failed"
-                )
+            for invalid in ("failure_committed", "remote_failed", "failed"):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    ParserOutputContractError,
+                    "remote_failure_committed or local_failure_committed",
+                ):
+                    handle.acknowledge_after_failure_committed(
+                        checkpoint_state=invalid
+                    )
             self.assertEqual(ack_calls, 0)
-            handle.acknowledge_after_failure_committed(
-                checkpoint_state="failure_committed"
-            )
-            self.assertEqual(ack_calls, 1)
+            for committed in (
+                "remote_failure_committed",
+                "local_failure_committed",
+            ):
+                handle.acknowledge_after_failure_committed(
+                    checkpoint_state=committed
+                )
+            self.assertEqual(ack_calls, 2)
 
     @staticmethod
     def _zip(entries: list[tuple[str, bytes]], *, symlink: bool = False) -> bytes:
