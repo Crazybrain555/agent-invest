@@ -23,6 +23,7 @@ from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import (
     MinerUHttpStagedParser,
 )
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    AcceptedSubmissionReceipt,
     EncodedCheckpointReceipt,
     FailureReceipt,
     TerminalReceipt,
@@ -32,6 +33,7 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
+    PersistedSubmissionReceipt,
     PreparedLocalSubmission,
     PreparedSubmissionIdentity,
     RemoteArtifactReceipt,
@@ -70,6 +72,15 @@ def _witness(
         prepared_submission_sha256 = prepared_identity.sha256
     if prepared_submission_sha256 is None:
         prepared_submission_sha256 = "sha256:" + "e" * 64
+    if (
+        state in {
+            "remote_failure_committed",
+            "local_failure_committed",
+            "finish_committed",
+        }
+        and accepted_submission_receipt_sha256 is None
+    ):
+        accepted_submission_receipt_sha256 = "sha256:" + "9" * 64
     projection = {
         "schema": "durable-checkpoint-witness.v1",
         "attempt_identity": attempt,
@@ -145,6 +156,22 @@ def _failure_receipt(
         retryable=True,
         retry_budget_class="neutral",
         message="test failure",
+    ))
+
+
+def _accepted_receipt(
+    public: PersistedSubmissionReceipt, token_bytes: bytes
+) -> EncodedCheckpointReceipt:
+    return encode_checkpoint_receipt(AcceptedSubmissionReceipt(
+        attempt_identity=public.attempt_identity,
+        fence_identity=public.fence_identity,
+        source_pdf_sha256=public.source_pdf_sha256,
+        client_submit_key=public.client_submit_key,
+        submission_epoch_unix=public.submission_epoch_unix,
+        remote_task_identity=public.remote_task_identity,
+        status_url=public.status_url,
+        result_url=public.result_url,
+        resume_token_sha256="sha256:" + hashlib.sha256(token_bytes).hexdigest(),
     ))
 
 
@@ -228,11 +255,25 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 transport=httpx.MockTransport(handler),
             )
             prepared = self._prepared_submission(parser, source, source_sha256)
+            original_inode = prepared.snapshot_inode
+            source.unlink()
+            # Crash after durable prepared->reconciling and before the first
+            # remote call reopens the attempt-owned snapshot without raw input.
+            prepared = parser.prepare_local_submission(
+                input_pdf=source,
+                options=PINNED_OPTIONS,
+                identity=prepared.identity,
+                witness=_witness(
+                    "reconciling", prepared_identity=prepared.identity, row_version=2
+                ),
+            )
+            self.assertEqual(prepared.snapshot_inode, original_inode)
             handle = parser.begin_remote_parse(
                 options=PINNED_OPTIONS,
                 prepared_submission=prepared,
             )
             public, secret = handle.submission_checkpoint()
+            accepted_receipt = _accepted_receipt(public, secret.token_bytes)
             self.assertNotIn(secret.token_bytes, public.exact_bytes)
             resumed = parser.resume_submitted_parse(
                 receipt=public, secret=secret, options=PINNED_OPTIONS
@@ -251,6 +292,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                         remote_task_identity=public.remote_task_identity,
                     ),
                     submission_receipt=public,
+                    accepted_receipt=accepted_receipt,
                 )
             self.assertTrue(prepared.snapshot_path.exists())
             restarted = MinerUHttpStagedParser(
@@ -264,20 +306,34 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                 witness=_witness(
                     "submitted",
                     prepared_identity=prepared.identity,
-                    accepted_submission_receipt_sha256=public.sha256,
+                    accepted_submission_receipt_sha256=accepted_receipt.sha256,
                     remote_task_identity=public.remote_task_identity,
                 ),
                 submission_receipt=public,
+                accepted_receipt=accepted_receipt,
             )
             parser.discard_local_submission(
                 prepared_submission=prepared,
                 witness=_witness(
                     "submitted",
                     prepared_identity=prepared.identity,
-                    accepted_submission_receipt_sha256=public.sha256,
+                    accepted_submission_receipt_sha256=accepted_receipt.sha256,
                     remote_task_identity=public.remote_task_identity,
                 ),
                 submission_receipt=public,
+                accepted_receipt=accepted_receipt,
+            )
+            # Commit-response loss may replay cleanup after the snapshot is gone.
+            restarted.discard_local_submission(
+                prepared_submission=prepared.identity,
+                witness=_witness(
+                    "submitted",
+                    prepared_identity=prepared.identity,
+                    accepted_submission_receipt_sha256=accepted_receipt.sha256,
+                    remote_task_identity=public.remote_task_identity,
+                ),
+                submission_receipt=public,
+                accepted_receipt=accepted_receipt,
             )
             self.assertFalse(prepared.snapshot_path.exists())
 

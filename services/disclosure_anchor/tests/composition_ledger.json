@@ -62,7 +62,7 @@
   },
   "tests/integration/test_remote_parse_checkpoint.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 14
   },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
@@ -478,7 +478,7 @@
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 25
   },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],

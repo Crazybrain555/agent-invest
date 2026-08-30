@@ -93,6 +93,15 @@ class CreditVector:
         }
 
 
+def _positive_credit_delta(before: CreditVector, after: CreditVector) -> CreditVector:
+    return CreditVector(
+        **{
+            item.name: max(0, getattr(after, item.name) - getattr(before, item.name))
+            for item in fields(CreditVector)
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CoordinatorWork:
     """Content-free projection of one claimed durable attempt."""
@@ -182,9 +191,10 @@ class StageLeaseGuard:
 
     deadline_monotonic: float
     _revoked: Event
+    _monotonic: Callable[[], float]
 
-    def checkpoint(self, monotonic: Callable[[], float] = time.monotonic) -> None:
-        if self._revoked.is_set() or monotonic() > self.deadline_monotonic:
+    def checkpoint(self) -> None:
+        if self._revoked.is_set() or self._monotonic() > self.deadline_monotonic:
             raise StageLeaseLost("bounded stage lease expired")
 
     def revoke(self) -> None:
@@ -228,12 +238,20 @@ class StagedCoordinatorBackend(Protocol):
         """Reload exact durable state after a renewal/commit response race."""
 
     def prepare_remote_io(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         """Run local-only preflight, then durably enter reconciling."""
 
     def run_remote(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork: ...
 
     def prepare_local_io(
@@ -246,11 +264,19 @@ class StagedCoordinatorBackend(Protocol):
         """Durably enter materializing and reserve exact local projections."""
 
     def run_local(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork: ...
 
     def commit(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork: ...
 
     def acknowledge(
@@ -483,7 +509,7 @@ class StagedParseCoordinator:
         }
         in_flight: dict[
             Future[CoordinatorWork],
-            tuple[CoordinatorLane, CoordinatorWork, StageLeaseGuard],
+            tuple[CoordinatorLane, CoordinatorWork, StageLeaseGuard, CreditVector],
         ] = {}
         reconciled_results: dict[Future[CoordinatorWork], CoordinatorWork] = {}
         in_flight_failures: set[Future[CoordinatorWork]] = set()
@@ -502,7 +528,7 @@ class StagedParseCoordinator:
                             lane.value,
                             sum(
                                 1
-                                for active_lane, _, _ in in_flight.values()
+                                for active_lane, _, _, _ in in_flight.values()
                                 if active_lane == lane
                             ),
                         )
@@ -664,13 +690,24 @@ class StagedParseCoordinator:
                 + self._limits.claim_renew_margin_seconds
             )
 
-        def local_prepare_hold(work: CoordinatorWork) -> CreditVector:
-            names = {
-                "local_items",
-                "compressed_bytes",
-                "decoded_bytes",
-                "temp_disk_bytes",
+        def transition_hold(
+            work: CoordinatorWork, lane: CoordinatorLane
+        ) -> CreditVector:
+            names_by_lane = {
+                CoordinatorLane.PREFLIGHT: {"remote_waits"},
+                CoordinatorLane.REMOTE: {"retained_results", "retained_bytes"},
+                CoordinatorLane.LOCAL_PREPARE: {
+                    "local_items",
+                    "compressed_bytes",
+                    "decoded_bytes",
+                    "temp_disk_bytes",
+                    "ack_items",
+                },
+                CoordinatorLane.LOCAL: {"db_stage_items", "unpublished_pages"},
+                CoordinatorLane.COMMIT: {"ack_items"},
+                CoordinatorLane.ACK: set(),
             }
+            names = names_by_lane[lane]
             return CreditVector(
                 **{
                     item.name: (
@@ -688,7 +725,7 @@ class StagedParseCoordinator:
 
         def guard_in_flight(now: float) -> None:
             nonlocal circuit_open, admission_open, blocked_reason
-            for future, (lane, work, stage_guard) in tuple(in_flight.items()):
+            for future, (lane, work, stage_guard, _grant) in tuple(in_flight.items()):
                 if future.done():
                     continue
                 if now > stage_guard.deadline_monotonic:
@@ -747,7 +784,7 @@ class StagedParseCoordinator:
                                 durable.attempt_id in oversubscribed_recovery
                             ),
                         )
-                        in_flight[future] = (lane, durable, stage_guard)
+                        in_flight[future] = (lane, durable, stage_guard, _grant)
                     elif (
                         durable.attempt_id == work.attempt_id
                         and durable.claim_generation == work.claim_generation
@@ -769,7 +806,7 @@ class StagedParseCoordinator:
                         )
                         in_flight_failures.add(future)
                 else:
-                    in_flight[future] = (lane, renewed, stage_guard)
+                    in_flight[future] = (lane, renewed, stage_guard, _grant)
 
         try:
             # Startup is an exhaustive keyset recovery barrier.  No new work
@@ -891,22 +928,25 @@ class StagedParseCoordinator:
                 for lane in _LANE_PRIORITY:
                     active = sum(
                         1
-                        for active_lane, _, _ in in_flight.values()
+                        for active_lane, _, _, _ in in_flight.values()
                         if active_lane == lane
                     )
                     while queues[lane] and active < lane_limits[lane]:
                         work = queues[lane].popleft()
-                        local_hold = CreditVector()
-                        if lane == CoordinatorLane.LOCAL_PREPARE:
-                            if work.attempt_id not in oversubscribed_recovery:
-                                local_hold = local_prepare_hold(work)
-                                if not (
-                                    ledger.in_use
-                                    + provisional_local_total
-                                    + local_hold
-                                ).fits(ledger.limit):
-                                    queues[lane].appendleft(work)
-                                    break
+                        local_hold = transition_hold(work, lane)
+                        if work.attempt_id in oversubscribed_recovery:
+                            # Recovery may begin above the configured envelope,
+                            # but only one positive-growth emergency grant may
+                            # run at a time. This drains without multiplying the
+                            # existing overage across concurrent owners.
+                            if local_hold != CreditVector() and provisional_local:
+                                queues[lane].appendleft(work)
+                                break
+                        elif not (
+                            ledger.in_use + provisional_local_total + local_hold
+                        ).fits(ledger.limit):
+                            queues[lane].appendleft(work)
+                            break
                         try:
                             if needs_renewal(work, now):
                                 work = renew(work, lane)
@@ -923,17 +963,20 @@ class StagedParseCoordinator:
                                 now + self._limits.max_stage_step_seconds
                             ),
                             _revoked=Event(),
+                            _monotonic=self._monotonic,
                         )
                         if lane == CoordinatorLane.PREFLIGHT:
                             future = pools[lane].submit(
                                 self._backend.prepare_remote_io,
                                 work,
+                                credit_allowance=local_hold,
                                 stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.REMOTE:
                             future = pools[lane].submit(
                                 self._backend.run_remote,
                                 work,
+                                credit_allowance=local_hold,
                                 stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.LOCAL_PREPARE:
@@ -952,12 +995,14 @@ class StagedParseCoordinator:
                             future = pools[lane].submit(
                                 self._backend.run_local,
                                 work,
+                                credit_allowance=local_hold,
                                 stage_guard=stage_guard,
                             )
                         elif lane == CoordinatorLane.COMMIT:
                             future = pools[lane].submit(
                                 self._backend.commit,
                                 work,
+                                credit_allowance=local_hold,
                                 stage_guard=stage_guard,
                             )
                         else:
@@ -966,8 +1011,8 @@ class StagedParseCoordinator:
                                 work,
                                 stage_guard=stage_guard,
                             )
-                        in_flight[future] = (lane, work, stage_guard)
-                        if lane == CoordinatorLane.LOCAL_PREPARE:
+                        in_flight[future] = (lane, work, stage_guard, local_hold)
+                        if local_hold != CreditVector():
                             provisional_local[future] = local_hold
                             provisional_local_total = (
                                 provisional_local_total + local_hold
@@ -1021,7 +1066,7 @@ class StagedParseCoordinator:
                     emit()
                     continue
                 for future in done:
-                    lane, work, stage_guard = in_flight.pop(future)
+                    lane, work, stage_guard, granted_delta = in_flight.pop(future)
                     released_local_hold = (
                         provisional_local.pop(future)
                         if future in provisional_local
@@ -1099,6 +1144,15 @@ class StagedParseCoordinator:
                         if self._monotonic() > stage_guard.deadline_monotonic:
                             preserve_contract_violation(
                                 work, updated, lane, "bounded stage exceeded deadline"
+                            )
+                        elif not _positive_credit_delta(
+                            work.credits, updated.credits
+                        ).fits(granted_delta):
+                            preserve_contract_violation(
+                                work,
+                                updated,
+                                lane,
+                                "durable transition exceeded its credit grant",
                             )
                         elif place_transition(work, updated, lane):
                             retry_attempts.pop(work.attempt_id, None)

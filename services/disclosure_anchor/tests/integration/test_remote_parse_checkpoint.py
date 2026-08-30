@@ -340,6 +340,13 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             )
             uow.commit()
         self.assertEqual(result.state, "finish_committed")
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            witness = uow.remote_parse_attempts.durable_checkpoint_witness(
+                self.attempt_id
+            )
+        self.assertEqual(witness.state, "finish_committed")
+        self.assertIsNotNone(witness.accepted_submission_receipt_sha256)
+        self.assertIsNotNone(witness.terminal_receipt_sha256)
         with self.engine.connect() as conn:
             self.assertEqual(conn.execute(text("SELECT status FROM disclosure_core.document WHERE document_id=:d"), {"d": self.document_id}).scalar_one(), "parsed")
 
@@ -476,6 +483,13 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             uow.commit()
         self.assertEqual(committed.state, "remote_failure_committed")
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            witness = uow.remote_parse_attempts.durable_checkpoint_witness(
+                self.attempt_id
+            )
+        self.assertEqual(witness.state, "remote_failure_committed")
+        self.assertIsNotNone(witness.accepted_submission_receipt_sha256)
+        self.assertIsNotNone(witness.failure_receipt_sha256)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             final = uow.remote_parse_attempts.transition(
                 attempt_id=self.attempt_id,
                 fence_identity="fence-1",
@@ -502,6 +516,48 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 {"r": self.run_id},
             ).one()
         self.assertEqual(tuple(row), ("failed", "parse_failed", 1))
+
+    def test_local_failure_committed_witness_retains_all_append_only_receipts(self) -> None:
+        terminal = self._terminal(self._submitted(self._add_claim()))
+        receipt = encode_checkpoint_receipt(FailureReceipt(
+            attempt_identity=self.attempt_id,
+            fence_identity="fence-1",
+            stage="local",
+            accepted=True,
+            ack_required=True,
+            submission_was_attempted=True,
+            remote_task_identity="task-1",
+            claim_generation=terminal.claim_generation,
+            terminal_receipt_sha256=terminal.terminal_receipt_sha256,
+            error_code="materialization_contract",
+            error_stage="local_materialization",
+            error_class="local_materialization",
+            retryable=False,
+            retry_budget_class="item",
+            message="deterministic local materialization failure",
+        ))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            committed = uow.remote_parse_attempts.fail_run_and_checkpoint(
+                document_id=self.document_id,
+                processing_run_id=self.run_id,
+                attempt_id=self.attempt_id,
+                fence_identity="fence-1",
+                expected_state="remote_terminal",
+                expected_version=terminal.row_version,
+                claim_owner_identity="worker-boot-1",
+                claim_generation=terminal.claim_generation,
+                receipt=receipt,
+            )
+            uow.commit()
+        self.assertEqual(committed.state, "local_failure_committed")
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            witness = uow.remote_parse_attempts.durable_checkpoint_witness(
+                self.attempt_id
+            )
+        self.assertEqual(witness.state, "local_failure_committed")
+        self.assertIsNotNone(witness.accepted_submission_receipt_sha256)
+        self.assertEqual(witness.terminal_receipt_sha256, terminal.terminal_receipt_sha256)
+        self.assertEqual(witness.failure_receipt_sha256, receipt.sha256)
 
     def test_current_v1_checkpoint_blocks_recovery(self) -> None:
         with self.engine.begin() as conn:

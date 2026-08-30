@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 import threading
 import time
 import unittest
@@ -13,6 +13,7 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     RecoveryDeferred,
     RetryStage,
     StageLeaseGuard,
+    StageLeaseLost,
     StagedParseCoordinator,
 )
 
@@ -119,6 +120,28 @@ class _Backend:
         self.block_local_prepare = False
         self.local_prepare_entered = 0
         self.local_prepare_release = threading.Event()
+        self.block_local = False
+        self.local_entered = 0
+        self.local_release = threading.Event()
+
+    @staticmethod
+    def _assert_credit_grant(
+        before: CoordinatorWork,
+        after: CoordinatorWork,
+        allowance: CreditVector,
+    ) -> None:
+        positive = CreditVector(
+            **{
+                item.name: max(
+                    0,
+                    getattr(after.credits, item.name)
+                    - getattr(before.credits, item.name),
+                )
+                for item in fields(CreditVector)
+            }
+        )
+        if not positive.fits(allowance):
+            raise RetryStage("stage credit grant exhausted", retry_after_seconds=0.001)
 
     def list_recoverable(
         self, *, after_attempt_id: str | None, limit: int
@@ -194,7 +217,11 @@ class _Backend:
         return selected
 
     def prepare_remote_io(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         stage_guard.checkpoint()
         self.calls.append(f"preflight:{work.attempt_id}")
@@ -202,6 +229,7 @@ class _Backend:
             _work(work.attempt_id, "reconciling", work.row_version + 1),
             claim_generation=work.claim_generation,
         )
+        self._assert_credit_grant(work, updated, credit_allowance)
         if self.transition_violation == "equal_version":
             return replace(updated, row_version=work.row_version)
         if self.transition_violation == "jump_version":
@@ -213,7 +241,11 @@ class _Backend:
         return updated
 
     def run_remote(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         stage_guard.checkpoint()
         self.calls.append(f"remote:{work.attempt_id}:{work.state}")
@@ -234,7 +266,9 @@ class _Backend:
             target = _work(work.attempt_id, "submitted", work.row_version + 1)
         else:
             target = _work(work.attempt_id, "remote_terminal", work.row_version + 1)
-        return replace(target, claim_generation=work.claim_generation)
+        updated = replace(target, claim_generation=work.claim_generation)
+        self._assert_credit_grant(work, updated, credit_allowance)
+        return updated
 
     def prepare_local_io(
         self,
@@ -273,32 +307,48 @@ class _Backend:
         )
 
     def run_local(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         stage_guard.checkpoint()
         self.calls.append(f"local:{work.attempt_id}")
+        self.local_entered += 1
+        if self.block_local:
+            while not self.local_release.wait(timeout=0.001):
+                stage_guard.checkpoint()
         target = _work(work.attempt_id, "local_materialized", work.row_version + 1)
-        return replace(
+        updated = replace(
             target,
             claim_generation=work.claim_generation,
             claim_owner_identity=work.claim_owner_identity,
             lease_expires_monotonic=work.lease_expires_monotonic,
             credit_reservation=work.credit_reservation,
         )
+        self._assert_credit_grant(work, updated, credit_allowance)
+        return updated
 
     def commit(
-        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         stage_guard.checkpoint()
         self.calls.append(f"commit:{work.attempt_id}")
         target = _work(work.attempt_id, "finish_committed", work.row_version + 1)
-        return replace(
+        updated = replace(
             target,
             claim_generation=work.claim_generation,
             claim_owner_identity=work.claim_owner_identity,
             lease_expires_monotonic=work.lease_expires_monotonic,
             credit_reservation=work.credit_reservation,
         )
+        self._assert_credit_grant(work, updated, credit_allowance)
+        return updated
 
     def acknowledge(
         self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard
@@ -376,6 +426,18 @@ class CreditVectorTests(unittest.TestCase):
 
 
 class StagedParseCoordinatorTests(unittest.TestCase):
+    def test_stage_guard_uses_the_coordinator_clock_domain(self) -> None:
+        clock = [9.0]
+        guard = StageLeaseGuard(
+            deadline_monotonic=10.0,
+            _revoked=threading.Event(),
+            _monotonic=lambda: clock[0],
+        )
+        guard.checkpoint()
+        clock[0] = 11.0
+        with self.assertRaises(StageLeaseLost):
+            guard.checkpoint()
+
     def test_local_prepare_deterministic_failure_drains_directly_through_ack(self) -> None:
         backend = _Backend(
             recoverable=(_work("attempt-1", "remote_terminal", 4),)
@@ -505,6 +567,39 @@ class StagedParseCoordinatorTests(unittest.TestCase):
             result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
         )
 
+    def test_parallel_local_completion_holds_db_and_page_credit_before_cas(self) -> None:
+        backend = _Backend(
+            recoverable=(
+                _work("attempt-1", "materializing", 5),
+                _work("attempt-2", "materializing", 5),
+            )
+        )
+        backend.block_local = True
+        result_box: list[object] = []
+        limits = _limits(
+            credits=replace(_LIMIT, db_stage_items=1, unpublished_pages=10),
+            local_workers=2,
+        )
+        thread = threading.Thread(
+            target=lambda: result_box.append(
+                StagedParseCoordinator(backend=backend, limits=limits).run()
+            )
+        )
+        thread.start()
+        deadline = time.monotonic() + 1
+        while backend.local_entered < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual(backend.local_entered, 1)
+        time.sleep(0.02)
+        self.assertEqual(backend.local_entered, 1)
+        backend.local_release.set()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(backend.local_entered, 2)
+        self.assertEqual(
+            result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
+        )
+
     def test_transient_remote_retry_preserves_work_and_then_completes(self) -> None:
         backend = _Backend(new=(_work("attempt-1", "prepared"),))
         backend.retry_remote_once = True
@@ -578,6 +673,45 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         ]
         self.assertTrue(admit_indices)
         self.assertLess(local_prepare_index, admit_indices[0])
+
+    def test_multiple_oversubscribed_recoveries_receive_one_growth_grant(self) -> None:
+        recoverable = tuple(
+            replace(
+                _work(f"attempt-{index}", "remote_terminal", 5),
+                credit_reservation=replace(
+                    _LIFECYCLE_RESERVATION, retained_bytes=20_000
+                ),
+                credits=CreditVector(
+                    documents=1, retained_results=1, retained_bytes=20_000
+                ),
+            )
+            for index in range(3)
+        )
+        backend = _Backend(recoverable=recoverable)
+        backend.block_local_prepare = True
+        result_box: list[object] = []
+        thread = threading.Thread(
+            target=lambda: result_box.append(
+                StagedParseCoordinator(
+                    backend=backend,
+                    limits=_limits(local_prepare_workers=3),
+                ).run()
+            )
+        )
+        thread.start()
+        deadline = time.monotonic() + 1
+        while backend.local_prepare_entered < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual(backend.local_prepare_entered, 1)
+        time.sleep(0.02)
+        self.assertEqual(backend.local_prepare_entered, 1)
+        backend.local_prepare_release.set()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(backend.local_prepare_entered, 3)
+        self.assertEqual(
+            result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
+        )
 
     def test_stop_during_unclaimable_recovery_never_reports_quiescent(self) -> None:
         backend = _Backend(recoverable=(_work("attempt-0", "submitted"),))

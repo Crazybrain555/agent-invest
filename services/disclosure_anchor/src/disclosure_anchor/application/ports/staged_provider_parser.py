@@ -32,6 +32,7 @@ class SubmissionAcceptanceAmbiguous(ParserOutputContractError):
 _DURABLE_CHECKPOINT_STATES = frozenset(
     {
         "prepared",
+        "reconciling",
         "submitted",
         "pre_submission_failed",
         "remote_failure_committed",
@@ -110,11 +111,12 @@ class DurableCheckpointWitness:
                 )
         expected_presence = {
             "prepared": (False, False, False, False),
+            "reconciling": (False, False, False, False),
             "submitted": (True, False, False, True),
             "pre_submission_failed": (False, False, True, False),
-            "remote_failure_committed": (False, False, True, True),
-            "local_failure_committed": (False, True, True, True),
-            "finish_committed": (False, True, False, True),
+            "remote_failure_committed": (True, False, True, True),
+            "local_failure_committed": (True, True, True, True),
+            "finish_committed": (True, True, False, True),
         }[self.state]
         actual_presence = tuple(value is not None for value in (*hashes, self.remote_task_identity))
         if actual_presence != expected_presence:
@@ -693,6 +695,7 @@ class StagedProviderDocumentParserPort(Protocol):
         prepared_submission: PreparedLocalSubmission | PreparedSubmissionIdentity,
         witness: DurableCheckpointWitness,
         submission_receipt: PersistedSubmissionReceipt | None = None,
+        accepted_receipt: EncodedCheckpointReceipt | None = None,
         failure_receipt: EncodedCheckpointReceipt | None = None,
     ) -> None:
         """Discard only after a DB state proves POST replay no longer needs it."""

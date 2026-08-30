@@ -29,6 +29,7 @@ from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
 )
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
+    AcceptedSubmissionReceipt,
     EncodedCheckpointReceipt,
     FailureReceipt,
     TerminalReceipt,
@@ -1107,7 +1108,7 @@ class MinerUHttpStagedParser:
         if identity != expected:
             raise _fail("durable prepared submission identity drifted")
         if (
-            witness.state != "prepared"
+            witness.state not in {"prepared", "reconciling"}
             or witness.attempt_identity != identity.attempt_identity
             or witness.fence_identity != identity.fence_identity
             or witness.prepared_submission_sha256 != identity.sha256
@@ -1121,6 +1122,44 @@ class MinerUHttpStagedParser:
             or witness.submission_epoch_unix != identity.submission_epoch_unix
         ):
             raise _fail("local submission requires its durable prepared checkpoint")
+        snapshot = self._spool_root / _derived_snapshot_name(identity)
+        if witness.state == "reconciling":
+            lock_path = snapshot.with_suffix(".lock")
+            lock_fd = os.open(lock_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                _validate_snapshot_stat(os.fstat(lock_fd))
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                snapshot_fd = os.open(
+                    snapshot, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    snapshot_stat, _ = _verify_snapshot_fd(
+                        snapshot_fd, expected_sha256=identity.source_pdf_sha256
+                    )
+                    current = snapshot.stat(follow_symlinks=False)
+                    if _stat_identity(current) != _stat_identity(snapshot_stat):
+                        raise _fail("reconciling snapshot path drifted")
+                finally:
+                    os.close(snapshot_fd)
+            finally:
+                os.close(lock_fd)
+            return PreparedLocalSubmission(
+                identity=identity,
+                checkpoint_contract_version=witness.checkpoint_contract_version,
+                row_version=witness.row_version,
+                claim_generation=witness.claim_generation,
+                snapshot_path=snapshot,
+                snapshot_sha256=identity.source_pdf_sha256,
+                snapshot_bytes=snapshot_stat.st_size,
+                snapshot_device=snapshot_stat.st_dev,
+                snapshot_inode=snapshot_stat.st_ino,
+                snapshot_mode=snapshot_stat.st_mode,
+                snapshot_uid=snapshot_stat.st_uid,
+                snapshot_nlink=snapshot_stat.st_nlink,
+                snapshot_mtime_ns=snapshot_stat.st_mtime_ns,
+                snapshot_ctime_ns=snapshot_stat.st_ctime_ns,
+                upload_filename=f"{identity.source_pdf_sha256[7:]}.pdf",
+            )
         source_fd = os.open(input_pdf, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         before = os.fstat(source_fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -1136,7 +1175,6 @@ class MinerUHttpStagedParser:
         ):
             os.close(source_fd)
             raise _fail("source differs from prepared submission")
-        snapshot = self._spool_root / _derived_snapshot_name(identity)
         lock_path = snapshot.with_suffix(".lock")
         temp_path: Path | None = None
         try:
@@ -1225,6 +1263,7 @@ class MinerUHttpStagedParser:
         prepared_submission: PreparedLocalSubmission | PreparedSubmissionIdentity,
         witness: DurableCheckpointWitness,
         submission_receipt: PersistedSubmissionReceipt | None = None,
+        accepted_receipt: EncodedCheckpointReceipt | None = None,
         failure_receipt: EncodedCheckpointReceipt | None = None,
     ) -> None:
         identity = (
@@ -1249,8 +1288,11 @@ class MinerUHttpStagedParser:
         ):
             raise _fail("snapshot discard requires an exact durable checkpoint state")
         if witness.state == "submitted":
+            accepted = None if accepted_receipt is None else accepted_receipt.receipt
             if (
                 submission_receipt is None
+                or not isinstance(accepted, AcceptedSubmissionReceipt)
+                or accepted_receipt is None
                 or failure_receipt is not None
                 or submission_receipt.attempt_identity != witness.attempt_identity
                 or submission_receipt.fence_identity != witness.fence_identity
@@ -1262,8 +1304,18 @@ class MinerUHttpStagedParser:
                 != witness.submission_epoch_unix
                 or submission_receipt.remote_task_identity
                 != witness.remote_task_identity
-                or submission_receipt.sha256
+                or accepted_receipt.sha256
                 != witness.accepted_submission_receipt_sha256
+                or accepted.attempt_identity != submission_receipt.attempt_identity
+                or accepted.fence_identity != submission_receipt.fence_identity
+                or accepted.source_pdf_sha256
+                != submission_receipt.source_pdf_sha256
+                or accepted.client_submit_key
+                != submission_receipt.client_submit_key
+                or accepted.submission_epoch_unix
+                != submission_receipt.submission_epoch_unix
+                or accepted.remote_task_identity
+                != submission_receipt.remote_task_identity
             ):
                 raise _fail("submitted snapshot discard receipt drifted")
         else:
@@ -1274,6 +1326,7 @@ class MinerUHttpStagedParser:
             if (
                 not isinstance(failure, FailureReceipt)
                 or submission_receipt is not None
+                or accepted_receipt is not None
                 or failure.attempt_identity != witness.attempt_identity
                 or failure.fence_identity != witness.fence_identity
                 or failure.remote_task_identity
@@ -1306,9 +1359,20 @@ class MinerUHttpStagedParser:
             if isinstance(prepared_submission, PreparedLocalSubmission):
                 _unlink_owned_snapshot(expected_path, expected=prepared_submission)
             else:
-                snapshot_fd = os.open(
-                    expected_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                )
+                try:
+                    snapshot_fd = os.open(
+                        expected_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                except FileNotFoundError:
+                    snapshot_fd = None
+                if snapshot_fd is None:
+                    _cleanup_stale_snapshot_temps(self._spool_root, expected_path)
+                    lock_stat = os.fstat(lock_fd)
+                    current = lock_path.stat(follow_symlinks=False)
+                    if _stat_identity(current) != _stat_identity(lock_stat):
+                        raise _fail("snapshot lock path drifted")
+                    _fsync_directory(self._spool_root)
+                    return
                 try:
                     snapshot_stat, _ = _verify_snapshot_fd(
                         snapshot_fd, expected_sha256=identity.source_pdf_sha256
