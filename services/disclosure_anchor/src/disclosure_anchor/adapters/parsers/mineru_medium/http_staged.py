@@ -45,10 +45,12 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     PreparedSubmissionIdentity,
     PrivateSubmittedTaskResume,
     ProviderMaterializationEvidence,
+    ProviderAckCompletionWitness,
     RemoteArtifactReceipt,
     RemoteProviderParseHandle,
     StagedProviderParserResult,
     SubmissionAcceptanceAmbiguous,
+    encode_provider_ack_completion_witness,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -883,7 +885,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         *,
         receipt: RemoteArtifactReceipt,
         witness: DurableCheckpointWitness,
-    ) -> None:
+    ) -> ProviderAckCompletionWitness:
         if (
             witness.state != "finish_committed"
             or witness.attempt_identity != receipt.attempt_identity
@@ -896,14 +898,24 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
         task, _spool_path, artifact_sha256 = _Task.from_token(receipt.resume_token)
         if task != self._task or artifact_sha256 != receipt.artifact_sha256:
             raise _fail("remote ACK receipt ownership drifted")
-        self._ack_terminal()
+        status = self._ack_terminal()
+        return encode_provider_ack_completion_witness(
+            attempt_identity=receipt.attempt_identity,
+            fence_identity=receipt.fence_identity,
+            remote_task_identity=self._task.task_id,
+            source_pdf_sha256=receipt.source_pdf_sha256,
+            committed_state="finish_committed",
+            terminal_receipt_sha256=witness.terminal_receipt_sha256,
+            failure_receipt_sha256=None,
+            http_status=status,
+        )
 
     def acknowledge_after_failure_committed(
         self,
         *,
         witness: DurableCheckpointWitness,
         failure_receipt: EncodedCheckpointReceipt,
-    ) -> None:
+    ) -> ProviderAckCompletionWitness:
         failure = failure_receipt.receipt
         if (
             not isinstance(failure, FailureReceipt)
@@ -932,9 +944,19 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             failure.terminal_receipt_sha256 != witness.terminal_receipt_sha256
         ):
             raise _fail("local failure terminal receipt drifted")
-        self._ack_terminal()
+        status = self._ack_terminal()
+        return encode_provider_ack_completion_witness(
+            attempt_identity=failure.attempt_identity,
+            fence_identity=failure.fence_identity,
+            remote_task_identity=self._task.task_id,
+            source_pdf_sha256=witness.source_pdf_sha256,
+            committed_state=witness.state,
+            terminal_receipt_sha256=witness.terminal_receipt_sha256,
+            failure_receipt_sha256=witness.failure_receipt_sha256,
+            http_status=status,
+        )
 
-    def _ack_terminal(self) -> None:
+    def _ack_terminal(self) -> int:
         with self._client(30.0) as client:
             with client.stream(
                 "POST", f"{self._task.base_url}/tasks/{self._task.task_id}/ack"
@@ -956,6 +978,7 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
                 }
             ):
                 raise _fail("result acknowledgement identity drifted")
+            return response.status_code
 
     def _download_retained_result(self, receipt: RemoteArtifactReceipt) -> Path:
         self._spool_root.mkdir(parents=True, exist_ok=True)

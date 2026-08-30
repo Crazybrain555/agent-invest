@@ -49,6 +49,7 @@ from disclosure_anchor.application.ports.repositories import (
 )
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
+    ProviderAckCompletionWitness,
     encode_durable_checkpoint_witness,
     prepared_submission_identity_from_reconcile,
 )
@@ -1729,6 +1730,434 @@ class RemoteParseAttemptRepository:
             secret_row=secret_row,
         )
 
+    def checkpoint_v3_local(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+    ) -> ClaimedAttemptSnapshot:
+        validated = decode_checkpoint_receipt(receipt.exact_bytes)
+        local = validated.receipt
+        prepared_encoded = (
+            None if expected_attempt.materialization_receipt_bytes is None
+            else decode_checkpoint_receipt(expected_attempt.materialization_receipt_bytes)
+        )
+        prepared = None if prepared_encoded is None else prepared_encoded.receipt
+        if validated != receipt or not isinstance(local, LocalMaterializationReceiptV2):
+            raise ValueError("v3 local receipt is not canonical LocalV2 evidence")
+        if not isinstance(prepared, PreparedMaterializationReceiptV2) or not (
+            expected_attempt.state == "materializing"
+            and local.attempt_identity == expected_attempt.attempt_id
+            and local.fence_identity == expected_attempt.fence_identity
+            and local.claim_generation == expected_attempt.claim_generation
+            and local.source_pdf_sha256 == expected_attempt.source_pdf_sha256
+            and local.source_page_count == expected_attempt.reservation_source_page_count
+            and local.parser_target_sha256 == expected_attempt.parser_target_sha256
+            and local.terminal_receipt_sha256 == expected_attempt.terminal_receipt_sha256
+            and local.process_profile_sha256 == expected_attempt.process_profile_sha256
+            and local.credit_policy_sha256 == expected_attempt.credit_policy_sha256
+            and local.reservation_input_sha256 == expected_attempt.reservation_input_sha256
+            and local.prepared_materialization_sha256
+            == expected_attempt.materialization_receipt_sha256
+            and local.artifact_owner_identity == expected_attempt.result_owner_identity
+            and local.artifact_sha256 == expected_attempt.result_artifact_sha256
+            and local.artifact_byte_count == expected_attempt.result_artifact_bytes
+            and local.compressed_byte_count == prepared.compressed_byte_count
+            and local.uncompressed_byte_count == prepared.uncompressed_byte_count
+            and local.member_count == prepared.member_count
+            and local.temporary_disk_byte_count == prepared.temporary_disk_byte_count
+            and local.decoded_byte_count == prepared.decoded_byte_count
+        ):
+            raise ValueError("v3 local receipt drifted from durable materialization")
+        candidate = credit_shape(
+            "local_materialized",
+            CreditShapeFacts(
+                terminal_byte_count=expected_attempt.result_artifact_bytes or 0,
+                compressed_byte_count=local.compressed_byte_count,
+                uncompressed_byte_count=local.uncompressed_byte_count,
+                decoded_byte_count=local.decoded_byte_count,
+                temporary_disk_byte_count=local.temporary_disk_byte_count,
+                db_staged_byte_count=local.db_staged_byte_count,
+                source_page_count=local.source_page_count,
+                materialization_prepared=True,
+                local_materialization_completed=True,
+            ),
+        )
+        return self._transition_v3_lifecycle(
+            expected=expected_attempt,
+            next_state="local_materialized",
+            candidate_current=candidate,
+            grant=grant,
+            extra_values={
+                "local_receipt_sha256": validated.sha256,
+                "local_receipt_bytes": validated.exact_bytes,
+                "local_receipt_byte_count": validated.byte_count,
+                "local_db_staged_byte_count": local.db_staged_byte_count,
+            },
+        )
+
+    def finish_v3_run_and_checkpoint(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, finished_run: e.ProcessingRun,
+    ) -> ClaimedAttemptSnapshot:
+        if expected_attempt.state != "local_materialized" or finished_run.status != "succeeded":
+            raise ValueError("v3 finish requires local_materialized and succeeded run")
+        if expected_attempt.local_receipt_bytes is None:
+            raise ValueError("v3 finish lacks local receipt")
+        encoded = decode_checkpoint_receipt(expected_attempt.local_receipt_bytes)
+        local = encoded.receipt
+        target_exact = (
+            None if finished_run.parser_target_identity is None else json.dumps(
+                finished_run.parser_target_identity,
+                sort_keys=True, separators=(",", ":"),
+            ).encode()
+        )
+        target_sha = None if target_exact is None else (
+            "sha256:" + hashlib.sha256(target_exact).hexdigest()
+        )
+        if not isinstance(local, LocalMaterializationReceiptV2) or not (
+            encoded.sha256 == expected_attempt.local_receipt_sha256
+            and finished_run.processing_run_id == expected_attempt.processing_run_id
+            and finished_run.document_id == expected_attempt.document_id
+            and finished_run.input_raw_file_hash == local.source_pdf_sha256
+            and target_sha == local.parser_target_sha256
+            and finished_run.provider_document_relpath == local.provider_envelope_relpath
+            and finished_run.artifact_hash == local.provider_envelope_sha256
+            and finished_run.parser_artifact_relpath == local.artifact_root_relpath
+        ):
+            raise ValueError("v3 succeeded run drifted from local receipt")
+        acquire_document_xact_lock(self._session, expected_attempt.document_id)
+        document = self._session.execute(sa.select(models.Document).where(
+            models.Document.document_id == expected_attempt.document_id
+        ).with_for_update()).scalar_one_or_none()
+        run = self._session.execute(sa.select(models.ProcessingRun).where(
+            models.ProcessingRun.processing_run_id == expected_attempt.processing_run_id,
+            models.ProcessingRun.document_id == expected_attempt.document_id,
+        ).with_for_update()).scalar_one_or_none()
+        current = self._session.execute(sa.select(models.RemoteParseAttempt).where(
+            models.RemoteParseAttempt.attempt_id == expected_attempt.attempt_id
+        ).with_for_update()).scalar_one_or_none()
+        if document is None or run is None or current is None or run.status != "running":
+            raise RemoteParseCheckpointConflict("v3 finish lost first-terminal lock")
+        candidate = credit_shape(
+            "finish_committed",
+            CreditShapeFacts(terminal_byte_count=expected_attempt.result_artifact_bytes or 0),
+        )
+        with self._session.begin_nested():
+            ProcessingRunRepository(self._session).update(finished_run)
+            if document.current_processing_run_id is None:
+                document.status = "parsed"
+            snapshot = self._transition_v3_lifecycle(
+                expected=expected_attempt, next_state="finish_committed",
+                candidate_current=candidate, grant=grant,
+            )
+        return snapshot
+
+    def _fail_v3_run_and_checkpoint(
+        self, *, expected: RemoteParseAttempt,
+        operation: str, grant: CreditTransitionGrant | None,
+        receipt: EncodedCheckpointReceipt,
+        local_receipt: EncodedCheckpointReceipt | None = None,
+    ) -> RemoteParseAttempt | ClaimedAttemptSnapshot:
+        validated = decode_checkpoint_receipt(receipt.exact_bytes)
+        failure = validated.receipt
+        expected_shape = {
+            "pre_submission": ("prepared", "pre_submission", "pre_submission_failed"),
+            "remote": ("submitted", "remote_terminal", "remote_failure_committed"),
+            "local_remote_terminal": (
+                "remote_terminal", "local_materialization", "local_failure_committed"
+            ),
+            "local_materializing": (
+                "materializing", "local_materialization", "local_failure_committed"
+            ),
+        }
+        if operation not in expected_shape:
+            raise ValueError("v3 failure operation is unsupported")
+        source_state, error_class, next_state = expected_shape[operation]
+        if validated != receipt or not isinstance(failure, FailureReceipt) or not (
+            expected.state == source_state
+            and failure.error_class == error_class
+            and failure.attempt_identity == expected.attempt_id
+            and failure.fence_identity == expected.fence_identity
+            and failure.claim_generation == expected.claim_generation
+            and failure.remote_task_identity == expected.remote_task_identity
+            and (
+                failure.stage == "remote"
+                if operation in {"pre_submission", "remote"}
+                else failure.stage == "local"
+            )
+            and (
+                failure.terminal_receipt_sha256 is None
+                if operation in {"pre_submission", "remote"}
+                else failure.terminal_receipt_sha256 == expected.terminal_receipt_sha256
+            )
+        ):
+            raise ValueError("v3 failure receipt drifted from operation")
+        if operation == "pre_submission" and not (
+            failure.accepted is False and failure.ack_required is False
+            and failure.submission_was_attempted is False
+        ):
+            raise ValueError("v3 pre-submission failure is not closed")
+        if operation != "pre_submission" and not (
+            failure.accepted and failure.ack_required and failure.submission_was_attempted
+        ):
+            raise ValueError("v3 accepted failure is not ACK-bound")
+        acquire_document_xact_lock(self._session, expected.document_id)
+        document = self._session.execute(sa.select(models.Document).where(
+            models.Document.document_id == expected.document_id
+        ).with_for_update()).scalar_one_or_none()
+        run = self._session.execute(sa.select(models.ProcessingRun).where(
+            models.ProcessingRun.processing_run_id == expected.processing_run_id,
+            models.ProcessingRun.document_id == expected.document_id,
+        ).with_for_update()).scalar_one_or_none()
+        current = self._session.execute(sa.select(models.RemoteParseAttempt).where(
+            models.RemoteParseAttempt.attempt_id == expected.attempt_id
+        ).with_for_update()).scalar_one_or_none()
+        if document is None or run is None or current is None or run.status != "running":
+            raise RemoteParseCheckpointConflict("v3 failure lost first-terminal lock")
+        error = {
+            "stage": failure.error_stage,
+            "error_code": failure.error_code,
+            "retryable": failure.retryable,
+            "retry_budget_class": failure.retry_budget_class,
+            "message": failure.message,
+        }
+        finished_at = datetime.now(timezone.utc)
+        extra: dict[str, Any] = {
+            "failure_receipt_sha256": validated.sha256,
+            "failure_receipt_bytes": validated.exact_bytes,
+            "failure_receipt_byte_count": validated.byte_count,
+            "failure_stage": failure.stage,
+        }
+        local: LocalMaterializationReceiptV2 | None = None
+        local_encoded: EncodedCheckpointReceipt | None = None
+        if local_receipt is not None:
+            local_encoded = decode_checkpoint_receipt(local_receipt.exact_bytes)
+            if local_encoded != local_receipt or not isinstance(
+                local_encoded.receipt, LocalMaterializationReceiptV2
+            ):
+                raise ValueError("v3 completed local failure receipt is invalid")
+            local = local_encoded.receipt
+            prepared_encoded = (
+                None if expected.materialization_receipt_bytes is None else
+                decode_checkpoint_receipt(expected.materialization_receipt_bytes)
+            )
+            prepared = None if prepared_encoded is None else prepared_encoded.receipt
+            if not (
+                operation == "local_materializing"
+                and isinstance(prepared, PreparedMaterializationReceiptV2)
+                and local.attempt_identity == expected.attempt_id
+                and local.fence_identity == expected.fence_identity
+                and local.claim_generation == expected.claim_generation
+                and local.source_pdf_sha256 == expected.source_pdf_sha256
+                and local.source_page_count == expected.reservation_source_page_count
+                and local.parser_target_sha256 == expected.parser_target_sha256
+                and local.prepared_materialization_sha256
+                == expected.materialization_receipt_sha256
+                and local.terminal_receipt_sha256 == expected.terminal_receipt_sha256
+                and local.process_profile_sha256 == expected.process_profile_sha256
+                and local.credit_policy_sha256 == expected.credit_policy_sha256
+                and local.reservation_input_sha256 == expected.reservation_input_sha256
+                and local.artifact_owner_identity == expected.result_owner_identity
+                and local.artifact_sha256 == expected.result_artifact_sha256
+                and local.artifact_byte_count == expected.result_artifact_bytes
+                and local.compressed_byte_count == prepared.compressed_byte_count
+                and local.uncompressed_byte_count == prepared.uncompressed_byte_count
+                and local.member_count == prepared.member_count
+                and local.temporary_disk_byte_count == prepared.temporary_disk_byte_count
+                and local.decoded_byte_count == prepared.decoded_byte_count
+            ):
+                raise ValueError("v3 completed local failure drifted from attempt")
+            extra.update(
+                local_receipt_sha256=local_encoded.sha256,
+                local_receipt_bytes=local_encoded.exact_bytes,
+                local_receipt_byte_count=local_encoded.byte_count,
+                local_db_staged_byte_count=local.db_staged_byte_count,
+            )
+        with self._session.begin_nested():
+            run.status = "failed"
+            run.finished_at = finished_at
+            run.error = error
+            if document.current_processing_run_id is None:
+                document.status = "parse_failed"
+            OutboxRepository(self._session).add(outbox_events.processing_run_failed(
+                document_id=expected.document_id,
+                processing_run_id=expected.processing_run_id,
+                error=error, occurred_at=finished_at,
+            ))
+            if operation == "pre_submission":
+                assert expected.current_credits is not None
+                clock = self._database_clock()
+                result = self._session.execute(sa.update(models.RemoteParseAttempt).where(
+                    models.RemoteParseAttempt.attempt_id == expected.attempt_id,
+                    models.RemoteParseAttempt.fence_identity == expected.fence_identity,
+                    models.RemoteParseAttempt.checkpoint_contract_version == 3,
+                    models.RemoteParseAttempt.state == "prepared",
+                    models.RemoteParseAttempt.row_version == expected.row_version,
+                    models.RemoteParseAttempt.claim_owner_identity == expected.claim_owner_identity,
+                    models.RemoteParseAttempt.claim_generation == expected.claim_generation,
+                    models.RemoteParseAttempt.claim_lease_until > clock.c.database_observed_at,
+                    *self._v3_current_predicates(expected.current_credits),
+                ).values(
+                    **extra, state=next_state, row_version=expected.row_version + 1,
+                    is_current=False, claim_owner_identity=None,
+                    claim_lease_until=None, updated_at=clock.c.database_observed_at,
+                    **{f"current_{name}": 0 for name in CreditVector.__dataclass_fields__},
+                ).returning(models.RemoteParseAttempt)).scalar_one_or_none()
+                if result is None:
+                    raise RemoteParseCheckpointConflict("v3 pre-submission failure lost CAS")
+                final = _remote_attempt_entity(result)
+            else:
+                facts = CreditShapeFacts()
+                if operation.startswith("local"):
+                    materialization = (
+                        None if expected.materialization_receipt_bytes is None else
+                        decode_checkpoint_receipt(expected.materialization_receipt_bytes).receipt
+                    )
+                    facts = CreditShapeFacts(
+                        terminal_byte_count=expected.result_artifact_bytes or 0,
+                        compressed_byte_count=(
+                            local.compressed_byte_count if local is not None else
+                            getattr(materialization, "compressed_byte_count", 0)
+                        ),
+                        uncompressed_byte_count=(
+                            local.uncompressed_byte_count if local is not None else
+                            getattr(materialization, "uncompressed_byte_count", 0)
+                        ),
+                        decoded_byte_count=(
+                            local.decoded_byte_count if local is not None else
+                            getattr(materialization, "decoded_byte_count", 0)
+                        ),
+                        temporary_disk_byte_count=(
+                            local.temporary_disk_byte_count if local is not None else
+                            getattr(materialization, "temporary_disk_byte_count", 0)
+                        ),
+                        db_staged_byte_count=0 if local is None else local.db_staged_byte_count,
+                        source_page_count=(
+                            0 if operation == "local_remote_terminal" else
+                            expected.reservation_source_page_count or 0
+                        ),
+                        materialization_prepared=operation == "local_materializing",
+                        local_materialization_completed=local is not None,
+                    )
+                candidate = credit_shape(next_state, facts)
+                if grant is None:
+                    raise ValueError("v3 committed failure requires a credit grant")
+                snapshot = self._transition_v3_lifecycle(
+                    expected=expected, next_state=next_state,
+                    candidate_current=candidate, grant=grant, extra_values=extra,
+                )
+        return final if operation == "pre_submission" else snapshot
+
+    def fail_v3_pre_submission(
+        self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
+    ) -> RemoteParseAttempt:
+        result = self._fail_v3_run_and_checkpoint(
+            expected=expected_attempt, operation="pre_submission",
+            grant=None, receipt=receipt,
+        )
+        assert isinstance(result, RemoteParseAttempt)
+        return result
+
+    def fail_v3_remote(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+    ) -> ClaimedAttemptSnapshot:
+        result = self._fail_v3_run_and_checkpoint(
+            expected=expected_attempt, operation="remote",
+            grant=grant, receipt=receipt,
+        )
+        assert isinstance(result, ClaimedAttemptSnapshot)
+        return result
+
+    def fail_v3_local(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+        local_receipt: EncodedCheckpointReceipt | None = None,
+    ) -> ClaimedAttemptSnapshot:
+        operation = (
+            "local_materializing" if expected_attempt.state == "materializing"
+            else "local_remote_terminal"
+        )
+        result = self._fail_v3_run_and_checkpoint(
+            expected=expected_attempt, operation=operation,
+            grant=grant, receipt=receipt, local_receipt=local_receipt,
+        )
+        assert isinstance(result, ClaimedAttemptSnapshot)
+        return result
+
+    def finalize_v3_ack(
+        self, *, expected_attempt: RemoteParseAttempt,
+        witness: ProviderAckCompletionWitness,
+    ) -> RemoteParseAttempt:
+        self._validate_expected_v3_attempt(expected_attempt)
+        if type(witness) is not ProviderAckCompletionWitness:
+            raise ValueError("v3 final ACK requires a typed provider witness")
+        final_state = {
+            "finish_committed": "acked",
+            "remote_failure_committed": "remote_failed",
+            "local_failure_committed": "local_failed",
+        }.get(expected_attempt.state)
+        if final_state is None or not (
+            witness.committed_state == expected_attempt.state
+            and witness.attempt_identity == expected_attempt.attempt_id
+            and witness.fence_identity == expected_attempt.fence_identity
+            and witness.remote_task_identity == expected_attempt.remote_task_identity
+            and witness.source_pdf_sha256 == expected_attempt.source_pdf_sha256
+            and witness.terminal_receipt_sha256 == expected_attempt.terminal_receipt_sha256
+            and witness.failure_receipt_sha256 == expected_attempt.failure_receipt_sha256
+        ):
+            raise ValueError("v3 provider ACK witness drifted from committed attempt")
+        assert expected_attempt.current_credits is not None
+        clock = self._database_clock()
+        values: dict[str, Any] = {
+            "state": final_state,
+            "is_current": False,
+            "row_version": expected_attempt.row_version + 1,
+            "claim_owner_identity": None,
+            "claim_lease_until": None,
+            "updated_at": clock.c.database_observed_at,
+            **{f"current_{name}": 0 for name in CreditVector.__dataclass_fields__},
+        }
+        result = self._session.execute(sa.update(models.RemoteParseAttempt).where(
+            models.RemoteParseAttempt.attempt_id == expected_attempt.attempt_id,
+            models.RemoteParseAttempt.fence_identity == expected_attempt.fence_identity,
+            models.RemoteParseAttempt.checkpoint_contract_version == 3,
+            models.RemoteParseAttempt.state == expected_attempt.state,
+            models.RemoteParseAttempt.row_version == expected_attempt.row_version,
+            models.RemoteParseAttempt.claim_owner_identity
+            == expected_attempt.claim_owner_identity,
+            models.RemoteParseAttempt.claim_generation == expected_attempt.claim_generation,
+            models.RemoteParseAttempt.claim_lease_until > clock.c.database_observed_at,
+            *self._v3_current_predicates(expected_attempt.current_credits),
+        ).values(**values).returning(models.RemoteParseAttempt)).scalar_one_or_none()
+        if result is not None:
+            return _remote_attempt_entity(result)
+        replay = self._session.execute(sa.select(models.RemoteParseAttempt).where(
+            models.RemoteParseAttempt.attempt_id == expected_attempt.attempt_id,
+            models.RemoteParseAttempt.fence_identity == expected_attempt.fence_identity,
+            models.RemoteParseAttempt.checkpoint_contract_version == 3,
+            models.RemoteParseAttempt.state == final_state,
+            models.RemoteParseAttempt.is_current.is_(False),
+            models.RemoteParseAttempt.row_version == expected_attempt.row_version + 1,
+            models.RemoteParseAttempt.remote_task_identity
+            == expected_attempt.remote_task_identity,
+            models.RemoteParseAttempt.terminal_receipt_sha256
+            .is_(None) if expected_attempt.terminal_receipt_sha256 is None else
+            models.RemoteParseAttempt.terminal_receipt_sha256
+            == expected_attempt.terminal_receipt_sha256,
+            models.RemoteParseAttempt.failure_receipt_sha256
+            .is_(None) if expected_attempt.failure_receipt_sha256 is None else
+            models.RemoteParseAttempt.failure_receipt_sha256
+            == expected_attempt.failure_receipt_sha256,
+            *(
+                getattr(models.RemoteParseAttempt, f"current_{name}") == 0
+                for name in CreditVector.__dataclass_fields__
+            ),
+        )).scalar_one_or_none()
+        if replay is None:
+            raise RemoteParseCheckpointConflict("v3 ACK finalization lost exact CAS")
+        return _remote_attempt_entity(replay)
+
     @staticmethod
     def _v3_operation_target_credit_predicates(next_state: str) -> tuple[Any, ...]:
         values: dict[str, Any] = {
@@ -1748,6 +2177,20 @@ class RemoteParseAttemptRepository:
                 "compressed_bytes": models.RemoteParseAttempt.materialization_compressed_byte_count,
                 "decoded_bytes": models.RemoteParseAttempt.materialization_decoded_byte_count,
                 "temp_disk_bytes": models.RemoteParseAttempt.materialization_temp_disk_byte_count,
+            })
+        elif next_state == "local_materialized":
+            values.update({
+                "retained_results": 1,
+                "retained_bytes": models.RemoteParseAttempt.result_artifact_bytes,
+                "db_stage_items": 1,
+                "db_staged_bytes": models.RemoteParseAttempt.local_db_staged_byte_count,
+                "unpublished_pages": models.RemoteParseAttempt.reservation_source_page_count,
+            })
+        elif next_state == "finish_committed":
+            values.update({
+                "retained_results": 1,
+                "retained_bytes": models.RemoteParseAttempt.result_artifact_bytes,
+                "ack_items": 1,
             })
         else:
             raise ValueError("v3 race operation target is unsupported")
@@ -1833,6 +2276,24 @@ class RemoteParseAttemptRepository:
             expected_attempt=expected_attempt,
             required_state="remote_terminal",
             next_state="materializing",
+        )
+
+    def reconcile_v3_local_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state="materializing",
+            next_state="local_materialized",
+        )
+
+    def reconcile_v3_finish_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state="local_materialized",
+            next_state="finish_committed",
         )
 
     def claim_recovery(

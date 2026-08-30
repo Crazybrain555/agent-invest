@@ -23,6 +23,7 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     AcceptedSubmissionReceipt,
     FailureReceipt,
     LocalMaterializationReceipt,
+    LocalMaterializationReceiptV2,
     PreparedMaterializationReceiptV2,
     PreparedReconcileReceipt,
     RemoteParseAttempt,
@@ -39,6 +40,9 @@ from disclosure_anchor.application.contracts.staged_credit import (
     credit_shape,
 )
 from disclosure_anchor.application.ports.repositories import CreditTransitionGrant
+from disclosure_anchor.application.ports.staged_provider_parser import (
+    encode_provider_ack_completion_witness,
+)
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
 from tests.unit.test_mineru_process_profile import _profile
@@ -428,6 +432,121 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             token_byte_count=encoded.byte_count,
             secret_contract_version=3,
         )
+
+    def _v3_claimed_attempt(self) -> RemoteParseAttempt:
+        attempt, secret = self._v3_attempt_and_secret()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+            assert created.current_credits is not None
+            claimed = uow.remote_parse_attempts.claim_v3_recovery(
+                attempt_id=self.attempt_id, fence_identity="fence-1",
+                expected_state="prepared", expected_version=0,
+                expected_current=created.current_credits,
+                owner_identity="worker-v3-a", lease_seconds=60,
+            ).attempt
+            uow.commit()
+            return claimed
+
+    def _v3_submitted_attempt(self) -> RemoteParseAttempt:
+        claimed = self._v3_claimed_attempt()
+        assert claimed.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            reconciling = uow.remote_parse_attempts.transition_v3_reconciling(
+                expected_attempt=claimed,
+                grant=CreditTransitionGrant(
+                    expected_current=claimed.current_credits,
+                    maximum_positive_delta=claimed.reservation,
+                ),
+            ).attempt
+            uow.commit()
+        token = b"v3-accepted-helper"
+        receipt = encode_checkpoint_receipt(AcceptedSubmissionReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"),
+            client_submit_key="submit-" + self.attempt_id,
+            submission_epoch_unix=100, remote_task_identity="task-v3",
+            status_url="http://private/tasks/task-v3",
+            result_url="http://private/tasks/task-v3/result",
+            resume_token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+        ))
+        secret = RemoteParseResumeSecret(
+            attempt_id=self.attempt_id, secret_kind="accepted_submission",
+            token_bytes=token,
+            token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+            token_byte_count=len(token), secret_contract_version=3,
+        )
+        assert reconciling.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            submitted = uow.remote_parse_attempts.checkpoint_v3_submitted(
+                expected_attempt=reconciling,
+                grant=CreditTransitionGrant(
+                    expected_current=reconciling.current_credits,
+                    maximum_positive_delta=reconciling.reservation,
+                ), receipt=receipt, accepted_secret=secret,
+            ).attempt
+            uow.commit()
+            return submitted
+
+    def _v3_remote_terminal_attempt(self) -> RemoteParseAttempt:
+        submitted = self._v3_submitted_attempt()
+        token = b"v3-terminal-helper"
+        receipt = encode_terminal_receipt(TerminalReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"), artifact_owner_identity="owner-v3",
+            artifact_byte_count=10, artifact_sha256=_sha("e"),
+            resume_token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+        ))
+        secret = RemoteParseResumeSecret(
+            attempt_id=self.attempt_id, secret_kind="terminal",
+            token_bytes=token,
+            token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+            token_byte_count=len(token), secret_contract_version=3,
+        )
+        assert submitted.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            terminal = uow.remote_parse_attempts.checkpoint_v3_terminal(
+                expected_attempt=submitted,
+                grant=CreditTransitionGrant(
+                    expected_current=submitted.current_credits,
+                    maximum_positive_delta=submitted.reservation,
+                ), receipt=receipt, terminal_secret=secret,
+            ).attempt
+            uow.commit()
+            return terminal
+
+    def _v3_materializing_attempt(self) -> RemoteParseAttempt:
+        terminal = self._v3_remote_terminal_attempt()
+        token = b"v3-materialization-helper"
+        receipt = encode_checkpoint_receipt(PreparedMaterializationReceiptV2(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            source_pdf_sha256=_sha("a"), source_page_count=2,
+            terminal_receipt_sha256=terminal.terminal_receipt_sha256 or "",
+            process_profile_sha256=terminal.process_profile_sha256 or "",
+            credit_policy_sha256=terminal.credit_policy_sha256 or "",
+            reservation_input_sha256=terminal.reservation_input_sha256 or "",
+            spool_relpath="attempt/result.zip", spool_sha256=_sha("e"),
+            spool_byte_count=10, compressed_byte_count=10,
+            uncompressed_byte_count=20, member_count=1,
+            temporary_disk_byte_count=30, decoded_byte_count=20,
+            private_token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+        ))
+        secret = RemoteParseResumeSecret(
+            attempt_id=self.attempt_id, secret_kind="materialization",
+            token_bytes=token,
+            token_sha256="sha256:" + hashlib.sha256(token).hexdigest(),
+            token_byte_count=len(token), secret_contract_version=3,
+        )
+        assert terminal.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            result = uow.remote_parse_attempts.prepare_v3_materialization(
+                expected_attempt=terminal,
+                grant=CreditTransitionGrant(
+                    expected_current=terminal.current_credits,
+                    maximum_positive_delta=terminal.reservation,
+                ), receipt=receipt, materialization_secret=secret,
+            ).attempt
+            uow.commit()
+            return result
 
     def test_v3_repository_add_list_claim_renew_reload_and_response_loss(self) -> None:
         attempt, secret = self._v3_attempt_and_secret()
@@ -857,6 +976,169 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 ).attempt,
                 materializing,
             )
+
+        local_receipt = encode_checkpoint_receipt(LocalMaterializationReceiptV2(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            claim_generation=materializing.claim_generation,
+            source_pdf_sha256=_sha("a"), source_page_count=2,
+            parser_target_sha256=_PARSER_TARGET_SHA,
+            terminal_receipt_sha256=terminal_receipt.sha256,
+            process_profile_sha256=materializing.process_profile_sha256,
+            credit_policy_sha256=materializing.credit_policy_sha256,
+            reservation_input_sha256=materializing.reservation_input_sha256,
+            prepared_materialization_sha256=materialization_receipt.sha256,
+            artifact_owner_identity="owner-v3", artifact_sha256=_sha("e"),
+            artifact_byte_count=10, output_manifest_sha256=_sha("f"),
+            output_manifest_relpath="run/manifest.json",
+            output_manifest_byte_count=20, artifact_root_relpath="run/artifacts",
+            provider_envelope_relpath="run/provider.json",
+            provider_envelope_sha256=_sha("1"), provider_envelope_byte_count=30,
+            compressed_byte_count=10, uncompressed_byte_count=20,
+            member_count=1, temporary_disk_byte_count=30,
+            decoded_byte_count=20, db_staged_byte_count=40,
+        ))
+        assert materializing.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            local_materialized = uow.remote_parse_attempts.checkpoint_v3_local(
+                expected_attempt=materializing,
+                grant=CreditTransitionGrant(
+                    expected_current=materializing.current_credits,
+                    maximum_positive_delta=materializing.reservation,
+                ), receipt=local_receipt,
+            ).attempt
+            uow.commit()
+        self.assertEqual(local_materialized.local_db_staged_byte_count, 40)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(
+                uow.remote_parse_attempts.reconcile_v3_local_after_race(
+                    expected_attempt=materializing,
+                ).attempt,
+                local_materialized,
+            )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            run = uow.processing_runs.get(self.run_id)
+            assert run is not None
+            run.status = "succeeded"
+            run.finished_at = datetime.now(timezone.utc)
+            run.parser_artifact_relpath = "run/artifacts"
+            run.provider_document_relpath = "run/provider.json"
+            run.artifact_hash = _sha("1")
+            assert local_materialized.reservation is not None
+            finish_committed = uow.remote_parse_attempts.finish_v3_run_and_checkpoint(
+                expected_attempt=local_materialized,
+                grant=CreditTransitionGrant(
+                    expected_current=local_materialized.current_credits,
+                    maximum_positive_delta=local_materialized.reservation,
+                ), finished_run=run,
+            ).attempt
+            uow.commit()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(
+                uow.remote_parse_attempts.reconcile_v3_finish_after_race(
+                    expected_attempt=local_materialized,
+                ).attempt,
+                finish_committed,
+            )
+        ack = encode_provider_ack_completion_witness(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
+            committed_state="finish_committed",
+            terminal_receipt_sha256=terminal_receipt.sha256,
+            failure_receipt_sha256=None, http_status=204,
+        )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            ValueError, "drifted"
+        ):
+            uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=finish_committed,
+                witness=replace(ack, remote_task_identity="wrong-task"),
+            )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            final = uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=finish_committed, witness=ack,
+            )
+            uow.commit()
+        self.assertEqual(final.state, "acked")
+        self.assertFalse(final.is_current)
+        self.assertEqual(final.current_credits, CreditVector())
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            replay_final = uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=finish_committed, witness=ack,
+            )
+        self.assertEqual(replay_final, final)
+
+    def test_v3_pre_submission_and_remote_failure_are_atomic_and_ack_bound(self) -> None:
+        claimed = self._v3_claimed_attempt()
+        pre_receipt = encode_checkpoint_receipt(FailureReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            stage="remote", accepted=False, ack_required=False,
+            submission_was_attempted=False, remote_task_identity=None,
+            claim_generation=claimed.claim_generation,
+            terminal_receipt_sha256=None, error_code="pre_submission_failed",
+            error_stage="pre_submit", error_class="pre_submission",
+            retryable=True, retry_budget_class="infrastructure",
+            message="local preflight failed before remote IO",
+        ))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            final = uow.remote_parse_attempts.fail_v3_pre_submission(
+                expected_attempt=claimed, receipt=pre_receipt,
+            )
+            uow.commit()
+        self.assertEqual(final.state, "pre_submission_failed")
+        self.assertEqual(final.current_credits, CreditVector())
+        self.assertIsNone(final.claim_owner_identity)
+        with self.engine.connect() as conn:
+            status = conn.execute(text(
+                "SELECT r.status,d.status,COUNT(o.event_id) "
+                "FROM disclosure_core.processing_run r "
+                "JOIN disclosure_core.document d ON d.document_id=r.document_id "
+                "LEFT JOIN disclosure_ops.outbox_event o "
+                "ON o.processing_run_id=r.processing_run_id "
+                "AND o.event_kind='processing_run_failed' "
+                "WHERE r.processing_run_id=:r GROUP BY r.status,d.status"
+            ), {"r": self.run_id}).one()
+        self.assertEqual(tuple(status), ("failed", "parse_failed", 1))
+
+    def test_v3_remote_failure_retains_ack_credit_until_typed_ack(self) -> None:
+        submitted = self._v3_submitted_attempt()
+        receipt = encode_checkpoint_receipt(FailureReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            stage="remote", accepted=True, ack_required=True,
+            submission_was_attempted=True, remote_task_identity="task-v3",
+            claim_generation=submitted.claim_generation,
+            terminal_receipt_sha256=None, error_code="remote_terminal",
+            error_stage="remote_terminal", error_class="remote_terminal",
+            retryable=False, retry_budget_class="item",
+            message="provider returned a durable terminal failure",
+        ))
+        assert submitted.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            committed = uow.remote_parse_attempts.fail_v3_remote(
+                expected_attempt=submitted,
+                grant=CreditTransitionGrant(
+                    expected_current=submitted.current_credits,
+                    maximum_positive_delta=submitted.reservation,
+                ), receipt=receipt,
+            ).attempt
+            uow.commit()
+        self.assertEqual(committed.state, "remote_failure_committed")
+        assert committed.current_credits is not None
+        self.assertEqual(committed.current_credits.ack_items, 1)
+        witness = encode_provider_ack_completion_witness(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
+            committed_state="remote_failure_committed",
+            terminal_receipt_sha256=None,
+            failure_receipt_sha256=receipt.sha256, http_status=204,
+        )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            final = uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=committed, witness=witness,
+            )
+            uow.commit()
+        self.assertEqual(final.state, "remote_failed")
+        self.assertEqual(final.current_credits, CreditVector())
+
 
     def test_v3_claim_foreign_live_expiry_takeover_and_atomic_add_rollback(self) -> None:
         attempt, secret = self._v3_attempt_and_secret()

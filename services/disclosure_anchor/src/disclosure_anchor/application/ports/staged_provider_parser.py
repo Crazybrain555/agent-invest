@@ -43,6 +43,99 @@ _DURABLE_CHECKPOINT_STATES = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderAckCompletionWitness:
+    schema: str
+    attempt_identity: str
+    fence_identity: str
+    remote_task_identity: str
+    source_pdf_sha256: str
+    committed_state: str
+    terminal_receipt_sha256: str | None
+    failure_receipt_sha256: str | None
+    http_status: int
+    exact_bytes: bytes = field(repr=False)
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema != "provider-ack-completion.v1":
+            raise ValueError("provider ACK witness schema is unsupported")
+        if self.committed_state not in {
+            "finish_committed", "remote_failure_committed", "local_failure_committed"
+        }:
+            raise ValueError("provider ACK witness committed state is unsupported")
+        for value in (
+            self.attempt_identity, self.fence_identity, self.remote_task_identity
+        ):
+            if not isinstance(value, str) or not value.strip() or len(value) > 1024:
+                raise ValueError("provider ACK witness identity is invalid")
+        _require_sha256(self.source_pdf_sha256, "provider ACK source")
+        for optional_hash in (
+            self.terminal_receipt_sha256, self.failure_receipt_sha256
+        ):
+            if optional_hash is not None:
+                _require_sha256(optional_hash, "provider ACK receipt")
+        expected = {
+            "finish_committed": (True, False),
+            "remote_failure_committed": (False, True),
+            "local_failure_committed": (True, True),
+        }[self.committed_state]
+        if (
+            self.terminal_receipt_sha256 is not None,
+            self.failure_receipt_sha256 is not None,
+        ) != expected or self.http_status not in {200, 204}:
+            raise ValueError("provider ACK witness shape is invalid")
+        projection = {
+            "schema": self.schema,
+            "attempt_identity": self.attempt_identity,
+            "fence_identity": self.fence_identity,
+            "remote_task_identity": self.remote_task_identity,
+            "source_pdf_sha256": self.source_pdf_sha256,
+            "committed_state": self.committed_state,
+            "terminal_receipt_sha256": self.terminal_receipt_sha256,
+            "failure_receipt_sha256": self.failure_receipt_sha256,
+            "http_status": self.http_status,
+        }
+        canonical = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+        if self.exact_bytes != canonical or self.sha256 != (
+            "sha256:" + hashlib.sha256(canonical).hexdigest()
+        ):
+            raise ValueError("provider ACK witness canonical bytes drifted")
+
+
+def encode_provider_ack_completion_witness(
+    *, attempt_identity: str, fence_identity: str, remote_task_identity: str,
+    source_pdf_sha256: str, committed_state: str,
+    terminal_receipt_sha256: str | None,
+    failure_receipt_sha256: str | None, http_status: int,
+) -> ProviderAckCompletionWitness:
+    projection = {
+        "schema": "provider-ack-completion.v1",
+        "attempt_identity": attempt_identity,
+        "fence_identity": fence_identity,
+        "remote_task_identity": remote_task_identity,
+        "source_pdf_sha256": source_pdf_sha256,
+        "committed_state": committed_state,
+        "terminal_receipt_sha256": terminal_receipt_sha256,
+        "failure_receipt_sha256": failure_receipt_sha256,
+        "http_status": http_status,
+    }
+    canonical = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+    return ProviderAckCompletionWitness(
+        schema="provider-ack-completion.v1",
+        attempt_identity=attempt_identity,
+        fence_identity=fence_identity,
+        remote_task_identity=remote_task_identity,
+        source_pdf_sha256=source_pdf_sha256,
+        committed_state=committed_state,
+        terminal_receipt_sha256=terminal_receipt_sha256,
+        failure_receipt_sha256=failure_receipt_sha256,
+        http_status=http_status,
+        exact_bytes=canonical,
+        sha256="sha256:" + hashlib.sha256(canonical).hexdigest(),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DurableCheckpointWitness:
     """State-discriminated projection returned after repository CAS/commit."""
 
@@ -645,7 +738,7 @@ class RemoteProviderParseHandle(Protocol):
 
     def acknowledge_after_finish_committed(
         self, *, receipt: RemoteArtifactReceipt, witness: DurableCheckpointWitness
-    ) -> None:
+    ) -> ProviderAckCompletionWitness:
         """ACK only after the durable DB checkpoint is exactly finish_committed."""
 
     def acknowledge_after_failure_committed(
@@ -653,7 +746,7 @@ class RemoteProviderParseHandle(Protocol):
         *,
         witness: DurableCheckpointWitness,
         failure_receipt: EncodedCheckpointReceipt,
-    ) -> None:
+    ) -> ProviderAckCompletionWitness:
         """ACK only after remote_failure_committed/local_failure_committed."""
 
 
@@ -728,6 +821,8 @@ __all__ = [
     "PrivateSubmittedTaskResume",
     "PreparedMaterialization",
     "ProviderMaterializationEvidence",
+    "ProviderAckCompletionWitness",
+    "encode_provider_ack_completion_witness",
     "RemoteProviderParseHandle",
     "StagedProviderParserResult",
     "StagedProviderDocumentParserPort",

@@ -28,6 +28,7 @@ from disclosure_anchor.application.contracts.publish_evidence_ledger import (
 )
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
+    ProviderAckCompletionWitness,
 )
 
 from disclosure_anchor.domain.entities import (
@@ -215,6 +216,12 @@ class RemoteParseAttemptRepository(Protocol):
     def reconcile_v3_materialization_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
     ) -> ClaimedAttemptSnapshot: ...
+    def reconcile_v3_local_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot: ...
+    def reconcile_v3_finish_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot: ...
     def transition_v3_reconciling(
         self, *, expected_attempt: RemoteParseAttempt,
         grant: CreditTransitionGrant,
@@ -234,6 +241,31 @@ class RemoteParseAttemptRepository(Protocol):
         grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
         materialization_secret: RemoteParseResumeSecret,
     ) -> ClaimedAttemptSnapshot: ...
+    def checkpoint_v3_local(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+    ) -> ClaimedAttemptSnapshot: ...
+    def finish_v3_run_and_checkpoint(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, finished_run: ProcessingRun,
+    ) -> ClaimedAttemptSnapshot: ...
+    def fail_v3_pre_submission(
+        self, *, expected_attempt: RemoteParseAttempt,
+        receipt: EncodedCheckpointReceipt,
+    ) -> RemoteParseAttempt: ...
+    def fail_v3_remote(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+    ) -> ClaimedAttemptSnapshot: ...
+    def fail_v3_local(
+        self, *, expected_attempt: RemoteParseAttempt,
+        grant: CreditTransitionGrant, receipt: EncodedCheckpointReceipt,
+        local_receipt: EncodedCheckpointReceipt | None = None,
+    ) -> ClaimedAttemptSnapshot: ...
+    def finalize_v3_ack(
+        self, *, expected_attempt: RemoteParseAttempt,
+        witness: ProviderAckCompletionWitness,
+    ) -> RemoteParseAttempt: ...
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
         owner_identity: str, lease_seconds: int,
