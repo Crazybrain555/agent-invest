@@ -62,7 +62,7 @@
   },
   "tests/integration/test_remote_parse_checkpoint.py": {
    "private_imports": [],
-   "tests": 25
+   "tests": 26
   },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],

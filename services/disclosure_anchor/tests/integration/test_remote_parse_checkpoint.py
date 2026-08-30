@@ -1195,6 +1195,44 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             reloaded = uow.remote_parse_attempts.get(self.attempt_id)
         self.assertEqual(reloaded, committed)
 
+    def test_v3_resource_free_local_failure_can_finalize_after_exact_ack(self) -> None:
+        terminal = self._v3_remote_terminal_attempt()
+        receipt = encode_checkpoint_receipt(FailureReceipt(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            stage="local", accepted=True, ack_required=True,
+            submission_was_attempted=True, remote_task_identity="task-v3",
+            claim_generation=terminal.claim_generation,
+            terminal_receipt_sha256=terminal.terminal_receipt_sha256,
+            error_code="local_preparation", error_stage="local_materialization",
+            error_class="local_materialization", retryable=False,
+            retry_budget_class="item", message="failed before local resources",
+        ))
+        assert terminal.reservation is not None
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            committed = uow.remote_parse_attempts.fail_v3_local(
+                expected_attempt=terminal,
+                grant=CreditTransitionGrant(
+                    expected_current=terminal.current_credits,
+                    maximum_positive_delta=terminal.reservation,
+                ), receipt=receipt,
+            ).attempt
+            uow.commit()
+        self.assertIsNone(committed.materialization_receipt_bytes)
+        witness = encode_provider_ack_completion_witness(
+            attempt_identity=self.attempt_id, fence_identity="fence-1",
+            remote_task_identity="task-v3", source_pdf_sha256=_sha("a"),
+            committed_state="local_failure_committed",
+            terminal_receipt_sha256=committed.terminal_receipt_sha256,
+            failure_receipt_sha256=receipt.sha256, http_status=204,
+        )
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            final = uow.remote_parse_attempts.finalize_v3_ack(
+                expected_attempt=committed, witness=witness,
+            )
+            uow.commit()
+        self.assertEqual(final.state, "local_failed")
+        self.assertEqual(final.current_credits, CreditVector())
+
 
     def test_v3_claim_foreign_live_expiry_takeover_and_atomic_add_rollback(self) -> None:
         attempt, secret = self._v3_attempt_and_secret()

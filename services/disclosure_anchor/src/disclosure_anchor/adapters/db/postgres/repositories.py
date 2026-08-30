@@ -2121,8 +2121,12 @@ class RemoteParseAttemptRepository:
         final_state = {
             "finish_committed": "acked",
             "remote_failure_committed": "remote_failed",
+            "local_failure_committed": "local_failed",
         }.get(expected_attempt.state)
-        if expected_attempt.state == "local_failure_committed":
+        if (
+            expected_attempt.state == "local_failure_committed"
+            and expected_attempt.materialization_receipt_bytes is not None
+        ):
             raise RemoteParseCheckpointConflict(
                 "v3 local failure ACK cannot release credits before durable cleanup"
             )
