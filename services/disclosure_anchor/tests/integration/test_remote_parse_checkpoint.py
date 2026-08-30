@@ -5,9 +5,13 @@ import copy
 import hashlib
 import json
 import threading
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
+
+import httpx
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -15,6 +19,9 @@ from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import models
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
+from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import (
+    MinerUHttpStagedParser,
+)
 from disclosure_anchor.adapters.db.postgres.schema import (
     APP_ROLE,
     FUTURE_L2_READER_ROLE,
@@ -41,8 +48,10 @@ from disclosure_anchor.application.contracts.staged_credit import (
     credit_shape,
 )
 from disclosure_anchor.application.ports.repositories import CreditTransitionGrant
+from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
     _issue_provider_ack_completion_witness,
+    encode_durable_checkpoint_witness,
 )
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
@@ -548,6 +557,212 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             ).attempt
             uow.commit()
             return result
+
+    def _exercise_real_http_ack_to_repository(self, http_status: int) -> None:
+        options = ParserOptions(
+            runtime_bundle_identity_sha256="sha256:" + "a" * 64
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.pdf"
+            source.write_bytes(b"%PDF-real-http-ack-composition")
+            source_sha = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+            ack_calls = 0
+
+            parser: MinerUHttpStagedParser
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal ack_calls
+                if request.url.path.startswith("/tasks/by-idempotency/"):
+                    return httpx.Response(404)
+                if request.url.path.endswith("/ack"):
+                    ack_calls += 1
+                    if http_status == 204:
+                        return httpx.Response(204)
+                    return httpx.Response(200, json={
+                        "schema": "mineru-task-protocol.v2",
+                        "task_id": "task-composition",
+                        "status": "consumed",
+                    })
+                return httpx.Response(202, json={
+                    "task_id": "task-composition",
+                    "status_url": "/tasks/task-composition",
+                    "result_url": "/tasks/task-composition/result",
+                    "task_protocol_schema": "mineru-task-protocol.v2",
+                    "idempotency_key": identity.client_submit_key,
+                    "attempt_identity": self.attempt_id,
+                    "fence_identity": "fence-1",
+                })
+
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+            )
+            identity = parser.prepare_submission_identity(
+                options=options, source_pdf_sha256=source_sha,
+                attempt_identity=self.attempt_id, fence_identity="fence-1",
+                submission_epoch_unix=100,
+            )
+            envelope = build_staged_credit_envelope(
+                profile=_profile(), source_pdf_sha256=source_sha,
+                source_byte_count=source.stat().st_size, source_page_count=2,
+            )
+            with self.engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE disclosure_core.processing_run "
+                    "SET input_raw_file_hash=:source "
+                    "WHERE processing_run_id=:run"
+                ), {"source": source_sha, "run": self.run_id})
+            attempt = RemoteParseAttempt(
+                attempt_id=self.attempt_id, processing_run_id=self.run_id,
+                document_id=self.document_id, attempt_generation=1,
+                fence_identity="fence-1", source_pdf_sha256=source_sha,
+                parser_target_sha256=identity.parser_target_identity_sha256,
+                request_sha256=identity.request_sha256,
+                runtime_epoch_sha256=identity.runtime_bundle_identity_sha256,
+                client_submit_key=identity.client_submit_key,
+                checkpoint_contract_version=3,
+                process_profile_sha256=envelope.process_profile_sha256,
+                credit_policy_sha256=envelope.credit_policy_sha256,
+                reservation_input_bytes=envelope.reservation_input.exact_bytes,
+                reservation_input_sha256=envelope.reservation_input.sha256,
+                reservation_input_byte_count=envelope.reservation_input.byte_count,
+                reservation_source_byte_count=source.stat().st_size,
+                reservation_source_page_count=2,
+                reservation_bucket=envelope.reservation_input.value.bucket,
+                reservation=envelope.reservation,
+                current_credits=credit_shape("prepared", CreditShapeFacts()),
+            )
+            prepared_receipt = encode_checkpoint_receipt(PreparedReconcileReceipt(
+                attempt_identity=self.attempt_id, fence_identity="fence-1",
+                source_pdf_sha256=source_sha,
+                client_submit_key=identity.client_submit_key,
+                submission_epoch_unix=100,
+                parser_target_sha256=identity.parser_target_identity_sha256,
+                request_sha256=identity.request_sha256,
+                runtime_epoch_sha256=identity.runtime_bundle_identity_sha256,
+            ))
+            prepared_secret = RemoteParseResumeSecret(
+                attempt_id=self.attempt_id, secret_kind="prepared_reconcile",
+                token_bytes=prepared_receipt.exact_bytes,
+                token_sha256=prepared_receipt.sha256,
+                token_byte_count=prepared_receipt.byte_count,
+                secret_contract_version=3,
+            )
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                created = uow.remote_parse_attempts.add_v3_prepared(
+                    attempt, prepared_secret
+                )
+                claimed = uow.remote_parse_attempts.claim_v3_recovery(
+                    attempt_id=self.attempt_id, fence_identity="fence-1",
+                    expected_state="prepared", expected_version=0,
+                    expected_current=created.current_credits,
+                    owner_identity="worker-http-composition", lease_seconds=60,
+                ).attempt
+                prepared_witness = uow.remote_parse_attempts.durable_checkpoint_witness(
+                    self.attempt_id
+                )
+                uow.commit()
+            prepared = parser.prepare_local_submission(
+                input_pdf=source, options=options, identity=identity,
+                # The HTTP snapshot contract remains v2 while the accepted
+                # receipt/secret is persisted by the explicit v3 repository.
+                witness=encode_durable_checkpoint_witness(
+                    attempt_identity=prepared_witness.attempt_identity,
+                    fence_identity=prepared_witness.fence_identity,
+                    checkpoint_contract_version=2,
+                    row_version=prepared_witness.row_version,
+                    claim_generation=prepared_witness.claim_generation,
+                    state="prepared",
+                    prepared_identity=identity,
+                    accepted_submission_receipt_sha256=None,
+                    terminal_receipt_sha256=None,
+                    failure_receipt_sha256=None,
+                    remote_task_identity=None,
+                ),
+            )
+            handle = parser.begin_remote_parse(
+                options=options, prepared_submission=prepared,
+            )
+            public, private = handle.submission_checkpoint()
+            accepted_receipt = encode_checkpoint_receipt(AcceptedSubmissionReceipt(
+                attempt_identity=public.attempt_identity,
+                fence_identity=public.fence_identity,
+                source_pdf_sha256=public.source_pdf_sha256,
+                client_submit_key=public.client_submit_key,
+                submission_epoch_unix=public.submission_epoch_unix,
+                remote_task_identity=public.remote_task_identity,
+                status_url=public.status_url, result_url=public.result_url,
+                resume_token_sha256=private.token_sha256,
+            ))
+            accepted_secret = RemoteParseResumeSecret(
+                attempt_id=self.attempt_id, secret_kind="accepted_submission",
+                token_bytes=private.token_bytes, token_sha256=private.token_sha256,
+                token_byte_count=len(private.token_bytes), secret_contract_version=3,
+            )
+            assert claimed.reservation is not None
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                reconciling = uow.remote_parse_attempts.transition_v3_reconciling(
+                    expected_attempt=claimed,
+                    grant=CreditTransitionGrant(
+                        expected_current=claimed.current_credits,
+                        maximum_positive_delta=claimed.reservation,
+                    ),
+                ).attempt
+                submitted = uow.remote_parse_attempts.checkpoint_v3_submitted(
+                    expected_attempt=reconciling,
+                    grant=CreditTransitionGrant(
+                        expected_current=reconciling.current_credits,
+                        maximum_positive_delta=reconciling.reservation,
+                    ), receipt=accepted_receipt, accepted_secret=accepted_secret,
+                ).attempt
+                uow.commit()
+            failure = encode_checkpoint_receipt(FailureReceipt(
+                attempt_identity=self.attempt_id, fence_identity="fence-1",
+                stage="remote", accepted=True, ack_required=True,
+                submission_was_attempted=True,
+                remote_task_identity="task-composition",
+                claim_generation=submitted.claim_generation,
+                terminal_receipt_sha256=None, error_code="remote_terminal",
+                error_stage="remote_terminal", error_class="remote_terminal",
+                retryable=False, retry_budget_class="item",
+                message="composition failure",
+            ))
+            assert submitted.reservation is not None
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                committed = uow.remote_parse_attempts.fail_v3_remote(
+                    expected_attempt=submitted,
+                    grant=CreditTransitionGrant(
+                        expected_current=submitted.current_credits,
+                        maximum_positive_delta=submitted.reservation,
+                    ), receipt=failure,
+                ).attempt
+                durable = uow.remote_parse_attempts.durable_checkpoint_witness(
+                    self.attempt_id
+                )
+                uow.commit()
+            ack = handle.acknowledge_after_failure_committed(
+                witness=durable, failure_receipt=failure,
+            )
+            self.assertEqual(ack.http_status, http_status)
+            self.assertEqual(ack_calls, 1)
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                final = uow.remote_parse_attempts.finalize_v3_ack(
+                    expected_attempt=committed, witness=ack,
+                )
+                uow.commit()
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                replay = uow.remote_parse_attempts.finalize_v3_ack(
+                    expected_attempt=committed, witness=ack,
+                )
+            self.assertEqual(replay, final)
+
+    def test_v3_real_http_200_ack_witness_finalizes_repository(self) -> None:
+        self._exercise_real_http_ack_to_repository(200)
+
+    def test_v3_real_http_204_ack_witness_finalizes_repository(self) -> None:
+        self._exercise_real_http_ack_to_repository(204)
 
     def test_v3_repository_add_list_claim_renew_reload_and_response_loss(self) -> None:
         attempt, secret = self._v3_attempt_and_secret()

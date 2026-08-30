@@ -64,7 +64,7 @@
    "private_imports": [
     "_issue_provider_ack_completion_witness"
    ],
-   "tests": 26
+   "tests": 28
   },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
