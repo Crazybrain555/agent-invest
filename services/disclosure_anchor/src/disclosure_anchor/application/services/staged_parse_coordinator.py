@@ -196,6 +196,9 @@ class StagedCoordinatorBackend(Protocol):
     ) -> CoordinatorWork:
         """Extend only the same owner/generation claim without changing state."""
 
+    def reload_claim(self, work: CoordinatorWork) -> CoordinatorWork:
+        """Reload exact durable state after a renewal/commit response race."""
+
     def prepare_remote_io(
         self, work: CoordinatorWork, *, step_deadline_monotonic: float
     ) -> CoordinatorWork:
@@ -343,7 +346,10 @@ _ALLOWED_LANE_TRANSITIONS = {
         }
     ),
     CoordinatorLane.LOCAL_PREPARE: frozenset(
-        {("remote_terminal", "materializing")}
+        {
+            ("remote_terminal", "materializing"),
+            ("remote_terminal", "local_failure_committed"),
+        }
     ),
     CoordinatorLane.LOCAL: frozenset(
         {
@@ -372,21 +378,25 @@ class _CreditLedger:
 
     def can_add(self, work: CoordinatorWork) -> bool:
         previous = self.by_attempt.get(work.attempt_id, CreditVector())
-        candidate = self.in_use - previous + work.credit_reservation
+        candidate = self.in_use - previous + work.credits
         return candidate.fits(self.limit)
 
     def replace(self, work: CoordinatorWork, *, allow_oversubscribed: bool) -> None:
         previous = self.by_attempt.get(work.attempt_id, CreditVector())
-        candidate = self.in_use - previous + work.credit_reservation
+        candidate = self.in_use - previous + work.credits
         if not allow_oversubscribed and not candidate.fits(self.limit):
             raise ValueError("new work exceeds coordinator credit limits")
-        self.by_attempt[work.attempt_id] = work.credit_reservation
+        self.by_attempt[work.attempt_id] = work.credits
         self.in_use = candidate
 
     def release(self, attempt_id: str) -> None:
         previous = self.by_attempt.pop(attempt_id, None)
         if previous is not None:
             self.in_use = self.in_use - previous
+
+    def allowance_for(self, attempt_id: str) -> CreditVector:
+        previous = self.by_attempt.get(attempt_id, CreditVector())
+        return self.limit - (self.in_use - previous)
 
 
 class StagedParseCoordinator:
@@ -446,6 +456,8 @@ class StagedParseCoordinator:
         in_flight: dict[
             Future[CoordinatorWork], tuple[CoordinatorLane, CoordinatorWork, float]
         ] = {}
+        reconciled_results: dict[Future[CoordinatorWork], CoordinatorWork] = {}
+        in_flight_failures: set[Future[CoordinatorWork]] = set()
 
         def emit() -> None:
             self._progress(
@@ -619,6 +631,80 @@ class StagedParseCoordinator:
                 + self._limits.claim_renew_margin_seconds
             )
 
+        def guard_in_flight(now: float) -> None:
+            nonlocal circuit_open, admission_open, blocked_reason
+            for future, (lane, work, deadline) in tuple(in_flight.items()):
+                if future.done() or future in reconciled_results:
+                    continue
+                if now > deadline:
+                    if future not in in_flight_failures:
+                        circuit_open = True
+                        admission_open = False
+                        blocked_reason = "bounded_stage_deadline_exceeded"
+                        errors.append(
+                            f"{work.attempt_id}:{lane.value}:stage deadline exceeded"
+                        )
+                        in_flight_failures.add(future)
+                    # Stop extending ownership after the backend broke its
+                    # bounded-step contract. Its lease/fence checks must then
+                    # prevent any further side effect.
+                    continue
+                if not needs_renewal(work, now):
+                    continue
+                try:
+                    renewed = renew(work, lane)
+                except Exception as exc:  # noqa: BLE001 - reconcile commit race
+                    if future.done():
+                        continue
+                    try:
+                        durable = self._backend.reload_claim(work)
+                    except Exception as reload_exc:  # noqa: BLE001
+                        if future not in in_flight_failures:
+                            circuit_open = True
+                            admission_open = False
+                            blocked_reason = "in_flight_claim_reconcile_failed"
+                            errors.append(
+                                f"{work.attempt_id}:{lane.value}:claim-reload:"
+                                f"{type(reload_exc).__name__}:{reload_exc}"
+                            )
+                            in_flight_failures.add(future)
+                        continue
+                    if (
+                        durable.attempt_id == work.attempt_id
+                        and durable.claim_generation == work.claim_generation
+                        and durable.claim_owner_identity == work.claim_owner_identity
+                        and durable.state == work.state
+                        and durable.row_version == work.row_version
+                        and durable.lease_expires_monotonic is not None
+                        and work.lease_expires_monotonic is not None
+                        and durable.lease_expires_monotonic
+                        > work.lease_expires_monotonic
+                    ):
+                        known[work.attempt_id] = durable
+                        in_flight[future] = (lane, durable, deadline)
+                    elif (
+                        durable.attempt_id == work.attempt_id
+                        and durable.claim_generation == work.claim_generation
+                        and (work.state, durable.state)
+                        in _ALLOWED_LANE_TRANSITIONS[lane]
+                        and durable.row_version == work.row_version + 1
+                    ):
+                        # The stage committed and its response raced renewal.
+                        # Consume the exact durable projection when the bounded
+                        # future returns; never dispatch a duplicate side effect.
+                        reconciled_results[future] = durable
+                    elif future not in in_flight_failures:
+                        circuit_open = True
+                        admission_open = False
+                        blocked_reason = "in_flight_claim_lost"
+                        errors.append(
+                            f"{work.attempt_id}:{lane.value}:claim:"
+                            f"{type(exc).__name__}:{exc}"
+                        )
+                        in_flight_failures.add(future)
+                else:
+                    in_flight[future] = (lane, renewed, deadline)
+
         try:
             # Startup is an exhaustive keyset recovery barrier.  No new work
             # is read until every current nonfinal attempt has been claimed or
@@ -699,7 +785,12 @@ class StagedParseCoordinator:
                         queues[lane].append(work)
 
                 active_ids = set(known)
-                if admission_open and not circuit_open and ledger.in_use.fits(ledger.limit):
+                if (
+                    admission_open
+                    and not circuit_open
+                    and not oversubscribed_recovery
+                    and ledger.in_use.fits(ledger.limit)
+                ):
                     capacity = max(0, self._limits.admission_batch_size - len(active_ids))
                     if capacity > 0:
                         available_credits = ledger.limit - ledger.in_use
@@ -767,7 +858,7 @@ class StagedParseCoordinator:
                             future = pools[lane].submit(
                                 self._backend.prepare_local_io,
                                 work,
-                                credit_allowance=work.credit_reservation,
+                                credit_allowance=ledger.allowance_for(work.attempt_id),
                                 step_deadline_monotonic=deadline,
                             )
                         elif lane == CoordinatorLane.LOCAL:
@@ -834,12 +925,22 @@ class StagedParseCoordinator:
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
+                    guard_in_flight(self._monotonic())
                     emit()
                     continue
                 for future in done:
                     lane, work, step_deadline = in_flight.pop(future)
                     try:
-                        updated = future.result()
+                        if future in reconciled_results:
+                            # Observe the future exception/result only to drain
+                            # thread ownership; durable reload is authoritative.
+                            try:
+                                future.result()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            updated = reconciled_results.pop(future)
+                        else:
+                            updated = future.result()
                     except RetryStage as exc:
                         retry_now = self._monotonic()
                         count = retry_attempts.get(work.attempt_id, 0) + 1
