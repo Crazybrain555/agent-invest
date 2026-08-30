@@ -203,9 +203,17 @@ class RemoteParseAttemptRepository(Protocol):
         expected_version: int, expected_current: CreditVector,
         owner_identity: str, claim_generation: int,
     ) -> ClaimedAttemptSnapshot: ...
-    def reconcile_v3_claim_after_race(
+    def reconcile_v3_reconciling_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
-        next_state: str, next_current: CreditVector,
+    ) -> ClaimedAttemptSnapshot: ...
+    def reconcile_v3_submitted_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot: ...
+    def reconcile_v3_terminal_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot: ...
+    def reconcile_v3_materialization_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
     ) -> ClaimedAttemptSnapshot: ...
     def transition_v3_reconciling(
         self, *, expected_attempt: RemoteParseAttempt,

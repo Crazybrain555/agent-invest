@@ -1729,16 +1729,41 @@ class RemoteParseAttemptRepository:
             secret_row=secret_row,
         )
 
-    def reconcile_v3_claim_after_race(
+    @staticmethod
+    def _v3_operation_target_credit_predicates(next_state: str) -> tuple[Any, ...]:
+        values: dict[str, Any] = {
+            name: 0 for name in CreditVector.__dataclass_fields__
+        }
+        values["documents"] = 1
+        if next_state in {"reconciling", "submitted"}:
+            values["remote_waits"] = 1
+        elif next_state == "remote_terminal":
+            values["retained_results"] = 1
+            values["retained_bytes"] = models.RemoteParseAttempt.result_artifact_bytes
+        elif next_state == "materializing":
+            values.update({
+                "retained_results": 1,
+                "retained_bytes": models.RemoteParseAttempt.result_artifact_bytes,
+                "local_items": 1,
+                "compressed_bytes": models.RemoteParseAttempt.materialization_compressed_byte_count,
+                "decoded_bytes": models.RemoteParseAttempt.materialization_decoded_byte_count,
+                "temp_disk_bytes": models.RemoteParseAttempt.materialization_temp_disk_byte_count,
+            })
+        else:
+            raise ValueError("v3 race operation target is unsupported")
+        return tuple(
+            getattr(models.RemoteParseAttempt, f"current_{name}") == value
+            for name, value in values.items()
+        )
+
+    def _reconcile_v3_operation_after_race(
         self, *, expected_attempt: RemoteParseAttempt,
-        next_state: str, next_current: CreditVector,
+        required_state: str, next_state: str,
     ) -> ClaimedAttemptSnapshot:
         self._validate_expected_v3_attempt(expected_attempt)
         assert isinstance(expected_attempt.current_credits, CreditVector)
-        if next_state not in STAGED_STATE_TRANSITIONS.get(
-            expected_attempt.state, frozenset()
-        ) or type(next_current) is not CreditVector:
-            raise ValueError("v3 race reconciliation next projection is invalid")
+        if expected_attempt.state != required_state:
+            raise ValueError("v3 race operation expected state is invalid")
         clock = self._database_clock()
         remaining = sa.cast(sa.func.floor(sa.extract(
             "epoch", models.RemoteParseAttempt.claim_lease_until
@@ -1752,7 +1777,7 @@ class RemoteParseAttemptRepository:
         next_projection = sa.and_(
             models.RemoteParseAttempt.state == next_state,
             models.RemoteParseAttempt.row_version == expected_attempt.row_version + 1,
-            *self._v3_current_predicates(next_current),
+            *self._v3_operation_target_credit_predicates(next_state),
         )
         statement = sa.select(
             models.RemoteParseAttempt, clock.c.database_observed_at, remaining,
@@ -1773,6 +1798,42 @@ class RemoteParseAttemptRepository:
         if result is None:
             raise RemoteParseCheckpointConflict("v3 race reconciliation lost exact projection")
         return self._claimed_snapshot(result[0], result[1], result[2])
+
+    def reconcile_v3_reconciling_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state="prepared",
+            next_state="reconciling",
+        )
+
+    def reconcile_v3_submitted_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state="reconciling",
+            next_state="submitted",
+        )
+
+    def reconcile_v3_terminal_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state="submitted",
+            next_state="remote_terminal",
+        )
+
+    def reconcile_v3_materialization_after_race(
+        self, *, expected_attempt: RemoteParseAttempt,
+    ) -> ClaimedAttemptSnapshot:
+        return self._reconcile_v3_operation_after_race(
+            expected_attempt=expected_attempt,
+            required_state="remote_terminal",
+            next_state="materializing",
+        )
 
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,

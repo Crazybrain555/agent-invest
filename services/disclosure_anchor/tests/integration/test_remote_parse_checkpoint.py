@@ -606,7 +606,6 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 owner_identity="worker-v3-a", lease_seconds=60,
             ).attempt
             assert claimed.reservation is not None
-            reconciling_current = credit_shape("reconciling", CreditShapeFacts())
             reconciling = uow.remote_parse_attempts.transition_v3_reconciling(
                 expected_attempt=claimed,
                 grant=CreditTransitionGrant(
@@ -616,12 +615,35 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             ).attempt
             uow.commit()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
-            replay = uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+            replay = uow.remote_parse_attempts.reconcile_v3_reconciling_after_race(
                 expected_attempt=claimed,
-                next_state="reconciling",
-                next_current=reconciling_current,
             )
         self.assertEqual(replay.attempt, reconciling)
+        for wrong_operation_name in (
+            "reconcile_v3_submitted_after_race",
+            "reconcile_v3_terminal_after_race",
+            "reconcile_v3_materialization_after_race",
+        ):
+            with SqlAlchemyUnitOfWork(engine=self.engine) as wrong_uow, self.assertRaisesRegex(
+                ValueError, "expected state"
+            ):
+                getattr(wrong_uow.remote_parse_attempts, wrong_operation_name)(
+                    expected_attempt=claimed
+                )
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE disclosure_ops.remote_parse_attempt SET row_version=row_version+1 WHERE attempt_id=:a"
+            ), {"a": self.attempt_id})
+        with SqlAlchemyUnitOfWork(engine=self.engine) as gap_uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict, "lost exact projection"
+        ):
+            gap_uow.remote_parse_attempts.reconcile_v3_reconciling_after_race(
+                expected_attempt=claimed
+            )
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE disclosure_ops.remote_parse_attempt SET row_version=:v WHERE attempt_id=:a"
+            ), {"a": self.attempt_id, "v": reconciling.row_version})
 
         accepted_token = b"v3-accepted-token"
         accepted_receipt = encode_checkpoint_receipt(AcceptedSubmissionReceipt(
@@ -687,10 +709,8 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             race_outcomes = tuple(pool.map(renew_or_submit, ("renew", "submit")))
         self.assertIn("submitted", race_outcomes)
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
-            submitted = uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+            submitted = uow.remote_parse_attempts.reconcile_v3_submitted_after_race(
                 expected_attempt=reconciling,
-                next_state="submitted",
-                next_current=credit_shape("submitted", CreditShapeFacts()),
             ).attempt
 
         terminal_token = b"v3-terminal-token"
@@ -768,10 +788,8 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             uow.commit()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             self.assertEqual(
-                uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+                uow.remote_parse_attempts.reconcile_v3_terminal_after_race(
                     expected_attempt=submitted,
-                    next_state="remote_terminal",
-                    next_current=remote_terminal.current_credits,
                 ).attempt,
                 remote_terminal,
             )
@@ -834,10 +852,8 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         self.assertEqual(materializing.materialization_receipt_sha256, materialization_receipt.sha256)
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
             self.assertEqual(
-                uow.remote_parse_attempts.reconcile_v3_claim_after_race(
+                uow.remote_parse_attempts.reconcile_v3_materialization_after_race(
                     expected_attempt=remote_terminal,
-                    next_state="materializing",
-                    next_current=materializing.current_credits,
                 ).attempt,
                 materializing,
             )
