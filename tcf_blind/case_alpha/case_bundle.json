@@ -1,0 +1,46 @@
+{
+  "skill_protocol": "TECHNOLOGY COMPANY FORECASTING — STRICT BLIND EXECUTION CONTRACT\n\nYou must execute the same substantive workflow as the unified Skill.\n\n1. Freeze contract: blind alias, cutoff, fiscal basis, GAAP, perimeter, horizons, output/readiness.\n2. Evidence: E0 filing anchors; E1 official results/Q&A and customer/supplier official read-through may alter near drivers with execution discount; measured E3 research may alter a specific driver only after independent corroboration; E2 papers set feasibility/failure/regime tails and cannot directly create revenue/share/margin; E4 anonymous claims are monitor-only. Separate facts, calculations, assumptions and scenarios.\n3. Review and explicitly report every source family: filings/results, formal investor dialogue, cross-company official, independent industry measurement, sell-side/deep research, named experts, technical papers/standards, news/media discovery. Record rejected and duplicated sources.\n4. Source independence: repeated reports from the same original source count as one cluster. A company statement and an article repeating it are one cluster. Base changes need at least two independent clusters and at least one direct/official/measured source, a causal chain, adjustment cap and falsification trigger.\n5. Normalize history/perimeter/GAAP. Do not infer future acquisitions or later outcomes.\n6. Route 100% of economics to mechanisms without double count. For this case use recurring-contract software, backlog conversion, maintenance/renewal, services, hardware/IP timing, technical design-complexity adoption, GAAP operating leverage, and accounting-standard timing.\n7. Demand/customer model: payer, paid usage/seat or contract base, retention/renewal, new bookings, price/mix, customer concentration, design activity and alternatives.\n8. Delivery/supply model: software capacity is not usually binding, but product release, verification hardware, IP timing, support and skilled labor may be.\n9. Formula model: Revenue = recurring opening base × retention × price/mix + new-booking conversion + services + hardware/IP timing. Backlog is visibility, not automatic growth. GAAP operating profit = gross profit − R&D − S&M − G&A − restructuring/acquisition items.\n10. Produce FY+1/FY+2/FY+3 point and intervals, Bear/Base/Bull probabilities, breakpoints, monitoring and human-required gaps. Year 3 must have wider uncertainty.\n11. Discuss cash/capital and normalized economics qualitatively even though valuation is not scored. Do not use peak economics as terminal. Include reverse/implicit expectations conceptually.\n12. Red-team at least six substantive risks: evidence permission/leakage, customer/renewal, backlog conversion, hardware/IP timing, GAAP/accounting timing, double-counting, valuation/normalization, source independence.\n13. Readiness cannot exceed retrospective blind research-grade. Return only the required JSON. Do not identify the company or use remembered future outcomes.\n",
+  "blind_case": {
+    "contract": {
+      "case_id": "CASE-ALPHA@T0",
+      "cutoff": "2018-02-26T23:59:59Z",
+      "identity_masked": true,
+      "open_web": false,
+      "FY0_revenue_index": 100,
+      "FY0_operating_margin": 0.1667,
+      "horizons": ["FY+1", "FY+2", "FY+3"]
+    },
+    "coverage": [
+      ["official filings/results", "accepted", "F1"],
+      ["formal investor dialogue", "accepted", "IR1"],
+      ["cross-company official", "accepted", "X1"],
+      ["independent industry research", "accepted", "R1"],
+      ["sell-side/deep research", "searched_no_qualified_source", "method not reproducible"],
+      ["named expert", "searched_no_qualified_source", "no verifiable direct operator"],
+      ["technical paper/standards", "accepted", "P1"],
+      ["news/media discovery", "accepted discovery only", "N1 traced to R1"]
+    ],
+    "sources": [
+      {"id":"F1","tier":"E0","cluster":"C1","role":"fact anchor","facts":["FY0 revenue index=100; GAAP operating margin=16.67%; revenue grew 7.6%; prior margin 13.6%.","Product+maintenance 93.4%; services 6.6%. Approximately 90% of revenue recognized over contract life.","Backlog/FY0 revenue=138.9%; prior-year backlog/prior revenue=135.3%; management expected about 70% of FY+1 revenue from backlog.","R&D/FY0 revenue=41.4%. One reporting segment. Hardware and IP timing more volatile than recurring software."],"limits":"backlog does not guarantee renewal, price or timing; product disclosure limited"},
+      {"id":"IR1","tier":"E1","cluster":"C1","role":"state/execution","facts":[">100 digital/signoff customers; ~40 working at leading 7nm; >30 tapeouts; 20 full-flow competitive wins.","IP revenue +18%; verification hardware revenue -5%.","Management old-standard FY+1 revenue guide index 105.8–107.8. New accounting standard expected to reduce reported FY+1 revenue about 2% through contract timing."],"limits":"management incentive; customer wins do not equal paid growth"},
+      {"id":"X1","tier":"E1","cluster":"C2","role":"peer read-through","facts":["Large peer: ~88% revenue over time; backlog/revenue ~131%; annual revenue +12.5%; multi-year licenses, maintenance and IP are major sources."],"limits":"peer mix/acquisitions differ"},
+      {"id":"R1","tier":"E3","cluster":"C3","role":"industry state","facts":["Independent industry measurement: latest-quarter EDA revenue +8% YoY; four-quarter moving average +11.5%; broad category/geographic growth."],"limits":"does not prove company share or future cycle immunity"},
+      {"id":"P1","tier":"E2","cluster":"C4","role":"technical boundary","facts":["2017 engineering paper: advanced 14/10/7/5nm design-manufacturing flows require more heterogeneous-data analytics and machine-learning methods as complexity rises."],"limits":"long-term demand boundary only; no direct company revenue/share"},
+      {"id":"N1","tier":"E3","cluster":"C3","role":"discovery only","facts":["Trade-media item repeated and linked to R1 industry statistics."],"limits":"no independent weight"}
+    ],
+    "rejected": [
+      {"id":"REJ1","reason":"sell-side preview repeated guidance/consensus without method"},
+      {"id":"REJ2","reason":"anonymous expert identity and operating proximity unavailable"},
+      {"id":"REJ3","reason":"media commentary duplicated R1"}
+    ],
+    "output_schema": {
+      "case_id":"CASE-ALPHA@T0","compliance":{},"source_review":{},"mechanism_map":{"weights":{}},"assumptions":[],
+      "forecast":[
+        {"period":"FY+1","revenue_index_point":0,"revenue_index_low":0,"revenue_index_high":0,"operating_margin_point":0,"operating_margin_low":0,"operating_margin_high":0,"point_evaluable":true},
+        {"period":"FY+2","revenue_index_point":0,"revenue_index_low":0,"revenue_index_high":0,"operating_margin_point":0,"operating_margin_low":0,"operating_margin_high":0,"point_evaluable":true},
+        {"period":"FY+3","revenue_index_point":0,"revenue_index_low":0,"revenue_index_high":0,"operating_margin_point":0,"operating_margin_low":0,"operating_margin_high":0,"point_evaluable":true}
+      ],
+      "scenarios":{"probabilities":{}},"formula_model":{"normalized_economics":{}},"breakpoints":[],"red_team":[],"human_required":[],"report_markdown":"","forecast_label":"blind_sealed_forecast_candidate"
+    }
+  }
+}
