@@ -239,9 +239,8 @@ mineru-service-epoch-freeze:
 		--ssh-host "$(SSH_HOST)" --ssh-user "$(SSH_USER)" --ssh-port "$(SSH_PORT)" \
 		--ssh-identity "$(SSH_IDENTITY)" --ssh-known-hosts "$(SSH_KNOWN_HOSTS)"
 
-# Seal two to eight independently produced custom-input v5 smoke receipts.
-# Each input must be a distinct complete multi-page held-out PDF; there is no
-# fixed 4/8/16 sweep, second confirmation arm, or memory-reserve requirement.
+# Seal independently produced custom-input v5 smoke receipts. Each input must
+# be a distinct complete multi-page held-out PDF.
 mineru-validation-receipt:
 	@test -n "$(SMOKE_RECEIPTS)" || (echo 'mineru-validation-receipt: SMOKE_RECEIPTS="/path/a.json /path/b.json" is required' && exit 2)
 	@test -n "$(RECEIPT)" || (echo 'mineru-validation-receipt: RECEIPT is required' && exit 2)

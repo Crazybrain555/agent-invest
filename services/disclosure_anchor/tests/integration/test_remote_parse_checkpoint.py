@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -34,6 +35,12 @@ def _sha(char: str) -> str:
     return "sha256:" + char * 64
 
 
+_PARSER_TARGET = {"name": "MinerU", "schema": "test-parser-target.v1"}
+_PARSER_TARGET_SHA = "sha256:" + hashlib.sha256(
+    json.dumps(_PARSER_TARGET, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+
+
 class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = engine_or_skip()
@@ -42,7 +49,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         self.attempt_id = "rpa_" + ids.new_ulid()
         with self.engine.begin() as conn:
             conn.execute(text("INSERT INTO disclosure_core.document (document_id,status) VALUES (:d,'registered')"), {"d": self.document_id})
-            conn.execute(text("INSERT INTO disclosure_core.processing_run (processing_run_id,document_id,artifact_owner_processing_run_id,run_kind,status,input_raw_file_hash,provider_document_relpath) VALUES (:r,:d,:r,'parse','running',:h,:p)"), {"r": self.run_id, "d": self.document_id, "h": _sha("a"), "p": "derived/checkpoint/provider.json"})
+            conn.execute(text("INSERT INTO disclosure_core.processing_run (processing_run_id,document_id,artifact_owner_processing_run_id,run_kind,status,input_raw_file_hash,provider_document_relpath,parser_target_identity) VALUES (:r,:d,:r,'parse','running',:h,:p,CAST(:t AS jsonb))"), {"r": self.run_id, "d": self.document_id, "h": _sha("a"), "p": "run/provider.json", "t": json.dumps(_PARSER_TARGET)})
 
     def tearDown(self) -> None:
         with self.engine.begin() as conn:
@@ -56,7 +63,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             attempt_id=self.attempt_id, processing_run_id=self.run_id,
             document_id=self.document_id, attempt_generation=1,
             fence_identity="fence-1", source_pdf_sha256=_sha("a"),
-            parser_target_sha256=_sha("b"), request_sha256=_sha("c"),
+            parser_target_sha256=_PARSER_TARGET_SHA, request_sha256=_sha("c"),
             runtime_epoch_sha256=_sha("d"),
             client_submit_key="submit-" + self.attempt_id,
         )
@@ -74,7 +81,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             attempt_identity=self.attempt_id, fence_identity="fence-1",
             source_pdf_sha256=_sha("a"),
             client_submit_key="submit-" + self.attempt_id,
-            submission_epoch_unix=100, parser_target_sha256=_sha("b"),
+            submission_epoch_unix=100, parser_target_sha256=_PARSER_TARGET_SHA,
             request_sha256=_sha("c"), runtime_epoch_sha256=_sha("d"),
         ))
         return self._secret("prepared_reconcile", encoded.exact_bytes)
@@ -142,6 +149,54 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             )
             uow.commit()
             return result
+
+    def _local_materialized(self) -> RemoteParseAttempt:
+        current = self._terminal(self._submitted(self._add_claim()))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            current = uow.remote_parse_attempts.transition(
+                attempt_id=self.attempt_id,
+                fence_identity="fence-1",
+                expected_state="remote_terminal",
+                expected_version=current.row_version,
+                next_state="materializing",
+                claim_owner_identity="worker-boot-1",
+                claim_generation=current.claim_generation,
+            )
+            uow.commit()
+        local = encode_checkpoint_receipt(LocalMaterializationReceipt(
+            attempt_identity=self.attempt_id,
+            fence_identity="fence-1",
+            claim_generation=current.claim_generation,
+            source_pdf_sha256=_sha("a"),
+            parser_target_sha256=_PARSER_TARGET_SHA,
+            terminal_receipt_sha256=current.terminal_receipt_sha256 or "",
+            artifact_owner_identity="owner-1",
+            artifact_sha256=_sha("e"),
+            artifact_byte_count=10,
+            output_manifest_sha256=_sha("f"),
+            output_manifest_relpath="run/manifest.json",
+            output_manifest_byte_count=20,
+            artifact_root_relpath="run/artifacts",
+            provider_envelope_relpath="run/provider.json",
+            provider_envelope_sha256=_sha("1"),
+            provider_envelope_byte_count=30,
+            compressed_byte_count=10,
+            uncompressed_byte_count=40,
+            member_count=2,
+            disk_byte_count=50,
+            decoded_byte_count=60,
+        ))
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            current = uow.remote_parse_attempts.checkpoint_local(
+                attempt_id=self.attempt_id,
+                fence_identity="fence-1",
+                expected_version=current.row_version,
+                claim_owner_identity="worker-boot-1",
+                claim_generation=current.claim_generation,
+                receipt=local,
+            )
+            uow.commit()
+            return current
 
     def test_claim_response_loss_and_renewal_are_idempotent(self) -> None:
         claimed = self._add_claim()
@@ -242,42 +297,15 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             )
 
     def test_success_finish_updates_run_document_and_checkpoint_atomically(self) -> None:
-        current = self._terminal(self._submitted(self._add_claim()))
+        current = self._local_materialized()
         with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
-            current = uow.remote_parse_attempts.transition(
-                attempt_id=self.attempt_id, fence_identity="fence-1",
-                expected_state="remote_terminal", expected_version=current.row_version,
-                next_state="materializing", claim_owner_identity="worker-boot-1",
-                claim_generation=current.claim_generation,
-            )
-            uow.commit()
-        local = encode_checkpoint_receipt(LocalMaterializationReceipt(
-            attempt_identity=self.attempt_id, fence_identity="fence-1",
-            claim_generation=current.claim_generation,
-            source_pdf_sha256=_sha("a"), parser_target_sha256=_sha("b"),
-            terminal_receipt_sha256=current.terminal_receipt_sha256 or "",
-            artifact_owner_identity="owner-1", artifact_sha256=_sha("e"),
-            artifact_byte_count=10, output_manifest_sha256=_sha("f"),
-            output_manifest_relpath="run/manifest.json", output_manifest_byte_count=20,
-            artifact_root_relpath="run/artifacts",
-            provider_envelope_relpath="run/provider.json",
-            provider_envelope_sha256=_sha("1"), provider_envelope_byte_count=30,
-            compressed_byte_count=10, uncompressed_byte_count=40, member_count=2,
-            disk_byte_count=50, decoded_byte_count=60,
-        ))
-        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
-            current = uow.remote_parse_attempts.checkpoint_local(
-                attempt_id=self.attempt_id, fence_identity="fence-1",
-                expected_version=current.row_version,
-                claim_owner_identity="worker-boot-1",
-                claim_generation=current.claim_generation, receipt=local,
-            )
             run = uow.processing_runs.get(self.run_id)
             assert run is not None
             run.status = "succeeded"
             run.finished_at = datetime.now(timezone.utc)
-            run.parser_artifact_relpath = "derived/checkpoint/artifacts"
-            run.artifact_hash = _sha("e")
+            run.parser_artifact_relpath = "run/artifacts"
+            run.provider_document_relpath = "run/provider.json"
+            run.artifact_hash = _sha("1")
             result = uow.remote_parse_attempts.finish_run_and_checkpoint(
                 finished_run=run, attempt_id=self.attempt_id,
                 fence_identity="fence-1", expected_version=current.row_version,
@@ -288,6 +316,56 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
         self.assertEqual(result.state, "finish_committed")
         with self.engine.connect() as conn:
             self.assertEqual(conn.execute(text("SELECT status FROM disclosure_core.document WHERE document_id=:d"), {"d": self.document_id}).scalar_one(), "parsed")
+
+    def test_finish_rejects_processing_run_drift_from_local_receipt(self) -> None:
+        current = self._local_materialized()
+        mutations = {
+            "source": ("input_raw_file_hash", _sha("2")),
+            "parser": ("parser_target_identity", {"name": "drift"}),
+            "provider_path": ("provider_document_relpath", "run/other.json"),
+            "provider_hash": ("artifact_hash", _sha("2")),
+            "artifact_root": ("parser_artifact_relpath", "run/other-artifacts"),
+        }
+        for label, (field, value) in mutations.items():
+            with self.subTest(label=label), SqlAlchemyUnitOfWork(
+                engine=self.engine
+            ) as uow:
+                run = uow.processing_runs.get(self.run_id)
+                assert run is not None
+                run.status = "succeeded"
+                run.finished_at = datetime.now(timezone.utc)
+                run.parser_artifact_relpath = "run/artifacts"
+                run.provider_document_relpath = "run/provider.json"
+                run.artifact_hash = _sha("1")
+                setattr(run, field, value)
+                with self.assertRaisesRegex(
+                    RemoteParseCheckpointConflict, "local receipt"
+                ):
+                    uow.remote_parse_attempts.finish_run_and_checkpoint(
+                        finished_run=run,
+                        attempt_id=self.attempt_id,
+                        fence_identity="fence-1",
+                        expected_version=current.row_version,
+                        claim_owner_identity="worker-boot-1",
+                        claim_generation=current.claim_generation,
+                    )
+        with self.engine.connect() as conn:
+            run_status = conn.execute(
+                text(
+                    "SELECT status FROM disclosure_core.processing_run "
+                    "WHERE processing_run_id=:r"
+                ),
+                {"r": self.run_id},
+            ).scalar_one()
+            attempt_state = conn.execute(
+                text(
+                    "SELECT state FROM disclosure_ops.remote_parse_attempt "
+                    "WHERE attempt_id=:a"
+                ),
+                {"a": self.attempt_id},
+            ).scalar_one()
+        self.assertEqual(run_status, "running")
+        self.assertEqual(attempt_state, "local_materialized")
 
     def test_pre_submission_not_attempted_closes_run_document_and_outbox(self) -> None:
         current = self._add_claim()

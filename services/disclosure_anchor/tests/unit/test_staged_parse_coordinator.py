@@ -29,10 +29,26 @@ _LIMIT = CreditVector(
     ack_items=4,
     unpublished_pages=1_000,
 )
+_LIFECYCLE_RESERVATION = CreditVector(
+    documents=1,
+    remote_waits=1,
+    retained_results=1,
+    retained_bytes=100,
+    local_items=1,
+    compressed_bytes=100,
+    decoded_bytes=400,
+    temp_disk_bytes=500,
+    db_stage_items=1,
+    ack_items=1,
+    unpublished_pages=10,
+)
 
 
 def _work(attempt_id: str, state: str, version: int = 0) -> CoordinatorWork:
-    state_credits = {
+    final = state in {
+        "acked", "remote_failed", "local_failed", "pre_submission_failed"
+    }
+    actual = {
         "prepared": CreditVector(documents=1),
         "reconciling": CreditVector(documents=1, remote_waits=1),
         "submitted": CreditVector(documents=1, remote_waits=1),
@@ -40,20 +56,13 @@ def _work(attempt_id: str, state: str, version: int = 0) -> CoordinatorWork:
             documents=1, retained_results=1, retained_bytes=100
         ),
         "materializing": CreditVector(
-            documents=1,
-            retained_results=1,
-            retained_bytes=100,
-            local_items=1,
-            compressed_bytes=100,
-            decoded_bytes=400,
+            documents=1, retained_results=1, retained_bytes=100,
+            local_items=1, compressed_bytes=100, decoded_bytes=400,
             temp_disk_bytes=500,
         ),
         "local_materialized": CreditVector(
-            documents=1,
-            retained_results=1,
-            retained_bytes=100,
-            db_stage_items=1,
-            unpublished_pages=10,
+            documents=1, retained_results=1, retained_bytes=100,
+            db_stage_items=1, unpublished_pages=10,
         ),
         "finish_committed": CreditVector(
             documents=1, retained_results=1, retained_bytes=100, ack_items=1
@@ -64,17 +73,16 @@ def _work(attempt_id: str, state: str, version: int = 0) -> CoordinatorWork:
         "local_failure_committed": CreditVector(
             documents=1, retained_results=1, retained_bytes=100, ack_items=1
         ),
-        "acked": CreditVector(),
-        "remote_failed": CreditVector(),
-        "local_failed": CreditVector(),
-        "pre_submission_failed": CreditVector(),
-    }
+    }.get(state, CreditVector())
     return CoordinatorWork(
         attempt_id=attempt_id,
         state=state,
         row_version=version,
         claim_generation=1,
-        credits=state_credits[state],
+        claim_owner_identity=None if final else "worker-boot-1",
+        lease_expires_monotonic=None if final else time.monotonic() + 60,
+        credit_reservation=CreditVector() if final else _LIFECYCLE_RESERVATION,
+        credits=actual,
     )
 
 
@@ -95,7 +103,13 @@ class _Backend:
         self.remote_calls = 0
         self.fail_remote = False
         self.defer_claim = False
+        self.defer_claim_ids: set[str] = set()
+        self.claim_attempts: dict[str, int] = {}
         self.violate_admission_credit = False
+        self.retry_remote_remaining = 0
+        self.transition_violation: str | None = None
+        self.renew_calls = 0
+        self.fail_renew = False
 
     def list_recoverable(
         self, *, after_attempt_id: str | None, limit: int
@@ -110,9 +124,28 @@ class _Backend:
 
     def claim_recovery(self, work: CoordinatorWork) -> CoordinatorWork:
         self.calls.append(f"claim:{work.attempt_id}")
-        if self.defer_claim:
+        self.claim_attempts[work.attempt_id] = (
+            self.claim_attempts.get(work.attempt_id, 0) + 1
+        )
+        if self.defer_claim or work.attempt_id in self.defer_claim_ids:
             raise RecoveryDeferred("held", retry_after_seconds=0.001)
-        return replace(work, claim_generation=work.claim_generation + 1)
+        return replace(
+            work,
+            claim_generation=work.claim_generation + 1,
+            claim_owner_identity="worker-boot-1",
+            lease_expires_monotonic=time.monotonic() + 60,
+        )
+
+    def renew_claim(
+        self, work: CoordinatorWork, *, lease_seconds: int
+    ) -> CoordinatorWork:
+        self.calls.append(f"renew:{work.attempt_id}")
+        self.renew_calls += 1
+        if self.fail_renew:
+            raise RuntimeError("claim lost")
+        return replace(
+            work, lease_expires_monotonic=time.monotonic() + lease_seconds
+        )
 
     def admit_new(
         self, *, limit: int, available_credits: CreditVector
@@ -133,14 +166,31 @@ class _Backend:
         del self.new[: len(selected)]
         return selected
 
-    def prepare_remote_io(self, work: CoordinatorWork) -> CoordinatorWork:
+    def prepare_remote_io(
+        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+    ) -> CoordinatorWork:
+        if step_deadline_monotonic <= time.monotonic():
+            raise AssertionError("preflight deadline is not future")
         self.calls.append(f"preflight:{work.attempt_id}")
-        return replace(
+        updated = replace(
             _work(work.attempt_id, "reconciling", work.row_version + 1),
             claim_generation=work.claim_generation,
         )
+        if self.transition_violation == "equal_version":
+            return replace(updated, row_version=work.row_version)
+        if self.transition_violation == "jump_version":
+            return replace(updated, row_version=work.row_version + 2)
+        if self.transition_violation == "claim_generation":
+            return replace(updated, claim_generation=work.claim_generation + 1)
+        if self.transition_violation == "state_jump":
+            return replace(updated, state="remote_terminal")
+        return updated
 
-    def run_remote(self, work: CoordinatorWork) -> CoordinatorWork:
+    def run_remote(
+        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+    ) -> CoordinatorWork:
+        if step_deadline_monotonic <= time.monotonic():
+            raise AssertionError("remote deadline is not future")
         self.calls.append(f"remote:{work.attempt_id}:{work.state}")
         self.remote_calls += 1
         self.remote_entered.set()
@@ -148,6 +198,9 @@ class _Backend:
             self.remote_release.wait(timeout=2)
         if self.retry_remote_once and self.remote_calls == 1:
             raise RetryStage("ambiguous", retry_after_seconds=0.001)
+        if self.retry_remote_remaining > 0:
+            self.retry_remote_remaining -= 1
+            raise RetryStage("persistent", retry_after_seconds=0.001)
         if self.fail_remote:
             raise RuntimeError("boom")
         if work.state == "reconciling":
@@ -156,49 +209,54 @@ class _Backend:
             target = _work(work.attempt_id, "remote_terminal", work.row_version + 1)
         return replace(target, claim_generation=work.claim_generation)
 
-    def prepare_local_io(self, work: CoordinatorWork) -> CoordinatorWork:
+    def prepare_local_io(
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: CreditVector,
+        step_deadline_monotonic: float,
+    ) -> CoordinatorWork:
         self.calls.append(f"local_prepare:{work.attempt_id}")
+        if credit_allowance != work.credit_reservation:
+            raise AssertionError("local credit allowance drifted")
         target = _work(work.attempt_id, "materializing", work.row_version + 1)
         return replace(
             target,
             claim_generation=work.claim_generation,
-            credits=replace(
-                target.credits,
-                retained_bytes=max(
-                    target.credits.retained_bytes, work.credits.retained_bytes
-                ),
-            ),
+            claim_owner_identity=work.claim_owner_identity,
+            lease_expires_monotonic=work.lease_expires_monotonic,
+            credit_reservation=work.credit_reservation,
         )
 
-    def run_local(self, work: CoordinatorWork) -> CoordinatorWork:
+    def run_local(
+        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+    ) -> CoordinatorWork:
         self.calls.append(f"local:{work.attempt_id}")
         target = _work(work.attempt_id, "local_materialized", work.row_version + 1)
         return replace(
             target,
             claim_generation=work.claim_generation,
-            credits=replace(
-                target.credits,
-                retained_bytes=max(
-                    target.credits.retained_bytes, work.credits.retained_bytes
-                ),
-            ),
+            claim_owner_identity=work.claim_owner_identity,
+            lease_expires_monotonic=work.lease_expires_monotonic,
+            credit_reservation=work.credit_reservation,
         )
 
-    def commit(self, work: CoordinatorWork) -> CoordinatorWork:
+    def commit(
+        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+    ) -> CoordinatorWork:
         self.calls.append(f"commit:{work.attempt_id}")
         target = _work(work.attempt_id, "finish_committed", work.row_version + 1)
         return replace(
             target,
             claim_generation=work.claim_generation,
-            credits=replace(
-                target.credits,
-                retained_bytes=max(
-                    target.credits.retained_bytes, work.credits.retained_bytes
-                ),
-            ),
+            claim_owner_identity=work.claim_owner_identity,
+            lease_expires_monotonic=work.lease_expires_monotonic,
+            credit_reservation=work.credit_reservation,
         )
 
-    def acknowledge(self, work: CoordinatorWork) -> CoordinatorWork:
+    def acknowledge(
+        self, work: CoordinatorWork, *, step_deadline_monotonic: float
+    ) -> CoordinatorWork:
         self.calls.append(f"ack:{work.attempt_id}:{work.state}")
         state = {
             "finish_committed": "acked",
@@ -230,6 +288,44 @@ class CreditVectorTests(unittest.TestCase):
             _ = used - CreditVector(documents=2)
         with self.assertRaisesRegex(ValueError, "non-negative"):
             CreditVector(local_items=-1)
+
+    def test_work_shape_closes_nonfinal_and_final_credit_ownership(self) -> None:
+        nonfinal = _work("attempt-1", "submitted")
+        with self.assertRaisesRegex(ValueError, "nonfinal coordinator work"):
+            replace(
+                nonfinal,
+                claim_owner_identity=None,
+                lease_expires_monotonic=None,
+            )
+        with self.assertRaisesRegex(ValueError, "nonfinal coordinator work"):
+            replace(nonfinal, credit_reservation=CreditVector(), credits=CreditVector())
+
+        final = _work("attempt-1", "acked")
+        with self.assertRaisesRegex(ValueError, "final coordinator work"):
+            replace(
+                final,
+                claim_owner_identity="worker-boot-1",
+                lease_expires_monotonic=time.monotonic() + 60,
+            )
+        with self.assertRaisesRegex(ValueError, "final coordinator work"):
+            replace(
+                final,
+                credit_reservation=_LIFECYCLE_RESERVATION,
+                credits=CreditVector(documents=1),
+            )
+
+    def test_unknown_state_remains_constructible_for_fail_closed_reporting(self) -> None:
+        unknown = CoordinatorWork(
+            attempt_id="attempt-unknown",
+            state="future_state",
+            row_version=1,
+            claim_generation=0,
+            claim_owner_identity=None,
+            lease_expires_monotonic=None,
+            credit_reservation=CreditVector(),
+            credits=CreditVector(),
+        )
+        self.assertEqual(unknown.state, "future_state")
 
 
 class StagedParseCoordinatorTests(unittest.TestCase):
@@ -320,21 +416,24 @@ class StagedParseCoordinatorTests(unittest.TestCase):
     def test_backend_admission_credit_violation_is_preserved_and_opens_circuit(self) -> None:
         too_large = replace(
             _work("attempt-1", "prepared"),
-            credits=CreditVector(documents=9),
+            credit_reservation=replace(_LIFECYCLE_RESERVATION, documents=9),
         )
         backend = _Backend(new=(too_large,))
         backend.violate_admission_credit = True
         result = StagedParseCoordinator(backend=backend, limits=_limits()).run()
         self.assertEqual(result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
-        self.assertEqual(result.final_states, (("attempt-1", "acked"),))
+        self.assertEqual(result.final_states, ())
         self.assertTrue(
             any("admission exceeded credit grant" in error for error in result.errors)
         )
-        self.assertEqual(result.credits_in_use, CreditVector())
+        self.assertEqual(result.credits_in_use.documents, 1)
 
     def test_recovered_oversubscription_drains_before_new_admission(self) -> None:
         huge = replace(
             _work("attempt-old", "remote_terminal", 5),
+            credit_reservation=replace(
+                _LIFECYCLE_RESERVATION, retained_bytes=20_000
+            ),
             credits=CreditVector(
                 documents=1, retained_results=1, retained_bytes=20_000
             ),
@@ -369,6 +468,110 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         )
         self.assertEqual(result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
         self.assertFalse(result.recovery_complete)
+
+    def test_transition_contract_rejects_noop_jump_and_claim_change(self) -> None:
+        for violation in (
+            "equal_version", "jump_version", "claim_generation", "state_jump"
+        ):
+            with self.subTest(violation=violation):
+                backend = _Backend(new=(_work("attempt-1", "prepared"),))
+                backend.transition_violation = violation
+                result = StagedParseCoordinator(
+                    backend=backend, limits=_limits()
+                ).run()
+                self.assertEqual(
+                    result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT
+                )
+                self.assertEqual(result.completed, 0)
+                self.assertEqual(result.credits_in_use.documents, 1)
+
+    def test_deferred_recovery_does_not_block_claimed_work_drain(self) -> None:
+        backend = _Backend(
+            recoverable=(
+                _work("attempt-active", "finish_committed", 7),
+                _work("attempt-deferred", "submitted", 2),
+            )
+        )
+        backend.defer_claim_ids.add("attempt-deferred")
+        result_box: list[object] = []
+        thread = threading.Thread(
+            target=lambda: result_box.append(
+                StagedParseCoordinator(
+                    backend=backend, limits=_limits()
+                ).run()
+            )
+        )
+        thread.start()
+        deadline = time.monotonic() + 1
+        while "ack:attempt-active:finish_committed" not in backend.calls:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.001)
+        self.assertFalse(any(call.startswith("admit:") for call in backend.calls))
+        backend.defer_claim_ids.clear()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            result_box[0].terminal, CoordinatorTerminal.QUIESCENT  # type: ignore[attr-defined]
+        )
+
+    def test_stage_renews_near_expiry_claim_before_side_effect(self) -> None:
+        near_expiry = replace(
+            _work("attempt-1", "prepared"),
+            lease_expires_monotonic=time.monotonic() + 0.01,
+        )
+        backend = _Backend(new=(near_expiry,))
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(
+                claim_lease_seconds=2,
+                claim_renew_margin_seconds=0.5,
+                max_stage_step_seconds=1,
+            ),
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertGreaterEqual(backend.renew_calls, 1)
+        self.assertLess(
+            backend.calls.index("renew:attempt-1"),
+            backend.calls.index("preflight:attempt-1"),
+        )
+
+    def test_retry_degrades_admission_then_success_reopens(self) -> None:
+        backend = _Backend(new=(_work("attempt-1", "prepared"),))
+        backend.retry_remote_remaining = 2
+        snapshots = []
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(
+                retry_initial_backoff_seconds=0.001,
+                retry_max_backoff_seconds=0.002,
+                retry_consecutive_threshold=2,
+                retry_max_attempts=4,
+                retry_stuck_seconds=1,
+            ),
+            progress=snapshots.append,
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertTrue(any(s.blocked_reason == "retry_degraded" for s in snapshots))
+        self.assertEqual(result.final_states, (("attempt-1", "acked"),))
+
+    def test_persistent_retry_becomes_stuck_and_retains_reservation(self) -> None:
+        backend = _Backend(new=(_work("attempt-1", "prepared"),))
+        backend.retry_remote_remaining = 20
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(
+                retry_initial_backoff_seconds=0.001,
+                retry_max_backoff_seconds=0.002,
+                retry_consecutive_threshold=2,
+                retry_max_attempts=3,
+                retry_stuck_seconds=1,
+            ),
+        ).run()
+        self.assertEqual(
+            result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT
+        )
+        self.assertEqual(result.completed, 0)
+        self.assertEqual(result.credits_in_use.documents, 1)
 
 
 def result_ready(backend: _Backend) -> bool:

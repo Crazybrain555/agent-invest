@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone
+import hashlib
 import json
 from typing import Any, Optional, cast
 
@@ -1302,6 +1303,35 @@ class RemoteParseAttemptRepository:
         ).scalar_one_or_none()
         if current is None or current.processing_run_id != finished_run.processing_run_id:
             raise RemoteParseCheckpointConflict("finish checkpoint run ownership drifted")
+        if current.local_receipt_bytes is None:
+            raise RemoteParseCheckpointConflict(
+                "finish checkpoint lacks local materialization evidence"
+            )
+        encoded_local = decode_checkpoint_receipt(bytes(current.local_receipt_bytes))
+        local = encoded_local.receipt
+        target_identity = finished_run.parser_target_identity
+        if target_identity is None:
+            target_sha256 = None
+        else:
+            target_exact = json.dumps(
+                target_identity, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            target_sha256 = "sha256:" + hashlib.sha256(target_exact).hexdigest()
+        if not isinstance(local, LocalMaterializationReceipt) or (
+            encoded_local.sha256 != current.local_receipt_sha256
+            or encoded_local.byte_count != current.local_receipt_byte_count
+            or local.attempt_identity != current.attempt_id
+            or local.fence_identity != current.fence_identity
+            or local.source_pdf_sha256 != finished_run.input_raw_file_hash
+            or local.parser_target_sha256 != target_sha256
+            or local.provider_envelope_relpath
+            != finished_run.provider_document_relpath
+            or local.provider_envelope_sha256 != finished_run.artifact_hash
+            or local.artifact_root_relpath != finished_run.parser_artifact_relpath
+        ):
+            raise RemoteParseCheckpointConflict(
+                "succeeded processing run drifted from local receipt"
+            )
         with self._session.begin_nested():
             ProcessingRunRepository(self._session).update(finished_run)
             if document_row.current_processing_run_id is None:
