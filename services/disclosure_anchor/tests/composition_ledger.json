@@ -326,13 +326,13 @@
    "private_imports": [],
    "tests": 8
   },
-  "tests/unit/test_mineru_process_profile.py": {
-   "private_imports": [],
-   "tests": 4
-  },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
    "tests": 12
+  },
+  "tests/unit/test_mineru_process_profile.py": {
+   "private_imports": [],
+   "tests": 6
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
