@@ -674,6 +674,30 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         self.assertTrue(admit_indices)
         self.assertLess(local_prepare_index, admit_indices[0])
 
+    def test_recovery_with_unreachable_lifecycle_envelope_uses_emergency_drain(self) -> None:
+        current_fits = replace(
+            _work("attempt-old", "remote_terminal", 5),
+            credit_reservation=replace(_LIFECYCLE_RESERVATION, local_items=5),
+        )
+        backend = _Backend(
+            recoverable=(current_fits,),
+            new=(_work("attempt-new", "prepared"),),
+        )
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(credits=replace(_LIMIT, local_items=1)),
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertIn("local_prepare:attempt-old", backend.calls)
+        self.assertLess(
+            backend.calls.index("local_prepare:attempt-old"),
+            next(
+                index
+                for index, call in enumerate(backend.calls)
+                if call.startswith("admit:")
+            ),
+        )
+
     def test_multiple_oversubscribed_recoveries_receive_one_growth_grant(self) -> None:
         recoverable = tuple(
             replace(

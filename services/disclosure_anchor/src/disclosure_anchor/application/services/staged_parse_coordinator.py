@@ -550,11 +550,18 @@ class StagedParseCoordinator:
             ):
                 raise RuntimeError("durable coordinator projection moved backwards")
             known[work.attempt_id] = work
-            if recovery and not ledger.can_add(work):
+            if recovery and (
+                not ledger.can_add(work)
+                or not work.credit_reservation.fits(ledger.limit)
+            ):
                 oversubscribed_recovery.add(work.attempt_id)
             ledger.replace(work, allow_oversubscribed=recovery)
             if oversubscribed_recovery and ledger.in_use.fits(ledger.limit):
-                oversubscribed_recovery.clear()
+                oversubscribed_recovery.intersection_update(
+                    attempt_id
+                    for attempt_id, durable in known.items()
+                    if not durable.credit_reservation.fits(ledger.limit)
+                )
             if work.state in _FINAL_STATES:
                 ledger.release(work.attempt_id)
                 final[work.attempt_id] = work.state
@@ -916,7 +923,10 @@ class StagedParseCoordinator:
                         for work in admitted_batch:
                             if work.attempt_id in active_ids or work.attempt_id in final:
                                 raise RuntimeError("new admission duplicated an active attempt")
-                            if not ledger.can_add(work):
+                            if (
+                                not ledger.can_add(work)
+                                or not work.credit_reservation.fits(ledger.limit)
+                            ):
                                 # ``admit_new`` has already durably created and
                                 # claimed the attempt. Preserve it and drain it;
                                 # never drop a backend contract violation.
@@ -1023,6 +1033,13 @@ class StagedParseCoordinator:
                         active += 1
 
                 if not in_flight:
+                    if any(queues.values()) and not circuit_open:
+                        circuit_open = True
+                        admission_open = False
+                        blocked_reason = "resource_credit_grant_unavailable"
+                        errors.append(
+                            "durable queued work cannot obtain its next credit grant"
+                        )
                     if (
                         recovery_complete
                         and not circuit_open
