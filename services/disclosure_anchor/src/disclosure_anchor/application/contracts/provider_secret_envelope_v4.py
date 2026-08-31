@@ -23,6 +23,8 @@ import re
 from dataclasses import asdict, dataclass, field
 
 from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
+    ACCEPTED_SUBMISSION_SECRET_KIND_MAX_BYTES,
+    ACCEPTED_SUBMISSION_TOKEN_MAX_BYTES,
     AcceptedSubmissionReceiptV4,
 )
 
@@ -38,7 +40,7 @@ PROVIDER_SECRET_TAG_BYTES = 16
 PROVIDER_SECRET_WRAPPED_DEK_BYTES = (
     PROVIDER_SECRET_DEK_BYTES + PROVIDER_SECRET_TAG_BYTES
 )
-PROVIDER_SECRET_MAX_TOKEN_BYTES = 65536
+PROVIDER_SECRET_MAX_TOKEN_BYTES = ACCEPTED_SUBMISSION_TOKEN_MAX_BYTES
 
 _MAX_AAD_BYTES = 1024 * 1024
 _MAX_INT = (1 << 63) - 1
@@ -62,7 +64,10 @@ class ProviderSecretBindingV4:
         _contract(self.contract_version, PROVIDER_SECRET_BINDING_V4_CONTRACT)
         _identity(self.attempt_id, max_bytes=1024)
         _identity(self.fence_identity, max_bytes=1024)
-        _identity(self.secret_kind, max_bytes=128)
+        _identity(
+            self.secret_kind,
+            max_bytes=ACCEPTED_SUBMISSION_SECRET_KIND_MAX_BYTES,
+        )
         _positive(self.provider_secret_version, "provider secret version")
         _sha(self.token_sha256, "provider token")
         _positive(self.token_byte_count, "provider token byte count")
@@ -142,6 +147,33 @@ class SealedProviderSecretV4:
             self.binding.token_byte_count + PROVIDER_SECRET_TAG_BYTES,
             "token ciphertext",
         )
+
+
+def validate_provider_secret_revision_history_v4(
+    history: tuple[SealedProviderSecretV4, ...],
+) -> None:
+    """Validate one complete ordered history before the current row is opened.
+
+    This closes only persisted structure.  The caller must still authenticate
+    the maximum revision through the injected provider-secret cipher.
+    """
+
+    if type(history) is not tuple or not history:
+        raise ValueError("provider secret revision history is invalid")
+    if any(type(item) is not SealedProviderSecretV4 for item in history):
+        raise ValueError("provider secret revision history is invalid")
+    if tuple(item.encryption_revision for item in history) != tuple(
+        range(1, len(history) + 1)
+    ):
+        raise ValueError("provider secret revisions are not contiguous")
+    first = history[0]
+    if any(
+        item.binding != first.binding
+        or item.data_nonce != first.data_nonce
+        or item.token_ciphertext != first.token_ciphertext
+        for item in history[1:]
+    ):
+        raise ValueError("provider secret data layer drifted across revisions")
 
 
 def provider_secret_data_aad_v4(binding: ProviderSecretBindingV4) -> bytes:
@@ -226,12 +258,12 @@ def _digest(value: bytes) -> str:
 
 
 def _contract(observed: str, expected: str) -> None:
-    if observed != expected:
+    if type(observed) is not str or observed != expected:
         raise ValueError("provider secret contract is unsupported")
 
 
 def _identity(value: str, *, max_bytes: int) -> None:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise ValueError("provider secret identity is invalid")
     try:
         encoded = value.encode("utf-8")
@@ -247,17 +279,17 @@ def _identity(value: str, *, max_bytes: int) -> None:
 
 
 def _kek_identity(value: str) -> None:
-    if not isinstance(value, str) or _KEK_ID.fullmatch(value) is None:
+    if type(value) is not str or _KEK_ID.fullmatch(value) is None:
         raise ValueError("provider secret KEK identity is invalid")
 
 
 def _sha(value: str, label: str) -> None:
-    if not isinstance(value, str) or _SHA.fullmatch(value) is None:
+    if type(value) is not str or _SHA.fullmatch(value) is None:
         raise ValueError(f"{label} hash is not canonical")
 
 
 def _positive(value: int, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_INT:
+    if type(value) is not int or not 1 <= value <= _MAX_INT:
         raise ValueError(f"{label} must be positive")
 
 
@@ -284,4 +316,5 @@ __all__ = [
     "provider_secret_data_aad_v4",
     "provider_secret_wrap_aad_v4",
     "validate_provider_secret_kek_id_v4",
+    "validate_provider_secret_revision_history_v4",
 ]

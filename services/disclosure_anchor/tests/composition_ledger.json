@@ -390,7 +390,7 @@
   },
   "tests/unit/test_provider_secret_envelope_v4.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 32
   },
   "tests/unit/test_provider_secret_keyring.py": {
    "private_imports": [],
@@ -436,7 +436,7 @@
   },
   "tests/unit/test_remote_parse_evidence_v4.py": {
    "private_imports": [],
-   "tests": 24
+   "tests": 25
   },
   "tests/unit/test_remote_parse_lifecycle_v4.py": {
    "private_imports": [],

@@ -78,6 +78,25 @@ from tests.unit.test_remote_parse_lifecycle_v4 import (
 )
 
 
+class _LyingStr(str):
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        return b"x"
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+
+class _LyingInt(int):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __le__(self, other: object) -> bool:
+        return True
+
+    def __gt__(self, other: object) -> bool:
+        return False
+
+
 class RemoteParseEvidenceV4Tests(unittest.TestCase):
     def test_fixed_evidence_records_round_trip_strictly(self) -> None:
         records = _records()
@@ -393,6 +412,22 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
                 accepted,
                 result_url="https://provider.invalid/task-1/result?token=secret",
             )
+
+    def test_accepted_submission_closes_secret_envelope_bounds(self) -> None:
+        accepted = _records()[3]
+        rejected = (
+            {"secret_kind": "x" * 129},
+            {"secret_kind": "界" * 43},
+            {"secret_kind": _LyingStr("界" * 1_000)},
+            {"token_byte_count": 65_537},
+            {"token_byte_count": _LyingInt(10**30)},
+            {"token_sha256": _LyingStr(SHA_E)},
+            {"contract_version": _LyingStr("not-v4")},
+        )
+        for overrides in rejected:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    replace(accepted, **overrides)
 
     def test_prepared_bundle_binds_typed_preparation_and_snapshot(self) -> None:
         reservation = _base()["reservation"]

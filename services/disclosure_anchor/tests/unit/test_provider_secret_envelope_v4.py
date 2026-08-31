@@ -20,6 +20,7 @@ from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import 
     bind_provider_secret_v4,
     provider_secret_data_aad_v4,
     provider_secret_wrap_aad_v4,
+    validate_provider_secret_revision_history_v4,
 )
 from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     AcceptedSubmissionReceiptV4,
@@ -36,6 +37,25 @@ _TOKEN = bytes(range(17))
 _TOKEN_SHA = "sha256:" + hashlib.sha256(_TOKEN).hexdigest()
 _KEK_PRIMARY = bytes(range(32))
 _KEK_LEGACY = bytes(range(32, 64))
+
+
+class _LyingStr(str):
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        return b"x"
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+
+class _LyingInt(int):
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __le__(self, other: object) -> bool:
+        return True
+
+    def __gt__(self, other: object) -> bool:
+        return False
 
 
 def _binding(token: bytes = _TOKEN) -> ProviderSecretBindingV4:
@@ -132,10 +152,14 @@ class ProviderSecretBindingTests(unittest.TestCase):
             {"fence_identity": "bad\x00fence"},
             {"secret_kind": ""},
             {"secret_kind": "x" * 129},
+            {"secret_kind": _LyingStr("界" * 1_000)},
+            {"provider_secret_version": _LyingInt(999)},
             {"provider_secret_version": 0},
             {"provider_secret_version": True},
+            {"token_sha256": _LyingStr("sha256:" + "a" * 64)},
             {"token_sha256": "sha256:" + "A" * 64},
             {"token_sha256": "md5:" + "a" * 64},
+            {"token_byte_count": _LyingInt(10**30)},
             {"token_byte_count": 0},
             {"token_byte_count": PROVIDER_SECRET_MAX_TOKEN_BYTES + 1},
             {"contract_version": "provider-secret-binding.v3"},
@@ -144,6 +168,16 @@ class ProviderSecretBindingTests(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaises(ValueError):
                     replace(_golden_binding(), **overrides)
+
+    def test_accepted_receipt_envelope_boundaries_always_bind(self) -> None:
+        receipt = replace(
+            _receipt(),
+            secret_kind="x" * 128,
+            token_byte_count=PROVIDER_SECRET_MAX_TOKEN_BYTES,
+        )
+        binding = bind_provider_secret_v4(receipt)
+        self.assertEqual(binding.secret_kind, receipt.secret_kind)
+        self.assertEqual(binding.token_byte_count, receipt.token_byte_count)
 
     def test_binding_canonical_bytes_golden(self) -> None:
         expected = (
@@ -214,6 +248,7 @@ class ProviderSecretAadTests(unittest.TestCase):
             {"binding": SimpleNamespace()},
             {"encryption_revision": 0},
             {"encryption_revision": True},
+            {"encryption_revision": _LyingInt(999)},
             {"kek_id": "KEK-2026A"},
             {"kek_id": "-starts-with-dash"},
             {"data_nonce": bytes(11)},
@@ -290,6 +325,65 @@ class SealedEnvelopeShapeTests(unittest.TestCase):
         plaintext_text = repr(_plaintext())
         self.assertNotIn(repr(_TOKEN), plaintext_text)
         self.assertNotIn(_TOKEN.hex(), plaintext_text)
+
+
+class ProviderSecretRevisionHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        cipher = AesGcmProviderSecretCipher(keyring=_keyring())
+        self.first = cipher.seal(_plaintext())
+        self.second = cipher.rewrap(self.first)
+        self.third = cipher.rewrap(self.second)
+
+    def test_single_and_multiple_revision_histories_are_valid(self) -> None:
+        validate_provider_secret_revision_history_v4((self.first,))
+        validate_provider_secret_revision_history_v4(
+            (self.first, self.second, self.third)
+        )
+
+    def test_history_requires_an_exact_nonempty_tuple(self) -> None:
+        rejected = ((), [], (SimpleNamespace(),))
+        for history in rejected:
+            with self.subTest(history_type=type(history).__name__):
+                with self.assertRaises(ValueError):
+                    validate_provider_secret_revision_history_v4(
+                        history  # type: ignore[arg-type]
+                    )
+
+    def test_history_rejects_revision_gaps_duplicates_and_reordering(self) -> None:
+        rejected = (
+            (replace(self.first, encryption_revision=2),),
+            (self.first, replace(self.second, encryption_revision=3)),
+            (self.first, replace(self.second, encryption_revision=1)),
+            (self.second, self.first),
+        )
+        for history in rejected:
+            with self.subTest(
+                revisions=[item.encryption_revision for item in history]
+            ):
+                with self.assertRaises(ValueError):
+                    validate_provider_secret_revision_history_v4(history)
+
+    def test_history_rejects_binding_or_data_layer_drift(self) -> None:
+        rejected = (
+            replace(
+                self.second,
+                binding=replace(self.second.binding, attempt_id="attempt-other"),
+            ),
+            replace(
+                self.second,
+                data_nonce=_flip(self.second.data_nonce, 0),
+            ),
+            replace(
+                self.second,
+                token_ciphertext=_flip(self.second.token_ciphertext, 0),
+            ),
+        )
+        for revision in rejected:
+            with self.subTest(revision=revision.encryption_revision):
+                with self.assertRaises(ValueError):
+                    validate_provider_secret_revision_history_v4(
+                        (self.first, revision)
+                    )
 
 
 class AesGcmProviderSecretCipherTests(unittest.TestCase):

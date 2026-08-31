@@ -52,6 +52,9 @@ TERMINAL_RECEIPT_V4_CONTRACT = "remote-terminal-receipt.v4"
 FAILURE_RECEIPT_V4_CONTRACT = "remote-parse-failure-receipt.v4"
 SUPERSESSION_RECEIPT_V4_CONTRACT = "remote-parse-supersession-receipt.v4"
 
+ACCEPTED_SUBMISSION_SECRET_KIND_MAX_BYTES = 128
+ACCEPTED_SUBMISSION_TOKEN_MAX_BYTES = 65_536
+
 EvidenceKindV4 = Literal[
     "preparation_intent",
     "snapshot_receipt",
@@ -349,13 +352,20 @@ class AcceptedSubmissionReceiptV4:
             self.remote_task_identity,
             self.status_url,
             self.result_url,
-            self.secret_kind,
             self.provider_protocol_version,
+        )
+        _identity(
+            self.secret_kind,
+            max_bytes=ACCEPTED_SUBMISSION_SECRET_KIND_MAX_BYTES,
         )
         _sha(self.submission_intent_sha256, "submission intent")
         _sha(self.token_sha256, "provider token")
         _positive(self.secret_version, "secret version")
         _positive(self.token_byte_count, "token byte count")
+        if self.token_byte_count > ACCEPTED_SUBMISSION_TOKEN_MAX_BYTES:
+            raise ValueError(
+                "accepted-submission token exceeds the durable envelope"
+            )
         status = urlsplit(self.status_url)
         result = urlsplit(self.result_url)
         if (
@@ -1726,24 +1736,33 @@ def _digest(value: bytes) -> str:
 
 
 def _contract(observed: str, expected: str) -> None:
-    if observed != expected:
+    if type(observed) is not str or observed != expected:
         raise ValueError("remote-parse v4 evidence contract is unsupported")
 
 
 def _identities(*values: str) -> None:
     for value in values:
-        if (
-            not isinstance(value, str)
-            or not value
-            or value != value.strip()
-            or len(value.encode("utf-8")) > 1024
-            or any(ord(character) < 0x20 for character in value)
-        ):
-            raise ValueError("remote-parse v4 evidence identity is invalid")
+        _identity(value, max_bytes=1024)
+
+
+def _identity(value: str, *, max_bytes: int) -> None:
+    if type(value) is not str:
+        raise ValueError("remote-parse v4 evidence identity is invalid")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("remote-parse v4 evidence identity is invalid") from None
+    if (
+        not value
+        or value != value.strip()
+        or len(encoded) > max_bytes
+        or any(ord(character) < 0x20 for character in value)
+    ):
+        raise ValueError("remote-parse v4 evidence identity is invalid")
 
 
 def _sha(value: str, label: str) -> None:
-    if not isinstance(value, str) or _SHA.fullmatch(value) is None:
+    if type(value) is not str or _SHA.fullmatch(value) is None:
         raise ValueError(f"{label} hash is not canonical")
 
 
@@ -1753,12 +1772,12 @@ def _optional_sha(value: str | None, label: str) -> None:
 
 
 def _positive(value: int, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_INT:
+    if type(value) is not int or not 1 <= value <= _MAX_INT:
         raise ValueError(f"{label} must be positive")
 
 
 def _nonnegative(value: int, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_INT:
+    if type(value) is not int or not 0 <= value <= _MAX_INT:
         raise ValueError(f"{label} must be non-negative")
 
 
@@ -1767,6 +1786,8 @@ def _relpath(value: str, label: str) -> None:
 
 
 __all__ = [
+    "ACCEPTED_SUBMISSION_SECRET_KIND_MAX_BYTES",
+    "ACCEPTED_SUBMISSION_TOKEN_MAX_BYTES",
     "ACCEPTED_SUBMISSION_V4_CONTRACT",
     "FAILURE_RECEIPT_V4_CONTRACT",
     "PREPARATION_INTENT_V4_CONTRACT",
