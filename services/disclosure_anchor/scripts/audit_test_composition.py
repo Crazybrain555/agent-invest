@@ -13,6 +13,7 @@ Usage: audit_test_composition.py [--update]
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -29,9 +30,20 @@ LEDGER_PATH = REPO / "tests" / "composition_ledger.json"
 LEDGER_SCHEMA = "test-composition-ledger.v1"
 
 _TEST_DEF_RE = re.compile(r"^\s*def (test_\w+)", re.MULTILINE)
-_PRIVATE_IMPORT_RE = re.compile(
-    r"^from disclosure_anchor[\w.]* import \(?([^)]*)\)?", re.MULTILINE
-)
+
+
+def _private_disclosure_imports(text: str) -> list[str]:
+    tree = ast.parse(text)
+    private: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.module is None:
+            continue
+        if node.module != "disclosure_anchor" and not node.module.startswith(
+            "disclosure_anchor."
+        ):
+            continue
+        private.update(alias.name for alias in node.names if alias.name.startswith("_"))
+    return sorted(private)
 
 
 def _scan() -> dict[str, _FileState]:
@@ -39,15 +51,9 @@ def _scan() -> dict[str, _FileState]:
     for path in sorted(REPO.glob("tests/**/test_*.py")):
         text = path.read_text(encoding="utf-8")
         tests = len(_TEST_DEF_RE.findall(text))
-        private: set[str] = set()
-        for match in _PRIVATE_IMPORT_RE.finditer(text):
-            for raw_name in match.group(1).replace("\n", ",").split(","):
-                name = raw_name.strip().split(" as ")[0].strip()
-                if name.startswith("_"):
-                    private.add(name)
         state[str(path.relative_to(REPO))] = {
             "tests": tests,
-            "private_imports": sorted(private),
+            "private_imports": _private_disclosure_imports(text),
         }
     return state
 

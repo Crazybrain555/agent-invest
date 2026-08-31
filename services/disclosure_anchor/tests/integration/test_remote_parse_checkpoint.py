@@ -47,11 +47,15 @@ from disclosure_anchor.application.contracts.staged_credit import (
     build_staged_credit_envelope,
     credit_shape,
 )
-from disclosure_anchor.application.ports.repositories import CreditTransitionGrant
+from disclosure_anchor.application.ports.repositories import (
+    CreditTransitionGrant,
+    V3ResumeSecretIdentityMismatch,
+    V3ResumeSecretMissing,
+    V3ResumeSecretStaleOwner,
+)
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
     _issue_provider_ack_completion_witness,
-    encode_durable_checkpoint_witness,
 )
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
@@ -666,21 +670,7 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                 uow.commit()
             prepared = parser.prepare_local_submission(
                 input_pdf=source, options=options, identity=identity,
-                # The HTTP snapshot contract remains v2 while the accepted
-                # receipt/secret is persisted by the explicit v3 repository.
-                witness=encode_durable_checkpoint_witness(
-                    attempt_identity=prepared_witness.attempt_identity,
-                    fence_identity=prepared_witness.fence_identity,
-                    checkpoint_contract_version=2,
-                    row_version=prepared_witness.row_version,
-                    claim_generation=prepared_witness.claim_generation,
-                    state="prepared",
-                    prepared_identity=identity,
-                    accepted_submission_receipt_sha256=None,
-                    terminal_receipt_sha256=None,
-                    failure_receipt_sha256=None,
-                    remote_task_identity=None,
-                ),
+                witness=prepared_witness,
             )
             handle = parser.begin_remote_parse(
                 options=options, prepared_submission=prepared,
@@ -718,6 +708,62 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
                     ), receipt=accepted_receipt, accepted_secret=accepted_secret,
                 ).attempt
                 uow.commit()
+            accepted_token_sha256 = accepted_secret.token_sha256
+            accepted_token_byte_count = accepted_secret.token_byte_count
+            del handle, private, accepted_secret, parser
+            with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+                recovered = uow.remote_parse_attempts.recover_v3_resume_secret(
+                    attempt_id=self.attempt_id, fence_identity="fence-1",
+                    secret_kind="accepted_submission",
+                    expected_token_sha256=accepted_token_sha256,
+                    expected_token_byte_count=accepted_token_byte_count,
+                    expected_state="submitted",
+                    expected_row_version=submitted.row_version,
+                    claim_owner_identity=submitted.claim_owner_identity or "",
+                    claim_generation=submitted.claim_generation,
+                )
+                with self.assertRaises(V3ResumeSecretIdentityMismatch):
+                    uow.remote_parse_attempts.recover_v3_resume_secret(
+                        attempt_id=self.attempt_id, fence_identity="fence-1",
+                        secret_kind="accepted_submission",
+                        expected_token_sha256=_sha("9"),
+                        expected_token_byte_count=accepted_token_byte_count,
+                        expected_state="submitted",
+                        expected_row_version=submitted.row_version,
+                        claim_owner_identity=submitted.claim_owner_identity or "",
+                        claim_generation=submitted.claim_generation,
+                    )
+                with self.assertRaises(V3ResumeSecretMissing):
+                    uow.remote_parse_attempts.recover_v3_resume_secret(
+                        attempt_id=self.attempt_id, fence_identity="fence-1",
+                        secret_kind="materialization",
+                        expected_token_sha256=_sha("8"),
+                        expected_token_byte_count=1,
+                        expected_state="submitted",
+                        expected_row_version=submitted.row_version,
+                        claim_owner_identity=submitted.claim_owner_identity or "",
+                        claim_generation=submitted.claim_generation,
+                    )
+                with self.assertRaises(V3ResumeSecretStaleOwner):
+                    uow.remote_parse_attempts.recover_v3_resume_secret(
+                        attempt_id=self.attempt_id, fence_identity="fence-1",
+                        secret_kind="accepted_submission",
+                        expected_token_sha256=accepted_token_sha256,
+                        expected_token_byte_count=accepted_token_byte_count,
+                        expected_state="submitted",
+                        expected_row_version=submitted.row_version,
+                        claim_owner_identity="different-worker",
+                        claim_generation=submitted.claim_generation,
+                    )
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+                transport=httpx.MockTransport(handler),
+            )
+            handle = parser.resume_submitted_parse(
+                receipt=public, secret=recovered, options=options,
+            )
             failure = encode_checkpoint_receipt(FailureReceipt(
                 attempt_identity=self.attempt_id, fence_identity="fence-1",
                 stage="remote", accepted=True, ack_required=True,

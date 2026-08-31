@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import tempfile
+from typing import Any, TextIO
 import unittest
+from unittest import mock
 
 from disclosure_anchor.adapters.parsers.mineru_medium import (
     MinerUMediumArtifactReader,
+)
+from disclosure_anchor.adapters.parsers.mineru_medium import (
+    artifacts as artifacts_module,
+)
+from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
+    PinnedArtifactTree,
 )
 from disclosure_anchor.domain.errors import (
     ParserOutputContractError,
@@ -54,7 +64,10 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                     segment.page_local_html
                     for segment in document.physical_table_segments
                 ],
-                ["<table><tr><td>前页</td></tr></table>", "<table><tr><td>续页</td></tr></table>"],
+                [
+                    "<table><tr><td>前页</td></tr></table>",
+                    "<table><tr><td>续页</td></tr></table>",
+                ],
             )
             first_segment_bbox = document.physical_table_segments[0].bbox
             self.assertIsNotNone(first_segment_bbox)
@@ -63,11 +76,12 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                 first_segment_bbox.as_tuple(),
                 (100.0, 100.0, 900.0, 875.0),
             )
-            self.assertIsNotNone(
-                document.physical_table_segments[1].crop_artifact_role
-            )
+            self.assertIsNotNone(document.physical_table_segments[1].crop_artifact_role)
             self.assertTrue(
-                any(artifact.relative_path == "notes.bin" for artifact in document.artifacts)
+                any(
+                    artifact.relative_path == "notes.bin"
+                    for artifact in document.artifacts
+                )
             )
             self.assertTrue(
                 all(":" not in artifact.role for artifact in document.artifacts)
@@ -179,7 +193,10 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
 
     def test_annotation_binding_rejects_page_and_item_count_mismatch(self) -> None:
         for mismatch in ("page_count", "item_count"):
-            with self.subTest(mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(mismatch=mismatch),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 _write_bundle(root)
                 typed_path = root / f"{_STEM}_content_list_v2.json"
@@ -259,6 +276,289 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                     root,
                     source_pdf_sha256=_SOURCE_SHA,
                 )
+
+    def test_rejects_symlink_root_fifo_hardlink_and_empty_directory(self) -> None:
+        with (
+            self.subTest(case="symlink root"),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            parent = Path(directory)
+            actual = parent / "actual"
+            actual.mkdir()
+            _write_bundle(actual)
+            linked = parent / "linked"
+            linked.symlink_to(actual, target_is_directory=True)
+
+            with self.assertRaises(ParserOutputContractError):
+                MinerUMediumArtifactReader().read(
+                    linked,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
+
+        with self.subTest(case="fifo"), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            os.mkfifo(root / "unsafe-fifo")
+
+            with self.assertRaises(ParserOutputContractError):
+                MinerUMediumArtifactReader().read(
+                    root,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
+
+        with self.subTest(case="hardlink"), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            os.link(root / "notes.bin", root / "notes-hardlink.bin")
+
+            with self.assertRaises(ParserOutputContractError):
+                MinerUMediumArtifactReader().read(
+                    root,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
+
+        with (
+            self.subTest(case="empty directory"),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            root = Path(directory)
+            _write_bundle(root)
+            (root / "unexpected-empty").mkdir()
+
+            with self.assertRaises(ParserOutputContractError):
+                MinerUMediumArtifactReader().read(
+                    root,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
+
+    def test_pinned_tree_rejects_root_file_directory_and_topology_rebinding(
+        self,
+    ) -> None:
+        with self.subTest(case="root"), tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "output"
+            root.mkdir()
+            _write_bundle(root)
+            with PinnedArtifactTree.open_path(root) as tree:
+                root.rename(parent / "original-output")
+                root.mkdir()
+                with self.assertRaises(ParserOutputContractError):
+                    tree.verify_unchanged()
+
+        with self.subTest(case="file"), tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "output"
+            root.mkdir()
+            _write_bundle(root)
+            replacement = parent / "replacement"
+            replacement.write_bytes((root / "notes.bin").read_bytes())
+            with PinnedArtifactTree.open_path(root) as tree:
+                os.replace(replacement, root / "notes.bin")
+                with self.assertRaises(ParserOutputContractError):
+                    tree.verify_unchanged()
+
+        with self.subTest(case="directory"), tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "output"
+            root.mkdir()
+            _write_bundle(root)
+            owner = (root / "images" / "owner.jpg").read_bytes()
+            continuation = (root / "images" / "continuation.jpg").read_bytes()
+            with PinnedArtifactTree.open_path(root) as tree:
+                (root / "images").rename(parent / "original-images")
+                (root / "images").mkdir()
+                (root / "images" / "owner.jpg").write_bytes(owner)
+                (root / "images" / "continuation.jpg").write_bytes(continuation)
+                with self.assertRaises(ParserOutputContractError):
+                    tree.verify_unchanged()
+
+        with self.subTest(case="topology"), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            with PinnedArtifactTree.open_path(root) as tree:
+                (root / "late-sidecar").write_bytes(b"late")
+                with self.assertRaises(ParserOutputContractError):
+                    tree.verify_unchanged()
+
+    def test_exact_admitted_deletion_has_linear_effect_and_scan_counts(self) -> None:
+        for file_count in (800, 1_600):
+            with self.subTest(file_count=file_count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for index in range(file_count):
+                    (root / f"item-{index:04d}.bin").write_bytes(b"")
+                with PinnedArtifactTree.open_path(
+                    root,
+                    max_files=file_count,
+                    max_bytes=1,
+                ) as tree:
+                    scan_calls = 0
+                    effect_calls = 0
+                    original_scan = tree._scan_metadata
+
+                    def count_scan(**kwargs: Any) -> None:
+                        nonlocal scan_calls
+                        scan_calls += 1
+                        original_scan(**kwargs)
+
+                    def count_effect() -> None:
+                        nonlocal effect_calls
+                        effect_calls += 1
+
+                    with mock.patch.object(
+                        tree,
+                        "_scan_metadata",
+                        side_effect=count_scan,
+                    ):
+                        tree.remove_exact_admitted_contents(
+                            before_effect=count_effect,
+                            last_files=(),
+                        )
+                self.assertEqual(scan_calls, 3)
+                self.assertEqual(effect_calls, file_count)
+                self.assertEqual(tuple(root.iterdir()), ())
+
+    def test_json_hash_and_parse_share_an_identity_and_reject_aba(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            content_path = root / f"{_STEM}_content_list.json"
+            original = content_path.read_bytes()
+            original_load = artifacts_module.json.load
+            mutated = False
+
+            def load_after_aba(
+                stream: TextIO,
+                *,
+                parse_constant: Callable[[str], object],
+            ) -> object:
+                nonlocal mutated
+                if not mutated:
+                    mutated = True
+                    content_path.write_bytes(b"[]")
+                    content_path.write_bytes(original)
+                return original_load(stream, parse_constant=parse_constant)
+
+            with (
+                PinnedArtifactTree.open_path(root) as tree,
+                mock.patch.object(
+                    artifacts_module.json,
+                    "load",
+                    side_effect=load_after_aba,
+                ),
+            ):
+                with self.assertRaises(ParserOutputContractError):
+                    tree.load_json(
+                        PurePosixPath(f"{_STEM}_content_list.json"),
+                        label="content_list",
+                    )
+
+    def test_failed_admission_does_not_leak_file_descriptors(self) -> None:
+        fd_root = Path("/dev/fd")
+        if not fd_root.is_dir():
+            fd_root = Path("/proc/self/fd")
+        if not fd_root.is_dir():
+            self.skipTest("process descriptor directory is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            os.mkfifo(root / "zz-unsafe-fifo")
+            before = len(tuple(fd_root.iterdir()))
+
+            for _ in range(20):
+                with self.assertRaises(ParserOutputContractError):
+                    PinnedArtifactTree.open_path(root)
+
+            self.assertEqual(len(tuple(fd_root.iterdir())), before)
+
+    def test_every_open_uses_nonfollowing_cloexec_nonblocking_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            observed_flags: list[tuple[int, int | None]] = []
+            original_open = artifacts_module.os.open
+
+            def checked_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                observed_flags.append((flags, dir_fd))
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(
+                artifacts_module.os,
+                "open",
+                side_effect=checked_open,
+            ):
+                MinerUMediumArtifactReader().read(
+                    root,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
+
+            required = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+            self.assertTrue(observed_flags)
+            self.assertTrue(
+                all(flags & required == required for flags, _ in observed_flags)
+            )
+            self.assertTrue(
+                any(
+                    flags & os.O_DIRECTORY and dir_fd is not None
+                    for flags, dir_fd in observed_flags
+                )
+            )
+
+    def test_streams_large_sidecars_in_bounded_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_bundle(root)
+            (root / "notes.bin").write_bytes(b"x" * (3 * 1024 * 1024 + 17))
+            observed_read_sizes: list[int] = []
+            original_read = artifacts_module.os.read
+
+            def bounded_read(fd: int, size: int) -> bytes:
+                observed_read_sizes.append(size)
+                return original_read(fd, size)
+
+            with mock.patch.object(
+                artifacts_module.os,
+                "read",
+                side_effect=bounded_read,
+            ):
+                document = MinerUMediumArtifactReader().read(
+                    root,
+                    source_pdf_sha256=_SOURCE_SHA,
+                )
+
+            self.assertTrue(observed_read_sizes)
+            self.assertLessEqual(max(observed_read_sizes), 1024 * 1024)
+            self.assertEqual(
+                next(
+                    artifact.size_bytes
+                    for artifact in document.artifacts
+                    if artifact.relative_path == "notes.bin"
+                ),
+                3 * 1024 * 1024 + 17,
+            )
+
+    def test_single_read_returns_nested_artifact_location(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / "nested" / "mineru"
+            nested.mkdir(parents=True)
+            _write_bundle(nested)
+
+            result = MinerUMediumArtifactReader().read_with_location(
+                root,
+                source_pdf_sha256=_SOURCE_SHA,
+            )
+
+            self.assertEqual(
+                result.artifact_root_relpath,
+                PurePosixPath("nested/mineru"),
+            )
+            self.assertEqual(len(result.document.pages), 2)
 
 
 def _write_bundle(

@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import date, datetime, timezone
 import hashlib
 import json
+import re
 from typing import Any, Optional, cast
 
 import sqlalchemy as sa
@@ -46,10 +47,15 @@ from disclosure_anchor.application.contracts.staged_credit import (
 from disclosure_anchor.application.ports.repositories import (
     ClaimedAttemptSnapshot,
     CreditTransitionGrant,
+    V3ResumeSecretIdentityMismatch,
+    V3ResumeSecretKeyUnavailable,
+    V3ResumeSecretMissing,
+    V3ResumeSecretStaleOwner,
 )
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
     ProviderAckCompletionWitness,
+    RecoveredV3ResumeSecret,
     encode_durable_checkpoint_witness,
     verify_provider_ack_completion_witness,
     prepared_submission_identity_from_reconcile,
@@ -76,6 +82,7 @@ from disclosure_anchor.domain.errors import (
 )
 
 _MAX_SIGNED_BIGINT = (1 << 63) - 1
+_SHA256_IDENTITY = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class CompanyRepository:
@@ -1040,6 +1047,97 @@ class RemoteParseAttemptRepository:
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]:
         row = self._session.get(models.RemoteParseAttempt, attempt_id)
         return None if row is None else _remote_attempt_entity(row)
+
+    def recover_v3_resume_secret(
+        self,
+        *,
+        attempt_id: str,
+        fence_identity: str,
+        secret_kind: str,
+        expected_token_sha256: str,
+        expected_token_byte_count: int,
+        expected_state: str,
+        expected_row_version: int,
+        claim_owner_identity: str,
+        claim_generation: int,
+    ) -> RecoveredV3ResumeSecret:
+        """Recover one private token only for the exact live v3 claim."""
+
+        if secret_kind not in {
+            "prepared_reconcile", "accepted_submission", "terminal", "materialization"
+        }:
+            raise ValueError("v3 resume secret kind is unsupported")
+        if (
+            not attempt_id.strip()
+            or not fence_identity.strip()
+            or not expected_state.strip()
+            or not claim_owner_identity.strip()
+            or _SHA256_IDENTITY.fullmatch(expected_token_sha256) is None
+            or type(expected_token_byte_count) is not int
+            or not 1 <= expected_token_byte_count <= 65_536
+            or type(expected_row_version) is not int
+            or not 1 <= expected_row_version <= _MAX_SIGNED_BIGINT
+            or type(claim_generation) is not int
+            or not 1 <= claim_generation <= _MAX_SIGNED_BIGINT
+        ):
+            raise ValueError("v3 resume recovery expectation is invalid")
+        now = sa.func.clock_timestamp().label("database_observed_at")
+        result = self._session.execute(
+            sa.select(models.RemoteParseAttempt, models.RemoteParseV3ResumeSecret, now)
+            .outerjoin(
+                models.RemoteParseV3ResumeSecret,
+                sa.and_(
+                    models.RemoteParseV3ResumeSecret.attempt_id
+                    == models.RemoteParseAttempt.attempt_id,
+                    models.RemoteParseV3ResumeSecret.secret_kind == secret_kind,
+                ),
+            )
+            .where(models.RemoteParseAttempt.attempt_id == attempt_id)
+        ).one_or_none()
+        if result is None:
+            raise V3ResumeSecretMissing("v3 resume attempt is absent")
+        attempt_row, secret_row, database_observed_at = result
+        if (
+            attempt_row.checkpoint_contract_version != 3
+            or attempt_row.fence_identity != fence_identity
+        ):
+            raise V3ResumeSecretIdentityMismatch("v3 resume attempt identity drifted")
+        if (
+            not attempt_row.is_current
+            or attempt_row.state != expected_state
+            or attempt_row.row_version != expected_row_version
+            or attempt_row.claim_owner_identity != claim_owner_identity
+            or attempt_row.claim_generation != claim_generation
+            or attempt_row.claim_lease_until is None
+            or attempt_row.claim_lease_until <= database_observed_at
+        ):
+            raise V3ResumeSecretStaleOwner("v3 resume claim is stale")
+        if secret_row is None:
+            raise V3ResumeSecretMissing("v3 resume secret is absent")
+        try:
+            token_bytes = bytes(secret_row.token_bytes)
+        except (TypeError, ValueError) as exc:
+            raise V3ResumeSecretKeyUnavailable(
+                "v3 resume token bytes are unavailable"
+            ) from exc
+        if (
+            secret_row.token_sha256 != expected_token_sha256
+            or secret_row.token_byte_count != expected_token_byte_count
+            or len(token_bytes) != expected_token_byte_count
+            or "sha256:" + hashlib.sha256(token_bytes).hexdigest()
+            != expected_token_sha256
+        ):
+            raise V3ResumeSecretIdentityMismatch("v3 resume secret identity drifted")
+        return RecoveredV3ResumeSecret(
+            attempt_identity=attempt_id,
+            secret_kind=secret_kind,
+            token_bytes=token_bytes,
+            token_sha256=expected_token_sha256,
+            token_byte_count=expected_token_byte_count,
+            checkpoint_row_version=expected_row_version,
+            claim_owner_identity=claim_owner_identity,
+            claim_generation=claim_generation,
+        )
 
     def durable_checkpoint_witness(
         self, attempt_id: str

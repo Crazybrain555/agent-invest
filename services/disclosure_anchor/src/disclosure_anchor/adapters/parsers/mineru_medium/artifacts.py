@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import codecs
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -73,6 +74,1208 @@ _COMPATIBLE_TYPED_ANNOTATIONS = frozenset(
     }
 )
 
+_MAX_TREE_DEPTH = 64
+_MAX_TREE_FILES = 100_000
+_MAX_TREE_BYTES = 32 * 1024 * 1024 * 1024
+_MAX_JSON_BYTES = 4 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    link_count: int
+    byte_count: int
+    modified_ns: int
+    changed_ns: int
+
+    @classmethod
+    def from_stat(cls, observed: os.stat_result) -> _FileIdentity:
+        return cls(
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            mode=observed.st_mode,
+            uid=observed.st_uid,
+            link_count=observed.st_nlink,
+            byte_count=observed.st_size,
+            modified_ns=observed.st_mtime_ns,
+            changed_ns=observed.st_ctime_ns,
+        )
+
+
+def _identity_without_changed_ns(
+    value: _FileIdentity,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        value.device,
+        value.inode,
+        value.mode,
+        value.uid,
+        value.link_count,
+        value.byte_count,
+        value.modified_ns,
+    )
+
+
+def _stable_identity(value: _FileIdentity) -> tuple[int, int, int, int]:
+    return value.device, value.inode, value.mode, value.uid
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedArtifactFile:
+    """One regular file read from a pinned root directory descriptor."""
+
+    relative_path: PurePosixPath
+    identity: _FileIdentity
+    sha256: str
+    size_bytes: int
+    leading_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class PinnedArtifactReadResult:
+    document: ProviderDocument
+    artifact_root_relpath: PurePosixPath
+
+
+class PinnedArtifactTree:
+    """Immutable-by-verification view over an already published output tree.
+
+    The tree never resolves a child through the process cwd or a mutable
+    absolute path.  Every component is opened relative to a pinned directory
+    descriptor with ``O_NOFOLLOW``.  A second topology pass closes mutations
+    which occur after an individual file was hashed.
+    """
+
+    def __init__(
+        self,
+        *,
+        display_root: Path,
+        root_fd: int,
+        max_files: int = _MAX_TREE_FILES,
+        max_bytes: int = _MAX_TREE_BYTES,
+        require_private_modes: bool = False,
+        allow_empty_directories: bool = False,
+    ) -> None:
+        _require_dirfd_flags()
+        if type(max_files) is not int or max_files < 1:
+            raise ParserOutputContractError("MinerU artifact file limit is invalid")
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ParserOutputContractError("MinerU artifact byte limit is invalid")
+        if type(require_private_modes) is not bool:
+            raise ParserOutputContractError("MinerU artifact mode policy is invalid")
+        if type(allow_empty_directories) is not bool:
+            raise ParserOutputContractError(
+                "MinerU artifact empty-directory policy is invalid"
+            )
+        self._display_root = display_root.absolute()
+        self._root_fd = os.dup(root_fd)
+        self._max_files = max_files
+        self._max_bytes = max_bytes
+        self._require_private_modes = require_private_modes
+        self._allow_empty_directories = allow_empty_directories
+        self._closed = False
+        try:
+            observed = os.fstat(self._root_fd)
+            self._root_identity = _directory_identity(
+                observed,
+                root_device=observed.st_dev,
+                label="MinerU output root",
+            )
+            self._require_private_identity(
+                self._root_identity,
+                is_directory=True,
+                label="MinerU output root",
+            )
+            self._assert_display_path()
+            self._directories: dict[PurePosixPath, _FileIdentity] = {}
+            self._directory_entries: dict[PurePosixPath, tuple[str, ...]] = {}
+            self._files: dict[PurePosixPath, PinnedArtifactFile] = {}
+            self._scan_initial()
+        except BaseException:
+            os.close(self._root_fd)
+            self._closed = True
+            raise
+
+    @classmethod
+    def open_path(
+        cls,
+        root: Path,
+        *,
+        max_files: int = _MAX_TREE_FILES,
+        max_bytes: int = _MAX_TREE_BYTES,
+        require_private_modes: bool = False,
+        allow_empty_directories: bool = False,
+    ) -> PinnedArtifactTree:
+        _require_dirfd_flags()
+        flags = (
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        )
+        try:
+            fd = os.open(root, flags)
+        except OSError as exc:
+            raise ParserOutputContractError(
+                f"cannot open pinned MinerU output root: {root}"
+            ) from exc
+        try:
+            return cls(
+                display_root=root,
+                root_fd=fd,
+                max_files=max_files,
+                max_bytes=max_bytes,
+                require_private_modes=require_private_modes,
+                allow_empty_directories=allow_empty_directories,
+            )
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def from_root_fd(
+        cls,
+        *,
+        display_root: Path,
+        root_fd: int,
+        max_files: int = _MAX_TREE_FILES,
+        max_bytes: int = _MAX_TREE_BYTES,
+        require_private_modes: bool = False,
+        allow_empty_directories: bool = False,
+    ) -> PinnedArtifactTree:
+        return cls(
+            display_root=display_root,
+            root_fd=root_fd,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            require_private_modes=require_private_modes,
+            allow_empty_directories=allow_empty_directories,
+        )
+
+    def __enter__(self) -> PinnedArtifactTree:
+        self._require_open()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            os.close(self._root_fd)
+            self._closed = True
+
+    @property
+    def display_root(self) -> Path:
+        return self._display_root
+
+    @property
+    def files(self) -> tuple[PinnedArtifactFile, ...]:
+        self._require_open()
+        return tuple(self._files[path] for path in sorted(self._files))
+
+    @property
+    def directory_paths(self) -> tuple[PurePosixPath, ...]:
+        """Return the complete admitted directory topology, including ``.``."""
+
+        self._require_open()
+        return tuple(sorted(self._directories))
+
+    @property
+    def root_identity(self) -> tuple[int, int]:
+        self._require_open()
+        return self._root_identity.device, self._root_identity.inode
+
+    def has_file(self, relative_path: PurePosixPath) -> bool:
+        self._require_open()
+        return _safe_relative(relative_path, label="MinerU artifact") in self._files
+
+    def require_file(self, relative_path: PurePosixPath) -> PinnedArtifactFile:
+        self._require_open()
+        relative = _safe_relative(relative_path, label="MinerU artifact")
+        try:
+            return self._files[relative]
+        except KeyError as exc:
+            raise ParserOutputContractError(
+                f"MinerU artifact is absent: {relative.as_posix()}"
+            ) from exc
+
+    def read_bytes(
+        self,
+        relative_path: PurePosixPath,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        """Read one already-pinned regular file without reopening by Path."""
+
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ParserOutputContractError("MinerU pinned byte limit is invalid")
+        receipt = self.require_file(relative_path)
+        if receipt.size_bytes > max_bytes:
+            raise ParserOutputContractError("MinerU pinned file exceeds its limit")
+        fd = self._open_regular(receipt.relative_path)
+        try:
+            before = _FileIdentity.from_stat(os.fstat(fd))
+            if before != receipt.identity:
+                raise ParserOutputContractError(
+                    "MinerU pinned file identity changed before reading"
+                )
+            digest = hashlib.sha256()
+            byte_count = 0
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, min(1024 * 1024, max_bytes + 1)):
+                byte_count += len(chunk)
+                if byte_count > max_bytes:
+                    raise ParserOutputContractError(
+                        "MinerU pinned file exceeded its limit while reading"
+                    )
+                digest.update(chunk)
+                chunks.append(chunk)
+            if (
+                _FileIdentity.from_stat(os.fstat(fd)) != before
+                or byte_count != receipt.size_bytes
+                or "sha256:" + digest.hexdigest() != receipt.sha256
+            ):
+                raise ParserOutputContractError(
+                    "MinerU pinned file changed while reading"
+                )
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def load_json(
+        self,
+        relative_path: PurePosixPath,
+        *,
+        label: str,
+        max_bytes: int = _MAX_JSON_BYTES,
+    ) -> object:
+        receipt = self.require_file(relative_path)
+        if receipt.size_bytes > max_bytes:
+            raise ParserOutputContractError(f"MinerU {label} JSON exceeds its limit")
+        fd = self._open_regular(receipt.relative_path)
+        try:
+            before = _FileIdentity.from_stat(os.fstat(fd))
+            if before != receipt.identity:
+                raise ParserOutputContractError(
+                    f"MinerU {label} JSON identity changed before parsing"
+                )
+            digest = _stream_digest(fd)[0]
+            if digest != receipt.sha256:
+                raise ParserOutputContractError(
+                    f"MinerU {label} JSON changed before parsing"
+                )
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                with os.fdopen(
+                    os.dup(fd), "r", encoding="utf-8", errors="strict"
+                ) as stream:
+                    value = json.load(stream, parse_constant=_reject_json_constant)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise ParserOutputContractError(f"invalid MinerU {label} JSON") from exc
+            if _FileIdentity.from_stat(os.fstat(fd)) != before:
+                raise ParserOutputContractError(
+                    f"MinerU {label} JSON changed during parsing"
+                )
+            return value
+        finally:
+            os.close(fd)
+
+    def validate_utf8(self, relative_path: PurePosixPath, *, label: str) -> None:
+        receipt = self.require_file(relative_path)
+        fd = self._open_regular(receipt.relative_path)
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        try:
+            before = _FileIdentity.from_stat(os.fstat(fd))
+            digest = hashlib.sha256()
+            while chunk := os.read(fd, 1024 * 1024):
+                decoder.decode(chunk, final=False)
+                digest.update(chunk)
+            decoder.decode(b"", final=True)
+            if (
+                before != receipt.identity
+                or _FileIdentity.from_stat(os.fstat(fd)) != before
+                or "sha256:" + digest.hexdigest() != receipt.sha256
+            ):
+                raise ParserOutputContractError(
+                    f"MinerU artifact role={label} changed during UTF-8 validation"
+                )
+        except UnicodeDecodeError as exc:
+            raise ParserOutputContractError(
+                f"cannot read MinerU artifact role={label}"
+            ) from exc
+        finally:
+            os.close(fd)
+
+    def verify_unchanged(self) -> None:
+        self._require_open()
+        self._assert_display_path()
+
+    def verify_pinned_topology_unchanged(
+        self, *, allow_root_rename_ctime: bool = False
+    ) -> None:
+        """Re-scan the exact pinned tree without resolving its display path.
+
+        This is intentionally separate from :meth:`verify_unchanged`: an
+        adapter may keep the root descriptor open across an atomic directory
+        rename, after which the original display path no longer names the
+        pinned inode.  Child topology and identities must still match the
+        admission snapshot before the adapter may act on the renamed tree.
+        """
+
+        self._require_open()
+        if type(allow_root_rename_ctime) is not bool:
+            raise ParserOutputContractError(
+                "MinerU pinned topology verification mode is invalid"
+            )
+        observed_directories: dict[PurePosixPath, _FileIdentity] = {}
+        observed_entries: dict[PurePosixPath, tuple[str, ...]] = {}
+        observed_files: dict[PurePosixPath, _FileIdentity] = {}
+        self._scan_metadata(
+            directory_fd=os.dup(self._root_fd),
+            relative=PurePosixPath("."),
+            depth=0,
+            directories=observed_directories,
+            entries=observed_entries,
+            files=observed_files,
+            allow_empty_directories=True,
+        )
+        expected_files = {
+            path: receipt.identity for path, receipt in self._files.items()
+        }
+        expected_directories = self._directories
+        if allow_root_rename_ctime:
+            root = PurePosixPath(".")
+            observed_root = observed_directories.get(root)
+            expected_root = expected_directories.get(root)
+            if (
+                observed_root is None
+                or expected_root is None
+                or _identity_without_changed_ns(observed_root)
+                != _identity_without_changed_ns(expected_root)
+            ):
+                raise ParserOutputContractError(
+                    "MinerU artifact root changed across atomic rename"
+                )
+            expected_directories = {**expected_directories, root: observed_root}
+        if (
+            observed_directories != expected_directories
+            or observed_entries != self._directory_entries
+            or observed_files != expected_files
+        ):
+            raise ParserOutputContractError(
+                "MinerU artifact tree changed during pinned admission"
+            )
+
+    def remove_exact_admitted_contents(
+        self,
+        *,
+        before_effect: Callable[[], object],
+        last_files: tuple[PurePosixPath, ...],
+    ) -> None:
+        """Delete only this admitted snapshot, with selected proof files last.
+
+        The pinned root stays open throughout.  One complete verification
+        admits the initial mutable suffix; each effect then resolves only an
+        expected entry through pinned parent descriptors and checks its exact
+        identity.  Complete scans are repeated at the ordinary/proof boundary,
+        immediately after every proof-file guard, and at the empty-root end.
+        Thus deletion is linear in admitted entries (times path depth), while
+        unknown entries are never recursively removed and proof files remain
+        last.
+        """
+
+        self._require_open()
+        if not callable(before_effect) or type(last_files) is not tuple:
+            raise ParserOutputContractError(
+                "MinerU exact cleanup arguments are invalid"
+            )
+        ordered_last = tuple(
+            _safe_relative(path, label="MinerU exact cleanup proof")
+            for path in last_files
+        )
+        if len(set(ordered_last)) != len(ordered_last) or any(
+            path not in self._files for path in ordered_last
+        ):
+            raise ParserOutputContractError(
+                "MinerU exact cleanup proof files are absent or duplicated"
+            )
+        expected_directories = dict(self._directories)
+        expected_entries = {
+            path: set(names) for path, names in self._directory_entries.items()
+        }
+        expected_files = {
+            path: receipt.identity for path, receipt in self._files.items()
+        }
+
+        def verify_remaining() -> None:
+            self._verify_expected_mutable_topology(
+                expected_directories=expected_directories,
+                expected_entries=expected_entries,
+                expected_files=expected_files,
+            )
+
+        def remove_file(
+            relative: PurePosixPath,
+            *,
+            verify_after_guard: bool,
+        ) -> None:
+            before_effect()
+            if verify_after_guard:
+                verify_remaining()
+            parent_fd = _open_parent_directory(
+                self._root_fd,
+                relative.parts[:-1],
+                root_device=self._root_identity.device,
+            )
+            try:
+                parent = relative.parent
+                parent_identity = _directory_identity(
+                    os.fstat(parent_fd),
+                    root_device=self._root_identity.device,
+                    label=f"MinerU exact cleanup parent {parent.as_posix()}",
+                )
+                if _stable_identity(parent_identity) != _stable_identity(
+                    expected_directories[parent]
+                ):
+                    raise ParserOutputContractError(
+                        "MinerU exact cleanup parent identity drifted"
+                    )
+                observed = os.stat(
+                    relative.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if _FileIdentity.from_stat(observed) != expected_files[relative]:
+                    raise ParserOutputContractError(
+                        "MinerU exact cleanup file identity drifted"
+                    )
+                os.unlink(relative.name, dir_fd=parent_fd)
+                try:
+                    os.stat(
+                        relative.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ParserOutputContractError(
+                        "MinerU exact cleanup file remained present"
+                    )
+                if _stable_identity(
+                    _directory_identity(
+                        os.fstat(parent_fd),
+                        root_device=self._root_identity.device,
+                        label=f"MinerU exact cleanup parent {parent.as_posix()}",
+                    )
+                ) != _stable_identity(expected_directories[parent]):
+                    raise ParserOutputContractError(
+                        "MinerU exact cleanup parent identity drifted"
+                    )
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            del expected_files[relative]
+            expected_entries[parent].remove(relative.name)
+
+        last_set = set(ordered_last)
+        verify_remaining()
+        # Initial admission order is deterministic because every directory scan
+        # consumes sorted names.  Reusing it avoids an additional N log N sort.
+        for relative in tuple(path for path in expected_files if path not in last_set):
+            remove_file(relative, verify_after_guard=False)
+        verify_remaining()
+
+        directories_by_depth: dict[int, list[PurePosixPath]] = {}
+        for relative in expected_directories:
+            if relative == PurePosixPath("."):
+                continue
+            directories_by_depth.setdefault(len(relative.parts), []).append(relative)
+        for depth in sorted(directories_by_depth, reverse=True):
+            for relative in reversed(directories_by_depth[depth]):
+                before_effect()
+                parent_fd = _open_parent_directory(
+                    self._root_fd,
+                    relative.parts[:-1],
+                    root_device=self._root_identity.device,
+                )
+                try:
+                    parent = relative.parent
+                    parent_identity = _directory_identity(
+                        os.fstat(parent_fd),
+                        root_device=self._root_identity.device,
+                        label=f"MinerU exact cleanup parent {parent.as_posix()}",
+                    )
+                    if _stable_identity(parent_identity) != _stable_identity(
+                        expected_directories[parent]
+                    ):
+                        raise ParserOutputContractError(
+                            "MinerU exact cleanup parent identity drifted"
+                        )
+                    observed = os.stat(
+                        relative.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if _stable_identity(
+                        _FileIdentity.from_stat(observed)
+                    ) != _stable_identity(expected_directories[relative]):
+                        raise ParserOutputContractError(
+                            "MinerU exact cleanup directory identity drifted"
+                        )
+                    try:
+                        os.rmdir(relative.name, dir_fd=parent_fd)
+                    except OSError as exc:
+                        raise ParserOutputContractError(
+                            "MinerU exact cleanup directory is not exact and empty"
+                        ) from exc
+                    try:
+                        os.stat(
+                            relative.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise ParserOutputContractError(
+                            "MinerU exact cleanup directory remained present"
+                        )
+                    if _stable_identity(
+                        _directory_identity(
+                            os.fstat(parent_fd),
+                            root_device=self._root_identity.device,
+                            label=f"MinerU exact cleanup parent {parent.as_posix()}",
+                        )
+                    ) != _stable_identity(expected_directories[parent]):
+                        raise ParserOutputContractError(
+                            "MinerU exact cleanup parent identity drifted"
+                        )
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                del expected_directories[relative]
+                del expected_entries[relative]
+                expected_entries[parent].remove(relative.name)
+
+        for relative in ordered_last:
+            remove_file(relative, verify_after_guard=True)
+        verify_remaining()
+        if (
+            expected_files
+            or set(expected_directories) != {PurePosixPath(".")}
+            or expected_entries != {PurePosixPath("."): set()}
+        ):
+            raise ParserOutputContractError(
+                "MinerU exact cleanup did not empty its admitted root"
+            )
+
+    def _verify_expected_mutable_topology(
+        self,
+        *,
+        expected_directories: dict[PurePosixPath, _FileIdentity],
+        expected_entries: dict[PurePosixPath, set[str]],
+        expected_files: dict[PurePosixPath, _FileIdentity],
+    ) -> None:
+        observed_directories: dict[PurePosixPath, _FileIdentity] = {}
+        observed_entries: dict[PurePosixPath, tuple[str, ...]] = {}
+        observed_files: dict[PurePosixPath, _FileIdentity] = {}
+        self._scan_metadata(
+            directory_fd=os.dup(self._root_fd),
+            relative=PurePosixPath("."),
+            depth=0,
+            directories=observed_directories,
+            entries=observed_entries,
+            files=observed_files,
+            allow_empty_directories=True,
+        )
+        if (
+            {path: _stable_identity(value) for path, value in observed_directories.items()}
+            != {
+                path: _stable_identity(value)
+                for path, value in expected_directories.items()
+            }
+            or {path: set(names) for path, names in observed_entries.items()}
+            != expected_entries
+            or observed_files != expected_files
+        ):
+            raise ParserOutputContractError(
+                "MinerU exact cleanup topology changed"
+            )
+
+    def fsync_exact(self) -> None:
+        """Durably flush the exact file/directory identities in this snapshot."""
+
+        self._require_open()
+        for relative, receipt in sorted(self._files.items()):
+            fd = self._open_regular(relative)
+            try:
+                before = _FileIdentity.from_stat(os.fstat(fd))
+                if before != receipt.identity:
+                    raise ParserOutputContractError(
+                        "MinerU pinned file changed before fsync"
+                    )
+                os.fsync(fd)
+                if _FileIdentity.from_stat(os.fstat(fd)) != before:
+                    raise ParserOutputContractError(
+                        "MinerU pinned file changed during fsync"
+                    )
+            finally:
+                os.close(fd)
+        for relative in sorted(
+            self._directories,
+            key=lambda value: len(_relative_parts(value)),
+            reverse=True,
+        ):
+            fd = _open_parent_directory(
+                self._root_fd,
+                _relative_parts(relative),
+                root_device=self._root_identity.device,
+            )
+            try:
+                before = _FileIdentity.from_stat(os.fstat(fd))
+                if before != self._directories[relative]:
+                    raise ParserOutputContractError(
+                        "MinerU pinned directory changed before fsync"
+                    )
+                os.fsync(fd)
+                if _FileIdentity.from_stat(os.fstat(fd)) != before:
+                    raise ParserOutputContractError(
+                        "MinerU pinned directory changed during fsync"
+                    )
+            finally:
+                os.close(fd)
+        self.verify_unchanged()
+        self.verify_pinned_topology_unchanged()
+        self._assert_display_path()
+
+    def _scan_initial(self) -> None:
+        file_count = [0]
+        total_bytes = [0]
+        self._scan_hashing(
+            directory_fd=os.dup(self._root_fd),
+            relative=PurePosixPath("."),
+            depth=0,
+            file_count=file_count,
+            total_bytes=total_bytes,
+        )
+
+    def _scan_hashing(
+        self,
+        *,
+        directory_fd: int,
+        relative: PurePosixPath,
+        depth: int,
+        file_count: list[int],
+        total_bytes: list[int],
+    ) -> None:
+        try:
+            if depth > _MAX_TREE_DEPTH:
+                raise ParserOutputContractError("MinerU artifact tree is too deep")
+            before = _directory_identity(
+                os.fstat(directory_fd),
+                root_device=self._root_identity.device,
+                label=f"MinerU artifact directory {relative.as_posix()}",
+            )
+            self._require_private_identity(
+                before,
+                is_directory=True,
+                label=f"MinerU artifact directory {relative.as_posix()}",
+            )
+            names = _directory_names(directory_fd, relative=relative)
+            if (
+                relative != PurePosixPath(".")
+                and not names
+                and not self._allow_empty_directories
+            ):
+                raise ParserOutputContractError(
+                    f"MinerU artifact tree contains an empty directory: {relative.as_posix()}"
+                )
+            self._directories[relative] = before
+            self._directory_entries[relative] = names
+            for name in names:
+                child = _child_relative(relative, name)
+                observed = _lstat_at(directory_fd, name, relative=child)
+                if stat.S_ISDIR(observed.st_mode):
+                    child_fd = _open_directory_at(
+                        directory_fd,
+                        name,
+                        expected=observed,
+                        root_device=self._root_identity.device,
+                        relative=child,
+                    )
+                    self._scan_hashing(
+                        directory_fd=child_fd,
+                        relative=child,
+                        depth=depth + 1,
+                        file_count=file_count,
+                        total_bytes=total_bytes,
+                    )
+                    continue
+                expected_file = _regular_identity(
+                    observed,
+                    root_device=self._root_identity.device,
+                    relative=child,
+                )
+                self._require_private_identity(
+                    expected_file,
+                    is_directory=False,
+                    label=f"MinerU artifact {child.as_posix()}",
+                )
+                if (
+                    file_count[0] + 1 > self._max_files
+                    or total_bytes[0] + expected_file.byte_count > self._max_bytes
+                ):
+                    raise ParserOutputContractError(
+                        "MinerU artifact tree exceeds its closed envelope"
+                    )
+                fd = _open_regular_at(
+                    directory_fd,
+                    name,
+                    expected=observed,
+                    root_device=self._root_identity.device,
+                    relative=child,
+                )
+                try:
+                    identity = _FileIdentity.from_stat(os.fstat(fd))
+                    sha256, size_bytes, leading = _stream_digest(fd)
+                    if _FileIdentity.from_stat(os.fstat(fd)) != identity:
+                        raise ParserOutputContractError(
+                            f"MinerU artifact changed while hashing: {child.as_posix()}"
+                        )
+                finally:
+                    os.close(fd)
+                file_count[0] += 1
+                total_bytes[0] += size_bytes
+                self._files[child] = PinnedArtifactFile(
+                    relative_path=child,
+                    identity=identity,
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                    leading_bytes=leading,
+                )
+            if (
+                _directory_names(directory_fd, relative=relative) != names
+                or _directory_identity(
+                    os.fstat(directory_fd),
+                    root_device=self._root_identity.device,
+                    label=f"MinerU artifact directory {relative.as_posix()}",
+                )
+                != before
+            ):
+                raise ParserOutputContractError(
+                    f"MinerU artifact directory changed during scan: {relative.as_posix()}"
+                )
+        finally:
+            os.close(directory_fd)
+
+    def _scan_metadata(
+        self,
+        *,
+        directory_fd: int,
+        relative: PurePosixPath,
+        depth: int,
+        directories: dict[PurePosixPath, _FileIdentity],
+        entries: dict[PurePosixPath, tuple[str, ...]],
+        files: dict[PurePosixPath, _FileIdentity],
+        allow_empty_directories: bool = False,
+    ) -> None:
+        try:
+            if depth > _MAX_TREE_DEPTH:
+                raise ParserOutputContractError("MinerU artifact tree is too deep")
+            before = _directory_identity(
+                os.fstat(directory_fd),
+                root_device=self._root_identity.device,
+                label=f"MinerU artifact directory {relative.as_posix()}",
+            )
+            self._require_private_identity(
+                before,
+                is_directory=True,
+                label=f"MinerU artifact directory {relative.as_posix()}",
+            )
+            names = _directory_names(directory_fd, relative=relative)
+            if (
+                relative != PurePosixPath(".")
+                and not names
+                and not allow_empty_directories
+            ):
+                raise ParserOutputContractError(
+                    f"MinerU artifact tree contains an empty directory: {relative.as_posix()}"
+                )
+            directories[relative] = before
+            entries[relative] = names
+            for name in names:
+                child = _child_relative(relative, name)
+                observed = _lstat_at(directory_fd, name, relative=child)
+                if stat.S_ISDIR(observed.st_mode):
+                    child_fd = _open_directory_at(
+                        directory_fd,
+                        name,
+                        expected=observed,
+                        root_device=self._root_identity.device,
+                        relative=child,
+                    )
+                    self._scan_metadata(
+                        directory_fd=child_fd,
+                        relative=child,
+                        depth=depth + 1,
+                        directories=directories,
+                        entries=entries,
+                        files=files,
+                        allow_empty_directories=allow_empty_directories,
+                    )
+                    continue
+                fd = _open_regular_at(
+                    directory_fd,
+                    name,
+                    expected=observed,
+                    root_device=self._root_identity.device,
+                    relative=child,
+                )
+                try:
+                    identity = _FileIdentity.from_stat(os.fstat(fd))
+                    self._require_private_identity(
+                        identity,
+                        is_directory=False,
+                        label=f"MinerU artifact {child.as_posix()}",
+                    )
+                    files[child] = identity
+                finally:
+                    os.close(fd)
+            if (
+                _directory_names(directory_fd, relative=relative) != names
+                or _directory_identity(
+                    os.fstat(directory_fd),
+                    root_device=self._root_identity.device,
+                    label=f"MinerU artifact directory {relative.as_posix()}",
+                )
+                != before
+            ):
+                raise ParserOutputContractError(
+                    f"MinerU artifact directory changed during verification: {relative.as_posix()}"
+                )
+        finally:
+            os.close(directory_fd)
+
+    def _open_regular(self, relative_path: PurePosixPath) -> int:
+        relative = _safe_relative(relative_path, label="MinerU artifact")
+        parent_fd = _open_parent_directory(
+            self._root_fd,
+            relative.parts[:-1],
+            root_device=self._root_identity.device,
+        )
+        try:
+            expected = os.stat(
+                relative.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            return _open_regular_at(
+                parent_fd,
+                relative.name,
+                expected=expected,
+                root_device=self._root_identity.device,
+                relative=relative,
+            )
+        except OSError as exc:
+            raise ParserOutputContractError(
+                f"cannot reopen MinerU artifact: {relative.as_posix()}"
+            ) from exc
+        finally:
+            os.close(parent_fd)
+
+    def _assert_display_path(self) -> None:
+        try:
+            current = os.stat(self._display_root, follow_symlinks=False)
+        except OSError as exc:
+            raise ParserOutputContractError(
+                "pinned MinerU output root path disappeared"
+            ) from exc
+        if _FileIdentity.from_stat(current) != self._root_identity:
+            raise ParserOutputContractError("pinned MinerU output root path changed")
+
+    def _require_private_identity(
+        self,
+        identity: _FileIdentity,
+        *,
+        is_directory: bool,
+        label: str,
+    ) -> None:
+        if not self._require_private_modes:
+            return
+        expected_mode = 0o700 if is_directory else 0o600
+        if stat.S_IMODE(identity.mode) != expected_mode:
+            raise ParserOutputContractError(f"{label} has an unsafe private mode")
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise ParserOutputContractError("pinned MinerU artifact tree is closed")
+
+
+def _require_dirfd_flags() -> None:
+    missing = tuple(
+        name
+        for name in ("O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC", "O_NONBLOCK")
+        if not hasattr(os, name)
+    )
+    if missing:
+        raise ParserOutputContractError(
+            "pinned MinerU artifact admission is unsupported: missing "
+            + ", ".join(missing)
+        )
+
+
+def _safe_relative(path: PurePosixPath, *, label: str) -> PurePosixPath:
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ParserOutputContractError(f"{label} path is unsafe: {path.as_posix()}")
+    return path
+
+
+def _child_relative(parent: PurePosixPath, name: str) -> PurePosixPath:
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        raise ParserOutputContractError("MinerU artifact tree contains an unsafe name")
+    if parent == PurePosixPath("."):
+        return PurePosixPath(name)
+    return parent / name
+
+
+def _directory_identity(
+    observed: os.stat_result,
+    *,
+    root_device: int,
+    label: str,
+) -> _FileIdentity:
+    identity = _FileIdentity.from_stat(observed)
+    if not stat.S_ISDIR(identity.mode):
+        raise ParserOutputContractError(f"{label} is not a directory")
+    if identity.device != root_device:
+        raise ParserOutputContractError(f"{label} crosses a filesystem boundary")
+    if identity.uid != os.getuid():
+        raise ParserOutputContractError(f"{label} is not owned by the current user")
+    if identity.link_count < 1:
+        raise ParserOutputContractError(f"{label} has an invalid link count")
+    return identity
+
+
+def _regular_identity(
+    observed: os.stat_result,
+    *,
+    root_device: int,
+    relative: PurePosixPath,
+) -> _FileIdentity:
+    identity = _FileIdentity.from_stat(observed)
+    if not stat.S_ISREG(identity.mode):
+        raise ParserOutputContractError(
+            f"MinerU artifact is not a regular file: {relative.as_posix()}"
+        )
+    if identity.device != root_device:
+        raise ParserOutputContractError(
+            f"MinerU artifact crosses a filesystem boundary: {relative.as_posix()}"
+        )
+    if identity.uid != os.getuid():
+        raise ParserOutputContractError(
+            f"MinerU artifact is not owned by the current user: {relative.as_posix()}"
+        )
+    if identity.link_count != 1:
+        raise ParserOutputContractError(
+            f"MinerU artifact must have exactly one link: {relative.as_posix()}"
+        )
+    return identity
+
+
+def _directory_names(
+    directory_fd: int,
+    *,
+    relative: PurePosixPath,
+) -> tuple[str, ...]:
+    try:
+        names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise ParserOutputContractError(
+            f"cannot list MinerU artifact directory: {relative.as_posix()}"
+        ) from exc
+    for name in names:
+        if not isinstance(name, str) or not name or name in {".", ".."}:
+            raise ParserOutputContractError(
+                f"MinerU artifact directory contains an unsafe name: {relative.as_posix()}"
+            )
+        if "/" in name or "\x00" in name:
+            raise ParserOutputContractError(
+                f"MinerU artifact directory contains an unsafe name: {relative.as_posix()}"
+            )
+    return tuple(sorted(names))
+
+
+def _lstat_at(
+    directory_fd: int,
+    name: str,
+    *,
+    relative: PurePosixPath,
+) -> os.stat_result:
+    try:
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ParserOutputContractError(
+            f"cannot inspect MinerU artifact: {relative.as_posix()}"
+        ) from exc
+    if stat.S_ISLNK(observed.st_mode):
+        raise ParserOutputContractError(
+            f"MinerU artifact tree contains a symlink: {relative.as_posix()}"
+        )
+    if not stat.S_ISDIR(observed.st_mode) and not stat.S_ISREG(observed.st_mode):
+        raise ParserOutputContractError(
+            f"MinerU artifact tree contains a non-regular entry: {relative.as_posix()}"
+        )
+    return observed
+
+
+def _open_directory_at(
+    directory_fd: int,
+    name: str,
+    *,
+    expected: os.stat_result,
+    root_device: int,
+    relative: PurePosixPath,
+) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ParserOutputContractError(
+            f"cannot pin MinerU artifact directory: {relative.as_posix()}"
+        ) from exc
+    try:
+        expected_identity = _directory_identity(
+            expected,
+            root_device=root_device,
+            label=f"MinerU artifact directory {relative.as_posix()}",
+        )
+        observed_identity = _directory_identity(
+            os.fstat(fd),
+            root_device=root_device,
+            label=f"MinerU artifact directory {relative.as_posix()}",
+        )
+        if observed_identity != expected_identity:
+            raise ParserOutputContractError(
+                f"MinerU artifact directory changed while opening: {relative.as_posix()}"
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_regular_at(
+    directory_fd: int,
+    name: str,
+    *,
+    expected: os.stat_result,
+    root_device: int,
+    relative: PurePosixPath,
+) -> int:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ParserOutputContractError(
+            f"cannot pin MinerU artifact: {relative.as_posix()}"
+        ) from exc
+    try:
+        expected_identity = _regular_identity(
+            expected,
+            root_device=root_device,
+            relative=relative,
+        )
+        observed_identity = _regular_identity(
+            os.fstat(fd),
+            root_device=root_device,
+            relative=relative,
+        )
+        if observed_identity != expected_identity:
+            raise ParserOutputContractError(
+                f"MinerU artifact changed while opening: {relative.as_posix()}"
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_parent_directory(
+    root_fd: int,
+    components: Sequence[str],
+    *,
+    root_device: int,
+) -> int:
+    current_fd = os.dup(root_fd)
+    current = PurePosixPath(".")
+    try:
+        for component in components:
+            relative = _child_relative(current, component)
+            expected = _lstat_at(current_fd, component, relative=relative)
+            if not stat.S_ISDIR(expected.st_mode):
+                raise ParserOutputContractError(
+                    f"MinerU artifact parent is not a directory: {relative.as_posix()}"
+                )
+            next_fd = _open_directory_at(
+                current_fd,
+                component,
+                expected=expected,
+                root_device=root_device,
+                relative=relative,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+            current = relative
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _stream_digest(fd: int) -> tuple[str, int, bytes]:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        size_bytes = 0
+        leading_bytes = b""
+        while chunk := os.read(fd, 1024 * 1024):
+            if not leading_bytes:
+                leading_bytes = chunk[:16]
+            digest.update(chunk)
+            size_bytes += len(chunk)
+        return "sha256:" + digest.hexdigest(), size_bytes, leading_bytes
+    except OSError as exc:
+        raise ParserOutputContractError("cannot stream MinerU artifact") from exc
+
+
+def _relative_parts(relative: PurePosixPath) -> tuple[str, ...]:
+    return () if relative == PurePosixPath(".") else relative.parts
+
+
+def _relative_to_or_none(
+    path: PurePosixPath,
+    root: PurePosixPath,
+) -> PurePosixPath | None:
+    try:
+        return _relative_to(path, root)
+    except ParserOutputContractError:
+        return None
+
+
+def _relative_to(path: PurePosixPath, root: PurePosixPath) -> PurePosixPath:
+    if root == PurePosixPath("."):
+        return path
+    try:
+        return path.relative_to(root)
+    except ValueError as exc:
+        raise ParserOutputContractError(
+            f"MinerU artifact {path.as_posix()} is outside {root.as_posix()}"
+        ) from exc
+
 
 class MinerUMediumArtifactReader:
     """Project the unique content-list directory subtree into diagnostic records."""
@@ -80,69 +1283,83 @@ class MinerUMediumArtifactReader:
     def locate_artifact_root(self, output_dir: Path) -> Path:
         """Return the unique official artifact leaf without reading semantics."""
 
-        root = _resolved_plain_directory(output_dir)
-        return _resolved_plain_directory(_locate_content_list(root).parent)
+        with PinnedArtifactTree.open_path(output_dir) as tree:
+            artifact_root = _locate_content_list_pinned(tree).relative_path.parent
+            tree.verify_unchanged()
+            return tree.display_root.joinpath(*_relative_parts(artifact_root))
 
     def read(self, output_dir: Path, *, source_pdf_sha256: str) -> ProviderDocument:
+        return self.read_with_location(
+            output_dir, source_pdf_sha256=source_pdf_sha256
+        ).document
+
+    def read_with_location(
+        self, output_dir: Path, *, source_pdf_sha256: str
+    ) -> PinnedArtifactReadResult:
+        with PinnedArtifactTree.open_path(output_dir) as tree:
+            return self.read_pinned(tree, source_pdf_sha256=source_pdf_sha256)
+
+    def read_pinned(
+        self, tree: PinnedArtifactTree, *, source_pdf_sha256: str
+    ) -> PinnedArtifactReadResult:
         if not _SHA256_RE.fullmatch(source_pdf_sha256):
             raise ParserOutputContractError("source PDF sha256 must be canonical")
-        root = _resolved_plain_directory(output_dir)
-        artifact_root = self.locate_artifact_root(root)
-        content_path = _locate_content_list(artifact_root)
-        stem = content_path.name.removesuffix("_content_list.json")
+        content_file = _locate_content_list_pinned(tree)
+        artifact_root = content_file.relative_path.parent
+        stem = content_file.relative_path.name.removesuffix("_content_list.json")
         expected_stem = source_pdf_sha256.replace("sha256:", "sha256_", 1)
         if stem != expected_stem:
             raise ParserOutputContractError(
                 "MinerU content-list stem does not match the source PDF sha256"
             )
 
-        role_paths: dict[str, Path] = {"content_list": content_path}
+        role_paths: dict[str, PurePosixPath] = {
+            "content_list": content_file.relative_path
+        }
         for role, suffix in _REQUIRED_SUFFIXES.items():
-            role_paths[role] = _resolved_plain_file(
-                content_path.with_name(f"{stem}{suffix}"),
-                root=artifact_root,
-            )
+            role_path = artifact_root / f"{stem}{suffix}"
+            role_paths[role] = tree.require_file(role_path).relative_path
         for role, suffix in _OPTIONAL_SUFFIXES.items():
-            path = content_path.with_name(f"{stem}{suffix}")
-            if not path.exists():
-                continue
-            role_paths[role] = _resolved_plain_file(path, root=artifact_root)
+            role_path = artifact_root / f"{stem}{suffix}"
+            if tree.has_file(role_path):
+                role_paths[role] = role_path
 
-        tree_files = _plain_tree_files(artifact_root)
-        relative_roles = _artifact_roles(
-            root=artifact_root,
+        tree_files = tuple(
+            file
+            for file in tree.files
+            if _relative_to_or_none(file.relative_path, artifact_root) is not None
+        )
+        relative_roles = _artifact_roles_pinned(
+            artifact_root=artifact_root,
             files=tree_files,
             explicit_role_paths=role_paths,
         )
         artifacts_tuple = tuple(
-            _artifact_record(
-                role=relative_roles[path.relative_to(artifact_root).as_posix()],
-                path=path,
-                root=artifact_root,
+            _artifact_record_pinned(
+                role=relative_roles[
+                    _relative_to(file.relative_path, artifact_root).as_posix()
+                ],
+                file=file,
+                tree=tree,
+                artifact_root=artifact_root,
             )
-            for path in tree_files
+            for file in tree_files
         )
         artifacts_by_relative = {
             artifact.relative_path: artifact for artifact in artifacts_tuple
         }
-        artifact_bytes = {
-            role: _read_artifact_bytes(path=path, root=artifact_root, role=role)
-            for role, path in role_paths.items()
-            if role in _PARSED_JSON_ROLES
-        }
-
         content_items = _object_list(
-            artifact_bytes["content_list"],
+            tree.load_json(role_paths["content_list"], label="content_list"),
             label="content_list",
         )
         typed_pages = _page_object_lists(
-            artifact_bytes["content_list_v2"],
+            tree.load_json(role_paths["content_list_v2"], label="content_list_v2"),
             label="content_list_v2",
         )
         page_sizes, parser_identity, ocr_enabled, middle_pages = _middle_document(
-            artifact_bytes["middle_json"],
+            tree.load_json(role_paths["middle_json"], label="middle_json"),
         )
-        _json_value(artifact_bytes["model_json"], label="model_json")
+        tree.load_json(role_paths["model_json"], label="model_json")
 
         block_specs: list[tuple[int, dict[str, Any], int, int]] = []
         page_orders = [0 for _ in page_sizes]
@@ -180,7 +1397,8 @@ class MinerUMediumArtifactReader:
             image_roles = _referenced_image_roles(
                 item=item,
                 source_index=source_index,
-                content_root=artifact_root,
+                tree=tree,
+                artifact_root=artifact_root,
                 artifacts_by_relative=artifacts_by_relative,
             )
             blocks_by_page[page_index].append(
@@ -212,123 +1430,50 @@ class MinerUMediumArtifactReader:
             )
             for page_index, page_size in enumerate(page_sizes)
         )
-        return ProviderDocument(
-            source_pdf_sha256=source_pdf_sha256,
-            parser_version=parser_identity[0],
-            backend=parser_identity[1],
-            effort=parser_identity[2],
-            ocr_enabled=ocr_enabled,
-            pages=pages,
-            physical_table_segments=physical_table_segments,
-            artifacts=artifacts_tuple,
-            bundle_sha256=provider_artifact_bundle_sha256(artifacts_tuple),
+        tree.verify_unchanged()
+        return PinnedArtifactReadResult(
+            document=ProviderDocument(
+                source_pdf_sha256=source_pdf_sha256,
+                parser_version=parser_identity[0],
+                backend=parser_identity[1],
+                effort=parser_identity[2],
+                ocr_enabled=ocr_enabled,
+                pages=pages,
+                physical_table_segments=physical_table_segments,
+                artifacts=artifacts_tuple,
+                bundle_sha256=provider_artifact_bundle_sha256(artifacts_tuple),
+            ),
+            artifact_root_relpath=artifact_root,
         )
 
 
-def _resolved_plain_directory(path: Path) -> Path:
-    try:
-        if path.is_symlink():
-            raise ParserOutputContractError(
-                f"MinerU output root cannot be a symlink: {path}"
-            )
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise ParserOutputContractError(
-            f"cannot resolve MinerU output root: {path}"
-        ) from exc
-    if not resolved.is_dir():
-        raise ParserOutputContractError(f"MinerU output root is not a directory: {path}")
-    return resolved
-
-
-def _locate_content_list(root: Path) -> Path:
-    candidates = sorted(
-        path
-        for path in root.rglob("*_content_list.json")
-        if not path.name.endswith("_content_list_v2.json")
+def _locate_content_list_pinned(tree: PinnedArtifactTree) -> PinnedArtifactFile:
+    candidates = tuple(
+        file
+        for file in tree.files
+        if file.relative_path.name.endswith("_content_list.json")
+        and not file.relative_path.name.endswith("_content_list_v2.json")
     )
     if len(candidates) != 1:
         raise ParserOutputContractError(
             "MinerU output must contain exactly one content_list artifact"
         )
-    return _resolved_plain_file(candidates[0], root=root)
+    return candidates[0]
 
 
-def _resolved_plain_file(path: Path, *, root: Path) -> Path:
-    try:
-        relative = path.relative_to(root)
-    except ValueError as exc:
-        raise ParserOutputContractError("MinerU artifact escapes its output root") from exc
-    cursor = root
-    for component in relative.parts:
-        cursor = cursor / component
-        try:
-            mode = cursor.lstat().st_mode
-        except OSError as exc:
-            raise ParserOutputContractError(
-                f"cannot inspect MinerU artifact path: {relative.as_posix()}"
-            ) from exc
-        if stat.S_ISLNK(mode):
-            raise ParserOutputContractError(
-                f"MinerU artifact path contains a symlink: {relative.as_posix()}"
-            )
-    try:
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, ValueError) as exc:
-        raise ParserOutputContractError(
-            f"cannot resolve MinerU artifact: {relative.as_posix()}"
-        ) from exc
-    if not resolved.is_file():
-        raise ParserOutputContractError(
-            f"MinerU artifact is not a regular file: {relative.as_posix()}"
-        )
-    return resolved
-
-
-def _plain_tree_files(root: Path) -> tuple[Path, ...]:
-    files: list[Path] = []
-    for current, directory_names, file_names in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        for name in sorted(directory_names):
-            candidate = current_path / name
-            try:
-                mode = candidate.lstat().st_mode
-            except OSError as exc:
-                raise ParserOutputContractError(
-                    f"cannot inspect MinerU artifact directory: {candidate}"
-                ) from exc
-            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                raise ParserOutputContractError(
-                    f"MinerU artifact tree contains an unsafe directory: {candidate}"
-                )
-        for name in sorted(file_names):
-            candidate = current_path / name
-            try:
-                mode = candidate.lstat().st_mode
-            except OSError as exc:
-                raise ParserOutputContractError(
-                    f"cannot inspect MinerU artifact file: {candidate}"
-                ) from exc
-            if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-                raise ParserOutputContractError(
-                    f"MinerU artifact tree contains a non-regular file: {candidate}"
-                )
-            files.append(_resolved_plain_file(candidate, root=root))
-    return tuple(sorted(files, key=lambda path: path.relative_to(root).as_posix()))
-
-
-def _artifact_roles(
+def _artifact_roles_pinned(
     *,
-    root: Path,
-    files: tuple[Path, ...],
-    explicit_role_paths: Mapping[str, Path],
+    artifact_root: PurePosixPath,
+    files: tuple[PinnedArtifactFile, ...],
+    explicit_role_paths: Mapping[str, PurePosixPath],
 ) -> dict[str, str]:
     explicit_by_relative = {
-        path.relative_to(root).as_posix(): role
+        _relative_to(path, artifact_root).as_posix(): role
         for role, path in explicit_role_paths.items()
     }
-    relative_paths = {path.relative_to(root).as_posix() for path in files}
+    relative_paths = {
+        _relative_to(file.relative_path, artifact_root).as_posix() for file in files
+    }
     if not set(explicit_by_relative).issubset(relative_paths):
         raise ParserOutputContractError("MinerU artifact bundle is incomplete")
     roles: dict[str, str] = {}
@@ -343,42 +1488,23 @@ def _artifact_roles(
     return roles
 
 
-def _artifact_record(
+def _artifact_record_pinned(
     *,
     role: str,
-    path: Path,
-    root: Path,
+    file: PinnedArtifactFile,
+    tree: PinnedArtifactTree,
+    artifact_root: PurePosixPath,
 ) -> ProviderArtifact:
-    resolved = _resolved_plain_file(path, root=root)
-    try:
-        digest = hashlib.sha256()
-        size_bytes = 0
-        leading_bytes = b""
-        markdown_decoder = (
-            codecs.getincrementaldecoder("utf-8")(errors="strict")
-            if role == "markdown"
-            else None
-        )
-        with resolved.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                if not leading_bytes:
-                    leading_bytes = chunk[:16]
-                if markdown_decoder is not None:
-                    markdown_decoder.decode(chunk, final=False)
-                digest.update(chunk)
-                size_bytes += len(chunk)
-        if markdown_decoder is not None:
-            markdown_decoder.decode(b"", final=True)
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ParserOutputContractError(f"cannot read MinerU artifact role={role}") from exc
+    if role == "markdown":
+        tree.validate_utf8(file.relative_path, label=role)
     return ProviderArtifact(
         role=role,
-        relative_path=resolved.relative_to(root).as_posix(),
-        sha256="sha256:" + digest.hexdigest(),
-        size_bytes=size_bytes,
+        relative_path=_relative_to(file.relative_path, artifact_root).as_posix(),
+        sha256=file.sha256,
+        size_bytes=file.size_bytes,
         media_type=_artifact_media_type(
             role=role,
-            leading_bytes=leading_bytes,
+            leading_bytes=file.leading_bytes,
         ),
     )
 
@@ -405,48 +1531,28 @@ def _artifact_media_type(*, role: str, leading_bytes: bytes) -> str:
     return "application/octet-stream"
 
 
-def _read_artifact_bytes(
-    *,
-    path: Path,
-    root: Path,
-    role: str,
-) -> bytes:
-    resolved = _resolved_plain_file(path, root=root)
-    try:
-        return resolved.read_bytes()
-    except OSError as exc:
-        raise ParserOutputContractError(f"cannot read MinerU artifact role={role}") from exc
-
-
-def _json_value(payload: bytes, *, label: str) -> object:
-    try:
-        return json.loads(payload, parse_constant=_reject_json_constant)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise ParserOutputContractError(f"invalid MinerU {label} JSON") from exc
-
-
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant: {value}")
 
 
-def _object_list(payload: bytes, *, label: str) -> list[dict[str, Any]]:
-    value = _json_value(payload, label=label)
+def _object_list(value: object, *, label: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise ParserOutputContractError(f"MinerU {label} must be an array of objects")
     return value
 
 
 def _page_object_lists(
-    payload: bytes,
+    value: object,
     *,
     label: str,
 ) -> list[list[dict[str, Any]]]:
-    value = _json_value(payload, label=label)
     if not isinstance(value, list):
         raise ParserOutputContractError(f"MinerU {label} must be page grouped")
     pages: list[list[dict[str, Any]]] = []
     for page in value:
-        if not isinstance(page, list) or not all(isinstance(block, dict) for block in page):
+        if not isinstance(page, list) or not all(
+            isinstance(block, dict) for block in page
+        ):
             raise ParserOutputContractError(
                 f"MinerU {label} pages must contain objects"
             )
@@ -454,15 +1560,14 @@ def _page_object_lists(
     return pages
 
 
-def _object_value(payload: bytes, *, label: str) -> dict[str, Any]:
-    value = _json_value(payload, label=label)
+def _object_value(value: object, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ParserOutputContractError(f"MinerU {label} must be an object")
     return value
 
 
 def _middle_document(
-    payload: bytes,
+    payload: object,
 ) -> tuple[
     tuple[tuple[float, float], ...],
     tuple[str, str, str],
@@ -474,7 +1579,9 @@ def _middle_document(
     backend = middle.get("_backend")
     effort = middle.get("_effort")
     if not all(isinstance(value, str) for value in (version, backend, effort)):
-        raise ParserOutputContractError("MinerU parser identity must contain text values")
+        raise ParserOutputContractError(
+            "MinerU parser identity must contain text values"
+        )
     assert isinstance(version, str)
     assert isinstance(backend, str)
     assert isinstance(effort, str)
@@ -523,7 +1630,9 @@ def _positive_number(value: object, *, field: str) -> float:
 def _page_index(item: Mapping[str, object], *, page_count: int) -> int:
     value = item.get("page_idx")
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ParserOutputContractError("MinerU content-list page_idx must be an integer")
+        raise ParserOutputContractError(
+            "MinerU content-list page_idx must be an integer"
+        )
     if value < 0 or value >= page_count:
         raise ParserOutputContractError("MinerU content-list page_idx is out of range")
     return value
@@ -601,10 +1710,14 @@ def _bind_typed_annotations(
 
 
 def _types_are_compatible(*, primary_type: str, typed_type: str) -> bool:
-    return primary_type == typed_type or (
-        primary_type,
-        typed_type,
-    ) in _COMPATIBLE_TYPED_ANNOTATIONS
+    return (
+        primary_type == typed_type
+        or (
+            primary_type,
+            typed_type,
+        )
+        in _COMPATIBLE_TYPED_ANNOTATIONS
+    )
 
 
 def _provider_payloads(
@@ -614,9 +1727,7 @@ def _provider_payloads(
     source_index: int,
 ) -> tuple[ProviderPayload, ...]:
     try:
-        scalar_fields, sequence_fields = provider_payload_field_contract(
-            provider_type
-        )
+        scalar_fields, sequence_fields = provider_payload_field_contract(provider_type)
     except ValueError as exc:
         raise ParserOutputContractError(
             f"MinerU item {source_index} has unsupported type {provider_type}"
@@ -663,7 +1774,8 @@ def _referenced_image_roles(
     *,
     item: Mapping[str, object],
     source_index: int,
-    content_root: Path,
+    tree: PinnedArtifactTree,
+    artifact_root: PurePosixPath,
     artifacts_by_relative: Mapping[str, ProviderArtifact],
 ) -> tuple[str, ...]:
     roles: list[str] = []
@@ -681,8 +1793,8 @@ def _referenced_image_roles(
             raise ParserOutputContractError(
                 f"MinerU item {source_index} contains an unsafe image path"
             )
-        resolved = _resolved_plain_file(content_root.joinpath(*pure.parts), root=content_root)
-        relative = resolved.relative_to(content_root).as_posix()
+        tree.require_file(artifact_root / pure)
+        relative = pure.as_posix()
         if relative in seen_paths:
             continue
         seen_paths.add(relative)
@@ -908,7 +2020,9 @@ def _canonical_value_json(value: object, *, label: str) -> str:
             allow_nan=False,
         )
     except (TypeError, ValueError) as exc:
-        raise ParserOutputContractError(f"MinerU {label} is not canonical JSON") from exc
+        raise ParserOutputContractError(
+            f"MinerU {label} is not canonical JSON"
+        ) from exc
 
 
 def _canonical_item_json(item: Mapping[str, object], *, source_index: int) -> str:
@@ -919,4 +2033,9 @@ def _sha256(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-__all__ = ["MinerUMediumArtifactReader"]
+__all__ = [
+    "MinerUMediumArtifactReader",
+    "PinnedArtifactFile",
+    "PinnedArtifactReadResult",
+    "PinnedArtifactTree",
+]

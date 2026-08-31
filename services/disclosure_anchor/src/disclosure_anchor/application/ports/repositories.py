@@ -29,6 +29,7 @@ from disclosure_anchor.application.contracts.publish_evidence_ledger import (
 from disclosure_anchor.application.ports.staged_provider_parser import (
     DurableCheckpointWitness,
     ProviderAckCompletionWitness,
+    RecoveredV3ResumeSecret,
 )
 
 from disclosure_anchor.domain.entities import (
@@ -167,6 +168,26 @@ class CreditTransitionGrant:
         return positive_delta.fits(self.maximum_positive_delta)
 
 
+class V3ResumeSecretRecoveryError(RuntimeError):
+    """A private v3 token cannot be recovered without weakening identity."""
+
+
+class V3ResumeSecretMissing(V3ResumeSecretRecoveryError):
+    pass
+
+
+class V3ResumeSecretIdentityMismatch(V3ResumeSecretRecoveryError):
+    pass
+
+
+class V3ResumeSecretStaleOwner(V3ResumeSecretRecoveryError):
+    pass
+
+
+class V3ResumeSecretKeyUnavailable(V3ResumeSecretRecoveryError):
+    """A wrapped token exists but its decryption key is unavailable."""
+
+
 class RemoteParseAttemptRepository(Protocol):
     def add(
         self, attempt: RemoteParseAttempt,
@@ -279,6 +300,12 @@ class RemoteParseAttemptRepository(Protocol):
         self, *, expected_attempt: RemoteParseAttempt,
         witness: ProviderAckCompletionWitness,
     ) -> RemoteParseAttempt: ...
+    def recover_v3_resume_secret(
+        self, *, attempt_id: str, fence_identity: str, secret_kind: str,
+        expected_token_sha256: str, expected_token_byte_count: int,
+        expected_state: str, expected_row_version: int,
+        claim_owner_identity: str, claim_generation: int,
+    ) -> RecoveredV3ResumeSecret: ...
     def claim_recovery(
         self, *, attempt_id: str, fence_identity: str, expected_version: int,
         owner_identity: str, lease_seconds: int,

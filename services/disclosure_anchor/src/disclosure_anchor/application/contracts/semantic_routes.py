@@ -10,8 +10,10 @@ from typing import Literal, cast, get_args
 
 SEMANTIC_ROUTE_RECEIPT_V1 = "semantic_route_receipt.v1"
 SEMANTIC_ROUTE_RECEIPT_VERSION = "semantic_route_receipt.v2"
+SEMANTIC_ROUTE_RECEIPT_V3 = "semantic_route_receipt.v3"
 SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME = "semantic_route_receipts.v1.jsonl"
 SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v2.jsonl"
+SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME = "semantic_route_receipts.v3.jsonl"
 SEMANTIC_FAILOVER_POLICY_VERSION = "availability_only.v1"
 SEMANTIC_OUTPUT_SCHEMA_VERSION = "semantic_route_output.v1"
 SEMANTIC_ROUTER_VERSION = "semantic_router.v101"
@@ -627,6 +629,48 @@ class SemanticRouteReceiptRow:
             raise SemanticRouteContractError("semantic receipt row identity is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticRouteReceiptRowV3:
+    """Pre-ID v4 receipt keyed by stable run/order/provider-draft identity."""
+
+    processing_run_id: str
+    unit_order_index: int
+    provider_locator_sha256: str
+    routed_draft_sha256: str
+    receipt: SemanticRouteReceipt
+    contract_version: str = SEMANTIC_ROUTE_RECEIPT_V3
+
+    def __post_init__(self) -> None:
+        if self.contract_version != SEMANTIC_ROUTE_RECEIPT_V3:
+            raise SemanticRouteContractError(
+                "semantic receipt v3 contract is unsupported"
+            )
+        if (
+            type(self.processing_run_id) is not str
+            or not self.processing_run_id
+            or type(self.unit_order_index) is not int
+            or self.unit_order_index < 1
+        ):
+            raise SemanticRouteContractError(
+                "semantic receipt v3 row identity is invalid"
+            )
+        for value, label in (
+            (self.provider_locator_sha256, "provider locator"),
+            (self.routed_draft_sha256, "routed draft"),
+        ):
+            if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+                raise SemanticRouteContractError(
+                    f"semantic receipt v3 {label} hash is invalid"
+                )
+        if (
+            type(self.receipt) is not SemanticRouteReceipt
+            or self.receipt.contract_version != SEMANTIC_ROUTE_RECEIPT_VERSION
+        ):
+            raise SemanticRouteContractError(
+                "semantic receipt v3 requires exact v2 route semantics"
+            )
+
+
 def semantic_route_receipt_row_to_payload(
     row: SemanticRouteReceiptRow,
 ) -> dict[str, object]:
@@ -651,6 +695,93 @@ def semantic_route_receipt_row_from_payload(payload: object) -> SemanticRouteRec
         order_index=order_index,
         receipt=semantic_route_receipt_from_payload(root["semantic_route"]),
     )
+
+
+def semantic_route_receipt_row_v3_to_payload(
+    row: SemanticRouteReceiptRowV3,
+) -> dict[str, object]:
+    return {
+        "contract_version": row.contract_version,
+        "processing_run_id": row.processing_run_id,
+        "provider_locator_sha256": row.provider_locator_sha256,
+        "routed_draft_sha256": row.routed_draft_sha256,
+        "semantic_route": semantic_route_receipt_to_payload(row.receipt),
+        "unit_order_index": row.unit_order_index,
+    }
+
+
+def semantic_route_receipt_row_v3_from_payload(
+    payload: object,
+) -> SemanticRouteReceiptRowV3:
+    root = _closed_mapping(
+        payload,
+        fields={
+            "contract_version",
+            "processing_run_id",
+            "provider_locator_sha256",
+            "routed_draft_sha256",
+            "semantic_route",
+            "unit_order_index",
+        },
+        label="semantic receipt v3 row",
+    )
+    unit_order_index = root["unit_order_index"]
+    if type(unit_order_index) is not int or unit_order_index < 1:
+        raise SemanticRouteContractError(
+            "semantic receipt v3 unit_order_index is invalid"
+        )
+    return SemanticRouteReceiptRowV3(
+        contract_version=_text(
+            root["contract_version"], label="semantic receipt v3 contract_version"
+        ),
+        processing_run_id=_text(
+            root["processing_run_id"], label="semantic receipt v3 processing_run_id"
+        ),
+        unit_order_index=unit_order_index,
+        provider_locator_sha256=_text(
+            root["provider_locator_sha256"],
+            label="semantic receipt v3 provider_locator_sha256",
+        ),
+        routed_draft_sha256=_text(
+            root["routed_draft_sha256"],
+            label="semantic receipt v3 routed_draft_sha256",
+        ),
+        receipt=semantic_route_receipt_from_payload(root["semantic_route"]),
+    )
+
+
+def validate_semantic_route_receipt_rows_v3(
+    rows: tuple[SemanticRouteReceiptRowV3, ...],
+    *,
+    processing_run_id: str,
+) -> None:
+    if (
+        not isinstance(rows, tuple)
+        or type(processing_run_id) is not str
+        or not processing_run_id
+        or any(type(row) is not SemanticRouteReceiptRowV3 for row in rows)
+    ):
+        raise SemanticRouteContractError("semantic receipt v3 set identity is invalid")
+    expected_order = tuple(range(1, len(rows) + 1))
+    if tuple(row.unit_order_index for row in rows) != expected_order:
+        raise SemanticRouteContractError(
+            "semantic receipt v3 rows are not contiguous and ordered"
+        )
+    if any(row.processing_run_id != processing_run_id for row in rows):
+        raise SemanticRouteContractError("semantic receipt v3 rows mix processing runs")
+    identities = {
+        (
+            row.processing_run_id,
+            row.unit_order_index,
+            row.provider_locator_sha256,
+            row.routed_draft_sha256,
+        )
+        for row in rows
+    }
+    if len(identities) != len(rows):
+        raise SemanticRouteContractError(
+            "semantic receipt v3 rows contain duplicate identities"
+        )
 
 
 def semantic_route_receipt_to_payload(receipt: SemanticRouteReceipt) -> dict[str, object]:
@@ -1053,8 +1184,10 @@ __all__ = [
     "SEMANTIC_OUTPUT_SCHEMA_VERSION",
     "SEMANTIC_ROUTE_RECEIPT_V1",
     "SEMANTIC_ROUTE_RECEIPT_VERSION",
+    "SEMANTIC_ROUTE_RECEIPT_V3",
     "SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME",
     "SEMANTIC_ROUTE_RECEIPTS_FILENAME",
+    "SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME",
     "SEMANTIC_ROUTER_VERSION",
     "SemanticAdjudicatedRoute",
     "SemanticAdjudicationDecision",
@@ -1067,6 +1200,7 @@ __all__ = [
     "SemanticRouteEvidence",
     "SemanticRouteReceipt",
     "SemanticRouteReceiptRow",
+    "SemanticRouteReceiptRowV3",
     "SemanticRouteSource",
     "SemanticRouteTaxonomy",
     "SemanticRouteUnitInput",
@@ -1075,5 +1209,8 @@ __all__ = [
     "semantic_route_receipt_from_payload",
     "semantic_route_receipt_row_from_payload",
     "semantic_route_receipt_row_to_payload",
+    "semantic_route_receipt_row_v3_from_payload",
+    "semantic_route_receipt_row_v3_to_payload",
     "semantic_route_receipt_to_payload",
+    "validate_semantic_route_receipt_rows_v3",
 ]

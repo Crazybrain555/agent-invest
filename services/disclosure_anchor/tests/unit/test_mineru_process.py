@@ -5,10 +5,14 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest import mock
 
 from disclosure_anchor.adapters.parsers.mineru_medium import process as mineru_process
+from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
+    PinnedArtifactReadResult,
+)
 from disclosure_anchor.adapters.parsers.mineru_medium.parser import (
     MinerUMediumDocumentParser,
 )
@@ -166,6 +170,45 @@ class MinerUProcessTests(unittest.TestCase):
                 parser_version="3.4.4",
                 api_url="http://mac-api:30000",
             ).readiness(options)
+
+    def test_medium_parser_admits_document_and_location_in_one_reader_pass(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.version.return_value = "3.4.4"
+        process.run.return_value = SimpleNamespace(output_dir=Path("published-output"))
+        reader = mock.Mock()
+        document = mock.sentinel.provider_document
+        reader.read_with_location.return_value = PinnedArtifactReadResult(
+            document=document,
+            artifact_root_relpath=PurePosixPath("nested/artifacts"),
+        )
+        parser = MinerUMediumDocumentParser(
+            process=process,
+            reader=reader,
+            api_url="http://mac-api:30000",
+            server_url="http://windows-vllm:30001/v1",
+        )
+        options = ParserOptions(runtime_bundle_identity_sha256=f"sha256:{'a' * 64}")
+
+        result = parser.parse(
+            input_pdf=Path("input.pdf"),
+            output_dir=Path("requested-output"),
+            options=options,
+            source_pdf_sha256=f"sha256:{'b' * 64}",
+        )
+
+        reader.read_with_location.assert_called_once_with(
+            Path("published-output"),
+            source_pdf_sha256=f"sha256:{'b' * 64}",
+        )
+        reader.read.assert_not_called()
+        reader.locate_artifact_root.assert_not_called()
+        self.assertIs(result.provider_document, document)
+        self.assertEqual(
+            result.artifact_root,
+            Path("published-output").absolute() / "nested" / "artifacts",
+        )
 
     def test_run_aligns_deadline_and_classifies_process_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

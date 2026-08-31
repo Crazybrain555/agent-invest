@@ -79,18 +79,11 @@
    "tests": 14
   },
   "tests/integration/test_tracked_pool_api.py": {
-   "private_imports": [
-    "_ADMIN_HEADERS",
-    "_ADMIN_TOKEN",
-    "_api_request"
-   ],
+   "private_imports": [],
    "tests": 4
   },
   "tests/sample_corpus/test_provider_unit_builder_frozen.py": {
-   "private_imports": [
-    "_ROOT_ENV = \"DISCLOSURE_MEDIUM_FROZEN_ROOT\"",
-    "_SAMPLES = (\"zhongke\""
-   ],
+   "private_imports": [],
    "tests": 1
   },
   "tests/sample_corpus/test_sample_filings.py": {
@@ -104,6 +97,10 @@
   "tests/unit/test_artifact_store.py": {
    "private_imports": [],
    "tests": 2
+  },
+  "tests/unit/test_atomic_document_publication_v4.py": {
+   "private_imports": [],
+   "tests": 11
   },
   "tests/unit/test_attest_mineru_remote_runtime.py": {
    "private_imports": [],
@@ -134,9 +131,7 @@
    "tests": 6
   },
   "tests/unit/test_capacity_cli.py": {
-   "private_imports": [
-    "_settings"
-   ],
+   "private_imports": [],
    "tests": 3
   },
   "tests/unit/test_capacity_host_observer.py": {
@@ -262,10 +257,7 @@
    "tests": 7
   },
   "tests/unit/test_generate_current_source_replay.py": {
-   "private_imports": [
-    "_CONTENT_HASH = \"sha256:\" + \"a\" * 64",
-    "_QUERY_HASH = \"sha256:\" + \"b\" * 64"
-   ],
+   "private_imports": [],
    "tests": 7
   },
   "tests/unit/test_health.py": {
@@ -296,6 +288,10 @@
    "private_imports": [],
    "tests": 8
   },
+  "tests/unit/test_local_materialization_manifest_v4.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
    "tests": 24
@@ -314,7 +310,13 @@
   },
   "tests/unit/test_mineru_http_staged.py": {
    "private_imports": [],
-   "tests": 24
+   "tests": 28
+  },
+  "tests/unit/test_mineru_http_staged_v4.py": {
+   "private_imports": [
+    "_ZipPathCollisionIndex"
+   ],
+   "tests": 63
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -322,7 +324,7 @@
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 19
   },
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
@@ -330,7 +332,7 @@
   },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 13
   },
   "tests/unit/test_mineru_process_profile.py": {
    "private_imports": [],
@@ -424,6 +426,14 @@
    "private_imports": [],
    "tests": 11
   },
+  "tests/unit/test_remote_parse_evidence_v4.py": {
+   "private_imports": [],
+   "tests": 24
+  },
+  "tests/unit/test_remote_parse_lifecycle_v4.py": {
+   "private_imports": [],
+   "tests": 24
+  },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
    "tests": 2
@@ -464,6 +474,10 @@
    "private_imports": [],
    "tests": 14
   },
+  "tests/unit/test_semantic_route_receipt_v3.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_semantic_route_store.py": {
    "private_imports": [],
    "tests": 11
@@ -485,6 +499,18 @@
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
    "tests": 38
+  },
+  "tests/unit/test_staged_provider_parser_v4.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_staged_resource_credit_v4.py": {
+   "private_imports": [],
+   "tests": 12
+  },
+  "tests/unit/test_staged_resource_paths.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],

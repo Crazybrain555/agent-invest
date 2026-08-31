@@ -84,14 +84,16 @@ class MinerUMediumDocumentParser:
             output_dir=output_dir,
             options=run_options,
         )
-        provider_document = self._reader.read(
+        admitted = self._reader.read_with_location(
             result.output_dir,
             source_pdf_sha256=source_pdf_sha256,
         )
         return ProviderParserResult(
             target_identity=target,
-            artifact_root=self._reader.locate_artifact_root(result.output_dir),
-            provider_document=provider_document,
+            artifact_root=result.output_dir.absolute().joinpath(
+                *admitted.artifact_root_relpath.parts
+            ),
+            provider_document=admitted.document,
         )
 
     def _endpoints(self, options: ParserOptions) -> tuple[str, str]:
