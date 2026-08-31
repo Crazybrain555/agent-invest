@@ -388,6 +388,14 @@
    "private_imports": [],
    "tests": 10
   },
+  "tests/unit/test_provider_secret_envelope_v4.py": {
+   "private_imports": [],
+   "tests": 27
+  },
+  "tests/unit/test_provider_secret_keyring.py": {
+   "private_imports": [],
+   "tests": 19
+  },
   "tests/unit/test_provider_table_projection.py": {
    "private_imports": [],
    "tests": 11

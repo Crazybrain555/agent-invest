@@ -334,6 +334,15 @@ class Settings(BaseSettings):
             "disclosure_mineru_validation_receipt",
         ),
     )
+    # Private V4 provider-secret keyring file. Default None keeps V4
+    # default-off; V4 secret composition fails closed when the path is absent.
+    disclosure_v4_secret_keyring_file: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_SECRET_KEYRING_FILE",
+            "disclosure_v4_secret_keyring_file",
+        ),
+    )
     # Operator-calibrated safety reserve for capacity observation and candidate
     # evaluation.  It is not a fixed deployment/admission requirement.
     disclosure_mineru_docker_memory_reserve_bytes: int = Field(
