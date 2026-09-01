@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 import subprocess
-import sys
 import unittest
 
 from sqlalchemy import exc, text
@@ -19,7 +16,7 @@ from disclosure_anchor.adapters.db.postgres.schema import (
     PUBLIC_VIEWS,
 )
 from disclosure_anchor.adapters.db.postgres.migration_state import single_migration_head
-from tests.integration._support import engine_or_skip
+from tests.integration._support import engine_or_skip, run_alembic
 
 EXPECTED_CORE_TABLES = {
     "company",
@@ -32,7 +29,6 @@ EXPECTED_CORE_TABLES = {
     "processing_run",
     "document_unit",
 }
-SERVICE_ROOT = Path(__file__).resolve().parents[2]
 
 
 class SchemaShapeTests(unittest.TestCase):
@@ -750,15 +746,10 @@ class SchemaShapeTests(unittest.TestCase):
                 {"document_id": document_id},
             )
 
-    @staticmethod
-    def _alembic(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, "-m", "alembic", *args],
-            cwd=SERVICE_ROOT,
-            env=os.environ.copy(),
-            capture_output=True,
-            text=True,
-        )
+    def _alembic(self, *args: str) -> subprocess.CompletedProcess[str]:
+        # Never build the child environment here: run_alembic pins every
+        # database URL variable to this test engine.
+        return run_alembic(self.engine, *args)
 
     def _restore_migration_head(self) -> None:
         restored = self._alembic("upgrade", "head")

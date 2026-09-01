@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from sqlalchemy import CheckConstraint
+
 from disclosure_anchor.adapters.db.postgres.migration_state import (
     migration_heads,
     single_migration_head,
@@ -46,6 +48,67 @@ class MigrationStateTests(unittest.TestCase):
         )
         self.assertEqual(migration.revision, "0054_publish_evidence_ledger")
         self.assertEqual(migration.down_revision, "0053_remote_parse_checkpoint")
+
+    def test_0057_is_adjacent_to_0056_and_is_the_only_head(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0057_remote_parse_v4_authority"
+        )
+
+        self.assertEqual(migration.revision, "0057_remote_parse_v4_authority")
+        self.assertEqual(
+            migration.down_revision,
+            "0056_staged_credit_evidence",
+        )
+        self.assertEqual(migration_heads(), (migration.revision,))
+
+    def test_0057_checkpoint_state_evidence_matches_orm_exactly(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0057_remote_parse_v4_authority"
+        )
+        models = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.models"
+        )
+
+        migration_shape = migration._v4_checkpoint_state_evidence_shape()
+        model_shape = models._v4_checkpoint_state_evidence_shape()
+        self.assertEqual(migration._all_null(()), "TRUE")
+        self.assertEqual(migration._all_present(()), "TRUE")
+        self.assertEqual(models._all_null(()), "TRUE")
+        self.assertEqual(models._all_present(()), "TRUE")
+        self.assertEqual(migration_shape, model_shape)
+        self.assertNotRegex(migration_shape, r"AND\s+AND|OR\s+OR")
+
+        constraint = next(
+            item
+            for item in models.RemoteParseV4Checkpoint.__table__.constraints
+            if item.name == "ck_remote_parse_v4_checkpoint_state_evidence"
+        )
+        self.assertIsInstance(constraint, CheckConstraint)
+        self.assertEqual(str(constraint.sqltext), f"({migration_shape}) IS TRUE")
+
+    def test_0057_checkpoint_credit_shape_matches_orm_exactly(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0057_remote_parse_v4_authority"
+        )
+        models = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.models"
+        )
+
+        migration_shape = migration._v4_checkpoint_credit_shape()
+        model_shape = models._v4_checkpoint_credit_shape()
+        self.assertEqual(migration_shape, model_shape)
+        self.assertNotRegex(migration_shape, r"AND\s+AND|OR\s+OR")
+
+        constraint = next(
+            item
+            for item in models.RemoteParseV4Checkpoint.__table__.constraints
+            if item.name == "ck_remote_parse_v4_checkpoint_credit_shape"
+        )
+        self.assertIsInstance(constraint, CheckConstraint)
+        self.assertEqual(str(constraint.sqltext), f"({migration_shape}) IS TRUE")
 
     def test_0051_binds_only_first_later_exact_uscc_observation(self) -> None:
         migration = importlib.import_module(

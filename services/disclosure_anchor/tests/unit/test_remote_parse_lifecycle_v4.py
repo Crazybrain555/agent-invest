@@ -41,6 +41,7 @@ from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     decode_resource_reservation_v4,
     provider_ack_request_v4_bytes,
     provider_ack_request_v4_identity,
+    validate_remote_parse_checkpoint_successor_v4,
     validate_resource_reservation_checkpoint_binding_v4,
 )
 from disclosure_anchor.application.contracts.staged_resource_credit import (
@@ -135,6 +136,60 @@ class RemoteParseLifecycleV4Tests(unittest.TestCase):
         self.assertNotIn("materialization_staged", STAGED_RESOURCE_STATE_TRANSITIONS)
         self.assertNotIn("cleanup_committed", STAGED_RESOURCE_STATE_TRANSITIONS)
         self.assertEqual(chain[-1].held_resource_credit, ResourceCreditVector())
+
+    def test_prepared_cannot_reappear_after_lifecycle_zero(self) -> None:
+        prepared = _base()["prepared"]
+        assert isinstance(prepared, RemoteParseCheckpointV4)
+        with self.assertRaisesRegex(ValueError, "lifecycle-zero states"):
+            replace(
+                prepared,
+                lifecycle_version=1,
+                previous_checkpoint_sha256=prepared.sha256,
+            )
+
+        payload = json.loads(prepared.canonical_bytes)
+        payload["lifecycle_version"] = 1
+        payload["previous_checkpoint_sha256"] = prepared.sha256
+        with self.assertRaisesRegex(ValueError, "lifecycle-zero states"):
+            decode_remote_parse_checkpoint_v4(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+
+    def test_preparation_failed_cannot_be_resourceful(self) -> None:
+        prepared = _base()["prepared"]
+        assert isinstance(prepared, RemoteParseCheckpointV4)
+        with self.assertRaisesRegex(ValueError, "lifecycle-zero states"):
+            replace(
+                prepared,
+                state="preparation_failed",
+                lifecycle_version=1,
+                previous_checkpoint_sha256=prepared.sha256,
+                held_resource_credit=ResourceCreditVector(),
+                failure_receipt_sha256=SHA_D,
+            )
+
+        payload = json.loads(prepared.canonical_bytes)
+        payload.update(
+            {
+                "state": "preparation_failed",
+                "lifecycle_version": 1,
+                "previous_checkpoint_sha256": prepared.sha256,
+                "held_resource_credit": asdict(ResourceCreditVector()),
+                "failure_receipt_sha256": SHA_D,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "lifecycle-zero states"):
+            decode_remote_parse_checkpoint_v4(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
 
     def test_every_canonical_record_round_trips_and_rejects_unknown_fields(self) -> None:
         fixture = _happy_path()
@@ -851,7 +906,10 @@ class RemoteParseLifecycleV4Tests(unittest.TestCase):
             advance_remote_parse_checkpoint_v4(
                 prepared,
                 state="cleanup_pending",
-                held_resource_credit=ResourceCreditVector(),
+                held_resource_credit=replace(
+                    prepared.held_resource_credit,
+                    provider_tasks=1,
+                ),
                 failure_receipt_sha256=SHA_D,
                 cleanup_plan_sha256=SHA_E,
             )
@@ -913,6 +971,147 @@ class RemoteParseLifecycleV4Tests(unittest.TestCase):
                 resources=tuple(
                     item for item in resources if item.kind != "spool"
                 ),
+            )
+
+    def test_exported_successor_rejects_cleanup_credit_loss_like_builder(self) -> None:
+        submitted = _happy_path()["chain"][2]
+        assert isinstance(submitted, RemoteParseCheckpointV4)
+        forged = replace(
+            submitted,
+            state="cleanup_pending",
+            lifecycle_version=submitted.lifecycle_version + 1,
+            previous_checkpoint_sha256=submitted.sha256,
+            held_resource_credit=_snapshot_credit(),
+            failure_receipt_sha256=SHA_A,
+            cleanup_plan_sha256=SHA_B,
+        )
+        with self.assertRaisesRegex(ValueError, "must equal"):
+            validate_remote_parse_checkpoint_successor_v4(submitted, forged)
+        with self.assertRaisesRegex(ValueError, "must equal"):
+            advance_remote_parse_checkpoint_v4(
+                submitted,
+                state="cleanup_pending",
+                held_resource_credit=_snapshot_credit(),
+                failure_receipt_sha256=SHA_A,
+                cleanup_plan_sha256=SHA_B,
+            )
+
+    def test_ack_pending_provider_result_credit_matches_terminal_receipt(self) -> None:
+        fixture = _happy_path()
+        cleanup_pending = fixture["chain"][-3]
+        assert isinstance(cleanup_pending, RemoteParseCheckpointV4)
+
+        with self.assertRaisesRegex(ValueError, "invented provider result"):
+            replace(
+                cleanup_pending,
+                state="ack_pending",
+                lifecycle_version=cleanup_pending.lifecycle_version + 1,
+                previous_checkpoint_sha256=cleanup_pending.sha256,
+                terminal_receipt_sha256=None,
+                cleanup_receipt_sha256=SHA_A,
+                held_resource_credit=ResourceCreditVector(
+                    documents=1,
+                    provider_tasks=1,
+                    provider_result_bytes=1,
+                    ack_items=1,
+                ),
+            )
+
+    def test_cleanup_and_ack_states_require_one_exact_outcome(self) -> None:
+        prepared = _base()["prepared"]
+        assert isinstance(prepared, RemoteParseCheckpointV4)
+
+        with self.assertRaisesRegex(ValueError, "exactly one outcome"):
+            advance_remote_parse_checkpoint_v4(
+                prepared,
+                state="cleanup_pending",
+                held_resource_credit=prepared.held_resource_credit,
+                cleanup_plan_sha256=SHA_D,
+            )
+
+        cleanup_pending = advance_remote_parse_checkpoint_v4(
+            prepared,
+            state="cleanup_pending",
+            held_resource_credit=prepared.held_resource_credit,
+            failure_receipt_sha256=SHA_D,
+            cleanup_plan_sha256=SHA_E,
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one outcome"):
+            replace(
+                cleanup_pending,
+                state="ack_pending",
+                lifecycle_version=cleanup_pending.lifecycle_version + 1,
+                previous_checkpoint_sha256=cleanup_pending.sha256,
+                accepted_submission_sha256=SHA_A,
+                cleanup_receipt_sha256=SHA_F,
+                failure_receipt_sha256=None,
+                held_resource_credit=_ack_credit(),
+            )
+
+    def test_terminal_failure_and_supersession_ack_shapes_are_closed(self) -> None:
+        prepared = _base()["prepared"]
+        assert isinstance(prepared, RemoteParseCheckpointV4)
+        failure_pending = advance_remote_parse_checkpoint_v4(
+            prepared,
+            state="cleanup_pending",
+            held_resource_credit=prepared.held_resource_credit,
+            failure_receipt_sha256=SHA_D,
+            cleanup_plan_sha256=SHA_E,
+        )
+        with self.assertRaisesRegex(ValueError, "accepted-task or ACK"):
+            advance_remote_parse_checkpoint_v4(
+                failure_pending,
+                state="pre_submission_failed",
+                held_resource_credit=ResourceCreditVector(),
+                cleanup_receipt_sha256=SHA_F,
+                ack_receipt_sha256=SHA_A,
+            )
+
+        supersession_pending = advance_remote_parse_checkpoint_v4(
+            prepared,
+            state="cleanup_pending",
+            held_resource_credit=prepared.held_resource_credit,
+            supersession_receipt_sha256=SHA_D,
+            cleanup_plan_sha256=SHA_E,
+        )
+        with self.assertRaisesRegex(ValueError, "accepted-task and ACK evidence disagree"):
+            advance_remote_parse_checkpoint_v4(
+                supersession_pending,
+                state="superseded",
+                held_resource_credit=ResourceCreditVector(),
+                cleanup_receipt_sha256=SHA_F,
+                ack_receipt_sha256=SHA_A,
+            )
+
+    def test_successor_allows_only_edge_specific_new_evidence(self) -> None:
+        fixture = _happy_path()
+        remote_terminal = fixture["chain"][3]
+        assert isinstance(remote_terminal, RemoteParseCheckpointV4)
+
+        with self.assertRaisesRegex(ValueError, "introduced unexpected evidence"):
+            advance_remote_parse_checkpoint_v4(
+                remote_terminal,
+                state="cleanup_pending",
+                held_resource_credit=remote_terminal.held_resource_credit,
+                failure_receipt_sha256=SHA_A,
+                cleanup_plan_sha256=SHA_B,
+                local_materialization_receipt_sha256=SHA_C,
+            )
+
+        cleanup_pending = advance_remote_parse_checkpoint_v4(
+            remote_terminal,
+            state="cleanup_pending",
+            held_resource_credit=remote_terminal.held_resource_credit,
+            supersession_receipt_sha256=SHA_A,
+            cleanup_plan_sha256=SHA_B,
+        )
+        with self.assertRaisesRegex(ValueError, "introduced unexpected evidence"):
+            advance_remote_parse_checkpoint_v4(
+                cleanup_pending,
+                state="superseded",
+                held_resource_credit=ResourceCreditVector(),
+                cleanup_receipt_sha256=SHA_C,
+                ack_receipt_sha256=SHA_D,
             )
 
     def test_success_cleanup_target_is_derived_from_provider_context(self) -> None:

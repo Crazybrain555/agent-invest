@@ -26,16 +26,10 @@ from disclosure_anchor.adapters.db.postgres.bootstrap import (
 from scripts.managed_scratch_database import (
     ManagedScratchDatabase,
 )
+from tests.integration._support import pinned_database_environment
 
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
-_DATABASE_ENV_KEYS = (
-    "DISCLOSURE_TEST_DATABASE_URL",
-    "DISCLOSURE_MIGRATION_DATABASE_URL",
-    "DATABASE_URL",
-    "DISCLOSURE_ADMIN_DATABASE_URL",
-    "DISCLOSURE_READER_DATABASE_URL",
-)
 _MINERU_RUNTIME_ENV_KEYS = (
     "DISCLOSURE_MINERU_BIN",
     "DISCLOSURE_MINERU_BACKEND",
@@ -82,9 +76,10 @@ class ScratchIntegrationDatabase(ManagedScratchDatabase):
             schema_engine.dispose()
 
     def _test_environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
-        for key in _DATABASE_ENV_KEYS:
-            environment[key] = self.database_url
+        environment = pinned_database_environment(
+            os.environ,
+            self.database_url,
+        )
         root = Path(self._roots.name)
         data_root = root / "services" / "disclosure_anchor"
         shared_root = root / "shared"

@@ -338,6 +338,21 @@ class StagedProviderParserV4PortTests(unittest.TestCase):
         self.assertTrue(claim.validates(checkpoint))
         self.assertFalse(claim.validates(_happy_path_for_port()["chain"][5]))
         self.assertNotIn(b"claim_owner", checkpoint.canonical_bytes)
+        max_int = (1 << 63) - 1
+        self.assertEqual(
+            replace(
+                claim,
+                lifecycle_version=max_int,
+                claim_generation=max_int,
+            ).claim_generation,
+            max_int,
+        )
+        for field_name in ("lifecycle_version", "claim_generation"):
+            with (
+                self.subTest(bound_field=field_name),
+                self.assertRaisesRegex(ValueError, "invalid"),
+            ):
+                replace(claim, **{field_name: max_int + 1})
         allowance = fixture["allowance"]
         validate_v4_materialization_authorization(
             checkpoint=checkpoint,
@@ -1064,21 +1079,10 @@ class StagedProviderParserV4PortTests(unittest.TestCase):
             checkpoint.held_resource_credit,
             provider_result_bytes=999,
         )
-        forged_credit_checkpoint = replace(
-            checkpoint,
-            held_resource_credit=forged_result_credit,
-        )
-        with self.assertRaisesRegex(ValueError, "credit drifted"):
-            seal_provider_ack_command_v4(
-                ack_pending_checkpoint=forged_credit_checkpoint,
-                accepted_submission=accepted,
-                terminal_receipt=None,
-                cleanup_plan=plan,
-                cleanup_receipt=cleanup_receipt,
-                replay_context=replace(
-                    replay_context,
-                    ack_pending_checkpoint=forged_credit_checkpoint,
-                ),
+        with self.assertRaisesRegex(ValueError, "invented provider result"):
+            replace(
+                checkpoint,
+                held_resource_credit=forged_result_credit,
             )
 
 

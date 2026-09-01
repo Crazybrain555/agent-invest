@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import unittest
 from unittest import mock
-from pathlib import Path
 
 import sqlalchemy
 from sqlalchemy import text
@@ -41,9 +39,7 @@ from disclosure_anchor.application.contracts.retrieval_primary import (
     RetrievalTarget,
     SearchTransform,
 )
-from tests.integration._support import engine_or_skip
-
-_SERVICE_ROOT = Path(__file__).resolve().parents[2]
+from tests.integration._support import engine_or_skip, run_alembic
 
 
 def _text_search_locator(order_index: int) -> dict[str, object]:
@@ -113,31 +109,17 @@ def _search_locator(
 
 
 class SearchProjectionIntegrationTests(unittest.TestCase):
-    temp_url: str = ""
-    subprocess_env: dict[str, str] = {}
     class_engine: sqlalchemy.engine.Engine | None = None
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.class_engine = engine_or_skip()
         cls.addClassCleanup(cls.class_engine.dispose)
-        cls.temp_url = cls.class_engine.url.render_as_string(hide_password=False)
-        cls.subprocess_env = {
-            **os.environ,
-            "DISCLOSURE_MIGRATION_DATABASE_URL": cls.temp_url,
-            "DATABASE_URL": cls.temp_url,
-            "PYTHONPATH": "src",
-        }
 
-    @classmethod
-    def _alembic(cls, *args: str) -> "subprocess.CompletedProcess[str]":
-        return subprocess.run(
-            [sys.executable, "-m", "alembic", *args],
-            cwd=str(_SERVICE_ROOT),
-            env=cls.subprocess_env,
-            capture_output=True,
-            text=True,
-        )
+    def _alembic(self, *args: str) -> subprocess.CompletedProcess[str]:
+        # Never build the child environment here: run_alembic pins every
+        # database URL variable to this test engine.
+        return run_alembic(self.engine, *args)
 
     def setUp(self) -> None:
         assert self.class_engine is not None

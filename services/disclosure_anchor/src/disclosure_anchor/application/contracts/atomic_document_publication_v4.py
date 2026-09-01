@@ -61,6 +61,7 @@ UPSTREAM_PUBLICATION_EVIDENCE_V4_CONTRACT = "publication-upstream-evidence.v4"
 PRE_ID_UNIT_PUBLICATION_V4_CONTRACT = "pre-id-unit-publication.v4"
 PREVIOUS_ACTIVE_UNIT_V4_CONTRACT = "previous-active-unit.v4"
 _MAX_BYTES = 8 * 1024 * 1024
+_MAX_INT = (1 << 63) - 1
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _ASSET_ID = re.compile(r"du_[0-9A-HJKMNP-TV-Z]{26}\Z")
 _QUERY_PROJECTION_REQUIRED_FIELDS = frozenset(
@@ -177,7 +178,7 @@ class UpstreamPublicationEvidenceV4:
             (self.evidence_sha256, "upstream evidence"),
         ):
             _sha(value, label)
-        _nonnegative(
+        _publication_lifecycle_version(
             self.local_materialized_lifecycle_version,
             "local checkpoint lifecycle version",
         )
@@ -264,7 +265,10 @@ class PublicationAttemptIdentityV4:
             raise WholeDocumentPublicationV4Error(
                 "publication requires local_materialized attempt state"
             )
-        _nonnegative(self.expected_lifecycle_version, "expected lifecycle version")
+        _publication_lifecycle_version(
+            self.expected_lifecycle_version,
+            "expected lifecycle version",
+        )
         _sha(self.expected_checkpoint_sha256, "expected checkpoint")
         _sha(
             self.expected_local_materialization_receipt_sha256,
@@ -1423,6 +1427,13 @@ def _positive(value: int, label: str) -> None:
 def _nonnegative(value: int, label: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise WholeDocumentPublicationV4Error(f"{label} must be non-negative")
+
+
+def _publication_lifecycle_version(value: int, label: str) -> None:
+    if type(value) is not int or not 0 <= value < _MAX_INT:
+        raise WholeDocumentPublicationV4Error(
+            f"{label} cannot admit an exact signed-BIGINT successor"
+        )
 
 
 def _relative_path(value: str, label: str) -> None:

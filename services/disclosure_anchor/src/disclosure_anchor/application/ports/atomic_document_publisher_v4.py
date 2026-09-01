@@ -10,6 +10,7 @@ import re
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness
 from disclosure_anchor.domain.services.unit_hashing import query_projection
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
 ATOMIC_PUBLICATION_WINNER_V4_CONTRACT = "atomic-publication-winner.v4"
 _MAX_BYTES = 8 * 1024 * 1024
+_MAX_INT = (1 << 63) - 1
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _ASSET_ID = re.compile(r"du_[0-9A-HJKMNP-TV-Z]{26}\Z")
 
@@ -213,7 +215,15 @@ class AtomicPublicationWinnerV4:
             (self.processing_run_row_sha256, "processing run row"),
         ):
             _sha(value, label)
-        _nonnegative(self.lifecycle_version_before, "lifecycle version before")
+        _publication_lifecycle_version(
+            self.lifecycle_version_before,
+            "lifecycle version before",
+        )
+        if (
+            type(self.lifecycle_version_after) is not int
+            or not 1 <= self.lifecycle_version_after <= _MAX_INT
+        ):
+            raise ValueError("lifecycle version after is outside signed BIGINT")
         if self.lifecycle_version_after != self.lifecycle_version_before + 1:
             raise ValueError("winner lifecycle version did not advance exactly")
         if self.previous_active_run_id is not None:
@@ -290,12 +300,44 @@ class AtomicWholeDocumentPublisherV4Port(Protocol):
     """
 
     def commit_whole_document(
-        self, request: AtomicPublicationRequestV4
+        self,
+        request: AtomicPublicationRequestV4,
+        *,
+        claim: V4ClaimWitness,
     ) -> AtomicPublicationWinnerV4: ...
 
     def reload_commit_winner(
         self, *, processing_run_id: str, attempt_id: str
     ) -> AtomicPublicationWinnerV4 | None: ...
+
+
+def validate_atomic_publication_claim_v4(
+    *,
+    request: AtomicPublicationRequestV4,
+    claim: V4ClaimWitness,
+) -> None:
+    """Validate the supplied operational claim before its transactional CAS.
+
+    The claim is deliberately absent from canonical request/winner bytes.  A
+    PostgreSQL implementation must additionally compare its owner, generation,
+    and live lease with the locked mutable head in the publication transaction.
+    """
+
+    if type(claim) is not V4ClaimWitness:
+        raise ValueError("publication requires an exact v4 claim witness")
+    identity = request.identity
+    _publication_lifecycle_version(
+        identity.expected_lifecycle_version,
+        "publication lifecycle version",
+    )
+    if (
+        claim.attempt_id != identity.attempt_id
+        or claim.fence_identity != identity.fence_identity
+        or claim.state != identity.expected_attempt_state
+        or claim.lifecycle_version != identity.expected_lifecycle_version
+        or claim.checkpoint_sha256 != identity.expected_checkpoint_sha256
+    ):
+        raise ValueError("publication claim drifted from its request")
 
 
 def seal_atomic_publication_winner_v4(
@@ -1299,6 +1341,11 @@ def _nonnegative(value: int, label: str) -> None:
         raise ValueError(f"{label} must be non-negative")
 
 
+def _publication_lifecycle_version(value: int, label: str) -> None:
+    if type(value) is not int or not 0 <= value < _MAX_INT:
+        raise ValueError(f"{label} cannot admit an exact signed-BIGINT successor")
+
+
 def _utc(value: datetime, label: str) -> None:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError(f"{label} must be timezone aware")
@@ -1330,4 +1377,5 @@ __all__ = [
     "published_outbox_event_row_sha256_v4",
     "published_outbox_events_sha256_v4",
     "validate_atomic_publication_winner_v4",
+    "validate_atomic_publication_claim_v4",
 ]

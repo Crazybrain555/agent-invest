@@ -125,6 +125,60 @@ _EVIDENCE_FIELDS = (
     "cleanup_receipt_sha256",
     "ack_receipt_sha256",
 )
+_OUTCOME_EVIDENCE_FIELDS = (
+    "publication_winner_sha256",
+    "failure_receipt_sha256",
+    "supersession_receipt_sha256",
+)
+_ALLOWED_NEW_EVIDENCE_BY_TRANSITION = {
+    ("prepared", "reconciling"): frozenset({"submission_intent_sha256"}),
+    ("reconciling", "submitted"): frozenset(
+        {"accepted_submission_sha256"}
+    ),
+    ("submitted", "remote_terminal"): frozenset(
+        {"terminal_receipt_sha256"}
+    ),
+    ("remote_terminal", "materializing"): frozenset(
+        {"materialization_intent_sha256"}
+    ),
+    ("materializing", "local_materialized"): frozenset(
+        {"local_materialization_receipt_sha256"}
+    ),
+    ("local_materialized", "publish_committed"): frozenset(
+        {"publication_winner_sha256"}
+    ),
+    **{
+        (state, "cleanup_pending"): frozenset(
+            {
+                "failure_receipt_sha256",
+                "supersession_receipt_sha256",
+                "cleanup_plan_sha256",
+            }
+        )
+        for state in (
+            "prepared",
+            "reconciling",
+            "submitted",
+            "remote_terminal",
+            "materializing",
+            "local_materialized",
+            "publish_committed",
+        )
+    },
+    ("cleanup_pending", "ack_pending"): frozenset(
+        {"cleanup_receipt_sha256"}
+    ),
+    ("cleanup_pending", "pre_submission_failed"): frozenset(
+        {"cleanup_receipt_sha256"}
+    ),
+    ("cleanup_pending", "superseded"): frozenset(
+        {"cleanup_receipt_sha256"}
+    ),
+    ("ack_pending", "acked"): frozenset({"ack_receipt_sha256"}),
+    ("ack_pending", "remote_failed"): frozenset({"ack_receipt_sha256"}),
+    ("ack_pending", "local_failed"): frozenset({"ack_receipt_sha256"}),
+    ("ack_pending", "superseded"): frozenset({"ack_receipt_sha256"}),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1178,6 +1232,13 @@ class RemoteParseCheckpointV4:
             if self.state == "superseded" and self.supersession_receipt_sha256 is None:
                 raise ValueError("resource-free supersession lacks exact evidence")
             return
+        if self.lifecycle_version > 0 and self.state in {
+            "prepared",
+            "preparation_failed",
+        }:
+            raise ValueError(
+                "prepared and preparation_failed are lifecycle-zero states"
+            )
         if self.lifecycle_version == 0:
             if self.state != "prepared" or self.previous_checkpoint_sha256 is not None:
                 raise ValueError("only prepared may start a resourceful lifecycle")
@@ -1250,16 +1311,30 @@ class RemoteParseCheckpointV4:
                 )
         if self.state == "ack_pending" and self.accepted_submission_sha256 is None:
             raise ValueError("ack_pending requires accepted provider-task evidence")
+        if self.state in {"cleanup_pending", "ack_pending"} and sum(
+            getattr(self, field_name) is not None
+            for field_name in _OUTCOME_EVIDENCE_FIELDS
+        ) != 1:
+            raise ValueError(
+                f"{self.state} checkpoint requires exactly one outcome evidence"
+            )
         if self.state in _FINAL_STATES and self.held_resource_credit != ResourceCreditVector():
             raise ValueError("final checkpoint retains resource credit")
-        if self.state == "pre_submission_failed" and self.accepted_submission_sha256 is not None:
-            raise ValueError("pre-submission failure cannot have accepted-task evidence")
+        if self.state == "pre_submission_failed" and (
+            self.accepted_submission_sha256 is not None
+            or self.ack_receipt_sha256 is not None
+        ):
+            raise ValueError(
+                "pre-submission failure cannot have accepted-task or ACK evidence"
+            )
         if (
             self.state == "superseded"
-            and self.accepted_submission_sha256 is not None
-            and self.ack_receipt_sha256 is None
+            and (self.accepted_submission_sha256 is None)
+            != (self.ack_receipt_sha256 is None)
         ):
-            raise ValueError("resourceful accepted supersession lacks ACK evidence")
+            raise ValueError(
+                "resourceful supersession accepted-task and ACK evidence disagree"
+            )
 
     @property
     def canonical_bytes(self) -> bytes:
@@ -1973,8 +2048,6 @@ def advance_remote_parse_checkpoint_v4(
     unknown = set(evidence_updates) - set(_EVIDENCE_FIELDS)
     if unknown:
         raise ValueError("checkpoint-v4 evidence update is unsupported")
-    if state == "cleanup_pending" and held_resource_credit != previous.held_resource_credit:
-        raise ValueError("cleanup-pending credit must equal its source checkpoint")
     values = {name: getattr(previous, name) for name in _EVIDENCE_FIELDS}
     for name, value in evidence_updates.items():
         old = values[name]
@@ -2080,6 +2153,21 @@ def validate_remote_parse_checkpoint_successor_v4(
         new = getattr(current, name)
         if old is not None and old != new:
             raise ValueError("checkpoint-v4 immutable evidence drifted")
+    allowed_new = _ALLOWED_NEW_EVIDENCE_BY_TRANSITION[
+        (previous.state, current.state)
+    ]
+    introduced = {
+        name
+        for name in _EVIDENCE_FIELDS
+        if getattr(previous, name) is None and getattr(current, name) is not None
+    }
+    if not introduced <= allowed_new:
+        raise ValueError("checkpoint-v4 transition introduced unexpected evidence")
+    if (
+        current.state == "cleanup_pending"
+        and current.held_resource_credit != previous.held_resource_credit
+    ):
+        raise ValueError("cleanup-pending credit must equal its source checkpoint")
 
 
 def _validate_checkpoint_credit_shape_v4(
@@ -2097,10 +2185,10 @@ def _validate_checkpoint_credit_shape_v4(
             or credit.ack_items != 1
         ):
             raise ValueError("ack-pending resource credit shape drifted")
-        if (
-            checkpoint.terminal_receipt_sha256 is not None
-            and credit.provider_result_bytes < 1
-        ):
+        if checkpoint.terminal_receipt_sha256 is None:
+            if credit.provider_result_bytes != 0:
+                raise ValueError("ack-pending invented provider result credit")
+        elif credit.provider_result_bytes < 1:
             raise ValueError("ack-pending lost terminal provider result credit")
         local_names = (
             "snapshot_items",

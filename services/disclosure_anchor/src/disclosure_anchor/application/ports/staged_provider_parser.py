@@ -59,6 +59,9 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
+_MAX_INT = (1 << 63) - 1
+
+
 class SubmissionAcceptanceAmbiguous(ParserOutputContractError):
     """Remote POST began but its acceptance cannot yet be reconciled."""
 
@@ -914,9 +917,15 @@ class V4ClaimWitness:
         ):
             if type(value) is not str or not value:
                 raise ValueError(f"v4 {label} identity is invalid")
-        if type(self.lifecycle_version) is not int or self.lifecycle_version < 0:
+        if (
+            type(self.lifecycle_version) is not int
+            or not 0 <= self.lifecycle_version <= _MAX_INT
+        ):
             raise ValueError("v4 lifecycle version is invalid")
-        if type(self.claim_generation) is not int or self.claim_generation < 1:
+        if (
+            type(self.claim_generation) is not int
+            or not 1 <= self.claim_generation <= _MAX_INT
+        ):
             raise ValueError("v4 claim generation is invalid")
         _require_exact_sha256_v4(self.checkpoint_sha256, "v4 checkpoint")
 

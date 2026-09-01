@@ -243,6 +243,25 @@ at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果
 
 ## 6. 契约变更记录（append-only）
 
+2026-09-01（0057 私有 remote parse v4 authority）——不改变 public view/API/change feed：
+
+```text
+disclosure_ops.remote_parse_attempt 以 checkpoint_contract_version=4 复用既有 shared head、document-current
+唯一性与 document advisory-lock root；row_version 等于当前 immutable V4 checkpoint lifecycle_version，
+claim/reclaim/renew 只改变 claim generation/owner/lease，不产生第二套 head 或 lifecycle token。
+remote_parse_v4_evidence/checkpoint/secret 与 atomic_publication_winner_v4 均为私有 append-only authority；
+checkpoint 通过命名 state/evidence CHECK 与 deferred predecessor trigger 同时限制每个状态的 evidence frontier、
+每条 transition 可新增的 evidence、outcome marker、cleanup/ACK 顺序和 immutable evidence 保留。
+checkpoint 私有 source byte/page 投影随 predecessor 冻结；命名 credit-shape CHECK 与 cleanup predecessor
+等值 trigger 共同禁止非终态凭空增加、提前释放或伪造 held credit，final state 必须归零。
+V4 provider secret 仅保存 AEAD envelope/revision；final secret purge 必须携带 exact attempt/fence/final
+checkpoint version+hash/current revision，函数只授予 disclosure_app，PUBLIC/reader/L2 无执行或表权限。
+processing_run semantic receipt locator 保留 absent、V1 hash-only，以及带 relpath+contract version+hash 的
+V2/V3 三种合法形状；任何 partial locator、非 canonical hash 或 document/Unit 不闭合继续 fail closed。
+0057 只建立私有 durable authority；typed evidence bytes 的 strict reload、repository/UOW CAS、transaction-P
+whole-PDF publication 和 coordinator activation 属后续默认关闭里程碑，不能从本 migration 的存在推断上线。
+```
+
 2026-08-30（0054 私有 publish evidence ledger）——不改变 public view/API/change feed：
 
 ```text

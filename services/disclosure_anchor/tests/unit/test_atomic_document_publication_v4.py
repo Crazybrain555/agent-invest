@@ -82,7 +82,9 @@ from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     seal_published_outbox_commit_reference_v4,
     seal_published_outbox_event_v4,
     validate_atomic_publication_winner_v4,
+    validate_atomic_publication_claim_v4,
 )
+from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness
 from tests.unit._semantic_routes import _fallback_receipt
 from tests.unit.test_remote_parse_lifecycle_v4 import _happy_path
 
@@ -95,6 +97,81 @@ SHA_E = "sha256:" + "e" * 64
 
 
 class AtomicDocumentPublicationV4Tests(unittest.TestCase):
+    def test_publication_claim_is_noncanonical_and_binds_the_cas_identity(self) -> None:
+        request = _request()
+        claim = V4ClaimWitness(
+            attempt_id=request.identity.attempt_id,
+            fence_identity=request.identity.fence_identity,
+            state=request.identity.expected_attempt_state,
+            lifecycle_version=request.identity.expected_lifecycle_version,
+            checkpoint_sha256=request.identity.expected_checkpoint_sha256,
+            claim_owner_identity="worker-1",
+            claim_generation=7,
+        )
+        validate_atomic_publication_claim_v4(request=request, claim=claim)
+        winner = _winner(request)
+        self.assertNotIn(b"claim_owner", request.canonical_bytes)
+        self.assertNotIn(b"claim_generation", request.canonical_bytes)
+        self.assertNotIn(b"claim_owner", winner.canonical_bytes)
+        self.assertNotIn(b"claim_generation", winner.canonical_bytes)
+        for field_name, value in (
+            ("attempt_id", "attempt-other"),
+            ("fence_identity", "fence-other"),
+            ("state", "publish_committed"),
+            ("lifecycle_version", claim.lifecycle_version + 1),
+            ("checkpoint_sha256", SHA_E),
+        ):
+            with (
+                self.subTest(field_name=field_name),
+                self.assertRaisesRegex(ValueError, "drifted"),
+            ):
+                validate_atomic_publication_claim_v4(
+                    request=request,
+                    claim=replace(claim, **{field_name: value}),
+                )
+
+    def test_publication_lifecycle_versions_fit_exact_bigint_successor(self) -> None:
+        request = _request()
+        max_int = (1 << 63) - 1
+        self.assertEqual(
+            replace(
+                request.identity,
+                expected_lifecycle_version=max_int - 1,
+            ).expected_lifecycle_version,
+            max_int - 1,
+        )
+        with self.assertRaisesRegex(
+            WholeDocumentPublicationV4Error,
+            "successor",
+        ):
+            replace(
+                request.identity,
+                expected_lifecycle_version=max_int,
+            )
+        with self.assertRaisesRegex(
+            WholeDocumentPublicationV4Error,
+            "successor",
+        ):
+            replace(
+                request.upstream_evidence,
+                local_materialized_lifecycle_version=max_int,
+            )
+        winner = _winner(request)
+        self.assertEqual(
+            replace(
+                winner,
+                lifecycle_version_before=max_int - 1,
+                lifecycle_version_after=max_int,
+            ).lifecycle_version_after,
+            max_int,
+        )
+        with self.assertRaisesRegex(ValueError, "successor"):
+            replace(
+                winner,
+                lifecycle_version_before=max_int,
+                lifecycle_version_after=max_int + 1,
+            )
+
     def test_pre_id_request_seals_and_round_trips_without_asset_ids(self) -> None:
         request = _request()
         self.assertEqual(decode_atomic_publication_request_v4(request.canonical_bytes), request)

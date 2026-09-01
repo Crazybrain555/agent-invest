@@ -5,13 +5,30 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
+import traceback
 import unittest
 from unittest import mock
 
+from sqlalchemy.engine import make_url
+
+from disclosure_anchor.settings import load_settings
 from tests.integration import _support
 from tests.integration._runner import (
     ScratchIntegrationDatabase,
     _run_unittest_child,
+)
+
+SCRATCH_NAME = "invest_engine_scratch_1785000035_456_deadbeef"
+SCRATCH_MARKER = f"{_support.TEST_DATABASE_COMMENT_PREFIX}1785000035:{SCRATCH_NAME}"
+SIBLING_SCRATCH_NAME = "invest_engine_scratch_1785000035_457_feedface"
+# Placeholder credentials only; the tests prove they never reach an error.
+SCRATCH_URL = (
+    "postgresql+psycopg://disclosure_owner:owner-secret@localhost:55432/"
+    f"{SCRATCH_NAME}"
+)
+RUNTIME_URL = (
+    "postgresql+psycopg://disclosure_app:app-secret@localhost:55432/invest_engine"
 )
 
 
@@ -128,6 +145,332 @@ class IntegrationDatabaseSafetyTests(unittest.TestCase):
         ):
             self.assertIs(_support.engine_or_skip(), engine)
         engine.dispose.assert_not_called()
+
+    def test_conflicting_destination_in_any_database_variable_is_rejected(
+        self,
+    ) -> None:
+        # Direct unittest invocation: the engine would follow the test URL
+        # while Alembic/settings follow an inherited sibling. Every mixed
+        # shape must stop before an engine or a subprocess exists.
+        conflicts = {
+            "database": SCRATCH_URL.replace(SCRATCH_NAME, SIBLING_SCRATCH_NAME),
+            "host": SCRATCH_URL.replace("@localhost:", "@db.example.internal:"),
+            "port": SCRATCH_URL.replace(":55432/", ":5432/"),
+            "runtime": RUNTIME_URL,
+        }
+        for variable in _support.DATABASE_ENV_KEYS:
+            if variable == _support.TEST_DATABASE_ENV_KEY:
+                continue
+            for dimension, conflicting_url in conflicts.items():
+                with self.subTest(variable=variable, dimension=dimension):
+                    with (
+                        mock.patch.dict(
+                            os.environ,
+                            {
+                                _support.TEST_DATABASE_ENV_KEY: SCRATCH_URL,
+                                variable: conflicting_url,
+                            },
+                            clear=True,
+                        ),
+                        mock.patch.object(
+                            _support, "create_db_engine"
+                        ) as create_engine,
+                        mock.patch.object(_support.subprocess, "run") as run,
+                    ):
+                        with self.assertRaises(RuntimeError) as caught:
+                            _support.engine_or_skip()
+                    message = str(caught.exception)
+                    self.assertIn(variable, message)
+                    self.assertIn(_support.TEST_DATABASE_ENV_KEY, message)
+                    self.assertNotIn("owner-secret", message)
+                    self.assertNotIn("app-secret", message)
+                    create_engine.assert_not_called()
+                    run.assert_not_called()
+
+    def test_unparsable_destination_is_rejected_without_exposing_credentials(
+        self,
+    ) -> None:
+        broken_urls = {
+            # SQLAlchemy echoes the whole string in its own parse error.
+            "missing_scheme": "disclosure_owner:owner-secret@localhost:55432/db",
+            "non_numeric_port": (
+                "postgresql+psycopg://disclosure_owner:owner-secret@localhost:port/db"
+            ),
+            "missing_database": (
+                "postgresql+psycopg://disclosure_owner:owner-secret@localhost:55432"
+            ),
+        }
+        for variable in (_support.TEST_DATABASE_ENV_KEY, "DATABASE_URL"):
+            for shape, broken_url in broken_urls.items():
+                with self.subTest(variable=variable, shape=shape):
+                    environment = {_support.TEST_DATABASE_ENV_KEY: SCRATCH_URL}
+                    environment[variable] = broken_url
+                    with (
+                        mock.patch.dict(os.environ, environment, clear=True),
+                        mock.patch.object(
+                            _support, "create_db_engine"
+                        ) as create_engine,
+                    ):
+                        with self.assertRaises(RuntimeError) as caught:
+                            _support.engine_or_skip()
+                    rendered = "".join(traceback.format_exception(caught.exception))
+                    self.assertIn(variable, str(caught.exception))
+                    self.assertNotIn("owner-secret", rendered)
+                    self.assertNotIn(broken_url, rendered)
+                    create_engine.assert_not_called()
+
+    def test_case_ambiguous_database_variable_is_rejected_before_connect(
+        self,
+    ) -> None:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    _support.TEST_DATABASE_ENV_KEY: SCRATCH_URL,
+                    "disclosure_migration_database_url": RUNTIME_URL,
+                },
+                clear=True,
+            ),
+            mock.patch.object(_support, "create_db_engine") as create_engine,
+            mock.patch.object(_support.subprocess, "run") as run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "noncanonical") as caught:
+                _support.engine_or_skip()
+        self.assertNotIn("app-secret", str(caught.exception))
+        create_engine.assert_not_called()
+        run.assert_not_called()
+
+    def test_distinct_connection_identity_to_the_same_destination_is_rejected(
+        self,
+    ) -> None:
+        environments = {
+            "different_logins_drivers_and_options": {
+                _support.TEST_DATABASE_ENV_KEY: SCRATCH_URL,
+                "DISCLOSURE_MIGRATION_DATABASE_URL": (
+                    "postgresql://migration_login:migration-secret@localhost:55432/"
+                    f"{SCRATCH_NAME}?application_name=alembic"
+                ),
+                "DATABASE_URL": (
+                    "postgresql+psycopg2://disclosure_app:app-secret@localhost:55432/"
+                    f"{SCRATCH_NAME}"
+                ),
+                "DISCLOSURE_ADMIN_DATABASE_URL": (
+                    "postgresql+psycopg://disclosure_admin@localhost:55432/"
+                    f"{SCRATCH_NAME}?sslmode=disable"
+                ),
+                "DISCLOSURE_READER_DATABASE_URL": (
+                    "postgresql+psycopg://disclosure_reader:reader-secret@/"
+                    f"{SCRATCH_NAME}?host=localhost&port=55432"
+                ),
+            },
+            "implicit_default_port": {
+                _support.TEST_DATABASE_ENV_KEY: (
+                    "postgresql://disclosure_owner:owner-secret@localhost/"
+                    f"{SCRATCH_NAME}"
+                ),
+                "DISCLOSURE_MIGRATION_DATABASE_URL": (
+                    "postgresql+psycopg://migration_login@localhost:5432/"
+                    f"{SCRATCH_NAME}"
+                ),
+            },
+        }
+        for shape, environment in environments.items():
+            with self.subTest(shape=shape):
+                engine = self._engine_with_identity(SCRATCH_NAME, SCRATCH_MARKER)
+                with (
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    mock.patch.object(
+                        _support, "create_db_engine", return_value=engine
+                    ) as create_engine,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "does not exactly match",
+                    ) as caught:
+                        _support.engine_or_skip()
+                rendered = "".join(traceback.format_exception(caught.exception))
+                for secret in (
+                    "owner-secret",
+                    "migration-secret",
+                    "app-secret",
+                    "reader-secret",
+                ):
+                    self.assertNotIn(secret, rendered)
+                create_engine.assert_not_called()
+                engine.dispose.assert_not_called()
+
+    def test_alembic_environment_pins_every_database_variable_to_the_engine(
+        self,
+    ) -> None:
+        inherited = {
+            _support.TEST_DATABASE_ENV_KEY: SCRATCH_URL.replace(
+                "disclosure_owner:owner-secret", "tester:tester-secret"
+            ),
+            "DISCLOSURE_MIGRATION_DATABASE_URL": SCRATCH_URL.replace(
+                SCRATCH_NAME, SIBLING_SCRATCH_NAME
+            ),
+            "DATABASE_URL": RUNTIME_URL,
+            "DISCLOSURE_ADMIN_DATABASE_URL": RUNTIME_URL.replace(
+                "disclosure_app:app-secret", "disclosure_admin:admin-secret"
+            ),
+            "DISCLOSURE_READER_DATABASE_URL": RUNTIME_URL.replace(
+                "disclosure_app:app-secret", "disclosure_reader:reader-secret"
+            ),
+            "PYTHONPATH": "/elsewhere/src",
+            "DISCLOSURE_DATA_ROOT": "/scratch/data",
+            "disclosure_migration_database_url": RUNTIME_URL,
+        }
+        engine = mock.MagicMock()
+        engine.url = make_url(SCRATCH_URL)
+        with mock.patch.dict(os.environ, inherited, clear=True):
+            environment = _support.alembic_subprocess_environment(engine)
+            # The parent process environment is copied, never mutated.
+            self.assertEqual(dict(os.environ), inherited)
+        for key in _support.DATABASE_ENV_KEYS:
+            self.assertEqual(environment[key], SCRATCH_URL)
+            if key in inherited:
+                self.assertNotIn(inherited[key], environment.values())
+        self.assertNotIn("disclosure_migration_database_url", environment)
+        self.assertEqual(environment["PYTHONPATH"], "src")
+        self.assertEqual(environment["DISCLOSURE_DATA_ROOT"], "/scratch/data")
+
+    def test_run_alembic_uses_the_pinned_environment_in_the_service_root(
+        self,
+    ) -> None:
+        engine = mock.MagicMock()
+        engine.url = make_url(SCRATCH_URL)
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        inherited = {
+            "DISCLOSURE_MIGRATION_DATABASE_URL": SCRATCH_URL.replace(
+                SCRATCH_NAME, SIBLING_SCRATCH_NAME
+            ),
+            "DATABASE_URL": RUNTIME_URL,
+        }
+        with (
+            mock.patch.dict(os.environ, inherited, clear=True),
+            mock.patch.object(
+                _support.subprocess, "run", return_value=completed
+            ) as run,
+        ):
+            result = _support.run_alembic(
+                engine, "downgrade", "0056_staged_credit_evidence"
+            )
+        self.assertIs(result, completed)
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args,
+            (
+                [
+                    sys.executable,
+                    "-m",
+                    "alembic",
+                    "downgrade",
+                    "0056_staged_credit_evidence",
+                ],
+            ),
+        )
+        options = run.call_args.kwargs
+        self.assertEqual(options["cwd"], _support.SERVICE_ROOT)
+        self.assertTrue(options["capture_output"])
+        self.assertTrue(options["text"])
+        self.assertFalse(options["check"])
+        for key in _support.DATABASE_ENV_KEYS:
+            self.assertEqual(options["env"][key], SCRATCH_URL)
+        for value in inherited.values():
+            self.assertNotIn(value, options["env"].values())
+
+    def test_runner_environment_pins_exactly_the_shared_keys_and_is_accepted(
+        self,
+    ) -> None:
+        # The runner and _support must agree on the variable set: a key pinned
+        # by only one side would reopen the mixed-destination window.
+        scratch = ScratchIntegrationDatabase(
+            "postgresql+psycopg://disclosure_owner:owner-secret@localhost:55432/"
+            "postgres"
+        )
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": RUNTIME_URL,
+                    "DISCLOSURE_MIGRATION_DATABASE_URL": RUNTIME_URL.replace(
+                        "disclosure_app:app-secret", "disclosure_owner:owner-secret"
+                    ),
+                },
+                clear=True,
+            ):
+                environment = scratch._test_environment()
+        finally:
+            scratch.close()
+        pinned = {
+            key
+            for key, value in environment.items()
+            if value == scratch.database_url
+        }
+        self.assertEqual(pinned, set(_support.DATABASE_ENV_KEYS))
+
+        created_epoch = _support.test_database_created_epoch(scratch.database_name)
+        engine = self._engine_with_identity(
+            scratch.database_name,
+            f"{_support.TEST_DATABASE_COMMENT_PREFIX}{created_epoch}:"
+            f"{scratch.database_name}",
+        )
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(
+                _support, "create_db_engine", return_value=engine
+            ) as create_engine,
+        ):
+            self.assertIs(_support.engine_or_skip(), engine)
+        create_engine.assert_called_once_with(scratch.database_url)
+
+    def test_runner_removes_case_collisions_before_settings_resolution(
+        self,
+    ) -> None:
+        scratch = ScratchIntegrationDatabase(
+            "postgresql+psycopg://disclosure_owner:owner-secret@localhost:55432/"
+            "postgres"
+        )
+        try:
+            orderings = (
+                (
+                    ("DISCLOSURE_MIGRATION_DATABASE_URL", RUNTIME_URL),
+                    ("disclosure_migration_database_url", RUNTIME_URL),
+                ),
+                (
+                    ("disclosure_migration_database_url", RUNTIME_URL),
+                    ("DISCLOSURE_MIGRATION_DATABASE_URL", RUNTIME_URL),
+                ),
+            )
+            for inherited_items in orderings:
+                with self.subTest(inherited_items=inherited_items):
+                    inherited = dict(inherited_items)
+                    with mock.patch.dict(os.environ, inherited, clear=True):
+                        environment = scratch._test_environment()
+                    variants = {
+                        key
+                        for key in environment
+                        if key.upper() in _support.DATABASE_ENV_KEYS
+                    }
+                    self.assertEqual(
+                        variants,
+                        set(_support.DATABASE_ENV_KEYS),
+                    )
+                    self.assertNotIn(
+                        "disclosure_migration_database_url",
+                        environment,
+                    )
+                    with mock.patch.dict(os.environ, environment, clear=True):
+                        settings = load_settings()
+                    assert settings.disclosure_migration_database_url is not None
+                    self.assertEqual(
+                        settings.disclosure_migration_database_url.get_secret_value(),
+                        scratch.database_url,
+                    )
+        finally:
+            scratch.close()
 
     def test_runner_sanitizes_mineru_environment_unless_opted_in(self) -> None:
         inherited = {

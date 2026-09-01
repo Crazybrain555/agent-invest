@@ -66,6 +66,10 @@
    ],
    "tests": 28
   },
+  "tests/integration/test_remote_parse_v4_authority.py": {
+   "private_imports": [],
+   "tests": 26
+  },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
    "tests": 4
@@ -100,7 +104,7 @@
   },
   "tests/unit/test_atomic_document_publication_v4.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 13
   },
   "tests/unit/test_attest_mineru_remote_runtime.py": {
    "private_imports": [],
@@ -286,7 +290,7 @@
   },
   "tests/unit/test_integration_db_safety.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 16
   },
   "tests/unit/test_local_materialization_manifest_v4.py": {
    "private_imports": [],
@@ -294,7 +298,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 24
+   "tests": 27
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
@@ -440,7 +444,7 @@
   },
   "tests/unit/test_remote_parse_lifecycle_v4.py": {
    "private_imports": [],
-   "tests": 24
+   "tests": 31
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],

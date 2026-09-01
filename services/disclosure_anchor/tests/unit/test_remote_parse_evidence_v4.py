@@ -946,28 +946,8 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             ack_pending_checkpoint=ack_pending,
         )
 
-        (
-            forged_checkpoint,
-            forged_reservation,
-            forged_values,
-            forged_cleanup_source,
-            forged_cleanup_pending,
-            forged_ack_pending,
-            forged_history,
-        ) = _typed_remote_failure_bundle(provider_result_bytes=999)
-        with self.assertRaisesRegex(ValueError, "provider ACK evidence"):
-            validate_remote_parse_evidence_bundle_v4(
-                checkpoint=forged_checkpoint,
-                evidence=tuple(
-                    encode_remote_parse_evidence_v4(value)
-                    for value in forged_values
-                ),
-                reservation=forged_reservation,
-                cleanup_source_checkpoint=forged_cleanup_source,
-                resourceful_checkpoint_history=forged_history,
-                cleanup_pending_checkpoint=forged_cleanup_pending,
-                ack_pending_checkpoint=forged_ack_pending,
-            )
+        with self.assertRaisesRegex(ValueError, "invented provider result"):
+            _typed_remote_failure_bundle(provider_result_bytes=999)
 
     def test_cleanup_pending_replays_source_credit(self) -> None:
         (
