@@ -530,7 +530,7 @@ _REMOTE_PARSE_STATE_SHAPE = (
 )
 _REMOTE_PARSE_LIFECYCLE_SHAPE = (
     "(checkpoint_contract_version IN (1,2,3) AND ((state IN ('prepared','reconciling','submitted','remote_terminal','materializing','local_materialized','finish_committed','remote_failure_committed','local_failure_committed') AND is_current) OR (state IN ('acked','remote_failed','local_failed','pre_submission_failed','superseded') AND NOT is_current))) OR "
-    f"(checkpoint_contract_version=4 AND ((state IN ({_sql_values(_V4_CURRENT_STATES)}) AND is_current) OR (state IN ({_sql_values(_V4_FINAL_STATES)}) AND NOT is_current)))"
+    f"(checkpoint_contract_version=4 AND ((state IN ({_sql_values(_V4_CURRENT_STATES)}) AND is_current) OR (state IN ({_sql_values(_V4_FINAL_STATES)}) AND NOT is_current) OR (state='prepared' AND NOT is_current)))"
 )
 _REMOTE_PARSE_INITIAL_SHAPE = (
     f"({_LEGACY_REMOTE_PARSE_INITIAL_SHAPE}) OR "
@@ -542,8 +542,9 @@ _REMOTE_PARSE_SUBMITTED_SHAPE = (
 )
 _REMOTE_PARSE_CLAIM_SHAPE = (
     f"({_LEGACY_REMOTE_PARSE_CLAIM_SHAPE}) OR "
-    f"(checkpoint_contract_version=4 AND state IN ({_sql_values(_V4_CURRENT_STATES)}) AND ((state='prepared' AND claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (claim_generation BETWEEN 1 AND {_MAX_SIGNED_BIGINT} AND claim_owner_identity IS NOT NULL AND btrim(claim_owner_identity)<>'' AND claim_lease_until IS NOT NULL))) OR "
-    f"(checkpoint_contract_version=4 AND state IN ({_sql_values(_V4_FINAL_STATES)}) AND (((row_version=0 AND state IN ('preparation_failed','superseded')) AND claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (row_version>0 AND claim_generation BETWEEN 1 AND {_MAX_SIGNED_BIGINT} AND claim_owner_identity IS NULL AND claim_lease_until IS NULL)))"
+    f"(checkpoint_contract_version=4 AND is_current AND state IN ({_sql_values(_V4_CURRENT_STATES)}) AND ((state='prepared' AND claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (claim_generation BETWEEN 1 AND {_MAX_SIGNED_BIGINT} AND claim_owner_identity IS NOT NULL AND btrim(claim_owner_identity)<>'' AND claim_lease_until IS NOT NULL))) OR "
+    "(checkpoint_contract_version=4 AND NOT is_current AND state='prepared' AND row_version=0 AND claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR "
+    f"(checkpoint_contract_version=4 AND NOT is_current AND state IN ({_sql_values(_V4_FINAL_STATES)}) AND (((row_version=0 AND state IN ('preparation_failed','superseded')) AND claim_generation=0 AND claim_owner_identity IS NULL AND claim_lease_until IS NULL) OR (row_version>0 AND claim_generation BETWEEN 1 AND {_MAX_SIGNED_BIGINT} AND claim_owner_identity IS NULL AND claim_lease_until IS NULL)))"
 )
 _REMOTE_PARSE_LOCAL_RECEIPT_SHAPE = (
     f"({_LEGACY_REMOTE_PARSE_LOCAL_RECEIPT}) OR "
@@ -668,6 +669,14 @@ class RemoteParseAttempt(Base):
             postgresql_where=text("is_current"),
         ),
         Index(
+            "uq_remote_parse_v4_staged_document",
+            "document_id",
+            unique=True,
+            postgresql_where=text(
+                "checkpoint_contract_version=4 AND state='prepared' AND NOT is_current"
+            ),
+        ),
+        Index(
             "ix_remote_parse_attempt_recovery",
             "state",
             "updated_at",
@@ -773,6 +782,12 @@ class RemoteParseV4Evidence(Base):
             "attempt_id",
             "evidence_sha256",
             name="uq_remote_parse_v4_evidence_hash",
+        ),
+        UniqueConstraint(
+            "attempt_id",
+            "evidence_kind",
+            "evidence_sha256",
+            name="uq_remote_parse_v4_evidence_kind_hash",
         ),
         ForeignKeyConstraint(
             ["attempt_id", "fence_identity"],
@@ -1029,6 +1044,117 @@ class RemoteParseV4Checkpoint(Base):
     publication_winner_sha256: Mapped[Optional[str]] = mapped_column(
         String(71),
         nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class RemoteParseV4SupersessionLink(Base):
+    __tablename__ = "remote_parse_v4_supersession_link"
+    __table_args__ = (
+        UniqueConstraint(
+            "superseding_attempt_id",
+            name="uq_remote_parse_v4_supersession_link_target",
+        ),
+        ForeignKeyConstraint(
+            ["source_attempt_id", "source_fence_identity"],
+            [
+                f"{OPS_SCHEMA}.remote_parse_attempt.attempt_id",
+                f"{OPS_SCHEMA}.remote_parse_attempt.fence_identity",
+            ],
+            name="fk_remote_parse_v4_supersession_link_source",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            [
+                "source_attempt_id",
+                "source_evidence_kind",
+                "source_supersession_receipt_sha256",
+            ],
+            [
+                f"{OPS_SCHEMA}.remote_parse_v4_evidence.attempt_id",
+                f"{OPS_SCHEMA}.remote_parse_v4_evidence.evidence_kind",
+                f"{OPS_SCHEMA}.remote_parse_v4_evidence.evidence_sha256",
+            ],
+            name="fk_remote_parse_v4_supersession_link_receipt",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            ["superseding_attempt_id", "superseding_fence_identity"],
+            [
+                f"{OPS_SCHEMA}.remote_parse_attempt.attempt_id",
+                f"{OPS_SCHEMA}.remote_parse_attempt.fence_identity",
+            ],
+            name="fk_remote_parse_v4_supersession_link_target",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            [
+                "superseding_attempt_id",
+                "superseding_lifecycle_version",
+                "superseding_checkpoint_sha256",
+            ],
+            [
+                f"{OPS_SCHEMA}.remote_parse_v4_checkpoint.attempt_id",
+                f"{OPS_SCHEMA}.remote_parse_v4_checkpoint.lifecycle_version",
+                f"{OPS_SCHEMA}.remote_parse_v4_checkpoint.checkpoint_sha256",
+            ],
+            name="fk_remote_parse_v4_supersession_link_checkpoint",
+            onupdate="RESTRICT",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        CheckConstraint(
+            "source_attempt_id<>superseding_attempt_id",
+            name="ck_remote_parse_v4_supersession_link_distinct",
+        ),
+        CheckConstraint(
+            "source_evidence_kind='supersession_receipt' AND "
+            "superseding_lifecycle_version=0 AND "
+            "source_supersession_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND "
+            "superseding_checkpoint_sha256 ~ '^sha256:[0-9a-f]{64}$'",
+            name="ck_remote_parse_v4_supersession_link_identity",
+        ),
+        {"schema": OPS_SCHEMA},
+    )
+
+    source_attempt_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+        nullable=False,
+    )
+    source_fence_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_evidence_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_supersession_receipt_sha256: Mapped[str] = mapped_column(
+        String(71),
+        nullable=False,
+    )
+    superseding_attempt_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    superseding_fence_identity: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    superseding_lifecycle_version: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+    )
+    superseding_checkpoint_sha256: Mapped[str] = mapped_column(
+        String(71),
+        nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

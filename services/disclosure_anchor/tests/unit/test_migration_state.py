@@ -49,7 +49,7 @@ class MigrationStateTests(unittest.TestCase):
         self.assertEqual(migration.revision, "0054_publish_evidence_ledger")
         self.assertEqual(migration.down_revision, "0053_remote_parse_checkpoint")
 
-    def test_0057_is_adjacent_to_0056_and_is_the_only_head(self) -> None:
+    def test_0057_is_adjacent_to_0056(self) -> None:
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
             "0057_remote_parse_v4_authority"
@@ -60,7 +60,103 @@ class MigrationStateTests(unittest.TestCase):
             migration.down_revision,
             "0056_staged_credit_evidence",
         )
+
+    def test_0058_is_adjacent_to_0057_and_is_the_only_head(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0058_v4_supersession_stage"
+        )
+
+        self.assertEqual(migration.revision, "0058_v4_supersession_stage")
+        self.assertEqual(
+            migration.down_revision,
+            "0057_remote_parse_v4_authority",
+        )
         self.assertEqual(migration_heads(), (migration.revision,))
+
+    def test_0058_attempt_shapes_match_orm_exactly(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0058_v4_supersession_stage"
+        )
+        models = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.models"
+        )
+
+        lifecycle_shape = migration._remote_parse_lifecycle_shape(
+            allow_staged=True
+        )
+        claim_shape = migration._remote_parse_claim_shape(allow_staged=True)
+        self.assertEqual(lifecycle_shape, models._REMOTE_PARSE_LIFECYCLE_SHAPE)
+        self.assertEqual(claim_shape, models._REMOTE_PARSE_CLAIM_SHAPE)
+
+        constraints = {
+            item.name: str(item.sqltext)
+            for item in models.RemoteParseAttempt.__table__.constraints
+            if isinstance(item, CheckConstraint)
+        }
+        self.assertEqual(
+            constraints["ck_remote_parse_attempt_lifecycle_shape"],
+            lifecycle_shape,
+        )
+        self.assertEqual(
+            constraints["ck_remote_parse_attempt_claim_shape"],
+            claim_shape,
+        )
+        staged_index = next(
+            item
+            for item in models.RemoteParseAttempt.__table__.indexes
+            if item.name == "uq_remote_parse_v4_staged_document"
+        )
+        self.assertTrue(staged_index.unique)
+        self.assertEqual(
+            str(staged_index.dialect_options["postgresql"]["where"]),
+            "checkpoint_contract_version=4 AND state='prepared' AND NOT is_current",
+        )
+
+        evidence_constraints = {
+            item.name
+            for item in models.RemoteParseV4Evidence.__table__.constraints
+        }
+        self.assertIn(
+            "uq_remote_parse_v4_evidence_kind_hash",
+            evidence_constraints,
+        )
+        link_constraints = {
+            item.name
+            for item in models.RemoteParseV4SupersessionLink.__table__.constraints
+        }
+        self.assertLessEqual(
+            {
+                "uq_remote_parse_v4_supersession_link_target",
+                "fk_remote_parse_v4_supersession_link_source",
+                "fk_remote_parse_v4_supersession_link_receipt",
+                "fk_remote_parse_v4_supersession_link_target",
+                "fk_remote_parse_v4_supersession_link_checkpoint",
+                "ck_remote_parse_v4_supersession_link_identity",
+            },
+            link_constraints,
+        )
+
+    def test_0058_upgrade_guard_runs_before_any_schema_change(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0058_v4_supersession_stage"
+        )
+        connection = MagicMock()
+        connection.execute.return_value.scalar_one.return_value = True
+        with (
+            patch.object(migration.op, "get_bind", return_value=connection),
+            patch.object(migration, "_replace_attempt_constraints") as replace,
+            patch.object(migration, "_create_link_table") as create_link,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "preexisting unlinked v4 supersession authority",
+            ),
+        ):
+            migration.upgrade()
+        replace.assert_not_called()
+        create_link.assert_not_called()
 
     def test_0057_checkpoint_state_evidence_matches_orm_exactly(self) -> None:
         migration = importlib.import_module(

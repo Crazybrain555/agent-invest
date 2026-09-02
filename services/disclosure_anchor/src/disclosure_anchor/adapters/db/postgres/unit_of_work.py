@@ -8,13 +8,13 @@ rolls back, so use cases must commit deliberately.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Self
+
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
-from disclosure_anchor.application.ports import repositories as ports_repos
-from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
-from disclosure_anchor.application.worker.locks import (
-    acquire_corpus_write_session_lock,
-    release_corpus_write_session_lock,
+
+from disclosure_anchor.adapters.db.postgres.remote_parse_v4_repository import (
+    RemoteParseV4Repository as PostgresRemoteParseV4Repository,
 )
 from disclosure_anchor.adapters.db.postgres.repositories import (
     CompanyIdentifierRepository,
@@ -29,6 +29,15 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
     SourceAccessRepository,
     SourceCheckpointRepository,
     TrackedCompanyRepository,
+)
+from disclosure_anchor.application.ports import repositories as ports_repos
+from disclosure_anchor.application.ports.remote_parse_v4_repository import (
+    RemoteParseV4Repository as RemoteParseV4RepositoryPort,
+)
+from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.worker.locks import (
+    acquire_corpus_write_session_lock,
+    release_corpus_write_session_lock,
 )
 
 
@@ -47,6 +56,7 @@ class SqlAlchemyUnitOfWork:
     documents: ports_repos.DocumentRepository
     processing_runs: ports_repos.ProcessingRunRepository
     remote_parse_attempts: ports_repos.RemoteParseAttemptRepository
+    remote_parse_v4: RemoteParseV4RepositoryPort
     document_units: ports_repos.DocumentUnitRepository
     outbox: ports_repos.OutboxRepository
     publish_evidence: ports_repos.PublishEvidenceRepository
@@ -62,7 +72,7 @@ class SqlAlchemyUnitOfWork:
         self._corpus_write_lock_held = False
 
     # -- context management -------------------------------------------------
-    def __enter__(self) -> "SqlAlchemyUnitOfWork":
+    def __enter__(self) -> Self:
         # Session-level advisory locks belong to the physical PostgreSQL
         # connection, not to SQLAlchemy's Session. Binding the Session to an
         # explicitly checked-out Connection keeps that same backend pinned
@@ -129,6 +139,7 @@ class SqlAlchemyUnitOfWork:
         self.documents = DocumentRepository(session)
         self.processing_runs = ProcessingRunRepository(session)
         self.remote_parse_attempts = RemoteParseAttemptRepository(session)
+        self.remote_parse_v4 = PostgresRemoteParseV4Repository(session)
         self.document_units = DocumentUnitRepository(session)
         self.outbox = OutboxRepository(session)
         self.publish_evidence = PublishEvidenceRepository(session)

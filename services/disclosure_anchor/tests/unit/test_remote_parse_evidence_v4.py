@@ -28,6 +28,7 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     build_preparation_intent_v4,
     decode_remote_parse_evidence_v4,
     encode_remote_parse_evidence_v4,
+    validate_durable_remote_parse_evidence_bundle_v4,
     validate_remote_parse_evidence_bundle_v4,
     validate_superseding_checkpoint_seed_evidence_v4,
 )
@@ -253,20 +254,24 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             supersession_receipt_sha256=receipt.sha256,
         )
         encoded = (encode_remote_parse_evidence_v4(receipt),)
-        validate_remote_parse_evidence_bundle_v4(
+        validate_durable_remote_parse_evidence_bundle_v4(
             checkpoint=checkpoint,
             evidence=encoded,
-            reservation=reservation,
+            reservation=None,
             superseding_checkpoint=superseding_checkpoint,
             superseding_reservation=superseding_reservation,
             superseding_preparation_intent=superseding_preparation,
             superseding_snapshot_receipt=superseding_snapshot,
         )
-        with self.assertRaisesRegex(ValueError, "lacks exact reservation"):
-            validate_remote_parse_evidence_bundle_v4(
+        with self.assertRaisesRegex(ValueError, "invented a source reservation"):
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=checkpoint,
                 evidence=encoded,
-                reservation=None,  # type: ignore[arg-type]
+                reservation=reservation,
+                superseding_checkpoint=superseding_checkpoint,
+                superseding_reservation=superseding_reservation,
+                superseding_preparation_intent=superseding_preparation,
+                superseding_snapshot_receipt=superseding_snapshot,
             )
 
         drifted = replace(receipt, source_checkpoint_sha256=SHA_A)
@@ -275,10 +280,10 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             supersession_receipt_sha256=drifted.sha256,
         )
         with self.assertRaisesRegex(ValueError, "resource-free supersession"):
-            validate_remote_parse_evidence_bundle_v4(
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=drifted_checkpoint,
                 evidence=(encode_remote_parse_evidence_v4(drifted),),
-                reservation=reservation,
+                reservation=None,
                 superseding_checkpoint=superseding_checkpoint,
                 superseding_reservation=superseding_reservation,
                 superseding_preparation_intent=superseding_preparation,
@@ -289,13 +294,13 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             ValueError,
             "resource-free supersession source state",
         ):
-            validate_remote_parse_evidence_bundle_v4(
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=replace(
                     checkpoint,
                     supersession_receipt_sha256=forged_state.sha256,
                 ),
                 evidence=(encode_remote_parse_evidence_v4(forged_state),),
-                reservation=reservation,
+                reservation=None,
                 superseding_checkpoint=superseding_checkpoint,
                 superseding_reservation=superseding_reservation,
                 superseding_preparation_intent=superseding_preparation,
@@ -308,10 +313,10 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "crossed the document chain"):
             replace(receipt, superseding_document_id="other-document")
         with self.assertRaisesRegex(ValueError, "drifted or reused"):
-            validate_remote_parse_evidence_bundle_v4(
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=checkpoint,
                 evidence=encoded,
-                reservation=reservation,
+                reservation=None,
                 superseding_checkpoint=replace(
                     superseding_checkpoint,
                     attempt_id="attempt-3",
@@ -331,13 +336,13 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             superseding_checkpoint_sha256=fake_generation.sha256,
         )
         with self.assertRaisesRegex(ValueError, "checkpoint immutable facts"):
-            validate_remote_parse_evidence_bundle_v4(
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=replace(
                     checkpoint,
                     supersession_receipt_sha256=fake_generation_receipt.sha256,
                 ),
                 evidence=(encode_remote_parse_evidence_v4(fake_generation_receipt),),
-                reservation=reservation,
+                reservation=None,
                 superseding_checkpoint=fake_generation,
                 superseding_reservation=superseding_reservation,
                 superseding_preparation_intent=superseding_preparation,
@@ -345,10 +350,10 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             )
         source_preparation, source_snapshot = _records()[:2]
         with self.assertRaisesRegex(ValueError, "checkpoint immutable facts"):
-            validate_remote_parse_evidence_bundle_v4(
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=checkpoint,
                 evidence=encoded,
-                reservation=reservation,
+                reservation=None,
                 superseding_checkpoint=superseding_checkpoint,
                 superseding_reservation=reservation,
                 superseding_preparation_intent=source_preparation,
@@ -383,16 +388,106 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
                 preparation_intent=superseding_preparation,
                 snapshot_receipt=superseding_snapshot,
             )
-        with self.assertRaisesRegex(ValueError, "resource-free lifecycle"):
-            validate_remote_parse_evidence_bundle_v4(
+        for extra in (
+            {"resourceful_checkpoint_history": (superseding_checkpoint,)},
+            {"cleanup_source_checkpoint": superseding_checkpoint},
+        ):
+            with (
+                self.subTest(extra=tuple(extra)),
+                self.assertRaisesRegex(ValueError, "resource-free lifecycle"),
+            ):
+                validate_durable_remote_parse_evidence_bundle_v4(
+                    checkpoint=checkpoint,
+                    evidence=encoded,
+                    reservation=None,
+                    superseding_checkpoint=superseding_checkpoint,
+                    superseding_reservation=superseding_reservation,
+                    superseding_preparation_intent=superseding_preparation,
+                    superseding_snapshot_receipt=superseding_snapshot,
+                    **extra,
+                )
+
+    def test_resource_free_preparation_failure_has_no_source_reservation(
+        self,
+    ) -> None:
+        reservation = _base()["reservation"]
+        failure = FailureReceiptV4(
+            **{
+                **_failure_values(),
+                "outcome": "preparation_failure",
+                "source_state": "not_prepared",
+                "source_lifecycle_version": 0,
+                "source_checkpoint_sha256": None,
+                "submission_was_attempted": False,
+            }
+        )
+        checkpoint = build_resource_free_remote_parse_checkpoint_v4(
+            state="preparation_failed",
+            attempt_id="attempt-1",
+            attempt_generation=1,
+            fence_identity="fence-1",
+            document_id="doc-1",
+            processing_run_id="run-1",
+            source_pdf_sha256=SHA_A,
+            source_byte_count=100,
+            source_page_count=2,
+            request_sha256=reservation.request_sha256,
+            runtime_epoch_sha256=reservation.runtime_epoch_sha256,
+            process_profile_sha256=reservation.process_profile_sha256,
+            credit_policy_sha256=reservation.credit_policy_sha256,
+            reservation_input_sha256=reservation.reservation_input_sha256,
+            failure_receipt_sha256=failure.sha256,
+        )
+        evidence = (encode_remote_parse_evidence_v4(failure),)
+        validate_durable_remote_parse_evidence_bundle_v4(
+            checkpoint=checkpoint,
+            evidence=evidence,
+            reservation=None,
+        )
+        with self.assertRaisesRegex(ValueError, "invented a source reservation"):
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=checkpoint,
-                evidence=encoded,
+                evidence=evidence,
                 reservation=reservation,
-                resourceful_checkpoint_history=(superseding_checkpoint,),
-                superseding_checkpoint=superseding_checkpoint,
-                superseding_reservation=superseding_reservation,
-                superseding_preparation_intent=superseding_preparation,
-                superseding_snapshot_receipt=superseding_snapshot,
+            )
+
+    def test_durable_validator_omits_filesystem_proof_without_weakening_full(
+        self,
+    ) -> None:
+        (
+            checkpoint,
+            reservation,
+            values,
+            cleanup_source,
+            _manifest,
+            _provider_envelope,
+            cleanup_pending,
+            ack_pending,
+            history,
+        ) = _typed_happy_bundle()
+        evidence = tuple(
+            encode_remote_parse_evidence_v4(value) for value in values
+        )
+        common = {
+            "checkpoint": checkpoint,
+            "evidence": evidence,
+            "reservation": reservation,
+            "cleanup_source_checkpoint": cleanup_source,
+            "resourceful_checkpoint_history": history,
+            "cleanup_pending_checkpoint": cleanup_pending,
+            "ack_pending_checkpoint": ack_pending,
+        }
+        validate_durable_remote_parse_evidence_bundle_v4(**common)
+        with self.assertRaisesRegex(ValueError, "exact manifest or envelope"):
+            validate_remote_parse_evidence_bundle_v4(**common)
+
+        prepared = history[0]
+        with self.assertRaisesRegex(ValueError, "lacks exact reservation"):
+            validate_durable_remote_parse_evidence_bundle_v4(
+                checkpoint=prepared,
+                evidence=evidence[:2],
+                reservation=None,
+                resourceful_checkpoint_history=(prepared,),
             )
 
     def test_checkpoint_rejects_future_evidence(self) -> None:
@@ -449,7 +544,7 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             resourceful_checkpoint_history=(checkpoint,),
         )
         with self.assertRaisesRegex(ValueError, "lacks exact checkpoint history"):
-            validate_remote_parse_evidence_bundle_v4(
+            validate_durable_remote_parse_evidence_bundle_v4(
                 checkpoint=checkpoint,
                 evidence=encoded,
                 reservation=reservation,
@@ -1358,6 +1453,19 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
             superseding_preparation_intent=superseding_preparation,
             superseding_snapshot_receipt=superseding_snapshot,
         )
+        with self.assertRaisesRegex(ValueError, "lacks exact reservation"):
+            validate_durable_remote_parse_evidence_bundle_v4(
+                checkpoint=checkpoint,
+                evidence=encoded,
+                reservation=None,
+                cleanup_source_checkpoint=cleanup_source,
+                resourceful_checkpoint_history=history,
+                cleanup_pending_checkpoint=cleanup_pending,
+                superseding_checkpoint=superseding_checkpoint,
+                superseding_reservation=superseding_reservation,
+                superseding_preparation_intent=superseding_preparation,
+                superseding_snapshot_receipt=superseding_snapshot,
+            )
         with self.assertRaisesRegex(ValueError, "lacks its exact superseding"):
             validate_remote_parse_evidence_bundle_v4(
                 checkpoint=checkpoint,

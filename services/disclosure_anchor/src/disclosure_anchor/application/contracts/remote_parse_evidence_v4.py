@@ -980,11 +980,12 @@ def _validate_resourceful_checkpoint_history_v4(
         raise ValueError("resourceful checkpoint history drifted from exact replay")
 
 
-def validate_remote_parse_evidence_bundle_v4(
+def _validate_remote_parse_evidence_bundle_v4(
     *,
     checkpoint: RemoteParseCheckpointV4,
     evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
-    reservation: ResourceReservationV4,
+    reservation: ResourceReservationV4 | None,
+    require_filesystem_evidence: bool,
     cleanup_source_checkpoint: RemoteParseCheckpointV4 | None = None,
     resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...] | None = None,
     cleanup_pending_checkpoint: RemoteParseCheckpointV4 | None = None,
@@ -996,7 +997,7 @@ def validate_remote_parse_evidence_bundle_v4(
     local_materialization_manifest: LocalMaterializationManifestV4 | None = None,
     provider_envelope: ProviderDocumentEnvelope | None = None,
 ) -> None:
-    """Replay one typed evidence frontier without claiming database authority.
+    """Shared replay engine for durable-only and filesystem-complete proofs.
 
     A root-replayed resourceful history closes every ordinary current
     checkpoint and, after cleanup begins, the exact cleanup source plus the
@@ -1008,17 +1009,30 @@ def validate_remote_parse_evidence_bundle_v4(
 
     if type(checkpoint) is not RemoteParseCheckpointV4 or type(evidence) is not tuple:
         raise ValueError("remote-parse v4 evidence bundle type is invalid")
-    if type(reservation) is not ResourceReservationV4:
-        raise ValueError("remote-parse v4 evidence bundle lacks exact reservation")
-    try:
-        validate_resource_reservation_checkpoint_binding_v4(
-            reservation=reservation,
-            checkpoint=checkpoint,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "remote-parse v4 evidence bundle reservation drifted from checkpoint"
-        ) from exc
+    is_resource_free_root = (
+        checkpoint.lifecycle_version == 0
+        and checkpoint.state in {"preparation_failed", "superseded"}
+    )
+    if is_resource_free_root:
+        if reservation is not None:
+            raise ValueError(
+                "resource-free v4 evidence bundle invented a source reservation"
+            )
+    else:
+        if type(reservation) is not ResourceReservationV4:
+            raise ValueError(
+                "remote-parse v4 evidence bundle lacks exact reservation"
+            )
+        try:
+            validate_resource_reservation_checkpoint_binding_v4(
+                reservation=reservation,
+                checkpoint=checkpoint,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "remote-parse v4 evidence bundle reservation drifted from checkpoint"
+            ) from exc
+    source_reservation = cast(ResourceReservationV4, reservation)
     by_kind: dict[EvidenceKindV4, EncodedRemoteParseEvidenceV4] = {}
     for item in evidence:
         if type(item) is not EncodedRemoteParseEvidenceV4:
@@ -1146,9 +1160,7 @@ def validate_remote_parse_evidence_bundle_v4(
             or preparation.process_profile_sha256 != checkpoint.process_profile_sha256
         ):
             raise ValueError("preparation evidence drifted from checkpoint")
-        if (
-            preparation.reservation_sha256 != reservation.sha256
-        ):
+        if preparation.reservation_sha256 != source_reservation.sha256:
             raise ValueError("preparation evidence drifted from reservation")
     if snapshot is not None and (
             preparation_item is None
@@ -1211,7 +1223,7 @@ def validate_remote_parse_evidence_bundle_v4(
             or preparation is None
             or intent.parser_target_sha256
             != preparation.parser_target_sha256
-            or intent.reservation_sha256 != reservation.sha256
+            or intent.reservation_sha256 != source_reservation.sha256
     ):
         raise ValueError("materialization-intent evidence chain drifted")
     if local_receipt is not None:
@@ -1241,21 +1253,29 @@ def validate_remote_parse_evidence_bundle_v4(
             or local_receipt.output_byte_count > intent.output_byte_limit
         ):
             raise ValueError("local-materialization evidence chain drifted")
-        if (
-            type(local_materialization_manifest)
-            is not LocalMaterializationManifestV4
-            or type(provider_envelope) is not ProviderDocumentEnvelope
-            or intent is None
+        if require_filesystem_evidence:
+            if (
+                type(local_materialization_manifest)
+                is not LocalMaterializationManifestV4
+                or type(provider_envelope) is not ProviderDocumentEnvelope
+                or intent is None
+            ):
+                raise ValueError(
+                    "local-materialization evidence lacks exact manifest or envelope"
+                )
+            validate_materialized_provider_evidence_v4(
+                intent=intent,
+                receipt=local_receipt,
+                manifest=local_materialization_manifest,
+                provider_envelope=provider_envelope,
+            )
+        elif (
+            local_materialization_manifest is not None
+            or provider_envelope is not None
         ):
             raise ValueError(
-                "local-materialization evidence lacks exact manifest or envelope"
+                "durable-only v4 validation cannot accept filesystem evidence"
             )
-        validate_materialized_provider_evidence_v4(
-            intent=intent,
-            receipt=local_receipt,
-            manifest=local_materialization_manifest,
-            provider_envelope=provider_envelope,
-        )
     elif local_materialization_manifest is not None or provider_envelope is not None:
         raise ValueError("materialization bytes supplied without a local receipt")
 
@@ -1362,13 +1382,15 @@ def validate_remote_parse_evidence_bundle_v4(
     ):
         raise ValueError("superseding seed evidence supplied without supersession")
 
-    is_resource_free_root = (
-        checkpoint.lifecycle_version == 0
-        and checkpoint.state in {"preparation_failed", "superseded"}
-    )
     if is_resource_free_root:
-        if resourceful_checkpoint_history is not None:
-            raise ValueError("resource-free lifecycle cannot carry resourceful history")
+        if (
+            resourceful_checkpoint_history is not None
+            or cleanup_source_checkpoint is not None
+        ):
+            raise ValueError(
+                "resource-free lifecycle cannot carry resourceful history "
+                "or a cleanup source checkpoint"
+            )
     else:
         history_target = checkpoint
         if cleanup_plan is not None:
@@ -1383,7 +1405,7 @@ def validate_remote_parse_evidence_bundle_v4(
             raise ValueError("resourceful history lacks exact preparation evidence")
         _validate_resourceful_checkpoint_history_v4(
             history=resourceful_checkpoint_history,
-            reservation=reservation,
+            reservation=source_reservation,
             target_checkpoint=history_target,
             preparation_intent=preparation,
             snapshot_receipt=snapshot,
@@ -1399,7 +1421,7 @@ def validate_remote_parse_evidence_bundle_v4(
         assert type(cleanup_source_checkpoint) is RemoteParseCheckpointV4
         validate_local_cleanup_plan_v4(
             plan=cleanup_plan,
-            reservation=reservation,
+            reservation=source_reservation,
             source_checkpoint=cleanup_source_checkpoint,
             materialization_intent=intent,
             local_receipt=local_receipt,
@@ -1489,7 +1511,7 @@ def validate_remote_parse_evidence_bundle_v4(
         ):
             raise ValueError("cleanup-receipt evidence chain drifted")
         validate_resource_reservation_checkpoint_binding_v4(
-            reservation=reservation,
+            reservation=source_reservation,
             checkpoint=cleanup_pending_checkpoint,
         )
         expected_cleanup_pending = advance_remote_parse_checkpoint_v4(
@@ -1555,7 +1577,7 @@ def validate_remote_parse_evidence_bundle_v4(
         ):
             raise ValueError("provider ACK lacks its accepted cleanup chain")
         validate_resource_reservation_checkpoint_binding_v4(
-            reservation=reservation,
+            reservation=source_reservation,
             checkpoint=ack_pending_checkpoint,
         )
         expected_ack_pending_credit = _expected_held_resource_credit_v4(
@@ -1666,6 +1688,79 @@ def validate_remote_parse_evidence_bundle_v4(
         and ack_item is None
     ):
         raise ValueError("accepted supersession lacks provider ACK")
+
+
+def validate_durable_remote_parse_evidence_bundle_v4(
+    *,
+    checkpoint: RemoteParseCheckpointV4,
+    evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+    reservation: ResourceReservationV4 | None,
+    cleanup_source_checkpoint: RemoteParseCheckpointV4 | None = None,
+    resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...] | None = None,
+    cleanup_pending_checkpoint: RemoteParseCheckpointV4 | None = None,
+    ack_pending_checkpoint: RemoteParseCheckpointV4 | None = None,
+    superseding_checkpoint: RemoteParseCheckpointV4 | None = None,
+    superseding_reservation: ResourceReservationV4 | None = None,
+    superseding_preparation_intent: PreparationIntentV4 | None = None,
+    superseding_snapshot_receipt: SnapshotReceiptV4 | None = None,
+) -> None:
+    """Replay only facts that can be loaded from durable V4 database rows.
+
+    This deliberately omits filesystem manifests and provider envelopes.  It
+    cannot authorize a filesystem side effect; those call sites must use the
+    full validator while holding the applicable resource lock.
+    """
+
+    _validate_remote_parse_evidence_bundle_v4(
+        checkpoint=checkpoint,
+        evidence=evidence,
+        reservation=reservation,
+        require_filesystem_evidence=False,
+        cleanup_source_checkpoint=cleanup_source_checkpoint,
+        resourceful_checkpoint_history=resourceful_checkpoint_history,
+        cleanup_pending_checkpoint=cleanup_pending_checkpoint,
+        ack_pending_checkpoint=ack_pending_checkpoint,
+        superseding_checkpoint=superseding_checkpoint,
+        superseding_reservation=superseding_reservation,
+        superseding_preparation_intent=superseding_preparation_intent,
+        superseding_snapshot_receipt=superseding_snapshot_receipt,
+    )
+
+
+def validate_remote_parse_evidence_bundle_v4(
+    *,
+    checkpoint: RemoteParseCheckpointV4,
+    evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+    reservation: ResourceReservationV4 | None,
+    cleanup_source_checkpoint: RemoteParseCheckpointV4 | None = None,
+    resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...] | None = None,
+    cleanup_pending_checkpoint: RemoteParseCheckpointV4 | None = None,
+    ack_pending_checkpoint: RemoteParseCheckpointV4 | None = None,
+    superseding_checkpoint: RemoteParseCheckpointV4 | None = None,
+    superseding_reservation: ResourceReservationV4 | None = None,
+    superseding_preparation_intent: PreparationIntentV4 | None = None,
+    superseding_snapshot_receipt: SnapshotReceiptV4 | None = None,
+    local_materialization_manifest: LocalMaterializationManifestV4 | None = None,
+    provider_envelope: ProviderDocumentEnvelope | None = None,
+) -> None:
+    """Replay the durable V4 DAG plus exact filesystem evidence when cited."""
+
+    _validate_remote_parse_evidence_bundle_v4(
+        checkpoint=checkpoint,
+        evidence=evidence,
+        reservation=reservation,
+        require_filesystem_evidence=True,
+        cleanup_source_checkpoint=cleanup_source_checkpoint,
+        resourceful_checkpoint_history=resourceful_checkpoint_history,
+        cleanup_pending_checkpoint=cleanup_pending_checkpoint,
+        ack_pending_checkpoint=ack_pending_checkpoint,
+        superseding_checkpoint=superseding_checkpoint,
+        superseding_reservation=superseding_reservation,
+        superseding_preparation_intent=superseding_preparation_intent,
+        superseding_snapshot_receipt=superseding_snapshot_receipt,
+        local_materialization_manifest=local_materialization_manifest,
+        provider_envelope=provider_envelope,
+    )
 
 
 def _decode_dataclass(exact_bytes: bytes, item_type: type[Any]) -> Any:
@@ -1810,6 +1905,7 @@ __all__ = [
     "build_preparation_intent_v4",
     "decode_remote_parse_evidence_v4",
     "encode_remote_parse_evidence_v4",
+    "validate_durable_remote_parse_evidence_bundle_v4",
     "validate_remote_parse_evidence_bundle_v4",
     "validate_superseding_checkpoint_seed_evidence_v4",
 ]

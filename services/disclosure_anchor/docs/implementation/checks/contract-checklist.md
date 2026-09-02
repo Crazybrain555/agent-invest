@@ -262,6 +262,32 @@ V2/V3 三种合法形状；任何 partial locator、非 canonical hash 或 docum
 whole-PDF publication 和 coordinator activation 属后续默认关闭里程碑，不能从本 migration 的存在推断上线。
 ```
 
+2026-09-02（0058 私有 V4 supersession staging authority）——不改变 public view/API/change feed：
+
+```text
+追加 remote_parse_v4_supersession_link 与非 current prepared H0 的严格暂存形状，不改写 0057；
+source supersession receipt、source current/final head、target H0 checkpoint 形成一对一不可变闭包；
+resourceful supersession 在 source cleanup/ACK 期间只暂存 target，source final superseded 后才原子转移 currentness；
+resource-free supersession 在一个事务中直接建立 final source、current target 与同一 link；
+0058 仍只建立私有 durable authority，不代表 repository/UOW、coordinator 或 live migration 已启用。
+```
+
+2026-09-02（M3 私有 V4 repository/UOW exact-CAS）——不改变 public view/API/change feed：
+
+```text
+strict load 必须逐行重建完整 checkpoint/evidence/reservation/winner/secret/link authority；持久化漂移
+映射为 typed authority violation，连接、deadlock、serialization 等基础设施 DBAPI 错误不得伪装成数据损坏；
+create/replay 在既有 DOC_NS + stable_document_hash(document_id) 事务锁下执行，generation 连续且
+同 document 只有一个 current；legacy current 以 typed projection 原样返回并阻止新的 V4 current；
+claim/reclaim/renew 在锁行后读取数据库时钟，same-owner response-loss 重试不增 generation，ABA 由
+claim_generation + exact head witness 封闭；successor append 只接受 exact CAS，final secret purge、winner、
+staged superseder 与 currentness transfer 均和 head 更新同事务，repository 不自行 commit；
+同一 outer UOW 若组合 row-locking claim/renew/reload/rewrap 与 successor append，调用方必须先取得独占
+DOC_NS 文档事务锁；禁止先持有 head row lock 再等待 DOC_NS，M4 transaction-P 也必须遵循 DOC_NS→head；
+UOW 绑定同一 Session，只有显式 commit 才持久化，未 commit、异常和 outer rollback 均保持全有或全无；
+V3 create 的共享文档锁/typed cross-version race 闭合是 M4 transaction-P 的显式前置，不能由 M3 推断完成。
+```
+
 2026-08-30（0054 私有 publish evidence ledger）——不改变 public view/API/change feed：
 
 ```text

@@ -68,7 +68,11 @@
   },
   "tests/integration/test_remote_parse_v4_authority.py": {
    "private_imports": [],
-   "tests": 26
+   "tests": 34
+  },
+  "tests/integration/test_remote_parse_v4_repository.py": {
+   "private_imports": [],
+   "tests": 38
   },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
@@ -298,7 +302,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 30
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
@@ -440,7 +444,7 @@
   },
   "tests/unit/test_remote_parse_evidence_v4.py": {
    "private_imports": [],
-   "tests": 25
+   "tests": 27
   },
   "tests/unit/test_remote_parse_lifecycle_v4.py": {
    "private_imports": [],

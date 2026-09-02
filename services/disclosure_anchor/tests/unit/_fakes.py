@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import Generic, TypeVar
+from typing import Generic, Protocol, Self, TypeVar, cast
 
+from disclosure_anchor.application.ports.remote_parse_v4_repository import (
+    RemoteParseV4Repository,
+)
 from disclosure_anchor.domain import entities as e
 
-
 T = TypeVar("T")
+
+class _ProcessingRunEvidence(Protocol):
+    processing_run_id: str
 
 
 class _Repo(Generic[T]):
@@ -284,7 +289,7 @@ class PublishEvidenceRepo:
         self.bases: dict[str, object] = {}
 
     def add_base(self, evidence: object) -> object:
-        run_id = str(getattr(evidence, "processing_run_id"))
+        run_id = str(cast(_ProcessingRunEvidence, evidence).processing_run_id)
         previous = self.bases.get(run_id)
         if previous is not None and previous != evidence:
             raise ValueError("publish evidence conflict")
@@ -300,6 +305,13 @@ class RemoteParseAttemptRepo:
         return self.current_by_document.get(document_id)
 
 
+class _UnavailableRemoteParseV4Repository:
+    def __getattr__(self, name: str) -> object:
+        raise NotImplementedError(
+            f"FakeUnitOfWork.remote_parse_v4 does not implement {name}"
+        )
+
+
 class FakeUnitOfWork:
     def __init__(self) -> None:
         self.companies = CompanyRepo()
@@ -312,6 +324,10 @@ class FakeUnitOfWork:
         self.source_accesses.documents = self.documents
         self.processing_runs = ProcessingRunRepo()
         self.remote_parse_attempts = RemoteParseAttemptRepo()
+        self.remote_parse_v4 = cast(
+            RemoteParseV4Repository,
+            _UnavailableRemoteParseV4Repository(),
+        )
         self.document_units = DocumentUnitRepo()
         self.document_units.processing_runs = self.processing_runs
         self.outbox = OutboxRepo()
@@ -319,10 +335,15 @@ class FakeUnitOfWork:
         self.commit_count = 0
         self.rollback_count = 0
 
-    def __enter__(self) -> "FakeUnitOfWork":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> None:
         if exc_type is not None:
             self.rollback()
         else:

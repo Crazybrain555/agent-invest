@@ -8,10 +8,10 @@ JSON or lifecycle hashing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, replace
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+from dataclasses import dataclass, fields, replace
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -21,11 +21,6 @@ from disclosure_anchor.adapters.security.provider_secret_cipher import (
 )
 from disclosure_anchor.adapters.security.provider_secret_keyring import (
     StaticProviderSecretKeyring,
-)
-from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import (
-    ProviderSecretPlaintextV4,
-    SealedProviderSecretV4,
-    bind_provider_secret_v4,
 )
 from disclosure_anchor.application.contracts.local_materialization_manifest_v4 import (
     LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
@@ -37,6 +32,11 @@ from disclosure_anchor.application.contracts.parser_target import ParserTargetId
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     PROVIDER_DOCUMENT_FILENAME,
 )
+from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import (
+    ProviderSecretPlaintextV4,
+    SealedProviderSecretV4,
+    bind_provider_secret_v4,
+)
 from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     AcceptedSubmissionReceiptV4,
     EncodedRemoteParseEvidenceV4,
@@ -45,15 +45,16 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     PreparationIntentV4,
     SnapshotReceiptV4,
     SubmissionIntentV4,
+    SupersessionReceiptV4,
     TerminalReceiptV4,
     build_preparation_intent_v4,
     encode_remote_parse_evidence_v4,
 )
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     CleanupResourceEntryV4,
+    LocalCleanupPlanV4,
     LocalCleanupReceiptV4,
     LocalCleanupResourceResultV4,
-    LocalCleanupPlanV4,
     LocalMaterializationReceiptV4,
     LocalOutputFileV4,
     MaterializationIntentV4,
@@ -89,7 +90,6 @@ from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     seal_published_outbox_event_v4,
 )
 from disclosure_anchor.domain import ids
-
 
 HELD_CREDIT_NAMES = tuple(item.name for item in fields(ResourceCreditVector))
 EVIDENCE_FIELD_NAMES = (
@@ -234,6 +234,215 @@ class V4AuthorityFixture:
             self.success_ack_pending,
             self.acked,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class V4SupersessionStageFixture:
+    source: V4AuthorityFixture
+    attempt_id: str
+    fence_identity: str
+    client_submit_key: str
+    parser_target_sha256: str
+    request_sha256: str
+    runtime_epoch_sha256: str
+    reservation: ResourceReservationV4
+    preparation: PreparationIntentV4
+    snapshot: SnapshotReceiptV4
+    prepared: RemoteParseCheckpointV4
+    supersession: SupersessionReceiptV4
+    cleanup_plan: LocalCleanupPlanV4
+    source_cleanup_pending: RemoteParseCheckpointV4
+    cleanup_receipt: LocalCleanupReceiptV4
+    source_superseded: RemoteParseCheckpointV4
+
+    @property
+    def prepared_evidence(self) -> tuple[EvidenceValueV4, ...]:
+        return (self.preparation, self.snapshot)
+
+
+@dataclass(frozen=True, slots=True)
+class V4ResourceFreeSupersessionFixture:
+    source: V4AuthorityFixture
+    target: V4SupersessionStageFixture
+    supersession: SupersessionReceiptV4
+    source_superseded: RemoteParseCheckpointV4
+
+
+def build_v4_supersession_stage_fixture(
+    source: V4AuthorityFixture,
+    *,
+    processing_run_id: str | None = None,
+) -> V4SupersessionStageFixture:
+    attempt_id = "rpa_" + ids.new_ulid()
+    fence_identity = "fence-" + ids.new_ulid()
+    client_submit_key = "submit-" + ids.new_ulid()
+    request_sha256 = sha256_bytes((attempt_id + ":request").encode())
+    runtime_epoch_sha256 = sha256_bytes((attempt_id + ":epoch").encode())
+    target_processing_run_id = (
+        source.processing_run_id
+        if processing_run_id is None
+        else processing_run_id
+    )
+    reservation = build_resource_reservation_v4(
+        attempt_id=attempt_id,
+        attempt_generation=source.reservation.attempt_generation + 1,
+        fence_identity=fence_identity,
+        document_id=source.document_id,
+        processing_run_id=target_processing_run_id,
+        source_pdf_sha256=source.source_pdf_sha256,
+        source_byte_count=source.reservation.source_byte_count,
+        source_page_count=source.reservation.source_page_count,
+        prepared_submission_identity_sha256=sha256_bytes(
+            (attempt_id + ":prepared-submission").encode()
+        ),
+        request_sha256=request_sha256,
+        runtime_epoch_sha256=runtime_epoch_sha256,
+        process_profile_sha256=source.process_profile_sha256,
+        credit_policy_sha256=source.credit_policy_sha256,
+        reservation_bucket=source.reservation.reservation_bucket,
+        reservation_input_sha256=source.reservation.reservation_input_sha256,
+        reserved_credit=source.reservation.reserved_credit,
+    )
+    preparation = build_preparation_intent_v4(
+        reservation=reservation,
+        parser_target_sha256=source.parser_target_sha256,
+    )
+    snapshot = SnapshotReceiptV4(
+        attempt_id=attempt_id,
+        fence_identity=fence_identity,
+        preparation_intent_sha256=preparation.sha256,
+        snapshot_relpath=reservation.snapshot_relpath,
+        snapshot_sha256=source.source_pdf_sha256,
+        snapshot_byte_count=reservation.source_byte_count,
+        part_path_absent=True,
+        part_owner_path_absent=True,
+        file_fsync_completed=True,
+        parent_fsync_completed=True,
+    )
+    prepared = build_initial_remote_parse_checkpoint_v4(
+        reservation=reservation,
+        preparation_intent_sha256=preparation.sha256,
+        snapshot_receipt_sha256=snapshot.sha256,
+        held_resource_credit=ResourceCreditVector(
+            documents=1,
+            snapshot_items=1,
+            snapshot_bytes=reservation.source_byte_count,
+        ),
+    )
+    supersession = SupersessionReceiptV4(
+        attempt_id=source.attempt_id,
+        fence_identity=source.fence_identity,
+        source_document_id=source.document_id,
+        source_attempt_generation=source.reservation.attempt_generation,
+        source_state=source.reconciling.state,
+        source_lifecycle_version=source.reconciling.lifecycle_version,
+        source_checkpoint_sha256=source.reconciling.sha256,
+        superseding_attempt_id=attempt_id,
+        superseding_attempt_generation=reservation.attempt_generation,
+        superseding_document_id=source.document_id,
+        superseding_checkpoint_sha256=prepared.sha256,
+        reason_code="newer_attempt",
+    )
+    snapshot_resource = CleanupResourceEntryV4(
+        kind="snapshot",
+        relpath=source.reservation.snapshot_relpath,
+        ownership_basis_sha256=source.reservation.sha256,
+        expected_sha256=source.source_pdf_sha256,
+        expected_byte_count=source.reservation.source_byte_count,
+        action="delete",
+    )
+    cleanup_plan = build_local_cleanup_plan_v4(
+        reservation=source.reservation,
+        source_checkpoint=source.reconciling,
+        outcome="superseded",
+        supersession_receipt_sha256=supersession.sha256,
+        resources=(snapshot_resource,),
+    )
+    source_cleanup_pending = advance_remote_parse_checkpoint_v4(
+        source.reconciling,
+        state="cleanup_pending",
+        held_resource_credit=source.reconciling.held_resource_credit,
+        supersession_receipt_sha256=supersession.sha256,
+        cleanup_plan_sha256=cleanup_plan.sha256,
+    )
+    cleanup_receipt = build_local_cleanup_receipt_v4(
+        plan=cleanup_plan,
+        cleanup_pending_checkpoint=source_cleanup_pending,
+        results=(
+            LocalCleanupResourceResultV4(
+                kind="snapshot",
+                relpath=source.reservation.snapshot_relpath,
+                disposition="absent",
+            ),
+        ),
+    )
+    source_superseded = advance_remote_parse_checkpoint_v4(
+        source_cleanup_pending,
+        state="superseded",
+        held_resource_credit=ResourceCreditVector(),
+        cleanup_receipt_sha256=cleanup_receipt.sha256,
+    )
+    return V4SupersessionStageFixture(
+        source=source,
+        attempt_id=attempt_id,
+        fence_identity=fence_identity,
+        client_submit_key=client_submit_key,
+        parser_target_sha256=source.parser_target_sha256,
+        request_sha256=request_sha256,
+        runtime_epoch_sha256=runtime_epoch_sha256,
+        reservation=reservation,
+        preparation=preparation,
+        snapshot=snapshot,
+        prepared=prepared,
+        supersession=supersession,
+        cleanup_plan=cleanup_plan,
+        source_cleanup_pending=source_cleanup_pending,
+        cleanup_receipt=cleanup_receipt,
+        source_superseded=source_superseded,
+    )
+
+
+def build_v4_resource_free_supersession_fixture(
+    source: V4AuthorityFixture,
+) -> V4ResourceFreeSupersessionFixture:
+    target = build_v4_supersession_stage_fixture(source)
+    supersession = SupersessionReceiptV4(
+        attempt_id=source.attempt_id,
+        fence_identity=source.fence_identity,
+        source_document_id=source.document_id,
+        source_attempt_generation=source.reservation.attempt_generation,
+        source_state="not_prepared",
+        source_lifecycle_version=0,
+        source_checkpoint_sha256=None,
+        superseding_attempt_id=target.attempt_id,
+        superseding_attempt_generation=target.reservation.attempt_generation,
+        superseding_document_id=source.document_id,
+        superseding_checkpoint_sha256=target.prepared.sha256,
+        reason_code="newer_attempt",
+    )
+    source_superseded = build_resource_free_remote_parse_checkpoint_v4(
+        state="superseded",
+        attempt_id=source.attempt_id,
+        attempt_generation=source.reservation.attempt_generation,
+        fence_identity=source.fence_identity,
+        document_id=source.document_id,
+        processing_run_id=source.processing_run_id,
+        source_pdf_sha256=source.source_pdf_sha256,
+        source_byte_count=source.reservation.source_byte_count,
+        source_page_count=source.reservation.source_page_count,
+        request_sha256=source.request_sha256,
+        runtime_epoch_sha256=source.runtime_epoch_sha256,
+        process_profile_sha256=source.process_profile_sha256,
+        credit_policy_sha256=source.credit_policy_sha256,
+        reservation_input_sha256=source.reservation_input.sha256,
+        supersession_receipt_sha256=supersession.sha256,
+    )
+    return V4ResourceFreeSupersessionFixture(
+        source=source,
+        target=target,
+        supersession=supersession,
+        source_superseded=source_superseded,
+    )
 
 
 def build_v4_authority_fixture() -> V4AuthorityFixture:
@@ -571,7 +780,7 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
             local_materialization_receipt.sha256
         ),
     )
-    publication_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    publication_at = datetime(2026, 9, 1, tzinfo=UTC)
     unit_asset = UnitAssetWinnerV4(
         unit_index=1,
         asset_id=str(ids.new_asset_id()),
@@ -1015,6 +1224,8 @@ def insert_v4_head(
     conn: Connection,
     fixture: V4AuthorityFixture,
     checkpoint: RemoteParseCheckpointV4,
+    *,
+    parser_target_sha256_override: str | None = None,
 ) -> None:
     current = checkpoint.state not in {
         "acked",
@@ -1043,7 +1254,11 @@ def insert_v4_head(
             "document_id": fixture.document_id,
             "fence": fixture.fence_identity,
             "source_sha": fixture.source_pdf_sha256,
-            "target_sha": fixture.parser_target_sha256,
+            "target_sha": (
+                fixture.parser_target_sha256
+                if parser_target_sha256_override is None
+                else parser_target_sha256_override
+            ),
             "request_sha": fixture.request_sha256,
             "epoch_sha": fixture.runtime_epoch_sha256,
             "submit_key": fixture.client_submit_key,
@@ -1054,7 +1269,7 @@ def insert_v4_head(
             "claim_generation": 1 if claimed else 0,
             "claim_owner": "worker-test" if claimed and current else None,
             "claim_lease": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
+                datetime.now(UTC) + timedelta(hours=1)
                 if claimed and current
                 else None
             ),
@@ -1089,10 +1304,17 @@ def insert_legacy_head(conn: Connection, fixture: V4AuthorityFixture) -> None:
 
 def insert_evidence(
     conn: Connection,
-    fixture: V4AuthorityFixture,
+    fixture: V4AuthorityFixture | V4SupersessionStageFixture,
     value: EvidenceValueV4,
+    *,
+    exact_bytes_override: bytes | None = None,
 ) -> EncodedRemoteParseEvidenceV4:
     encoded = encode_remote_parse_evidence_v4(value)
+    exact_bytes = (
+        encoded.exact_bytes
+        if exact_bytes_override is None
+        else exact_bytes_override
+    )
     conn.execute(
         text(
             "INSERT INTO disclosure_ops.remote_parse_v4_evidence "
@@ -1105,8 +1327,8 @@ def insert_evidence(
             "fence": fixture.fence_identity,
             "kind": encoded.kind,
             "sha": encoded.sha256,
-            "payload": encoded.exact_bytes,
-            "byte_count": encoded.byte_count,
+            "payload": exact_bytes,
+            "byte_count": len(exact_bytes),
         },
     )
     return encoded
@@ -1114,7 +1336,7 @@ def insert_evidence(
 
 def insert_checkpoint(
     conn: Connection,
-    fixture: V4AuthorityFixture,
+    fixture: V4AuthorityFixture | V4SupersessionStageFixture,
     checkpoint: RemoteParseCheckpointV4,
     *,
     preparation_intent_override: str | None | object = ...,
@@ -1122,6 +1344,8 @@ def insert_checkpoint(
     held_credit_overrides: dict[str, int] | None = None,
     source_byte_count_override: int | None = None,
     source_page_count_override: int | None = None,
+    checkpoint_bytes_override: bytes | None = None,
+    reservation_bytes_override: bytes | None = None,
 ) -> None:
     reservation = (
         fixture.reservation
@@ -1153,16 +1377,36 @@ def insert_checkpoint(
         "lifecycle_version": checkpoint.lifecycle_version,
         "previous_checkpoint_sha256": checkpoint.previous_checkpoint_sha256,
         "checkpoint_sha256": checkpoint.sha256,
-        "checkpoint_bytes": checkpoint.canonical_bytes,
-        "checkpoint_byte_count": len(checkpoint.canonical_bytes),
+        "checkpoint_bytes": (
+            checkpoint.canonical_bytes
+            if checkpoint_bytes_override is None
+            else checkpoint_bytes_override
+        ),
+        "checkpoint_byte_count": len(
+            checkpoint.canonical_bytes
+            if checkpoint_bytes_override is None
+            else checkpoint_bytes_override
+        ),
         "resource_reservation_sha256": None
         if reservation is None
         else reservation.sha256,
-        "resource_reservation_bytes": None
-        if reservation is None
-        else reservation.canonical_bytes,
+        "resource_reservation_bytes": (
+            None
+            if reservation is None
+            else (
+                reservation.canonical_bytes
+                if reservation_bytes_override is None
+                else reservation_bytes_override
+            )
+        ),
         "resource_reservation_byte_count": (
-            None if reservation is None else len(reservation.canonical_bytes)
+            None
+            if reservation is None
+            else len(
+                reservation.canonical_bytes
+                if reservation_bytes_override is None
+                else reservation_bytes_override
+            )
         ),
         "source_byte_count": checkpoint.source_byte_count
         if source_byte_count_override is None
@@ -1276,10 +1520,126 @@ def update_v4_head(
             "checkpoint_sha": checkpoint.sha256,
             "claim_owner": "worker-test" if current else None,
             "claim_lease": (
-                datetime.now(timezone.utc) + timedelta(hours=1) if current else None
+                datetime.now(UTC) + timedelta(hours=1) if current else None
             ),
         },
     )
+
+
+def insert_v4_supersession_link(
+    conn: Connection,
+    stage: V4SupersessionStageFixture,
+    *,
+    source_evidence_kind: str = "supersession_receipt",
+    source_receipt_sha256: str | None = None,
+) -> None:
+    source = stage.source
+    conn.execute(
+        text(
+            "INSERT INTO disclosure_ops.remote_parse_v4_supersession_link "
+            "(source_attempt_id,source_fence_identity,source_evidence_kind,"
+            "source_supersession_receipt_sha256,superseding_attempt_id,"
+            "superseding_fence_identity,superseding_lifecycle_version,"
+            "superseding_checkpoint_sha256) VALUES "
+            "(:source_attempt_id,:source_fence,:source_evidence_kind,"
+            ":receipt_sha,:target_attempt_id,:target_fence,0,"
+            ":target_checkpoint_sha)"
+        ),
+        {
+            "source_attempt_id": source.attempt_id,
+            "source_fence": source.fence_identity,
+            "source_evidence_kind": source_evidence_kind,
+            "receipt_sha": source_receipt_sha256 or stage.supersession.sha256,
+            "target_attempt_id": stage.attempt_id,
+            "target_fence": stage.fence_identity,
+            "target_checkpoint_sha": stage.prepared.sha256,
+        },
+    )
+
+
+def _insert_superseding_prepared_head(
+    conn: Connection,
+    stage: V4SupersessionStageFixture,
+    *,
+    is_current: bool,
+) -> None:
+    source = stage.source
+    conn.execute(
+        text(
+            "INSERT INTO disclosure_ops.remote_parse_attempt "
+            "(attempt_id,processing_run_id,document_id,attempt_generation,"
+            "fence_identity,source_pdf_sha256,parser_target_sha256,request_sha256,"
+            "runtime_epoch_sha256,client_submit_key,checkpoint_contract_version,"
+            "state,is_current,row_version,current_checkpoint_sha256,claim_generation,"
+            "claim_owner_identity,claim_lease_until) VALUES "
+            "(:attempt_id,:run_id,:document_id,:generation,:fence,:source_sha,"
+            ":target_sha,:request_sha,:epoch_sha,:submit_key,4,'prepared',"
+            ":is_current,0,:checkpoint_sha,0,NULL,NULL)"
+        ),
+        {
+            "attempt_id": stage.attempt_id,
+            "run_id": source.processing_run_id,
+            "document_id": source.document_id,
+            "generation": stage.reservation.attempt_generation,
+            "fence": stage.fence_identity,
+            "source_sha": source.source_pdf_sha256,
+            "target_sha": stage.parser_target_sha256,
+            "request_sha": stage.request_sha256,
+            "epoch_sha": stage.runtime_epoch_sha256,
+            "submit_key": stage.client_submit_key,
+            "is_current": is_current,
+            "checkpoint_sha": stage.prepared.sha256,
+        },
+    )
+    for evidence in stage.prepared_evidence:
+        insert_evidence(conn, stage, evidence)
+    insert_checkpoint(conn, stage, stage.prepared)
+
+
+def install_v4_supersession_stage(
+    conn: Connection,
+    stage: V4SupersessionStageFixture,
+    *,
+    include_link: bool = True,
+) -> None:
+    source = stage.source
+    insert_core_rows(conn, source)
+    insert_v4_head(conn, source, source.prepared)
+    for evidence in (*source.prepared_evidence, source.submission):
+        insert_evidence(conn, source, evidence)
+    insert_checkpoint(conn, source, source.prepared)
+    insert_checkpoint(conn, source, source.reconciling)
+    update_v4_head(conn, source, source.reconciling)
+
+    insert_evidence(conn, source, stage.supersession)
+    insert_evidence(conn, source, stage.cleanup_plan)
+    insert_checkpoint(conn, source, stage.source_cleanup_pending)
+    update_v4_head(conn, source, stage.source_cleanup_pending)
+
+    _insert_superseding_prepared_head(conn, stage, is_current=False)
+    if not include_link:
+        return
+    insert_v4_supersession_link(conn, stage)
+
+
+def install_v4_resource_free_supersession(
+    conn: Connection,
+    fixture: V4ResourceFreeSupersessionFixture,
+    *,
+    include_link: bool = True,
+) -> None:
+    source = fixture.source
+    insert_core_rows(conn, source)
+    insert_v4_head(conn, source, fixture.source_superseded)
+    insert_evidence(conn, source, fixture.supersession)
+    insert_checkpoint(conn, source, fixture.source_superseded)
+    _insert_superseding_prepared_head(conn, fixture.target, is_current=True)
+    if include_link:
+        insert_v4_supersession_link(
+            conn,
+            fixture.target,
+            source_receipt_sha256=fixture.supersession.sha256,
+        )
 
 
 def install_prepared_cycle(conn: Connection, fixture: V4AuthorityFixture) -> None:
@@ -1355,8 +1715,15 @@ def install_remote_failed_without_secret(
 def insert_winner(
     conn: Connection,
     fixture: V4AuthorityFixture,
+    *,
+    winner_bytes_override: bytes | None = None,
 ) -> None:
     winner = fixture.publication_winner
+    winner_bytes = (
+        winner.canonical_bytes
+        if winner_bytes_override is None
+        else winner_bytes_override
+    )
     conn.execute(
         text(
             "INSERT INTO disclosure_ops.atomic_publication_winner_v4 "
@@ -1393,8 +1760,8 @@ def insert_winner(
             "deleted": winner.deleted_count,
             "published_at": winner.publish_precommit_at,
             "winner_sha": winner.sha256,
-            "winner_bytes": winner.canonical_bytes,
-            "winner_byte_count": len(winner.canonical_bytes),
+            "winner_bytes": winner_bytes,
+            "winner_byte_count": len(winner_bytes),
         },
     )
 
@@ -1475,22 +1842,29 @@ __all__ = [
     "EVIDENCE_FIELD_NAMES",
     "HELD_CREDIT_NAMES",
     "V4AuthorityFixture",
+    "V4ResourceFreeSupersessionFixture",
+    "V4SupersessionStageFixture",
     "append_remote_failed_tail",
     "build_v4_authority_fixture",
+    "build_v4_resource_free_supersession_fixture",
+    "build_v4_supersession_stage_fixture",
     "insert_checkpoint",
     "insert_core_rows",
     "insert_evidence",
     "insert_legacy_head",
     "insert_secret",
     "insert_v4_head",
+    "insert_v4_supersession_link",
     "insert_winner",
     "install_acked_cycle",
     "install_local_materialized_cycle",
     "install_prepared_cycle",
     "install_remote_failed_without_secret",
     "install_resource_free_failure",
-    "install_success_ack_pending_cycle",
     "install_submitted_cycle",
+    "install_success_ack_pending_cycle",
+    "install_v4_resource_free_supersession",
+    "install_v4_supersession_stage",
     "sha256_bytes",
     "update_v4_head",
 ]

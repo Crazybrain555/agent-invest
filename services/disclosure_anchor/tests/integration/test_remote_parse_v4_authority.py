@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import replace
 import importlib
 import subprocess
 import unittest
+from collections.abc import Callable
+from dataclasses import replace
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -37,38 +37,43 @@ from tests.integration._remote_parse_v4_factory import (
     V4AuthorityFixture,
     append_remote_failed_tail,
     build_v4_authority_fixture,
+    build_v4_resource_free_supersession_fixture,
+    build_v4_supersession_stage_fixture,
     insert_checkpoint,
     insert_core_rows,
     insert_evidence,
     insert_legacy_head,
     insert_secret,
     insert_v4_head,
+    insert_v4_supersession_link,
     insert_winner,
     install_acked_cycle,
     install_local_materialized_cycle,
     install_prepared_cycle,
     install_remote_failed_without_secret,
     install_resource_free_failure,
-    install_success_ack_pending_cycle,
     install_submitted_cycle,
+    install_success_ack_pending_cycle,
+    install_v4_resource_free_supersession,
+    install_v4_supersession_stage,
     sha256_bytes,
     update_v4_head,
 )
 from tests.integration._support import engine_or_skip, run_alembic
-
 
 V4_TABLES = (
     "remote_parse_v4_evidence",
     "remote_parse_v4_checkpoint",
     "remote_parse_v4_secret",
     "atomic_publication_winner_v4",
+    "remote_parse_v4_supersession_link",
 )
 PURGE_FUNCTION = (
     "disclosure_ops.purge_remote_parse_v4_secrets_final(text,text,bigint,text,bigint)"
 )
 V4_MIGRATION_MODULE = (
     "disclosure_anchor.adapters.db.postgres.migrations.versions."
-    "0057_remote_parse_v4_authority"
+    "0058_v4_supersession_stage"
 )
 
 
@@ -214,6 +219,341 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
                         {"attempt_id": fixture.attempt_id},
                     ).scalar_one(),
                     0,
+                )
+            finally:
+                transaction.rollback()
+
+    def test_linked_noncurrent_h0_stages_and_transfers_currentness_atomically(
+        self,
+    ) -> None:
+        fixture = build_v4_authority_fixture()
+        stage = build_v4_supersession_stage_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                install_v4_supersession_stage(conn, stage)
+                self._force_constraints(conn)
+                self._defer_constraints(conn)
+
+                heads = conn.execute(
+                    text(
+                        "SELECT attempt_id,state,is_current,row_version,"
+                        "claim_generation,claim_owner_identity,claim_lease_until "
+                        "FROM disclosure_ops.remote_parse_attempt "
+                        "WHERE attempt_id=ANY(:attempt_ids) ORDER BY attempt_id"
+                    ),
+                    {"attempt_ids": [fixture.attempt_id, stage.attempt_id]},
+                ).all()
+                by_attempt = {row.attempt_id: row for row in heads}
+                self.assertEqual(
+                    tuple(by_attempt[fixture.attempt_id][1:6]),
+                    (
+                        "cleanup_pending",
+                        True,
+                        stage.source_cleanup_pending.lifecycle_version,
+                        1,
+                        "worker-test",
+                    ),
+                )
+                self.assertIsNotNone(
+                    by_attempt[fixture.attempt_id].claim_lease_until
+                )
+                self.assertEqual(
+                    tuple(by_attempt[stage.attempt_id][1:]),
+                    ("prepared", False, 0, 0, None, None),
+                )
+
+                self._assert_rejected(
+                    conn,
+                    lambda: conn.execute(
+                        text(
+                            "UPDATE disclosure_ops.remote_parse_attempt SET "
+                            "is_current=true WHERE attempt_id=:attempt_id"
+                        ),
+                        {"attempt_id": stage.attempt_id},
+                    ),
+                    message="uq_remote_parse_attempt_current_document",
+                )
+
+                self._assert_rejected(
+                    conn,
+                    lambda: conn.execute(
+                        text(
+                            "UPDATE disclosure_ops.remote_parse_attempt SET "
+                            "claim_generation=1,claim_owner_identity='forged-owner',"
+                            "claim_lease_until=clock_timestamp()+interval '1 minute' "
+                            "WHERE attempt_id=:attempt_id"
+                        ),
+                        {"attempt_id": stage.attempt_id},
+                    ),
+                    message="ck_remote_parse_attempt_claim_shape",
+                )
+
+                transfer = conn.begin_nested()
+                try:
+                    insert_evidence(conn, fixture, stage.cleanup_receipt)
+                    insert_checkpoint(conn, fixture, stage.source_superseded)
+                    update_v4_head(conn, fixture, stage.source_superseded)
+                    conn.execute(
+                        text(
+                            "UPDATE disclosure_ops.remote_parse_attempt SET "
+                            "is_current=true WHERE attempt_id=:attempt_id"
+                        ),
+                        {"attempt_id": stage.attempt_id},
+                    )
+                    self._force_constraints(conn)
+                    transferred = conn.execute(
+                        text(
+                            "SELECT attempt_id,state,is_current FROM "
+                            "disclosure_ops.remote_parse_attempt WHERE "
+                            "attempt_id=ANY(:attempt_ids) ORDER BY attempt_id"
+                        ),
+                        {
+                            "attempt_ids": [
+                                fixture.attempt_id,
+                                stage.attempt_id,
+                            ]
+                        },
+                    ).all()
+                    transferred_by_attempt = {
+                        row.attempt_id: row for row in transferred
+                    }
+                    self.assertEqual(
+                        tuple(transferred_by_attempt[fixture.attempt_id][1:]),
+                        ("superseded", False),
+                    )
+                    self.assertEqual(
+                        tuple(transferred_by_attempt[stage.attempt_id][1:]),
+                        ("prepared", True),
+                    )
+                finally:
+                    transfer.rollback()
+                self._defer_constraints(conn)
+
+                rolled_back = conn.execute(
+                    text(
+                        "SELECT attempt_id,state,is_current FROM "
+                        "disclosure_ops.remote_parse_attempt WHERE "
+                        "attempt_id=ANY(:attempt_ids) ORDER BY attempt_id"
+                    ),
+                    {"attempt_ids": [fixture.attempt_id, stage.attempt_id]},
+                ).all()
+                rolled_back_by_attempt = {
+                    row.attempt_id: row for row in rolled_back
+                }
+                self.assertEqual(
+                    tuple(rolled_back_by_attempt[fixture.attempt_id][1:]),
+                    ("cleanup_pending", True),
+                )
+                self.assertEqual(
+                    tuple(rolled_back_by_attempt[stage.attempt_id][1:]),
+                    ("prepared", False),
+                )
+            finally:
+                transaction.rollback()
+
+    def test_unlinked_noncurrent_h0_is_rejected(self) -> None:
+        fixture = build_v4_authority_fixture()
+        stage = build_v4_supersession_stage_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                self._assert_rejected(
+                    conn,
+                    lambda: install_v4_supersession_stage(
+                        conn,
+                        stage,
+                        include_link=False,
+                    ),
+                    message="supersession",
+                )
+            finally:
+                transaction.rollback()
+
+    def test_second_staged_h0_for_one_document_is_rejected_immediately(
+        self,
+    ) -> None:
+        fixture = build_v4_authority_fixture()
+        stage = build_v4_supersession_stage_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                install_v4_supersession_stage(conn, stage)
+                self._force_constraints(conn)
+                self._defer_constraints(conn)
+                self._assert_rejected(
+                    conn,
+                    lambda: conn.execute(
+                        text(
+                            "INSERT INTO disclosure_ops.remote_parse_attempt "
+                            "(attempt_id,processing_run_id,document_id,"
+                            "attempt_generation,fence_identity,source_pdf_sha256,"
+                            "parser_target_sha256,request_sha256,"
+                            "runtime_epoch_sha256,client_submit_key,"
+                            "checkpoint_contract_version,state,is_current,"
+                            "row_version,current_checkpoint_sha256,"
+                            "claim_generation,claim_owner_identity,"
+                            "claim_lease_until) VALUES "
+                            "(:attempt_id,:run_id,:document_id,:generation,"
+                            ":fence,:source_sha,:target_sha,:request_sha,"
+                            ":epoch_sha,:submit_key,4,'prepared',false,0,"
+                            ":checkpoint_sha,0,NULL,NULL)"
+                        ),
+                        {
+                            "attempt_id": stage.attempt_id + "-second",
+                            "run_id": fixture.processing_run_id,
+                            "document_id": fixture.document_id,
+                            "generation": stage.reservation.attempt_generation + 1,
+                            "fence": stage.fence_identity + "-second",
+                            "source_sha": fixture.source_pdf_sha256,
+                            "target_sha": stage.parser_target_sha256,
+                            "request_sha": sha256_bytes(b"second-stage-request"),
+                            "epoch_sha": stage.runtime_epoch_sha256,
+                            "submit_key": stage.client_submit_key + "-second",
+                            "checkpoint_sha": stage.prepared.sha256,
+                        },
+                    ),
+                    message="uq_remote_parse_v4_staged_document",
+                )
+            finally:
+                transaction.rollback()
+
+    def test_source_cannot_finalize_while_superseding_h0_remains_staged(
+        self,
+    ) -> None:
+        fixture = build_v4_authority_fixture()
+        stage = build_v4_supersession_stage_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                install_v4_supersession_stage(conn, stage)
+                self._force_constraints(conn)
+                self._defer_constraints(conn)
+
+                def finalize_source_only() -> None:
+                    insert_evidence(conn, fixture, stage.cleanup_receipt)
+                    insert_checkpoint(conn, fixture, stage.source_superseded)
+                    update_v4_head(conn, fixture, stage.source_superseded)
+
+                self._assert_rejected(
+                    conn,
+                    finalize_source_only,
+                    message="supersession activation is incomplete",
+                )
+            finally:
+                transaction.rollback()
+
+    def test_supersession_link_receipt_kind_is_fk_pinned(self) -> None:
+        fixture = build_v4_authority_fixture()
+        stage = build_v4_supersession_stage_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                def install_wrong_kind_hash() -> None:
+                    install_v4_supersession_stage(
+                        conn,
+                        stage,
+                        include_link=False,
+                    )
+                    insert_v4_supersession_link(
+                        conn,
+                        stage,
+                        source_receipt_sha256=stage.cleanup_plan.sha256,
+                    )
+                    conn.exec_driver_sql(
+                        "SET CONSTRAINTS disclosure_ops."
+                        "fk_remote_parse_v4_supersession_link_receipt IMMEDIATE"
+                    )
+
+                self._assert_rejected(
+                    conn,
+                    install_wrong_kind_hash,
+                    message=(
+                        "violates foreign key constraint "
+                        '"fk_remote_parse_v4_supersession_link_receipt"'
+                    ),
+                )
+            finally:
+                transaction.rollback()
+
+    def test_supersession_link_is_immutable(self) -> None:
+        fixture = build_v4_authority_fixture()
+        stage = build_v4_supersession_stage_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                install_v4_supersession_stage(conn, stage)
+                self._force_constraints(conn)
+                self._defer_constraints(conn)
+                for statement in (
+                    (
+                        "UPDATE disclosure_ops.remote_parse_v4_supersession_link "
+                        "SET created_at=created_at WHERE "
+                        "source_attempt_id=:attempt_id"
+                    ),
+                    (
+                        "DELETE FROM "
+                        "disclosure_ops.remote_parse_v4_supersession_link "
+                        "WHERE source_attempt_id=:attempt_id"
+                    ),
+                ):
+                    self._assert_rejected(
+                        conn,
+                        lambda statement=statement: conn.execute(
+                            text(statement),
+                            {"attempt_id": fixture.attempt_id},
+                        ),
+                        message="immutable",
+                    )
+            finally:
+                transaction.rollback()
+
+    def test_resource_free_supersession_pair_requires_exact_link(self) -> None:
+        fixture = build_v4_authority_fixture()
+        pair = build_v4_resource_free_supersession_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                install_v4_resource_free_supersession(conn, pair)
+                self._force_constraints(conn)
+                heads = conn.execute(
+                    text(
+                        "SELECT attempt_id,state,is_current,row_version,"
+                        "claim_generation FROM disclosure_ops.remote_parse_attempt "
+                        "WHERE attempt_id=ANY(:attempt_ids) ORDER BY attempt_id"
+                    ),
+                    {
+                        "attempt_ids": [
+                            fixture.attempt_id,
+                            pair.target.attempt_id,
+                        ]
+                    },
+                ).all()
+                by_attempt = {row.attempt_id: row for row in heads}
+                self.assertEqual(
+                    tuple(by_attempt[fixture.attempt_id][1:]),
+                    ("superseded", False, 0, 0),
+                )
+                self.assertEqual(
+                    tuple(by_attempt[pair.target.attempt_id][1:]),
+                    ("prepared", True, 0, 0),
+                )
+            finally:
+                transaction.rollback()
+
+        fixture = build_v4_authority_fixture()
+        pair = build_v4_resource_free_supersession_fixture(fixture)
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                self._assert_rejected(
+                    conn,
+                    lambda: install_v4_resource_free_supersession(
+                        conn,
+                        pair,
+                        include_link=False,
+                    ),
+                    message="supersession",
                 )
             finally:
                 transaction.rollback()
@@ -1215,6 +1555,77 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
                 (None, None, canonical_hash),
             )
 
+    def test_0058_upgrade_refuses_real_unlinked_v4_supersession_authority(
+        self,
+    ) -> None:
+        fixture = build_v4_authority_fixture()
+        pair = build_v4_resource_free_supersession_fixture(fixture)
+        downgraded = self._alembic(
+            "downgrade",
+            "0057_remote_parse_v4_authority",
+        )
+        self.assertEqual(
+            downgraded.returncode,
+            0,
+            downgraded.stdout + downgraded.stderr,
+        )
+        try:
+            with self.engine.begin() as conn:
+                install_v4_resource_free_supersession(
+                    conn,
+                    pair,
+                    include_link=False,
+                )
+                self._force_constraints(conn)
+
+            refused = self._alembic("upgrade", "head")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn(
+                "0058 refuses preexisting unlinked v4 supersession authority",
+                refused.stdout + refused.stderr,
+            )
+            with self.engine.connect() as conn:
+                self.assertEqual(
+                    conn.execute(
+                        text(
+                            "SELECT version_num FROM "
+                            "disclosure_ops.alembic_version"
+                        )
+                    ).scalar_one(),
+                    "0057_remote_parse_v4_authority",
+                )
+        finally:
+            with self.engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "TRUNCATE TABLE "
+                    "disclosure_ops.remote_parse_attempt CASCADE"
+                )
+            removed_authority = self._alembic(
+                "downgrade",
+                "0056_staged_credit_evidence",
+            )
+            self.assertEqual(
+                removed_authority.returncode,
+                0,
+                removed_authority.stdout + removed_authority.stderr,
+            )
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "DELETE FROM disclosure_core.processing_run "
+                        "WHERE processing_run_id=:run_id"
+                    ),
+                    {"run_id": fixture.processing_run_id},
+                )
+                conn.execute(
+                    text(
+                        "DELETE FROM disclosure_core.document "
+                        "WHERE document_id=:document_id"
+                    ),
+                    {"document_id": fixture.document_id},
+                )
+            self._restore_migration_head()
+
     def test_clean_downgrade_round_trip_and_nonempty_guard(self) -> None:
         self.addCleanup(self._restore_migration_head)
         downgraded = self._alembic(
@@ -1234,21 +1645,24 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
         )
 
         migration = importlib.import_module(V4_MIGRATION_MODULE)
-        downgrade = getattr(migration, "downgrade")
+        downgrade = migration.downgrade
         fixture = build_v4_authority_fixture()
+        stage = build_v4_supersession_stage_fixture(fixture)
         with self.engine.connect() as conn:
             transaction = conn.begin()
             try:
-                install_prepared_cycle(conn, fixture)
+                install_v4_supersession_stage(conn, stage)
                 self._force_constraints(conn)
                 self._defer_constraints(conn)
                 migration_context = MigrationContext.configure(conn)
-                with Operations.context(migration_context):
-                    with self.assertRaisesRegex(
+                with (
+                    Operations.context(migration_context),
+                    self.assertRaisesRegex(
                         RuntimeError,
-                        "0057 downgrade would destroy v4 staged evidence",
-                    ):
-                        downgrade()
+                        "0058 downgrade would destroy staged v4 supersession authority",
+                    ),
+                ):
+                    downgrade()
                 self.assertEqual(
                     conn.execute(
                         text(
@@ -1256,7 +1670,7 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
                             "disclosure_ops.alembic_version"
                         )
                     ).scalar_one(),
-                    "0057_remote_parse_v4_authority",
+                    "0058_v4_supersession_stage",
                 )
                 retained_tables = set(
                     conn.execute(
@@ -1381,32 +1795,51 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
             )
             self.assertIn("current_checkpoint_sha256", attempt_columns)
 
+            link_columns = set(
+                conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema='disclosure_ops' AND "
+                        "table_name='remote_parse_v4_supersession_link'"
+                    )
+                ).scalars()
+            )
+            self.assertLessEqual(
+                {
+                    "source_attempt_id",
+                    "source_fence_identity",
+                    "source_evidence_kind",
+                    "source_supersession_receipt_sha256",
+                    "superseding_attempt_id",
+                    "superseding_fence_identity",
+                    "superseding_lifecycle_version",
+                    "superseding_checkpoint_sha256",
+                },
+                link_columns,
+            )
+
+            expected_constraints = {
+                "fk_remote_parse_attempt_v4_current_checkpoint",
+                "fk_remote_parse_v4_checkpoint_predecessor",
+                "fk_remote_parse_v4_secret_accepted_evidence",
+                "uq_remote_parse_attempt_v4_parent_identity",
+                "uq_remote_parse_v4_evidence_kind_hash",
+                "remote_parse_v4_supersession_link_pkey",
+                "uq_remote_parse_v4_supersession_link_target",
+                "ck_remote_parse_v4_checkpoint_state_evidence",
+                "ck_remote_parse_v4_checkpoint_credit_shape",
+                "fk_remote_parse_v4_supersession_link_source",
+                "fk_remote_parse_v4_supersession_link_receipt",
+                "fk_remote_parse_v4_supersession_link_target",
+                "fk_remote_parse_v4_supersession_link_checkpoint",
+            }
             critical_constraints = set(
                 conn.execute(
                     text("SELECT conname FROM pg_constraint WHERE conname=ANY(:names)"),
-                    {
-                        "names": [
-                            "fk_remote_parse_attempt_v4_current_checkpoint",
-                            "fk_remote_parse_v4_checkpoint_predecessor",
-                            "fk_remote_parse_v4_secret_accepted_evidence",
-                            "uq_remote_parse_attempt_v4_parent_identity",
-                            "ck_remote_parse_v4_checkpoint_state_evidence",
-                            "ck_remote_parse_v4_checkpoint_credit_shape",
-                        ]
-                    },
+                    {"names": list(expected_constraints)},
                 ).scalars()
             )
-            self.assertEqual(
-                critical_constraints,
-                {
-                    "fk_remote_parse_attempt_v4_current_checkpoint",
-                    "fk_remote_parse_v4_checkpoint_predecessor",
-                    "fk_remote_parse_v4_secret_accepted_evidence",
-                    "uq_remote_parse_attempt_v4_parent_identity",
-                    "ck_remote_parse_v4_checkpoint_state_evidence",
-                    "ck_remote_parse_v4_checkpoint_credit_shape",
-                },
-            )
+            self.assertEqual(critical_constraints, expected_constraints)
             head_fk = conn.execute(
                 text(
                     "SELECT condeferrable,condeferred FROM pg_constraint "
@@ -1414,6 +1847,19 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
                 )
             ).one()
             self.assertEqual(tuple(head_fk), (True, True))
+
+            staged_index = conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes WHERE "
+                    "schemaname='disclosure_ops' AND "
+                    "indexname='uq_remote_parse_v4_staged_document'"
+                )
+            ).scalar_one()
+            self.assertIn("UNIQUE INDEX", staged_index)
+            normalized_staged_index = " ".join(staged_index.split())
+            self.assertIn("checkpoint_contract_version = 4", normalized_staged_index)
+            self.assertIn("'prepared'::text", normalized_staged_index)
+            self.assertIn("NOT is_current", normalized_staged_index)
 
             for table_name in V4_TABLES:
                 relation = "disclosure_ops." + table_name
@@ -1455,6 +1901,22 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
                         ).scalar_one(),
                         (role, table_name),
                     )
+
+            for function_name in (
+                "disclosure_ops.assert_remote_parse_v4_supersession_link(text,text)",
+                "disclosure_ops.enforce_remote_parse_v4_supersession_link()",
+                "disclosure_ops.enforce_remote_parse_v4_supersession_head()",
+            ):
+                self.assertFalse(
+                    conn.execute(
+                        text(
+                            "SELECT has_function_privilege("
+                            ":role,:function,'EXECUTE')"
+                        ),
+                        {"role": APP_ROLE, "function": function_name},
+                    ).scalar_one(),
+                    function_name,
+                )
 
             self.assertTrue(
                 conn.execute(
