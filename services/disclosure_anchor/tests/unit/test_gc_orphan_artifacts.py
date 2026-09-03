@@ -15,10 +15,17 @@ from scripts.gc_orphan_artifacts import (
     _Candidate,
     _build_manifest,
     _collect_orphans,
+    _merge_expected_owners,
     _scan_old_candidates,
     _snapshot_expected_owners,
+    _snapshot_preparation_owners,
     _write_manifest_before_delete,
     main,
+)
+from tests.unit.test_atomic_document_publication_v4 import (
+    _artifact_preparation,
+    _artifact_readiness,
+    _request,
 )
 
 
@@ -47,21 +54,14 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         }
 
     def test_family_ownership_uses_prefix_only_for_parser_artifacts(self) -> None:
-        owned_parser = self._file(
-            "parser_artifacts/cninfo/000001/doc/run/child.json"
-        )
+        owned_parser = self._file("parser_artifacts/cninfo/000001/doc/run/child.json")
         orphan_parser = self._file(
             "parser_artifacts/cninfo/000001/doc/retired/child.json"
         )
-        owned_ir = self._file(
-            "derived/normalized_ir/doc/run/normalized_ir.v3.json"
-        )
-        sibling_ir = self._file(
-            "derived/normalized_ir/doc/run/unowned-sibling.json"
-        )
+        owned_ir = self._file("derived/normalized_ir/doc/run/normalized_ir.v3.json")
+        sibling_ir = self._file("derived/normalized_ir/doc/run/unowned-sibling.json")
         owned_provider = self._file(
-            "derived/provider_documents/cninfo/000001/pid/run/"
-            "provider_document.v1.json"
+            "derived/provider_documents/cninfo/000001/pid/run/provider_document.v1.json"
         )
         sibling_provider = self._file(
             "derived/provider_documents/cninfo/000001/pid/run/unowned.json"
@@ -70,23 +70,18 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl"
         )
         orphan_units = self._file(
-            "derived/document_unit_snapshots/doc/retired/"
-            "document_units.v1.jsonl"
+            "derived/document_unit_snapshots/doc/retired/document_units.v1.jsonl"
         )
         expected = self._expected()
-        expected["parser_artifacts"].add(
-            "parser_artifacts/cninfo/000001/doc/run"
-        )
+        expected["parser_artifacts"].add("parser_artifacts/cninfo/000001/doc/run")
         expected["normalized_ir"].add(
             "derived/normalized_ir/doc/run/normalized_ir.v3.json"
         )
         expected["provider_documents"].add(
-            "derived/provider_documents/cninfo/000001/pid/run/"
-            "provider_document.v1.json"
+            "derived/provider_documents/cninfo/000001/pid/run/provider_document.v1.json"
         )
         expected["document_unit_snapshots"].add(
-            "derived/document_unit_snapshots/doc/run/"
-            "document_units.v1.jsonl"
+            "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl"
         )
 
         candidates, skipped = _scan_old_candidates(
@@ -112,9 +107,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         self.assertNotIn(owned_units, {orphan.path for orphan in orphans})
 
     def test_age_is_rechecked_after_the_ownership_snapshot(self) -> None:
-        path = self._file(
-            "derived/normalized_ir/doc/run/normalized_ir.v3.json"
-        )
+        path = self._file("derived/normalized_ir/doc/run/normalized_ir.v3.json")
         candidates, initially_skipped = _scan_old_candidates(
             self.data_root,
             now_ts=self.now_ts,
@@ -159,9 +152,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
 
         expected = _snapshot_expected_owners(conn)
 
-        statement = " ".join(
-            str(conn.execute.call_args.args[0]).upper().split()
-        )
+        statement = " ".join(str(conn.execute.call_args.args[0]).upper().split())
         self.assertNotIn("WHERE", statement)
         self.assertNotIn("IS_ACTIVE", statement)
         self.assertEqual(expected["parser_artifacts"], {active[0], inactive[0]})
@@ -208,10 +199,11 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
             "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl"
         )
         conn = MagicMock()
-        conn.execute.return_value = [(None, None, None, units_relpath, None, None, None)]
+        conn.execute.return_value = [
+            (None, None, None, units_relpath, None, None, None)
+        ]
         receipt = self._file(
-            "derived/document_unit_snapshots/doc/run/"
-            "semantic_route_receipts.v1.jsonl"
+            "derived/document_unit_snapshots/doc/run/semantic_route_receipts.v1.jsonl"
         )
 
         expected = _snapshot_expected_owners(conn)
@@ -225,11 +217,87 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
 
         self.assertEqual([orphan.path for orphan in orphans], [receipt])
 
+    def test_preparation_only_bundle_is_a_conservative_gc_owner(self) -> None:
+        preparation = _artifact_preparation(_request())
+        prep_relpath = Path(preparation.document_unit_snapshot_plan.relpath).with_name(
+            "atomic_publication_preparation.v1.json"
+        )
+        protected = {
+            "parser_artifacts": (
+                Path(preparation.parser_output_plan.published_relpath) / "result.json"
+            ),
+            "provider_documents": Path(preparation.provider_document_plan.relpath),
+            "document_units": Path(preparation.document_unit_snapshot_plan.relpath),
+            "semantic": Path(preparation.semantic_route_receipts_plan.relpath),
+            "preparation": prep_relpath,
+        }
+        for name, relpath in protected.items():
+            path = self._file(relpath.as_posix())
+            if name == "preparation":
+                path.write_bytes(preparation.canonical_bytes)
+                old = self.now_ts - 25 * 3600
+                os.utime(path, (old, old))
+
+        preparation_owners = _snapshot_preparation_owners(self.data_root)
+        expected = _merge_expected_owners(
+            self._expected(),
+            preparation_owners,
+        )
+        candidates, _ = _scan_old_candidates(
+            self.data_root,
+            now_ts=self.now_ts,
+        )
+        orphans, _ = _collect_orphans(
+            candidates,
+            data_root=self.data_root,
+            expected=expected,
+            now_ts=self.now_ts,
+        )
+
+        self.assertEqual(orphans, [])
+        self.assertIn(
+            prep_relpath.as_posix(),
+            expected["document_unit_snapshots"],
+        )
+        self.assertIn(
+            prep_relpath.with_name("atomic_publication_readiness.v1.json").as_posix(),
+            expected["document_unit_snapshots"],
+        )
+
+    def test_ready_bundle_and_invalid_preparation_are_not_silently_collected(
+        self,
+    ) -> None:
+        preparation = _artifact_preparation(_request())
+        manifest, _ = _artifact_readiness(preparation)
+        prep_relpath = Path(manifest.preparation_relpath)
+        readiness_relpath = prep_relpath.with_name(
+            "atomic_publication_readiness.v1.json"
+        )
+        prep = self._file(prep_relpath.as_posix())
+        prep.write_bytes(preparation.canonical_bytes)
+        ready = self._file(readiness_relpath.as_posix())
+        ready.write_bytes(manifest.canonical_bytes)
+        old = self.now_ts - 25 * 3600
+        os.utime(prep, (old, old))
+        os.utime(ready, (old, old))
+
+        owners = _snapshot_preparation_owners(self.data_root)
+        self.assertIn(
+            readiness_relpath.as_posix(),
+            owners["document_unit_snapshots"],
+        )
+
+        prep.write_bytes(b"not canonical")
+        with self.assertRaisesRegex(RuntimeError, "blocks GC"):
+            _snapshot_preparation_owners(self.data_root)
+
+        prep.unlink()
+        with self.assertRaisesRegex(RuntimeError, "readiness blocks GC"):
+            _snapshot_preparation_owners(self.data_root)
+
     def test_daily_job_is_orphan_only(self) -> None:
         service_root = Path(__file__).resolve().parents[2]
-        script = (service_root / "scripts" / "gc_daily.sh").read_text(
-            encoding="utf-8"
-        )
+        script = (service_root / "scripts" / "gc_daily.sh").read_text(encoding="utf-8")
 
         self.assertNotIn("retire_derived_generation", script)
         self.assertNotIn("--auto", script)
@@ -244,12 +312,9 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         self,
     ) -> None:
         path = self._file(
-            "derived/document_unit_snapshots/doc/run/"
-            "document_units.v1.jsonl"
+            "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl"
         )
-        candidates = [
-            _Candidate(family="document_unit_snapshots", path=path)
-        ]
+        candidates = [_Candidate(family="document_unit_snapshots", path=path)]
         orphans, _ = _collect_orphans(
             candidates,
             data_root=self.data_root,
@@ -270,8 +335,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         self.assertEqual(stored["families"]["document_unit_snapshots"]["files"], 1)
         self.assertEqual(
             stored["files"][0]["relpath"],
-            "derived/document_unit_snapshots/doc/run/"
-            "document_units.v1.jsonl",
+            "derived/document_unit_snapshots/doc/run/document_units.v1.jsonl",
         )
         with self.assertRaises(FileExistsError):
             _write_manifest_before_delete(audit_path, manifest)
@@ -279,9 +343,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
     def test_apply_holds_exclusive_gate_from_owner_snapshot_through_unlink(
         self,
     ) -> None:
-        orphan = self._file(
-            "derived/normalized_ir/doc/run/normalized_ir.v3.json"
-        )
+        orphan = self._file("derived/normalized_ir/doc/run/normalized_ir.v3.json")
         settings = MagicMock()
         settings.disclosure_data_root = Path(self._tempdir.name)
         settings.database_url.get_secret_value.return_value = "unused"
@@ -325,9 +387,7 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
 
         self.assertFalse(gate_state["held"])
         self.assertFalse(orphan.exists())
-        manifests = list(
-            (Path(self._tempdir.name) / "audit" / "gc").glob("*.json")
-        )
+        manifests = list((Path(self._tempdir.name) / "audit" / "gc").glob("*.json"))
         self.assertEqual(len(manifests), 1)
         engine.dispose.assert_called_once_with()
 

@@ -41,12 +41,30 @@ from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     fetch_mineru_orchestrator_health,
 )
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
+from disclosure_anchor.adapters.storage.atomic_publication_artifact_readiness_v4 import (
+    FilesystemAtomicPublicationArtifactReadinessV4,
+)
+from disclosure_anchor.adapters.storage.immutable_artifact_store import (
+    ImmutableArtifactStore,
+)
+from disclosure_anchor.adapters.storage.published_parser_output_verifier_v4 import (
+    PublishedParserOutputVerifierV4,
+)
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
+from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
+    decode_atomic_publication_winner_v4,
+)
 from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPT_V3,
     SEMANTIC_ROUTE_RECEIPT_VERSION,
+    semantic_adjudication_terminal_v1,
     semantic_route_receipt_row_from_payload,
+    semantic_route_receipt_row_v3_from_payload,
+    semantic_route_receipts_file_bytes_v3,
+    validate_semantic_route_receipt_rows_v3,
 )
 from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
+from disclosure_anchor.domain.errors import ParserOutputContractError
 from disclosure_anchor.settings import Settings
 
 
@@ -60,6 +78,8 @@ _PYTHON_STRIP_CHARS_SQL = (
 )
 _CANONICAL_CODE_SQL = f"btrim(security_code, {_PYTHON_STRIP_CHARS_SQL})"
 _CANONICAL_EXCHANGE_SQL = f"upper(btrim(exchange, {_PYTHON_STRIP_CHARS_SQL}))"
+
+
 @dataclass(frozen=True)
 class CheckResult:
     name: str
@@ -192,7 +212,9 @@ def _environment_checks(settings: Settings) -> list[CheckResult]:
         _check_path_exists("mount sentinel", settings.sentinel_path),
         _check_writable_dir("DISCLOSURE_DATA_ROOT", settings.disclosure_data_root),
         _check_writable_dir("DISCLOSURE_SHARED_ROOT", settings.disclosure_shared_root),
-        _check_writable_dir("DISCLOSURE_RUNTIME_ROOT", settings.disclosure_runtime_root),
+        _check_writable_dir(
+            "DISCLOSURE_RUNTIME_ROOT", settings.disclosure_runtime_root
+        ),
     ]
     cache_names = ("MINERU_MODEL_CACHE", "HF_HOME", "MODELSCOPE_CACHE")
     checks.extend(
@@ -266,9 +288,7 @@ def _mineru_orphan_check() -> CheckResult:
         processes[pid] = (ppid, parts[2])
 
     mineru_pids = [
-        pid
-        for pid, (_, command) in processes.items()
-        if _is_mineru_process(command)
+        pid for pid, (_, command) in processes.items() if _is_mineru_process(command)
     ]
     orphan_pids: list[int] = []
     for pid in mineru_pids:
@@ -320,9 +340,7 @@ def _disk_headroom_checks(settings: Settings) -> list[CheckResult]:
             continue
         free_pct = usage.free / usage.total * 100
         detail = f"{free_pct:.0f}% free ({usage.free / 2**30:.0f} GiB) at {probe}"
-        checks.append(
-            _pass(name, detail) if free_pct >= 10 else _warn(name, detail)
-        )
+        checks.append(_pass(name, detail) if free_pct >= 10 else _warn(name, detail))
     return checks
 
 
@@ -330,9 +348,7 @@ def _ops_launchd_check() -> CheckResult:
     """PostgreSQL has no boot autostart by itself; after a power cycle the
     worker KeepAlive loops against a dead DB with no alert (batch 4)."""
 
-    plist = (
-        Path.home() / "Library" / "LaunchAgents" / "com.agentinvest.postgres.plist"
-    )
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.agentinvest.postgres.plist"
     if not plist.exists():
         return _warn(
             "postgres autostart",
@@ -345,9 +361,9 @@ def _ops_launchd_check() -> CheckResult:
     data_dir = os.environ.get(
         "DISCLOSURE_PGDATA", "/Volumes/AgentSSD/agent_system/postgres/pg18-main"
     )
-    pg_ctl = Path(
-        os.environ.get("PG_BIN", "/opt/homebrew/opt/postgresql@18/bin")
-    ) / "pg_ctl"
+    pg_ctl = (
+        Path(os.environ.get("PG_BIN", "/opt/homebrew/opt/postgresql@18/bin")) / "pg_ctl"
+    )
     if not pg_ctl.exists():
         return _pass("postgres autostart", f"installed: {plist.name}")
     try:
@@ -425,15 +441,143 @@ def run_doctor(
         checks.extend(_database_catalog_checks(engine))
         checks.extend(_classification_coverage_checks(engine))
         checks.extend(_database_consistency_checks(settings, engine))
-        checks.extend(run_raw_archive_checks(settings, engine, full=full, sample_size=sample_size))
+        checks.extend(
+            run_raw_archive_checks(settings, engine, full=full, sample_size=sample_size)
+        )
         checks.extend(_processing_run_checks(settings, engine))
-        checks.extend(_document_unit_locator_checks(settings, engine, sample_size=sample_size))
+        checks.extend(
+            _document_unit_locator_checks(settings, engine, sample_size=sample_size)
+        )
+        checks.extend(
+            atomic_publication_readiness_checks(
+                settings,
+                engine,
+                full=full,
+                sample_size=sample_size,
+            )
+        )
         checks.extend(_orphan_file_checks(settings, engine))
     except Exception as exc:
         checks.append(_fail("database doctor checks", str(exc)))
     finally:
         engine.dispose()
     return DoctorReport(results=tuple(checks))
+
+
+class _DoctorReadOnlyPromotion:
+    def __init__(self, verifier: PublishedParserOutputVerifierV4) -> None:
+        self._verifier = verifier
+
+    def promote_or_replay(self, **_kwargs: object) -> None:
+        raise RuntimeError("Doctor readiness verifier cannot promote output")
+
+    def verify_published(
+        self,
+        *,
+        published_relpath: str,
+        expected_inventory_sha256: str,
+        expected_file_count: int,
+        expected_byte_count: int,
+    ) -> None:
+        self._verifier.verify_published(
+            published_relpath=published_relpath,
+            expected_inventory_sha256=expected_inventory_sha256,
+            expected_file_count=expected_file_count,
+            expected_byte_count=expected_byte_count,
+        )
+
+
+def atomic_publication_readiness_checks(
+    settings: Settings,
+    engine: Engine,
+    *,
+    full: bool,
+    sample_size: int,
+) -> list[CheckResult]:
+    """Verify committed winner-v2 → readiness → preparation → resources."""
+
+    limit = max(sample_size, 1)
+    with engine.connect() as raw_connection:
+        conn = raw_connection.execution_options(isolation_level="REPEATABLE READ")
+        with conn.begin():
+            conn.exec_driver_sql("SET TRANSACTION READ ONLY")
+            total = int(
+                conn.execute(
+                    text(
+                        f"SELECT count(*) FROM "
+                        f"{OPS_SCHEMA}.atomic_publication_winner_v4"
+                    )
+                ).scalar_one()
+            )
+            statement = text(
+                f"SELECT winner_bytes,winner_sha256,winner_byte_count FROM "
+                f"{OPS_SCHEMA}.atomic_publication_winner_v4 "
+                "ORDER BY created_at DESC,attempt_id,processing_run_id"
+                + ("" if full else " LIMIT :limit")
+            )
+            rows = tuple(conn.execute(statement, {} if full else {"limit": limit}))
+    expected_rows = total if full else min(total, limit)
+    if len(rows) != expected_rows:
+        return [
+            _fail(
+                "atomic publication readiness",
+                f"winner inventory changed within snapshot: "
+                f"rows={len(rows)} expected={expected_rows} total={total}",
+            )
+        ]
+    if total == 0:
+        return [_pass("atomic publication readiness", "no committed winners")]
+
+    paths = FileStorePathBuilder(settings)
+    immutable = ImmutableArtifactStore(paths)
+    verifier = PublishedParserOutputVerifierV4(paths)
+    readiness = FilesystemAtomicPublicationArtifactReadinessV4(
+        paths=paths,
+        immutable_store=immutable,
+        output_promotion=_DoctorReadOnlyPromotion(verifier),
+    )
+    legacy = 0
+    verified = 0
+    failures: list[str] = []
+    for raw, expected_sha256, expected_byte_count in rows:
+        try:
+            winner_bytes = bytes(raw)
+            actual_sha256 = "sha256:" + hashlib.sha256(winner_bytes).hexdigest()
+            if (
+                len(winner_bytes) != expected_byte_count
+                or actual_sha256 != expected_sha256
+            ):
+                raise ValueError("winner row bytes drifted")
+            winner = decode_atomic_publication_winner_v4(winner_bytes)
+            if winner.sha256 != expected_sha256:
+                raise ValueError("winner canonical hash drifted")
+            if winner.winner_row_version == 1:
+                legacy += 1
+                continue
+            assert winner.artifact_readiness is not None
+            readiness.verify_ready(
+                reference=winner.artifact_readiness,
+                expected_winner=winner,
+            )
+            verified += 1
+        except (OSError, ParserOutputContractError, RuntimeError, ValueError) as exc:
+            failures.append(str(exc))
+    scope = f"checked={len(rows)}/{total}; v2={verified}; legacy_v1={legacy}"
+    if failures:
+        return [
+            _fail(
+                "atomic publication readiness",
+                f"{scope}; failures={len(failures)}; first={failures[0]}",
+            )
+        ]
+    if legacy:
+        return [
+            _warn(
+                "atomic publication readiness",
+                f"{scope}; winner v1 is decode-only and not M4-admissible",
+            )
+        ]
+    return [_pass("atomic publication readiness", scope)]
 
 
 def _database_ping_and_migration_checks(engine: Engine) -> list[CheckResult]:
@@ -556,9 +700,7 @@ def _classification_coverage_checks(engine: Engine) -> list[CheckResult]:
         for prefix in spec["prefixes"]
     ]
     facet_prefixes = [
-        str(prefix)
-        for rule in load_facet_map()["rules"]
-        for prefix in rule["prefixes"]
+        str(prefix) for rule in load_facet_map()["rules"] for prefix in rule["prefixes"]
     ]
     known_classes = set(class_map["classes"])
     with engine.connect() as conn:
@@ -646,7 +788,9 @@ def _database_catalog_checks(engine: Engine) -> list[CheckResult]:
                 text("SELECT schema_name FROM information_schema.schemata")
             )
         }
-        roles = {str(row[0]) for row in conn.execute(text("SELECT rolname FROM pg_roles"))}
+        roles = {
+            str(row[0]) for row in conn.execute(text("SELECT rolname FROM pg_roles"))
+        }
 
         missing_schemas = set(ALL_SCHEMAS) - schemas
         checks.append(
@@ -686,7 +830,9 @@ def _database_catalog_checks(engine: Engine) -> list[CheckResult]:
                     {"role": APP_ROLE, "schema": schema},
                 ).scalar_one():
                     permission_failures.append(f"{APP_ROLE}:{schema}:USAGE")
-        for role in (candidate for candidate in READ_ONLY_PUBLIC_ROLES if candidate in roles):
+        for role in (
+            candidate for candidate in READ_ONLY_PUBLIC_ROLES if candidate in roles
+        ):
             if not conn.execute(
                 text("SELECT has_schema_privilege(:role, :schema, 'USAGE')"),
                 {"role": role, "schema": PUBLIC_SCHEMA},
@@ -716,23 +862,31 @@ def _database_catalog_checks(engine: Engine) -> list[CheckResult]:
     return checks
 
 
-def _database_consistency_checks(settings: Settings, engine: Engine) -> list[CheckResult]:
+def _database_consistency_checks(
+    settings: Settings, engine: Engine
+) -> list[CheckResult]:
     checks: list[CheckResult] = []
     with engine.connect() as conn:
         # Repeated full-corpus rebuilds replace every asset_id, and a
         # per-round-bounded delta can then never refill the projection — it
         # sat at 0.04% coverage for days with every check green (2026-07-21).
         # Search is only as alive as this ratio.
-        active_units = conn.execute(
-            text(
-                f"SELECT count(*) FROM {CORE_SCHEMA}.document_unit u "
-                f"JOIN {CORE_SCHEMA}.processing_run r "
-                "ON r.processing_run_id = u.processing_run_id WHERE r.is_active"
-            )
-        ).scalar() or 0
-        projected = conn.execute(
-            text(f"SELECT count(*) FROM {CORE_SCHEMA}.unit_search_projection")
-        ).scalar() or 0
+        active_units = (
+            conn.execute(
+                text(
+                    f"SELECT count(*) FROM {CORE_SCHEMA}.document_unit u "
+                    f"JOIN {CORE_SCHEMA}.processing_run r "
+                    "ON r.processing_run_id = u.processing_run_id WHERE r.is_active"
+                )
+            ).scalar()
+            or 0
+        )
+        projected = (
+            conn.execute(
+                text(f"SELECT count(*) FROM {CORE_SCHEMA}.unit_search_projection")
+            ).scalar()
+            or 0
+        )
         if active_units:
             coverage = projected / active_units
             detail = (
@@ -768,22 +922,26 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
                 "HAVING count(*) > 1"
             )
         ).all()
-        identity_shape = conn.execute(
-            text(
-                f"SELECT count(*) FILTER (WHERE security_code <> {_CANONICAL_CODE_SQL} "
-                f"OR exchange <> {_CANONICAL_EXCHANGE_SQL}) AS noncanonical, "
-                "count(*) FILTER (WHERE exchange IN ('SSE','SZSE','BSE') AND NOT ("
-                "security_code ~ '^[0-9]{6}$' AND CASE "
-                "WHEN security_code LIKE '92%' OR security_code LIKE '4%' "
-                "  OR security_code LIKE '8%' THEN exchange = 'BSE' "
-                "WHEN security_code LIKE '6%' OR security_code LIKE '9%' "
-                "  THEN exchange = 'SSE' "
-                "WHEN security_code LIKE '0%' OR security_code LIKE '2%' "
-                "  OR security_code LIKE '3%' THEN exchange = 'SZSE' "
-                "ELSE false END)) AS mainland_mismatch "
-                f"FROM {CORE_SCHEMA}.security"
+        identity_shape = (
+            conn.execute(
+                text(
+                    f"SELECT count(*) FILTER (WHERE security_code <> {_CANONICAL_CODE_SQL} "
+                    f"OR exchange <> {_CANONICAL_EXCHANGE_SQL}) AS noncanonical, "
+                    "count(*) FILTER (WHERE exchange IN ('SSE','SZSE','BSE') AND NOT ("
+                    "security_code ~ '^[0-9]{6}$' AND CASE "
+                    "WHEN security_code LIKE '92%' OR security_code LIKE '4%' "
+                    "  OR security_code LIKE '8%' THEN exchange = 'BSE' "
+                    "WHEN security_code LIKE '6%' OR security_code LIKE '9%' "
+                    "  THEN exchange = 'SSE' "
+                    "WHEN security_code LIKE '0%' OR security_code LIKE '2%' "
+                    "  OR security_code LIKE '3%' THEN exchange = 'SZSE' "
+                    "ELSE false END)) AS mainland_mismatch "
+                    f"FROM {CORE_SCHEMA}.security"
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         identity_problem = bool(
             duplicate_security_keys
             or identity_shape["noncanonical"]
@@ -820,12 +978,16 @@ def _database_consistency_checks(settings: Settings, engine: Engine) -> list[Che
             )
         )
 
-        seq_stats = conn.execute(
-            text(
-                f"SELECT count(*) AS event_count, min(seq) AS min_seq, max(seq) AS max_seq "
-                f"FROM {OPS_SCHEMA}.outbox_event"
+        seq_stats = (
+            conn.execute(
+                text(
+                    f"SELECT count(*) AS event_count, min(seq) AS min_seq, max(seq) AS max_seq "
+                    f"FROM {OPS_SCHEMA}.outbox_event"
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         if seq_stats["event_count"] == 0:
             checks.append(_pass("outbox seq", "no outbox events"))
         else:
@@ -991,7 +1153,9 @@ def _registered_raw_documents(
                 {"limit": sample_size},
             ).all()
             latest_rows = conn.execute(
-                text(query + " ORDER BY created_at DESC, document_id DESC LIMIT :limit"),
+                text(
+                    query + " ORDER BY created_at DESC, document_id DESC LIMIT :limit"
+                ),
                 {"limit": sample_size},
             ).all()
             by_document_id = {str(row[0]): row for row in first_rows}
@@ -1050,20 +1214,25 @@ def run_raw_archive_checks(
 def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResult]:
     checks: list[CheckResult] = []
     with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                f"SELECT processing_run_id, status, normalized_ir_relpath, "
-                f"provider_document_relpath, "
-                f"artifact_hash, error, unit_build_status, document_units_relpath, "
-                f"content_hash_aggregate, unit_build_error, "
-                f"semantic_adjudication_status, semantic_degraded_unit_count, "
-                f"semantic_adjudication_summary, semantic_route_receipts_relpath, "
-                f"semantic_route_receipts_contract_version, "
-                f"semantic_route_receipts_hash FROM {CORE_SCHEMA}.processing_run "
-                "WHERE status IN ('succeeded', 'failed') "
-                "OR unit_build_status = 'succeeded'"
+        rows = (
+            conn.execute(
+                text(
+                    f"SELECT processing_run_id, status, normalized_ir_relpath, "
+                    f"provider_document_relpath, "
+                    f"artifact_hash, error, unit_build_status, document_units_relpath, "
+                    f"content_hash_aggregate, unit_build_error, "
+                    f"semantic_adjudication_status, semantic_degraded_unit_count, "
+                    f"semantic_failover_group_count, "
+                    f"semantic_adjudication_summary, semantic_route_receipts_relpath, "
+                    f"semantic_route_receipts_contract_version, "
+                    f"semantic_route_receipts_hash FROM {CORE_SCHEMA}.processing_run "
+                    "WHERE status IN ('succeeded', 'failed') "
+                    "OR unit_build_status = 'succeeded'"
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
 
     if not rows:
         return [_pass("processing runs", "no completed or failed runs")]
@@ -1096,7 +1265,10 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
             )
         elif row["status"] == "failed":
             error = row["error"]
-            if isinstance(error, dict) and {"stage", "error_code", "retryable"} <= error.keys():
+            if (
+                isinstance(error, dict)
+                and {"stage", "error_code", "retryable"} <= error.keys()
+            ):
                 checks.append(_pass("failed run error", f"processing_run_id={run_id}"))
             else:
                 checks.append(
@@ -1125,8 +1297,9 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
                         ],
                         expected_hash=row["semantic_route_receipts_hash"],
                         semantic_status=row["semantic_adjudication_status"],
-                        expected_degraded_count=row[
-                            "semantic_degraded_unit_count"
+                        expected_degraded_count=row["semantic_degraded_unit_count"],
+                        expected_failover_group_count=row[
+                            "semantic_failover_group_count"
                         ],
                         summary=row["semantic_adjudication_summary"],
                     )
@@ -1155,10 +1328,14 @@ def _semantic_receipt_check(
     expected_hash: str | None,
     semantic_status: str | None,
     expected_degraded_count: int | None,
+    expected_failover_group_count: int | None,
     summary: object,
 ) -> CheckResult:
-    name = "semantic route receipt v2"
-    if contract_version != SEMANTIC_ROUTE_RECEIPT_VERSION or not expected_hash:
+    name = f"semantic route receipt {contract_version or 'unknown'}"
+    if contract_version not in {
+        SEMANTIC_ROUTE_RECEIPT_VERSION,
+        SEMANTIC_ROUTE_RECEIPT_V3,
+    } or not expected_hash:
         return _fail(name, f"{object_id} locator/version/hash is inconsistent")
     path = settings.disclosure_data_root / "data" / relpath
     try:
@@ -1168,6 +1345,36 @@ def _semantic_receipt_check(
         actual_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
         if actual_hash != expected_hash:
             return _fail(name, f"{object_id} receipt hash mismatch")
+        if contract_version == SEMANTIC_ROUTE_RECEIPT_V3:
+            if not raw or any(not line.strip() for line in raw.splitlines()):
+                return _fail(name, f"{object_id} receipt JSONL is not canonical")
+            rows_v3 = tuple(
+                semantic_route_receipt_row_v3_from_payload(json.loads(line))
+                for line in raw.splitlines()
+            )
+            validate_semantic_route_receipt_rows_v3(
+                rows_v3,
+                processing_run_id=object_id,
+            )
+            if semantic_route_receipts_file_bytes_v3(rows_v3) != raw:
+                return _fail(name, f"{object_id} receipt JSONL is not canonical")
+            terminal = semantic_adjudication_terminal_v1(
+                tuple(row.receipt for row in rows_v3)
+            )
+            if (
+                semantic_status != terminal.status
+                or expected_degraded_count != terminal.degraded_unit_count
+                or expected_failover_group_count != terminal.failover_group_count
+                or summary != terminal.summary
+            ):
+                return _fail(name, f"{object_id} semantic terminal drifted")
+            if terminal.status == "degraded_unavailable":
+                return _warn(
+                    name,
+                    f"{object_id} verified with "
+                    f"{terminal.degraded_unit_count} unavailable Units",
+                )
+            return _pass(name, f"{object_id} verified ({len(rows_v3)} units)")
         rows = tuple(
             semantic_route_receipt_row_from_payload(json.loads(line))
             for line in raw.splitlines()
@@ -1178,8 +1385,7 @@ def _semantic_receipt_check(
     if any(row.receipt.contract_version != contract_version for row in rows):
         return _fail(name, f"{object_id} receipt rows mix contract versions")
     degraded_count = sum(
-        row.receipt.decision_source == "adjudicator_unavailable_abstain"
-        for row in rows
+        row.receipt.decision_source == "adjudicator_unavailable_abstain" for row in rows
     )
     if degraded_count != (expected_degraded_count or 0):
         return _fail(name, f"{object_id} degraded receipt count drifted")
@@ -1277,9 +1483,13 @@ def _document_unit_locator_checks(
 
     checks: list[CheckResult] = []
     for asset_id, locator in rows:
-        artifact_path = locator.get("artifact_path") if isinstance(locator, dict) else None
+        artifact_path = (
+            locator.get("artifact_path") if isinstance(locator, dict) else None
+        )
         if not artifact_path:
-            checks.append(_pass("document unit artifact locator", f"asset_id={asset_id} no path"))
+            checks.append(
+                _pass("document unit artifact locator", f"asset_id={asset_id} no path")
+            )
             continue
         path = settings.disclosure_data_root / "data" / str(artifact_path)
         checks.append(
@@ -1377,4 +1587,6 @@ def _file_hash(path: Path) -> str:
 
 
 def render_report(results: Iterable[CheckResult]) -> str:
-    return "\n".join(f"[{result.status}] {result.name}: {result.message}" for result in results)
+    return "\n".join(
+        f"[{result.status}] {result.name}: {result.message}" for result in results
+    )

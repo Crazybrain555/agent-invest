@@ -34,8 +34,14 @@ from sqlalchemy.engine import Connection
 
 from disclosure_anchor.adapters.db.postgres.connection import create_db_engine
 from disclosure_anchor.adapters.db.postgres.schema import CORE_SCHEMA
+from disclosure_anchor.application.contracts.atomic_publication_artifact_readiness_v4 import (
+    ATOMIC_PUBLICATION_PREPARATION_FILENAME,
+    ATOMIC_PUBLICATION_READINESS_FILENAME,
+    decode_atomic_publication_preparation_v1,
+)
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME,
+    SEMANTIC_ROUTE_RECEIPT_V3,
 )
 from disclosure_anchor.application.worker.locks import (
     exclusive_corpus_mutation,
@@ -98,9 +104,7 @@ def _scan_old_candidates(
 
 
 def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
-    expected: dict[str, set[str]] = {
-        family: set() for family in _FAMILY_ROOTS
-    }
+    expected: dict[str, set[str]] = {family: set() for family in _FAMILY_ROOTS}
     rows = conn.execute(
         text(
             f"""
@@ -133,7 +137,10 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
                 expected[family].add(str(value).rstrip("/"))
         if units_relpath is not None and receipt_hash is not None:
             if receipt_relpath is not None:
-                if receipt_version != "semantic_route_receipt.v2":
+                if receipt_version not in {
+                    "semantic_route_receipt.v2",
+                    SEMANTIC_ROUTE_RECEIPT_V3,
+                }:
                     raise RuntimeError(
                         "processing_run semantic receipt version is unsupported"
                     )
@@ -150,6 +157,108 @@ def _snapshot_expected_owners(conn: Connection) -> dict[str, set[str]]:
     return expected
 
 
+def _snapshot_preparation_owners(data_root: Path) -> dict[str, set[str]]:
+    """Preserve valid preparation-only and readiness-complete bundles.
+
+    Preparation is immutable authority created before transaction P, so the DB
+    intentionally cannot be its sole owner oracle. Invalid authority files
+    stop GC rather than becoming deletion candidates.
+    """
+
+    expected: dict[str, set[str]] = {family: set() for family in _FAMILY_ROOTS}
+    root = data_root / _FAMILY_ROOTS["document_unit_snapshots"]
+    if not root.exists():
+        return expected
+    preparation_paths = tuple(
+        sorted(root.rglob(ATOMIC_PUBLICATION_PREPARATION_FILENAME))
+    )
+    readiness_paths = tuple(sorted(root.rglob(ATOMIC_PUBLICATION_READINESS_FILENAME)))
+    preparation_path_set = set(preparation_paths)
+    for readiness_path in readiness_paths:
+        if (
+            readiness_path.with_name(ATOMIC_PUBLICATION_PREPARATION_FILENAME)
+            not in preparation_path_set
+        ):
+            raise RuntimeError(
+                f"orphan atomic publication readiness blocks GC: {readiness_path}"
+            )
+    for path in preparation_paths:
+        try:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags)
+            try:
+                observed = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or observed.st_size < 1
+                    or observed.st_size > 24 * 1024 * 1024
+                ):
+                    raise ValueError("authority file identity is unsafe")
+                raw = bytearray()
+                while len(raw) < observed.st_size:
+                    chunk = os.read(
+                        fd,
+                        min(1024 * 1024, observed.st_size - len(raw)),
+                    )
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                after = os.fstat(fd)
+            finally:
+                os.close(fd)
+            if (
+                len(raw) != observed.st_size
+                or after.st_dev != observed.st_dev
+                or after.st_ino != observed.st_ino
+                or after.st_size != observed.st_size
+                or after.st_mtime_ns != observed.st_mtime_ns
+            ):
+                raise ValueError("authority file changed while read")
+            preparation = decode_atomic_publication_preparation_v1(bytes(raw))
+            actual_relpath = path.relative_to(data_root).as_posix()
+            expected_preparation = PurePosixPath(
+                preparation.document_unit_snapshot_plan.relpath
+            ).with_name(ATOMIC_PUBLICATION_PREPARATION_FILENAME)
+            if actual_relpath != expected_preparation.as_posix():
+                raise ValueError("authority file path differs from its request")
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"invalid atomic publication preparation blocks GC: {path}"
+            ) from exc
+
+        run_root = expected_preparation.parent
+        expected["document_unit_snapshots"].update(
+            {
+                expected_preparation.as_posix(),
+                (run_root / ATOMIC_PUBLICATION_READINESS_FILENAME).as_posix(),
+                preparation.document_unit_snapshot_plan.relpath,
+                preparation.semantic_route_receipts_plan.relpath,
+            }
+        )
+        expected["provider_documents"].add(preparation.provider_document_plan.relpath)
+        expected["parser_artifacts"].add(
+            preparation.parser_output_plan.published_relpath.rstrip("/")
+        )
+    return expected
+
+
+def _merge_expected_owners(
+    *snapshots: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    merged: dict[str, set[str]] = {family: set() for family in _FAMILY_ROOTS}
+    for snapshot in snapshots:
+        if set(snapshot) != set(_FAMILY_ROOTS):
+            raise RuntimeError("artifact owner snapshot families drifted")
+        for family in _FAMILY_ROOTS:
+            merged[family].update(snapshot[family])
+    return merged
+
+
 def _is_owned(
     *,
     family: str,
@@ -159,7 +268,9 @@ def _is_owned(
     owners = expected[family]
     if family in _PREFIX_OWNERSHIP_FAMILIES:
         path = PurePosixPath(relpath)
-        return any(candidate.as_posix() in owners for candidate in (path, *path.parents))
+        return any(
+            candidate.as_posix() in owners for candidate in (path, *path.parents)
+        )
     return relpath in owners
 
 
@@ -215,9 +326,7 @@ def _build_manifest(orphans: list[_Orphan], *, planned_at: str) -> dict[str, obj
         family: {
             "files": sum(orphan.family == family for orphan in orphans),
             "bytes": sum(
-                orphan.size_bytes
-                for orphan in orphans
-                if orphan.family == family
+                orphan.size_bytes for orphan in orphans if orphan.family == family
             ),
         }
         for family in _FAMILY_ROOTS
@@ -300,16 +409,17 @@ def main() -> int:
     )
 
     engine = create_db_engine(settings.database_url.get_secret_value())
-    mutation_gate = (
-        exclusive_corpus_mutation(engine) if args.apply else nullcontext()
-    )
+    mutation_gate = exclusive_corpus_mutation(engine) if args.apply else nullcontext()
     try:
         # Apply mode takes the cross-tool lock before its DB reference
         # snapshot and holds it through the last unlink.  A full reset can
         # therefore never expose its just-truncated DB to this orphan scan.
         with mutation_gate:
             with engine.connect() as conn:
-                expected = _snapshot_expected_owners(conn)
+                expected = _merge_expected_owners(
+                    _snapshot_expected_owners(conn),
+                    _snapshot_preparation_owners(data_root),
+                )
 
             orphans, recheck_skipped_young = _collect_orphans(
                 candidates,
@@ -327,8 +437,7 @@ def main() -> int:
                 group_count[group] += 1
             skipped_young = {
                 family: (
-                    initially_skipped_young[family]
-                    + recheck_skipped_young[family]
+                    initially_skipped_young[family] + recheck_skipped_young[family]
                 )
                 for family in _FAMILY_ROOTS
             }
@@ -343,17 +452,15 @@ def main() -> int:
                 family_orphans = [
                     orphan for orphan in orphans if orphan.family == family
                 ]
-                family_bytes = sum(
-                    orphan.size_bytes for orphan in family_orphans
-                )
+                family_bytes = sum(orphan.size_bytes for orphan in family_orphans)
                 print(
                     f"  {family}: {len(family_orphans)} files, "
                     f"{family_bytes / 1024 / 1024:.1f} MiB; "
                     f"skipped_young={skipped_young[family]}"
                 )
-            for group, size in sorted(
-                group_bytes.items(), key=lambda item: -item[1]
-            )[: args.top]:
+            for group, size in sorted(group_bytes.items(), key=lambda item: -item[1])[
+                : args.top
+            ]:
                 print(
                     f"  {size / 1024 / 1024:8.1f} MiB  "
                     f"{group_count[group]:6d} files  {group}"

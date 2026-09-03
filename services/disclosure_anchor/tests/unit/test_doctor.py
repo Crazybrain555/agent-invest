@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,9 +16,11 @@ from disclosure_anchor.adapters.runtime.doctor import (
     CheckResult,
     _check_unit_snapshot_aggregate,
     _invalid_process_class_overrides,
+    _processing_run_checks,
     _semantic_receipt_check,
     mineru_remote_inference_check,
     inventory_orphan_files,
+    atomic_publication_readiness_checks,
     running_run_liveness_checks,
     run_doctor,
     run_startup_preflight,
@@ -25,10 +28,17 @@ from disclosure_anchor.adapters.runtime.doctor import (
 from disclosure_anchor.adapters.runtime.bounded_http import (
     BoundedHTTPProtocolError,
 )
-from disclosure_anchor.domain.errors import ConfigurationError
+from disclosure_anchor.domain.errors import ConfigurationError, ParserOutputContractError
 from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPT_VERSION,
+    SemanticRouteReceiptRowV3,
+    semantic_adjudication_terminal_v1,
+    semantic_route_receipts_file_bytes_v3,
+)
 from disclosure_anchor.settings import SENTINEL_NAME, Settings
 from tests.unit._env import without_db_env
+from tests.unit._semantic_routes import _fallback_receipt
 
 
 def _settings(
@@ -59,7 +69,230 @@ def _create_roots(root: Path) -> None:
     (root / SENTINEL_NAME).write_text("agent-system\n", encoding="utf-8")
 
 
+def _read_only_snapshot_engine(connection: MagicMock) -> tuple[MagicMock, MagicMock]:
+    raw_connection = MagicMock()
+    raw_connection.execution_options.return_value = connection
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = raw_connection
+    return engine, raw_connection
+
+
 class DoctorTests(unittest.TestCase):
+    def test_atomic_publication_readiness_reports_empty_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            connection = MagicMock()
+            count = MagicMock()
+            count.scalar_one.return_value = 0
+            connection.execute.side_effect = (count, ())
+            engine, raw_connection = _read_only_snapshot_engine(connection)
+
+            results = atomic_publication_readiness_checks(
+                _settings(root),
+                engine,
+                full=False,
+                sample_size=5,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "PASS")
+        self.assertIn("no committed winners", results[0].message)
+        raw_connection.execution_options.assert_called_once_with(
+            isolation_level="REPEATABLE READ"
+        )
+        connection.exec_driver_sql.assert_called_once_with(
+            "SET TRANSACTION READ ONLY"
+        )
+
+    def test_atomic_publication_readiness_fails_closed_on_row_drift(self) -> None:
+        winner_bytes = b"{}"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            connection = MagicMock()
+            count = MagicMock()
+            count.scalar_one.return_value = 1
+            connection.execute.side_effect = (
+                count,
+                ((winner_bytes, "sha256:" + "f" * 64, len(winner_bytes)),),
+            )
+            engine, _ = _read_only_snapshot_engine(connection)
+
+            results = atomic_publication_readiness_checks(
+                _settings(root),
+                engine,
+                full=True,
+                sample_size=5,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "FAIL")
+        self.assertIn("winner row bytes drifted", results[0].message)
+
+    def test_atomic_publication_readiness_warns_for_decode_only_v1(self) -> None:
+        winner_bytes = b'{"legacy":true}'
+        winner_sha256 = "sha256:" + hashlib.sha256(winner_bytes).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            connection = MagicMock()
+            count = MagicMock()
+            count.scalar_one.return_value = 1
+            connection.execute.side_effect = (
+                count,
+                ((winner_bytes, winner_sha256, len(winner_bytes)),),
+            )
+            engine, _ = _read_only_snapshot_engine(connection)
+
+            with patch(
+                "disclosure_anchor.adapters.runtime.doctor."
+                "decode_atomic_publication_winner_v4",
+                return_value=SimpleNamespace(
+                    sha256=winner_sha256,
+                    winner_row_version=1,
+                ),
+            ):
+                results = atomic_publication_readiness_checks(
+                    _settings(root),
+                    engine,
+                    full=False,
+                    sample_size=5,
+                )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, "WARN")
+        self.assertIn("decode-only", results[0].message)
+
+    def test_atomic_publication_readiness_reports_parser_tree_drift_as_fail(self) -> None:
+        winner_bytes = b'{"winner":2}'
+        winner_sha256 = "sha256:" + hashlib.sha256(winner_bytes).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            connection = MagicMock()
+            count = MagicMock()
+            count.scalar_one.return_value = 1
+            connection.execute.side_effect = (
+                count,
+                ((winner_bytes, winner_sha256, len(winner_bytes)),),
+            )
+            engine, _ = _read_only_snapshot_engine(connection)
+            winner = SimpleNamespace(
+                sha256=winner_sha256,
+                winner_row_version=2,
+                artifact_readiness=object(),
+            )
+
+            with (
+                patch(
+                    "disclosure_anchor.adapters.runtime.doctor."
+                    "decode_atomic_publication_winner_v4",
+                    return_value=winner,
+                ),
+                patch(
+                    "disclosure_anchor.adapters.runtime.doctor."
+                    "FilesystemAtomicPublicationArtifactReadinessV4.verify_ready",
+                    side_effect=ParserOutputContractError("parser tree drifted"),
+                ),
+            ):
+                results = atomic_publication_readiness_checks(
+                    _settings(root),
+                    engine,
+                    full=True,
+                    sample_size=5,
+                )
+
+        self.assertEqual(results[0].status, "FAIL")
+        self.assertIn("parser tree drifted", results[0].message)
+
+    def test_atomic_publication_readiness_fails_on_snapshot_count_row_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            connection = MagicMock()
+            count = MagicMock()
+            count.scalar_one.return_value = 0
+            connection.execute.side_effect = (
+                count,
+                ((b"{}", "sha256:" + "a" * 64, 2),),
+            )
+            engine, _ = _read_only_snapshot_engine(connection)
+
+            results = atomic_publication_readiness_checks(
+                _settings(root),
+                engine,
+                full=False,
+                sample_size=5,
+            )
+
+        self.assertEqual(results[0].status, "FAIL")
+        self.assertIn("rows=1 expected=0 total=0", results[0].message)
+
+    def test_processing_run_query_projects_semantic_failover_group_count(
+        self,
+    ) -> None:
+        connection = MagicMock()
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = [
+            {
+                "processing_run_id": "run_v3",
+                "status": "succeeded",
+                "normalized_ir_relpath": None,
+                "provider_document_relpath": "provider.json",
+                "artifact_hash": "sha256:" + "1" * 64,
+                "error": None,
+                "unit_build_status": "succeeded",
+                "document_units_relpath": "units.jsonl",
+                "content_hash_aggregate": "sha256:" + "2" * 64,
+                "unit_build_error": None,
+                "semantic_adjudication_status": "degraded_unavailable",
+                "semantic_degraded_unit_count": 3,
+                "semantic_failover_group_count": 2,
+                "semantic_adjudication_summary": {
+                    "status": "degraded_unavailable"
+                },
+                "semantic_route_receipts_relpath": "semantic.jsonl",
+                "semantic_route_receipts_contract_version": (
+                    "semantic_route_receipt.v3"
+                ),
+                "semantic_route_receipts_hash": "sha256:" + "3" * 64,
+            }
+        ]
+        connection.execute.return_value = result
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value = connection
+        passed = CheckResult(name="test", status="PASS", message="verified")
+
+        with (
+            patch(
+                "disclosure_anchor.adapters.runtime.doctor._check_artifact_hash",
+                return_value=passed,
+            ),
+            patch(
+                "disclosure_anchor.adapters.runtime.doctor."
+                "_check_unit_snapshot_aggregate",
+                return_value=passed,
+            ),
+            patch(
+                "disclosure_anchor.adapters.runtime.doctor._semantic_receipt_check",
+                return_value=passed,
+            ) as semantic_check,
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            results = _processing_run_checks(_settings(Path(tmp)), engine)
+
+        statement = str(connection.execute.call_args.args[0])
+        self.assertIn("semantic_failover_group_count", statement)
+        semantic_check.assert_called_once()
+        self.assertEqual(
+            semantic_check.call_args.kwargs["expected_failover_group_count"],
+            2,
+        )
+        self.assertEqual(results, [passed, passed, passed])
+
     def test_doctor_verifies_hash_bound_historical_semantic_receipt(self) -> None:
         payload = {
             "asset_id": "asset_1",
@@ -93,11 +326,55 @@ class DoctorTests(unittest.TestCase):
                 expected_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
                 semantic_status="not_required",
                 expected_degraded_count=0,
+                expected_failover_group_count=0,
                 summary={"status": "not_required"},
             )
 
         self.assertEqual(result.status, "PASS")
         self.assertIn("verified", result.message)
+
+    def test_doctor_verifies_v3_jsonl_and_complete_semantic_terminal(self) -> None:
+        route = SemanticRouteReceiptRowV3(
+            processing_run_id="run_v3",
+            unit_order_index=1,
+            provider_locator_sha256="sha256:" + "2" * 64,
+            routed_draft_sha256="sha256:" + "3" * 64,
+            receipt=replace(
+                _fallback_receipt(1),
+                contract_version=SEMANTIC_ROUTE_RECEIPT_VERSION,
+                semantic_keys=(),
+                evidence=(),
+            ),
+        )
+        raw = semantic_route_receipts_file_bytes_v3((route,))
+        terminal = semantic_adjudication_terminal_v1((route.receipt,))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _create_roots(root)
+            relpath = Path("derived/test/semantic_route_receipts.v3.jsonl")
+            path = root / "services" / "disclosure_anchor" / "data" / relpath
+            path.parent.mkdir(parents=True)
+            path.write_bytes(raw)
+            values = {
+                "settings": _settings(root),
+                "object_id": "run_v3",
+                "relpath": str(relpath),
+                "contract_version": "semantic_route_receipt.v3",
+                "expected_hash": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                "semantic_status": terminal.status,
+                "expected_degraded_count": terminal.degraded_unit_count,
+                "expected_failover_group_count": terminal.failover_group_count,
+                "summary": terminal.summary,
+            }
+
+            result = _semantic_receipt_check(**values)
+            drifted = _semantic_receipt_check(
+                **{**values, "summary": {"status": terminal.status}}
+            )
+
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(drifted.status, "FAIL")
+        self.assertIn("terminal drifted", drifted.message)
 
     def test_runtime_identity_requires_direct_non_superuser_app_login(self) -> None:
         cases = (
@@ -237,8 +514,7 @@ class DoctorTests(unittest.TestCase):
                     return_value=identity,
                 ),
                 patch(
-                    "disclosure_anchor.adapters.runtime.doctor."
-                    "single_migration_head",
+                    "disclosure_anchor.adapters.runtime.doctor.single_migration_head",
                     return_value="0050",
                 ),
                 patch(
@@ -323,9 +599,7 @@ class DoctorTests(unittest.TestCase):
                 update={"disclosure_mineru_observability_url": "http://gpu:30000"}
             )
         client = MagicMock()
-        client.get_bytes.side_effect = BoundedHTTPProtocolError(
-            "partial response"
-        )
+        client.get_bytes.side_effect = BoundedHTTPProtocolError("partial response")
 
         with patch(
             "disclosure_anchor.adapters.runtime.mineru_canary._direct_client",
@@ -430,7 +704,7 @@ class DoctorTests(unittest.TestCase):
                 "203 102 /runtime/bin/mineru -p pipeline.pdf\n"
                 "204 103 /runtime/bin/mineru -p admin-api.pdf\n"
                 "300 1 python -c from doctor import _mineru_orphan_check\n"
-            )
+            ),
         )
 
         with without_db_env(), tempfile.TemporaryDirectory() as tmp:
@@ -463,7 +737,7 @@ class DoctorTests(unittest.TestCase):
                 "1 0 /sbin/launchd\n"
                 "200 1 /runtime/bin/mineru -p report.pdf\n"
                 "201 200 /runtime/bin/python -m mineru.cli.fast_api\n"
-            )
+            ),
         )
 
         with without_db_env(), tempfile.TemporaryDirectory() as tmp:
@@ -556,9 +830,12 @@ class DoctorTests(unittest.TestCase):
             self.assertIn("DATABASE_URL", failed)
 
     def test_startup_preflight_fails_when_reader_url_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, patch(
-            "disclosure_anchor.adapters.runtime.doctor._database_ping_and_migration_checks",
-            return_value=[],
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "disclosure_anchor.adapters.runtime.doctor._database_ping_and_migration_checks",
+                return_value=[],
+            ),
         ):
             root = Path(tmp)
             _create_roots(root)
@@ -575,9 +852,12 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("exact reader role", failures["DISCLOSURE_READER_DATABASE_URL"])
 
     def test_startup_preflight_passes_reader_url_when_configured(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, patch(
-            "disclosure_anchor.adapters.runtime.doctor._database_ping_and_migration_checks",
-            return_value=[],
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "disclosure_anchor.adapters.runtime.doctor._database_ping_and_migration_checks",
+                return_value=[],
+            ),
         ):
             root = Path(tmp)
             _create_roots(root)
@@ -599,7 +879,10 @@ class DoctorTests(unittest.TestCase):
             (root / SENTINEL_NAME).unlink()
             report = run_doctor(_settings(root))
             self.assertFalse(report.ok)
-            self.assertIn("mount sentinel", [result.name for result in report.results if not result.ok])
+            self.assertIn(
+                "mount sentinel",
+                [result.name for result in report.results if not result.ok],
+            )
 
     def test_fails_when_model_cache_escapes_shared_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -617,9 +900,7 @@ class UnitSnapshotAggregateCheckTests(unittest.TestCase):
     RELPATH = "derived/document_unit_snapshots/x/y/z/run/document_units.v1.jsonl"
 
     def _write_snapshot(self, root: Path, rows: list[dict[str, object]]) -> None:
-        path = (
-            root / "services" / "disclosure_anchor" / "data" / Path(self.RELPATH)
-        )
+        path = root / "services" / "disclosure_anchor" / "data" / Path(self.RELPATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"

@@ -17,6 +17,22 @@ from disclosure_anchor.application.contracts.atomic_document_publication_v4 impo
     seal_pre_id_unit_publication_v4,
     seal_upstream_publication_evidence_v4,
 )
+from disclosure_anchor.application.contracts.atomic_publication_artifact_readiness_v4 import (
+    AtomicPublicationArtifactPreparationV1,
+    AtomicPublicationArtifactReadinessError,
+    AtomicPublicationFileResourceV1,
+    AtomicPublicationParserOutputPlanV1,
+    AtomicPublicationReadinessManifestV1,
+    AtomicPublicationReadinessReferenceV1,
+    AtomicPublicationUnitBindingV4,
+    decode_atomic_publication_preparation_v1,
+    decode_atomic_publication_readiness_v1,
+    document_unit_snapshot_file_bytes_v1,
+    final_unit_bindings_sha256_v4,
+    lineage_bindings_sha256_v4,
+    readiness_resource_values_sha256_v1,
+    validate_preparation_readiness_pair_v1,
+)
 from disclosure_anchor.application.contracts.local_materialization_manifest_v4 import (
     LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
     LocalMaterializationManifestV4,
@@ -55,9 +71,11 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPT_V3,
+    SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME,
     SEMANTIC_ROUTE_RECEIPT_VERSION,
     SemanticRouteReceiptRowV3,
-    semantic_route_receipt_row_v3_to_payload,
+    semantic_adjudication_terminal_v1,
+    semantic_route_receipts_file_bytes_v3,
 )
 from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitLocator,
@@ -78,6 +96,7 @@ from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     lineage_row_sha256_v4,
     lineage_rows_sha256_v4,
     processing_run_row_sha256_v4,
+    seal_unit_asset_winners_v4,
     seal_atomic_publication_winner_v4,
     seal_published_outbox_commit_reference_v4,
     seal_published_outbox_event_v4,
@@ -260,6 +279,27 @@ class AtomicDocumentPublicationV4Tests(unittest.TestCase):
             replace(unit, section_keys=("section", "section"))
         with self.assertRaisesRegex(WholeDocumentPublicationV4Error, "locator"):
             replace(unit, provider_locator_sha256=SHA_A)
+
+    def test_v4_rejects_rebuild_projection_without_self_owned_parse_authority(self) -> None:
+        request = _request()
+        projection = json.loads(request.processing_run_projection_json)
+        projection["run_kind"] = "rebuild_units"
+        projection_json = json.dumps(
+            projection,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.assertRaisesRegex(
+            WholeDocumentPublicationV4Error,
+            "self-owned parse",
+        ):
+            replace(
+                request,
+                processing_run_projection_json=projection_json,
+                processing_run_projection_sha256=(
+                    "sha256:" + hashlib.sha256(projection_json.encode()).hexdigest()
+                ),
+            )
 
     def test_upstream_bridge_rejects_cross_attempt_and_fact_drift(self) -> None:
         reservation, checkpoint, intent, receipt, manifest, provider_envelope = (
@@ -989,6 +1029,95 @@ def _publication_materialized_evidence() -> tuple[
     )
 
 
+class AtomicPublicationArtifactReadinessV4Tests(unittest.TestCase):
+    def test_preparation_and_readiness_round_trip_exactly(self) -> None:
+        request = _request()
+        preparation = _artifact_preparation(request)
+        self.assertEqual(
+            decode_atomic_publication_preparation_v1(preparation.canonical_bytes),
+            preparation,
+        )
+        manifest, reference = _artifact_readiness(preparation)
+        self.assertEqual(
+            decode_atomic_publication_readiness_v1(manifest.canonical_bytes),
+            manifest,
+        )
+        validate_preparation_readiness_pair_v1(
+            preparation=preparation,
+            manifest=manifest,
+            reference=reference,
+            request=request,
+        )
+
+    def test_preparation_binds_request_bytes_ids_and_jsonl_hashes(self) -> None:
+        request = _request()
+        preparation = _artifact_preparation(request)
+        snapshot = document_unit_snapshot_file_bytes_v1(
+            request=request,
+            bindings=preparation.unit_bindings,
+        )
+        semantic = semantic_route_receipts_file_bytes_v3(
+            request.semantic_route_receipts
+        )
+        self.assertEqual(
+            preparation.document_unit_snapshot_plan.sha256,
+            "sha256:" + hashlib.sha256(snapshot).hexdigest(),
+        )
+        self.assertEqual(
+            preparation.semantic_route_receipts_plan.sha256,
+            "sha256:" + hashlib.sha256(semantic).hexdigest(),
+        )
+        self.assertFalse(semantic.startswith(b"["))
+        self.assertTrue(semantic.endswith(b"\n"))
+
+    def test_readiness_rejects_request_or_resource_drift(self) -> None:
+        request = _request()
+        preparation = _artifact_preparation(request)
+        manifest, reference = _artifact_readiness(preparation)
+        with self.assertRaisesRegex(
+            AtomicPublicationArtifactReadinessError,
+            "request bytes drifted",
+        ):
+            validate_preparation_readiness_pair_v1(
+                preparation=preparation,
+                manifest=manifest,
+                reference=reference,
+                request=_request(
+                    previous_active_run_id="run-old",
+                    previous_active_units=(_previous_active_unit(request),),
+                ),
+            )
+        with self.assertRaisesRegex(
+            AtomicPublicationArtifactReadinessError,
+            "aggregate",
+        ):
+            replace(manifest, resources_sha256=SHA_A)
+        with self.assertRaisesRegex(
+            AtomicPublicationArtifactReadinessError,
+            "resource contract is unsupported",
+        ):
+            replace(
+                preparation.provider_document_plan,
+                resource_contract_version="provider_document.v2",
+            )
+        with self.assertRaisesRegex(
+            AtomicPublicationArtifactReadinessError,
+            "fixed siblings",
+        ):
+            validate_preparation_readiness_pair_v1(
+                preparation=preparation,
+                manifest=manifest,
+                reference=replace(
+                    reference,
+                    manifest_relpath=(
+                        "derived/document_unit_snapshots/other/run/"
+                        "atomic_publication_readiness.v1.json"
+                    ),
+                ),
+                request=request,
+            )
+
+
 def _request(
     *,
     previous_active_run_id: str | None = None,
@@ -1005,6 +1134,8 @@ def _request(
         manifest=manifest,
         provider_envelope=provider_envelope,
     )
+    context = intent.provider_envelope_context
+    parser_target = context.parser_target_identity
     payload = {"text": "hello"}
     hashes = compute_unit_hashes(
         payload_kind="text",
@@ -1070,14 +1201,11 @@ def _request(
             evidence=(),
         ),
     )
-    semantic_projection = json.dumps(
-        [semantic_route_receipt_row_v3_to_payload(route)],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
+    semantic_projection = semantic_route_receipts_file_bytes_v3((route,))
+    terminal = semantic_adjudication_terminal_v1((route.receipt,))
     projection = json.dumps(
         {
+            "artifact_owner_processing_run_id": "run-1",
             "builder_rules_version": "provider-unit-builder.v1",
             "content_hash_aggregate": content_hash_aggregate([unit.content_hash]),
             "contract_version": "processing-run-publication.v4",
@@ -1087,7 +1215,14 @@ def _request(
                 "run-1/document_units.v1.jsonl"
             ),
             "is_active": True,
+            "normalized_ir_relpath": None,
             "parser_artifact_relpath": upstream.parser_artifact_root_relpath,
+            "parser_backend": parser_target.backend,
+            "parser_language": parser_target.language,
+            "parser_method": parser_target.method,
+            "parser_name": parser_target.name,
+            "parser_target_identity": parser_target.to_payload(),
+            "parser_version": parser_target.package_version,
             "processing_run_id": "run-1",
             "provider_document_id": upstream.provider_document_id,
             "provider_document_relpath": (
@@ -1096,7 +1231,15 @@ def _request(
             ),
             "provider_document_sha256": upstream.provider_document_sha256,
             "run_kind": "parse",
+            "semantic_adjudication_status": terminal.status,
+            "semantic_adjudication_summary": terminal.summary,
+            "semantic_degraded_unit_count": terminal.degraded_unit_count,
+            "semantic_failover_group_count": terminal.failover_group_count,
             "semantic_route_receipts_contract_version": SEMANTIC_ROUTE_RECEIPT_V3,
+            "semantic_route_receipts_relpath": (
+                "derived/document_unit_snapshots/cninfo/000001/1225087169/"
+                f"run-1/{SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME}"
+            ),
             "semantic_route_receipts_sha256": (
                 "sha256:" + hashlib.sha256(semantic_projection).hexdigest()
             ),
@@ -1106,6 +1249,8 @@ def _request(
             "structure_hash_aggregate": structure_hash_aggregate(
                 [unit.structure_hash]
             ),
+            "unit_build_attempt_count": 1,
+            "unit_build_status": "succeeded",
             "unit_count": 1,
         },
         sort_keys=True,
@@ -1133,12 +1278,143 @@ def _request(
         ),
         semantic_route_receipts_contract_version=SEMANTIC_ROUTE_RECEIPT_V3,
         semantic_route_receipts=(route,),
+        expected_unit_build_status_before="running",
+        expected_unit_build_attempt_count_before=0,
         previous_active_units=previous_active_units,
         previous_active_units_sha256=previous_active_units_sha256_v4(
             previous_active_units
         ),
         units=(unit,),
     )
+
+
+def _artifact_preparation(
+    request: AtomicPublicationRequestV4,
+) -> AtomicPublicationArtifactPreparationV1:
+    assets = seal_unit_asset_winners_v4(
+        request=request,
+        asset_ids=("du_01K00000000000000000000000",),
+    )
+    bindings = tuple(
+        AtomicPublicationUnitBindingV4(
+            unit_index=item.unit_index,
+            asset_id=item.asset_id,
+            routed_draft_sha256=item.routed_draft_sha256,
+            final_unit_row_sha256=item.final_unit_row_sha256,
+            lineage_row_sha256=item.lineage_row_sha256,
+        )
+        for item in assets
+    )
+    projection = json.loads(request.processing_run_projection_json)
+    snapshot = document_unit_snapshot_file_bytes_v1(
+        request=request,
+        bindings=bindings,
+    )
+    semantic = semantic_route_receipts_file_bytes_v3(
+        request.semantic_route_receipts
+    )
+    return AtomicPublicationArtifactPreparationV1(
+        attempt_id=request.identity.attempt_id,
+        attempt_generation=request.identity.attempt_generation,
+        fence_identity=request.identity.fence_identity,
+        document_id=request.identity.document_id,
+        processing_run_id=request.identity.processing_run_id,
+        provider_document_id=request.identity.provider_document_id,
+        canonical_request_json=request.canonical_bytes.decode("utf-8"),
+        request_sha256=request.request_sha256,
+        request_byte_count=len(request.canonical_bytes),
+        artifact_owner_processing_run_id=request.identity.processing_run_id,
+        parser_target_sha256=request.upstream_evidence.parser_target_sha256,
+        provider_envelope_context_sha256=(
+            request.upstream_evidence.provider_envelope_context_sha256
+        ),
+        unit_bindings=bindings,
+        final_units_sha256=final_unit_bindings_sha256_v4(bindings),
+        lineage_sha256=lineage_bindings_sha256_v4(bindings),
+        parser_output_plan=AtomicPublicationParserOutputPlanV1(
+            source_relpath="staged/materialized/attempt-1/output",
+            published_relpath=request.upstream_evidence.parser_artifact_root_relpath,
+            inventory_sha256=request.upstream_evidence.output_files_sha256,
+            file_count=request.upstream_evidence.output_file_count,
+            byte_count=request.upstream_evidence.output_total_byte_count,
+        ),
+        provider_document_plan=AtomicPublicationFileResourceV1(
+            role="provider_document",
+            relpath=projection["provider_document_relpath"],
+            sha256=request.upstream_evidence.provider_document_sha256,
+            byte_count=request.upstream_evidence.provider_envelope_byte_count,
+            resource_contract_version="provider_document.v1",
+        ),
+        document_unit_snapshot_plan=AtomicPublicationFileResourceV1(
+            role="document_unit_snapshot",
+            relpath=projection["document_units_relpath"],
+            sha256="sha256:" + hashlib.sha256(snapshot).hexdigest(),
+            byte_count=len(snapshot),
+            resource_contract_version="document_units.v1",
+        ),
+        semantic_route_receipts_plan=AtomicPublicationFileResourceV1(
+            role="semantic_route_receipts",
+            relpath=(
+                "derived/document_unit_snapshots/cninfo/000001/1225087169/"
+                "run-1/semantic_route_receipts.v3.jsonl"
+            ),
+            sha256="sha256:" + hashlib.sha256(semantic).hexdigest(),
+            byte_count=len(semantic),
+            resource_contract_version=SEMANTIC_ROUTE_RECEIPT_V3,
+        ),
+    )
+
+
+def _artifact_readiness(
+    preparation: AtomicPublicationArtifactPreparationV1,
+) -> tuple[
+    AtomicPublicationReadinessManifestV1,
+    AtomicPublicationReadinessReferenceV1,
+]:
+    prep_relpath = (
+        "derived/document_unit_snapshots/cninfo/000001/1225087169/run-1/"
+        "atomic_publication_preparation.v1.json"
+    )
+    resources_sha256 = readiness_resource_values_sha256_v1(
+        parser_output=preparation.parser_output_plan,
+        provider_document=preparation.provider_document_plan,
+        document_unit_snapshot=preparation.document_unit_snapshot_plan,
+        semantic_route_receipts=preparation.semantic_route_receipts_plan,
+    )
+    manifest = AtomicPublicationReadinessManifestV1(
+        attempt_id=preparation.attempt_id,
+        attempt_generation=preparation.attempt_generation,
+        fence_identity=preparation.fence_identity,
+        document_id=preparation.document_id,
+        processing_run_id=preparation.processing_run_id,
+        provider_document_id=preparation.provider_document_id,
+        request_sha256=preparation.request_sha256,
+        artifact_owner_processing_run_id=preparation.artifact_owner_processing_run_id,
+        parser_target_sha256=preparation.parser_target_sha256,
+        provider_envelope_context_sha256=(
+            preparation.provider_envelope_context_sha256
+        ),
+        preparation_relpath=prep_relpath,
+        preparation_sha256=preparation.sha256,
+        preparation_byte_count=len(preparation.canonical_bytes),
+        unit_bindings=preparation.unit_bindings,
+        final_units_sha256=preparation.final_units_sha256,
+        lineage_sha256=preparation.lineage_sha256,
+        parser_output=preparation.parser_output_plan,
+        provider_document=preparation.provider_document_plan,
+        document_unit_snapshot=preparation.document_unit_snapshot_plan,
+        semantic_route_receipts=preparation.semantic_route_receipts_plan,
+        resources_sha256=resources_sha256,
+    )
+    reference = AtomicPublicationReadinessReferenceV1(
+        manifest_relpath=(
+            "derived/document_unit_snapshots/cninfo/000001/1225087169/run-1/"
+            "atomic_publication_readiness.v1.json"
+        ),
+        manifest_sha256=manifest.sha256,
+        manifest_byte_count=len(manifest.canonical_bytes),
+    )
+    return manifest, reference
 
 
 def _previous_active_unit(

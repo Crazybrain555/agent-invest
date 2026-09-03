@@ -10,7 +10,15 @@ import re
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+from disclosure_anchor.application.contracts.atomic_publication_artifact_readiness_v4 import (
+    AtomicPublicationArtifactsReadyV4,
+    AtomicPublicationReadinessReferenceV1,
+    AtomicPublicationUnitBindingV4,
+    validate_preparation_readiness_pair_v1,
+)
 from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness
+from disclosure_anchor.domain import entities as e
+from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain.services.unit_hashing import query_projection
 
 if TYPE_CHECKING:
@@ -192,6 +200,7 @@ class AtomicPublicationWinnerV4:
     durable_base_commit: DurablePublishBaseCommitReference
     unit_assets: tuple[UnitAssetWinnerV4, ...]
     publish_precommit_at: datetime
+    artifact_readiness: AtomicPublicationReadinessReferenceV1 | None = None
     winner_row_version: int = 1
     contract_version: str = ATOMIC_PUBLICATION_WINNER_V4_CONTRACT
 
@@ -280,8 +289,14 @@ class AtomicPublicationWinnerV4:
             != self.publish_precommit_at
         ):
             raise ValueError("durable-base precommit time drifted from winner")
-        if self.winner_row_version != 1:
-            raise ValueError("winner row version is not immutable v1")
+        if self.winner_row_version == 1:
+            if self.artifact_readiness is not None:
+                raise ValueError("legacy winner v1 cannot bind artifact readiness")
+        elif self.winner_row_version == 2:
+            if type(self.artifact_readiness) is not AtomicPublicationReadinessReferenceV1:
+                raise ValueError("winner v2 lacks exact artifact readiness")
+        else:
+            raise ValueError("winner row version is unsupported")
 
     @property
     def canonical_bytes(self) -> bytes:
@@ -292,11 +307,25 @@ class AtomicPublicationWinnerV4:
         return "sha256:" + hashlib.sha256(self.canonical_bytes).hexdigest()
 
 
-class AtomicWholeDocumentPublisherV4Port(Protocol):
+class AtomicPublicationWinnerReaderV4Port(Protocol):
+    """Read committed winner authority without knowing its attempt ID."""
+
+    def reload_commit_winner_by_processing_run_id(
+        self,
+        *,
+        processing_run_id: str,
+    ) -> AtomicPublicationWinnerV4 | None: ...
+
+
+class AtomicWholeDocumentPublisherV4Port(
+    AtomicPublicationWinnerReaderV4Port,
+    Protocol,
+):
     """One non-async-local-commit PostgreSQL transaction selects the winner.
 
     The transaction locks the active run and must compare its canonical Unit
-    inventory and digest with the request before assigning fresh Unit IDs.
+    inventory and digest with the request before consuming the ordinary Unit
+    IDs sealed by the immutable preparation intent.
     """
 
     def commit_whole_document(
@@ -304,11 +333,13 @@ class AtomicWholeDocumentPublisherV4Port(Protocol):
         request: AtomicPublicationRequestV4,
         *,
         claim: V4ClaimWitness,
+        artifacts_ready: AtomicPublicationArtifactsReadyV4,
     ) -> AtomicPublicationWinnerV4: ...
 
     def reload_commit_winner(
         self, *, processing_run_id: str, attempt_id: str
     ) -> AtomicPublicationWinnerV4 | None: ...
+
 
 
 def validate_atomic_publication_claim_v4(
@@ -338,6 +369,44 @@ def validate_atomic_publication_claim_v4(
         or claim.checkpoint_sha256 != identity.expected_checkpoint_sha256
     ):
         raise ValueError("publication claim drifted from its request")
+
+
+def validate_atomic_publication_artifacts_ready_v4(
+    *,
+    request: AtomicPublicationRequestV4,
+    artifacts_ready: AtomicPublicationArtifactsReadyV4,
+) -> None:
+    if type(artifacts_ready) is not AtomicPublicationArtifactsReadyV4:
+        raise ValueError("publication requires an exact artifact-ready witness")
+    if artifacts_ready.request.canonical_bytes != request.canonical_bytes:
+        raise ValueError("artifact-ready witness belongs to another request")
+    validate_preparation_readiness_pair_v1(
+        preparation=artifacts_ready.preparation,
+        manifest=artifacts_ready.manifest,
+        reference=artifacts_ready.reference,
+        request=request,
+    )
+    expected_assets = seal_unit_asset_winners_v4(
+        request=request,
+        asset_ids=tuple(
+            item.asset_id for item in artifacts_ready.preparation.unit_bindings
+        ),
+    )
+    expected_bindings = tuple(
+        AtomicPublicationUnitBindingV4(
+            unit_index=item.unit_index,
+            asset_id=item.asset_id,
+            routed_draft_sha256=item.routed_draft_sha256,
+            final_unit_row_sha256=item.final_unit_row_sha256,
+            lineage_row_sha256=item.lineage_row_sha256,
+        )
+        for item in expected_assets
+    )
+    if (
+        artifacts_ready.preparation.unit_bindings != expected_bindings
+        or artifacts_ready.manifest.unit_bindings != expected_bindings
+    ):
+        raise ValueError("artifact-ready Unit bindings drifted from request")
 
 
 def seal_atomic_publication_winner_v4(
@@ -505,6 +574,96 @@ def seal_published_outbox_commit_reference_v4(
         processing_run_published_event_sha256=published[0].event_row_sha256,
         events=events,
     )
+
+
+def build_atomic_publication_outbox_events_v4(
+    *,
+    request: AtomicPublicationRequestV4,
+    asset_ids: tuple[str, ...],
+    occurred_at: datetime,
+) -> tuple[e.OutboxEvent, ...]:
+    """Build the only outbox ordering admitted by transaction P."""
+
+    _utc(occurred_at, "atomic publication outbox time")
+    unit_assets = seal_unit_asset_winners_v4(
+        request=request,
+        asset_ids=asset_ids,
+    )
+    unit_diff = _derive_unit_diff_v4(
+        request=request,
+        unit_assets=unit_assets,
+    )
+    events: list[e.OutboxEvent] = []
+    for old in unit_diff.removed:
+        events.append(
+            outbox_events.document_unit_removed(
+                document_id=request.identity.document_id,
+                old_processing_run_id=old.processing_run_id,
+                old_asset_id=old.asset_id,
+                content_hash=old.content_hash,
+                payload_kind=old.payload_kind,
+                old_order_index=old.order_index,
+                old_heading_path=list(old.heading_path),
+                occurred_at=occurred_at,
+            )
+        )
+    for new in unit_diff.created:
+        unit = new.unit
+        events.append(
+            outbox_events.document_unit_created(
+                document_id=request.identity.document_id,
+                processing_run_id=request.identity.processing_run_id,
+                new_asset_id=new.asset_id,
+                content_hash=unit.content_hash,
+                payload_kind=unit.payload_kind,
+                new_order_index=unit.unit_index,
+                new_heading_path=list(unit.heading_path),
+                occurred_at=occurred_at,
+            )
+        )
+    for old, new, changed_fields in unit_diff.projection_changed:
+        events.append(
+            outbox_events.document_unit_projection_changed(
+                document_id=request.identity.document_id,
+                new_processing_run_id=request.identity.processing_run_id,
+                old_asset_id=old.asset_id,
+                new_asset_id=new.asset_id,
+                content_hash=new.unit.content_hash,
+                old_query_projection_hash=old.query_projection_hash,
+                new_query_projection_hash=new.unit.query_projection_hash,
+                changed_fields=list(changed_fields),
+                occurred_at=occurred_at,
+            )
+        )
+    projection = cast(
+        dict[str, Any],
+        strict_json_loads(request.processing_run_projection_json.encode("utf-8")),
+    )
+    previous_run = request.identity.expected_previous_processing_run_id
+    change_kind = (
+        "materialized"
+        if previous_run is None or unit_diff.created or unit_diff.removed
+        else "observed"
+    )
+    events.append(
+        outbox_events.processing_run_published(
+            document_id=request.identity.document_id,
+            processing_run_id=request.identity.processing_run_id,
+            change_kind=change_kind,
+            previous_processing_run_id=previous_run,
+            content_hash_aggregate=projection["content_hash_aggregate"],
+            structure_hash=projection["structure_hash_aggregate"],
+            unit_count=len(request.units),
+            created_count=len(unit_diff.created),
+            removed_count=len(unit_diff.removed),
+            projection_changed_count=len(unit_diff.projection_changed),
+            source_identity=request.upstream_evidence.source_pdf_sha256,
+            source_page_count=request.source_page_count,
+            publish_committed_at=occurred_at,
+            occurred_at=occurred_at,
+        )
+    )
+    return tuple(events)
 
 
 def durable_publish_base_sha256_v4(
@@ -1085,7 +1244,12 @@ def decode_atomic_publication_winner_v4(
     if not isinstance(payload, dict):
         raise ValueError("atomic publication winner must be an object")
     root = cast(dict[str, Any], payload)
-    _closed(root, AtomicPublicationWinnerV4)
+    current_fields = {item.name for item in fields(AtomicPublicationWinnerV4)}
+    legacy_fields = current_fields - {"artifact_readiness"}
+    if set(root) == legacy_fields and root.get("winner_row_version") == 1:
+        root = {**root, "artifact_readiness": None}
+    elif set(root) != current_fields:
+        raise ValueError("AtomicPublicationWinnerV4 fields are not closed")
     outbox = _decode_outbox_commit(root["outbox_commit"])
     durable_payload = root["durable_base_commit"]
     if not isinstance(durable_payload, dict):
@@ -1103,12 +1267,22 @@ def decode_atomic_publication_winner_v4(
     if not isinstance(raw_assets, list):
         raise ValueError("winner Unit assets must be an array")
     assets = tuple(_nested(item, UnitAssetWinnerV4) for item in raw_assets)
+    readiness_payload = root["artifact_readiness"]
+    readiness = (
+        None
+        if readiness_payload is None
+        else _nested(
+            readiness_payload,
+            AtomicPublicationReadinessReferenceV1,
+        )
+    )
     value = AtomicPublicationWinnerV4(
         **{
             **root,
             "outbox_commit": outbox,
             "durable_base_commit": durable,
             "unit_assets": assets,
+            "artifact_readiness": readiness,
             "publish_precommit_at": _datetime(root["publish_precommit_at"]),
         }
     )
@@ -1132,6 +1306,8 @@ def _winner_payload(value: AtomicPublicationWinnerV4) -> dict[str, Any]:
         ),
     }
     payload["unit_assets"] = [asdict(item) for item in value.unit_assets]
+    if value.winner_row_version == 1:
+        payload.pop("artifact_readiness", None)
     return payload
 
 
@@ -1358,7 +1534,9 @@ __all__ = [
     "AtomicPublicationCommitResponseLost",
     "AtomicPublicationUniqueConflict",
     "AtomicPublicationWinnerV4",
+    "AtomicPublicationWinnerReaderV4Port",
     "AtomicWholeDocumentPublisherV4Port",
+    "build_atomic_publication_outbox_events_v4",
     "DurablePublishBaseCommitReference",
     "PublishedOutboxCommitReference",
     "PublishedOutboxEventV4",
@@ -1377,5 +1555,6 @@ __all__ = [
     "published_outbox_event_row_sha256_v4",
     "published_outbox_events_sha256_v4",
     "validate_atomic_publication_winner_v4",
+    "validate_atomic_publication_artifacts_ready_v4",
     "validate_atomic_publication_claim_v4",
 ]

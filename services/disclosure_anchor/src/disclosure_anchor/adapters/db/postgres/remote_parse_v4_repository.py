@@ -570,9 +570,10 @@ class RemoteParseV4Repository:
     ) -> RemoteParseV4Authority:
         if type(claim) is not V4ClaimWitness or type(lock_for_transition) is not bool:
             raise ValueError("v4 claimed reload request is invalid")
-        head = self._select_head(
-            claim.attempt_id,
-            lock="update" if lock_for_transition else "share",
+        head = (
+            self._lock_append_heads(claim.attempt_id)
+            if lock_for_transition
+            else self._select_head(claim.attempt_id, lock="share")
         )
         if head["checkpoint_contract_version"] != 4:
             raise V4HeadStale("v4 claimed reload crossed contract version")

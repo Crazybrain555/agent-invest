@@ -28,9 +28,12 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPT_V3,
+    SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME,
     SemanticRouteReceiptRowV3,
+    semantic_adjudication_terminal_v1,
     semantic_route_receipt_row_v3_from_payload,
     semantic_route_receipt_row_v3_to_payload,
+    semantic_route_receipts_file_bytes_v3,
     validate_semantic_route_receipt_rows_v3,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
@@ -84,21 +87,36 @@ _PROCESSING_RUN_PROJECTION_FIELDS = frozenset(
         "builder_rules_version",
         "content_hash_aggregate",
         "contract_version",
+        "artifact_owner_processing_run_id",
         "document_id",
         "document_units_relpath",
         "is_active",
+        "normalized_ir_relpath",
         "parser_artifact_relpath",
+        "parser_backend",
+        "parser_language",
+        "parser_method",
+        "parser_name",
+        "parser_target_identity",
+        "parser_version",
         "processing_run_id",
         "provider_document_id",
         "provider_document_relpath",
         "provider_document_sha256",
         "run_kind",
+        "semantic_adjudication_status",
+        "semantic_adjudication_summary",
+        "semantic_degraded_unit_count",
+        "semantic_failover_group_count",
         "semantic_route_receipts_contract_version",
+        "semantic_route_receipts_relpath",
         "semantic_route_receipts_sha256",
         "source_pdf_relpath",
         "source_pdf_sha256",
         "status",
         "structure_hash_aggregate",
+        "unit_build_attempt_count",
+        "unit_build_status",
         "unit_count",
     }
 )
@@ -555,6 +573,8 @@ class AtomicPublicationRequestV4:
     processing_run_projection_sha256: str
     semantic_route_receipts_contract_version: str
     semantic_route_receipts: tuple[SemanticRouteReceiptRowV3, ...]
+    expected_unit_build_status_before: str
+    expected_unit_build_attempt_count_before: int
     previous_active_units: tuple[PreviousActiveUnitV4, ...]
     previous_active_units_sha256: str
     units: tuple[PreIdUnitPublicationV4, ...]
@@ -584,6 +604,21 @@ class AtomicPublicationRequestV4:
         if self.source_page_count != self.upstream_evidence.source_page_count:
             raise WholeDocumentPublicationV4Error(
                 "publication source page count drifted"
+            )
+        if self.expected_unit_build_status_before not in {
+            "not_started",
+            "running",
+        }:
+            raise WholeDocumentPublicationV4Error(
+                "publication Unit-build precondition is unsupported"
+            )
+        _nonnegative(
+            self.expected_unit_build_attempt_count_before,
+            "publication Unit-build attempt precondition",
+        )
+        if self.expected_unit_build_attempt_count_before >= _MAX_INT:
+            raise WholeDocumentPublicationV4Error(
+                "publication Unit-build attempt cannot advance"
             )
         if (
             self.identity.attempt_id != self.upstream_evidence.attempt_id
@@ -667,6 +702,10 @@ class AtomicPublicationRequestV4:
         processing_projection = _processing_run_projection_v4(
             self.processing_run_projection_json
         )
+        provider_context = _provider_envelope_context_v4(
+            self.upstream_evidence.provider_envelope_context_json
+        )
+        parser_target = provider_context.parser_target_identity
         _sha(self.processing_run_projection_sha256, "processing-run projection")
         if self.processing_run_projection_sha256 != _digest(
             self.processing_run_projection_json.encode("utf-8")
@@ -677,6 +716,8 @@ class AtomicPublicationRequestV4:
         if (
             processing_projection["processing_run_id"]
             != self.identity.processing_run_id
+            or processing_projection["artifact_owner_processing_run_id"]
+            != self.identity.processing_run_id
             or processing_projection["document_id"] != self.identity.document_id
             or processing_projection["provider_document_id"]
             != self.identity.provider_document_id
@@ -685,15 +726,21 @@ class AtomicPublicationRequestV4:
             or processing_projection["provider_document_sha256"]
             != self.upstream_evidence.provider_document_sha256
             or processing_projection["unit_count"] != len(self.units)
+            or processing_projection["normalized_ir_relpath"] is not None
+            or processing_projection["parser_name"] != parser_target.name
+            or processing_projection["parser_version"]
+            != parser_target.package_version
+            or processing_projection["parser_backend"] != parser_target.backend
+            or processing_projection["parser_method"] != parser_target.method
+            or processing_projection["parser_language"] != parser_target.language
+            or processing_projection["parser_target_identity"]
+            != parser_target.to_payload()
             or processing_projection["semantic_route_receipts_contract_version"]
             != SEMANTIC_ROUTE_RECEIPT_V3
             or processing_projection["semantic_route_receipts_sha256"]
             != _digest(
-                _canonical_json(
-                    [
-                        semantic_route_receipt_row_v3_to_payload(item)
-                        for item in self.semantic_route_receipts
-                    ]
+                semantic_route_receipts_file_bytes_v3(
+                    self.semantic_route_receipts
                 )
             )
             or processing_projection["content_hash_aggregate"]
@@ -769,6 +816,25 @@ class AtomicPublicationRequestV4:
                 raise WholeDocumentPublicationV4Error(
                     "publication Unit locator cites another provider document"
                 )
+        terminal = semantic_adjudication_terminal_v1(
+            tuple(item.receipt for item in self.semantic_route_receipts)
+        )
+        if (
+            processing_projection["semantic_adjudication_status"]
+            != terminal.status
+            or processing_projection["semantic_degraded_unit_count"]
+            != terminal.degraded_unit_count
+            or processing_projection["semantic_failover_group_count"]
+            != terminal.failover_group_count
+            or processing_projection["semantic_adjudication_summary"]
+            != terminal.summary
+            or processing_projection["unit_build_status"] != "succeeded"
+            or processing_projection["unit_build_attempt_count"]
+            != self.expected_unit_build_attempt_count_before + 1
+        ):
+            raise WholeDocumentPublicationV4Error(
+                "processing-run semantic terminal drifted"
+            )
         _sha(self.request_sha256, "publication request")
         if self.request_sha256 != atomic_publication_request_sha256_v4(self):
             raise WholeDocumentPublicationV4Error(
@@ -1102,6 +1168,10 @@ def _decode_previous_active_unit(value: object) -> PreviousActiveUnitV4:
 def _request_payload(value: AtomicPublicationRequestV4) -> dict[str, Any]:
     return {
         "contract_version": value.contract_version,
+        "expected_unit_build_attempt_count_before": (
+            value.expected_unit_build_attempt_count_before
+        ),
+        "expected_unit_build_status_before": value.expected_unit_build_status_before,
         "identity": asdict(value.identity),
         "processing_run_projection_json": value.processing_run_projection_json,
         "processing_run_projection_sha256": value.processing_run_projection_sha256,
@@ -1189,6 +1259,12 @@ def _request_unsealed_payload(values: dict[str, Any]) -> dict[str, Any]:
         )
     return {
         "contract_version": values["contract_version"],
+        "expected_unit_build_attempt_count_before": values[
+            "expected_unit_build_attempt_count_before"
+        ],
+        "expected_unit_build_status_before": values[
+            "expected_unit_build_status_before"
+        ],
         "identity": asdict(identity),
         "processing_run_projection_json": values[
             "processing_run_projection_json"
@@ -1275,16 +1351,81 @@ def _processing_run_projection_v4(value: str) -> dict[str, Any]:
         "processing_run_id",
         "document_id",
         "provider_document_id",
+        "artifact_owner_processing_run_id",
         "builder_rules_version",
+        "parser_name",
+        "parser_version",
+        "parser_backend",
+        "parser_method",
+        "parser_language",
     ):
         _identity(projection[name], f"processing-run {name}")
-    if projection["run_kind"] not in {"parse", "rebuild_units"}:
-        raise WholeDocumentPublicationV4Error("processing-run kind is unsupported")
+    if projection["run_kind"] != "parse":
+        raise WholeDocumentPublicationV4Error(
+            "V4 processing-run projection must be a self-owned parse"
+        )
     if projection["status"] != "succeeded" or projection["is_active"] is not True:
         raise WholeDocumentPublicationV4Error(
             "processing-run projection is not an active success"
         )
+    if projection["normalized_ir_relpath"] is not None:
+        raise WholeDocumentPublicationV4Error(
+            "V4 processing-run projection cannot carry normalized IR"
+        )
+    try:
+        parser_target = ParserTargetIdentity.from_payload(
+            projection["parser_target_identity"]
+        )
+    except ValueError as exc:
+        raise WholeDocumentPublicationV4Error(
+            "processing-run parser target is invalid"
+        ) from exc
+    if (
+        projection["parser_name"] != parser_target.name
+        or projection["parser_version"] != parser_target.package_version
+        or projection["parser_backend"] != parser_target.backend
+        or projection["parser_method"] != parser_target.method
+        or projection["parser_language"] != parser_target.language
+    ):
+        raise WholeDocumentPublicationV4Error(
+            "processing-run parser projection drifted from its target"
+        )
     _positive(projection["unit_count"], "processing-run Unit count")
+    if projection["unit_build_status"] != "succeeded":
+        raise WholeDocumentPublicationV4Error(
+            "processing-run Unit-build terminal is unsupported"
+        )
+    _positive(
+        projection["unit_build_attempt_count"],
+        "processing-run Unit-build attempt count",
+    )
+    if projection["semantic_adjudication_status"] not in {
+        "not_required",
+        "complete_primary",
+        "complete_backup",
+        "degraded_unavailable",
+    }:
+        raise WholeDocumentPublicationV4Error(
+            "processing-run semantic terminal is unsupported"
+        )
+    _nonnegative(
+        projection["semantic_degraded_unit_count"],
+        "processing-run semantic degraded Unit count",
+    )
+    _nonnegative(
+        projection["semantic_failover_group_count"],
+        "processing-run semantic failover group count",
+    )
+    summary = projection["semantic_adjudication_summary"]
+    if (
+        not isinstance(summary, dict)
+        or summary.get("contract_version")
+        != "semantic_adjudication_summary.v1"
+        or summary.get("status") != projection["semantic_adjudication_status"]
+    ):
+        raise WholeDocumentPublicationV4Error(
+            "processing-run semantic summary is not closed"
+        )
     for name in (
         "source_pdf_sha256",
         "provider_document_sha256",
@@ -1297,6 +1438,7 @@ def _processing_run_projection_v4(value: str) -> dict[str, Any]:
         "parser_artifact_relpath",
         "provider_document_relpath",
         "document_units_relpath",
+        "semantic_route_receipts_relpath",
         "source_pdf_relpath",
     ):
         _relative_path(projection[name], f"processing-run {name}")
@@ -1381,6 +1523,15 @@ def _processing_run_resource_paths_v4(
             / provider_document_id
             / run_id
             / "document_units.v1.jsonl"
+        ),
+        "semantic_route_receipts_relpath": str(
+            durable_root
+            / "document_unit_snapshots"
+            / upstream.provider
+            / security_code
+            / provider_document_id
+            / run_id
+            / SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME
         ),
     }
 

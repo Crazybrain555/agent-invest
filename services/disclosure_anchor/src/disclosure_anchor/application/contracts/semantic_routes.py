@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import json
 import re
-from typing import Literal, cast, get_args
+from typing import Any, Literal, cast, get_args
 
 
 SEMANTIC_ROUTE_RECEIPT_V1 = "semantic_route_receipt.v1"
@@ -75,6 +76,16 @@ SemanticRouteEvidenceKind = Literal[
 
 class SemanticRouteContractError(ValueError):
     """Semantic route input, receipt, or adjudication is not closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAdjudicationTerminalV1:
+    """One terminal summary derived only from immutable per-Unit receipts."""
+
+    status: str
+    degraded_unit_count: int
+    failover_group_count: int
+    summary: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -671,6 +682,87 @@ class SemanticRouteReceiptRowV3:
             )
 
 
+def semantic_adjudication_terminal_v1(
+    receipts: tuple[SemanticRouteReceipt, ...],
+) -> SemanticAdjudicationTerminalV1:
+    """Derive the persisted semantic terminal from the exact receipt set.
+
+    Adjudication lineage is copied into every affected Unit receipt.  Group
+    accounting therefore deduplicates by the immutable group hash while the
+    degraded Unit count deliberately remains per Unit.
+    """
+
+    if not isinstance(receipts, tuple) or any(
+        type(item) is not SemanticRouteReceipt for item in receipts
+    ):
+        raise SemanticRouteContractError(
+            "semantic terminal requires exact receipt tuple"
+        )
+    by_group: dict[str, SemanticAdjudicationReceipt] = {}
+    for receipt in receipts:
+        adjudication = receipt.adjudication
+        if adjudication is None:
+            continue
+        existing = by_group.get(adjudication.group_hash)
+        if existing is not None and existing != adjudication:
+            raise SemanticRouteContractError(
+                "semantic adjudication group lineage drifted across Units"
+            )
+        by_group[adjudication.group_hash] = adjudication
+    groups = tuple(by_group[key] for key in sorted(by_group))
+    if any(item.actual_result_attempt is None for item in groups):
+        status = "degraded_unavailable"
+    elif any(cast(int, item.actual_result_attempt) > 1 for item in groups):
+        status = "complete_backup"
+    elif groups:
+        status = "complete_primary"
+    else:
+        status = "not_required"
+    attempts = tuple(attempt for group in groups for attempt in group.attempts)
+    summary = _semantic_attempt_summary(attempts)
+    summary.update(
+        {
+            "contract_version": "semantic_adjudication_summary.v1",
+            "group_count": len(groups),
+            "policy_version": SEMANTIC_FAILOVER_POLICY_VERSION,
+            "status": status,
+        }
+    )
+    return SemanticAdjudicationTerminalV1(
+        status=status,
+        degraded_unit_count=sum(
+            item.decision_source == "adjudicator_unavailable_abstain"
+            for item in receipts
+        ),
+        failover_group_count=sum(len(item.attempts) > 1 for item in groups),
+        summary=summary,
+    )
+
+
+def _semantic_attempt_summary(
+    attempts: tuple[SemanticProviderAttempt, ...],
+) -> dict[str, Any]:
+    outcome_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    provider_counts: dict[str, int] = {}
+    provider_models: dict[str, str] = {}
+    for attempt in attempts:
+        outcome_counts[attempt.outcome] = outcome_counts.get(attempt.outcome, 0) + 1
+        provider_id = attempt.provider.provider_id
+        provider_counts[provider_id] = provider_counts.get(provider_id, 0) + 1
+        provider_models[provider_id] = attempt.provider.canonical_model
+        if attempt.reason_code is not None:
+            reason_counts[attempt.reason_code] = (
+                reason_counts.get(attempt.reason_code, 0) + 1
+            )
+    return {
+        "attempt_outcome_counts": dict(sorted(outcome_counts.items())),
+        "provider_attempt_counts": dict(sorted(provider_counts.items())),
+        "provider_models": dict(sorted(provider_models.items())),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
 def semantic_route_receipt_row_to_payload(
     row: SemanticRouteReceiptRow,
 ) -> dict[str, object]:
@@ -782,6 +874,30 @@ def validate_semantic_route_receipt_rows_v3(
         raise SemanticRouteContractError(
             "semantic receipt v3 rows contain duplicate identities"
         )
+
+
+def semantic_route_receipts_file_bytes_v3(
+    rows: tuple[SemanticRouteReceiptRowV3, ...],
+) -> bytes:
+    """Return the sole durable JSONL encoding for semantic receipt v3 rows."""
+
+    if not rows:
+        raise SemanticRouteContractError("semantic receipt v3 file cannot be empty")
+    validate_semantic_route_receipt_rows_v3(
+        rows,
+        processing_run_id=rows[0].processing_run_id,
+    )
+    return "".join(
+        json.dumps(
+            semantic_route_receipt_row_v3_to_payload(row),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+        for row in rows
+    ).encode("utf-8")
 
 
 def semantic_route_receipt_to_payload(receipt: SemanticRouteReceipt) -> dict[str, object]:
@@ -1192,6 +1308,7 @@ __all__ = [
     "SemanticAdjudicatedRoute",
     "SemanticAdjudicationDecision",
     "SemanticAdjudicationReceipt",
+    "SemanticAdjudicationTerminalV1",
     "SemanticAdjudicatorMetadata",
     "SemanticDocumentContext",
     "SemanticRouteCandidate",
@@ -1211,6 +1328,8 @@ __all__ = [
     "semantic_route_receipt_row_to_payload",
     "semantic_route_receipt_row_v3_from_payload",
     "semantic_route_receipt_row_v3_to_payload",
+    "semantic_route_receipts_file_bytes_v3",
     "semantic_route_receipt_to_payload",
+    "semantic_adjudication_terminal_v1",
     "validate_semantic_route_receipt_rows_v3",
 ]

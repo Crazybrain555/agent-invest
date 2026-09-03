@@ -408,17 +408,18 @@ class PinnedArtifactTree:
     def verify_unchanged(self) -> None:
         self._require_open()
         self._assert_display_path()
+        self.verify_pinned_topology_unchanged()
+        self._assert_display_path()
 
     def verify_pinned_topology_unchanged(
         self, *, allow_root_rename_ctime: bool = False
     ) -> None:
         """Re-scan the exact pinned tree without resolving its display path.
 
-        This is intentionally separate from :meth:`verify_unchanged`: an
-        adapter may keep the root descriptor open across an atomic directory
-        rename, after which the original display path no longer names the
-        pinned inode.  Child topology and identities must still match the
-        admission snapshot before the adapter may act on the renamed tree.
+        This pinned-only check intentionally does not require the display path
+        to name the root.  An adapter may keep the root descriptor open across
+        an atomic directory rename, after which child topology and identities
+        must still match before the adapter may act on the renamed tree.
         """
 
         self._require_open()
@@ -745,8 +746,6 @@ class PinnedArtifactTree:
             finally:
                 os.close(fd)
         self.verify_unchanged()
-        self.verify_pinned_topology_unchanged()
-        self._assert_display_path()
 
     def _scan_initial(self) -> None:
         file_count = [0]

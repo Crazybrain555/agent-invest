@@ -174,7 +174,9 @@ class _Transport:
 
 
 class MinerUHttpStagedV4Tests(unittest.TestCase):
-    def test_lock_inode_replacement_cannot_enter_a_second_critical_section(self) -> None:
+    def test_lock_inode_replacement_cannot_enter_a_second_critical_section(
+        self,
+    ) -> None:
         archive = _official_zip()
         fixture = _materialize_fixture(archive)
         with tempfile.TemporaryDirectory() as directory:
@@ -246,7 +248,8 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 victim = next(
                     path
                     for path in staging.rglob("*")
-                    if path.is_file() and path.relative_to(staging).as_posix() not in reserved
+                    if path.is_file()
+                    and path.relative_to(staging).as_posix() not in reserved
                 )
                 exact = victim.read_bytes()
                 victim.unlink()
@@ -288,7 +291,8 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 victim = next(
                     path
                     for path in output.rglob("*")
-                    if path.is_file() and path.relative_to(output).as_posix() not in reserved
+                    if path.is_file()
+                    and path.relative_to(output).as_posix() not in reserved
                 )
                 exact = victim.read_bytes()
                 victim.write_bytes(exact[:-1] + bytes([exact[-1] ^ 1]))
@@ -316,7 +320,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 **fixture.arguments(),
                 claim_guard=_Guard(),
             )
-            self.assertEqual(recovered.receipt.spool_sha256, fixture.intent.artifact_sha256)
+            self.assertEqual(
+                recovered.receipt.spool_sha256, fixture.intent.artifact_sha256
+            )
             self.assertEqual(transport.downloads, 1)
             self.assertFalse(marker.exists())
 
@@ -328,7 +334,10 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             "after_invalid_output_quarantine_rename",
         )
         for crash_phase in phases:
-            with self.subTest(phase=crash_phase), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(phase=crash_phase),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 transport = _Transport(archive)
                 damaged = False
@@ -360,9 +369,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                         transport=transport,
                         clock=lambda: 1.0,
                         fault_hook=damage,
-                    ).materialize_v4(
-                        **fixture.arguments(), claim_guard=_Guard()
-                    )
+                    ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
 
                 def crash(phase: str) -> None:
                     if phase == crash_phase:
@@ -374,22 +381,20 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                         transport=transport,
                         clock=lambda: 2.0,
                         fault_hook=crash,
-                    ).materialize_v4(
-                        **fixture.arguments(), claim_guard=_Guard()
-                    )
+                    ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
                 recovered = MinerUHttpStagedV4(
                     scratch_root=root,
                     transport=transport,
                     clock=lambda: 3.0,
-                ).materialize_v4(
-                    **fixture.arguments(), claim_guard=_Guard()
-                )
+                ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
                 self.assertEqual(
                     recovered.receipt.spool_sha256, fixture.intent.artifact_sha256
                 )
                 self.assertEqual(transport.downloads, 1)
 
-    def test_invalid_output_recovery_fails_closed_on_staging_race_and_claim_loss(self) -> None:
+    def test_invalid_output_recovery_fails_closed_on_staging_race_and_claim_loss(
+        self,
+    ) -> None:
         archive = _official_zip()
         for mode in ("staging-race", "claim-loss"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
@@ -425,12 +430,11 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                         transport=transport,
                         clock=lambda: 1.0,
                         fault_hook=damage,
-                    ).materialize_v4(
-                        **fixture.arguments(), claim_guard=_Guard()
-                    )
+                    ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
                 output = root / fixture.intent.output_relpath
                 quarantine = _quarantine_path(root, fixture)
                 if mode == "staging-race":
+
                     def create_quarantine(phase: str) -> None:
                         if phase != "before_invalid_output_quarantine_rename":
                             return
@@ -628,7 +632,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 fault_hook=inject_after_recovery_rename,
             ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
             quarantine = _quarantine_path(root, fixture)
-            self.assertEqual(recovered.receipt.spool_sha256, fixture.intent.artifact_sha256)
+            self.assertEqual(
+                recovered.receipt.spool_sha256, fixture.intent.artifact_sha256
+            )
             self.assertEqual(
                 (quarantine / injected.relative_to(output)).read_bytes(),
                 b"foreign",
@@ -641,6 +647,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             transport = _Transport(archive)
+
             def crash_after_seal(phase: str) -> None:
                 if phase == "after_staging_fsync":
                     raise RuntimeError("sealed crash")
@@ -685,10 +692,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 (staging / fixture.intent.output_manifest_relpath).is_file()
             )
             self.assertTrue(
-                (
-                    staging
-                    / Path(fixture.intent.staging_marker_relpath).name
-                ).is_file()
+                (staging / Path(fixture.intent.staging_marker_relpath).name).is_file()
             )
 
             recovered = MinerUHttpStagedV4(
@@ -696,16 +700,22 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 transport=transport,
                 clock=lambda: 3.0,
             ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
-            self.assertEqual(recovered.receipt.spool_sha256, fixture.intent.artifact_sha256)
+            self.assertEqual(
+                recovered.receipt.spool_sha256, fixture.intent.artifact_sha256
+            )
             self.assertEqual(transport.downloads, 1)
 
     def test_marker_only_recovery_restart_is_exact_and_never_recursive(self) -> None:
         archive = _official_zip()
         for polluted in (False, True):
-            with self.subTest(polluted=polluted), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(polluted=polluted),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 fixture = _materialize_fixture(archive)
                 transport = _Transport(archive)
+
                 def crash_after_seal(phase: str) -> None:
                     if phase == "after_staging_fsync":
                         raise RuntimeError("sealed crash")
@@ -748,7 +758,10 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 self.assertFalse(manifest.exists())
                 self.assertTrue(marker.is_file())
                 self.assertEqual(
-                    {path.relative_to(staging).as_posix() for path in staging.rglob("*")},
+                    {
+                        path.relative_to(staging).as_posix()
+                        for path in staging.rglob("*")
+                    },
                     {marker.name},
                 )
 
@@ -829,7 +842,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             self.assertFalse(_quarantine_path(root, fixture).exists())
             self.assertEqual(transport.downloads, 1)
 
-    def test_materialize_recovers_after_promoted_marker_and_replays_exactly(self) -> None:
+    def test_materialize_recovers_after_promoted_marker_and_replays_exactly(
+        self,
+    ) -> None:
         archive = _official_zip()
         fixture = _materialize_fixture(archive)
         with tempfile.TemporaryDirectory() as directory:
@@ -908,7 +923,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 **fixture.arguments(),
                 claim_guard=_Guard(),
             )
-            self.assertEqual(recovered.receipt.spool_sha256, fixture.intent.artifact_sha256)
+            self.assertEqual(
+                recovered.receipt.spool_sha256, fixture.intent.artifact_sha256
+            )
             self.assertEqual(exact.downloads, 1)
 
     def test_replay_does_not_treat_dangling_residue_symlink_as_absent(self) -> None:
@@ -1010,7 +1027,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     **fixture.arguments(),
                     claim_guard=_Guard(),
                 )
-                self.assertEqual(replayed.receipt.spool_sha256, fixture.intent.artifact_sha256)
+                self.assertEqual(
+                    replayed.receipt.spool_sha256, fixture.intent.artifact_sha256
+                )
                 self.assertEqual(
                     transport.downloads,
                     2 if phase == "after_spool_fsync" else 1,
@@ -1021,7 +1040,10 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
     ) -> None:
         archive = _official_zip()
         for injected in (False, True):
-            with self.subTest(injected=injected), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(injected=injected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 fixture = _materialize_fixture(archive)
                 transport = _Transport(archive)
@@ -1064,9 +1086,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                             scratch_root=root,
                             transport=transport,
                             clock=lambda: 3.0,
-                        ).materialize_v4(
-                            **fixture.arguments(), claim_guard=_Guard()
-                        )
+                        ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
                     self.assertEqual(foreign.read_bytes(), b"foreign")
                 else:
                     value = backend.materialize_v4(
@@ -1130,9 +1150,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                         transport=transport,
                         clock=lambda: 1.0,
                         fault_hook=crash_after_seal,
-                    ).materialize_v4(
-                        **fixture.arguments(), claim_guard=_Guard()
-                    )
+                    ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
                 staging = root / fixture.intent.staging_relpath
                 reserved = {
                     fixture.intent.provider_envelope_relpath,
@@ -1170,7 +1188,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     self.assertEqual(retained.read_bytes(), expected)
                 else:
                     self.assertFalse(retained.exists())
-                    self.assertTrue((quarantine / payload[0].relative_to(staging)).is_file())
+                    self.assertTrue(
+                        (quarantine / payload[0].relative_to(staging)).is_file()
+                    )
                 self.assertEqual(
                     value.receipt.spool_sha256,
                     fixture.intent.artifact_sha256,
@@ -1271,7 +1291,11 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
         )
         cases = (
             ("middle-identity", invalid_middle, None),
-            ("missing-content-list", _drop_zip_suffix(official, "_content_list.json"), None),
+            (
+                "missing-content-list",
+                _drop_zip_suffix(official, "_content_list.json"),
+                None,
+            ),
             ("source-page-count", official, 3),
         )
         for label, archive, source_page_count in cases:
@@ -1312,7 +1336,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 cleanup_receipt = backend.cleanup_v4(**cleanup)
                 self.assertEqual(backend.cleanup_v4(**cleanup), cleanup_receipt)
                 self.assertTrue(
-                    all(item.disposition == "absent" for item in cleanup_receipt.results)
+                    all(
+                        item.disposition == "absent" for item in cleanup_receipt.results
+                    )
                 )
                 transport.response = MinerUV4HttpResponse(
                     404,
@@ -1483,7 +1509,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             )
             self.assertEqual(staging_result.disposition, "absent")
 
-    def test_cleanup_refuses_second_ambiguous_tree_with_occupied_quarantine(self) -> None:
+    def test_cleanup_refuses_second_ambiguous_tree_with_occupied_quarantine(
+        self,
+    ) -> None:
         archive = _official_zip()
         fixture = _materialize_fixture(archive)
         with tempfile.TemporaryDirectory() as directory:
@@ -1791,9 +1819,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
 
         file_ancestor = _ZipPathCollisionIndex.empty()
         self.assertTrue(file_ancestor.admit(("parent",), is_directory=False))
-        self.assertFalse(
-            file_ancestor.admit(("parent", "child"), is_directory=False)
-        )
+        self.assertFalse(file_ancestor.admit(("parent", "child"), is_directory=False))
 
         new_file_ancestor = _ZipPathCollisionIndex.empty()
         self.assertTrue(
@@ -1851,16 +1877,14 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             )
             digest = "sha256:" + hashlib.sha256(b"").hexdigest()
             paths = tuple(
-                PurePosixPath(f"item-{index:04d}.bin")
-                for index in range(4_000)
+                PurePosixPath(f"item-{index:04d}.bin") for index in range(4_000)
             )
             expected = {path: (digest, 0) for path in paths}
             peak = 0
             for removed in (0, 1, len(paths) // 2, len(paths) - 1, len(paths)):
                 projection = _ProjectionTree(
                     files=tuple(
-                        _ProjectionFile(path, digest, 0)
-                        for path in paths[removed:]
+                        _ProjectionFile(path, digest, 0) for path in paths[removed:]
                     ),
                     directory_paths=(PurePosixPath("."),),
                 )
@@ -2091,16 +2115,16 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                         transport=transport,
                         clock=lambda: 2.0,
                         fault_hook=crash,
-                    ).materialize_v4(
-                        **fixture.arguments(), claim_guard=_Guard()
-                    )
+                    ).materialize_v4(**fixture.arguments(), claim_guard=_Guard())
                 quarantine = _quarantine_path(root, fixture)
                 if phase.startswith("before_"):
                     self.assertTrue(staging.is_dir())
                     self.assertFalse(quarantine.exists())
                 else:
                     self.assertFalse(staging.exists())
-                    self.assertEqual((quarantine / "partial.bin").read_bytes(), b"partial")
+                    self.assertEqual(
+                        (quarantine / "partial.bin").read_bytes(), b"partial"
+                    )
                 value = MinerUHttpStagedV4(
                     scratch_root=root,
                     transport=transport,
@@ -2151,7 +2175,10 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
     ) -> None:
         archive = _official_zip()
         for swap_marker in (False, True):
-            with self.subTest(swap_marker=swap_marker), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(swap_marker=swap_marker),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 fixture = _materialize_fixture(archive)
                 transport = _Transport(archive)
@@ -2336,7 +2363,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 (Path(directory) / reservation.snapshot_lock_relpath).is_file()
             )
 
-    def test_cleanup_deletes_spool_and_transfers_exact_output_idempotently(self) -> None:
+    def test_cleanup_deletes_spool_and_transfers_exact_output_idempotently(
+        self,
+    ) -> None:
         archive = _official_zip()
         fixture = _materialize_fixture(archive)
         with tempfile.TemporaryDirectory() as directory:
@@ -2400,8 +2429,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     action="transfer",
                     target_owner_identity=fixture.intent.processing_run_id,
                     target_relpath=(
-                        fixture.intent.provider_envelope_context
-                        .parser_artifact_root_relpath
+                        fixture.intent.provider_envelope_context.parser_artifact_root_relpath
                     ),
                 ),
             )
@@ -2458,8 +2486,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             self.assertTrue(
                 (
                     root
-                    / fixture.intent.provider_envelope_context
-                    .parser_artifact_root_relpath
+                    / fixture.intent.provider_envelope_context.parser_artifact_root_relpath
                 ).is_dir()
             )
             self.assertTrue((root / fixture.intent.spool_lock_relpath).is_file())
@@ -2574,6 +2601,50 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             with self.assertRaisesRegex(ParserOutputContractError, "both source"):
                 backend.cleanup_v4(**common)
 
+    def test_publication_promotion_and_read_only_verification_replay_exactly(
+        self,
+    ) -> None:
+        archive = _official_zip()
+        fixture = _materialize_fixture(archive)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(archive),
+                clock=lambda: 1.0,
+            )
+            materialized = backend.materialize_v4(
+                **fixture.arguments(),
+                claim_guard=_Guard(),
+            )
+            cleanup = _successful_cleanup_arguments(
+                fixture=fixture,
+                materialized=materialized,
+            )
+            checkpoint = cleanup["replay_context"].resourceful_checkpoint_history[-2]
+            published_relpath = (
+                fixture.intent.provider_envelope_context.parser_artifact_root_relpath
+            )
+            arguments = {
+                "checkpoint": checkpoint,
+                "materialized": materialized,
+                "published_relpath": published_relpath,
+                "claim": _claim(checkpoint),
+                "claim_guard": _Guard(),
+            }
+
+            backend.promote_or_replay(**arguments)
+            backend.verify_published(
+                published_relpath=published_relpath,
+                expected_inventory_sha256=(materialized.receipt.output_files_sha256),
+                expected_file_count=materialized.receipt.output_file_count,
+                expected_byte_count=materialized.receipt.output_byte_count,
+            )
+            backend.promote_or_replay(**arguments)
+
+            self.assertFalse((root / fixture.intent.output_relpath).exists())
+            self.assertTrue((root / published_relpath).is_dir())
+
     def test_cleanup_replays_after_transfer_rename_before_parent_fsync(self) -> None:
         archive = _official_zip()
         fixture = _materialize_fixture(archive)
@@ -2610,8 +2681,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             self.assertTrue(
                 (
                     root
-                    / fixture.intent.provider_envelope_context
-                    .parser_artifact_root_relpath
+                    / fixture.intent.provider_envelope_context.parser_artifact_root_relpath
                 ).is_dir()
             )
 
@@ -2793,9 +2863,13 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     ),
                 ),
                 key=lambda item: (
-                    "snapshot snapshot_part snapshot_part_owner spool spool_part "
-                    "spool_part_owner staging staging_marker output"
-                ).split().index(item.kind),
+                    (
+                        "snapshot snapshot_part snapshot_part_owner spool spool_part "
+                        "spool_part_owner staging staging_marker output"
+                    )
+                    .split()
+                    .index(item.kind)
+                ),
             )
         )
         plan = build_local_cleanup_plan_v4(
@@ -3015,7 +3089,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 fixture=fixture,
                 materialized=materialized,
             )
-            with self.assertRaisesRegex(ParserOutputContractError, "destination exists"):
+            with self.assertRaisesRegex(
+                ParserOutputContractError, "destination exists"
+            ):
                 backend.cleanup_v4(**common)
             self.assertTrue(source.is_dir())
             self.assertTrue(target.is_dir())
@@ -3088,14 +3164,14 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifact = root / "value.json"
-            artifact.write_bytes(b"{\"value\":1}")
+            artifact.write_bytes(b'{"value":1}')
             with PinnedArtifactTree.open_path(root) as tree:
                 self.assertEqual(
                     tree.read_bytes(PurePosixPath("value.json"), max_bytes=64),
-                    b"{\"value\":1}",
+                    b'{"value":1}',
                 )
                 artifact.unlink()
-                artifact.write_bytes(b"{\"value\":1}")
+                artifact.write_bytes(b'{"value":1}')
                 with self.assertRaisesRegex(
                     ParserOutputContractError, "identity changed"
                 ):
@@ -3292,9 +3368,7 @@ def _quarantine_path(root: Path, fixture: _MaterializeFixture) -> Path:
     digest = hashlib.sha256(
         (fixture.intent.sha256 + "\x00" + staging.as_posix()).encode("utf-8")
     ).hexdigest()[:32]
-    return root.joinpath(
-        *(staging.parent / f".agent-v4-quarantine-{digest}").parts
-    )
+    return root.joinpath(*(staging.parent / f".agent-v4-quarantine-{digest}").parts)
 
 
 def _materialize_fixture(
@@ -4007,7 +4081,9 @@ def _drop_zip_suffix(archive_bytes: bytes, suffix: str) -> bytes:
 def _corrupt_zip_member(archive_bytes: bytes, suffix: str) -> bytes:
     corrupted = bytearray(archive_bytes)
     with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as archive:
-        info = next(item for item in archive.infolist() if item.filename.endswith(suffix))
+        info = next(
+            item for item in archive.infolist() if item.filename.endswith(suffix)
+        )
         offset = info.header_offset
         name_bytes = int.from_bytes(corrupted[offset + 26 : offset + 28], "little")
         extra_bytes = int.from_bytes(corrupted[offset + 28 : offset + 30], "little")

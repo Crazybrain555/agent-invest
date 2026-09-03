@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -39,12 +40,16 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
 from disclosure_anchor.application.ports.provider_document_source import (
     ProviderDocumentSourceError,
 )
+from disclosure_anchor.application.services.atomic_provider_document_admission_v4 import (
+    AtomicReadyProviderDocumentAdmissionV4,
+)
 from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
 from disclosure_anchor.domain import (
     entities as e,
 )
+from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
 _SOURCE_SHA = "sha256:" + "a" * 64
@@ -59,6 +64,154 @@ _RECORD_RELPATH = Path(
 
 
 class ProviderDocumentAdmissionTests(unittest.TestCase):
+    def test_m4_admission_requires_and_verifies_v2_readiness(self) -> None:
+        envelope = _envelope()
+        record = provider_document_envelope_to_bytes(envelope)
+        source = _FakeSource(record=record, rebuilt=envelope.provider_document)
+        run = _run(artifact_hash=_sha_bytes(record))
+        reference = object()
+        winner = SimpleNamespace(
+            winner_row_version=2,
+            artifact_readiness=reference,
+            document_id=_DOCUMENT,
+            processing_run_id=_OWNER,
+        )
+        witness = SimpleNamespace(
+            request=SimpleNamespace(
+                identity=SimpleNamespace(
+                    document_id=_DOCUMENT,
+                    processing_run_id=_OWNER,
+                )
+            ),
+            preparation=SimpleNamespace(
+                artifact_owner_processing_run_id=_OWNER,
+                provider_document_plan=SimpleNamespace(
+                    relpath=_RECORD_RELPATH.as_posix(),
+                    sha256=_sha_bytes(record),
+                ),
+            ),
+        )
+
+        class Reader:
+            def reload_commit_winner_by_processing_run_id(
+                self, *, processing_run_id: str
+            ) -> object:
+                self.processing_run_id = processing_run_id
+                return winner
+
+        class Verifier:
+            def verify_ready(self, **kwargs: object) -> object:
+                self.kwargs = kwargs
+                return witness
+
+        reader = Reader()
+        verifier = Verifier()
+        admitted = AtomicReadyProviderDocumentAdmissionV4(
+            delegate=ProviderDocumentAdmission(
+                path_builder=_PathBuilder(),  # type: ignore[arg-type]
+                source=source,
+            ),
+            winner_reader=reader,  # type: ignore[arg-type]
+            publication_readiness=verifier,  # type: ignore[arg-type]
+        ).admit(
+            document=_document(),
+            run=run,
+            artifact_owner=run,
+            security_code="000001",
+        )
+
+        self.assertEqual(admitted.provider_document_sha256, _sha_bytes(record))
+        self.assertEqual(reader.processing_run_id, _OWNER)
+        self.assertEqual(verifier.kwargs["reference"], reference)
+        self.assertIs(verifier.kwargs["expected_winner"], winner)
+
+    def test_m4_admission_fails_before_source_io_without_v2_winner(self) -> None:
+        envelope = _envelope()
+        record = provider_document_envelope_to_bytes(envelope)
+        source = _FakeSource(record=record, rebuilt=envelope.provider_document)
+
+        class Reader:
+            def reload_commit_winner_by_processing_run_id(
+                self, *, processing_run_id: str
+            ) -> None:
+                return None
+
+        class Verifier:
+            def verify_ready(self, **kwargs: object) -> object:
+                raise AssertionError("readiness must not run without a winner")
+
+        admission = AtomicReadyProviderDocumentAdmissionV4(
+            delegate=ProviderDocumentAdmission(
+                path_builder=_PathBuilder(),  # type: ignore[arg-type]
+                source=source,
+            ),
+            winner_reader=Reader(),  # type: ignore[arg-type]
+            publication_readiness=Verifier(),  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(
+            ProviderDocumentAdmissionError,
+            "M4-admissible",
+        ):
+            admission.admit(
+                document=_document(),
+                run=_run(artifact_hash=_sha_bytes(record)),
+                artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+                security_code="000001",
+            )
+        self.assertEqual(source.calls, [])
+
+    def test_m4_admission_normalizes_parser_output_integrity_before_source_io(self) -> None:
+        envelope = _envelope()
+        record = provider_document_envelope_to_bytes(envelope)
+        source = _FakeSource(record=record, rebuilt=envelope.provider_document)
+        winner = SimpleNamespace(
+            winner_row_version=2,
+            artifact_readiness=object(),
+            document_id=_DOCUMENT,
+            processing_run_id=_OWNER,
+        )
+
+        class Reader:
+            def reload_commit_winner_by_processing_run_id(
+                self, *, processing_run_id: str
+            ) -> object:
+                return winner
+
+        class Verifier:
+            def verify_ready(self, **kwargs: object) -> object:
+                raise ParserOutputContractError("parser tree drifted")
+
+        admission = AtomicReadyProviderDocumentAdmissionV4(
+            delegate=ProviderDocumentAdmission(
+                path_builder=_PathBuilder(),  # type: ignore[arg-type]
+                source=source,
+            ),
+            winner_reader=Reader(),  # type: ignore[arg-type]
+            publication_readiness=Verifier(),  # type: ignore[arg-type]
+        )
+        with self.assertRaisesRegex(
+            ProviderDocumentAdmissionError,
+            "parser tree drifted",
+        ):
+            admission.admit(
+                document=_document(),
+                run=_run(artifact_hash=_sha_bytes(record)),
+                artifact_owner=_run(artifact_hash=_sha_bytes(record)),
+                security_code="000001",
+            )
+        self.assertEqual(source.calls, [])
+
+    def test_m4_admission_constructor_fails_closed_without_readers(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires delegate"):
+            AtomicReadyProviderDocumentAdmissionV4(
+                delegate=ProviderDocumentAdmission(
+                    path_builder=_PathBuilder(),  # type: ignore[arg-type]
+                    source=_FakeSource(record=b"x", rebuilt=_provider_document()),
+                ),
+                winner_reader=None,
+                publication_readiness=None,
+            )
+
     def test_admits_exact_parse_owner_after_full_bundle_rebuild(self) -> None:
         envelope = _envelope()
         record = provider_document_envelope_to_bytes(envelope)
@@ -580,14 +733,12 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 "malformed_numeric_grouping",
             ),
             (
-                "<table><tr><td>账面价值</td><td>246,8 45,256.40</td>"
-                "</tr></table>",
+                "<table><tr><td>账面价值</td><td>246,8 45,256.40</td></tr></table>",
                 "账面价值 246,845,256.40",
                 "malformed_numeric_grouping",
             ),
             (
-                "<table><tr><td>账面价值</td><td>240,940.074.94</td>"
-                "</tr></table>",
+                "<table><tr><td>账面价值</td><td>240,940.074.94</td></tr></table>",
                 "账面价值 240,9\r\n40,07\r\n4.94",
                 "malformed_numeric_grouping",
             ),
@@ -707,18 +858,15 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 "链接 http://222.143.24.250:8247/report",
             ),
             (
-                "<table><tr><td>账面价值</td><td>246,8 45,256.40</td>"
-                "</tr></table>",
+                "<table><tr><td>账面价值</td><td>246,8 45,256.40</td></tr></table>",
                 "账面价值 未披露",
             ),
             (
-                "<table><tr><td>账面价值</td><td>240,940.074.94</td>"
-                "</tr></table>",
+                "<table><tr><td>账面价值</td><td>240,940.074.94</td></tr></table>",
                 "账面价值 未披露",
             ),
             (
-                "<table><tr><td>金额</td><td>240,940,074.94</td>"
-                "</tr></table>",
+                "<table><tr><td>金额</td><td>240,940,074.94</td></tr></table>",
                 "金额 240,940,074.94",
             ),
         ):
@@ -980,9 +1128,7 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                         blocks=(
                             replace(
                                 block,
-                                payloads=(
-                                    replace(block.payloads[0], text="伪造正文"),
-                                ),
+                                payloads=(replace(block.payloads[0], text="伪造正文"),),
                             ),
                         ),
                     ),
@@ -1447,11 +1593,14 @@ class _PathBuilder:
         provider_document_id: str,
         artifact_owner_processing_run_id: str,
     ) -> Path:
-        return Path(
-            "derived/provider_documents"
-        ) / provider / security_code / provider_document_id / (
-            artifact_owner_processing_run_id
-        ) / "provider_document.v1.json"
+        return (
+            Path("derived/provider_documents")
+            / provider
+            / security_code
+            / provider_document_id
+            / (artifact_owner_processing_run_id)
+            / "provider_document.v1.json"
+        )
 
 
 class _DataPaths:
@@ -1530,9 +1679,7 @@ def _admit_single_table_observation(
                         block,
                         provider_type="table",
                         typed_annotation="table",
-                        payloads=(
-                            ProviderPayload("table_body", None, provider_html),
-                        ),
+                        payloads=(ProviderPayload("table_body", None, provider_html),),
                     ),
                 ),
             ),
@@ -1590,9 +1737,8 @@ def _run(*, artifact_hash: str | None = None) -> e.ProcessingRun:
         parser_target_identity=_target().to_payload(),
         input_raw_file_hash=_SOURCE_SHA,
         parser_artifact_relpath=_envelope().parser_artifact_root_relpath,
-        artifact_hash=artifact_hash or _sha_bytes(
-            provider_document_envelope_to_bytes(_envelope())
-        ),
+        artifact_hash=artifact_hash
+        or _sha_bytes(provider_document_envelope_to_bytes(_envelope())),
         normalized_ir_relpath=None,
         provider_document_relpath=_RECORD_RELPATH.as_posix(),
     )

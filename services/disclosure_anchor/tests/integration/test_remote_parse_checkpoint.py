@@ -57,6 +57,7 @@ from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.staged_provider_parser import (
     _issue_provider_ack_completion_witness,
 )
+from disclosure_anchor.application.worker.locks import DOC_NS, stable_document_hash
 from disclosure_anchor.domain import ids
 from tests.integration._support import engine_or_skip
 from tests.unit.test_mineru_process_profile import _profile
@@ -1626,6 +1627,62 @@ class RemoteParseCheckpointIntegrationTests(unittest.TestCase):
             uow.commit()
         self.assertEqual(takeover.attempt.claim_generation, 2)
         self.assertEqual(takeover.attempt.row_version, 2)
+
+    def test_v3_create_holds_shared_document_lock_and_replays_exactly(self) -> None:
+        attempt, secret = self._v3_attempt_and_secret()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+            with self.engine.connect() as contender:
+                acquired = contender.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:ns, :h)"),
+                    {
+                        "ns": DOC_NS,
+                        "h": stable_document_hash(self.document_id),
+                    },
+                ).scalar_one()
+                self.assertFalse(acquired)
+                contender.rollback()
+            uow.commit()
+
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            replayed = uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+            uow.commit()
+        self.assertEqual(replayed.attempt_id, created.attempt_id)
+        self.assertEqual(replayed.fence_identity, created.fence_identity)
+        self.assertEqual(replayed.attempt_generation, created.attempt_generation)
+
+    def test_v3_create_rejects_generation_gap_with_typed_conflict(self) -> None:
+        attempt, secret = self._v3_attempt_and_secret()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict,
+            "generation",
+        ):
+            uow.remote_parse_attempts.add_v3_prepared(
+                replace(attempt, attempt_generation=2),
+                secret,
+            )
+
+    def test_v3_create_does_not_replay_a_claimed_attempt(self) -> None:
+        attempt, secret = self._v3_attempt_and_secret()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            created = uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
+            assert isinstance(created.current_credits, CreditVector)
+            uow.remote_parse_attempts.claim_v3_recovery(
+                attempt_id=created.attempt_id,
+                fence_identity=created.fence_identity,
+                expected_state="prepared",
+                expected_version=0,
+                expected_current=created.current_credits,
+                owner_identity="worker-v3-replay-negative",
+                lease_seconds=30,
+            )
+            uow.commit()
+
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow, self.assertRaisesRegex(
+            RemoteParseCheckpointConflict,
+            "conflicts with an existing attempt",
+        ):
+            uow.remote_parse_attempts.add_v3_prepared(attempt, secret)
 
     def test_non_v3_current_checkpoint_blocks_v3_activation_listing(self) -> None:
         attempt, secret = self._v3_attempt_and_secret()

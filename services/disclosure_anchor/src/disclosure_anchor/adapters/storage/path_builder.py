@@ -9,8 +9,15 @@ from pathlib import Path
 from disclosure_anchor.application.contracts.normalized_ir_v4_evidence import (
     NORMALIZED_IR_V4_FILENAME,
 )
+from disclosure_anchor.application.contracts.atomic_publication_artifact_readiness_v4 import (
+    ATOMIC_PUBLICATION_PREPARATION_FILENAME,
+    ATOMIC_PUBLICATION_READINESS_FILENAME,
+)
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     PROVIDER_DOCUMENT_FILENAME,
+)
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME,
 )
 from disclosure_anchor.domain.errors import PathSafetyError
 from disclosure_anchor.settings import Settings
@@ -178,6 +185,51 @@ class FileStorePathBuilder:
             / "document_units.v1.jsonl"
         )
         return _assert_relative(relpath)
+
+    def semantic_route_receipts_v3_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+    ) -> Path:
+        return self.document_units_snapshot_relpath(
+            provider=provider,
+            security_code=security_code,
+            provider_document_id=provider_document_id,
+            processing_run_id=processing_run_id,
+        ).with_name(SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME)
+
+    def atomic_publication_preparation_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+    ) -> Path:
+        return self.document_units_snapshot_relpath(
+            provider=provider,
+            security_code=security_code,
+            provider_document_id=provider_document_id,
+            processing_run_id=processing_run_id,
+        ).with_name(ATOMIC_PUBLICATION_PREPARATION_FILENAME)
+
+    def atomic_publication_readiness_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+    ) -> Path:
+        return self.document_units_snapshot_relpath(
+            provider=provider,
+            security_code=security_code,
+            provider_document_id=provider_document_id,
+            processing_run_id=processing_run_id,
+        ).with_name(ATOMIC_PUBLICATION_READINESS_FILENAME)
 
     def provider_document_relpath(
         self,

@@ -28,6 +28,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SemanticRouteContractError,
     SemanticRouteReceipt,
     SemanticRouteReceiptRow,
+    semantic_adjudication_terminal_v1,
 )
 from disclosure_anchor.application.ports.file_store import (
     ArtifactStorePort,
@@ -36,7 +37,6 @@ from disclosure_anchor.application.ports.file_store import (
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.ports.semantic_routes import (
-    SemanticAdjudicationOutcome,
     SemanticRouteAdjudicatorError,
     SemanticRouteReceiptStoreError,
     SemanticRouteReceiptStorePort,
@@ -171,7 +171,6 @@ class BuildUnits:
             stats = self._build_stats(
                 build,
                 receipts=routed.receipts,
-                outcomes=routed.adjudication_outcomes,
             )
         except SemanticRouteAdjudicatorError as exc:
             if exc.reason_code == "invalid_decision":
@@ -762,12 +761,12 @@ class BuildUnits:
         build: ProviderUnitBuildResult,
         *,
         receipts: tuple[SemanticRouteReceipt, ...],
-        outcomes: tuple[SemanticAdjudicationOutcome, ...],
     ) -> dict[str, Any]:
         narrow_count = sum(unit.semantic_keys is not None for unit in build.units)
         section_count = sum(unit.section_keys is not None for unit in build.units)
-        semantic_summary = _successful_adjudication_summary(outcomes)
-        semantic_status = cast(str, semantic_summary["status"])
+        terminal = semantic_adjudication_terminal_v1(receipts)
+        semantic_summary = terminal.summary
+        semantic_status = terminal.status
         executor = getattr(self._semantic_router, "executor", None)
         provider_identities = (
             executor.provider_identities
@@ -791,13 +790,8 @@ class BuildUnits:
                 for receipt in receipts
             ),
             "semantic_adjudication_status": semantic_status,
-            "semantic_degraded_unit_count": sum(
-                receipt.decision_source == "adjudicator_unavailable_abstain"
-                for receipt in receipts
-            ),
-            "semantic_failover_group_count": sum(
-                len(outcome.attempts) > 1 for outcome in outcomes
-            ),
+            "semantic_degraded_unit_count": terminal.degraded_unit_count,
+            "semantic_failover_group_count": terminal.failover_group_count,
             "semantic_adjudication_summary": semantic_summary,
             "section_routed_unit_count": section_count,
             "semantic_route_taxonomy_version": self._semantic_router.taxonomy.version,
@@ -839,34 +833,6 @@ class BuildUnits:
         if reason_code is not None:
             error["reason_code"] = reason_code
         return error
-
-
-def _successful_adjudication_summary(
-    outcomes: tuple[SemanticAdjudicationOutcome, ...],
-) -> dict[str, Any]:
-    if any(item.degraded_unavailable for item in outcomes):
-        status = "degraded_unavailable"
-    elif any((item.actual_result_attempt or 0) > 1 for item in outcomes):
-        status = "complete_backup"
-    elif outcomes:
-        status = "complete_primary"
-    else:
-        status = "not_required"
-    attempts = tuple(
-        attempt for outcome in outcomes for attempt in outcome.attempts
-    )
-    summary = _attempt_summary(attempts)
-    summary.update(
-        {
-            "contract_version": "semantic_adjudication_summary.v1",
-            "group_count": len(outcomes),
-            "policy_version": (
-                outcomes[0].policy_version if outcomes else "availability_only.v1"
-            ),
-            "status": status,
-        }
-    )
-    return summary
 
 
 def _failed_adjudication_summary(

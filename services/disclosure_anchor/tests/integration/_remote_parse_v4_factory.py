@@ -12,6 +12,8 @@ import hashlib
 import json
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
@@ -24,13 +26,38 @@ from disclosure_anchor.adapters.security.provider_secret_keyring import (
 )
 from disclosure_anchor.application.contracts.local_materialization_manifest_v4 import (
     LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
+    LocalMaterializationManifestV4,
     LocalMaterializationObservationsV4,
     LocalMaterializationPayloadFileV4,
     seal_local_materialization_manifest_v4,
 )
+from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
+    ATOMIC_PUBLICATION_REQUEST_V4_CONTRACT,
+    UPSTREAM_PUBLICATION_EVIDENCE_V4_CONTRACT,
+    AtomicPublicationRequestV4,
+    PreviousActiveUnitV4,
+    PublicationAttemptIdentityV4,
+    UpstreamPublicationEvidenceV4,
+    previous_active_units_sha256_v4,
+    seal_atomic_publication_request_v4,
+    seal_pre_id_unit_publication_v4,
+)
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     PROVIDER_DOCUMENT_FILENAME,
+    ProviderDocumentEnvelope,
+    provider_document_envelope_to_bytes,
+)
+from disclosure_anchor.application.contracts.provider_document import (
+    ProviderArtifact,
+    ProviderDocument,
+    ProviderPage,
+    provider_artifact_bundle_sha256,
+)
+from disclosure_anchor.application.contracts.provider_unit import (
+    PROVIDER_UNIT_BUILDER_VERSION,
+    ProviderUnitLocator,
+    provider_unit_locator_to_payload,
 )
 from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import (
     ProviderSecretPlaintextV4,
@@ -80,6 +107,14 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
     ResourceReservationInput,
     encode_resource_reservation_input,
 )
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SEMANTIC_ROUTE_RECEIPT_V3,
+    SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME,
+    SEMANTIC_ROUTE_RECEIPT_VERSION,
+    SemanticRouteReceiptRowV3,
+    semantic_adjudication_terminal_v1,
+    semantic_route_receipts_file_bytes_v3,
+)
 from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     AtomicPublicationWinnerV4,
     DurablePublishBaseCommitReference,
@@ -90,6 +125,12 @@ from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     seal_published_outbox_event_v4,
 )
 from disclosure_anchor.domain import ids
+from disclosure_anchor.domain.services.unit_hashing import (
+    compute_unit_hashes,
+    content_hash_aggregate,
+    structure_hash_aggregate,
+)
+from tests.unit._semantic_routes import _fallback_receipt
 
 HELD_CREDIT_NAMES = tuple(item.name for item in fields(ResourceCreditVector))
 EVIDENCE_FIELD_NAMES = (
@@ -148,6 +189,9 @@ class V4AuthorityFixture:
     terminal: TerminalReceiptV4
     materialization_intent: MaterializationIntentV4
     local_materialization_receipt: LocalMaterializationReceiptV4
+    materialization_manifest: LocalMaterializationManifestV4
+    provider_envelope: ProviderDocumentEnvelope
+    parser_artifact_files: tuple[tuple[str, bytes], ...]
     remote_terminal: RemoteParseCheckpointV4
     materializing: RemoteParseCheckpointV4
     local_materialized: RemoteParseCheckpointV4
@@ -266,6 +310,230 @@ class V4ResourceFreeSupersessionFixture:
     target: V4SupersessionStageFixture
     supersession: SupersessionReceiptV4
     source_superseded: RemoteParseCheckpointV4
+
+
+def build_atomic_publication_request_v4(
+    fixture: V4AuthorityFixture,
+    *,
+    previous_active_run_id: str | None = None,
+    previous_active_units: tuple[PreviousActiveUnitV4, ...] = (),
+) -> AtomicPublicationRequestV4:
+    """Build a strict transaction-P request from the canonical V4 fixture."""
+
+    context = fixture.materialization_intent.provider_envelope_context
+    receipt = fixture.local_materialization_receipt
+    upstream_values: dict[str, Any] = {
+        "attempt_id": fixture.attempt_id,
+        "attempt_generation": fixture.local_materialized.attempt_generation,
+        "fence_identity": fixture.fence_identity,
+        "document_id": fixture.document_id,
+        "processing_run_id": fixture.processing_run_id,
+        "provider": context.provider,
+        "provider_document_id": context.provider_document_id,
+        "source_pdf_relpath": context.source_pdf_relpath,
+        "parser_artifact_root_relpath": context.parser_artifact_root_relpath,
+        "provider_envelope_context_json": context.canonical_bytes.decode("utf-8"),
+        "provider_envelope_context_sha256": context.sha256,
+        "local_materialized_checkpoint_sha256": fixture.local_materialized.sha256,
+        "local_materialized_lifecycle_version": (
+            fixture.local_materialized.lifecycle_version
+        ),
+        "source_pdf_sha256": fixture.source_pdf_sha256,
+        "source_page_count": fixture.local_materialized.source_page_count,
+        "parser_target_sha256": fixture.parser_target_sha256,
+        "request_sha256": fixture.request_sha256,
+        "runtime_epoch_sha256": fixture.runtime_epoch_sha256,
+        "process_profile_sha256": fixture.process_profile_sha256,
+        "terminal_receipt_sha256": fixture.terminal.sha256,
+        "materialization_intent_sha256": fixture.materialization_intent.sha256,
+        "local_materialization_receipt_sha256": receipt.sha256,
+        "output_files_sha256": receipt.output_files_sha256,
+        "output_file_count": receipt.output_file_count,
+        "output_total_byte_count": receipt.output_byte_count,
+        "output_manifest_sha256": receipt.output_manifest_sha256,
+        "output_manifest_relpath": receipt.output_manifest_relpath,
+        "output_manifest_byte_count": receipt.output_manifest_byte_count,
+        "provider_envelope_sha256": receipt.provider_envelope_sha256,
+        "provider_envelope_relpath": receipt.provider_envelope_relpath,
+        "provider_envelope_byte_count": receipt.provider_envelope_byte_count,
+        "provider_document_sha256": receipt.provider_envelope_sha256,
+        "contract_version": UPSTREAM_PUBLICATION_EVIDENCE_V4_CONTRACT,
+    }
+    upstream = UpstreamPublicationEvidenceV4(
+        **upstream_values,
+        evidence_sha256=sha256_bytes(
+            json.dumps(
+                upstream_values,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ),
+    )
+    payload = {"text": "fixture publication"}
+    hashes = compute_unit_hashes(
+        payload_kind="text",
+        payload=payload,
+        title=None,
+        heading_path=[],
+        semantic_keys=None,
+        section_keys=["section"],
+        quality_status="ok",
+        applicability="applicable",
+        order_index=1,
+    )
+    locator = ProviderUnitLocator(
+        provider_document_sha256=upstream.provider_document_sha256,
+        unit_index=0,
+        heading_chain=(),
+        parts=(),
+        evidence_only_block_source_indices=(),
+        unbound_table_parts=(),
+        evidence_artifacts=(),
+        search_targets=(),
+    )
+    locator_json = json.dumps(
+        provider_unit_locator_to_payload(locator),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    unit = seal_pre_id_unit_publication_v4(
+        document_id=fixture.document_id,
+        processing_run_id=fixture.processing_run_id,
+        provider_document_id=upstream.provider_document_id,
+        unit_index=1,
+        payload_kind="text",
+        heading_path=(),
+        title=None,
+        semantic_keys=None,
+        section_keys=("section",),
+        canonical_payload_json=json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        content_hash=hashes.content_hash,
+        structure_hash=hashes.structure_hash,
+        quality_status="ok",
+        applicability="applicable",
+        page_no=1,
+        page_numbers=(1,),
+        query_projection_hash=hashes.query_projection_hash,
+        canonical_artifact_locator_json=locator_json,
+        provider_locator_sha256=sha256_bytes(locator_json.encode("utf-8")),
+    )
+    route = SemanticRouteReceiptRowV3(
+        processing_run_id=fixture.processing_run_id,
+        unit_order_index=1,
+        provider_locator_sha256=unit.provider_locator_sha256,
+        routed_draft_sha256=unit.routed_draft_sha256,
+        receipt=replace(
+            _fallback_receipt(1),
+            contract_version=SEMANTIC_ROUTE_RECEIPT_VERSION,
+            semantic_keys=(),
+            evidence=(),
+        ),
+    )
+    semantic_projection = semantic_route_receipts_file_bytes_v3((route,))
+    security_code = context.source_pdf_relpath.split("/")[2]
+    provider_document_relpath = (
+        "derived/provider_documents/"
+        f"{context.provider}/{security_code}/{context.provider_document_id}/"
+        f"{fixture.processing_run_id}/{PROVIDER_DOCUMENT_FILENAME}"
+    )
+    document_units_relpath = (
+        "derived/document_unit_snapshots/"
+        f"{context.provider}/{security_code}/{context.provider_document_id}/"
+        f"{fixture.processing_run_id}/document_units.v1.jsonl"
+    )
+    projection = json.dumps(
+        {
+            "artifact_owner_processing_run_id": fixture.processing_run_id,
+            "builder_rules_version": PROVIDER_UNIT_BUILDER_VERSION,
+            "content_hash_aggregate": content_hash_aggregate([unit.content_hash]),
+            "contract_version": "processing-run-publication.v4",
+            "document_id": fixture.document_id,
+            "document_units_relpath": document_units_relpath,
+            "is_active": True,
+            "normalized_ir_relpath": None,
+            "parser_artifact_relpath": context.parser_artifact_root_relpath,
+            "parser_backend": context.parser_target_identity.backend,
+            "parser_language": context.parser_target_identity.language,
+            "parser_method": context.parser_target_identity.method,
+            "parser_name": context.parser_target_identity.name,
+            "parser_target_identity": context.parser_target_identity.to_payload(),
+            "parser_version": context.parser_target_identity.package_version,
+            "processing_run_id": fixture.processing_run_id,
+            "provider_document_id": context.provider_document_id,
+            "provider_document_relpath": provider_document_relpath,
+            "provider_document_sha256": upstream.provider_document_sha256,
+            "run_kind": "parse",
+            "semantic_adjudication_status": (
+                semantic_adjudication_terminal_v1((route.receipt,)).status
+            ),
+            "semantic_adjudication_summary": (
+                semantic_adjudication_terminal_v1((route.receipt,)).summary
+            ),
+            "semantic_degraded_unit_count": (
+                semantic_adjudication_terminal_v1((route.receipt,)).degraded_unit_count
+            ),
+            "semantic_failover_group_count": (
+                semantic_adjudication_terminal_v1((route.receipt,)).failover_group_count
+            ),
+            "semantic_route_receipts_contract_version": (
+                SEMANTIC_ROUTE_RECEIPT_V3
+            ),
+            "semantic_route_receipts_relpath": str(
+                PurePosixPath(document_units_relpath).with_name(
+                    SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME
+                )
+            ),
+            "semantic_route_receipts_sha256": sha256_bytes(semantic_projection),
+            "source_pdf_relpath": context.source_pdf_relpath,
+            "source_pdf_sha256": fixture.source_pdf_sha256,
+            "status": "succeeded",
+            "structure_hash_aggregate": structure_hash_aggregate(
+                [unit.structure_hash]
+            ),
+            "unit_build_attempt_count": 1,
+            "unit_build_status": "succeeded",
+            "unit_count": 1,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return seal_atomic_publication_request_v4(
+        identity=PublicationAttemptIdentityV4(
+            attempt_id=fixture.attempt_id,
+            document_id=fixture.document_id,
+            processing_run_id=fixture.processing_run_id,
+            provider_document_id=context.provider_document_id,
+            attempt_generation=fixture.local_materialized.attempt_generation,
+            fence_identity=fixture.fence_identity,
+            expected_attempt_state="local_materialized",
+            expected_lifecycle_version=fixture.local_materialized.lifecycle_version,
+            expected_checkpoint_sha256=fixture.local_materialized.sha256,
+            expected_local_materialization_receipt_sha256=receipt.sha256,
+            expected_previous_processing_run_id=previous_active_run_id,
+        ),
+        upstream_evidence=upstream,
+        source_page_count=fixture.local_materialized.source_page_count,
+        processing_run_projection_json=projection,
+        processing_run_projection_sha256=sha256_bytes(projection.encode("utf-8")),
+        semantic_route_receipts_contract_version=SEMANTIC_ROUTE_RECEIPT_V3,
+        semantic_route_receipts=(route,),
+        expected_unit_build_status_before="running",
+        expected_unit_build_attempt_count_before=0,
+        previous_active_units=previous_active_units,
+        previous_active_units_sha256=previous_active_units_sha256_v4(
+            previous_active_units
+        ),
+        units=(unit,),
+        contract_version=ATOMIC_PUBLICATION_REQUEST_V4_CONTRACT,
+    )
 
 
 def build_v4_supersession_stage_fixture(
@@ -485,10 +753,10 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
         provider_result_bytes=20,
         materialization_items=1,
         compressed_bytes=20,
-        decoded_bytes=30,
-        temp_disk_bytes=8192,
+        decoded_bytes=65_536,
+        temp_disk_bytes=131_072,
         output_items=1,
-        output_bytes=4096,
+        output_bytes=65_536,
         output_pages=2,
         ack_items=1,
     )
@@ -663,7 +931,7 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
         provider_envelope_relpath=PROVIDER_DOCUMENT_FILENAME,
         output_manifest_relpath=LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
         member_count_limit=10,
-        uncompressed_byte_limit=100,
+        uncompressed_byte_limit=65_536,
     )
     materializing = advance_remote_parse_checkpoint_v4(
         remote_terminal,
@@ -671,8 +939,56 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
         held_resource_credit=materialization_intent.held_resource_credit,
         materialization_intent_sha256=materialization_intent.sha256,
     )
-    provider_envelope_bytes = b"provider"
-    parser_artifact_bytes = b"parser-output"
+    parser_artifact_files = (
+        ("a_content_list.json", b"[]"),
+        ("b_content_list_v2.json", b"[]"),
+        ("c_middle.json", b"{}"),
+        ("d_model.json", b"{}"),
+    )
+    provider_artifacts = tuple(
+        ProviderArtifact(
+            role=role,
+            relative_path=relpath,
+            sha256=sha256_bytes(payload),
+            size_bytes=len(payload),
+            media_type="application/json",
+        )
+        for role, (relpath, payload) in zip(
+            ("content_list", "content_list_v2", "middle_json", "model_json"),
+            parser_artifact_files,
+            strict=True,
+        )
+    )
+    provider_document = ProviderDocument(
+        source_pdf_sha256=source_pdf_sha256,
+        parser_version=parser_target_identity.package_version,
+        backend="hybrid",
+        effort=parser_target_identity.effort,
+        ocr_enabled=False,
+        pages=(
+            ProviderPage(page_index=0, page_size=(595.0, 842.0), blocks=()),
+            ProviderPage(page_index=1, page_size=(595.0, 842.0), blocks=()),
+        ),
+        physical_table_segments=(),
+        artifacts=provider_artifacts,
+        bundle_sha256=provider_artifact_bundle_sha256(provider_artifacts),
+    )
+    provider_envelope = ProviderDocumentEnvelope.build(
+        document_id=document_id,
+        artifact_owner_processing_run_id=processing_run_id,
+        provider=provider_context.provider,
+        provider_document_id=provider_document_id,
+        source_pdf_relpath=provider_context.source_pdf_relpath,
+        source_pdf_page_count=provider_context.source_page_count,
+        parser_artifact_root_relpath=(
+            provider_context.parser_artifact_root_relpath
+        ),
+        parser_target_identity=parser_target_identity,
+        provider_document=provider_document,
+    )
+    provider_envelope_bytes = provider_document_envelope_to_bytes(
+        provider_envelope
+    )
     payload_files = tuple(
         sorted(
             (
@@ -682,11 +998,14 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
                     sha256=sha256_bytes(provider_envelope_bytes),
                     byte_count=len(provider_envelope_bytes),
                 ),
-                LocalMaterializationPayloadFileV4(
-                    role="parser_artifact",
-                    relpath="result/content.md",
-                    sha256=sha256_bytes(parser_artifact_bytes),
-                    byte_count=len(parser_artifact_bytes),
+                *(
+                    LocalMaterializationPayloadFileV4(
+                        role="parser_artifact",
+                        relpath=relpath,
+                        sha256=sha256_bytes(payload),
+                        byte_count=len(payload),
+                    )
+                    for relpath, payload in parser_artifact_files
                 ),
             ),
             key=lambda item: item.relpath,
@@ -714,9 +1033,9 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
         provider_envelope_byte_count=len(provider_envelope_bytes),
         observations=LocalMaterializationObservationsV4(
             member_count=2,
-            uncompressed_byte_count=30,
+            uncompressed_byte_count=payload_byte_count,
             decoded_byte_count=20,
-            temporary_disk_peak_byte_count=50,
+            temporary_disk_peak_byte_count=payload_byte_count * 2,
             output_file_count=len(payload_files),
             output_byte_count=payload_byte_count,
         ),
@@ -750,9 +1069,9 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
         provider_envelope_relpath=PROVIDER_DOCUMENT_FILENAME,
         output_manifest_relpath=LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
         member_count=2,
-        uncompressed_byte_count=30,
+        uncompressed_byte_count=payload_byte_count,
         decoded_byte_count=20,
-        temporary_disk_peak_byte_count=50,
+        temporary_disk_peak_byte_count=payload_byte_count * 2,
         file_fsync_completed=True,
         output_parent_fsync_completed=True,
         marker_removed=True,
@@ -1180,6 +1499,9 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
         terminal=terminal,
         materialization_intent=materialization_intent,
         local_materialization_receipt=local_materialization_receipt,
+        materialization_manifest=materialization_manifest,
+        provider_envelope=provider_envelope,
+        parser_artifact_files=parser_artifact_files,
         remote_terminal=remote_terminal,
         materializing=materializing,
         local_materialized=local_materialized,
@@ -1195,6 +1517,7 @@ def build_v4_authority_fixture() -> V4AuthorityFixture:
 
 
 def insert_core_rows(conn: Connection, fixture: V4AuthorityFixture) -> None:
+    parser_target = json.loads(fixture.parser_target_identity_json)
     conn.execute(
         text(
             "INSERT INTO disclosure_core.document (document_id,status) "
@@ -1206,16 +1529,23 @@ def insert_core_rows(conn: Connection, fixture: V4AuthorityFixture) -> None:
         text(
             "INSERT INTO disclosure_core.processing_run "
             "(processing_run_id,document_id,artifact_owner_processing_run_id,"
-            "run_kind,status,input_raw_file_hash,provider_document_relpath,"
-            "parser_target_identity) VALUES "
-            "(:run_id,:document_id,:run_id,'parse','running',:source_sha,"
-            "'scratch/provider.json',CAST(:target AS jsonb))"
+            "run_kind,status,parser_name,parser_version,parser_backend,"
+            "parser_method,parser_language,input_raw_file_hash,"
+            "provider_document_relpath,parser_target_identity) VALUES "
+            "(:run_id,:document_id,:run_id,'parse','running',:parser_name,"
+            ":parser_version,:parser_backend,:parser_method,:parser_language,"
+            ":source_sha,'scratch/provider.json',CAST(:target AS jsonb))"
         ),
         {
             "run_id": fixture.processing_run_id,
             "document_id": fixture.document_id,
             "source_sha": fixture.source_pdf_sha256,
             "target": fixture.parser_target_identity_json,
+            "parser_name": parser_target["name"],
+            "parser_version": parser_target["package_version"],
+            "parser_backend": parser_target["backend"],
+            "parser_method": parser_target["method"],
+            "parser_language": parser_target["language"],
         },
     )
 
@@ -1845,6 +2175,7 @@ __all__ = [
     "V4ResourceFreeSupersessionFixture",
     "V4SupersessionStageFixture",
     "append_remote_failed_tail",
+    "build_atomic_publication_request_v4",
     "build_v4_authority_fixture",
     "build_v4_resource_free_supersession_fixture",
     "build_v4_supersession_stage_fixture",

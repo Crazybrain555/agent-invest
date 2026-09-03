@@ -105,6 +105,36 @@ class FileStorePathPort(Protocol):
     ) -> Path:
         ...
 
+    def semantic_route_receipts_v3_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+    ) -> Path:
+        ...
+
+    def atomic_publication_preparation_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+    ) -> Path:
+        ...
+
+    def atomic_publication_readiness_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+    ) -> Path:
+        ...
+
     def runtime_tmp_path(self, name: str | None = None) -> Path:
         ...
 

@@ -8,7 +8,7 @@ the transaction boundary.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -998,6 +998,69 @@ class RemoteParseAttemptRepository:
             or prepared.runtime_epoch_sha256 != attempt.runtime_epoch_sha256
         ):
             raise ValueError("v3 prepared reconcile evidence drifted from attempt")
+        # V3 and V4 share one document-generation namespace.  Acquire the
+        # common document lock before reading either version's heads so a
+        # mixed-version create race has one deterministic winner and never
+        # leaks a database uniqueness error to the application boundary.
+        acquire_document_xact_lock(self._session, attempt.document_id)
+        chain = tuple(
+            self._session.execute(
+                sa.select(models.RemoteParseAttempt)
+                .where(models.RemoteParseAttempt.document_id == attempt.document_id)
+                .order_by(
+                    models.RemoteParseAttempt.attempt_generation,
+                    models.RemoteParseAttempt.attempt_id,
+                )
+                .with_for_update()
+            ).scalars()
+        )
+        existing = next(
+            (row for row in chain if row.attempt_id == attempt.attempt_id),
+            None,
+        )
+        if existing is not None:
+            if existing.checkpoint_contract_version != 3:
+                raise RemoteParseCheckpointConflict(
+                    "v3 prepared creation conflicts with a cross-version attempt"
+                )
+            loaded = _remote_attempt_entity(existing)
+            stored_secret = self._session.get(
+                models.RemoteParseV3ResumeSecret,
+                (attempt.attempt_id, "prepared_reconcile"),
+            )
+            if self._same_v3_creation(
+                loaded=loaded,
+                candidate=attempt,
+                stored_secret=stored_secret,
+                candidate_secret=prepared_secret,
+            ):
+                return loaded
+            raise RemoteParseCheckpointConflict(
+                "v3 prepared creation conflicts with an existing attempt"
+            )
+        generations = tuple(row.attempt_generation for row in chain)
+        if generations and generations != tuple(range(1, max(generations) + 1)):
+            raise RemoteParseCheckpointConflict(
+                "stored remote-parse generation chain is not contiguous"
+            )
+        if any(row.is_current for row in chain):
+            raise RemoteParseCheckpointConflict(
+                "document already has a current remote-parse attempt"
+            )
+        if any(
+            row.checkpoint_contract_version == 4
+            and row.state == "prepared"
+            and not row.is_current
+            for row in chain
+        ):
+            raise RemoteParseCheckpointConflict(
+                "document already has a staged v4 remote-parse attempt"
+            )
+        expected_generation = 1 if not generations else generations[-1] + 1
+        if attempt.attempt_generation != expected_generation:
+            raise RemoteParseCheckpointConflict(
+                "v3 prepared generation is not the next document generation"
+            )
         values = {
             name: getattr(attempt, name)
             for name in (
@@ -1038,11 +1101,43 @@ class RemoteParseAttemptRepository:
             token_sha256=prepared_secret.token_sha256,
             token_byte_count=prepared_secret.token_byte_count,
         )
-        with self._session.begin_nested():
-            self._session.add(row)
-            self._session.add(secret_row)
-            self._session.flush()
+        try:
+            with self._session.begin_nested():
+                self._session.add(row)
+                self._session.add(secret_row)
+                self._session.flush()
+        except IntegrityError as exc:
+            raise RemoteParseCheckpointConflict(
+                "v3 prepared creation lost a typed first-write race"
+            ) from exc
         return _remote_attempt_entity(row)
+
+    @staticmethod
+    def _same_v3_creation(
+        *,
+        loaded: RemoteParseAttempt,
+        candidate: RemoteParseAttempt,
+        stored_secret: models.RemoteParseV3ResumeSecret | None,
+        candidate_secret: RemoteParseResumeSecret,
+    ) -> bool:
+        exact_projection_fields = tuple(
+            item.name
+            for item in fields(RemoteParseAttempt)
+            if item.name not in {"created_at", "updated_at"}
+        )
+        return (
+            loaded.checkpoint_contract_version == 3
+            and all(
+                getattr(loaded, name) == getattr(candidate, name)
+                for name in exact_projection_fields
+            )
+            and stored_secret is not None
+            and stored_secret.attempt_id == candidate_secret.attempt_id
+            and stored_secret.secret_kind == candidate_secret.secret_kind
+            and bytes(stored_secret.token_bytes) == candidate_secret.token_bytes
+            and stored_secret.token_sha256 == candidate_secret.token_sha256
+            and stored_secret.token_byte_count == candidate_secret.token_byte_count
+        )
 
     def get(self, attempt_id: str) -> Optional[RemoteParseAttempt]:
         row = self._session.get(models.RemoteParseAttempt, attempt_id)

@@ -16,6 +16,10 @@
    "private_imports": [],
    "tests": 8
   },
+  "tests/integration/test_atomic_document_publisher_v4.py": {
+   "private_imports": [],
+   "tests": 14
+  },
   "tests/integration/test_cninfo_download.py": {
    "private_imports": [],
    "tests": 1
@@ -48,6 +52,10 @@
    "private_imports": [],
    "tests": 9
   },
+  "tests/integration/test_prepare_and_publish_whole_document_v4.py": {
+   "private_imports": [],
+   "tests": 1
+  },
   "tests/integration/test_public_views_content.py": {
    "private_imports": [],
    "tests": 14
@@ -64,7 +72,11 @@
    "private_imports": [
     "_issue_provider_ack_completion_witness"
    ],
-   "tests": 28
+   "tests": 31
+  },
+  "tests/integration/test_remote_parse_cross_version_lock.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/integration/test_remote_parse_v4_authority.py": {
    "private_imports": [],
@@ -108,7 +120,11 @@
   },
   "tests/unit/test_atomic_document_publication_v4.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 17
+  },
+  "tests/unit/test_atomic_publication_artifact_readiness_adapter_v4.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_attest_mineru_remote_runtime.py": {
    "private_imports": [],
@@ -200,9 +216,10 @@
    "private_imports": [
     "_check_unit_snapshot_aggregate",
     "_invalid_process_class_overrides",
+    "_processing_run_checks",
     "_semantic_receipt_check"
    ],
-   "tests": 28
+   "tests": 35
   },
   "tests/unit/test_doctor_render.py": {
    "private_imports": [],
@@ -262,7 +279,7 @@
   },
   "tests/unit/test_gc_orphan_artifacts.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 9
   },
   "tests/unit/test_generate_current_source_replay.py": {
    "private_imports": [],
@@ -279,6 +296,10 @@
   "tests/unit/test_ids_extra.py": {
    "private_imports": [],
    "tests": 7
+  },
+  "tests/unit/test_immutable_artifact_store.py": {
+   "private_imports": [],
+   "tests": 15
   },
   "tests/unit/test_install_launchd.py": {
    "private_imports": [],
@@ -324,7 +345,7 @@
    "private_imports": [
     "_ZipPathCollisionIndex"
    ],
-   "tests": 63
+   "tests": 64
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -332,7 +353,7 @@
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 22
   },
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
@@ -388,9 +409,13 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/unit/test_prepare_and_publish_whole_document_v4.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_provider_document_admission.py": {
    "private_imports": [],
-   "tests": 29
+   "tests": 33
   },
   "tests/unit/test_provider_document_envelope.py": {
    "private_imports": [],
@@ -425,6 +450,10 @@
     "_validate_candidate_unit_set"
    ],
    "tests": 26
+  },
+  "tests/unit/test_published_parser_output_verifier_v4.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],
@@ -492,7 +521,7 @@
   },
   "tests/unit/test_semantic_route_receipt_v3.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 6
   },
   "tests/unit/test_semantic_route_store.py": {
    "private_imports": [],

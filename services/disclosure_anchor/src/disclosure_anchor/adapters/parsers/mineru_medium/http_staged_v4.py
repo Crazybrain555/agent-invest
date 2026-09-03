@@ -1382,6 +1382,125 @@ class MinerUHttpStagedV4:
                 results=tuple(results),
             )
 
+    def promote_or_replay(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        materialized: MaterializedProviderDocumentV4,
+        published_relpath: str,
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+    ) -> None:
+        """Transfer the exact materialized tree before transaction P.
+
+        This is deliberately narrower than cleanup: it neither deletes other
+        attempt resources nor advances lifecycle state.  The preparation
+        intent owns the target path and the later readiness manifest proves
+        the transferred tree before PostgreSQL publication can begin.
+        """
+
+        self._observe_clock()
+        if (
+            type(checkpoint) is not RemoteParseCheckpointV4
+            or checkpoint.state != "local_materialized"
+            or type(materialized) is not MaterializedProviderDocumentV4
+            or type(claim) is not V4ClaimWitness
+            or not claim.validates(checkpoint)
+            or checkpoint.local_materialization_receipt_sha256
+            != materialized.receipt.sha256
+            or checkpoint.materialization_intent_sha256
+            != materialized.intent.sha256
+            or (
+                checkpoint.attempt_id,
+                checkpoint.fence_identity,
+                checkpoint.document_id,
+                checkpoint.processing_run_id,
+            )
+            != (
+                materialized.intent.attempt_id,
+                materialized.intent.fence_identity,
+                materialized.intent.document_id,
+                materialized.intent.processing_run_id,
+            )
+        ):
+            raise self._fail("publication output promotion authority drifted")
+        validate_relative_resource_path_v4(
+            published_relpath,
+            "publication parser output",
+        )
+        intent = materialized.intent
+        receipt = materialized.receipt
+        source = self._path(intent.output_relpath)
+        target = self._path(published_relpath)
+        lock_binding = self._resource_binding(intent)
+        lock_paths = [
+            self._path(intent.spool_lock_relpath),
+            self._path(intent.staging_lock_relpath),
+        ]
+        with self._ordered_locks(lock_paths, lock_binding):
+            self._guard(claim_guard, checkpoint, claim)
+            evidence_root = (
+                source
+                if self._try_path_stat(source) is not None
+                else target
+            )
+            loaded = self._load_exact_output(
+                intent=intent,
+                output=evidence_root,
+            )
+            if loaded != materialized:
+                raise self._fail("publication output promotion evidence drifted")
+            self._transfer_planned(
+                source=source,
+                target=target,
+                expected_sha256=receipt.output_files_sha256,
+                expected_byte_count=receipt.output_byte_count,
+                before_effect=lambda: self._guard(
+                    claim_guard,
+                    checkpoint,
+                    claim,
+                ),
+                max_files=receipt.output_file_count,
+            )
+            replayed = self._load_exact_output(
+                intent=intent,
+                output=target,
+            )
+            if replayed != materialized:
+                raise self._fail("published parser output drifted after promotion")
+
+    def verify_published(
+        self,
+        *,
+        published_relpath: str,
+        expected_inventory_sha256: str,
+        expected_file_count: int,
+        expected_byte_count: int,
+    ) -> None:
+        """Read-only exact inventory verification for readiness/Doctor/GC."""
+
+        validate_relative_resource_path_v4(
+            published_relpath,
+            "published parser output",
+        )
+        if type(expected_file_count) is not int or expected_file_count < 1:
+            raise self._fail("published parser output file count is invalid")
+        with self._root_lock_coordinator.process_lock:
+            root = self._path(published_relpath)
+            identity = self._require_tree_inventory(
+                root,
+                expected_inventory_sha256,
+                expected_byte_count,
+                max_files=expected_file_count,
+            )
+            self._fsync_exact_tree_and_parent(
+                root,
+                expected_sha256=expected_inventory_sha256,
+                expected_byte_count=expected_byte_count,
+                max_files=expected_file_count,
+                expected_identity=identity,
+            )
+
     def acknowledge_v4(
         self,
         *,

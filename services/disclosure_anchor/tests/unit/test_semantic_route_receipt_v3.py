@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import unittest
 
 from disclosure_anchor.application.contracts.semantic_routes import (
@@ -9,6 +10,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SemanticRouteReceiptRowV3,
     semantic_route_receipt_row_v3_from_payload,
     semantic_route_receipt_row_v3_to_payload,
+    semantic_route_receipts_file_bytes_v3,
     validate_semantic_route_receipt_rows_v3,
 )
 from tests.unit._semantic_routes import _fallback_receipt
@@ -60,6 +62,32 @@ class SemanticRouteReceiptV3Tests(unittest.TestCase):
                 provider_locator_sha256=SHA_A,
                 routed_draft_sha256=SHA_B,
                 receipt=_fallback_receipt(0),
+            )
+
+    def test_file_bytes_are_the_unique_ordered_jsonl_encoding(self) -> None:
+        rows = (_row(1), _row(2))
+        exact = semantic_route_receipts_file_bytes_v3(rows)
+        expected = "".join(
+            json.dumps(
+                semantic_route_receipt_row_v3_to_payload(row),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+            for row in rows
+        ).encode("utf-8")
+        self.assertEqual(exact, expected)
+        self.assertTrue(exact.endswith(b"\n"))
+        self.assertFalse(exact.startswith(b"["))
+
+    def test_file_bytes_reject_empty_or_mixed_runs(self) -> None:
+        with self.assertRaisesRegex(SemanticRouteContractError, "cannot be empty"):
+            semantic_route_receipts_file_bytes_v3(())
+        with self.assertRaisesRegex(SemanticRouteContractError, "mix"):
+            semantic_route_receipts_file_bytes_v3(
+                (_row(1), replace(_row(2), processing_run_id="run-2"))
             )
 
 

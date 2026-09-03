@@ -102,32 +102,50 @@ class SqlAlchemyUnitOfWork:
         exc: BaseException | None,
         tb: object,
     ) -> None:
+        cleanup_error: BaseException | None = None
         try:
-            if exc_type is not None:
-                self.rollback()
-            else:
+            try:
                 # Default-safe: rollback anything not explicitly committed.
                 self.rollback()
-        finally:
+            except BaseException as cleanup_exc:
+                cleanup_error = cleanup_exc
+                assert self._connection is not None
+                self._connection.invalidate()
             assert self._session is not None
             assert self._connection is not None
             try:
                 if self._corpus_write_lock_held:
-                    release_corpus_write_session_lock(self._session)
+                    if not self._connection.invalidated:
+                        release_corpus_write_session_lock(self._session)
+                    # A dead PostgreSQL backend releases all session advisory
+                    # locks server-side.  Never reconnect merely to unlock:
+                    # that would query a new backend, report a false lost-lock
+                    # error, and mask the commit-response-loss exception.
                     self._corpus_write_lock_held = False
-                self._session.commit()
-            except BaseException:
+                if not self._connection.invalidated:
+                    self._session.commit()
+            except BaseException as cleanup_exc:
+                if cleanup_error is None:
+                    cleanup_error = cleanup_exc
                 # Never return a connection with uncertain session-lock state
                 # to the pool. A dead connection releases PostgreSQL advisory
                 # locks server-side; an apparently live but inconsistent one
                 # must be invalidated explicitly.
                 self._connection.invalidate()
-                raise
-            finally:
-                self._session.close()
-                self._connection.close()
-                self._session = None
-                self._connection = None
+        finally:
+            assert self._session is not None
+            assert self._connection is not None
+            self._session.close()
+            self._connection.close()
+            self._session = None
+            self._connection = None
+        if cleanup_error is not None:
+            if exc is None:
+                raise cleanup_error
+            exc.add_note(
+                "SqlAlchemyUnitOfWork cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
     def _bind_repositories(self, session: Session) -> None:
         self.companies = CompanyRepository(session)

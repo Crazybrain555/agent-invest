@@ -380,6 +380,60 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                 with self.assertRaises(ParserOutputContractError):
                     tree.verify_unchanged()
 
+    def test_pinned_tree_final_verification_detects_nested_equal_length_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            nested = root / "nested"
+            nested.mkdir()
+            artifact = nested / "artifact.bin"
+            artifact.write_bytes(b"AAAA")
+
+            with PinnedArtifactTree.open_path(root) as tree:
+                fd = os.open(artifact, os.O_WRONLY)
+                try:
+                    os.write(fd, b"BBBB")
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+
+                with self.assertRaises(ParserOutputContractError):
+                    tree.verify_unchanged()
+
+    def test_pinned_only_verification_allows_root_rename_but_displayed_does_not(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "output"
+            moved = parent / "moved"
+            root.mkdir()
+            (root / "artifact.bin").write_bytes(b"exact")
+
+            with PinnedArtifactTree.open_path(root) as tree:
+                root.rename(moved)
+                tree.verify_pinned_topology_unchanged(
+                    allow_root_rename_ctime=True
+                )
+                with self.assertRaises(ParserOutputContractError):
+                    tree.verify_unchanged()
+
+    def test_fsync_exact_performs_one_final_metadata_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "artifact.bin").write_bytes(b"exact")
+
+            with PinnedArtifactTree.open_path(root) as tree:
+                with mock.patch.object(
+                    tree,
+                    "_scan_metadata",
+                    wraps=tree._scan_metadata,
+                ) as scan:
+                    tree.fsync_exact()
+
+                self.assertEqual(scan.call_count, 1)
+
     def test_exact_admitted_deletion_has_linear_effect_and_scan_counts(self) -> None:
         for file_count in (800, 1_600):
             with self.subTest(file_count=file_count), tempfile.TemporaryDirectory() as directory:
