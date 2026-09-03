@@ -22,9 +22,9 @@ from threading import Event
 import time
 from typing import Protocol
 
-from disclosure_anchor.application.contracts.staged_credit import (
-    CreditVector,
-    STAGED_STATE_TRANSITIONS,
+from disclosure_anchor.application.contracts.staged_resource_credit import (
+    ResourceCreditVector,
+    STAGED_RESOURCE_STATE_TRANSITIONS,
 )
 
 
@@ -34,6 +34,7 @@ class CoordinatorLane(str, Enum):
     LOCAL_PREPARE = "local_prepare"
     LOCAL = "local"
     COMMIT = "commit"
+    CLEANUP = "cleanup"
     ACK = "ack"
 
 
@@ -42,11 +43,14 @@ class CoordinatorTerminal(str, Enum):
     STUCK_OPEN_CIRCUIT = "stuck_open_circuit"
 
 
-def _positive_credit_delta(before: CreditVector, after: CreditVector) -> CreditVector:
-    return CreditVector(
+def _positive_credit_delta(
+    before: ResourceCreditVector,
+    after: ResourceCreditVector,
+) -> ResourceCreditVector:
+    return ResourceCreditVector(
         **{
             item.name: max(0, getattr(after, item.name) - getattr(before, item.name))
-            for item in fields(CreditVector)
+            for item in fields(ResourceCreditVector)
         }
     )
 
@@ -57,12 +61,12 @@ class CoordinatorWork:
 
     attempt_id: str
     state: str
-    row_version: int
+    lifecycle_version: int
     claim_generation: int
     claim_owner_identity: str | None
     lease_expires_monotonic: float | None
-    credit_reservation: CreditVector
-    credits: CreditVector
+    credit_reservation: ResourceCreditVector
+    credits: ResourceCreditVector
 
     def __post_init__(self) -> None:
         if not self.attempt_id.strip() or len(self.attempt_id) > 128:
@@ -70,7 +74,7 @@ class CoordinatorWork:
         if not self.state.strip() or len(self.state) > 64:
             raise ValueError("coordinator work state is invalid")
         for value, label in (
-            (self.row_version, "row version"),
+            (self.lifecycle_version, "lifecycle version"),
             (self.claim_generation, "claim generation"),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -105,12 +109,38 @@ class CoordinatorWork:
         elif self.state in _FINAL_STATES and (
             self.claim_owner_identity is not None
             or self.lease_expires_monotonic is not None
-            or self.credit_reservation != CreditVector()
-            or self.credits != CreditVector()
+            or self.credit_reservation != ResourceCreditVector()
+            or self.credits != ResourceCreditVector()
         ):
             raise ValueError(
                 "final coordinator work must release its claim and all credits"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionOutcome:
+    """One bounded backlog read with exact vector-pressure telemetry."""
+
+    work: tuple[CoordinatorWork, ...]
+    backlog_exists: bool
+    blocked_dimensions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        credit_names = tuple(item.name for item in fields(ResourceCreditVector))
+        canonical_blocked = tuple(
+            name for name in credit_names if name in self.blocked_dimensions
+        )
+        if (
+            type(self.work) is not tuple
+            or any(type(item) is not CoordinatorWork for item in self.work)
+            or type(self.backlog_exists) is not bool
+            or type(self.blocked_dimensions) is not tuple
+            or canonical_blocked != self.blocked_dimensions
+            or any(name not in credit_names for name in self.blocked_dimensions)
+            or (not self.backlog_exists and self.blocked_dimensions)
+            or (self.backlog_exists and not self.work and not self.blocked_dimensions)
+        ):
+            raise ValueError("admission outcome is not closed")
 
 
 class RecoveryDeferred(RuntimeError):
@@ -147,6 +177,27 @@ class RetryStage(RuntimeError):
             or retry_after_seconds <= 0
         ):
             raise ValueError("stage retry delay must be positive")
+        self.retry_after_seconds = float(retry_after_seconds)
+
+
+class StageWaiting(RuntimeError):
+    """A healthy bounded poll observed durable work that is not terminal yet.
+
+    Normal provider execution can outlive many claim-renewal windows.  Unlike
+    ``RetryStage``, this outcome does not consume an error budget or close new
+    admission; the backend must still enforce the attempt's durable runaway
+    envelope and raise a real failure when that boundary is crossed.
+    """
+
+    def __init__(self, message: str, *, retry_after_seconds: float) -> None:
+        super().__init__(message)
+        if (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, (int, float))
+            or not isfinite(retry_after_seconds)
+            or retry_after_seconds <= 0
+        ):
+            raise ValueError("stage wait delay must be positive")
         self.retry_after_seconds = float(retry_after_seconds)
 
 
@@ -210,9 +261,9 @@ class StagedCoordinatorBackend(Protocol):
     def claim_recovery(self, work: CoordinatorWork) -> CoordinatorWork: ...
 
     def admit_new(
-        self, *, limit: int, available_credits: CreditVector
-    ) -> Sequence[CoordinatorWork]:
-        """Create/claim only work whose aggregate credits fit the allowance."""
+        self, *, limit: int, available_credits: ResourceCreditVector
+    ) -> AdmissionOutcome:
+        """Create/claim fitting work and report exact blocked backlog dimensions."""
 
     def renew_claim(
         self, work: CoordinatorWork, *, lease_seconds: int
@@ -226,7 +277,7 @@ class StagedCoordinatorBackend(Protocol):
         self,
         work: CoordinatorWork,
         *,
-        credit_allowance: CreditVector,
+        credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         """Run local-only preflight, then durably enter reconciling."""
@@ -235,7 +286,7 @@ class StagedCoordinatorBackend(Protocol):
         self,
         work: CoordinatorWork,
         *,
-        credit_allowance: CreditVector,
+        credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork: ...
 
@@ -243,7 +294,7 @@ class StagedCoordinatorBackend(Protocol):
         self,
         work: CoordinatorWork,
         *,
-        credit_allowance: CreditVector,
+        credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         """Durably enter materializing and reserve exact local projections."""
@@ -252,7 +303,7 @@ class StagedCoordinatorBackend(Protocol):
         self,
         work: CoordinatorWork,
         *,
-        credit_allowance: CreditVector,
+        credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork: ...
 
@@ -260,7 +311,15 @@ class StagedCoordinatorBackend(Protocol):
         self,
         work: CoordinatorWork,
         *,
-        credit_allowance: CreditVector,
+        credit_allowance: ResourceCreditVector,
+        stage_guard: StageLeaseGuard,
+    ) -> CoordinatorWork: ...
+
+    def cleanup(
+        self,
+        work: CoordinatorWork,
+        *,
+        credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork: ...
 
@@ -271,7 +330,7 @@ class StagedCoordinatorBackend(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class CoordinatorLimits:
-    credits: CreditVector
+    credits: ResourceCreditVector
     recovery_page_size: int = 128
     admission_batch_size: int = 32
     preflight_workers: int = 1
@@ -279,6 +338,7 @@ class CoordinatorLimits:
     local_prepare_workers: int = 1
     local_workers: int = 2
     commit_workers: int = 2
+    cleanup_workers: int = 2
     ack_workers: int = 2
     poll_seconds: float = 0.1
     idle_open_circuit_seconds: float = 300.0
@@ -300,6 +360,7 @@ class CoordinatorLimits:
             (self.local_prepare_workers, "local prepare workers"),
             (self.local_workers, "local workers"),
             (self.commit_workers, "commit workers"),
+            (self.cleanup_workers, "cleanup workers"),
             (self.ack_workers, "ACK workers"),
             (self.claim_lease_seconds, "claim lease seconds"),
             (self.retry_consecutive_threshold, "retry consecutive threshold"),
@@ -350,10 +411,11 @@ class CoordinatorSnapshot:
     circuit_open: bool
     queued: tuple[tuple[str, int], ...]
     in_flight: tuple[tuple[str, int], ...]
-    credits_in_use: CreditVector
-    credits_limit: CreditVector
+    credits_in_use: ResourceCreditVector
+    credits_limit: ResourceCreditVector
     completed: int
     blocked_reason: str | None
+    credit_blocked_by_lane: tuple[tuple[str, tuple[str, ...]], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,11 +426,18 @@ class CoordinatorResult:
     completed: int
     final_states: tuple[tuple[str, str], ...]
     errors: tuple[str, ...]
-    credits_in_use: CreditVector
+    credits_in_use: ResourceCreditVector
 
 
 _FINAL_STATES = frozenset(
-    {"acked", "remote_failed", "local_failed", "pre_submission_failed", "superseded"}
+    {
+        "acked",
+        "remote_failed",
+        "local_failed",
+        "pre_submission_failed",
+        "preparation_failed",
+        "superseded",
+    }
 )
 _LANE_BY_STATE = {
     "prepared": CoordinatorLane.PREFLIGHT,
@@ -377,64 +446,72 @@ _LANE_BY_STATE = {
     "remote_terminal": CoordinatorLane.LOCAL_PREPARE,
     "materializing": CoordinatorLane.LOCAL,
     "local_materialized": CoordinatorLane.COMMIT,
-    "finish_committed": CoordinatorLane.ACK,
-    "remote_failure_committed": CoordinatorLane.ACK,
-    "local_failure_committed": CoordinatorLane.ACK,
+    "publish_committed": CoordinatorLane.CLEANUP,
+    "cleanup_pending": CoordinatorLane.CLEANUP,
+    "ack_pending": CoordinatorLane.ACK,
 }
 _LANE_PRIORITY = (
     CoordinatorLane.ACK,
+    CoordinatorLane.CLEANUP,
     CoordinatorLane.COMMIT,
     CoordinatorLane.LOCAL,
     CoordinatorLane.LOCAL_PREPARE,
     CoordinatorLane.REMOTE,
     CoordinatorLane.PREFLIGHT,
 )
+_STATE_PRIORITY_WITHIN_LANE = {
+    CoordinatorLane.CLEANUP: {
+        "cleanup_pending": 0,
+        "publish_committed": 1,
+    },
+}
 _ALLOWED_LANE_TRANSITIONS = {
     CoordinatorLane.PREFLIGHT: frozenset(
-        ("prepared", target) for target in STAGED_STATE_TRANSITIONS["prepared"]
+        ("prepared", target) for target in STAGED_RESOURCE_STATE_TRANSITIONS["prepared"]
     ),
     CoordinatorLane.REMOTE: frozenset(
         (source, target)
         for source in ("reconciling", "submitted")
-        for target in STAGED_STATE_TRANSITIONS[source]
+        for target in STAGED_RESOURCE_STATE_TRANSITIONS[source]
     ),
     CoordinatorLane.LOCAL_PREPARE: frozenset(
         ("remote_terminal", target)
-        for target in STAGED_STATE_TRANSITIONS["remote_terminal"]
+        for target in STAGED_RESOURCE_STATE_TRANSITIONS["remote_terminal"]
     ),
     CoordinatorLane.LOCAL: frozenset(
         ("materializing", target)
-        for target in STAGED_STATE_TRANSITIONS["materializing"]
+        for target in STAGED_RESOURCE_STATE_TRANSITIONS["materializing"]
     ),
     CoordinatorLane.COMMIT: frozenset(
         ("local_materialized", target)
-        for target in STAGED_STATE_TRANSITIONS["local_materialized"]
+        for target in STAGED_RESOURCE_STATE_TRANSITIONS["local_materialized"]
+    ),
+    CoordinatorLane.CLEANUP: frozenset(
+        (source, target)
+        for source in ("publish_committed", "cleanup_pending")
+        for target in STAGED_RESOURCE_STATE_TRANSITIONS[source]
     ),
     CoordinatorLane.ACK: frozenset(
         (source, target)
-        for source in (
-            "finish_committed",
-            "remote_failure_committed",
-            "local_failure_committed",
-        )
-        for target in STAGED_STATE_TRANSITIONS[source]
+        for source in ("ack_pending",)
+        for target in STAGED_RESOURCE_STATE_TRANSITIONS[source]
     ),
 }
 
 
 class _CreditLedger:
-    def __init__(self, limit: CreditVector) -> None:
+    def __init__(self, limit: ResourceCreditVector) -> None:
         self.limit = limit
-        self.in_use = CreditVector()
-        self.by_attempt: dict[str, CreditVector] = {}
+        self.in_use = ResourceCreditVector()
+        self.by_attempt: dict[str, ResourceCreditVector] = {}
 
     def can_add(self, work: CoordinatorWork) -> bool:
-        previous = self.by_attempt.get(work.attempt_id, CreditVector())
+        previous = self.by_attempt.get(work.attempt_id, ResourceCreditVector())
         candidate = self.in_use - previous + work.credits
         return candidate.fits(self.limit)
 
     def replace(self, work: CoordinatorWork, *, allow_oversubscribed: bool) -> None:
-        previous = self.by_attempt.get(work.attempt_id, CreditVector())
+        previous = self.by_attempt.get(work.attempt_id, ResourceCreditVector())
         candidate = self.in_use - previous + work.credits
         if not allow_oversubscribed and not candidate.fits(self.limit):
             raise ValueError("new work exceeds coordinator credit limits")
@@ -446,8 +523,8 @@ class _CreditLedger:
         if previous is not None:
             self.in_use = self.in_use - previous
 
-    def allowance_for(self, attempt_id: str) -> CreditVector:
-        previous = self.by_attempt.get(attempt_id, CreditVector())
+    def allowance_for(self, attempt_id: str) -> ResourceCreditVector:
+        previous = self.by_attempt.get(attempt_id, ResourceCreditVector())
         return self.limit - (self.in_use - previous)
 
 
@@ -486,6 +563,8 @@ class StagedParseCoordinator:
         admitted = 0
         completed = 0
         admission_open = False
+        admission_blocked_dimensions: tuple[str, ...] = ()
+        admission_blocked_available: ResourceCreditVector | None = None
         recovery_complete = False
         circuit_open = False
         blocked_reason: str | None = "recovery_barrier"
@@ -496,6 +575,7 @@ class StagedParseCoordinator:
             CoordinatorLane.LOCAL_PREPARE: self._limits.local_prepare_workers,
             CoordinatorLane.LOCAL: self._limits.local_workers,
             CoordinatorLane.COMMIT: self._limits.commit_workers,
+            CoordinatorLane.CLEANUP: self._limits.cleanup_workers,
             CoordinatorLane.ACK: self._limits.ack_workers,
         }
         pools = {
@@ -507,12 +587,20 @@ class StagedParseCoordinator:
         }
         in_flight: dict[
             Future[CoordinatorWork],
-            tuple[CoordinatorLane, CoordinatorWork, StageLeaseGuard, CreditVector],
+            tuple[
+                CoordinatorLane,
+                CoordinatorWork,
+                StageLeaseGuard,
+                ResourceCreditVector,
+            ],
         ] = {}
         reconciled_results: dict[Future[CoordinatorWork], CoordinatorWork] = {}
         in_flight_failures: set[Future[CoordinatorWork]] = set()
-        provisional_local: dict[Future[CoordinatorWork], CreditVector] = {}
-        provisional_local_total = CreditVector()
+        provisional_local: dict[Future[CoordinatorWork], ResourceCreditVector] = {}
+        provisional_local_total = ResourceCreditVector()
+        credit_blocked_by_lane: dict[CoordinatorLane, set[str]] = {
+            lane: set() for lane in CoordinatorLane
+        }
 
         def emit() -> None:
             self._progress(
@@ -520,7 +608,9 @@ class StagedParseCoordinator:
                     admission_open=admission_open,
                     recovery_complete=recovery_complete,
                     circuit_open=circuit_open,
-                    queued=tuple((lane.value, len(queues[lane])) for lane in CoordinatorLane),
+                    queued=tuple(
+                        (lane.value, len(queues[lane])) for lane in CoordinatorLane
+                    ),
                     in_flight=tuple(
                         (
                             lane.value,
@@ -536,6 +626,10 @@ class StagedParseCoordinator:
                     credits_limit=ledger.limit,
                     completed=completed,
                     blocked_reason=blocked_reason,
+                    credit_blocked_by_lane=tuple(
+                        (lane.value, tuple(sorted(credit_blocked_by_lane[lane])))
+                        for lane in CoordinatorLane
+                    ),
                 )
             )
 
@@ -544,7 +638,7 @@ class StagedParseCoordinator:
             previous = known.get(work.attempt_id)
             if previous is not None and (
                 work.claim_generation < previous.claim_generation
-                or work.row_version < previous.row_version
+                or work.lifecycle_version < previous.lifecycle_version
             ):
                 raise RuntimeError("durable coordinator projection moved backwards")
             known[work.attempt_id] = work
@@ -588,13 +682,12 @@ class StagedParseCoordinator:
             previous = known.get(work.attempt_id)
             if previous is not None and (
                 work.claim_generation < previous.claim_generation
-                or work.row_version < previous.row_version
+                or work.lifecycle_version < previous.lifecycle_version
             ):
                 raise RuntimeError("deferred recovery projection moved backwards")
             known[work.attempt_id] = work
-            if (
-                not ledger.can_add(work)
-                or not work.credit_reservation.fits(ledger.limit)
+            if not ledger.can_add(work) or not work.credit_reservation.fits(
+                ledger.limit
             ):
                 oversubscribed_recovery.add(work.attempt_id)
             ledger.replace(work, allow_oversubscribed=True)
@@ -636,13 +729,18 @@ class StagedParseCoordinator:
                 return False
             if (prior.state, updated.state) not in _ALLOWED_LANE_TRANSITIONS[lane]:
                 preserve_contract_violation(
-                    prior, updated, lane,
+                    prior,
+                    updated,
+                    lane,
                     f"illegal transition {prior.state}->{updated.state}",
                 )
                 return False
-            if updated.row_version != prior.row_version + 1:
+            if updated.lifecycle_version != prior.lifecycle_version + 1:
                 preserve_contract_violation(
-                    prior, updated, lane, "row version did not advance exactly once"
+                    prior,
+                    updated,
+                    lane,
+                    "lifecycle version did not advance exactly once",
                 )
                 return False
             if updated.claim_generation != prior.claim_generation:
@@ -677,7 +775,7 @@ class StagedParseCoordinator:
                 return False
             if (
                 updated.state in _FINAL_STATES
-                and updated.credit_reservation != CreditVector()
+                and updated.credit_reservation != ResourceCreditVector()
             ):
                 preserve_contract_violation(
                     prior, updated, lane, "final state retained lifecycle reservation"
@@ -700,20 +798,31 @@ class StagedParseCoordinator:
             if (
                 renewed.attempt_id != work.attempt_id
                 or renewed.state != work.state
-                or renewed.row_version != work.row_version
+                or renewed.lifecycle_version != work.lifecycle_version
                 or renewed.claim_generation != work.claim_generation
                 or renewed.claim_owner_identity != work.claim_owner_identity
                 or renewed.credit_reservation != work.credit_reservation
                 or renewed.credits != work.credits
                 or renewed.lease_expires_monotonic is None
                 or work.lease_expires_monotonic is None
-                or renewed.lease_expires_monotonic
-                <= work.lease_expires_monotonic
+                or renewed.lease_expires_monotonic <= work.lease_expires_monotonic
             ):
                 preserve_contract_violation(
                     work, renewed, lane, "claim renewal changed durable work"
                 )
                 raise RuntimeError("claim renewal contract violation")
+            minimum_lease = (
+                self._limits.max_stage_step_seconds
+                + self._limits.claim_renew_margin_seconds
+            )
+            if renewed.lease_expires_monotonic - self._monotonic() <= minimum_lease:
+                preserve_contract_violation(
+                    work,
+                    renewed,
+                    lane,
+                    "claim renewal cannot cover the bounded stage",
+                )
+                raise RuntimeError("claim renewal is too short for the bounded stage")
             known[work.attempt_id] = renewed
             return renewed
 
@@ -725,34 +834,73 @@ class StagedParseCoordinator:
                 + self._limits.claim_renew_margin_seconds
             )
 
-        def transition_hold(
-            work: CoordinatorWork, lane: CoordinatorLane
-        ) -> CreditVector:
-            names_by_lane = {
-                CoordinatorLane.PREFLIGHT: {"remote_waits"},
-                CoordinatorLane.REMOTE: {
-                    "retained_results",
-                    "retained_bytes",
-                    "ack_items",
-                },
-                CoordinatorLane.LOCAL_PREPARE: {
-                    "local_items",
+        def bounded_defer_delay(
+            work: CoordinatorWork,
+            *,
+            now: float,
+            requested_seconds: float,
+        ) -> float:
+            configured_max_wait = (
+                self._limits.claim_lease_seconds
+                - self._limits.max_stage_step_seconds
+                - self._limits.claim_renew_margin_seconds
+            )
+            lease_remaining = (
+                (work.lease_expires_monotonic or now)
+                - now
+                - self._limits.claim_renew_margin_seconds
+            )
+            safe_wait = max(
+                self._limits.poll_seconds,
+                min(configured_max_wait, lease_remaining),
+            )
+            return min(requested_seconds, safe_wait)
+
+        def exceeded_dimensions(
+            used: ResourceCreditVector,
+            limit: ResourceCreditVector,
+        ) -> tuple[str, ...]:
+            return tuple(
+                item.name
+                for item in fields(ResourceCreditVector)
+                if getattr(used, item.name) > getattr(limit, item.name)
+            )
+
+        def positive_dimensions(value: ResourceCreditVector) -> tuple[str, ...]:
+            return tuple(
+                item.name
+                for item in fields(ResourceCreditVector)
+                if getattr(value, item.name) > 0
+            )
+
+        def transition_hold(work: CoordinatorWork) -> ResourceCreditVector:
+            names_by_state = {
+                "prepared": {"remote_waits"},
+                "reconciling": {"provider_tasks", "ack_items"},
+                "submitted": {"provider_result_bytes"},
+                "remote_terminal": {
+                    "materialization_items",
                     "compressed_bytes",
                     "decoded_bytes",
                     "temp_disk_bytes",
-                    "ack_items",
                 },
-                CoordinatorLane.LOCAL: {
-                    "db_stage_items",
-                    "db_staged_bytes",
-                    "unpublished_pages",
-                    "ack_items",
+                "materializing": {
+                    "output_items",
+                    "output_bytes",
+                    "output_pages",
                 },
-                CoordinatorLane.COMMIT: {"ack_items"},
-                CoordinatorLane.ACK: set(),
+                "local_materialized": set(),
+                "publish_committed": set(),
+                "cleanup_pending": set(),
+                "ack_pending": set(),
             }
-            names = names_by_lane[lane]
-            return CreditVector(
+            try:
+                names = names_by_state[work.state]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"unsupported credit transition source: {work.state}"
+                ) from exc
+            return ResourceCreditVector(
                 **{
                     item.name: (
                         max(
@@ -763,7 +911,7 @@ class StagedParseCoordinator:
                         if item.name in names
                         else 0
                     )
-                    for item in fields(CreditVector)
+                    for item in fields(ResourceCreditVector)
                 }
             )
 
@@ -807,19 +955,23 @@ class StagedParseCoordinator:
                                 f"{type(reload_exc).__name__}:{reload_exc}"
                             )
                             in_flight_failures.add(future)
+                            stage_guard.revoke()
                         continue
                     if (
                         durable.attempt_id == work.attempt_id
                         and durable.claim_generation == work.claim_generation
                         and durable.claim_owner_identity == work.claim_owner_identity
                         and durable.state == work.state
-                        and durable.row_version == work.row_version
+                        and durable.lifecycle_version == work.lifecycle_version
                         and durable.credits == work.credits
                         and durable.credit_reservation == work.credit_reservation
                         and durable.lease_expires_monotonic is not None
                         and work.lease_expires_monotonic is not None
                         and durable.lease_expires_monotonic
                         > work.lease_expires_monotonic
+                        and durable.lease_expires_monotonic
+                        > stage_guard.deadline_monotonic
+                        + self._limits.claim_renew_margin_seconds
                     ):
                         known[work.attempt_id] = durable
                         ledger.replace(
@@ -834,7 +986,7 @@ class StagedParseCoordinator:
                         and durable.claim_generation == work.claim_generation
                         and (work.state, durable.state)
                         in _ALLOWED_LANE_TRANSITIONS[lane]
-                        and durable.row_version == work.row_version + 1
+                        and durable.lifecycle_version == work.lifecycle_version + 1
                     ):
                         # The stage committed and its response raced renewal.
                         # Consume the exact durable projection when the bounded
@@ -849,6 +1001,7 @@ class StagedParseCoordinator:
                             f"{type(exc).__name__}:{exc}"
                         )
                         in_flight_failures.add(future)
+                        stage_guard.revoke()
                 else:
                     in_flight[future] = (lane, renewed, stage_guard, _grant)
 
@@ -906,9 +1059,9 @@ class StagedParseCoordinator:
                     admission_open = False
                     blocked_reason = "draining"
 
-                for attempt_id, (ready_at, work) in tuple(
-                    deferred_claims.items()
-                ):
+                for attempt_id, (ready_at, work) in tuple(deferred_claims.items()):
+                    if stop_requested():
+                        break
                     if ready_at > now:
                         continue
                     try:
@@ -950,72 +1103,177 @@ class StagedParseCoordinator:
                         retry_at.pop(attempt_id)
                         lane = _LANE_BY_STATE.get(work.state)
                         if lane is None:
-                            raise RuntimeError("retry work has unsupported durable state")
+                            raise RuntimeError(
+                                "retry work has unsupported durable state"
+                            )
                         queues[lane].append(work)
 
                 active_ids = set(known)
-                if (
-                    admission_open
-                    and not circuit_open
-                    and not oversubscribed_recovery
-                    and ledger.in_use.fits(ledger.limit)
-                ):
-                    capacity = max(0, self._limits.admission_batch_size - len(active_ids))
-                    if capacity > 0:
+                if admission_open and not circuit_open:
+                    if oversubscribed_recovery or not ledger.in_use.fits(ledger.limit):
+                        blocked_reason = "oversubscribed_recovery_drain"
+                    else:
                         available_credits = ledger.limit - ledger.in_use
-                        admitted_batch = tuple(
-                            self._backend.admit_new(
+                        saturated = tuple(
+                            item.name
+                            for item in fields(ResourceCreditVector)
+                            if getattr(available_credits, item.name) == 0
+                        )
+                        capacity = min(
+                            self._limits.admission_batch_size,
+                            available_credits.documents,
+                        )
+                        if capacity == 0:
+                            admission_blocked_dimensions = saturated or ("documents",)
+                            admission_blocked_available = available_credits
+                            blocked_reason = "credit_backpressure:" + ",".join(
+                                admission_blocked_dimensions
+                            )
+                        elif (
+                            admission_blocked_dimensions
+                            and admission_blocked_available is not None
+                            and not any(
+                                getattr(available_credits, name)
+                                > getattr(admission_blocked_available, name)
+                                for name in admission_blocked_dimensions
+                            )
+                        ):
+                            blocked_reason = "credit_backpressure:" + ",".join(
+                                admission_blocked_dimensions
+                            )
+                        else:
+                            if blocked_reason is not None and (
+                                blocked_reason.startswith("credit_backpressure:")
+                                or blocked_reason == "oversubscribed_recovery_drain"
+                            ):
+                                blocked_reason = None
+                            admission = self._backend.admit_new(
                                 limit=capacity,
                                 available_credits=available_credits,
                             )
-                        )
-                        if len(admitted_batch) > capacity:
-                            raise RuntimeError("backend exceeded its admission count grant")
-                        for work in admitted_batch:
-                            if work.attempt_id in active_ids or work.attempt_id in final:
-                                raise RuntimeError("new admission duplicated an active attempt")
+                            if type(admission) is not AdmissionOutcome:
+                                raise RuntimeError(
+                                    "backend returned an invalid admission outcome"
+                                )
+                            admitted_batch = admission.work
+                            if len(admitted_batch) > capacity:
+                                raise RuntimeError(
+                                    "backend exceeded its admission count grant"
+                                )
+                            for work in admitted_batch:
+                                if (
+                                    work.attempt_id in active_ids
+                                    or work.attempt_id in final
+                                ):
+                                    raise RuntimeError(
+                                        "new admission duplicated an active attempt"
+                                    )
+                                valid_initial_shape = (
+                                    work.state == "prepared"
+                                    and work.lifecycle_version == 0
+                                )
+                                if (
+                                    not valid_initial_shape
+                                    or not ledger.can_add(work)
+                                    or not work.credit_reservation.fits(ledger.limit)
+                                ):
+                                    # ``admit_new`` has already durably created and
+                                    # claimed the attempt. Preserve it and drain it;
+                                    # never drop a backend contract violation.
+                                    place(work, recovery=True)
+                                    circuit_open = True
+                                    admission_open = False
+                                    blocked_reason = (
+                                        "admission_initial_state_contract_violation"
+                                        if not valid_initial_shape
+                                        else "admission_credit_contract_violation"
+                                    )
+                                    errors.append(
+                                        f"{work.attempt_id}:admission returned an invalid "
+                                        "initial state"
+                                        if not valid_initial_shape
+                                        else f"{work.attempt_id}:admission exceeded credit grant"
+                                    )
+                                else:
+                                    place(work, recovery=False)
+                                active_ids.add(work.attempt_id)
+                                admitted += 1
+                                last_progress = now
                             if (
-                                not ledger.can_add(work)
-                                or not work.credit_reservation.fits(ledger.limit)
+                                admission.backlog_exists
+                                and admission.blocked_dimensions
                             ):
-                                # ``admit_new`` has already durably created and
-                                # claimed the attempt. Preserve it and drain it;
-                                # never drop a backend contract violation.
-                                place(work, recovery=True)
-                                circuit_open = True
-                                admission_open = False
-                                blocked_reason = "admission_credit_contract_violation"
-                                errors.append(
-                                    f"{work.attempt_id}:admission exceeded credit grant"
+                                admission_blocked_dimensions = (
+                                    admission.blocked_dimensions
+                                )
+                                admission_blocked_available = (
+                                    ledger.limit - ledger.in_use
+                                )
+                                blocked_reason = "credit_backpressure:" + ",".join(
+                                    admission_blocked_dimensions
                                 )
                             else:
-                                place(work, recovery=False)
-                            active_ids.add(work.attempt_id)
-                            admitted += 1
-                            last_progress = now
+                                admission_blocked_dimensions = ()
+                                admission_blocked_available = None
 
+                credit_blocked_by_lane = {lane: set() for lane in CoordinatorLane}
                 for lane in _LANE_PRIORITY:
+                    if circuit_open:
+                        break
                     active = sum(
                         1
                         for active_lane, _, _, _ in in_flight.values()
                         if active_lane == lane
                     )
                     while queues[lane] and active < lane_limits[lane]:
-                        work = queues[lane].popleft()
-                        local_hold = transition_hold(work, lane)
-                        if work.attempt_id in oversubscribed_recovery:
-                            # Recovery may begin above the configured envelope,
-                            # but only one positive-growth emergency grant may
-                            # run at a time. This drains without multiplying the
-                            # existing overage across concurrent owners.
-                            if local_hold != CreditVector() and provisional_local:
-                                queues[lane].appendleft(work)
-                                break
-                        elif not (
-                            ledger.in_use + provisional_local_total + local_hold
-                        ).fits(ledger.limit):
-                            queues[lane].appendleft(work)
+                        queue = queues[lane]
+                        priorities = _STATE_PRIORITY_WITHIN_LANE.get(lane)
+                        ordered_indices = sorted(
+                            range(len(queue)),
+                            key=lambda candidate: (
+                                priorities.get(queue[candidate].state, len(priorities))
+                                if priorities
+                                else 0,
+                                candidate,
+                            ),
+                        )
+                        selected: (
+                            tuple[int, CoordinatorWork, ResourceCreditVector] | None
+                        ) = None
+                        first_shortages: tuple[str, ...] = ()
+                        for position, index in enumerate(ordered_indices):
+                            candidate = queue[index]
+                            candidate_hold = transition_hold(candidate)
+                            if position > 0 and any(
+                                getattr(candidate_hold, name) > 0
+                                for name in first_shortages
+                            ):
+                                continue
+                            if candidate.attempt_id in oversubscribed_recovery:
+                                shortages = (
+                                    positive_dimensions(candidate_hold)
+                                    if candidate_hold != ResourceCreditVector()
+                                    and provisional_local
+                                    else ()
+                                )
+                            else:
+                                shortages = exceeded_dimensions(
+                                    ledger.in_use
+                                    + provisional_local_total
+                                    + candidate_hold,
+                                    ledger.limit,
+                                )
+                            if shortages:
+                                if position == 0:
+                                    first_shortages = shortages
+                                    credit_blocked_by_lane[lane].update(shortages)
+                                continue
+                            selected = (index, candidate, candidate_hold)
                             break
+                        if selected is None:
+                            break
+                        index, work, local_hold = selected
+                        del queue[index]
                         try:
                             if needs_renewal(work, now):
                                 work = renew(work, lane)
@@ -1069,6 +1327,13 @@ class StagedParseCoordinator:
                                 credit_allowance=local_hold,
                                 stage_guard=stage_guard,
                             )
+                        elif lane == CoordinatorLane.CLEANUP:
+                            future = pools[lane].submit(
+                                self._backend.cleanup,
+                                work,
+                                credit_allowance=local_hold,
+                                stage_guard=stage_guard,
+                            )
                         else:
                             future = pools[lane].submit(
                                 self._backend.acknowledge,
@@ -1076,7 +1341,7 @@ class StagedParseCoordinator:
                                 stage_guard=stage_guard,
                             )
                         in_flight[future] = (lane, work, stage_guard, local_hold)
-                        if local_hold != CreditVector():
+                        if local_hold != ResourceCreditVector():
                             provisional_local[future] = local_hold
                             provisional_local_total = (
                                 provisional_local_total + local_hold
@@ -1163,6 +1428,18 @@ class StagedParseCoordinator:
                             updated = reconciled_results.pop(future)
                         else:
                             updated = future.result()
+                    except StageWaiting as exc:
+                        wait_now = self._monotonic()
+                        retry_at[work.attempt_id] = (
+                            wait_now
+                            + bounded_defer_delay(
+                                work,
+                                now=wait_now,
+                                requested_seconds=exc.retry_after_seconds,
+                            ),
+                            work,
+                        )
+                        last_progress = wait_now
                     except RetryStage as exc:
                         retry_now = self._monotonic()
                         count = retry_attempts.get(work.attempt_id, 0) + 1
@@ -1173,8 +1450,7 @@ class StagedParseCoordinator:
                         consecutive_retries += 1
                         if (
                             count > self._limits.retry_max_attempts
-                            or retry_now - started
-                            >= self._limits.retry_stuck_seconds
+                            or retry_now - started >= self._limits.retry_stuck_seconds
                         ):
                             circuit_open = True
                             admission_open = False
@@ -1192,7 +1468,15 @@ class StagedParseCoordinator:
                                 * (2**exponent),
                             ),
                         )
-                        retry_at[work.attempt_id] = (retry_now + backoff, work)
+                        retry_at[work.attempt_id] = (
+                            retry_now
+                            + bounded_defer_delay(
+                                work,
+                                now=retry_now,
+                                requested_seconds=backoff,
+                            ),
+                            work,
+                        )
                         last_progress = retry_now
                         if (
                             consecutive_retries
@@ -1246,17 +1530,19 @@ class StagedParseCoordinator:
 
 
 __all__ = [
+    "AdmissionOutcome",
     "CoordinatorLane",
     "CoordinatorLimits",
     "CoordinatorResult",
     "CoordinatorSnapshot",
     "CoordinatorTerminal",
     "CoordinatorWork",
-    "CreditVector",
+    "ResourceCreditVector",
     "RecoveryDeferred",
     "RetryStage",
     "StageLeaseGuard",
     "StageLeaseLost",
+    "StageWaiting",
     "StagedCoordinatorBackend",
     "StagedParseCoordinator",
 ]

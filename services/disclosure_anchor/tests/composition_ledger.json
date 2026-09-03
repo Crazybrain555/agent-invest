@@ -543,7 +543,7 @@
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
-   "tests": 38
+   "tests": 52
   },
   "tests/unit/test_staged_provider_parser_v4.py": {
    "private_imports": [],
