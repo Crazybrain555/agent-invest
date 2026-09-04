@@ -8,7 +8,7 @@ the scratch root, and the under-lock claim guard.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 import ctypes
 import errno
@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import sys
 import threading
-from typing import Any, Iterator, Protocol, cast
+from typing import Any, BinaryIO, Iterator, NoReturn, Protocol, cast
 import unicodedata
 import zipfile
 import zlib
@@ -44,8 +44,13 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
 )
 from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     AcceptedSubmissionReceiptV4,
+    EncodedRemoteParseEvidenceV4,
     PreparationIntentV4,
+    SnapshotReceiptV4,
+    SubmissionIntentV4,
     TerminalReceiptV4,
+    validate_durable_remote_parse_evidence_bundle_v4,
+    validate_remote_parse_evidence_bundle_v4,
 )
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     LocalCleanupPlanV4,
@@ -75,9 +80,13 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     V4ClaimGuard,
     V4ClaimWitness,
     V4EvidenceReplayContext,
+    V4StageGuard,
     validate_v4_ack_authorization,
     validate_v4_cleanup_authorization,
     validate_v4_materialization_authorization,
+)
+from disclosure_anchor.application.ports.remote_provider_v4 import (
+    PinnedSnapshotSourceV4,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -114,6 +123,18 @@ class _StableFileStat:
             modified_ns=observed.st_mtime_ns,
             changed_ns=observed.st_ctime_ns,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAckTransportResponseV4:
+    """Exact bounded ACK response shared only by the MinerU adapters."""
+
+    status_code: int
+    exact_bytes: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.status_code) is not int or type(self.exact_bytes) is not bytes:
+            raise ValueError("v4 ACK transport response drifted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +305,78 @@ def _root_coordinator(identity: tuple[int, int]) -> _RootLockCoordinator:
         return _ROOT_COORDINATORS.setdefault(identity, _RootLockCoordinator())
 
 
+class _PinnedSubmissionSnapshotSourceV4:
+    """Opaque one-attempt snapshot capability issued by the scratch owner."""
+
+    __slots__ = (
+        "__backend",
+        "__checkpoint",
+        "__reservation",
+        "__snapshot_receipt",
+        "__submission_intent",
+        "__evidence",
+        "__resourceful_checkpoint_history",
+        "__claim",
+        "__claim_guard",
+    )
+
+    def __init__(
+        self,
+        *,
+        backend: MinerUHttpStagedV4,
+        checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        snapshot_receipt: SnapshotReceiptV4,
+        submission_intent: SubmissionIntentV4,
+        evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+        resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...],
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+    ) -> None:
+        self.__backend = backend
+        self.__checkpoint = checkpoint
+        self.__reservation = reservation
+        self.__snapshot_receipt = snapshot_receipt
+        self.__submission_intent = submission_intent
+        self.__evidence = evidence
+        self.__resourceful_checkpoint_history = resourceful_checkpoint_history
+        self.__claim = claim
+        self.__claim_guard = claim_guard
+
+    def __repr__(self) -> str:
+        return "<PinnedSnapshotSourceV4>"
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("PinnedSnapshotSourceV4 is process-local and non-serializable")
+
+    def validates(
+        self,
+        *,
+        submission_intent: SubmissionIntentV4,
+        snapshot_receipt: SnapshotReceiptV4,
+    ) -> bool:
+        return (
+            type(submission_intent) is SubmissionIntentV4
+            and type(snapshot_receipt) is SnapshotReceiptV4
+            and submission_intent == self.__submission_intent
+            and snapshot_receipt == self.__snapshot_receipt
+        )
+
+    def open(
+        self, *, step_guard: V4StageGuard
+    ) -> AbstractContextManager[BinaryIO]:
+        return self.__backend._open_submission_snapshot_v4(
+            checkpoint=self.__checkpoint,
+            reservation=self.__reservation,
+            snapshot_receipt=self.__snapshot_receipt,
+            evidence=self.__evidence,
+            resourceful_checkpoint_history=self.__resourceful_checkpoint_history,
+            claim=self.__claim,
+            claim_guard=self.__claim_guard,
+            step_guard=step_guard,
+        )
+
+
 class MinerUV4Transport(Protocol):
     """Private provider operations; implementations must not inherit proxy env."""
 
@@ -291,7 +384,11 @@ class MinerUV4Transport(Protocol):
         self,
         *,
         accepted_submission: AcceptedSubmissionReceiptV4,
+        terminal_receipt: TerminalReceiptV4,
         provider_capability: PrivateProviderCapabilityV4,
+        result_lease_seconds: int,
+        step_guard: V4StageGuard,
+        before_result_get: Callable[[], None],
     ) -> Iterable[bytes]: ...
 
     def acknowledge(
@@ -299,17 +396,9 @@ class MinerUV4Transport(Protocol):
         *,
         command: ProviderAckCommandV4,
         provider_capability: PrivateProviderCapabilityV4,
-    ) -> "MinerUV4HttpResponse": ...
-
-
-@dataclass(frozen=True, slots=True)
-class MinerUV4HttpResponse:
-    status_code: int
-    exact_bytes: bytes
-
-    def __post_init__(self) -> None:
-        if type(self.status_code) is not int or type(self.exact_bytes) is not bytes:
-            raise ValueError("v4 HTTP response envelope drifted")
+        step_guard: V4StageGuard,
+        before_ack_post: Callable[[], None],
+    ) -> ProviderAckTransportResponseV4: ...
 
 
 class MinerUHttpStagedV4:
@@ -345,6 +434,69 @@ class MinerUHttpStagedV4:
         self._active_locks = threading.local()
         self._name_max = int(os.pathconf(self._root, "PC_NAME_MAX"))
 
+    def submission_snapshot_source_v4(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        snapshot_receipt: SnapshotReceiptV4,
+        submission_intent: SubmissionIntentV4,
+        evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+        resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...],
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+    ) -> PinnedSnapshotSourceV4:
+        """Issue one lazy snapshot stream from exact durable reconciling facts.
+
+        The returned object contains no caller-selected path.  It opens only the
+        reservation's canonical relpath and revalidates the live claim while the
+        existing snapshot resource lock is held.
+        """
+
+        if (
+            type(checkpoint) is not RemoteParseCheckpointV4
+            or checkpoint.state != "reconciling"
+            or type(reservation) is not ResourceReservationV4
+            or type(snapshot_receipt) is not SnapshotReceiptV4
+            or type(submission_intent) is not SubmissionIntentV4
+            or type(evidence) is not tuple
+            or type(resourceful_checkpoint_history) is not tuple
+            or type(claim) is not V4ClaimWitness
+            or not claim.validates(checkpoint)
+            or not callable(
+                getattr(claim_guard, "assert_current_under_resource_lock", None)
+            )
+        ):
+            raise ValueError("v4 submission snapshot authority is invalid")
+        validate_durable_remote_parse_evidence_bundle_v4(
+            checkpoint=checkpoint,
+            evidence=evidence,
+            reservation=reservation,
+            resourceful_checkpoint_history=resourceful_checkpoint_history,
+        )
+        if (
+            checkpoint.snapshot_receipt_sha256 != snapshot_receipt.sha256
+            or checkpoint.submission_intent_sha256 != submission_intent.sha256
+            or snapshot_receipt.snapshot_relpath != reservation.snapshot_relpath
+            or snapshot_receipt.snapshot_sha256 != reservation.source_pdf_sha256
+            or snapshot_receipt.snapshot_byte_count != reservation.source_byte_count
+            or submission_intent.snapshot_receipt_sha256 != snapshot_receipt.sha256
+            or submission_intent.source_pdf_sha256
+            != snapshot_receipt.snapshot_sha256
+        ):
+            raise ValueError("v4 submission snapshot evidence drifted")
+        return _PinnedSubmissionSnapshotSourceV4(
+            backend=self,
+            checkpoint=checkpoint,
+            reservation=reservation,
+            snapshot_receipt=snapshot_receipt,
+            submission_intent=submission_intent,
+            evidence=evidence,
+            resourceful_checkpoint_history=resourceful_checkpoint_history,
+            claim=claim,
+            claim_guard=claim_guard,
+        )
+
     def materialize_v4(
         self,
         *,
@@ -357,9 +509,12 @@ class MinerUHttpStagedV4:
         provider_capability: PrivateProviderCapabilityV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
+        result_lease_seconds: int,
         allowance: PerAttemptResourceAllowance,
         replay_context: V4EvidenceReplayContext,
     ) -> MaterializedProviderDocumentV4:
+        self._validate_stage_guard(stage_guard, result_lease_seconds)
         self._observe_clock()
         validate_v4_materialization_authorization(
             checkpoint=checkpoint,
@@ -395,7 +550,10 @@ class MinerUHttpStagedV4:
                 claim_guard=claim_guard,
                 intent=intent,
                 accepted=accepted_submission,
+                terminal=terminal_receipt,
                 capability=provider_capability,
+                stage_guard=stage_guard,
+                result_lease_seconds=result_lease_seconds,
                 spool=spool,
                 part=spool_part,
                 owner=spool_owner,
@@ -1508,7 +1666,9 @@ class MinerUHttpStagedV4:
         provider_capability: PrivateProviderCapabilityV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> ProviderAckReceiptV4:
+        self._validate_stage_guard(stage_guard)
         self._observe_clock()
         validate_v4_ack_authorization(
             command=command,
@@ -1542,6 +1702,7 @@ class MinerUHttpStagedV4:
                 provider_capability=provider_capability,
                 claim=claim,
                 claim_guard=claim_guard,
+                stage_guard=stage_guard,
             )
 
     def _acknowledge_locked(
@@ -1551,13 +1712,20 @@ class MinerUHttpStagedV4:
         provider_capability: PrivateProviderCapabilityV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> ProviderAckReceiptV4:
         self._guard(claim_guard, command.ack_pending_checkpoint, claim)
         response = self._transport.acknowledge(
             command=command,
             provider_capability=provider_capability,
+            step_guard=stage_guard,
+            before_ack_post=lambda: self._guard(
+                claim_guard,
+                command.ack_pending_checkpoint,
+                claim,
+            ),
         )
-        if type(response) is not MinerUV4HttpResponse:
+        if type(response) is not ProviderAckTransportResponseV4:
             raise self._fail("provider ACK transport returned a forged response")
         if (
             type(response.status_code) is not int
@@ -1629,7 +1797,10 @@ class MinerUHttpStagedV4:
         claim_guard: V4ClaimGuard,
         intent: MaterializationIntentV4,
         accepted: AcceptedSubmissionReceiptV4,
+        terminal: TerminalReceiptV4,
         capability: PrivateProviderCapabilityV4,
+        stage_guard: V4StageGuard,
+        result_lease_seconds: int,
         spool: Path,
         part: Path,
         owner: Path,
@@ -1655,6 +1826,7 @@ class MinerUHttpStagedV4:
                 )
             self._fsync_dir(spool.parent)
             return spool_identity
+        stage_guard.checkpoint()
         if part.exists() or part.is_symlink() or owner.exists() or owner.is_symlink():
             if not owner.exists() or owner.is_symlink() or self._read_private(owner) != owner_bytes:
                 raise self._fail("spool partial ownership collision")
@@ -1665,8 +1837,11 @@ class MinerUHttpStagedV4:
             self._remove_owned_file(part, allow_absent=True, before_effect=before)
             self._remove_owned_file(owner, allow_absent=False, before_effect=before)
             self._fsync_dir(part.parent)
+            stage_guard.checkpoint()
         self._ensure_parent(part)
+        stage_guard.checkpoint()
         self._write_private(owner, owner_bytes)
+        stage_guard.checkpoint()
         digest = hashlib.sha256()
         byte_count = 0
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -1676,28 +1851,56 @@ class MinerUHttpStagedV4:
             self._require_owned_regular_stat(part_stat, "new spool part")
             self._require_entry_identity(parent_fd, name, part_stat, "new spool part")
             part_identity = self._identity(part_stat)
-        try:
-            for chunk in self._transport.stream_result(
+        result_stream = iter(
+            self._transport.stream_result(
                 accepted_submission=accepted,
+                terminal_receipt=terminal,
                 provider_capability=capability,
-            ):
+                result_lease_seconds=result_lease_seconds,
+                step_guard=stage_guard,
+                before_result_get=lambda: self._guard(
+                    claim_guard,
+                    checkpoint,
+                    claim,
+                ),
+            )
+        )
+        stream_failed = False
+        try:
+            for chunk in result_stream:
+                stage_guard.checkpoint()
                 if type(chunk) is not bytes or not chunk:
                     raise self._fail("provider result stream yielded an invalid chunk")
                 byte_count += len(chunk)
                 if byte_count > intent.result_byte_limit:
                     raise self._fail("provider result exceeded its byte limit")
                 digest.update(chunk)
-                self._write_all(fd, chunk)
+                self._guarded_write_all(fd, chunk, stage_guard)
+                stage_guard.checkpoint()
+            stage_guard.checkpoint()
             os.fsync(fd)
+            stage_guard.checkpoint()
             if self._identity(os.fstat(fd)) != part_identity:
                 raise self._fail("spool part changed while downloading")
+        except BaseException:
+            stream_failed = True
+            raise
         finally:
-            os.close(fd)
+            try:
+                close_stream = getattr(result_stream, "close", None)
+                if callable(close_stream):
+                    close_stream()
+            except BaseException:
+                if not stream_failed:
+                    raise
+            finally:
+                os.close(fd)
         if byte_count != intent.artifact_byte_count or (
             "sha256:" + digest.hexdigest()
         ) != intent.artifact_sha256:
             raise self._fail("provider result identity drifted")
         self._fault_hook("after_spool_fsync")
+        stage_guard.checkpoint()
         self._guard(claim_guard, checkpoint, claim)
         self._exclusive_rename(
             part,
@@ -1705,6 +1908,7 @@ class MinerUHttpStagedV4:
             expected_source_identity=part_identity,
         )
         self._fault_hook("after_spool_rename")
+        stage_guard.checkpoint()
         self._fsync_dir(spool.parent)
         self._remove_owned_file(
             owner,
@@ -2722,64 +2926,276 @@ class MinerUHttpStagedV4:
             self._assert_dir_path_identity(path.parent, parent_fd)
 
     @contextmanager
+    def _open_submission_snapshot_v4(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        snapshot_receipt: SnapshotReceiptV4,
+        evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+        resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...],
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        step_guard: V4StageGuard,
+    ) -> Iterator[BinaryIO]:
+        """Pin the canonical snapshot without holding filesystem locks on HTTP IO.
+
+        Root and per-snapshot locks protect only authorization and descriptor
+        pinning.  Once the exact regular file is open, its descriptor remains a
+        stable source even if later cleanup unlinks the namespace entry.  This
+        keeps independent cleanup and upload work-conserving.
+        """
+
+        snapshot = self._path(reservation.snapshot_relpath)
+        snapshot_part = self._path(reservation.snapshot_part_relpath)
+        snapshot_owner = self._path(reservation.snapshot_part_owner_relpath)
+        snapshot_lock = self._path(reservation.snapshot_lock_relpath)
+        lock_binding = {
+            "attempt_id": checkpoint.attempt_id,
+            "fence_identity": checkpoint.fence_identity,
+        }
+        snapshot_parent_fd: int | None = None
+        snapshot_fd: int | None = None
+        snapshot_name = self._relative_parts(snapshot)[-1]
+        try:
+            # Use the common resource-lock discipline: acquire the exact flock
+            # without the root gate, then hold only that resource while the
+            # claim and namespace are pinned.  Duplicating this sequence here
+            # previously allowed a waiter to hold the root gate while blocking
+            # an existing holder that needed the same gate to release.
+            with self._locked(snapshot_lock, "snapshot", lock_binding):
+                self._guard(claim_guard, checkpoint, claim)
+                validate_remote_parse_evidence_bundle_v4(
+                    checkpoint=checkpoint,
+                    evidence=evidence,
+                    reservation=reservation,
+                    resourceful_checkpoint_history=resourceful_checkpoint_history,
+                )
+                if (
+                    self._try_path_stat(snapshot_part) is not None
+                    or self._try_path_stat(snapshot_owner) is not None
+                ):
+                    raise self._fail("durable snapshot coexists with a partial file")
+                snapshot_parent_fd = self._open_dir_fd(snapshot.parent)
+                self._assert_dir_path_identity(snapshot.parent, snapshot_parent_fd)
+                try:
+                    snapshot_fd = os.open(
+                        snapshot_name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=snapshot_parent_fd,
+                    )
+                except OSError as exc:
+                    raise self._fail("snapshot is absent or unsafe") from exc
+                opened = os.fstat(snapshot_fd)
+                self._require_owned_regular_stat(opened, "snapshot")
+                self._require_entry_identity(
+                    snapshot_parent_fd,
+                    snapshot_name,
+                    opened,
+                    "snapshot",
+                )
+                before = _StableFileStat.from_stat(opened)
+                self._guard(claim_guard, checkpoint, claim)
+
+            assert snapshot_fd is not None
+            os.close(snapshot_parent_fd)
+            snapshot_parent_fd = None
+            digest, byte_count = self._guarded_hash_fd(snapshot_fd, step_guard)
+            after_hash = os.fstat(snapshot_fd)
+            self._require_owned_regular_stat(after_hash, "snapshot")
+            if (
+                _StableFileStat.from_stat(after_hash) != before
+                or digest != snapshot_receipt.snapshot_sha256
+                or byte_count != snapshot_receipt.snapshot_byte_count
+            ):
+                raise self._fail("snapshot identity drifted before upload")
+            self._revalidate_pinned_submission_snapshot_v4(
+                checkpoint=checkpoint,
+                reservation=reservation,
+                evidence=evidence,
+                resourceful_checkpoint_history=resourceful_checkpoint_history,
+                claim=claim,
+                claim_guard=claim_guard,
+                snapshot_fd=snapshot_fd,
+                expected_stat=before,
+            )
+            step_guard.checkpoint()
+            os.lseek(snapshot_fd, 0, os.SEEK_SET)
+            step_guard.checkpoint()
+            stream = cast(BinaryIO, os.fdopen(snapshot_fd, "rb", closefd=False))
+            upload_failed = False
+            try:
+                yield stream
+            except BaseException:
+                upload_failed = True
+                raise
+            finally:
+                post_upload_error: BaseException | None = None
+                try:
+                    stream.close()
+                except BaseException as exc:
+                    post_upload_error = exc
+                try:
+                    self._revalidate_pinned_submission_snapshot_v4(
+                        checkpoint=checkpoint,
+                        reservation=reservation,
+                        evidence=evidence,
+                        resourceful_checkpoint_history=(
+                            resourceful_checkpoint_history
+                        ),
+                        claim=claim,
+                        claim_guard=claim_guard,
+                        snapshot_fd=snapshot_fd,
+                        expected_stat=before,
+                    )
+                    step_guard.checkpoint()
+                except BaseException as exc:
+                    if post_upload_error is None:
+                        post_upload_error = exc
+                if not upload_failed and post_upload_error is not None:
+                    raise post_upload_error
+        finally:
+            if snapshot_fd is not None:
+                os.close(snapshot_fd)
+            if snapshot_parent_fd is not None:
+                os.close(snapshot_parent_fd)
+
+    def _revalidate_pinned_submission_snapshot_v4(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+        resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...],
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        snapshot_fd: int,
+        expected_stat: _StableFileStat,
+    ) -> None:
+        snapshot = self._path(reservation.snapshot_relpath)
+        snapshot_part = self._path(reservation.snapshot_part_relpath)
+        snapshot_owner = self._path(reservation.snapshot_part_owner_relpath)
+        snapshot_lock = self._path(reservation.snapshot_lock_relpath)
+        lock_binding = {
+            "attempt_id": checkpoint.attempt_id,
+            "fence_identity": checkpoint.fence_identity,
+        }
+        with self._locked(snapshot_lock, "snapshot", lock_binding):
+            self._guard(claim_guard, checkpoint, claim)
+            validate_remote_parse_evidence_bundle_v4(
+                checkpoint=checkpoint,
+                evidence=evidence,
+                reservation=reservation,
+                resourceful_checkpoint_history=resourceful_checkpoint_history,
+            )
+            current_fd_stat = os.fstat(snapshot_fd)
+            self._require_owned_regular_stat(current_fd_stat, "snapshot")
+            if _StableFileStat.from_stat(current_fd_stat) != expected_stat:
+                raise self._fail("snapshot changed during upload")
+            with self._parent_fd(snapshot) as (parent_fd, name):
+                self._require_entry_identity(
+                    parent_fd,
+                    name,
+                    current_fd_stat,
+                    "snapshot",
+                )
+            if (
+                self._try_path_stat(snapshot_part) is not None
+                or self._try_path_stat(snapshot_owner) is not None
+            ):
+                raise self._fail("snapshot partial appeared during upload")
+            self._guard(claim_guard, checkpoint, claim)
+
+    @contextmanager
     def _locked(
         self,
         path: Path,
         kind: str,
         binding: dict[str, str],
     ) -> Iterator[None]:
+        """Hold only the exact resource lock across the caller's operation.
+
+        The scratch-root lock is a short namespace-admission gate.  Waiting for
+        a resource flock, network I/O, hashing, extraction, and publication must
+        not hold it, otherwise unrelated attempts become globally serialized.
+        """
+
         exact = self._lock_bytes(kind, binding)
         flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
-        with self._root_lock_scope():
-            self._assert_active_locks()
-            with self._parent_fd(path, create=True) as (parent_fd, name):
+        parent_fd: int | None = None
+        fd: int | None = None
+        lock_acquired = False
+        active: list[_ActiveLockRecord] | None = None
+        record: _ActiveLockRecord | None = None
+        parts = self._relative_parts(path)
+        if not parts:
+            raise self._fail("scratch root cannot be used as a resource lock")
+        name = parts[-1]
+        try:
+            with self._root_lock_scope():
+                self._assert_active_locks()
+                parent_fd = self._open_dir_fd(path.parent, create=True)
                 self._assert_dir_path_identity(path.parent, parent_fd)
                 try:
                     fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
                 except OSError as exc:
                     raise self._fail(f"cannot open {kind} lock") from exc
+                observed = os.fstat(fd)
+                self._require_owned_regular_stat(observed, f"{kind} lock")
+                self._assert_dir_path_identity(path.parent, parent_fd)
+                self._require_entry_identity(
+                    parent_fd, name, observed, f"{kind} lock"
+                )
+
+            # Never wait for another attempt while holding the global root gate.
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            lock_acquired = True
+
+            with self._root_lock_scope():
+                self._assert_active_locks()
+                self._assert_dir_path_identity(path.parent, parent_fd)
+                self._require_entry_identity(
+                    parent_fd, name, observed, f"{kind} lock"
+                )
+                current = self._read_fd(fd, max_bytes=_MAX_METADATA_BYTES)
+                if not current:
+                    self._write_record_fd(fd, exact)
+                    os.fsync(parent_fd)
+                elif current != exact:
+                    raise self._fail(f"{kind} lock metadata drifted")
+                self._assert_dir_path_identity(path.parent, parent_fd)
+                self._require_entry_identity(
+                    parent_fd, name, observed, f"{kind} lock"
+                )
+                active = self._active_lock_records()
+                record = _ActiveLockRecord(
+                    parent_path=path.parent,
+                    parent_fd=parent_fd,
+                    name=name,
+                    observed=observed,
+                    kind=kind,
+                )
+                active.append(record)
+
+            try:
+                yield
+            finally:
                 try:
-                    observed = os.fstat(fd)
-                    self._require_owned_regular_stat(observed, f"{kind} lock")
-                    self._assert_dir_path_identity(path.parent, parent_fd)
-                    self._require_entry_identity(
-                        parent_fd, name, observed, f"{kind} lock"
-                    )
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                    self._assert_dir_path_identity(path.parent, parent_fd)
-                    self._require_entry_identity(
-                        parent_fd, name, observed, f"{kind} lock"
-                    )
-                    current = self._read_fd(fd, max_bytes=_MAX_METADATA_BYTES)
-                    if not current:
-                        self._write_record_fd(fd, exact)
-                        os.fsync(parent_fd)
-                    elif current != exact:
-                        raise self._fail(f"{kind} lock metadata drifted")
-                    self._assert_dir_path_identity(path.parent, parent_fd)
-                    active = self._active_lock_records()
-                    active.append(
-                        _ActiveLockRecord(
-                            parent_path=path.parent,
-                            parent_fd=parent_fd,
-                            name=name,
-                            observed=observed,
-                            kind=kind,
-                        )
-                    )
-                    try:
-                        yield
-                    finally:
-                        try:
-                            self._assert_dir_path_identity(path.parent, parent_fd)
-                            self._require_entry_identity(
-                                parent_fd, name, observed, f"{kind} lock"
-                            )
-                        finally:
-                            active.pop()
+                    with self._root_lock_scope():
+                        self._assert_active_locks()
                 finally:
+                    if active is not None and record is not None:
+                        if active and active[-1] is record:
+                            active.pop()
+                        elif record in active:
+                            active.remove(record)
+        finally:
+            if fd is not None:
+                if lock_acquired:
                     fcntl.flock(fd, fcntl.LOCK_UN)
-                    os.close(fd)
+                os.close(fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     @contextmanager
     def _ordered_locks(
@@ -3561,6 +3977,28 @@ class MinerUHttpStagedV4:
             digest.update(chunk)
         return "sha256:" + digest.hexdigest(), count
 
+    @staticmethod
+    def _guarded_hash_fd(
+        fd: int,
+        step_guard: V4StageGuard,
+    ) -> tuple[str, int]:
+        if not callable(getattr(step_guard, "checkpoint", None)):
+            raise ValueError("v4 snapshot step guard is invalid")
+        digest = hashlib.sha256()
+        count = 0
+        step_guard.checkpoint()
+        os.lseek(fd, 0, os.SEEK_SET)
+        step_guard.checkpoint()
+        while True:
+            step_guard.checkpoint()
+            chunk = os.read(fd, _CHUNK_BYTES)
+            step_guard.checkpoint()
+            if not chunk:
+                break
+            count += len(chunk)
+            digest.update(chunk)
+        return "sha256:" + digest.hexdigest(), count
+
     def _fsync_tree(self, root: Path) -> None:
         with self._open_dir(root) as root_fd:
             self._fsync_tree_fd(root_fd)
@@ -3574,6 +4012,21 @@ class MinerUHttpStagedV4:
         view = memoryview(value)
         while view:
             written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short local write")
+            view = view[written:]
+
+    @staticmethod
+    def _guarded_write_all(
+        fd: int,
+        value: bytes,
+        step_guard: V4StageGuard,
+    ) -> None:
+        view = memoryview(value)
+        while view:
+            step_guard.checkpoint()
+            written = os.write(fd, view)
+            step_guard.checkpoint()
             if written <= 0:
                 raise OSError("short local write")
             view = view[written:]
@@ -3604,8 +4057,8 @@ class MinerUHttpStagedV4:
             value = strict_json_loads(exact)
         except ValueError as exc:
             raise self._fail("provider ACK response is not strict JSON") from exc
-        if type(value) is not dict or set(value) != fields or self._canonical(value) != exact:
-            raise self._fail("provider ACK response is not closed canonical JSON")
+        if type(value) is not dict or set(value) != fields:
+            raise self._fail("provider ACK response is not closed JSON")
         return cast(dict[str, Any], value)
 
     @staticmethod
@@ -3660,6 +4113,22 @@ class MinerUHttpStagedV4:
         value = self._clock()
         if type(value) not in {int, float} or not math.isfinite(float(value)):
             raise ValueError("v4 backend clock is invalid")
+
+    @staticmethod
+    def _validate_stage_guard(
+        guard: V4StageGuard,
+        result_lease_seconds: int | None = None,
+    ) -> None:
+        if not callable(getattr(guard, "checkpoint", None)) or not callable(
+            getattr(guard, "remaining_seconds", None)
+        ):
+            raise ValueError("v4 stage guard is invalid")
+        if result_lease_seconds is not None and (
+            isinstance(result_lease_seconds, bool)
+            or not isinstance(result_lease_seconds, int)
+            or not 1 <= result_lease_seconds <= 3600
+        ):
+            raise ValueError("v4 result lease duration is invalid")
 
     @staticmethod
     def _fail(message: str) -> ParserOutputContractError:

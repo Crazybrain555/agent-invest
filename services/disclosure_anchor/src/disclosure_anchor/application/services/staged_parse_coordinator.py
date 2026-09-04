@@ -223,15 +223,21 @@ class StageLeaseGuard:
             raise ValueError("stage lease deadline must be finite and positive")
 
     def checkpoint(self) -> None:
+        self.remaining_seconds()
+
+    def remaining_seconds(self) -> float:
+        """Return the live bounded-stage budget after checking the claim fence."""
+
         observed = self._monotonic()
         if (
             isinstance(observed, bool)
             or not isinstance(observed, (int, float))
             or not isfinite(observed)
             or self._revoked.is_set()
-            or observed > self.deadline_monotonic
+            or observed >= self.deadline_monotonic
         ):
             raise StageLeaseLost("bounded stage lease expired")
+        return max(0.0, float(self.deadline_monotonic - observed))
 
     def revoke(self) -> None:
         self._revoked.set()
@@ -920,7 +926,7 @@ class StagedParseCoordinator:
             for future, (lane, work, stage_guard, _grant) in tuple(in_flight.items()):
                 if future.done():
                     continue
-                if now > stage_guard.deadline_monotonic:
+                if now >= stage_guard.deadline_monotonic:
                     if future not in in_flight_failures:
                         circuit_open = True
                         admission_open = False
@@ -1501,7 +1507,7 @@ class StagedParseCoordinator:
                             f"{work.attempt_id}:{lane.value}:{type(exc).__name__}:{exc}"
                         )
                     else:
-                        if self._monotonic() > stage_guard.deadline_monotonic:
+                        if self._monotonic() >= stage_guard.deadline_monotonic:
                             preserve_contract_violation(
                                 work, updated, lane, "bounded stage exceeded deadline"
                             )

@@ -337,6 +337,10 @@
    "private_imports": [],
    "tests": 18
   },
+  "tests/unit/test_mineru_http_remote_v4.py": {
+   "private_imports": [],
+   "tests": 42
+  },
   "tests/unit/test_mineru_http_staged.py": {
    "private_imports": [],
    "tests": 28
@@ -345,7 +349,7 @@
    "private_imports": [
     "_ZipPathCollisionIndex"
    ],
-   "tests": 64
+   "tests": 69
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -370,6 +374,10 @@
   "tests/unit/test_mineru_process_profile_loader.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_mineru_protocol_v2_wire.py": {
+   "private_imports": [],
+   "tests": 12
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],

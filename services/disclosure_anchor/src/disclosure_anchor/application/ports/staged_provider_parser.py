@@ -1139,6 +1139,14 @@ class V4ClaimGuard(Protocol):
         """Raise unless checkpoint, claim owner/generation and lease are current."""
 
 
+class V4StageGuard(Protocol):
+    """Cooperative monotonic deadline guard for one remote/file stage."""
+
+    def checkpoint(self) -> None: ...
+
+    def remaining_seconds(self) -> float: ...
+
+
 def validate_v4_materialization_authorization(
     *,
     checkpoint: RemoteParseCheckpointV4,
@@ -1843,6 +1851,8 @@ class V4MaterializationPort(Protocol):
         provider_capability: PrivateProviderCapabilityV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
+        result_lease_seconds: int,
         allowance: PerAttemptResourceAllowance,
         replay_context: V4EvidenceReplayContext,
     ) -> MaterializedProviderDocumentV4: ...
@@ -1863,6 +1873,7 @@ class V4MaterializationPort(Protocol):
         provider_capability: PrivateProviderCapabilityV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> ProviderAckReceiptV4: ...
 
 
@@ -1992,6 +2003,7 @@ __all__ = [
     "V4MaterializationPort",
     "V4ClaimGuard",
     "V4ClaimWitness",
+    "V4StageGuard",
     "validate_v4_ack_authorization",
     "validate_v4_cleanup_authorization",
     "validate_v4_materialization_authorization",

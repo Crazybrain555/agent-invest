@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import fcntl
 import hashlib
 import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import pickle
 import shutil
 import stat
 import tempfile
@@ -19,7 +21,7 @@ import zipfile
 
 from disclosure_anchor.adapters.parsers.mineru_medium.http_staged_v4 import (
     MinerUHttpStagedV4,
-    MinerUV4HttpResponse,
+    ProviderAckTransportResponseV4,
     _ZipPathCollisionIndex,
 )
 from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
@@ -105,8 +107,35 @@ class _MaterializeFixture:
             "terminal_receipt": self.terminal,
             "provider_capability": self.capability,
             "claim": self.claim,
+            "stage_guard": _StepGuard(),
+            "result_lease_seconds": 300,
             "allowance": self.allowance,
             "replay_context": self.replay,
+        }
+
+
+@dataclass(frozen=True)
+class _SubmissionSnapshotFixture:
+    source: bytes
+    reservation: ResourceReservationV4
+    snapshot: SnapshotReceiptV4
+    submission: SubmissionIntentV4
+    checkpoint: RemoteParseCheckpointV4
+    evidence: tuple[Any, ...]
+    history: tuple[RemoteParseCheckpointV4, ...]
+
+    def source_arguments(self, *, claim_guard: _Guard) -> dict[str, Any]:
+        return {
+            "checkpoint": self.checkpoint,
+            "reservation": self.reservation,
+            "snapshot_receipt": self.snapshot,
+            "submission_intent": self.submission,
+            "evidence": tuple(
+                encode_remote_parse_evidence_v4(value) for value in self.evidence
+            ),
+            "resourceful_checkpoint_history": self.history,
+            "claim": _claim(self.checkpoint),
+            "claim_guard": claim_guard,
         }
 
 
@@ -141,32 +170,51 @@ class _Guard:
             raise RuntimeError("claim lost")
 
 
+class _StepGuard:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def checkpoint(self) -> None:
+        self.calls += 1
+
+    def remaining_seconds(self) -> float:
+        self.checkpoint()
+        return 60.0
+
+
 class _Transport:
     def __init__(
         self,
         result: bytes,
         *,
-        response: MinerUV4HttpResponse | BaseException | None = None,
+        response: ProviderAckTransportResponseV4 | BaseException | None = None,
     ) -> None:
         self.result = result
-        self.response = response or MinerUV4HttpResponse(204, b"")
+        self.response = response or ProviderAckTransportResponseV4(204, b"")
         self.downloads = 0
+        self.stream_closes = 0
         self.acks = 0
-
     def stream_result(self, **_: object) -> Iterator[bytes]:
         self.downloads += 1
         midpoint = max(1, len(self.result) // 2)
-        yield self.result[:midpoint]
-        if self.result[midpoint:]:
-            yield self.result[midpoint:]
+        try:
+            yield self.result[:midpoint]
+            if self.result[midpoint:]:
+                yield self.result[midpoint:]
+        finally:
+            self.stream_closes += 1
 
     def acknowledge(
         self,
         *,
         command: ProviderAckCommandV4,
         provider_capability: PrivateProviderCapabilityV4,
-    ) -> MinerUV4HttpResponse:
+        step_guard: _StepGuard,
+        before_ack_post: Any,
+    ) -> ProviderAckTransportResponseV4:
         del command, provider_capability
+        step_guard.checkpoint()
+        before_ack_post()
         self.acks += 1
         if isinstance(self.response, BaseException):
             raise self.response
@@ -174,6 +222,239 @@ class _Transport:
 
 
 class MinerUHttpStagedV4Tests(unittest.TestCase):
+    def test_submission_snapshot_source_is_opaque_and_holds_no_lock_on_upload(
+        self,
+    ) -> None:
+        fixture = _submission_snapshot_fixture(
+            b"%PDF-1.7\nexact pinned submission snapshot\n%%EOF\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(b"unused"),
+                clock=lambda: 1.0,
+            )
+            snapshot = root / fixture.reservation.snapshot_relpath
+            with backend._open_dir(snapshot.parent, create=True):
+                pass
+            snapshot.write_bytes(fixture.source)
+            snapshot.chmod(0o600)
+            claim_guard = _Guard()
+            source = backend.submission_snapshot_source_v4(
+                **fixture.source_arguments(claim_guard=claim_guard)
+            )
+
+            self.assertTrue(
+                source.validates(
+                    submission_intent=fixture.submission,
+                    snapshot_receipt=fixture.snapshot,
+                )
+            )
+            self.assertNotIn(str(root), repr(source))
+            self.assertNotIn(fixture.reservation.snapshot_relpath, repr(source))
+            with self.assertRaisesRegex(TypeError, "non-serializable"):
+                pickle.dumps(source)
+
+            step_guard = _StepGuard()
+            entered_same_resource_lock = threading.Event()
+            thread_errors: list[BaseException] = []
+            with source.open(step_guard=step_guard) as stream:
+                self.assertEqual(stream.read(), fixture.source)
+                self.assertEqual(backend._active_lock_records(), [])
+                self.assertEqual(
+                    int(getattr(backend._root_lock_coordinator.local, "depth", 0)),
+                    0,
+                )
+
+                def enter_same_resource_lock() -> None:
+                    try:
+                        with backend._locked(
+                            root / fixture.reservation.snapshot_lock_relpath,
+                            "snapshot",
+                            {
+                                "attempt_id": fixture.checkpoint.attempt_id,
+                                "fence_identity": fixture.checkpoint.fence_identity,
+                            },
+                        ):
+                            entered_same_resource_lock.set()
+                    except BaseException as exc:  # pragma: no cover - assertion path
+                        thread_errors.append(exc)
+
+                thread = threading.Thread(target=enter_same_resource_lock)
+                thread.start()
+                self.assertTrue(entered_same_resource_lock.wait(timeout=2.0))
+                thread.join(timeout=2.0)
+                self.assertFalse(thread.is_alive())
+
+            self.assertEqual(thread_errors, [])
+            self.assertGreaterEqual(step_guard.calls, 6)
+            self.assertGreaterEqual(claim_guard.calls, 6)
+
+    def test_submission_snapshot_source_rejects_path_replacement_on_close(
+        self,
+    ) -> None:
+        fixture = _submission_snapshot_fixture(
+            b"%PDF-1.7\npath replacement witness\n%%EOF\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(b"unused"),
+                clock=lambda: 1.0,
+            )
+            snapshot = root / fixture.reservation.snapshot_relpath
+            with backend._open_dir(snapshot.parent, create=True):
+                pass
+            snapshot.write_bytes(fixture.source)
+            snapshot.chmod(0o600)
+            source = backend.submission_snapshot_source_v4(
+                **fixture.source_arguments(claim_guard=_Guard())
+            )
+
+            with self.assertRaisesRegex(
+                ParserOutputContractError,
+                "snapshot is unsafe|path changed",
+            ):
+                with source.open(step_guard=_StepGuard()) as stream:
+                    self.assertEqual(stream.read(), fixture.source)
+                    snapshot.unlink()
+                    snapshot.write_bytes(fixture.source)
+                    snapshot.chmod(0o600)
+
+    def test_submission_snapshot_waiter_never_holds_the_root_gate(self) -> None:
+        fixture = _submission_snapshot_fixture(
+            b"%PDF-1.7\ncontended pinned snapshot\n%%EOF\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(b"unused"),
+                clock=lambda: 1.0,
+            )
+            snapshot = root / fixture.reservation.snapshot_relpath
+            with backend._open_dir(snapshot.parent, create=True):
+                pass
+            snapshot.write_bytes(fixture.source)
+            snapshot.chmod(0o600)
+            source = backend.submission_snapshot_source_v4(
+                **fixture.source_arguments(claim_guard=_Guard())
+            )
+            snapshot_lock = root / fixture.reservation.snapshot_lock_relpath
+            binding = {
+                "attempt_id": fixture.checkpoint.attempt_id,
+                "fence_identity": fixture.checkpoint.fence_identity,
+            }
+            holder_entered = threading.Event()
+            release_holder = threading.Event()
+            opener_at_flock = threading.Event()
+            opener_done = threading.Event()
+            unrelated_entered = threading.Event()
+            errors: list[BaseException] = []
+            real_flock = fcntl.flock
+            opener_thread: threading.Thread
+
+            def hold_snapshot_lock() -> None:
+                try:
+                    with backend._locked(snapshot_lock, "snapshot", binding):
+                        holder_entered.set()
+                        release_holder.wait(timeout=3.0)
+                except BaseException as exc:  # pragma: no cover - assertion path
+                    errors.append(exc)
+
+            def open_snapshot() -> None:
+                try:
+                    with source.open(step_guard=_StepGuard()) as stream:
+                        self.assertEqual(stream.read(), fixture.source)
+                    opener_done.set()
+                except BaseException as exc:  # pragma: no cover - assertion path
+                    errors.append(exc)
+
+            def observe_flock(fd: int, operation: int) -> Any:
+                if (
+                    threading.current_thread() is opener_thread
+                    and operation & fcntl.LOCK_EX
+                ):
+                    opener_at_flock.set()
+                return real_flock(fd, operation)
+
+            def enter_unrelated_lock() -> None:
+                try:
+                    with backend._locked(
+                        root / "locks" / "unrelated.lock",
+                        "spool",
+                        {"resource": "unrelated"},
+                    ):
+                        unrelated_entered.set()
+                except BaseException as exc:  # pragma: no cover - assertion path
+                    errors.append(exc)
+
+            holder = threading.Thread(target=hold_snapshot_lock, daemon=True)
+            holder.start()
+            self.assertTrue(holder_entered.wait(timeout=2.0))
+            opener_thread = threading.Thread(target=open_snapshot, daemon=True)
+            unrelated = threading.Thread(target=enter_unrelated_lock, daemon=True)
+            with mock.patch(
+                "disclosure_anchor.adapters.parsers.mineru_medium.http_staged_v4.fcntl.flock",
+                side_effect=observe_flock,
+            ):
+                opener_thread.start()
+                self.assertTrue(opener_at_flock.wait(timeout=2.0))
+                self.assertFalse(opener_done.is_set())
+                unrelated.start()
+                self.assertTrue(unrelated_entered.wait(timeout=2.0))
+                release_holder.set()
+                holder.join(timeout=2.0)
+                opener_thread.join(timeout=2.0)
+                unrelated.join(timeout=2.0)
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(opener_thread.is_alive())
+            self.assertFalse(unrelated.is_alive())
+            self.assertTrue(opener_done.is_set())
+            self.assertEqual(errors, [])
+
+    def test_submission_snapshot_source_rejects_unsafe_or_partial_source(
+        self,
+    ) -> None:
+        fixture = _submission_snapshot_fixture(
+            b"%PDF-1.7\nunsafe source witness\n%%EOF\n"
+        )
+        for case in ("mode", "part", "claim"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                backend = MinerUHttpStagedV4(
+                    scratch_root=root,
+                    transport=_Transport(b"unused"),
+                    clock=lambda: 1.0,
+                )
+                snapshot = root / fixture.reservation.snapshot_relpath
+                with backend._open_dir(snapshot.parent, create=True):
+                    pass
+                snapshot.write_bytes(fixture.source)
+                snapshot.chmod(0o644 if case == "mode" else 0o600)
+                if case == "part":
+                    part = root / fixture.reservation.snapshot_part_relpath
+                    part.write_bytes(b"partial")
+                    part.chmod(0o600)
+                claim_guard = _Guard(fail_at=1 if case == "claim" else None)
+                source = backend.submission_snapshot_source_v4(
+                    **fixture.source_arguments(claim_guard=claim_guard)
+                )
+
+                expected = {
+                    "mode": "snapshot is unsafe",
+                    "part": "coexists with a partial file",
+                    "claim": "claim lost",
+                }[case]
+                with self.assertRaisesRegex(
+                    (ParserOutputContractError, RuntimeError),
+                    expected,
+                ):
+                    with source.open(step_guard=_StepGuard()):
+                        self.fail("unsafe snapshot source became usable")
+
     def test_lock_inode_replacement_cannot_enter_a_second_critical_section(
         self,
     ) -> None:
@@ -226,6 +507,55 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             self.assertFalse(entered)
             self.assertTrue((moved_parent / spool_lock.name).is_file())
             self.assertFalse(staging_lock.exists())
+
+    def test_resource_locks_serialize_only_the_same_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(b"unused"),
+                clock=lambda: 1.0,
+            )
+            first = root / "locks" / "first.lock"
+            second = root / "locks" / "second.lock"
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            same_entered = threading.Event()
+            errors: list[BaseException] = []
+
+            def hold_first() -> None:
+                try:
+                    with backend._locked(first, "spool", {"resource": "first"}):
+                        first_entered.set()
+                        release_first.wait(timeout=3.0)
+                except BaseException as exc:  # pragma: no cover - assertion path
+                    errors.append(exc)
+
+            def wait_for_first() -> None:
+                try:
+                    with backend._locked(first, "spool", {"resource": "first"}):
+                        same_entered.set()
+                except BaseException as exc:  # pragma: no cover - assertion path
+                    errors.append(exc)
+
+            holder = threading.Thread(target=hold_first)
+            waiter = threading.Thread(target=wait_for_first)
+            holder.start()
+            self.assertTrue(first_entered.wait(timeout=2.0))
+            waiter.start()
+            self.assertFalse(same_entered.wait(timeout=0.1))
+
+            # A different exact resource must not wait behind the global root gate.
+            with backend._locked(second, "spool", {"resource": "second"}):
+                self.assertFalse(same_entered.is_set())
+
+            release_first.set()
+            holder.join(timeout=2.0)
+            waiter.join(timeout=2.0)
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(waiter.is_alive())
+            self.assertTrue(same_entered.is_set())
+            self.assertEqual(errors, [])
 
     def test_promotion_rejects_same_bytes_new_inode_after_exact_fsync(self) -> None:
         archive = _official_zip()
@@ -913,6 +1243,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 )
             self.assertTrue((root / fixture.intent.spool_part_relpath).is_file())
             self.assertTrue((root / fixture.intent.spool_part_owner_relpath).is_file())
+            self.assertEqual(oversized.stream_closes, 1)
 
             exact = _Transport(archive)
             recovered = MinerUHttpStagedV4(
@@ -1260,7 +1591,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             self.assertEqual(backend.cleanup_v4(**cleanup), cleanup_receipt)
             self.assertFalse((root / fixture.intent.spool_relpath).exists())
 
-            transport.response = MinerUV4HttpResponse(
+            transport.response = ProviderAckTransportResponseV4(
                 404,
                 _canonical({"detail": "Task not found"}),
             )
@@ -1340,7 +1671,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                         item.disposition == "absent" for item in cleanup_receipt.results
                     )
                 )
-                transport.response = MinerUV4HttpResponse(
+                transport.response = ProviderAckTransportResponseV4(
                     404,
                     _canonical({"detail": "Task not found"}),
                 )
@@ -1413,7 +1744,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
             )
             cleanup_receipt = backend.cleanup_v4(**cleanup)
             self.assertEqual(backend.cleanup_v4(**cleanup), cleanup_receipt)
-            transport.response = MinerUV4HttpResponse(
+            transport.response = ProviderAckTransportResponseV4(
                 404,
                 _canonical({"detail": "Task not found"}),
             )
@@ -3190,16 +3521,13 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
         )
         capability = _capability(fixture, "result_acknowledgement")
         claim = _claim(checkpoint)
-        exact_200 = _canonical(
-            {
-                "schema": "mineru-task-protocol.v2",
-                "status": "consumed",
-                "task_id": command.remote_task_identity,
-            }
+        exact_200 = (
+            b'{"schema":"mineru-task-protocol.v2","task_id":"task-1",'
+            b'"status":"consumed"}'
         )
         with tempfile.TemporaryDirectory() as directory:
             transport = _Transport(
-                b"unused", response=MinerUV4HttpResponse(200, exact_200)
+                b"unused", response=ProviderAckTransportResponseV4(200, exact_200)
             )
             backend = MinerUHttpStagedV4(
                 scratch_root=Path(directory),
@@ -3211,6 +3539,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 provider_capability=capability,
                 claim=claim,
                 claim_guard=_Guard(),
+                stage_guard=_StepGuard(),
             )
             self.assertEqual(consumed.ack_kind, "consumed")
             self.assertEqual(consumed.provider_receipt_identity, "task-1")
@@ -3222,8 +3551,9 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     provider_capability=capability,
                     claim=claim,
                     claim_guard=_Guard(),
+                    stage_guard=_StepGuard(),
                 )
-            transport.response = MinerUV4HttpResponse(
+            transport.response = ProviderAckTransportResponseV4(
                 404, _canonical({"detail": "Task not found"})
             )
             absent = backend.acknowledge_v4(
@@ -3231,11 +3561,12 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 provider_capability=capability,
                 claim=claim,
                 claim_guard=_Guard(),
+                stage_guard=_StepGuard(),
             )
             self.assertEqual(absent.ack_kind, "absent")
             self.assertEqual(absent.request_identity, consumed.request_identity)
 
-            transport.response = MinerUV4HttpResponse(
+            transport.response = ProviderAckTransportResponseV4(
                 404, _canonical({"detail": "something else"})
             )
             with self.assertRaisesRegex(ParserOutputContractError, "absence"):
@@ -3244,6 +3575,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     provider_capability=capability,
                     claim=claim,
                     claim_guard=_Guard(),
+                    stage_guard=_StepGuard(),
                 )
 
     def test_ack_is_serialized_and_rejects_duck_response(self) -> None:
@@ -3266,14 +3598,14 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 self.max_active = 0
                 self.mutex = threading.Lock()
 
-            def acknowledge(self, **_: object) -> MinerUV4HttpResponse:
+            def acknowledge(self, **_: object) -> ProviderAckTransportResponseV4:
                 with self.mutex:
                     self.active += 1
                     self.max_active = max(self.max_active, self.active)
                 time.sleep(0.02)
                 with self.mutex:
                     self.active -= 1
-                return MinerUV4HttpResponse(204, b"")
+                return ProviderAckTransportResponseV4(204, b"")
 
         with tempfile.TemporaryDirectory() as directory:
             transport = ConcurrentTransport()
@@ -3291,6 +3623,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                         provider_capability=capability,
                         claim=_claim(checkpoint),
                         claim_guard=_Guard(),
+                        stage_guard=_StepGuard(),
                     )
                 except BaseException as exc:  # pragma: no cover - asserted below
                     errors.append(exc)
@@ -3319,13 +3652,14 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     provider_capability=capability,
                     claim=_claim(checkpoint),
                     claim_guard=_Guard(),
+                    stage_guard=_StepGuard(),
                 )
 
         class EvilBytes(bytes):
             def __ne__(self, _: object) -> bool:
                 return False
 
-        forged = MinerUV4HttpResponse(204, b"")
+        forged = ProviderAckTransportResponseV4(204, b"")
         object.__setattr__(forged, "exact_bytes", EvilBytes(b"NOT-EMPTY"))
         with tempfile.TemporaryDirectory() as directory:
             backend = MinerUHttpStagedV4(
@@ -3339,6 +3673,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     provider_capability=capability,
                     claim=_claim(checkpoint),
                     claim_guard=_Guard(),
+                    stage_guard=_StepGuard(),
                 )
 
 
@@ -3473,8 +3808,8 @@ def _materialize_fixture(
         fence_identity=reservation.fence_identity,
         submission_intent_sha256=submission.sha256,
         remote_task_identity="task-1",
-        status_url="https://provider.invalid/task-1",
-        result_url="https://provider.invalid/task-1/result",
+        status_url="https://provider.invalid/tasks/task-1",
+        result_url="https://provider.invalid/tasks/task-1/result",
         secret_kind="mineru-task-token.v1",
         secret_version=1,
         token_sha256=token_sha,
@@ -3595,6 +3930,97 @@ def _materialize_fixture(
             remote_terminal,
             materializing,
         ),
+    )
+
+
+def _submission_snapshot_fixture(source: bytes) -> _SubmissionSnapshotFixture:
+    base, base_allowance = _exact_materialization_reservation_and_allowance()
+    source_sha256 = "sha256:" + hashlib.sha256(source).hexdigest()
+    reserved = replace(
+        base.reserved_credit,
+        snapshot_bytes=len(source),
+    )
+    encoded_input = encode_resource_reservation_input(
+        replace(
+            base_allowance.reservation_input.value,
+            source_pdf_sha256=source_sha256,
+            source_byte_count=len(source),
+            reservation=reserved,
+        )
+    )
+    reservation = build_resource_reservation_v4(
+        attempt_id=base.attempt_id,
+        attempt_generation=base.attempt_generation,
+        fence_identity=base.fence_identity,
+        document_id=base.document_id,
+        processing_run_id=base.processing_run_id,
+        source_pdf_sha256=source_sha256,
+        source_byte_count=len(source),
+        source_page_count=base.source_page_count,
+        prepared_submission_identity_sha256=(
+            base.prepared_submission_identity_sha256
+        ),
+        request_sha256=base.request_sha256,
+        runtime_epoch_sha256=base.runtime_epoch_sha256,
+        process_profile_sha256=base.process_profile_sha256,
+        credit_policy_sha256=base.credit_policy_sha256,
+        reservation_bucket=base.reservation_bucket,
+        reservation_input_sha256=encoded_input.sha256,
+        reserved_credit=reserved,
+    )
+    preparation = build_preparation_intent_v4(
+        reservation=reservation,
+        parser_target_sha256=_provider_envelope_context().parser_target_sha256,
+    )
+    snapshot = SnapshotReceiptV4(
+        attempt_id=reservation.attempt_id,
+        fence_identity=reservation.fence_identity,
+        preparation_intent_sha256=preparation.sha256,
+        snapshot_relpath=reservation.snapshot_relpath,
+        snapshot_sha256=source_sha256,
+        snapshot_byte_count=len(source),
+        part_path_absent=True,
+        part_owner_path_absent=True,
+        file_fsync_completed=True,
+        parent_fsync_completed=True,
+    )
+    snapshot_credit = ResourceCreditVector(
+        documents=1,
+        snapshot_items=1,
+        snapshot_bytes=len(source),
+    )
+    prepared = build_initial_remote_parse_checkpoint_v4(
+        reservation=reservation,
+        preparation_intent_sha256=preparation.sha256,
+        snapshot_receipt_sha256=snapshot.sha256,
+        held_resource_credit=snapshot_credit,
+    )
+    submission = SubmissionIntentV4(
+        attempt_id=reservation.attempt_id,
+        fence_identity=reservation.fence_identity,
+        snapshot_receipt_sha256=snapshot.sha256,
+        source_pdf_sha256=source_sha256,
+        parser_target_sha256=preparation.parser_target_sha256,
+        request_sha256=reservation.request_sha256,
+        runtime_epoch_sha256=reservation.runtime_epoch_sha256,
+        client_submit_key="submit-v4-snapshot-source-test",
+        submission_epoch_unix=1,
+        provider_protocol_version="mineru-task-protocol.v2",
+    )
+    reconciling = advance_remote_parse_checkpoint_v4(
+        prepared,
+        state="reconciling",
+        held_resource_credit=replace(snapshot_credit, remote_waits=1),
+        submission_intent_sha256=submission.sha256,
+    )
+    return _SubmissionSnapshotFixture(
+        source=source,
+        reservation=reservation,
+        snapshot=snapshot,
+        submission=submission,
+        checkpoint=reconciling,
+        evidence=(preparation, snapshot, submission),
+        history=(prepared, reconciling),
     )
 
 
@@ -3854,6 +4280,7 @@ def _ack_no_receipt_local_failure(
         ),
         claim=_claim(ack_pending),
         claim_guard=_Guard(),
+        stage_guard=_StepGuard(),
     )
 
 

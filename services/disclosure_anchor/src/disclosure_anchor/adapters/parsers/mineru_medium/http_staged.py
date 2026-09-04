@@ -22,12 +22,20 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import Event, Lock
 from typing import Any, Callable, Iterator, TypeVar, cast
-from urllib.parse import urljoin, urlsplit
 
 import httpx
 
 from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
     MinerUMediumArtifactReader,
+)
+from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
+    MinerUProtocolV2WireError,
+    canonical_client_submit_key_v2,
+    canonical_result_owner_v2,
+    decode_closed_json_v2,
+    same_origin_url_v2,
+    submission_form_v2,
+    submission_request_exact_bytes_v2,
 )
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
@@ -77,34 +85,22 @@ def _make_idempotency_key(
     *,
     observed_unix: float,
 ) -> str:
-    epoch = int(observed_unix)
-    digest = hashlib.sha256(
-        f"{epoch:x}\0{source_pdf_sha256}\0{attempt_identity}\0{fence_identity}".encode()
-    ).hexdigest()
-    return f"{epoch:x}.{digest}"
+    try:
+        return canonical_client_submit_key_v2(
+            source_pdf_sha256=source_pdf_sha256,
+            attempt_identity=attempt_identity,
+            fence_identity=fence_identity,
+            submission_epoch_unix=int(observed_unix),
+        )
+    except MinerUProtocolV2WireError as exc:
+        raise _fail("submission idempotency key inputs are invalid") from exc
 
 
 def _submission_form(options: ParserOptions, *, server_url: str) -> dict[str, str]:
-    return {
-        "lang_list": options.language,
-        "backend": options.backend,
-        "effort": options.effective_effort or "medium",
-        "parse_method": options.method,
-        "formula_enable": str(options.formula).lower(),
-        "table_enable": str(options.table).lower(),
-        "image_analysis": str(options.effective_image_analysis).lower(),
-        "return_md": "true",
-        "return_middle_json": "true",
-        "return_model_output": "true",
-        "return_content_list": "true",
-        "return_images": "true",
-        "response_format_zip": "true",
-        "return_original_file": "true",
-        "client_side_output_generation": "false",
-        "start_page_id": "0",
-        "end_page_id": "99999",
-        "server_url": server_url,
-    }
+    try:
+        return submission_form_v2(options, server_url=server_url)
+    except MinerUProtocolV2WireError as exc:
+        raise _fail("submission form escaped protocol v2") from exc
 
 
 def _validate_submission_facts(
@@ -908,19 +904,14 @@ def _identity(value: str, label: str) -> str:
 
 
 def _same_origin_url(base_url: str, value: str, label: str) -> str:
-    resolved = urljoin(base_url.rstrip("/") + "/", value)
-    base = urlsplit(base_url)
-    target = urlsplit(resolved)
-    if (
-        base.scheme not in {"http", "https"}
-        or target.scheme != base.scheme
-        or target.netloc != base.netloc
-        or target.username is not None
-        or target.password is not None
-        or target.fragment
-    ):
-        raise _fail(f"{label} escaped the configured API origin")
-    return resolved
+    try:
+        return same_origin_url_v2(
+            api_origin=base_url,
+            value=value,
+            label=label,
+        )
+    except MinerUProtocolV2WireError as exc:
+        raise _fail(f"{label} escaped the configured API origin") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -1214,9 +1205,14 @@ class MinerUHttpRemoteHandle(RemoteProviderParseHandle):
             or any(char not in "0123456789abcdef" for char in owner)
         ):
             raise _fail("invalid retained result identity")
-        expected_owner = hashlib.sha256(
-            f"{self._task.task_id}\0{artifact_sha256}\0{artifact_bytes}".encode()
-        ).hexdigest()
+        try:
+            expected_owner = canonical_result_owner_v2(
+                task_id=self._task.task_id,
+                artifact_sha256=artifact_sha256,
+                artifact_byte_count=artifact_bytes,
+            )
+        except MinerUProtocolV2WireError as exc:
+            raise _fail("invalid retained result identity") from exc
         if owner != expected_owner:
             raise _fail("retained result owner is not canonical")
         expected_protocol = {
@@ -1832,16 +1828,14 @@ class MinerUHttpStagedParser:
         target_exact = json.dumps(
             target.to_payload(), sort_keys=True, separators=(",", ":")
         ).encode()
-        request_exact = json.dumps(
-            {
-                "schema": "mineru-staged-request.v1",
-                "api_origin": self._api_url,
-                "form": _submission_form(options, server_url=self._server_url),
-                "upload_filename": f"{source_pdf_sha256[7:]}.pdf",
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+        try:
+            request_exact = submission_request_exact_bytes_v2(
+                api_origin=self._api_url,
+                form=_submission_form(options, server_url=self._server_url),
+                upload_filename=f"{source_pdf_sha256[7:]}.pdf",
+            )
+        except MinerUProtocolV2WireError as exc:
+            raise _fail("submission request escaped protocol v2") from exc
         parser_target_sha256 = "sha256:" + hashlib.sha256(target_exact).hexdigest()
         request_sha256 = "sha256:" + hashlib.sha256(request_exact).hexdigest()
         client_submit_key = _make_idempotency_key(
@@ -2452,29 +2446,14 @@ def _closed_json(
         chunks.append(chunk)
     content = b"".join(chunks)
 
-    def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        value: dict[str, Any] = {}
-        for key, item in pairs:
-            if key in value:
-                raise _fail("response JSON contains duplicate fields")
-            value[key] = item
-        return value
-
     try:
-        payload = json.loads(
+        return decode_closed_json_v2(
             content,
-            object_pairs_hook=closed_object,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                _fail(f"response JSON contains non-finite value {value}")
-            ),
+            required=frozenset(required),
+            allowed=None if allowed is None else frozenset(allowed),
         )
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+    except MinerUProtocolV2WireError as exc:
         raise _fail("response is not JSON") from exc
-    if not isinstance(payload, dict) or not required.issubset(payload):
-        raise _fail("response JSON shape is invalid")
-    if allowed is not None and not set(payload).issubset(allowed):
-        raise _fail("response JSON fields are not closed")
-    return payload
 
 
 def _reconcile_ambiguous_submission(
