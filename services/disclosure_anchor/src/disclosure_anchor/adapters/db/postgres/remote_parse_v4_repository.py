@@ -296,6 +296,98 @@ class RemoteParseV4Repository:
             )
         return result
 
+    def list_unclaimed_prepared_heads(
+        self,
+        *,
+        after_attempt_id: str | None,
+        limit: int,
+    ) -> tuple[RecoveryCandidate, ...]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("v4 admission page limit is outside 1..1000")
+        if after_attempt_id is not None:
+            _identity(after_attempt_id, "admission cursor")
+
+        table = models.RemoteParseAttempt.__table__
+        clock = self._database_clock()
+        ordered_attempt_id = sa.collate(table.c.attempt_id, "C")
+        predicates = [
+            table.c.checkpoint_contract_version == 4,
+            table.c.is_current.is_(True),
+            table.c.state == "prepared",
+            table.c.row_version == 0,
+            table.c.claim_generation == 0,
+            table.c.claim_owner_identity.is_(None),
+            table.c.claim_lease_until.is_(None),
+        ]
+        if after_attempt_id is not None:
+            predicates.append(ordered_attempt_id > after_attempt_id)
+        statement = (
+            sa.select(
+                table.c.attempt_id,
+                table.c.checkpoint_contract_version,
+                table.c.state,
+                table.c.is_current,
+                table.c.row_version,
+                table.c.claim_generation,
+                table.c.claim_owner_identity,
+                table.c.claim_lease_until,
+                clock.c.database_observed_at,
+            )
+            .select_from(table.join(clock, sa.true()))
+            .where(*predicates)
+            .order_by(ordered_attempt_id)
+            .limit(limit)
+        )
+        try:
+            rows = self._session.execute(statement).mappings().all()
+        except DBAPIError as exc:
+            self._raise_authority_dbapi(
+                exc,
+                "v4 admission backlog could not be read",
+            )
+
+        observed_at: datetime | None = None
+        candidates: list[RecoveryCandidate] = []
+        for row in rows:
+            raw_observed_at = row["database_observed_at"]
+            if not isinstance(raw_observed_at, datetime):
+                raise RemoteParseV4AuthorityViolation(
+                    "v4 admission database clock is invalid"
+                )
+            row_observed_at = _utc(raw_observed_at)
+            if observed_at is None:
+                observed_at = row_observed_at
+            elif row_observed_at != observed_at:
+                raise RemoteParseV4AuthorityViolation(
+                    "v4 admission page used more than one database clock"
+                )
+            candidates.append(
+                recovery_candidate_from_head_row(
+                    row,
+                    database_observed_at=observed_at,
+                )
+            )
+
+        result = tuple(candidates)
+        identities = tuple(item.attempt_id for item in result)
+        if identities != tuple(sorted(identities)) or len(set(identities)) != len(
+            identities
+        ):
+            raise RemoteParseV4AuthorityViolation(
+                "v4 admission page is not strictly byte ordered"
+            )
+        if after_attempt_id is not None and any(
+            identity <= after_attempt_id for identity in identities
+        ):
+            raise RemoteParseV4AuthorityViolation(
+                "v4 admission page crossed its keyset cursor"
+            )
+        return result
+
     def create_prepared(
         self,
         creation: V4PreparedCreation,

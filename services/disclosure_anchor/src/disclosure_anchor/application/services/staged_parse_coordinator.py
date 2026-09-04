@@ -148,6 +148,35 @@ class AdmissionOutcome:
             raise ValueError("admission outcome is not closed")
 
 
+class AdmissionInterrupted(RuntimeError):
+    """Admission failed after one or more claims became durable.
+
+    The coordinator must account these claims before opening its circuit.  An
+    exception without this witness would make already-owned work disappear
+    from the in-process credit ledger until the next recovery boot.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        claimed_work: tuple[CoordinatorWork, ...],
+    ) -> None:
+        super().__init__(message)
+        if (
+            type(claimed_work) is not tuple
+            or not claimed_work
+            or any(type(work) is not CoordinatorWork for work in claimed_work)
+        ):
+            raise ValueError("interrupted admission witness is not closed")
+        attempt_ids = tuple(work.attempt_id for work in claimed_work)
+        if len(attempt_ids) != len(set(attempt_ids)) or any(
+            work.state not in _LANE_BY_STATE for work in claimed_work
+        ):
+            raise ValueError("interrupted admission witness is not closed")
+        self.claimed_work = claimed_work
+
+
 class RecoveryDeferred(RuntimeError):
     """A live durable claim cannot be taken until its lease becomes available."""
 
@@ -287,7 +316,11 @@ class StagedCoordinatorBackend(Protocol):
     def admit_new(
         self, *, limit: int, available_credits: ResourceCreditVector
     ) -> AdmissionOutcome:
-        """Create/claim fitting work and report exact blocked backlog dimensions."""
+        """Claim fitting work and report exact blocked backlog dimensions.
+
+        A backend that fails after one or more claims commit must raise
+        ``AdmissionInterrupted`` with every observed durable claim.
+        """
 
     def renew_claim(
         self, work: CoordinatorWork, *, lease_seconds: int
@@ -394,6 +427,8 @@ class CoordinatorLimits:
                 raise ValueError(f"{label} must be a positive integer")
         if not 1 <= self.claim_lease_seconds <= 300:
             raise ValueError("claim lease seconds must fit the DB 1..300 contract")
+        if self.recovery_page_size > 1000:
+            raise ValueError("recovery page size must fit the DB 1..1000 contract")
         for timing_value, label in (
             (self.poll_seconds, "poll seconds"),
             (self.idle_open_circuit_seconds, "idle open-circuit seconds"),
@@ -1314,74 +1349,101 @@ class StagedParseCoordinator:
                                 or blocked_reason == "oversubscribed_recovery_drain"
                             ):
                                 blocked_reason = None
-                            admission = self._backend.admit_new(
-                                limit=capacity,
-                                available_credits=available_credits,
-                            )
-                            if type(admission) is not AdmissionOutcome:
-                                raise RuntimeError(
-                                    "backend returned an invalid admission outcome"
+                            try:
+                                admission = self._backend.admit_new(
+                                    limit=capacity,
+                                    available_credits=available_credits,
                                 )
-                            admitted_batch = admission.work
-                            if len(admitted_batch) > capacity:
-                                raise RuntimeError(
-                                    "backend exceeded its admission count grant"
-                                )
-                            for work in admitted_batch:
-                                if (
-                                    work.attempt_id in active_ids
-                                    or work.attempt_id in final
-                                ):
-                                    raise RuntimeError(
-                                        "new admission duplicated an active attempt"
-                                    )
-                                valid_initial_shape = (
-                                    work.state == "prepared"
-                                    and work.lifecycle_version == 0
-                                )
-                                if (
-                                    not valid_initial_shape
-                                    or not ledger.can_add(work)
-                                    or not work.credit_reservation.fits(ledger.limit)
-                                ):
-                                    # ``admit_new`` has already durably created and
-                                    # claimed the attempt. Preserve it and drain it;
-                                    # never drop a backend contract violation.
+                            except AdmissionInterrupted as exc:
+                                for work in exc.claimed_work:
+                                    if (
+                                        work.attempt_id in active_ids
+                                        or work.attempt_id in final
+                                    ):
+                                        raise RuntimeError(
+                                            "interrupted admission duplicated an active attempt"
+                                        ) from exc
+                                    # These claims are already durable. Account their
+                                    # exact reservation even when it exceeds the grant;
+                                    # recovery on the next boot will see the same rows.
                                     place(work, recovery=True)
-                                    circuit_open = True
-                                    admission_open = False
-                                    blocked_reason = (
-                                        "admission_initial_state_contract_violation"
-                                        if not valid_initial_shape
-                                        else "admission_credit_contract_violation"
-                                    )
-                                    errors.append(
-                                        f"{work.attempt_id}:admission returned an invalid "
-                                        "initial state"
-                                        if not valid_initial_shape
-                                        else f"{work.attempt_id}:admission exceeded credit grant"
-                                    )
-                                else:
-                                    place(work, recovery=False)
-                                active_ids.add(work.attempt_id)
-                                admitted += 1
-                                last_progress = now
-                            if (
-                                admission.backlog_exists
-                                and admission.blocked_dimensions
-                            ):
-                                admission_blocked_dimensions = (
-                                    admission.blocked_dimensions
-                                )
-                                admission_blocked_available = (
-                                    ledger.limit - ledger.in_use
-                                )
-                                blocked_reason = "credit_backpressure:" + ",".join(
-                                    admission_blocked_dimensions
+                                    active_ids.add(work.attempt_id)
+                                    admitted += 1
+                                    last_progress = now
+                                circuit_open = True
+                                admission_open = False
+                                blocked_reason = "admission_interrupted"
+                                errors.append(
+                                    "admission interrupted after "
+                                    f"{len(exc.claimed_work)} durable claim(s) "
+                                    f"[{','.join(work.attempt_id for work in exc.claimed_work)}]:"
+                                    f"{exc}"
                                 )
                             else:
-                                admission_blocked_dimensions = ()
-                                admission_blocked_available = None
+                                if type(admission) is not AdmissionOutcome:
+                                    raise RuntimeError(
+                                        "backend returned an invalid admission outcome"
+                                    )
+                                admitted_batch = admission.work
+                                if len(admitted_batch) > capacity:
+                                    raise RuntimeError(
+                                        "backend exceeded its admission count grant"
+                                    )
+                                for work in admitted_batch:
+                                    if (
+                                        work.attempt_id in active_ids
+                                        or work.attempt_id in final
+                                    ):
+                                        raise RuntimeError(
+                                            "new admission duplicated an active attempt"
+                                        )
+                                    valid_initial_shape = (
+                                        work.state == "prepared"
+                                        and work.lifecycle_version == 0
+                                    )
+                                    if (
+                                        not valid_initial_shape
+                                        or not ledger.can_add(work)
+                                        or not work.credit_reservation.fits(ledger.limit)
+                                    ):
+                                        # ``admit_new`` has already durably created and
+                                        # claimed the attempt. Preserve it and drain it;
+                                        # never drop a backend contract violation.
+                                        place(work, recovery=True)
+                                        circuit_open = True
+                                        admission_open = False
+                                        blocked_reason = (
+                                            "admission_initial_state_contract_violation"
+                                            if not valid_initial_shape
+                                            else "admission_credit_contract_violation"
+                                        )
+                                        errors.append(
+                                            f"{work.attempt_id}:admission returned an invalid "
+                                            "initial state"
+                                            if not valid_initial_shape
+                                            else f"{work.attempt_id}:admission exceeded credit grant"
+                                        )
+                                    else:
+                                        place(work, recovery=False)
+                                    active_ids.add(work.attempt_id)
+                                    admitted += 1
+                                    last_progress = now
+                                if (
+                                    admission.backlog_exists
+                                    and admission.blocked_dimensions
+                                ):
+                                    admission_blocked_dimensions = (
+                                        admission.blocked_dimensions
+                                    )
+                                    admission_blocked_available = (
+                                        ledger.limit - ledger.in_use
+                                    )
+                                    blocked_reason = "credit_backpressure:" + ",".join(
+                                        admission_blocked_dimensions
+                                    )
+                                else:
+                                    admission_blocked_dimensions = ()
+                                    admission_blocked_available = None
 
                 # Claims returned by recovery/admission may have less time
                 # remaining than this coordinator's configured lease.  Guard
@@ -1704,6 +1766,7 @@ class StagedParseCoordinator:
 
 
 __all__ = [
+    "AdmissionInterrupted",
     "AdmissionOutcome",
     "CoordinatorLane",
     "CoordinatorLimits",

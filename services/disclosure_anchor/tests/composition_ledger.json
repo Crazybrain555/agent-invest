@@ -84,7 +84,7 @@
   },
   "tests/integration/test_remote_parse_v4_recovery_scan.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 9
   },
   "tests/integration/test_remote_parse_v4_repository.py": {
    "private_imports": [],
@@ -101,6 +101,10 @@
   "tests/integration/test_search_projection.py": {
    "private_imports": [],
    "tests": 14
+  },
+  "tests/integration/test_staged_coordinator_persistence_v4.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [],
@@ -553,13 +557,17 @@
    "private_imports": [],
    "tests": 7
   },
+  "tests/unit/test_staged_coordinator_persistence_v4.py": {
+   "private_imports": [],
+   "tests": 12
+  },
   "tests/unit/test_staged_credit.py": {
    "private_imports": [],
    "tests": 11
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
-   "tests": 65
+   "tests": 68
   },
   "tests/unit/test_staged_provider_parser_v4.py": {
    "private_imports": [],

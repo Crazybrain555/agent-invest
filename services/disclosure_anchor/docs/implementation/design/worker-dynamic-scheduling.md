@@ -421,6 +421,28 @@ renew margin 减去该轮同步调度开销；该开销与 in-flight guard 共�
 bounded recovery feeder/batch renewal；不能为假设扩容增加第二队列或削弱 recovery-before-admission。
 这仍是默认关闭、尚未接入 production composition 的 V4 边界。
 
+M5b 的 `DurableStagedCoordinatorPersistenceV4` 只实现 coordinator 的 PostgreSQL
+recovery/claim/renew/reload/admission 切片，尚未实现七个有副作用 stage，因此不得作为完整 backend
+接入 worker。它不保留进程内 claim witness cache；每次 renew/reload 都从完整 V4 authority fresh load
+重建 fence/checkpoint witness，再由 repository 的 exact CAS 写入。读取与 claim 使用两个短 UoW，避免
+把 share-lock 升级成 update-lock；claim 或 renew 的 outer commit 响应不确定时，只允许一次 fresh
+authority 对账和一次幂等重试，owner/generation/head/lease 不能精确闭合就 fail closed。UTC database
+lease 通过包围完整 UoW 的 monotonic bracket 投影；foreign live projection 只记资源账并等待其租约
+上界，不取得执行权。
+
+运行中 admission 使用同一 `remote_parse_attempt` authority 上的
+`list_unclaimed_prepared_heads`，在 SQL `LIMIT` 前严格过滤 current V4、prepared/version 0、generation 0
+和无 owner/lease；它不是第二个持久队列。每个 hint 仍 fresh load 后才 claim。暂时放不进当前剩余
+credit 的较大 head 保持可见，但不阻止后面的较小 head 被准入；`backlog_exists` 和
+`blocked_dimensions` 按扫描后真实剩余 credit 闭合。`recovery_page_size` 在 coordinator 配置入口限制为
+数据库契约的 1..1000。只有未来实际 `EXPLAIN`/backlog 延迟证明必要时才追加 partial index，不能为
+尚未观测的规模改写已应用 migration。
+
+同一次 admission 批次若在一个或多个 claim 已提交后发生后续异常，backend 必须用
+`AdmissionInterrupted` 返回所有已提交 claim 的完整 durable projection；coordinator 先把它们按 recovery
+口径记入 ledger，再显式开路，禁止等到租约过期才重新发现。candidate hint 与 claim 事务之间允许其他
+claim generation 完整发生；新 owner 的提交见证要求 generation 严格前进，不假设一定等于 1 或只增加 1。
+
 ### 4.4 正常长任务续租、软耗时包络与失败域
 
 真实待处理样本曾出现 500–994 页 PDF；统一一小时 timeout 会把正常超大任务反复杀死，

@@ -275,6 +275,24 @@ generation-0 current prepared head 与 live/expired owned head 均可表达，�
 第二持久队列或重复 backlog reader。
 ```
 
+2026-09-04（M5b 私有 V4 coordinator persistence slice）——不改变 migration/public view/API/change feed：
+
+```text
+DurableStagedCoordinatorPersistenceV4 只闭合 list/claim/renew/reload/admit 的 PostgreSQL authority，
+七个 remote/local/publish/cleanup/ACK stage 尚未实现，因此本切片保持 default-off 且不可接入 worker；
+CoordinatorWork 不足以自行构造 fence/checkpoint witness，renew/reload 必须 fresh load 完整 V4 authority，
+禁止以内存 cache 代替数据库真相；读取和写 claim 分属短 UoW，避免 share→update lock upgrade。
+own lease 用覆盖完整 UoW 的 monotonic bracket 保守投影；foreign live claim 只进入 credit ledger，等待
+数据库租约上界后重试，不授予本进程执行权。claim/renew 的 commit 响应丢失只允许 exact reload 闭合
+或一次相同幂等写重试，任一 owner/generation/state/version/checkpoint/lease 漂移均 fail closed。
+运行时 generation-0 superseder 由同表 list_unclaimed_prepared_heads 读取；current/V4/prepared/version0/
+generation0/no-owner/no-lease 全部在 LIMIT 前过滤，hint fresh load 后才 CAS claim。当前放不下的 head
+保持 backlog/blocked-dimension 可见，同时允许后续可装入 head 继续准入；recovery page 配置限 1..1000。
+批内已有 claim 成功、后续 candidate 再失败时，以 AdmissionInterrupted 携带全部 durable claim；coordinator
+先按 recovery 记账再开路，不允许已占有 work 暂时隐身。并发 claimant 可使 generation 从 hint 跨越多个
+代际；只要求本次 owner 的 generation 相对 fresh-load hint 严格前进，不固定 generation=1 或恰好 +1。
+```
+
 2026-09-02（0058 私有 V4 supersession staging authority）——不改变 public view/API/change feed：
 
 ```text

@@ -11,6 +11,7 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
 )
 from disclosure_anchor.application.services import staged_parse_coordinator
 from disclosure_anchor.application.services.staged_parse_coordinator import (
+    AdmissionInterrupted,
     AdmissionOutcome,
     CoordinatorLimits,
     CoordinatorResult,
@@ -242,6 +243,7 @@ class _Backend:
         self.duplicate_recovery_page = False
         self.claim_attempts: dict[str, int] = {}
         self.violate_admission_credit = False
+        self.interrupt_admission_claim_count = 0
         self.retry_remote_remaining = 0
         self.wait_remote_remaining = 0
         self.wait_remote_retry_after_seconds = 0.001
@@ -413,6 +415,14 @@ class _Backend:
         self, *, limit: int, available_credits: ResourceCreditVector
     ) -> AdmissionOutcome:
         self.calls.append(f"admit:{limit}")
+        if self.interrupt_admission_claim_count and self.new:
+            claim_count = min(self.interrupt_admission_claim_count, len(self.new))
+            work = tuple(self.new[:claim_count])
+            del self.new[:claim_count]
+            raise AdmissionInterrupted(
+                "fake failure after durable claim",
+                claimed_work=work,
+            )
         if self.violate_admission_credit and self.new:
             work = self.new.pop(0)
             return AdmissionOutcome(
@@ -694,6 +704,10 @@ def _limits(**changes: object) -> CoordinatorLimits:
 
 
 class CreditVectorTests(unittest.TestCase):
+    def test_recovery_page_size_cannot_exceed_database_contract(self) -> None:
+        with self.assertRaisesRegex(ValueError, "DB 1..1000"):
+            _limits(recovery_page_size=1001)
+
     def test_dimensions_are_non_fungible_and_never_negative(self) -> None:
         used = ResourceCreditVector(documents=1, decoded_bytes=10)
         self.assertFalse(used.fits(ResourceCreditVector(documents=2, decoded_bytes=9)))
@@ -1703,6 +1717,61 @@ class StagedParseCoordinatorTests(unittest.TestCase):
             any("admission exceeded credit grant" in error for error in result.errors)
         )
         self.assertEqual(result.credits_in_use.documents, 9)
+
+    def test_interrupted_admission_preserves_durable_claim_and_opens_circuit(
+        self,
+    ) -> None:
+        backend = _Backend(new=(_work("attempt-1", "prepared"),))
+        backend.interrupt_admission_claim_count = 1
+        snapshots: list[CoordinatorSnapshot] = []
+
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(),
+            progress=snapshots.append,
+        ).run()
+
+        self.assertEqual(result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
+        self.assertEqual(result.admitted, 1)
+        self.assertEqual(result.credits_in_use.documents, 1)
+        self.assertTrue(
+            any("after 1 durable claim" in error for error in result.errors)
+        )
+        self.assertTrue(
+            any(snapshot.blocked_reason == "admission_interrupted" for snapshot in snapshots)
+        )
+        self.assertNotIn("preflight:attempt-1", backend.calls)
+
+    def test_interrupted_admission_accounts_every_claim_even_when_oversubscribed(
+        self,
+    ) -> None:
+        oversized = replace(
+            _work("attempt-2", "prepared"),
+            credit_reservation=replace(_LIFECYCLE_RESERVATION, documents=9),
+            credits=ResourceCreditVector(documents=9),
+        )
+        backend = _Backend(
+            new=(_work("attempt-1", "prepared"), oversized),
+        )
+        backend.interrupt_admission_claim_count = 2
+        snapshots: list[CoordinatorSnapshot] = []
+
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(),
+            progress=snapshots.append,
+        ).run()
+
+        self.assertEqual(result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
+        self.assertEqual(result.admitted, 2)
+        self.assertEqual(result.credits_in_use.documents, 10)
+        self.assertTrue(
+            any(dict(snapshot.queued)["preflight"] == 2 for snapshot in snapshots)
+        )
+        self.assertTrue(
+            any("[attempt-1,attempt-2]" in error for error in result.errors)
+        )
+        self.assertFalse(any(call.startswith("preflight:") for call in backend.calls))
 
     def test_backend_admission_must_return_prepared_lifecycle_zero(self) -> None:
         backend = _Backend(new=(_work("attempt-1", "submitted", 2),))

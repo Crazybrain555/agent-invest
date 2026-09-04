@@ -28,11 +28,13 @@ from tests.integration._remote_parse_v4_factory import (
     V4AuthorityFixture,
     append_remote_failed_tail,
     build_v4_authority_fixture,
+    build_v4_supersession_stage_fixture,
     insert_core_rows,
     insert_legacy_head,
     install_prepared_cycle,
     install_remote_failed_without_secret,
     install_submitted_cycle,
+    install_v4_supersession_stage,
 )
 from tests.integration._support import engine_or_skip
 
@@ -94,6 +96,22 @@ class RemoteParseV4RecoveryScanIntegrationTests(unittest.TestCase):
             session, repository = self._repository(conn)
             try:
                 return repository.list_recoverable_heads(
+                    after_attempt_id=after_attempt_id,
+                    limit=limit,
+                )
+            finally:
+                session.close()
+
+    def _admission_scan(
+        self,
+        *,
+        after_attempt_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[RecoveryCandidate, ...]:
+        with self.engine.begin() as conn:
+            session, repository = self._repository(conn)
+            try:
+                return repository.list_unclaimed_prepared_heads(
                     after_attempt_id=after_attempt_id,
                     limit=limit,
                 )
@@ -223,6 +241,78 @@ class RemoteParseV4RecoveryScanIntegrationTests(unittest.TestCase):
             finally:
                 session.close()
 
+    def test_admission_scan_filters_claimed_heads_before_limit(self) -> None:
+        claimed_prepared = build_v4_authority_fixture(
+            attempt_id="rpa_0-claimed-prepared"
+        )
+        claimed_submitted = build_v4_authority_fixture(
+            attempt_id="rpa_1-claimed-submitted"
+        )
+        expired_claimed_prepared = build_v4_authority_fixture(
+            attempt_id="rpa_1b-expired-claimed-prepared"
+        )
+        first_unclaimed = build_v4_authority_fixture(
+            attempt_id="rpa_2-unclaimed"
+        )
+        second_unclaimed = build_v4_authority_fixture(
+            attempt_id="rpa_3-unclaimed"
+        )
+        with self.engine.begin() as conn:
+            install_prepared_cycle(conn, claimed_prepared)
+            conn.execute(
+                sa.text(
+                    "UPDATE disclosure_ops.remote_parse_attempt SET "
+                    "claim_generation=1,claim_owner_identity='other-worker',"
+                    "claim_lease_until=clock_timestamp()+interval '1 hour' "
+                    "WHERE attempt_id=:attempt_id"
+                ),
+                {"attempt_id": claimed_prepared.attempt_id},
+            )
+            install_submitted_cycle(conn, claimed_submitted, include_secret=True)
+            install_prepared_cycle(conn, expired_claimed_prepared)
+            conn.execute(
+                sa.text(
+                    "UPDATE disclosure_ops.remote_parse_attempt SET "
+                    "claim_generation=2,claim_owner_identity='expired-worker',"
+                    "claim_lease_until=clock_timestamp()-interval '1 second' "
+                    "WHERE attempt_id=:attempt_id"
+                ),
+                {"attempt_id": expired_claimed_prepared.attempt_id},
+            )
+            install_prepared_cycle(conn, first_unclaimed)
+            install_prepared_cycle(conn, second_unclaimed)
+
+        first = self._admission_scan(limit=1)
+        self.assertEqual(
+            tuple(item.attempt_id for item in first),
+            (first_unclaimed.attempt_id,),
+        )
+        self.assertEqual(first[0].state, "prepared")
+        self.assertEqual(first[0].lifecycle_version, 0)
+        self.assertEqual(first[0].claim_generation, 0)
+        self.assertIsNone(first[0].claim_owner_identity)
+        second = self._admission_scan(
+            after_attempt_id=first[0].attempt_id,
+            limit=1,
+        )
+        self.assertEqual(
+            tuple(item.attempt_id for item in second),
+            (second_unclaimed.attempt_id,),
+        )
+
+    def test_admission_scan_excludes_a_noncurrent_supersession_target(self) -> None:
+        source = build_v4_authority_fixture(attempt_id="rpa_0-source")
+        stage = build_v4_supersession_stage_fixture(source)
+        eligible = build_v4_authority_fixture(attempt_id="rpa_z-eligible")
+        with self.engine.begin() as conn:
+            install_v4_supersession_stage(conn, stage)
+            install_prepared_cycle(conn, eligible)
+
+        self.assertEqual(
+            tuple(item.attempt_id for item in self._admission_scan()),
+            (eligible.attempt_id,),
+        )
+
     def test_uncommitted_claim_does_not_block_or_leak_into_scan(self) -> None:
         fixture = build_v4_authority_fixture(attempt_id="rpa_claim-race")
         with self.engine.begin() as conn:
@@ -260,6 +350,10 @@ class RemoteParseV4RecoveryScanIntegrationTests(unittest.TestCase):
             scan_future = executor.submit(self._scan, limit=10)
             try:
                 during = scan_future.result(timeout=2)
+                admission_during = executor.submit(
+                    self._admission_scan,
+                    limit=10,
+                ).result(timeout=2)
             finally:
                 release_claim.set()
             claim_future.result(timeout=3)
@@ -268,9 +362,12 @@ class RemoteParseV4RecoveryScanIntegrationTests(unittest.TestCase):
         self.assertEqual(len(during), 1)
         self.assertEqual(during[0].claim_generation, 0)
         self.assertIsNone(during[0].claim_owner_identity)
+        self.assertEqual(len(admission_during), 1)
+        self.assertEqual(admission_during[0].claim_generation, 0)
         after = self._scan(limit=10)
         self.assertEqual(after[0].claim_generation, 1)
         self.assertEqual(after[0].claim_owner_identity, "worker-uncommitted")
+        self.assertEqual(self._admission_scan(limit=10), ())
 
     def test_finalization_between_pages_is_observed_without_stale_locking(self) -> None:
         first = build_v4_authority_fixture(attempt_id="rpa_1-first")
@@ -328,6 +425,10 @@ class RemoteParseV4RecoveryScanIntegrationTests(unittest.TestCase):
                     after_attempt_id=None,
                     limit=10,
                 )), 1)
+                self.assertEqual(len(repository.list_unclaimed_prepared_heads(
+                    after_attempt_id=None,
+                    limit=10,
+                )), 1)
                 with self.engine.begin() as lock_conn:
                     locked = lock_conn.execute(
                         sa.text(
@@ -365,10 +466,20 @@ class RemoteParseV4RecoveryScanIntegrationTests(unittest.TestCase):
                                 after_attempt_id=None,
                                 limit=limit,  # type: ignore[arg-type]
                             )
+                        with self.assertRaises(ValueError):
+                            repository.list_unclaimed_prepared_heads(
+                                after_attempt_id=None,
+                                limit=limit,  # type: ignore[arg-type]
+                            )
                 for cursor in ("", "   ", 1):
                     with self.subTest(cursor=cursor):
                         with self.assertRaises(ValueError):
                             repository.list_recoverable_heads(
+                                after_attempt_id=cursor,  # type: ignore[arg-type]
+                                limit=1,
+                            )
+                        with self.assertRaises(ValueError):
+                            repository.list_unclaimed_prepared_heads(
                                 after_attempt_id=cursor,  # type: ignore[arg-type]
                                 limit=1,
                             )

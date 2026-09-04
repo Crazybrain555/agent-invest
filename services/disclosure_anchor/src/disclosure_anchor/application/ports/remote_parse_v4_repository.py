@@ -628,6 +628,21 @@ class RemoteParseV4Repository(Protocol):
         the only producer of new current V4 heads during the startup barrier.
         """
 
+    def list_unclaimed_prepared_heads(
+        self,
+        *,
+        after_attempt_id: str | None,
+        limit: int,
+    ) -> tuple[RecoveryCandidate, ...]:
+        """Return one byte-ordered page of runtime-admissible V4 heads.
+
+        This is a narrower projection over the same PostgreSQL authority, not
+        a second durable queue.  Every eligibility predicate is applied before
+        ``LIMIT`` so live or expired claimed rows cannot starve a newly
+        activated generation-zero superseder.  The returned rows are hints;
+        admission still reloads and claims the exact durable head.
+        """
+
     def load(self, attempt_id: str) -> RemoteParseV4Authority: ...
 
     def load_current_for_document(
