@@ -2,7 +2,7 @@
 id: disclosure_anchor_worker_dynamic_scheduling
 title: Worker 动态调度、GPU 锯齿根因与发布验收
 date: 2026-07-09
-updated_at: 2026-07-26
+updated_at: 2026-09-04
 status: continuous-resident-candidate-pending-cutover
 authority: tracked implementation design; live runtime values must be re-verified
 ---
@@ -342,6 +342,7 @@ Protocol v2 的 server registry、idempotent submit、result lease、ACK/consume
 Mac 私有 checkpoint/recovery。只有 checkpoint wiring、Windows exact-image attestation 和对应 crash/race
 门禁都通过后，production worker 才能切换到 staged adapter；此前 production 仍保持当前同步 parser
 调用，不能把“代码唯一协议”误写成“运行时已激活”。
+
 - 当前 MinerU 3.4.4 CLI 的 `--api-url` 路径把 submit/status/terminal、result ZIP 下载/解压绑定在
   同一个 CLI process return 中，没有可证明的提前 terminal/result-owner 回调。因此 production adapter
   仍走当前同步 port；新的 `StagedParseCoordinator` 只有在 protocol-v2 adapter 与 v2 checkpoint/recovery
@@ -388,6 +389,31 @@ Mac 私有 checkpoint/recovery。只有 checkpoint wiring、Windows exact-image 
 `worker once` 保持可预测的“最多 N 份”运维语义；production resident 则采用成熟 consumer
 的生命周期语义：持续消费、独立快照、显式背压。这样既不会为了“100% GPU”盲目过载，也
 不会因为写报告而主动制造空谷。
+
+#### 4.3.1 V4 startup recovery 与 claim 租约
+
+V4 coordinator 的启动恢复分成两个不可混淆的动作：`list_recoverable` 只按 attempt identity
+做无副作用、无过滤的 keyset 扫描，返回可表达 generation-0 未认领 head 和租约已过期 head 的
+`RecoveryCandidate`；`claim_recovery` 必须在持久层重新读取 current head，并且是唯一可以取得
+或接管 claim、返回可执行 `CoordinatorWork` 的入口。扫描必须正常读到 empty/short page 才能设置
+`barrier_exhausted`；未穷尽、存在 foreign deferred claim 或 circuit 已打开时，新的 admission 一律关闭。
+PostgreSQL adapter 必须用与 64 字符 attempt identity 一致的 byte-wise 排序，不能在 `LIMIT` 后过滤。
+
+claim 是执行所有权而不是一次性 dequeue 标记。当前 owner 的工作无论在 lane queue、retry timer
+还是 in-flight 都必须在到期前续租；foreign deferred projection 只用于资源记账，绝不代替其 owner
+续租。等待续租只接受 attempt/state/lifecycle version/generation/owner/credits/reservation 完全相同且
+lease 严格前移的 durable projection；响应丢失时也只能按这组字段重新读取并闭合。任一字段漂移、
+续租丢失或 reload 不闭合立即开路，停止 admission 和等待续租，让下一 boot 可在旧 lease 到期后
+接管；graceful drain 则继续续租。`max_stage_step + renew_margin < claim_lease`，并且
+`poll_interval <= max_stage_step`；因此一次刚刚跳过的 waiting lease 到下一轮 guard 时仍至少保留
+renew margin 减去该轮同步调度开销；该开销与 in-flight guard 共用同一预算。新取得的短 lease
+在 lane 选择或 poll sleep 前先经过同一 guard。续租不改变 claim generation、credit ledger、状态
+或 transition 顺序。
+
+当前实现采用完整 recovery barrier 加周期等待续租，因为 admission 的 documents credit 会约束日常
+等待集合。只有真实 backlog 与数据库 RTT 证明一次 barrier 的候选规模超过该续租能力，才引入
+bounded recovery feeder/batch renewal；不能为假设扩容增加第二队列或削弱 recovery-before-admission。
+这仍是默认关闭、尚未接入 production composition 的 V4 边界。
 
 ### 4.4 正常长任务续租、软耗时包络与失败域
 

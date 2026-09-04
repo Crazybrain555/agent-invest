@@ -8,6 +8,8 @@ the first provider lookup or POST.
 
 There is deliberately no cancelled completion state.  Closing admission lets
 already accepted work drain through durable finish/failure and remote ACK.
+Every own-claimed attempt is renewed while it waits as well as while it runs;
+otherwise a congested lane could turn an expired queue into a restart livelock.
 """
 
 from __future__ import annotations
@@ -115,6 +117,69 @@ class CoordinatorWork:
             raise ValueError(
                 "final coordinator work must release its claim and all credits"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryCandidate:
+    """Read-only observation of one current nonfinal head before any claim.
+
+    Candidate fields are only hints from the recovery scan.  The backend must
+    re-read the head under its durable authority before attempting the claim.
+    An observed lease may already be expired, so its remaining duration is
+    intentionally allowed to be zero or negative.
+    """
+
+    attempt_id: str
+    state: str
+    lifecycle_version: int
+    claim_generation: int
+    claim_owner_identity: str | None
+    lease_remaining_seconds: float | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.attempt_id) is not str
+            or not self.attempt_id.strip()
+            or len(self.attempt_id) > 128
+        ):
+            raise ValueError("recovery candidate attempt identity is invalid")
+        if (
+            type(self.state) is not str
+            or not self.state.strip()
+            or len(self.state) > 64
+        ):
+            raise ValueError("recovery candidate state is invalid")
+        if self.state in _FINAL_STATES:
+            raise ValueError("recovery candidate must be a nonfinal current head")
+        for value, label in (
+            (self.lifecycle_version, "lifecycle version"),
+            (self.claim_generation, "claim generation"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"recovery candidate {label} is invalid")
+        if (self.claim_owner_identity is None) != (
+            self.lease_remaining_seconds is None
+        ):
+            raise ValueError("recovery candidate owner and lease must be paired")
+        if (self.claim_owner_identity is None) != (self.claim_generation == 0):
+            raise ValueError(
+                "recovery candidate owner and claim generation disagree"
+            )
+        if self.claim_owner_identity is None and (
+            self.state != "prepared" or self.lifecycle_version != 0
+        ):
+            raise ValueError(
+                "unclaimed recovery candidate must be prepared at lifecycle version zero"
+            )
+        if self.claim_owner_identity is not None and (
+            type(self.claim_owner_identity) is not str
+            or not self.claim_owner_identity.strip()
+            or len(self.claim_owner_identity) > 128
+            or isinstance(self.lease_remaining_seconds, bool)
+            or not isinstance(self.lease_remaining_seconds, (int, float))
+            or not isfinite(self.lease_remaining_seconds)
+        ):
+            raise ValueError("recovery candidate claim observation is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,9 +327,22 @@ class StagedCoordinatorBackend(Protocol):
 
     def list_recoverable(
         self, *, after_attempt_id: str | None, limit: int
-    ) -> Sequence[CoordinatorWork]: ...
+    ) -> Sequence[RecoveryCandidate]:
+        """Read an exact side-effect-free keyset page of current nonfinal heads.
 
-    def claim_recovery(self, work: CoordinatorWork) -> CoordinatorWork: ...
+        No row may be filtered after applying ``limit`` because a short page
+        ends the startup recovery barrier.
+        """
+
+    def claim_recovery(
+        self, candidate: RecoveryCandidate
+    ) -> CoordinatorWork:
+        """Claim one freshly reloaded candidate and return durable work.
+
+        A head that completed between scan and claim may return its exact final
+        projection.  A live foreign claim raises ``RecoveryDeferred`` with the
+        durable foreign-owned projection.
+        """
 
     def admit_new(
         self, *, limit: int, available_credits: ResourceCreditVector
@@ -400,6 +478,10 @@ class CoordinatorLimits:
             >= self.claim_lease_seconds
         ):
             raise ValueError("bounded stage plus renewal margin must fit the lease")
+        if self.poll_seconds > self.max_stage_step_seconds:
+            raise ValueError(
+                "poll interval must not exceed the maximum stage step"
+            )
         if (
             self.poll_seconds <= 0
             or self.idle_open_circuit_seconds <= 0
@@ -575,6 +657,7 @@ class StagedParseCoordinator:
         circuit_open = False
         blocked_reason: str | None = "recovery_barrier"
         last_progress = self._monotonic()
+        waiting_renewal_floor = float("inf")
         lane_limits = {
             CoordinatorLane.PREFLIGHT: self._limits.preflight_workers,
             CoordinatorLane.REMOTE: self._limits.remote_workers,
@@ -639,6 +722,15 @@ class StagedParseCoordinator:
                 )
             )
 
+        def track_waiting_lease(work: CoordinatorWork) -> None:
+            nonlocal waiting_renewal_floor
+            if work.lease_expires_monotonic is None:
+                raise RuntimeError("waiting work lacks a claim lease")
+            waiting_renewal_floor = min(
+                waiting_renewal_floor,
+                work.lease_expires_monotonic,
+            )
+
         def place(work: CoordinatorWork, *, recovery: bool) -> None:
             nonlocal completed, last_progress, circuit_open, blocked_reason
             previous = known.get(work.attempt_id)
@@ -681,6 +773,7 @@ class StagedParseCoordinator:
                 errors.append(f"{work.attempt_id}:unsupported state:{work.state}")
                 return
             queues[lane].append(work)
+            track_waiting_lease(work)
 
         def reserve_deferred(work: CoordinatorWork) -> None:
             """Account durable ownership without making the live claim runnable."""
@@ -839,6 +932,105 @@ class StagedParseCoordinator:
                 <= self._limits.max_stage_step_seconds
                 + self._limits.claim_renew_margin_seconds
             )
+
+        def fail_waiting_renewal(
+            work: CoordinatorWork,
+            lane: CoordinatorLane,
+            kind: str,
+            exc: Exception,
+        ) -> None:
+            nonlocal circuit_open, admission_open, blocked_reason
+            circuit_open = True
+            admission_open = False
+            blocked_reason = "claim_renewal_failed"
+            errors.append(
+                f"{work.attempt_id}:{lane.value}:{kind}:"
+                f"{type(exc).__name__}:{exc}"
+            )
+
+        def renew_waiting(
+            work: CoordinatorWork,
+            lane: CoordinatorLane,
+        ) -> CoordinatorWork | None:
+            """Renew one waiting claim, reconciling a lost renewal response."""
+
+            try:
+                return renew(work, lane)
+            except Exception as exc:  # noqa: BLE001 - reconcile commit race
+                if circuit_open:
+                    return None
+                try:
+                    durable = self._backend.reload_claim(work)
+                except Exception as reload_exc:  # noqa: BLE001
+                    fail_waiting_renewal(
+                        work,
+                        lane,
+                        "claim-reload-wait",
+                        reload_exc,
+                    )
+                    return None
+                threshold = (
+                    self._limits.max_stage_step_seconds
+                    + self._limits.claim_renew_margin_seconds
+                )
+                if (
+                    durable.attempt_id == work.attempt_id
+                    and durable.state == work.state
+                    and durable.lifecycle_version == work.lifecycle_version
+                    and durable.claim_generation == work.claim_generation
+                    and durable.claim_owner_identity == work.claim_owner_identity
+                    and durable.credit_reservation == work.credit_reservation
+                    and durable.credits == work.credits
+                    and durable.lease_expires_monotonic is not None
+                    and work.lease_expires_monotonic is not None
+                    and durable.lease_expires_monotonic
+                    > work.lease_expires_monotonic
+                    and durable.lease_expires_monotonic - self._monotonic()
+                    > threshold
+                ):
+                    known[work.attempt_id] = durable
+                    return durable
+                fail_waiting_renewal(work, lane, "claim-wait", exc)
+                return None
+
+        def guard_waiting(now: float) -> None:
+            """Keep every own-claimed queue/retry owner live without busy scans."""
+
+            nonlocal waiting_renewal_floor
+            threshold = (
+                self._limits.max_stage_step_seconds
+                + self._limits.claim_renew_margin_seconds
+            )
+            if circuit_open or now + threshold < waiting_renewal_floor:
+                return
+            next_floor = float("inf")
+            for lane in CoordinatorLane:
+                queue = queues[lane]
+                for index in range(len(queue)):
+                    work = queue[index]
+                    if needs_renewal(work, now):
+                        renewed = renew_waiting(work, lane)
+                        if renewed is None:
+                            return
+                        queue[index] = work = renewed
+                    assert work.lease_expires_monotonic is not None
+                    next_floor = min(next_floor, work.lease_expires_monotonic)
+            for attempt_id, (ready_at, work) in tuple(retry_at.items()):
+                try:
+                    retry_lane = _LANE_BY_STATE[work.state]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "retry work has unsupported durable state"
+                    ) from exc
+                if needs_renewal(work, now):
+                    renewed = renew_waiting(work, retry_lane)
+                    if renewed is None:
+                        return
+                    retry_at[attempt_id] = (ready_at, renewed)
+                    work = renewed
+                assert work.lease_expires_monotonic is not None
+                next_floor = min(next_floor, work.lease_expires_monotonic)
+            waiting_renewal_floor = next_floor
 
         def bounded_defer_delay(
             work: CoordinatorWork,
@@ -1016,7 +1208,8 @@ class StagedParseCoordinator:
             # is read until every current nonfinal attempt has been claimed or
             # placed on an explicit deferred-claim timer.
             after: str | None = None
-            deferred_claims: dict[str, tuple[float, CoordinatorWork]] = {}
+            barrier_exhausted = False
+            deferred_claims: dict[str, tuple[float, RecoveryCandidate]] = {}
             while True:
                 page = tuple(
                     self._backend.list_recoverable(
@@ -1025,38 +1218,58 @@ class StagedParseCoordinator:
                     )
                 )
                 if not page:
+                    barrier_exhausted = True
                     break
-                ids = [work.attempt_id for work in page]
+                if any(type(item) is not RecoveryCandidate for item in page):
+                    raise RuntimeError(
+                        "recovery page is not a candidate projection"
+                    )
+                ids = [recovery_candidate.attempt_id for recovery_candidate in page]
                 if (
                     ids != sorted(ids)
                     or len(ids) != len(set(ids))
                     or (after is not None and ids[0] <= after)
                 ):
                     raise RuntimeError("recovery keyset page is not strictly ordered")
-                for work in page:
+                for recovery_candidate in page:
                     try:
-                        place(self._backend.claim_recovery(work), recovery=True)
+                        place(
+                            self._backend.claim_recovery(recovery_candidate),
+                            recovery=True,
+                        )
                     except RecoveryDeferred as exc:
                         if (
-                            exc.durable_work.attempt_id != work.attempt_id
+                            exc.durable_work.attempt_id
+                            != recovery_candidate.attempt_id
                             or exc.durable_work.state in _FINAL_STATES
                             or exc.durable_work.claim_owner_identity is None
                         ):
                             raise RuntimeError(
                                 "deferred recovery returned a foreign or final projection"
-                            )
-                        reserve_deferred(exc.durable_work)
-                        deferred_claims[work.attempt_id] = (
-                            self._monotonic() + exc.retry_after_seconds,
-                            exc.durable_work,
                         )
+                        reserve_deferred(exc.durable_work)
+                        deferred_claims[recovery_candidate.attempt_id] = (
+                            self._monotonic() + exc.retry_after_seconds,
+                            recovery_candidate,
+                        )
+                    guard_waiting(self._monotonic())
+                    if circuit_open:
+                        break
+                if circuit_open:
+                    break
                 after = ids[-1]
                 if len(page) < self._limits.recovery_page_size:
+                    barrier_exhausted = True
                     break
 
-            recovery_complete = not deferred_claims
-            admission_open = recovery_complete and not stop_requested()
-            blocked_reason = None if admission_open else "admission_closed"
+            recovery_complete = barrier_exhausted and not deferred_claims
+            admission_open = (
+                recovery_complete and not circuit_open and not stop_requested()
+            )
+            if admission_open:
+                blocked_reason = None
+            elif not circuit_open:
+                blocked_reason = "admission_closed"
             emit()
 
             while True:
@@ -1064,17 +1277,21 @@ class StagedParseCoordinator:
                 if stop_requested():
                     admission_open = False
                     blocked_reason = "draining"
+                guard_waiting(now)
 
-                for attempt_id, (ready_at, work) in tuple(deferred_claims.items()):
-                    if stop_requested():
+                for attempt_id, (ready_at, recovery_candidate) in tuple(
+                    deferred_claims.items()
+                ):
+                    if stop_requested() or circuit_open:
                         break
                     if ready_at > now:
                         continue
                     try:
-                        claimed = self._backend.claim_recovery(work)
+                        claimed = self._backend.claim_recovery(recovery_candidate)
                     except RecoveryDeferred as exc:
                         if (
-                            exc.durable_work.attempt_id != work.attempt_id
+                            exc.durable_work.attempt_id
+                            != recovery_candidate.attempt_id
                             or exc.durable_work.state in _FINAL_STATES
                             or exc.durable_work.claim_owner_identity is None
                         ):
@@ -1084,13 +1301,13 @@ class StagedParseCoordinator:
                         reserve_deferred(exc.durable_work)
                         deferred_claims[attempt_id] = (
                             now + exc.retry_after_seconds,
-                            exc.durable_work,
+                            recovery_candidate,
                         )
                     else:
                         deferred_claims.pop(attempt_id, None)
                         place(claimed, recovery=True)
                         last_progress = now
-                recovery_complete = not deferred_claims
+                recovery_complete = barrier_exhausted and not deferred_claims
                 if (
                     recovery_complete
                     and not retry_degraded
@@ -1100,7 +1317,11 @@ class StagedParseCoordinator:
                     admission_open = True
                     if blocked_reason == "recovery_barrier":
                         blocked_reason = None
-                elif not recovery_complete and not stop_requested():
+                elif (
+                    not recovery_complete
+                    and not circuit_open
+                    and not stop_requested()
+                ):
                     admission_open = False
                     blocked_reason = "recovery_barrier"
 
@@ -1222,6 +1443,11 @@ class StagedParseCoordinator:
                                 admission_blocked_dimensions = ()
                                 admission_blocked_available = None
 
+                # Claims returned by recovery/admission may have less time
+                # remaining than this coordinator's configured lease.  Guard
+                # them before any lane selection or poll sleep, not merely on
+                # the next loop turn.
+                guard_waiting(self._monotonic())
                 credit_blocked_by_lane = {lane: set() for lane in CoordinatorLane}
                 for lane in _LANE_PRIORITY:
                     if circuit_open:
@@ -1248,14 +1474,14 @@ class StagedParseCoordinator:
                         ) = None
                         first_shortages: tuple[str, ...] = ()
                         for position, index in enumerate(ordered_indices):
-                            candidate = queue[index]
-                            candidate_hold = transition_hold(candidate)
+                            queued_work = queue[index]
+                            candidate_hold = transition_hold(queued_work)
                             if position > 0 and any(
                                 getattr(candidate_hold, name) > 0
                                 for name in first_shortages
                             ):
                                 continue
-                            if candidate.attempt_id in oversubscribed_recovery:
+                            if queued_work.attempt_id in oversubscribed_recovery:
                                 shortages = (
                                     positive_dimensions(candidate_hold)
                                     if candidate_hold != ResourceCreditVector()
@@ -1274,7 +1500,7 @@ class StagedParseCoordinator:
                                     first_shortages = shortages
                                     credit_blocked_by_lane[lane].update(shortages)
                                 continue
-                            selected = (index, candidate, candidate_hold)
+                            selected = (index, queued_work, candidate_hold)
                             break
                         if selected is None:
                             break
@@ -1445,6 +1671,7 @@ class StagedParseCoordinator:
                             ),
                             work,
                         )
+                        track_waiting_lease(work)
                         last_progress = wait_now
                     except RetryStage as exc:
                         retry_now = self._monotonic()
@@ -1483,6 +1710,7 @@ class StagedParseCoordinator:
                             ),
                             work,
                         )
+                        track_waiting_lease(work)
                         last_progress = retry_now
                         if (
                             consecutive_retries
@@ -1544,6 +1772,7 @@ __all__ = [
     "CoordinatorTerminal",
     "CoordinatorWork",
     "ResourceCreditVector",
+    "RecoveryCandidate",
     "RecoveryDeferred",
     "RetryStage",
     "StageLeaseGuard",
