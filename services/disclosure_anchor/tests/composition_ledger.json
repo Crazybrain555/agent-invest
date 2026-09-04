@@ -82,6 +82,10 @@
    "private_imports": [],
    "tests": 34
   },
+  "tests/integration/test_remote_parse_v4_recovery_scan.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/integration/test_remote_parse_v4_repository.py": {
    "private_imports": [],
    "tests": 38
@@ -486,6 +490,10 @@
   "tests/unit/test_remote_parse_lifecycle_v4.py": {
    "private_imports": [],
    "tests": 31
+  },
+  "tests/unit/test_remote_parse_v4_recovery_projection.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],

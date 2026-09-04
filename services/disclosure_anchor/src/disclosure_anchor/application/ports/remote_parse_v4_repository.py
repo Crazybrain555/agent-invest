@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from typing import Protocol
 
 from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import (
@@ -40,6 +41,16 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
 )
 
 _MAX_INT = (1 << 63) - 1
+_RECOVERY_FINAL_STATES = frozenset(
+    {
+        "acked",
+        "remote_failed",
+        "local_failed",
+        "pre_submission_failed",
+        "preparation_failed",
+        "superseded",
+    }
+)
 
 
 class RemoteParseV4RepositoryError(RuntimeError):
@@ -92,6 +103,69 @@ class V4SuccessorNotCommitted(RemoteParseV4RepositoryError):
 
 class V4SecretRevisionConflict(RemoteParseV4RepositoryError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryCandidate:
+    """Read-only observation of one current nonfinal V4 head.
+
+    The projection is only a recovery hint.  Claim acquisition must re-read
+    the current head under the repository's durable authority.  An observed
+    owned lease may already be expired, so its remaining duration may be zero
+    or negative.
+    """
+
+    attempt_id: str
+    state: str
+    lifecycle_version: int
+    claim_generation: int
+    claim_owner_identity: str | None
+    lease_remaining_seconds: float | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.attempt_id) is not str
+            or not self.attempt_id.strip()
+            or len(self.attempt_id) > 128
+        ):
+            raise ValueError("recovery candidate attempt identity is invalid")
+        if (
+            type(self.state) is not str
+            or not self.state.strip()
+            or len(self.state) > 64
+        ):
+            raise ValueError("recovery candidate state is invalid")
+        if self.state in _RECOVERY_FINAL_STATES:
+            raise ValueError("recovery candidate must be a nonfinal current head")
+        for value, label in (
+            (self.lifecycle_version, "lifecycle version"),
+            (self.claim_generation, "claim generation"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"recovery candidate {label} is invalid")
+        if (self.claim_owner_identity is None) != (
+            self.lease_remaining_seconds is None
+        ):
+            raise ValueError("recovery candidate owner and lease must be paired")
+        if (self.claim_owner_identity is None) != (self.claim_generation == 0):
+            raise ValueError(
+                "recovery candidate owner and claim generation disagree"
+            )
+        if self.claim_owner_identity is None and (
+            self.state != "prepared" or self.lifecycle_version != 0
+        ):
+            raise ValueError(
+                "unclaimed recovery candidate must be prepared at lifecycle version zero"
+            )
+        if self.claim_owner_identity is not None and (
+            type(self.claim_owner_identity) is not str
+            or not self.claim_owner_identity.strip()
+            or len(self.claim_owner_identity) > 128
+            or isinstance(self.lease_remaining_seconds, bool)
+            or not isinstance(self.lease_remaining_seconds, (int, float))
+            or not isfinite(self.lease_remaining_seconds)
+        ):
+            raise ValueError("recovery candidate claim observation is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +611,23 @@ class RemoteParseV4Repository(Protocol):
     document-authority mutations own the ``DOC_NS -> head`` order.
     """
 
+    def list_recoverable_heads(
+        self,
+        *,
+        after_attempt_id: str | None,
+        limit: int,
+    ) -> tuple[RecoveryCandidate, ...]:
+        """Return one side-effect-free byte-ordered page of current V4 heads.
+
+        The query is version-scoped, so current legacy heads on other
+        documents are ignored.  It must apply every eligibility predicate
+        before ``LIMIT``, use one database-clock observation for the whole
+        page, and never lock or mutate the returned rows.  Lease durations are
+        hints only; a later claim must re-read and compare the durable head.
+        Exhaustive pagination assumes the process-wide worker singleton is
+        the only producer of new current V4 heads during the startup barrier.
+        """
+
     def load(self, attempt_id: str) -> RemoteParseV4Authority: ...
 
     def load_current_for_document(
@@ -623,6 +714,7 @@ def _require_creation_head_roots(
 
 __all__ = [
     "LegacyCurrentRemoteParseAuthority",
+    "RecoveryCandidate",
     "RemoteParseV4Authority",
     "RemoteParseV4AuthorityViolation",
     "RemoteParseV4Repository",

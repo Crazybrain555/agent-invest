@@ -28,6 +28,9 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
     ResourceCreditVector,
     STAGED_RESOURCE_STATE_TRANSITIONS,
 )
+from disclosure_anchor.application.ports.remote_parse_v4_repository import (
+    RecoveryCandidate,
+)
 
 
 class CoordinatorLane(str, Enum):
@@ -117,69 +120,6 @@ class CoordinatorWork:
             raise ValueError(
                 "final coordinator work must release its claim and all credits"
             )
-
-
-@dataclass(frozen=True, slots=True)
-class RecoveryCandidate:
-    """Read-only observation of one current nonfinal head before any claim.
-
-    Candidate fields are only hints from the recovery scan.  The backend must
-    re-read the head under its durable authority before attempting the claim.
-    An observed lease may already be expired, so its remaining duration is
-    intentionally allowed to be zero or negative.
-    """
-
-    attempt_id: str
-    state: str
-    lifecycle_version: int
-    claim_generation: int
-    claim_owner_identity: str | None
-    lease_remaining_seconds: float | None
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.attempt_id) is not str
-            or not self.attempt_id.strip()
-            or len(self.attempt_id) > 128
-        ):
-            raise ValueError("recovery candidate attempt identity is invalid")
-        if (
-            type(self.state) is not str
-            or not self.state.strip()
-            or len(self.state) > 64
-        ):
-            raise ValueError("recovery candidate state is invalid")
-        if self.state in _FINAL_STATES:
-            raise ValueError("recovery candidate must be a nonfinal current head")
-        for value, label in (
-            (self.lifecycle_version, "lifecycle version"),
-            (self.claim_generation, "claim generation"),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"recovery candidate {label} is invalid")
-        if (self.claim_owner_identity is None) != (
-            self.lease_remaining_seconds is None
-        ):
-            raise ValueError("recovery candidate owner and lease must be paired")
-        if (self.claim_owner_identity is None) != (self.claim_generation == 0):
-            raise ValueError(
-                "recovery candidate owner and claim generation disagree"
-            )
-        if self.claim_owner_identity is None and (
-            self.state != "prepared" or self.lifecycle_version != 0
-        ):
-            raise ValueError(
-                "unclaimed recovery candidate must be prepared at lifecycle version zero"
-            )
-        if self.claim_owner_identity is not None and (
-            type(self.claim_owner_identity) is not str
-            or not self.claim_owner_identity.strip()
-            or len(self.claim_owner_identity) > 128
-            or isinstance(self.lease_remaining_seconds, bool)
-            or not isinstance(self.lease_remaining_seconds, (int, float))
-            or not isfinite(self.lease_remaining_seconds)
-        ):
-            raise ValueError("recovery candidate claim observation is invalid")
 
 
 @dataclass(frozen=True, slots=True)

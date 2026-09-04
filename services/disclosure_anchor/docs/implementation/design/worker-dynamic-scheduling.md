@@ -398,6 +398,12 @@ V4 coordinator 的启动恢复分成两个不可混淆的动作：`list_recovera
 或接管 claim、返回可执行 `CoordinatorWork` 的入口。扫描必须正常读到 empty/short page 才能设置
 `barrier_exhausted`；未穷尽、存在 foreign deferred claim 或 circuit 已打开时，新的 admission 一律关闭。
 PostgreSQL adapter 必须用与 64 字符 attempt identity 一致的 byte-wise 排序，不能在 `LIMIT` 后过滤。
+当前具体入口是 `RemoteParseV4Repository.list_recoverable_heads`：在同一条 SQL 内用 materialized
+database clock 观测整页租约，并对 keyset predicate 与 `ORDER BY` 都使用 `COLLATE "C"`；查询只包含
+current V4 head，其他文档上的 legacy current head 由各自生命周期处理。完整启动扫描依赖进程级 worker
+singleton，阻止扫描期间另一 producer 在 cursor 之前生成新 current head。启动后 supersession 激活出的
+generation-0 current `prepared` head 不会另建 backlog reader；M5b 的 `admit_new` 必须把这类 head 纳入
+同一 PostgreSQL admission 来源。
 
 claim 是执行所有权而不是一次性 dequeue 标记。当前 owner 的工作无论在 lane queue、retry timer
 还是 in-flight 都必须在到期前续租；foreign deferred projection 只用于资源记账，绝不代替其 owner

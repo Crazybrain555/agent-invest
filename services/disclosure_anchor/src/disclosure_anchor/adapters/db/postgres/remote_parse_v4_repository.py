@@ -47,6 +47,7 @@ from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
 )
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     LegacyCurrentRemoteParseAuthority,
+    RecoveryCandidate,
     RemoteParseV4Authority,
     RemoteParseV4AuthorityViolation,
     V4AttemptFinal,
@@ -207,6 +208,93 @@ class RemoteParseV4Repository:
             raise RemoteParseV4AuthorityViolation(
                 "current v4 authority cannot be reconstructed"
             ) from exc
+
+    def list_recoverable_heads(
+        self,
+        *,
+        after_attempt_id: str | None,
+        limit: int,
+    ) -> tuple[RecoveryCandidate, ...]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("v4 recovery page limit is outside 1..1000")
+        if after_attempt_id is not None:
+            _identity(after_attempt_id, "recovery cursor")
+
+        table = models.RemoteParseAttempt.__table__
+        clock = self._database_clock()
+        ordered_attempt_id = sa.collate(table.c.attempt_id, "C")
+        predicates = [
+            table.c.checkpoint_contract_version == 4,
+            table.c.is_current.is_(True),
+        ]
+        if after_attempt_id is not None:
+            predicates.append(ordered_attempt_id > after_attempt_id)
+        statement = (
+            sa.select(
+                table.c.attempt_id,
+                table.c.checkpoint_contract_version,
+                table.c.state,
+                table.c.is_current,
+                table.c.row_version,
+                table.c.claim_generation,
+                table.c.claim_owner_identity,
+                table.c.claim_lease_until,
+                clock.c.database_observed_at,
+            )
+            .select_from(table.join(clock, sa.true()))
+            .where(*predicates)
+            .order_by(ordered_attempt_id)
+            .limit(limit)
+        )
+        try:
+            rows = self._session.execute(statement).mappings().all()
+        except DBAPIError as exc:
+            self._raise_authority_dbapi(
+                exc,
+                "v4 recovery backlog could not be read",
+            )
+
+        observed_at: datetime | None = None
+        candidates: list[RecoveryCandidate] = []
+        for row in rows:
+            raw_observed_at = row["database_observed_at"]
+            if not isinstance(raw_observed_at, datetime):
+                raise RemoteParseV4AuthorityViolation(
+                    "v4 recovery database clock is invalid"
+                )
+            row_observed_at = _utc(raw_observed_at)
+            if observed_at is None:
+                observed_at = row_observed_at
+            elif row_observed_at != observed_at:
+                raise RemoteParseV4AuthorityViolation(
+                    "v4 recovery page used more than one database clock"
+                )
+            candidates.append(
+                recovery_candidate_from_head_row(
+                    row,
+                    database_observed_at=observed_at,
+                )
+            )
+
+        result = tuple(candidates)
+        identities = tuple(item.attempt_id for item in result)
+        if identities != tuple(sorted(identities)) or len(set(identities)) != len(
+            identities
+        ):
+            raise RemoteParseV4AuthorityViolation(
+                "v4 recovery page is not strictly byte ordered"
+            )
+        if after_attempt_id is not None and any(
+            identity <= after_attempt_id for identity in identities
+        ):
+            raise RemoteParseV4AuthorityViolation(
+                "v4 recovery page crossed its keyset cursor"
+            )
+        return result
 
     def create_prepared(
         self,
@@ -2505,6 +2593,91 @@ class RemoteParseV4Repository:
         return _utc(value)
 
 
+def recovery_candidate_from_head_row(
+    row: Mapping[Any, Any],
+    *,
+    database_observed_at: datetime,
+) -> RecoveryCandidate:
+    """Validate and project one V4 recovery head without loading its history."""
+
+    try:
+        contract_version = row["checkpoint_contract_version"]
+        is_current = row["is_current"]
+        state = row["state"]
+        lifecycle_version = row["row_version"]
+        claim_generation = row["claim_generation"]
+        claim_owner_identity = row["claim_owner_identity"]
+        claim_lease_until = row["claim_lease_until"]
+        attempt_id = row["attempt_id"]
+    except KeyError as exc:
+        raise RemoteParseV4AuthorityViolation(
+            "v4 recovery head projection is incomplete"
+        ) from exc
+
+    if (
+        type(contract_version) is not int
+        or contract_version != 4
+        or type(is_current) is not bool
+        or not is_current
+        or type(state) is not str
+        or state not in _CURRENT_STATES
+        or isinstance(lifecycle_version, bool)
+        or not isinstance(lifecycle_version, int)
+        or not 0 <= lifecycle_version <= _MAX_INT
+        or isinstance(claim_generation, bool)
+        or not isinstance(claim_generation, int)
+        or not 0 <= claim_generation <= _MAX_INT
+        or not isinstance(database_observed_at, datetime)
+    ):
+        raise RemoteParseV4AuthorityViolation(
+            "v4 recovery head projection violates durable authority"
+        )
+
+    lease_remaining_seconds: float | None
+    if claim_owner_identity is None:
+        if (
+            claim_generation != 0
+            or claim_lease_until is not None
+            or state != "prepared"
+            or lifecycle_version != 0
+        ):
+            raise RemoteParseV4AuthorityViolation(
+                "v4 unclaimed recovery head has an invalid durable shape"
+            )
+        lease_remaining_seconds = None
+    else:
+        if (
+            type(claim_owner_identity) is not str
+            or not claim_owner_identity.strip()
+            or claim_generation < 1
+            or not isinstance(claim_lease_until, datetime)
+        ):
+            raise RemoteParseV4AuthorityViolation(
+                "v4 claimed recovery head has an invalid durable shape"
+            )
+        remaining = _utc(claim_lease_until) - _utc(database_observed_at)
+        remaining_microseconds = (
+            remaining.days * 86_400_000_000
+            + remaining.seconds * 1_000_000
+            + remaining.microseconds
+        )
+        lease_remaining_seconds = remaining_microseconds / 1_000_000
+
+    try:
+        return RecoveryCandidate(
+            attempt_id=attempt_id,
+            state=state,
+            lifecycle_version=lifecycle_version,
+            claim_generation=claim_generation,
+            claim_owner_identity=claim_owner_identity,
+            lease_remaining_seconds=lease_remaining_seconds,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RemoteParseV4AuthorityViolation(
+            "v4 recovery head cannot be represented canonically"
+        ) from exc
+
+
 def _link_authority(row: Mapping[Any, Any]) -> V4SupersessionLinkAuthority:
     if (
         row["source_evidence_kind"] != "supersession_receipt"
@@ -2600,4 +2773,4 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-__all__ = ["RemoteParseV4Repository"]
+__all__ = ["RemoteParseV4Repository", "recovery_candidate_from_head_row"]

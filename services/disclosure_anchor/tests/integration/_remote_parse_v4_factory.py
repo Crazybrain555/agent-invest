@@ -713,10 +713,13 @@ def build_v4_resource_free_supersession_fixture(
     )
 
 
-def build_v4_authority_fixture() -> V4AuthorityFixture:
+def build_v4_authority_fixture(
+    *,
+    attempt_id: str | None = None,
+) -> V4AuthorityFixture:
     document_id = ids.new_document_id()
     processing_run_id = ids.new_processing_run_id()
-    attempt_id = "rpa_" + ids.new_ulid()
+    attempt_id = attempt_id or "rpa_" + ids.new_ulid()
     fence_identity = "fence-" + ids.new_ulid()
     client_submit_key = "submit-" + ids.new_ulid()
     source_pdf_sha256 = sha256_bytes((attempt_id + ":source").encode())

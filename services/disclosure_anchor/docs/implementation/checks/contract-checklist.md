@@ -262,6 +262,19 @@ V2/V3 三种合法形状；任何 partial locator、非 canonical hash 或 docum
 whole-PDF publication 和 coordinator activation 属后续默认关闭里程碑，不能从本 migration 的存在推断上线。
 ```
 
+2026-09-04（M5b 私有 V4 recovery backlog reader）——不改变 migration/public view/API/change feed：
+
+```text
+RemoteParseV4Repository.list_recoverable_heads 只读 current contract-v4 head；legacy current head 不属于
+本版本作用域，静默忽略、不报错。所有过滤都在 LIMIT 前完成，cursor predicate 与 ORDER BY 共同使用 COLLATE "C"，
+返回严格递增且不重复的 attempt identity keyset page；整页租约只使用同一 materialized database clock，
+remaining seconds 仅为可过期 hint，claim_recovery 仍须重新读取并以 durable CAS 取得执行权；
+扫描不取 row/document lock、不写入、不 commit，也不加载 checkpoint/evidence/secret 完整 aggregate；
+generation-0 current prepared head 与 live/expired owned head 均可表达，完整启动扫描依赖 worker singleton；
+运行中 supersession 激活的新 generation-0 head 由后续 admit_new 纳入同一 PostgreSQL admission，不增加
+第二持久队列或重复 backlog reader。
+```
+
 2026-09-02（0058 私有 V4 supersession staging authority）——不改变 public view/API/change feed：
 
 ```text
