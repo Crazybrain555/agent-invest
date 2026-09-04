@@ -318,6 +318,29 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                 created = repository.create_prepared(creation)
                 replayed = repository.create_prepared(creation)
                 reloaded = repository.load(fixture.attempt_id)
+                claimed = repository.claim(
+                    V4HeadExpectation.from_authority(reloaded),
+                    owner_identity="worker-delayed-snapshot",
+                    lease_seconds=120,
+                )
+                reconciling = advance_remote_parse_checkpoint_v4(
+                    checkpoint,
+                    state="reconciling",
+                    held_resource_credit=replace(
+                        checkpoint.held_resource_credit,
+                        remote_waits=1,
+                    ),
+                    snapshot_receipt_sha256=fixture.snapshot.sha256,
+                    submission_intent_sha256=fixture.submission.sha256,
+                )
+                progressed = repository.append_successor(
+                    self._successor_append(
+                        claimed,
+                        reconciling,
+                        fixture.snapshot,
+                        fixture.submission,
+                    )
+                )
             finally:
                 session.close()
 
@@ -327,6 +350,11 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
         self.assertEqual(
             tuple(item.kind for item in reloaded.evidence),
             ("preparation_intent",),
+        )
+        self.assertEqual(progressed.state, "reconciling")
+        self.assertEqual(
+            tuple(item.kind for item in progressed.evidence),
+            ("preparation_intent", "snapshot_receipt", "submission_intent"),
         )
 
     def test_strict_reload_rejects_head_projection_drift(self) -> None:

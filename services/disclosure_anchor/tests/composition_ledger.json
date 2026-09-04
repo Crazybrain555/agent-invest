@@ -80,7 +80,7 @@
   },
   "tests/integration/test_remote_parse_v4_authority.py": {
    "private_imports": [],
-   "tests": 34
+   "tests": 35
   },
   "tests/integration/test_remote_parse_v4_recovery_scan.py": {
    "private_imports": [],
@@ -133,6 +133,10 @@
   "tests/unit/test_atomic_publication_artifact_readiness_adapter_v4.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_atomic_publication_request_factory_v4.py": {
+   "private_imports": [],
+   "tests": 1
   },
   "tests/unit/test_attest_mineru_remote_runtime.py": {
    "private_imports": [],
@@ -331,7 +335,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 30
+   "tests": 34
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
@@ -357,7 +361,7 @@
    "private_imports": [
     "_ZipPathCollisionIndex"
    ],
-   "tests": 69
+   "tests": 74
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
@@ -489,11 +493,11 @@
   },
   "tests/unit/test_remote_parse_evidence_v4.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 28
   },
   "tests/unit/test_remote_parse_lifecycle_v4.py": {
    "private_imports": [],
-   "tests": 31
+   "tests": 32
   },
   "tests/unit/test_remote_parse_v4_recovery_projection.py": {
    "private_imports": [],
@@ -557,9 +561,13 @@
    "private_imports": [],
    "tests": 7
   },
+  "tests/unit/test_staged_coordinator_backend_v4.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 14
   },
   "tests/unit/test_staged_credit.py": {
    "private_imports": [],

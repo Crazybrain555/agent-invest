@@ -171,11 +171,14 @@ class _Guard:
 
 
 class _StepGuard:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_at: int | None = None) -> None:
         self.calls = 0
+        self.fail_at = fail_at
 
     def checkpoint(self) -> None:
         self.calls += 1
+        if self.fail_at is not None and self.calls >= self.fail_at:
+            raise RuntimeError("stage lease lost")
 
     def remaining_seconds(self) -> float:
         self.checkpoint()
@@ -222,6 +225,187 @@ class _Transport:
 
 
 class MinerUHttpStagedV4Tests(unittest.TestCase):
+    def test_snapshot_creation_reconciles_owner_only_crash_on_restart(
+        self,
+    ) -> None:
+        source = b"%PDF-1.7\nowner-only restart\n"
+        fixture = _submission_snapshot_fixture(source)
+        prepared = build_initial_remote_parse_checkpoint_v4(
+            reservation=fixture.reservation,
+            preparation_intent_sha256=fixture.evidence[0].sha256,
+            snapshot_receipt_sha256=None,
+            held_resource_credit=ResourceCreditVector(
+                documents=1,
+                snapshot_items=1,
+                snapshot_bytes=len(source),
+            ),
+        )
+        evidence = (encode_remote_parse_evidence_v4(fixture.evidence[0]),)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_pdf = root.parent / f"{root.name}-source.pdf"
+            source_pdf.write_bytes(source)
+            source_pdf.chmod(0o600)
+            source_pdf = source_pdf.resolve(strict=True)
+
+            def crash(phase: str) -> None:
+                if phase == "after_snapshot_owner_write":
+                    raise RuntimeError("simulated owner-only snapshot crash")
+
+            arguments = {
+                "checkpoint": prepared,
+                "reservation": fixture.reservation,
+                "preparation_intent": fixture.evidence[0],
+                "source_pdf": source_pdf,
+                "evidence": evidence,
+                "resourceful_checkpoint_history": (prepared,),
+                "claim": _claim(prepared),
+                "claim_guard": _Guard(),
+                "stage_guard": _StepGuard(),
+            }
+            try:
+                with self.assertRaisesRegex(RuntimeError, "owner-only"):
+                    MinerUHttpStagedV4(
+                        scratch_root=root,
+                        transport=_Transport(b"unused"),
+                        clock=lambda: 1.0,
+                        fault_hook=crash,
+                    ).create_or_reconcile_snapshot_v4(**arguments)
+
+                owner = root / fixture.reservation.snapshot_part_owner_relpath
+                self.assertTrue(owner.is_file())
+                self.assertFalse(
+                    (root / fixture.reservation.snapshot_part_relpath).exists()
+                )
+                self.assertFalse(
+                    (root / fixture.reservation.snapshot_relpath).exists()
+                )
+
+                receipt = MinerUHttpStagedV4(
+                    scratch_root=root,
+                    transport=_Transport(b"unused"),
+                    clock=lambda: 2.0,
+                ).create_or_reconcile_snapshot_v4(**arguments)
+                self.assertEqual(receipt, fixture.snapshot)
+                self.assertFalse(owner.exists())
+                self.assertEqual(
+                    (root / fixture.reservation.snapshot_relpath).read_bytes(),
+                    source,
+                )
+            finally:
+                source_pdf.unlink(missing_ok=True)
+
+    def test_snapshot_creation_reconciles_crash_after_rename_on_restart(
+        self,
+    ) -> None:
+        source = b"%PDF-1.7\nclosed snapshot\n"
+        fixture = _submission_snapshot_fixture(source)
+        prepared = build_initial_remote_parse_checkpoint_v4(
+            reservation=fixture.reservation,
+            preparation_intent_sha256=fixture.evidence[0].sha256,
+            snapshot_receipt_sha256=None,
+            held_resource_credit=ResourceCreditVector(
+                documents=1,
+                snapshot_items=1,
+                snapshot_bytes=len(source),
+            ),
+        )
+        evidence = (encode_remote_parse_evidence_v4(fixture.evidence[0]),)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_pdf = root.parent / f"{root.name}-source.pdf"
+            source_pdf.write_bytes(source)
+            source_pdf.chmod(0o600)
+            source_pdf = source_pdf.resolve(strict=True)
+
+            def crash(phase: str) -> None:
+                if phase == "after_snapshot_rename":
+                    raise RuntimeError("simulated snapshot response loss")
+
+            arguments = {
+                "checkpoint": prepared,
+                "reservation": fixture.reservation,
+                "preparation_intent": fixture.evidence[0],
+                "source_pdf": source_pdf,
+                "evidence": evidence,
+                "resourceful_checkpoint_history": (prepared,),
+                "claim": _claim(prepared),
+                "claim_guard": _Guard(),
+                "stage_guard": _StepGuard(),
+            }
+            try:
+                with self.assertRaisesRegex(RuntimeError, "response loss"):
+                    MinerUHttpStagedV4(
+                        scratch_root=root,
+                        transport=_Transport(b"unused"),
+                        clock=lambda: 1.0,
+                        fault_hook=crash,
+                    ).create_or_reconcile_snapshot_v4(**arguments)
+
+                snapshot = root / fixture.reservation.snapshot_relpath
+                owner = root / fixture.reservation.snapshot_part_owner_relpath
+                self.assertEqual(snapshot.read_bytes(), source)
+                self.assertTrue(owner.is_file())
+
+                receipt = MinerUHttpStagedV4(
+                    scratch_root=root,
+                    transport=_Transport(b"unused"),
+                    clock=lambda: 2.0,
+                ).create_or_reconcile_snapshot_v4(**arguments)
+                self.assertEqual(receipt, fixture.snapshot)
+                self.assertFalse(owner.exists())
+                self.assertFalse(
+                    (root / fixture.reservation.snapshot_part_relpath).exists()
+                )
+            finally:
+                source_pdf.unlink(missing_ok=True)
+
+    def test_snapshot_creation_rejects_source_identity_drift(self) -> None:
+        source = b"%PDF-1.7\nclosed snapshot\n"
+        fixture = _submission_snapshot_fixture(source)
+        prepared = build_initial_remote_parse_checkpoint_v4(
+            reservation=fixture.reservation,
+            preparation_intent_sha256=fixture.evidence[0].sha256,
+            snapshot_receipt_sha256=None,
+            held_resource_credit=ResourceCreditVector(
+                documents=1,
+                snapshot_items=1,
+                snapshot_bytes=len(source),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_pdf = root.parent / f"{root.name}-source.pdf"
+            source_pdf.write_bytes(source + b"drift")
+            source_pdf.chmod(0o600)
+            source_pdf = source_pdf.resolve(strict=True)
+            try:
+                with self.assertRaisesRegex(
+                    ParserOutputContractError, "source PDF identity drifted"
+                ):
+                    MinerUHttpStagedV4(
+                        scratch_root=root,
+                        transport=_Transport(b"unused"),
+                        clock=lambda: 1.0,
+                    ).create_or_reconcile_snapshot_v4(
+                        checkpoint=prepared,
+                        reservation=fixture.reservation,
+                        preparation_intent=fixture.evidence[0],
+                        source_pdf=source_pdf,
+                        evidence=(
+                            encode_remote_parse_evidence_v4(fixture.evidence[0]),
+                        ),
+                        resourceful_checkpoint_history=(prepared,),
+                        claim=_claim(prepared),
+                        claim_guard=_Guard(),
+                        stage_guard=_StepGuard(),
+                    )
+                self.assertFalse(
+                    (root / fixture.reservation.snapshot_relpath).exists()
+                )
+            finally:
+                source_pdf.unlink(missing_ok=True)
+
     def test_submission_snapshot_source_is_opaque_and_holds_no_lock_on_upload(
         self,
     ) -> None:
@@ -2684,6 +2868,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 "plan": plan,
                 "claim": claim,
                 "claim_guard": _Guard(),
+                "stage_guard": _StepGuard(),
                 "replay_context": replay,
             }
             first = backend.cleanup_v4(**common)
@@ -2807,6 +2992,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 "plan": plan,
                 "claim": _claim(cleanup_pending),
                 "claim_guard": _Guard(),
+                "stage_guard": _StepGuard(),
                 "replay_context": replay,
             }
             first = backend.cleanup_v4(**common)
@@ -2975,6 +3161,86 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
 
             self.assertFalse((root / fixture.intent.output_relpath).exists())
             self.assertTrue((root / published_relpath).is_dir())
+
+    def test_reopen_materialized_after_restart_before_and_after_promotion(
+        self,
+    ) -> None:
+        archive = _official_zip()
+        fixture = _materialize_fixture(archive)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initial = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(archive),
+                clock=lambda: 1.0,
+            )
+            materialized = initial.materialize_v4(
+                **fixture.arguments(),
+                claim_guard=_Guard(),
+            )
+            local_credit = ResourceCreditVector(
+                documents=1,
+                snapshot_items=1,
+                snapshot_bytes=fixture.reservation.source_byte_count,
+                provider_tasks=1,
+                provider_result_bytes=fixture.intent.artifact_byte_count,
+                compressed_bytes=fixture.intent.artifact_byte_count,
+                output_items=1,
+                output_bytes=materialized.receipt.output_byte_count,
+                output_pages=fixture.reservation.source_page_count,
+                ack_items=1,
+            )
+            local = advance_remote_parse_checkpoint_v4(
+                fixture.checkpoint,
+                state="local_materialized",
+                held_resource_credit=local_credit,
+                local_materialization_receipt_sha256=materialized.receipt.sha256,
+            )
+            replay = V4EvidenceReplayContext(
+                evidence=tuple(
+                    encode_remote_parse_evidence_v4(value)
+                    for value in (*fixture.evidence_values, materialized.receipt)
+                ),
+                reservation=fixture.reservation,
+                resourceful_checkpoint_history=(*fixture.history, local),
+            )
+            arguments = {
+                "checkpoint": local,
+                "reservation": fixture.reservation,
+                "intent": fixture.intent,
+                "local_receipt": materialized.receipt,
+                "claim": _claim(local),
+                "claim_guard": _Guard(),
+                "stage_guard": _StepGuard(),
+                "replay_context": replay,
+            }
+
+            restarted = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(b"unused"),
+                clock=lambda: 2.0,
+            )
+            self.assertEqual(
+                restarted.reopen_materialized_v4(**arguments), materialized
+            )
+            restarted.promote_or_replay(
+                checkpoint=local,
+                materialized=materialized,
+                published_relpath=(
+                    fixture.intent.provider_envelope_context
+                    .parser_artifact_root_relpath
+                ),
+                claim=_claim(local),
+                claim_guard=_Guard(),
+            )
+            self.assertEqual(
+                MinerUHttpStagedV4(
+                    scratch_root=root,
+                    transport=_Transport(b"unused"),
+                    clock=lambda: 3.0,
+                ).reopen_materialized_v4(**arguments),
+                materialized,
+            )
 
     def test_cleanup_replays_after_transfer_rename_before_parent_fsync(self) -> None:
         archive = _official_zip()
@@ -3244,6 +3510,7 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     plan=plan,
                     claim=_claim(cleanup_pending),
                     claim_guard=_Guard(),
+                    stage_guard=_StepGuard(),
                     replay_context=replay,
                 )
             self.assertEqual(part.read_bytes(), b"foreign")
@@ -3490,6 +3757,40 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 backend.cleanup_v4(**common)
             self.assertTrue((root / fixture.intent.spool_relpath).is_file())
             self.assertTrue((root / fixture.intent.output_relpath).is_dir())
+
+    def test_cleanup_stage_lease_loss_stops_before_next_resource(self) -> None:
+        archive = _official_zip()
+        fixture = _materialize_fixture(archive)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MinerUHttpStagedV4(
+                scratch_root=root,
+                transport=_Transport(archive),
+                clock=lambda: 1.0,
+            )
+            materialized = backend.materialize_v4(
+                **fixture.arguments(),
+                claim_guard=_Guard(),
+            )
+            common = _successful_cleanup_arguments(
+                fixture=fixture,
+                materialized=materialized,
+            )
+            spool = root / fixture.intent.spool_relpath
+            output = root / fixture.intent.output_relpath
+
+            class LoseAfterSpoolDeletion(_StepGuard):
+                def checkpoint(self) -> None:
+                    super().checkpoint()
+                    if not spool.exists():
+                        raise RuntimeError("stage lease lost after spool deletion")
+
+            common["stage_guard"] = LoseAfterSpoolDeletion()
+            with self.assertRaisesRegex(RuntimeError, "stage lease lost"):
+                backend.cleanup_v4(**common)
+
+            self.assertFalse(spool.exists())
+            self.assertTrue(output.is_dir())
 
     def test_pinned_read_bytes_rejects_path_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4122,6 +4423,7 @@ def _successful_cleanup_arguments(
         "plan": plan,
         "claim": _claim(cleanup_pending),
         "claim_guard": _Guard(),
+        "stage_guard": _StepGuard(),
         "replay_context": replay,
     }
 
@@ -4220,6 +4522,7 @@ def _no_receipt_local_failure_cleanup_arguments(
             "plan": plan,
             "claim": _claim(cleanup_pending),
             "claim_guard": _Guard(),
+            "stage_guard": _StepGuard(),
             "replay_context": replay,
         },
         failure,
@@ -4395,6 +4698,7 @@ def _local_failure_cleanup_arguments(
         "plan": plan,
         "claim": _claim(cleanup_pending),
         "claim_guard": _Guard(),
+        "stage_guard": _StepGuard(),
         "replay_context": replay,
     }
 

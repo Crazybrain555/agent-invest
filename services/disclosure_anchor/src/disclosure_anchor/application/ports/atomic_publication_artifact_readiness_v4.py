@@ -91,6 +91,15 @@ class AtomicPublicationArtifactReadinessV4Port(Protocol):
         request: AtomicPublicationRequestV4,
     ) -> AtomicPublicationArtifactPreparationV1 | None: ...
 
+    def reopen_prepared_request(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        materialized: MaterializedProviderDocumentV4,
+    ) -> AtomicPublicationRequestV4 | None:
+        """Reopen an exact request saved before a prior publication attempt."""
+        ...
+
     def verify_ready(
         self,
         *,

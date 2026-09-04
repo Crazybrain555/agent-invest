@@ -42,6 +42,7 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     PreparationIntentV4,
     SnapshotReceiptV4,
     TerminalReceiptV4,
+    validate_durable_remote_parse_evidence_bundle_v4,
     validate_remote_parse_evidence_bundle_v4,
 )
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
@@ -1080,13 +1081,60 @@ class V4EvidenceReplayContext:
             raise ValueError("v4 evidence replay context value drifted")
 
     def validate_current(self, checkpoint: RemoteParseCheckpointV4) -> None:
+        self._validate_current_position(checkpoint)
+        validate_remote_parse_evidence_bundle_v4(
+            checkpoint=checkpoint,
+            evidence=self.evidence,
+            reservation=self.reservation,
+            cleanup_source_checkpoint=self.cleanup_source_checkpoint,
+            resourceful_checkpoint_history=self.resourceful_checkpoint_history,
+            cleanup_pending_checkpoint=self.cleanup_pending_checkpoint,
+            # The side effect starts from pre-ACK `checkpoint`; the validator's
+            # similarly named auxiliary is only for a post-ACK receipt bundle.
+            ack_pending_checkpoint=None,
+            superseding_checkpoint=self.superseding_checkpoint,
+            superseding_reservation=self.superseding_reservation,
+            superseding_preparation_intent=self.superseding_preparation_intent,
+            superseding_snapshot_receipt=self.superseding_snapshot_receipt,
+            local_materialization_manifest=self.local_materialization_manifest,
+            provider_envelope=self.provider_envelope,
+        )
+
+    def validate_durable_current(self, checkpoint: RemoteParseCheckpointV4) -> None:
+        """Replay only PostgreSQL facts before filesystem evidence is reopened."""
+
+        self._validate_current_position(checkpoint)
+        validate_durable_remote_parse_evidence_bundle_v4(
+            checkpoint=checkpoint,
+            evidence=self.evidence,
+            reservation=self.reservation,
+            cleanup_source_checkpoint=self.cleanup_source_checkpoint,
+            resourceful_checkpoint_history=self.resourceful_checkpoint_history,
+            cleanup_pending_checkpoint=self.cleanup_pending_checkpoint,
+            ack_pending_checkpoint=None,
+            superseding_checkpoint=self.superseding_checkpoint,
+            superseding_reservation=self.superseding_reservation,
+            superseding_preparation_intent=self.superseding_preparation_intent,
+            superseding_snapshot_receipt=self.superseding_snapshot_receipt,
+        )
+
+    def _validate_current_position(
+        self,
+        checkpoint: RemoteParseCheckpointV4,
+    ) -> None:
         if type(checkpoint) is not RemoteParseCheckpointV4 or checkpoint.state not in {
             "materializing",
+            "local_materialized",
+            "publish_committed",
             "cleanup_pending",
             "ack_pending",
         }:
             raise ValueError("v4 evidence replay checkpoint state is unsupported")
-        if checkpoint.state == "materializing" and any(
+        if checkpoint.state in {
+            "materializing",
+            "local_materialized",
+            "publish_committed",
+        } and any(
             item is not None
             for item in (
                 self.cleanup_source_checkpoint,
@@ -1108,23 +1156,6 @@ class V4EvidenceReplayContext:
             or self.ack_pending_checkpoint != checkpoint
         ):
             raise ValueError("ACK replay lacks its exact pending checkpoints")
-        validate_remote_parse_evidence_bundle_v4(
-            checkpoint=checkpoint,
-            evidence=self.evidence,
-            reservation=self.reservation,
-            cleanup_source_checkpoint=self.cleanup_source_checkpoint,
-            resourceful_checkpoint_history=self.resourceful_checkpoint_history,
-            cleanup_pending_checkpoint=self.cleanup_pending_checkpoint,
-            # The side effect starts from pre-ACK `checkpoint`; the validator's
-            # similarly named auxiliary is only for a post-ACK receipt bundle.
-            ack_pending_checkpoint=None,
-            superseding_checkpoint=self.superseding_checkpoint,
-            superseding_reservation=self.superseding_reservation,
-            superseding_preparation_intent=self.superseding_preparation_intent,
-            superseding_snapshot_receipt=self.superseding_snapshot_receipt,
-            local_materialization_manifest=self.local_materialization_manifest,
-            provider_envelope=self.provider_envelope,
-        )
 
 
 class V4ClaimGuard(Protocol):
@@ -1403,7 +1434,11 @@ def validate_v4_cleanup_authorization(
         "local_materialization_receipt", LocalMaterializationReceiptV4
     ) is not None:
         raise ValueError("v4 cleanup replay invented a materialization receipt")
-    replay_context.validate_current(checkpoint)
+    # Cleanup may delete the exact materialized output described by the local
+    # receipt.  From this boundary onward durable evidence is authoritative;
+    # requiring the filesystem materialization to remain reopenable would make
+    # a successful cleanup impossible to resume after response loss.
+    replay_context.validate_durable_current(checkpoint)
     validate_local_cleanup_plan_v4(
         plan=plan,
         reservation=reservation,
@@ -1425,7 +1460,9 @@ def validate_v4_ack_authorization(
         or type(claim) is not V4ClaimWitness
     ):
         raise ValueError("v4 ACK authorization drifted")
-    command.replay_context.validate_current(command.ack_pending_checkpoint)
+    command.replay_context.validate_durable_current(
+        command.ack_pending_checkpoint
+    )
     exact_request = command.ack_request_exact_bytes
     expected_request_sha256 = "sha256:" + hashlib.sha256(exact_request).hexdigest()
     expected_request_identity = provider_ack_request_v4_identity(
@@ -1753,7 +1790,12 @@ class ProviderAckCommandV4:
         self.replay_context.require_evidence(
             "cleanup_receipt", self.cleanup_receipt
         )
-        self.replay_context.validate_current(self.ack_pending_checkpoint)
+        # ACK is deliberately after cleanup.  Its authorization must close over
+        # durable evidence rather than materialized files that cleanup already
+        # transferred or removed.
+        self.replay_context.validate_durable_current(
+            self.ack_pending_checkpoint
+        )
         expected_ack_pending_credit = ResourceCreditVector(
             documents=1,
             provider_tasks=1,
@@ -1841,6 +1883,18 @@ def seal_provider_ack_command_v4(
 class V4MaterializationPort(Protocol):
     """Three idempotent v4 side-effect domains; no stage/promotion API split."""
 
+    def create_or_reconcile_snapshot_v4(
+        self, *, checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        preparation_intent: PreparationIntentV4,
+        source_pdf: Path,
+        evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+        resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...],
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
+    ) -> SnapshotReceiptV4: ...
+
     def materialize_v4(
         self, *, checkpoint: RemoteParseCheckpointV4,
         reservation: ResourceReservationV4,
@@ -1857,6 +1911,17 @@ class V4MaterializationPort(Protocol):
         replay_context: V4EvidenceReplayContext,
     ) -> MaterializedProviderDocumentV4: ...
 
+    def reopen_materialized_v4(
+        self, *, checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        intent: MaterializationIntentV4,
+        local_receipt: LocalMaterializationReceiptV4,
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
+        replay_context: V4EvidenceReplayContext,
+    ) -> MaterializedProviderDocumentV4: ...
+
     def cleanup_v4(
         self, *, checkpoint: RemoteParseCheckpointV4,
         source_checkpoint: RemoteParseCheckpointV4,
@@ -1865,6 +1930,7 @@ class V4MaterializationPort(Protocol):
         local_receipt: LocalMaterializationReceiptV4 | None,
         plan: LocalCleanupPlanV4, claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
         replay_context: V4EvidenceReplayContext,
     ) -> LocalCleanupReceiptV4: ...
 

@@ -333,6 +333,17 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                 preparation = failing.load_preparation(request=self.request)
                 self.assertIsNotNone(preparation)
                 assert preparation is not None
+                self.assertEqual(
+                    FilesystemAtomicPublicationArtifactReadinessV4(
+                        paths=paths,  # type: ignore[arg-type]
+                        immutable_store=delegate,
+                        output_promotion=promotion,  # type: ignore[arg-type]
+                    ).reopen_prepared_request(
+                        checkpoint=self.checkpoint,
+                        materialized=self.materialized,
+                    ),
+                    self.request,
+                )
                 assigned_ids = tuple(
                     item.asset_id for item in preparation.unit_bindings
                 )

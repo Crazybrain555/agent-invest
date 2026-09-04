@@ -186,6 +186,51 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         self._require_same_request(preparation=value, request=request)
         return value
 
+    def reopen_prepared_request(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        materialized: MaterializedProviderDocumentV4,
+    ) -> AtomicPublicationRequestV4 | None:
+        """Recover the canonical request without retaining a process object."""
+
+        if (
+            type(checkpoint) is not RemoteParseCheckpointV4
+            or checkpoint.state != "local_materialized"
+            or type(materialized) is not MaterializedProviderDocumentV4
+        ):
+            raise AtomicPublicationArtifactReadinessError(
+                "publication request reopen authority is invalid"
+            )
+        context = materialized.intent.provider_envelope_context
+        preparation_relpath, _ = self._authority_paths_from_values(
+            provider=context.provider,
+            source_pdf_relpath=context.source_pdf_relpath,
+            provider_document_id=context.provider_document_id,
+            processing_run_id=checkpoint.processing_run_id,
+        )
+        raw = self._read_untrusted_regular(
+            preparation_relpath,
+            max_byte_count=_MAX_PREPARATION_BYTES,
+        )
+        if raw is None:
+            return None
+        preparation = decode_atomic_publication_preparation_v1(raw)
+        request = decode_atomic_publication_request_v4(
+            preparation.canonical_request_json.encode("utf-8")
+        )
+        self._validate_reopened_request(
+            request=request,
+            checkpoint=checkpoint,
+            materialized=materialized,
+        )
+        expected_preparation_relpath, _ = self._authority_paths(request)
+        if preparation_relpath != expected_preparation_relpath:
+            raise AtomicPublicationArtifactReadinessError(
+                "publication preparation path drifted from durable input"
+            )
+        return request
+
     def verify_ready(
         self,
         *,
@@ -379,16 +424,31 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         self,
         request: AtomicPublicationRequestV4,
     ) -> tuple[Path, Path]:
-        source_parts = request.upstream_evidence.source_pdf_relpath.split("/")
+        return self._authority_paths_from_values(
+            provider=request.upstream_evidence.provider,
+            source_pdf_relpath=request.upstream_evidence.source_pdf_relpath,
+            provider_document_id=request.identity.provider_document_id,
+            processing_run_id=request.identity.processing_run_id,
+        )
+
+    def _authority_paths_from_values(
+        self,
+        *,
+        provider: str,
+        source_pdf_relpath: str,
+        provider_document_id: str,
+        processing_run_id: str,
+    ) -> tuple[Path, Path]:
+        source_parts = source_pdf_relpath.split("/")
         if len(source_parts) != 6:
             raise AtomicPublicationArtifactReadinessError(
                 "publication source path topology drifted"
             )
         values = {
-            "provider": request.upstream_evidence.provider,
+            "provider": provider,
             "security_code": source_parts[2],
-            "provider_document_id": request.identity.provider_document_id,
-            "processing_run_id": request.identity.processing_run_id,
+            "provider_document_id": provider_document_id,
+            "processing_run_id": processing_run_id,
         }
         return (
             self._paths.atomic_publication_preparation_relpath(**values),
@@ -480,14 +540,33 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         materialized: MaterializedProviderDocumentV4,
         claim: V4ClaimWitness,
     ) -> None:
-        evidence = request.upstream_evidence
         if (
             type(request) is not AtomicPublicationRequestV4
             or type(checkpoint) is not RemoteParseCheckpointV4
             or type(materialized) is not MaterializedProviderDocumentV4
             or type(claim) is not V4ClaimWitness
             or not claim.validates(checkpoint)
-            or checkpoint.state != "local_materialized"
+        ):
+            raise AtomicPublicationArtifactReadinessError(
+                "publication readiness input evidence drifted"
+            )
+        FilesystemAtomicPublicationArtifactReadinessV4._validate_reopened_request(
+            request=request,
+            checkpoint=checkpoint,
+            materialized=materialized,
+        )
+
+    @staticmethod
+    def _validate_reopened_request(
+        *,
+        request: AtomicPublicationRequestV4,
+        checkpoint: RemoteParseCheckpointV4,
+        materialized: MaterializedProviderDocumentV4,
+    ) -> None:
+        evidence = request.upstream_evidence
+        context = materialized.intent.provider_envelope_context
+        if (
+            checkpoint.state != "local_materialized"
             or (
                 checkpoint.attempt_id,
                 checkpoint.attempt_generation,
@@ -505,6 +584,18 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
                 request.identity.processing_run_id,
                 evidence.local_materialized_checkpoint_sha256,
                 evidence.local_materialization_receipt_sha256,
+            )
+            or (
+                evidence.provider,
+                evidence.provider_document_id,
+                evidence.source_pdf_relpath,
+                evidence.provider_envelope_context_sha256,
+            )
+            != (
+                context.provider,
+                context.provider_document_id,
+                context.source_pdf_relpath,
+                context.sha256,
             )
             or materialized.receipt.sha256
             != evidence.local_materialization_receipt_sha256

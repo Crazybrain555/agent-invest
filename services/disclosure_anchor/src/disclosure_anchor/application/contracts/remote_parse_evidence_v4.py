@@ -914,46 +914,50 @@ def _validate_resourceful_checkpoint_history_v4(
         local_receipt=local_materialization_receipt,
     )
     assert expected_credit is not None
+    initial_snapshot_sha256 = (
+        snapshot_receipt.sha256
+        if snapshot_receipt is not None
+        and history[0].snapshot_receipt_sha256 is not None
+        else None
+    )
     current = build_initial_remote_parse_checkpoint_v4(
         reservation=reservation,
         preparation_intent_sha256=preparation_intent.sha256,
-        snapshot_receipt_sha256=(
-            snapshot_receipt.sha256 if snapshot_receipt is not None else None
-        ),
+        snapshot_receipt_sha256=initial_snapshot_sha256,
         held_resource_credit=expected_credit,
     )
     expected_history = [current]
-    updates: dict[CheckpointStateV4, tuple[str, str]] = {}
+    updates: dict[CheckpointStateV4, dict[str, str]] = {}
     if submission_intent is not None:
-        updates["reconciling"] = (
-            "submission_intent_sha256",
-            submission_intent.sha256,
-        )
+        updates["reconciling"] = {
+            "submission_intent_sha256": submission_intent.sha256,
+        }
+        if snapshot_receipt is not None and initial_snapshot_sha256 is None:
+            updates["reconciling"]["snapshot_receipt_sha256"] = (
+                snapshot_receipt.sha256
+            )
     if accepted_submission is not None:
-        updates["submitted"] = (
-            "accepted_submission_sha256",
-            accepted_submission.sha256,
-        )
+        updates["submitted"] = {
+            "accepted_submission_sha256": accepted_submission.sha256,
+        }
     if terminal_receipt is not None:
-        updates["remote_terminal"] = (
-            "terminal_receipt_sha256",
-            terminal_receipt.sha256,
-        )
+        updates["remote_terminal"] = {
+            "terminal_receipt_sha256": terminal_receipt.sha256,
+        }
     if materialization_intent is not None:
-        updates["materializing"] = (
-            "materialization_intent_sha256",
-            materialization_intent.sha256,
-        )
+        updates["materializing"] = {
+            "materialization_intent_sha256": materialization_intent.sha256,
+        }
     if local_materialization_receipt is not None:
-        updates["local_materialized"] = (
-            "local_materialization_receipt_sha256",
-            local_materialization_receipt.sha256,
-        )
+        updates["local_materialized"] = {
+            "local_materialization_receipt_sha256": (
+                local_materialization_receipt.sha256
+            ),
+        }
     if publication_winner_sha256 is not None:
-        updates["publish_committed"] = (
-            "publication_winner_sha256",
-            publication_winner_sha256,
-        )
+        updates["publish_committed"] = {
+            "publication_winner_sha256": publication_winner_sha256,
+        }
 
     for state in expected_states[1:]:
         expected_credit = _expected_held_resource_credit_v4(
@@ -966,12 +970,11 @@ def _validate_resourceful_checkpoint_history_v4(
         )
         if expected_credit is None or state not in updates:
             raise ValueError("resourceful checkpoint history evidence is incomplete")
-        field_name, digest = updates[state]
         current = advance_remote_parse_checkpoint_v4(
             current,
             state=state,
             held_resource_credit=expected_credit,
-            **{field_name: digest},
+            **updates[state],
         )
         expected_history.append(current)
 

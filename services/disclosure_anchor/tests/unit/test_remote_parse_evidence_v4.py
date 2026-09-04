@@ -570,6 +570,40 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
                 resourceful_checkpoint_history=(forged_checkpoint,),
             )
 
+    def test_claimed_preflight_can_durably_add_first_snapshot(self) -> None:
+        reservation = _base()["reservation"]
+        preparation, snapshot, submission = _records()[:3]
+        prepared = build_initial_remote_parse_checkpoint_v4(
+            reservation=reservation,
+            preparation_intent_sha256=preparation.sha256,
+            held_resource_credit=_snapshot_credit(),
+        )
+        reconciling = advance_remote_parse_checkpoint_v4(
+            prepared,
+            state="reconciling",
+            held_resource_credit=replace(_snapshot_credit(), remote_waits=1),
+            snapshot_receipt_sha256=snapshot.sha256,
+            submission_intent_sha256=submission.sha256,
+        )
+        evidence = tuple(
+            encode_remote_parse_evidence_v4(value)
+            for value in (preparation, snapshot, submission)
+        )
+        validate_durable_remote_parse_evidence_bundle_v4(
+            checkpoint=reconciling,
+            evidence=evidence,
+            reservation=reservation,
+            resourceful_checkpoint_history=(prepared, reconciling),
+        )
+
+        with self.assertRaisesRegex(ValueError, "kind set drifted"):
+            validate_durable_remote_parse_evidence_bundle_v4(
+                checkpoint=reconciling,
+                evidence=(evidence[0], evidence[2]),
+                reservation=reservation,
+                resourceful_checkpoint_history=(prepared, reconciling),
+            )
+
     def test_bundle_rejects_tuple_subclass_with_flipping_iteration(self) -> None:
         reservation = _base()["reservation"]
         preparation, snapshot, submission, accepted = _records()[:4]

@@ -19,6 +19,9 @@ from disclosure_anchor.adapters.db.postgres.schema import (
     FUTURE_L2_READER_ROLE,
     READER_ROLE,
 )
+from disclosure_anchor.adapters.db.postgres.migration_state import (
+    single_migration_head,
+)
 from disclosure_anchor.adapters.security.provider_secret_cipher import (
     AesGcmProviderSecretCipher,
 )
@@ -30,6 +33,8 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
 )
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     RemoteParseCheckpointV4,
+    advance_remote_parse_checkpoint_v4,
+    build_initial_remote_parse_checkpoint_v4,
 )
 from tests.integration._remote_parse_v4_factory import (
     EVIDENCE_FIELD_NAMES,
@@ -1670,7 +1675,7 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
                             "disclosure_ops.alembic_version"
                         )
                     ).scalar_one(),
-                    "0058_v4_supersession_stage",
+                    single_migration_head(),
                 )
                 retained_tables = set(
                     conn.execute(
@@ -1683,6 +1688,62 @@ class RemoteParseV4AuthorityIntegrationTests(unittest.TestCase):
                     ).scalars()
                 )
                 self.assertEqual(retained_tables, set(V4_TABLES))
+            finally:
+                transaction.rollback()
+
+    def test_0059_downgrade_refuses_delayed_snapshot_history(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0059_v4_delayed_snapshot_transition"
+        )
+        fixture = build_v4_authority_fixture()
+        delayed_prepared = build_initial_remote_parse_checkpoint_v4(
+            reservation=fixture.reservation,
+            preparation_intent_sha256=fixture.preparation.sha256,
+            held_resource_credit=fixture.prepared.held_resource_credit,
+        )
+        delayed_reconciling = advance_remote_parse_checkpoint_v4(
+            delayed_prepared,
+            state="reconciling",
+            held_resource_credit=fixture.reconciling.held_resource_credit,
+            snapshot_receipt_sha256=fixture.snapshot.sha256,
+            submission_intent_sha256=fixture.submission.sha256,
+        )
+
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                insert_core_rows(conn, fixture)
+                insert_v4_head(conn, fixture, delayed_prepared)
+                for evidence in (
+                    fixture.preparation,
+                    fixture.snapshot,
+                    fixture.submission,
+                ):
+                    insert_evidence(conn, fixture, evidence)
+                insert_checkpoint(conn, fixture, delayed_prepared)
+                insert_checkpoint(conn, fixture, delayed_reconciling)
+                update_v4_head(conn, fixture, delayed_reconciling)
+                self._force_constraints(conn)
+
+                migration_context = MigrationContext.configure(conn)
+                with (
+                    Operations.context(migration_context),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "0059 downgrade would strand delayed snapshot authority",
+                    ),
+                ):
+                    migration.downgrade()
+                self.assertEqual(
+                    conn.execute(
+                        text(
+                            "SELECT version_num FROM "
+                            "disclosure_ops.alembic_version"
+                        )
+                    ).scalar_one(),
+                    single_migration_head(),
+                )
             finally:
                 transaction.rollback()
 

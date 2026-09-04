@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import ctypes
 import errno
 import fcntl
@@ -434,6 +434,295 @@ class MinerUHttpStagedV4:
         self._active_locks = threading.local()
         self._name_max = int(os.pathconf(self._root, "PC_NAME_MAX"))
 
+    def create_or_reconcile_snapshot_v4(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        preparation_intent: PreparationIntentV4,
+        source_pdf: Path,
+        evidence: tuple[EncodedRemoteParseEvidenceV4, ...],
+        resourceful_checkpoint_history: tuple[RemoteParseCheckpointV4, ...],
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
+    ) -> SnapshotReceiptV4:
+        """Create or reopen the deterministic immutable source snapshot."""
+
+        if (
+            type(checkpoint) is not RemoteParseCheckpointV4
+            or checkpoint.state != "prepared"
+            or type(reservation) is not ResourceReservationV4
+            or type(preparation_intent) is not PreparationIntentV4
+            or not isinstance(source_pdf, Path)
+            or not source_pdf.is_absolute()
+            or type(evidence) is not tuple
+            or type(resourceful_checkpoint_history) is not tuple
+            or type(claim) is not V4ClaimWitness
+            or not claim.validates(checkpoint)
+        ):
+            raise ValueError("v4 snapshot preparation authority is invalid")
+        validate_durable_remote_parse_evidence_bundle_v4(
+            checkpoint=checkpoint,
+            evidence=evidence,
+            reservation=reservation,
+            resourceful_checkpoint_history=resourceful_checkpoint_history,
+        )
+        if (
+            checkpoint.preparation_intent_sha256 != preparation_intent.sha256
+            or preparation_intent.reservation_sha256 != reservation.sha256
+        ):
+            raise ValueError("v4 snapshot preparation evidence drifted")
+        snapshot = self._path(reservation.snapshot_relpath)
+        part = self._path(reservation.snapshot_part_relpath)
+        owner = self._path(reservation.snapshot_part_owner_relpath)
+        lock = self._path(reservation.snapshot_lock_relpath)
+        lock_binding = {
+            "attempt_id": checkpoint.attempt_id,
+            "fence_identity": checkpoint.fence_identity,
+        }
+        owner_bytes = self._snapshot_owner_bytes(preparation_intent)
+        stage_guard.checkpoint()
+        with self._locked(lock, "snapshot", lock_binding):
+            stage_guard.checkpoint()
+            self._guard(claim_guard, checkpoint, claim)
+            final_stat = self._try_path_stat(snapshot)
+            part_stat = self._try_path_stat(part)
+            owner_stat = self._try_path_stat(owner)
+            if final_stat is not None:
+                if part_stat is not None:
+                    raise self._fail("durable snapshot coexists with a partial file")
+                self._require_exact_snapshot(
+                    snapshot=snapshot,
+                    expected_sha256=reservation.source_pdf_sha256,
+                    expected_byte_count=reservation.source_byte_count,
+                    stage_guard=stage_guard,
+                )
+                if owner_stat is not None:
+                    if self._read_private(owner) != owner_bytes:
+                        raise self._fail("snapshot partial owner metadata drifted")
+                    self._remove_owned_file(
+                        owner,
+                        allow_absent=False,
+                        before_effect=lambda: self._guarded_claim(
+                            stage_guard, claim_guard, checkpoint, claim
+                        ),
+                    )
+                stage_guard.checkpoint()
+                self._guard(claim_guard, checkpoint, claim)
+                return self._snapshot_receipt(preparation_intent)
+            if part_stat is not None and owner_stat is None:
+                raise self._fail("snapshot partial ownership is incomplete")
+            if part_stat is None and owner_stat is not None:
+                if self._read_private(owner) != owner_bytes:
+                    raise self._fail("snapshot partial owner metadata drifted")
+                self._remove_owned_file(
+                    owner,
+                    allow_absent=False,
+                    before_effect=lambda: self._guarded_claim(
+                        stage_guard, claim_guard, checkpoint, claim
+                    ),
+                )
+                owner_stat = None
+            if part_stat is not None:
+                if self._read_private(owner) != owner_bytes:
+                    raise self._fail("snapshot partial owner metadata drifted")
+
+                def before_remove() -> None:
+                    self._guarded_claim(
+                        stage_guard, claim_guard, checkpoint, claim
+                    )
+
+                self._remove_owned_file(
+                    part,
+                    allow_absent=False,
+                    before_effect=before_remove,
+                )
+                self._remove_owned_file(
+                    owner,
+                    allow_absent=False,
+                    before_effect=before_remove,
+                )
+            self._write_private(owner, owner_bytes)
+            self._fault_hook("after_snapshot_owner_write")
+            stage_guard.checkpoint()
+            source_fd = self._open_source_pdf(
+                source_pdf,
+                expected_sha256=reservation.source_pdf_sha256,
+                expected_byte_count=reservation.source_byte_count,
+                stage_guard=stage_guard,
+            )
+            part_fd: int | None = None
+            try:
+                with self._parent_fd(part, create=True) as (parent_fd, name):
+                    part_fd = os.open(
+                        name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_NOFOLLOW
+                        | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    created = os.fstat(part_fd)
+                    self._require_owned_regular_stat(created, "new snapshot part")
+                    self._require_entry_identity(
+                        parent_fd, name, created, "new snapshot part"
+                    )
+                    part_identity = self._identity(created)
+                os.lseek(source_fd, 0, os.SEEK_SET)
+                while True:
+                    stage_guard.checkpoint()
+                    chunk = os.read(source_fd, _CHUNK_BYTES)
+                    stage_guard.checkpoint()
+                    if not chunk:
+                        break
+                    self._guarded_write_all(part_fd, chunk, stage_guard)
+                stage_guard.checkpoint()
+                os.fsync(part_fd)
+                stage_guard.checkpoint()
+                if self._identity(os.fstat(part_fd)) != part_identity:
+                    raise self._fail("snapshot part changed while writing")
+            finally:
+                if part_fd is not None:
+                    os.close(part_fd)
+                os.close(source_fd)
+            self._require_exact_snapshot(
+                snapshot=part,
+                expected_sha256=reservation.source_pdf_sha256,
+                expected_byte_count=reservation.source_byte_count,
+                stage_guard=stage_guard,
+            )
+            self._fault_hook("after_snapshot_part_fsync")
+            self._guarded_claim(stage_guard, claim_guard, checkpoint, claim)
+            self._exclusive_rename(
+                part,
+                snapshot,
+                expected_source_identity=part_identity,
+            )
+            self._fault_hook("after_snapshot_rename")
+            stage_guard.checkpoint()
+            self._fsync_dir(snapshot.parent)
+            self._fault_hook("after_snapshot_parent_fsync")
+            self._remove_owned_file(
+                owner,
+                allow_absent=False,
+                before_effect=lambda: self._guarded_claim(
+                    stage_guard, claim_guard, checkpoint, claim
+                ),
+            )
+            self._fsync_dir(owner.parent)
+            stage_guard.checkpoint()
+            return self._snapshot_receipt(preparation_intent)
+
+    @staticmethod
+    def _snapshot_owner_bytes(intent: PreparationIntentV4) -> bytes:
+        return json.dumps(
+            {
+                "attempt_id": intent.attempt_id,
+                "fence_identity": intent.fence_identity,
+                "preparation_intent_sha256": intent.sha256,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    @staticmethod
+    def _snapshot_receipt(intent: PreparationIntentV4) -> SnapshotReceiptV4:
+        return SnapshotReceiptV4(
+            attempt_id=intent.attempt_id,
+            fence_identity=intent.fence_identity,
+            preparation_intent_sha256=intent.sha256,
+            snapshot_relpath=intent.snapshot_relpath,
+            snapshot_sha256=intent.source_pdf_sha256,
+            snapshot_byte_count=intent.source_byte_count,
+            part_path_absent=True,
+            part_owner_path_absent=True,
+            file_fsync_completed=True,
+            parent_fsync_completed=True,
+        )
+
+    def _guarded_claim(
+        self,
+        stage_guard: V4StageGuard,
+        claim_guard: V4ClaimGuard,
+        checkpoint: RemoteParseCheckpointV4,
+        claim: V4ClaimWitness,
+    ) -> None:
+        stage_guard.checkpoint()
+        self._guard(claim_guard, checkpoint, claim)
+
+    def _open_source_pdf(
+        self,
+        path: Path,
+        *,
+        expected_sha256: str,
+        expected_byte_count: int,
+        stage_guard: V4StageGuard,
+    ) -> int:
+        try:
+            if path.resolve(strict=True) != path:
+                raise self._fail("source PDF path is not canonical")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise self._fail("source PDF is absent or unsafe") from exc
+        try:
+            before = os.fstat(fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+            ):
+                raise self._fail("source PDF identity is unsafe")
+            current = path.stat(follow_symlinks=False)
+            if self._identity(current) != self._identity(before):
+                raise self._fail("source PDF path changed while opening")
+            digest, count = self._guarded_hash_fd(fd, stage_guard)
+            after = os.fstat(fd)
+            if (
+                _StableFileStat.from_stat(after) != _StableFileStat.from_stat(before)
+                or digest != expected_sha256
+                or count != expected_byte_count
+            ):
+                raise self._fail("source PDF identity drifted")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _require_exact_snapshot(
+        self,
+        *,
+        snapshot: Path,
+        expected_sha256: str,
+        expected_byte_count: int,
+        stage_guard: V4StageGuard,
+    ) -> None:
+        with self._parent_fd(snapshot) as (parent_fd, name):
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+            try:
+                before = os.fstat(fd)
+                self._require_owned_regular_stat(before, "snapshot")
+                self._require_entry_identity(parent_fd, name, before, "snapshot")
+                digest, count = self._guarded_hash_fd(fd, stage_guard)
+                after = os.fstat(fd)
+                self._require_entry_identity(parent_fd, name, after, "snapshot")
+                if (
+                    _StableFileStat.from_stat(after)
+                    != _StableFileStat.from_stat(before)
+                    or digest != expected_sha256
+                    or count != expected_byte_count
+                ):
+                    raise self._fail("snapshot identity drifted")
+            finally:
+                os.close(fd)
+
     def submission_snapshot_source_v4(
         self,
         *,
@@ -829,6 +1118,77 @@ class MinerUHttpStagedV4:
             expected_output_identity=output_identity,
             fsync_exact=True,
         )
+
+    def reopen_materialized_v4(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        reservation: ResourceReservationV4,
+        intent: MaterializationIntentV4,
+        local_receipt: LocalMaterializationReceiptV4,
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
+        replay_context: V4EvidenceReplayContext,
+    ) -> MaterializedProviderDocumentV4:
+        """Rehydrate exact materialized evidence after restart or transfer."""
+
+        if (
+            type(checkpoint) is not RemoteParseCheckpointV4
+            or checkpoint.state
+            not in {
+                "local_materialized",
+                "publish_committed",
+                "cleanup_pending",
+                "ack_pending",
+            }
+            or type(reservation) is not ResourceReservationV4
+            or type(intent) is not MaterializationIntentV4
+            or type(local_receipt) is not LocalMaterializationReceiptV4
+            or type(claim) is not V4ClaimWitness
+            or type(replay_context) is not V4EvidenceReplayContext
+            or not claim.validates(checkpoint)
+        ):
+            raise ValueError("v4 materialized reopen authority is invalid")
+        replay_context.require_evidence("materialization_intent", intent)
+        replay_context.require_evidence(
+            "local_materialization_receipt", local_receipt
+        )
+        replay_context.validate_durable_current(checkpoint)
+        stage_guard.checkpoint()
+        source = self._path(intent.output_relpath)
+        published = self._path(
+            intent.provider_envelope_context.parser_artifact_root_relpath
+        )
+        lock_binding = self._resource_binding(intent)
+        lock_paths = [
+            self._path(intent.spool_lock_relpath),
+            self._path(intent.staging_lock_relpath),
+        ]
+        with self._ordered_locks(lock_paths, lock_binding):
+            stage_guard.checkpoint()
+            self._guard(claim_guard, checkpoint, claim)
+            source_present = self._try_path_stat(source) is not None
+            published_present = self._try_path_stat(published) is not None
+            if source_present and published_present:
+                raise self._fail(
+                    "materialized output exists in private and published namespaces"
+                )
+            root = source if source_present else published
+            if not source_present and not published_present:
+                raise self._fail("materialized output is absent")
+            materialized = self._load_exact_output(intent=intent, output=root)
+            stage_guard.checkpoint()
+            if materialized.receipt != local_receipt:
+                raise self._fail("materialized reopen receipt drifted")
+            replace(
+                replay_context,
+                local_materialization_manifest=materialized.manifest,
+                provider_envelope=materialized.provider_envelope,
+            ).validate_current(checkpoint)
+            self._guard(claim_guard, checkpoint, claim)
+            stage_guard.checkpoint()
+            return materialized
 
     def _validate_recovery_tree_admission(
         self,
@@ -1392,8 +1752,10 @@ class MinerUHttpStagedV4:
         plan: LocalCleanupPlanV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
         replay_context: V4EvidenceReplayContext,
     ) -> LocalCleanupReceiptV4:
+        stage_guard.checkpoint()
         self._observe_clock()
         validate_v4_cleanup_authorization(
             checkpoint=checkpoint,
@@ -1417,7 +1779,13 @@ class MinerUHttpStagedV4:
                 self._path(intent.staging_lock_relpath),
             ]
         with self._ordered_locks(lock_paths, lock_binding):
+            stage_guard.checkpoint()
             self._guard(claim_guard, checkpoint, claim)
+
+            def guard_side_effect() -> None:
+                stage_guard.checkpoint()
+                self._guard(claim_guard, checkpoint, claim)
+
             volatile_proofs = self._capture_volatile_cleanup_proofs(
                 plan=plan,
                 reservation=reservation,
@@ -1425,6 +1793,7 @@ class MinerUHttpStagedV4:
             )
             results: list[LocalCleanupResourceResultV4] = []
             for resource in plan.resources:
+                stage_guard.checkpoint()
                 self._guard(claim_guard, checkpoint, claim)
                 source = self._path(resource.relpath)
                 if resource.kind == "output":
@@ -1460,6 +1829,7 @@ class MinerUHttpStagedV4:
                             staging=source,
                             staging_lock=self._path(intent.staging_lock_relpath),
                         )
+                        stage_guard.checkpoint()
                         results.append(
                             LocalCleanupResourceResultV4(
                                 kind=resource.kind,
@@ -1472,9 +1842,7 @@ class MinerUHttpStagedV4:
                         source,
                         resource.expected_sha256,
                         resource.expected_byte_count,
-                        before_effect=lambda: self._guard(
-                            claim_guard, checkpoint, claim
-                        ),
+                        before_effect=guard_side_effect,
                         volatile_proof=volatile_proofs.get(
                             (resource.kind, resource.relpath)
                         ),
@@ -1501,6 +1869,7 @@ class MinerUHttpStagedV4:
                             else None
                         ),
                     )
+                    stage_guard.checkpoint()
                     results.append(
                         LocalCleanupResourceResultV4(
                             kind=resource.kind,
@@ -1516,15 +1885,14 @@ class MinerUHttpStagedV4:
                     target=target,
                     expected_sha256=resource.expected_sha256,
                     expected_byte_count=resource.expected_byte_count,
-                    before_effect=lambda: self._guard(
-                        claim_guard, checkpoint, claim
-                    ),
+                    before_effect=guard_side_effect,
                     max_files=(
                         local_receipt.output_file_count
                         if local_receipt is not None
                         else 1
                     ),
                 )
+                stage_guard.checkpoint()
                 results.append(
                     LocalCleanupResourceResultV4(
                         kind=resource.kind,
@@ -1534,6 +1902,7 @@ class MinerUHttpStagedV4:
                         target_relpath=resource.target_relpath,
                     )
                 )
+            stage_guard.checkpoint()
             return build_local_cleanup_receipt_v4(
                 plan=plan,
                 cleanup_pending_checkpoint=checkpoint,

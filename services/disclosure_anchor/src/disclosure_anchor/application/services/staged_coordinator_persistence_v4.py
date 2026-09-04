@@ -21,6 +21,9 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
     ResourceCreditVector,
     STAGED_RESOURCE_STATE_TRANSITIONS,
 )
+from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
+    RemoteParseCheckpointV4,
+)
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RecoveryCandidate,
     RemoteParseV4Authority,
@@ -30,6 +33,12 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4HeadExpectation,
     V4HeadNotFound,
     V4HeadStale,
+    V4SuccessorAppend,
+    V4SuccessorNotCommitted,
+    V4SuccessorReconciliation,
+)
+from disclosure_anchor.application.ports.staged_provider_parser import (
+    V4ClaimWitness,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.staged_parse_coordinator import (
@@ -62,6 +71,30 @@ class _ObservedAuthority:
 
 class _MutationOutcomeUnknown(RuntimeError):
     """The repository returned a mutation, but its outer transaction was uncertain."""
+
+
+class DurableV4ClaimGuard:
+    """Revalidate the exact live PostgreSQL claim under a resource lock."""
+
+    def __init__(self, *, uow_factory: Callable[[], UnitOfWork]) -> None:
+        if not callable(uow_factory):
+            raise ValueError("v4 claim guard requires a unit-of-work factory")
+        self._uow_factory = uow_factory
+
+    def assert_current_under_resource_lock(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        claim: V4ClaimWitness,
+    ) -> None:
+        if type(claim) is not V4ClaimWitness:
+            raise StagedClaimLost("resource operation lacks an exact V4 claim")
+        with self._uow_factory() as uow:
+            authority = uow.remote_parse_v4.reload_claimed(claim)
+        if authority.checkpoint != checkpoint:
+            raise StagedClaimLost(
+                "resource operation checkpoint differs from the durable V4 head"
+            )
 
 
 def _is_final(authority: RemoteParseV4Authority) -> bool:
@@ -206,6 +239,60 @@ class DurableStagedCoordinatorPersistenceV4:
             projected = self._project_owned(observed)
         self._require_reload_continuity(work, projected)
         return projected
+
+    def load_owned_authority(
+        self,
+        work: CoordinatorWork,
+    ) -> RemoteParseV4Authority:
+        """Load exact stage inputs without relying on a process witness cache."""
+
+        if type(work) is not CoordinatorWork:
+            raise ValueError("stage authority load requires exact coordinator work")
+        observed = self._load(work.attempt_id)
+        projected = self._project_owned(observed)
+        self._require_same_work(work, projected, ignore_lease=True)
+        return observed.authority
+
+    def append_successor(
+        self,
+        work: CoordinatorWork,
+        append: V4SuccessorAppend,
+    ) -> CoordinatorWork:
+        """Commit one exact successor and close a lost outer commit response."""
+
+        if type(work) is not CoordinatorWork or type(append) is not V4SuccessorAppend:
+            raise ValueError("successor append input is invalid")
+        baseline = self._load(work.attempt_id)
+        baseline_work = self._project_owned(baseline)
+        self._require_same_work(work, baseline_work, ignore_lease=True)
+        if append.claim != baseline.authority.claim_witness:
+            raise StagedClaimLost("successor append claim drifted from durable work")
+
+        for write_number in range(2):
+            try:
+                observed = self._append_transaction(append)
+            except _MutationOutcomeUnknown as exc:
+                try:
+                    reconciled = self._reconcile_append(append)
+                except V4SuccessorNotCommitted:
+                    if write_number == 0:
+                        continue
+                    raise StagedClaimResponseLost(
+                        f"{work.attempt_id}: successor remained absent after replay"
+                    ) from exc
+                except Exception as reconcile_exc:
+                    raise StagedClaimResponseLost(
+                        f"{work.attempt_id}: successor outcome could not be reconciled"
+                    ) from reconcile_exc
+                if not reconciled.authorization_still_live and not _is_final(
+                    reconciled.authority
+                ):
+                    raise StagedClaimResponseLost(
+                        f"{work.attempt_id}: successor committed after claim expiry"
+                    ) from exc
+                return self._project_transition_result(reconciled.authority)
+            return self._project_transition_result(observed.authority)
+        raise AssertionError("bounded successor append did not terminate")
 
     def admit_new(
         self,
@@ -432,6 +519,44 @@ class DurableStagedCoordinatorPersistenceV4:
         after = self._now()
         self._require_monotonic_bracket(before, after)
         return _ObservedAuthority(renewed, before, after)
+
+    def _append_transaction(
+        self,
+        append: V4SuccessorAppend,
+    ) -> _ObservedAuthority:
+        before = self._now()
+        mutation_returned = False
+        try:
+            with self._uow_factory() as uow:
+                authority = uow.remote_parse_v4.append_successor(append)
+                mutation_returned = True
+                uow.commit()
+        except Exception as exc:
+            if mutation_returned:
+                raise _MutationOutcomeUnknown(
+                    f"{append.claim.attempt_id}: successor transaction outcome is unknown"
+                ) from exc
+            raise
+        after = self._now()
+        self._require_monotonic_bracket(before, after)
+        return _ObservedAuthority(authority, before, after)
+
+    def _reconcile_append(
+        self,
+        append: V4SuccessorAppend,
+    ) -> V4SuccessorReconciliation:
+        with self._uow_factory() as uow:
+            return uow.remote_parse_v4.reconcile_successor(append)
+
+    def _project_transition_result(
+        self,
+        authority: RemoteParseV4Authority,
+    ) -> CoordinatorWork:
+        if _is_final(authority):
+            return self._project_final(authority)
+        # A successful append keeps the same claim lease. Re-read with a fresh
+        # PostgreSQL clock so the returned coordinator deadline is conservative.
+        return self._project_owned(self._load(authority.attempt_id))
 
     def _claim_observed(self, observed: _ObservedAuthority) -> CoordinatorWork:
         last_unknown: _MutationOutcomeUnknown | None = None
@@ -738,6 +863,7 @@ class DurableStagedCoordinatorPersistenceV4:
 
 
 __all__ = [
+    "DurableV4ClaimGuard",
     "DurableStagedCoordinatorPersistenceV4",
     "StagedClaimLost",
     "StagedClaimResponseLost",

@@ -353,6 +353,27 @@ class RemoteParseLifecycleV4Tests(unittest.TestCase):
                 accepted_submission_sha256=SHA_E,
             )
 
+    def test_claimed_preflight_can_close_first_snapshot_with_submission(self) -> None:
+        base = _base()
+        prepared = build_initial_remote_parse_checkpoint_v4(
+            reservation=base["reservation"],
+            preparation_intent_sha256=SHA_B,
+            snapshot_receipt_sha256=None,
+            held_resource_credit=_snapshot_credit(),
+        )
+
+        reconciling = advance_remote_parse_checkpoint_v4(
+            prepared,
+            state="reconciling",
+            held_resource_credit=replace(_snapshot_credit(), remote_waits=1),
+            snapshot_receipt_sha256=SHA_C,
+            submission_intent_sha256=SHA_D,
+        )
+
+        self.assertIsNone(prepared.snapshot_receipt_sha256)
+        self.assertEqual(reconciling.snapshot_receipt_sha256, SHA_C)
+        self.assertEqual(reconciling.submission_intent_sha256, SHA_D)
+
     def test_pre_submission_failure_requires_cleanup_and_no_accepted_task(self) -> None:
         fixture = _base()
         prepared = fixture["prepared"]

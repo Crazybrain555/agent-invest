@@ -61,7 +61,7 @@ class MigrationStateTests(unittest.TestCase):
             "0056_staged_credit_evidence",
         )
 
-    def test_0058_is_adjacent_to_0057_and_is_the_only_head(self) -> None:
+    def test_0058_is_adjacent_to_0057(self) -> None:
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
             "0058_v4_supersession_stage"
@@ -72,7 +72,84 @@ class MigrationStateTests(unittest.TestCase):
             migration.down_revision,
             "0057_remote_parse_v4_authority",
         )
+
+    def test_0059_is_adjacent_to_0058_and_is_the_only_head(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0059_v4_delayed_snapshot_transition"
+        )
+
+        self.assertEqual(
+            migration.revision,
+            "0059_v4_delayed_snapshot",
+        )
+        self.assertEqual(
+            migration.down_revision,
+            "0058_v4_supersession_stage",
+        )
         self.assertEqual(migration_heads(), (migration.revision,))
+
+    def test_0059_changes_only_delayed_snapshot_evidence_allowance(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0059_v4_delayed_snapshot_transition"
+        )
+
+        upgraded = migration._allowed_new_evidence_by_transition(
+            allow_delayed_snapshot=True
+        )
+        downgraded = migration._allowed_new_evidence_by_transition(
+            allow_delayed_snapshot=False
+        )
+        changed_edges = {
+            edge for edge in upgraded if upgraded[edge] != downgraded[edge]
+        }
+        self.assertEqual(changed_edges, {("prepared", "reconciling")})
+        self.assertEqual(
+            set(upgraded[("prepared", "reconciling")])
+            - set(downgraded[("prepared", "reconciling")]),
+            {"snapshot_receipt_sha256"},
+        )
+
+    def test_0059_downgrade_refuses_delayed_snapshot_history(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0059_v4_delayed_snapshot_transition"
+        )
+        binding = MagicMock()
+        binding.execute.return_value.scalar_one.return_value = True
+
+        with (
+            patch.object(migration.op, "get_bind", return_value=binding),
+            patch.object(migration.op, "execute") as execute,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "0059 downgrade would strand delayed snapshot authority",
+            ),
+        ):
+            migration.downgrade()
+
+        execute.assert_not_called()
+
+    def test_0059_clean_downgrade_restores_previous_trigger(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0059_v4_delayed_snapshot_transition"
+        )
+        binding = MagicMock()
+        binding.execute.return_value.scalar_one.return_value = False
+
+        with (
+            patch.object(migration.op, "get_bind", return_value=binding),
+            patch.object(migration.op, "execute") as execute,
+        ):
+            migration.downgrade()
+
+        execute.assert_called_once_with(
+            migration._checkpoint_chain_function_sql(
+                allow_delayed_snapshot=False
+            )
+        )
 
     def test_0058_attempt_shapes_match_orm_exactly(self) -> None:
         migration = importlib.import_module(

@@ -28,9 +28,14 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4HeadExpectation,
     V4HeadNotFound,
     V4HeadStale,
+    V4SuccessorAppend,
+    V4SuccessorNotCommitted,
+    V4SuccessorReconciliation,
 )
+from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness
 from disclosure_anchor.application.services.staged_coordinator_persistence_v4 import (
     DurableStagedCoordinatorPersistenceV4,
+    DurableV4ClaimGuard,
     StagedClaimLost,
     StagedLeaseNotRunnable,
 )
@@ -347,6 +352,68 @@ class _Repository:
         self.heads[attempt_id] = renewed
         return renewed
 
+    def reload_claimed(
+        self,
+        claim: V4ClaimWitness,
+        *,
+        lock_for_transition: bool = False,
+    ) -> RemoteParseV4Authority:
+        del lock_for_transition
+        authority = self.load(claim.attempt_id)
+        if (
+            authority.claim_witness != claim
+            or authority.database_lease is None
+            or authority.database_lease.remaining_microseconds <= 0
+        ):
+            raise V4ClaimLost("fake claimed reload lost authority")
+        return authority
+
+    def append_successor(
+        self,
+        append: V4SuccessorAppend,
+    ) -> RemoteParseV4Authority:
+        authority = self.reload_claimed(append.claim)
+        successor = append.successor
+        if successor.previous_checkpoint_sha256 != authority.checkpoint_sha256:
+            raise V4HeadStale("fake successor predecessor drifted")
+        updated = replace(
+            authority,
+            state=successor.state,
+            lifecycle_version=successor.lifecycle_version,
+            checkpoint_sha256=successor.sha256,
+            checkpoint_history=(*authority.checkpoint_history, successor),
+            evidence=(*authority.evidence, *append.new_evidence),
+            publication_winner=append.publication_winner,
+            claim_owner_identity=(
+                None if successor.state.endswith("failed") else authority.claim_owner_identity
+            ),
+            claim_lease_until=(
+                None if successor.state.endswith("failed") else authority.claim_lease_until
+            ),
+            database_lease=(
+                None if successor.state.endswith("failed") else authority.database_lease
+            ),
+        )
+        self.heads[authority.attempt_id] = updated
+        return updated
+
+    def reconcile_successor(
+        self,
+        append: V4SuccessorAppend,
+    ) -> V4SuccessorReconciliation:
+        authority = self.load(append.claim.attempt_id)
+        if authority.checkpoint == append.successor:
+            return V4SuccessorReconciliation(
+                authority=authority,
+                authorization_still_live=(
+                    authority.database_lease is not None
+                    and authority.database_lease.remaining_microseconds > 0
+                ),
+            )
+        if authority.checkpoint_sha256 == append.claim.checkpoint_sha256:
+            raise V4SuccessorNotCommitted("fake successor is absent")
+        raise V4HeadStale("fake different successor committed")
+
 
 class _UnitOfWork:
     def __init__(self, owner: _Factory) -> None:
@@ -563,6 +630,68 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
         self.assertEqual(reloaded.state, "reconciling")
         self.assertEqual(reloaded.lifecycle_version, 1)
         self.assertEqual(reloaded.claim_generation, claimed.claim_generation)
+
+    def test_successor_commit_response_loss_reloads_exact_durable_head(self) -> None:
+        authority = _prepared_authority(
+            "attempt-successor-loss",
+            snapshot_bytes=100,
+            database_now=self.database_now,
+        )
+        repository = _Repository((authority,))
+        factory = _Factory(repository)
+        backend = self._backend(repository, factory)
+        claimed = backend.claim_recovery(
+            repository._candidate(repository.load(authority.attempt_id))
+        )
+        durable = repository.load(authority.attempt_id)
+        successor = advance_remote_parse_checkpoint_v4(
+            durable.checkpoint,
+            state="reconciling",
+            held_resource_credit=replace(
+                durable.checkpoint.held_resource_credit,
+                remote_waits=1,
+            ),
+            submission_intent_sha256=_sha("successor-loss-submission"),
+        )
+        factory.commit_losses = 1
+
+        updated = backend.append_successor(
+            claimed,
+            V4SuccessorAppend(
+                claim=durable.claim_witness,
+                successor=successor,
+            ),
+        )
+
+        self.assertEqual(updated.state, "reconciling")
+        self.assertEqual(updated.lifecycle_version, 1)
+        self.assertEqual(repository.heads[authority.attempt_id].checkpoint, successor)
+
+    def test_claim_guard_reloads_live_exact_head_under_resource_lock(self) -> None:
+        authority = _prepared_authority(
+            "attempt-guard",
+            snapshot_bytes=100,
+            database_now=self.database_now,
+        )
+        repository = _Repository((authority,))
+        factory = _Factory(repository)
+        backend = self._backend(repository, factory)
+        backend.claim_recovery(
+            repository._candidate(repository.load(authority.attempt_id))
+        )
+        durable = repository.load(authority.attempt_id)
+        guard = DurableV4ClaimGuard(uow_factory=factory)  # type: ignore[arg-type]
+
+        guard.assert_current_under_resource_lock(
+            checkpoint=durable.checkpoint,
+            claim=durable.claim_witness,
+        )
+        repository.database_now += timedelta(seconds=121)
+        with self.assertRaises(V4ClaimLost):
+            guard.assert_current_under_resource_lock(
+                checkpoint=durable.checkpoint,
+                claim=durable.claim_witness,
+            )
 
     def test_reload_rejects_a_foreign_reclaim(self) -> None:
         authority = _prepared_authority(

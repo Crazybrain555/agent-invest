@@ -131,7 +131,12 @@ _OUTCOME_EVIDENCE_FIELDS = (
     "supersession_receipt_sha256",
 )
 _ALLOWED_NEW_EVIDENCE_BY_TRANSITION = {
-    ("prepared", "reconciling"): frozenset({"submission_intent_sha256"}),
+    # A generation-zero head may be inserted before copying the source PDF.
+    # The claimed PRE_FLIGHT transition then durably closes both the first
+    # snapshot and the exact submission command in one successor append.
+    ("prepared", "reconciling"): frozenset(
+        {"snapshot_receipt_sha256", "submission_intent_sha256"}
+    ),
     ("reconciling", "submitted"): frozenset(
         {"accepted_submission_sha256"}
     ),
