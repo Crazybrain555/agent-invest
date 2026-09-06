@@ -257,7 +257,7 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
     def test_creates_h0_then_claims_it_with_remaining_credit(self) -> None:
         admitter, _, claims, claimed, credit = self._fixture()
 
-        outcome = self._admit(admitter, 
+        outcome = self._admit(admitter,
             limit=1,
             available_credits=credit.reservation,
         )
@@ -274,7 +274,7 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
         admitter._admission_guard = mock.Mock(
             side_effect=NewWorkAdmissionUnavailable("provider still draining"),
         )
-        outcome = self._admit(admitter, 
+        outcome = self._admit(admitter,
             limit=2, available_credits=credit.reservation + credit.reservation,
         )
         self.assertEqual(outcome.work, (claimed,))
@@ -344,7 +344,7 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
         )
         claims.claimed = overgrant
         with self.assertRaises(AdmissionInterrupted) as raised:
-            self._admit(admitter, 
+            self._admit(admitter,
                 limit=1,
                 available_credits=replace(credit.reservation, snapshot_bytes=1024),
             )
@@ -373,7 +373,7 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
             work=(overgrant,), backlog_exists=False,
         )
         with self.assertRaises(AdmissionInterrupted) as raised:
-            self._admit(admitter, 
+            self._admit(admitter,
                 limit=2, available_credits=replace(credit.reservation, snapshot_bytes=1024),
             )
         self.assertEqual(raised.exception.claimed_work, (overgrant,))
