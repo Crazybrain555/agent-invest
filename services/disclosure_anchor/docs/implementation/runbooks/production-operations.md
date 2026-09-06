@@ -261,6 +261,12 @@ parse-capable worker/pipeline/admin 会在连 DB 前重算并核验当前 PASS �
 逐文档、时间、epoch 与 cleanup；路径缺失或证据漂移一律拒绝入场。该命令声明 database/queue access
 均为 none；不得与 worker、pipeline 或 API producer 并行执行。
 
+### Staged-v4 resource cutover (default-off)
+
+staged-v4 的默认关闭 source candidate 另有 [V4 资源生命周期与离线切换步骤](../design/v4-resource-lifetime.md)：
+0060→全历史 spec 回填→0061 验证；实际旧 writer 退出是前置，不可用 PG lease 代替。
+启动历史隔离残留门或 ACK 前残留检查失败时保留证据/信用，不手工伪造清理回执或删除未知树。
+
 ### 1.1b Semantic provider chain
 
 默认是 Luna low 主用、canonical Sonnet 5 low 备用。自定义完整链只写入仓外

@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 import json
 from pathlib import Path
 import tempfile
+from threading import Event
 import unittest
 
 from disclosure_anchor.adapters.storage.atomic_publication_artifact_readiness_v4 import (
@@ -18,6 +19,7 @@ from disclosure_anchor.application.contracts.atomic_publication_artifact_readine
     AtomicPublicationArtifactConflict,
 )
 from disclosure_anchor.application.ports.file_store import ArtifactWriteResult
+from disclosure_anchor.application.services.staged_parse_coordinator import StageLeaseGuard, StageLeaseLost
 from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     validate_atomic_publication_artifacts_ready_v4,
 )
@@ -142,6 +144,7 @@ class _Guard:
 
 class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
     def setUp(self) -> None:
+        self.stage_guard = StageLeaseGuard(deadline_monotonic=60.0, _revoked=Event(), _monotonic=lambda: 0.0)
         self.request = _request()
         _, checkpoint, intent, receipt, manifest, envelope = (
             _publication_materialized_evidence()
@@ -183,6 +186,7 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                 materialized=self.materialized,
                 claim=self.claim,
                 claim_guard=_Guard(),
+                stage_guard=self.stage_guard,
             )
             witness = adapter.verify_ready(
                 reference=reference,
@@ -213,6 +217,7 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                 materialized=self.materialized,
                 claim=self.claim,
                 claim_guard=_Guard(),
+                stage_guard=self.stage_guard,
             )
             self.assertEqual(replay, reference)
             replay_witness = adapter.verify_ready(
@@ -256,6 +261,7 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                 materialized=self.materialized,
                 claim=self.claim,
                 claim_guard=_Guard(),
+                stage_guard=self.stage_guard,
             )
             projection = json.loads(self.request.processing_run_projection_json)
             semantic = root / projection["semantic_route_receipts_relpath"]
@@ -281,6 +287,7 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                 materialized=self.materialized,
                 claim=self.claim,
                 claim_guard=_Guard(),
+                stage_guard=self.stage_guard,
             )
             different = _request(
                 previous_active_run_id="run-old",
@@ -293,6 +300,62 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                     materialized=self.materialized,
                     claim=self.claim,
                     claim_guard=_Guard(),
+                    stage_guard=self.stage_guard,
+                )
+
+    def test_revocation_stops_next_resource_write_and_fresh_stage_replays(self) -> None:
+        boundaries = (
+            ATOMIC_PUBLICATION_PREPARATION_FILENAME, "parser-output",
+            "provider_document.v1.json", "document_units.v1.jsonl",
+            "semantic_route_receipts.v3.jsonl",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as raw_root:
+                stage = StageLeaseGuard(deadline_monotonic=60.0, _revoked=Event(), _monotonic=lambda: 0.0)
+                events: list[str] = []
+
+                class Store(_RecordingStore):
+                    def create_or_verify(self, *, relpath: Path, payload: bytes) -> ArtifactWriteResult:
+                        result = super().create_or_verify(relpath=relpath, payload=payload)
+                        events.append(relpath.name)
+                        if relpath.name == boundary:
+                            stage.revoke()
+                        return result
+
+                class Promotion(_Promotion):
+                    def promote_or_replay(self, **kwargs: object) -> None:
+                        super().promote_or_replay(**kwargs)
+                        if boundary == "parser-output":
+                            stage.revoke()
+
+                paths = _Paths(Path(raw_root))
+                store = Store(ImmutableArtifactStore(paths))  # type: ignore[arg-type]
+                promotion = Promotion(events)
+                adapter = FilesystemAtomicPublicationArtifactReadinessV4(
+                    paths=paths, immutable_store=store, output_promotion=promotion,  # type: ignore[arg-type]
+                )
+                with self.assertRaises(StageLeaseLost):
+                    adapter.prepare_or_replay(
+                        request=self.request, checkpoint=self.checkpoint,
+                        materialized=self.materialized, claim=self.claim,
+                        claim_guard=_Guard(), stage_guard=stage,
+                    )
+                self.assertEqual(
+                    [event for event in events if event != "verify-parser-output"],
+                    list(boundaries[:boundaries.index(boundary) + 1]),
+                )
+                preparation = adapter.load_preparation(request=self.request)
+                assert preparation is not None
+                # No repair/deletion of earlier immutable artifacts: a new
+                # authorized stage reuses the same IDs and completes readiness.
+                reference = adapter.prepare_or_replay(
+                    request=self.request, checkpoint=self.checkpoint,
+                    materialized=self.materialized, claim=self.claim,
+                    claim_guard=_Guard(), stage_guard=self.stage_guard,
+                )
+                self.assertEqual(
+                    adapter.verify_ready(reference=reference).preparation.unit_bindings,
+                    preparation.unit_bindings,
                 )
 
     def test_every_outer_readiness_boundary_replays_with_the_same_unit_ids(self) -> None:
@@ -329,6 +392,7 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                         materialized=self.materialized,
                         claim=self.claim,
                         claim_guard=_Guard(),
+                        stage_guard=self.stage_guard,
                     )
                 preparation = failing.load_preparation(request=self.request)
                 self.assertIsNotNone(preparation)
@@ -359,6 +423,7 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                     materialized=self.materialized,
                     claim=self.claim,
                     claim_guard=_Guard(),
+                    stage_guard=self.stage_guard,
                 )
                 witness = replay.verify_ready(
                     reference=reference,

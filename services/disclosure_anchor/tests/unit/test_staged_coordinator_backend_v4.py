@@ -36,8 +36,10 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
 from disclosure_anchor.application.services.staged_coordinator_backend_v4 import (
     DurableStagedCoordinatorBackendV4,
     ExpectedV4AttemptFailure,
+    V4StageInputResolver,
 )
 from disclosure_anchor.application.services.staged_parse_coordinator import (
+    AdmissionOutcome,
     CoordinatorWork,
     RetryStage,
     StageLeaseGuard,
@@ -60,7 +62,10 @@ class _Persistence:
         self,
         _work: CoordinatorWork,
         append: V4SuccessorAppend,
+        *,
+        stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
+        stage_guard.checkpoint()
         self.appends.append(append)
         if append.successor.state in {
             "acked",
@@ -83,7 +88,16 @@ class _Persistence:
         return _work_for(append.successor, self.authority.reservation.reserved_credit)
 
     def reload_claim(self, _work: CoordinatorWork) -> CoordinatorWork:
-        return _work
+        return _work_for(
+            self.authority.checkpoint,
+            self.authority.reservation.reserved_credit,
+        )
+
+    def reload_stage_claim(
+        self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard,
+    ) -> CoordinatorWork:
+        stage_guard.checkpoint()
+        return self.reload_claim(work)
 
 
 def _fixture():
@@ -211,10 +225,12 @@ def _backend(
     inputs: mock.Mock | None = None,
     remote: mock.Mock | None = None,
     materialization: mock.Mock | None = None,
+    publication_committed=lambda _replaced: None,
     wall_clock=lambda: 2.0,
 ) -> tuple[DurableStagedCoordinatorBackendV4, _Persistence, mock.Mock, mock.Mock]:
     persistence = _Persistence(authority)
-    inputs = mock.Mock() if inputs is None else inputs
+    inputs = mock.Mock(spec=V4StageInputResolver) if inputs is None else inputs
+    inputs.bind_stage.return_value = inputs
     remote = mock.Mock() if remote is None else remote
     materialization = mock.Mock() if materialization is None else materialization
     backend = DurableStagedCoordinatorBackendV4(
@@ -224,15 +240,68 @@ def _backend(
         materialization=materialization,
         secret_cipher=mock.Mock(),
         claim_guard=mock.Mock(),
-        publication_requests=mock.Mock(),
         publisher=mock.Mock(),
         poll_seconds=0.25,
+        publication_committed=publication_committed,
         wall_clock=wall_clock,
     )
     return backend, persistence, inputs, materialization
 
 
 class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
+    def test_composition_guard_precedes_effects_in_every_recovery_stage(self) -> None:
+        stages = {
+            "prepared": "prepare_remote_io", "reconciling": "run_remote",
+            "submitted": "run_remote", "remote_terminal": "prepare_local_io",
+            "materializing": "run_local", "local_materialized": "commit",
+            "publish_committed": "cleanup", "cleanup_pending": "cleanup",
+            "ack_pending": "acknowledge",
+        }
+        for state, method in stages.items():
+            with self.subTest(state=state):
+                authority = _authority(state)
+                inputs = mock.Mock(spec=V4StageInputResolver)
+                inputs.bind_stage.side_effect = ValueError("composition drift")
+                backend, persistence, _, materialization = _backend(authority, inputs=inputs)
+                arguments = {"stage_guard": _guard()}
+                if method != "acknowledge":
+                    arguments["credit_allowance"] = authority.reservation.reserved_credit
+                with self.assertRaisesRegex(ValueError, "composition drift"):
+                    getattr(backend, method)(_work(authority), **arguments)
+                inputs.bind_stage.assert_called_once_with(authority, stage_guard=arguments["stage_guard"])
+                self.assertEqual(materialization.mock_calls, [])
+                self.assertEqual(backend._remote.mock_calls, [])
+                self.assertEqual(backend._publisher.mock_calls, [])
+                self.assertEqual(persistence.appends, [])
+
+    def test_optional_new_work_admitter_owns_initial_h0_admission(self) -> None:
+        authority = _authority("prepared")
+        persistence = _Persistence(authority)
+        admitter = mock.Mock()
+        expected = AdmissionOutcome(work=(), backlog_exists=False)
+        admitter.admit_new.return_value = expected
+        backend = DurableStagedCoordinatorBackendV4(
+            persistence=persistence,  # type: ignore[arg-type]
+            inputs=mock.Mock(),
+            remote=mock.Mock(),
+            materialization=mock.Mock(),
+            secret_cipher=mock.Mock(),
+            claim_guard=mock.Mock(),
+            publisher=mock.Mock(),
+            poll_seconds=0.25,
+            new_work_admitter=admitter,
+        )
+        credits = ResourceCreditVector(documents=1)
+
+        self.assertIs(
+            backend.admit_new(limit=1, available_credits=credits),
+            expected,
+        )
+        admitter.admit_new.assert_called_once_with(
+            limit=1,
+            available_credits=credits,
+        )
+
     def test_credit_check_uses_positive_transition_delta(self) -> None:
         authority = _authority("prepared")
         reconciling = _authority("reconciling").checkpoint
@@ -256,7 +325,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
     def test_preflight_appends_exact_reconciling_successor(self) -> None:
         authority = _authority("prepared")
         _, values, _, _, _ = _fixture()
-        inputs = mock.Mock()
+        inputs = mock.Mock(spec=V4StageInputResolver)
         inputs.submission_intent.return_value = values[2]
         backend, persistence, _, materialization = _backend(
             authority,
@@ -280,7 +349,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
     def test_preflight_creates_missing_snapshot_and_appends_both_facts(self) -> None:
         authority = _delayed_prepared_authority()
         _, values, _, _, _ = _fixture()
-        inputs = mock.Mock()
+        inputs = mock.Mock(spec=V4StageInputResolver)
         inputs.source_pdf.return_value = mock.sentinel.source_pdf
         inputs.submission_intent.return_value = values[2]
         materialization = mock.Mock()
@@ -306,7 +375,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
 
     def test_ambiguous_submission_retries_without_append(self) -> None:
         authority = _authority("reconciling")
-        inputs = mock.Mock()
+        inputs = mock.Mock(spec=V4StageInputResolver)
         inputs.submission_command.return_value = mock.sentinel.command
         remote = mock.Mock()
         remote.reconcile_or_submit.side_effect = RemoteSubmissionAmbiguousV4(
@@ -336,7 +405,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
 
     def test_waiting_past_durable_runaway_becomes_remote_failure(self) -> None:
         authority = _authority("submitted")
-        inputs = mock.Mock()
+        inputs = mock.Mock(spec=V4StageInputResolver)
         inputs.poll_command.return_value = mock.sentinel.poll
         inputs.remote_runaway_seconds.return_value = 10
         remote = mock.Mock()
@@ -375,7 +444,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
 
     def test_full_provider_failure_message_is_item_local(self) -> None:
         authority = _authority("submitted")
-        inputs = mock.Mock()
+        inputs = mock.Mock(spec=V4StageInputResolver)
         inputs.poll_command.return_value = mock.sentinel.poll
         remote = mock.Mock()
         remote.poll_once.return_value = RemoteProviderFailedV4(
@@ -408,7 +477,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
 
     def test_local_prepare_known_failure_drains_to_cleanup(self) -> None:
         authority = _authority("remote_terminal")
-        inputs = mock.Mock()
+        inputs = mock.Mock(spec=V4StageInputResolver)
         inputs.materialization_intent.side_effect = ExpectedV4AttemptFailure(
             error_code="unsupported_provider_result",
             message="provider result is unsupported",
@@ -458,34 +527,36 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
         )
         materialization = mock.Mock()
         materialization.reopen_materialized_v4.return_value = materialized
+        publication_committed = mock.Mock()
         backend, persistence, _, _ = _backend(
             authority,
             materialization=materialization,
+            publication_committed=publication_committed,
         )
-        request = mock.sentinel.request
-        backend._publication_requests.build_or_reopen.return_value = request
+        winner = mock.Mock(previous_active_run_id="prior-run")
 
+        def publish(**_kwargs):
+            persistence.authority = _authority("publish_committed")
+            return winner
+
+        backend._publisher.execute.side_effect = publish
         updated = backend.commit(
             _work(authority),
             credit_allowance=ResourceCreditVector(),
             stage_guard=_guard(),
         )
 
-        self.assertEqual(updated, _work(authority))
+        self.assertEqual(updated, _work(persistence.authority))
         materialization.reopen_materialized_v4.assert_called_once()
-        backend._publication_requests.build_or_reopen.assert_called_once_with(
-            checkpoint=authority.checkpoint,
-            materialized=materialized,
-            stage_guard=mock.ANY,
-        )
         backend._publisher.execute.assert_called_once_with(
-            request=request,
             checkpoint=authority.checkpoint,
             materialized=materialized,
             claim=authority.claim_witness,
             claim_guard=backend._claim_guard,
+            stage_guard=mock.ANY,
         )
         self.assertEqual(persistence.appends, [])
+        publication_committed.assert_called_once_with(True)
 
     def test_result_download_and_ack_unavailability_are_retriable(self) -> None:
         materializing = _authority("materializing")
@@ -493,7 +564,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
         local_materialization.materialize_v4.side_effect = (
             RemoteProviderUnavailableV4("result GET unavailable")
         )
-        local_inputs = mock.Mock()
+        local_inputs = mock.Mock(spec=V4StageInputResolver)
         _, allowance = _exact_materialization_reservation_and_allowance()
         local_inputs.materialization_allowance.return_value = allowance
         local_inputs.result_lease_seconds.return_value = 300

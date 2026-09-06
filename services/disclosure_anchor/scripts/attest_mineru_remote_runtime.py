@@ -17,9 +17,12 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_EGRESS_POLICY,
     MINERU_API_EXPOSURE_POLICY,
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
+    MINERU_API_MAX_UNACKED_RESULT_BYTES,
     MINERU_API_OUTPUT_ROOT_POLICY,
     MINERU_API_PROTOCOL_VERSION,
+    MINERU_API_RESULT_RESERVATION_BYTES,
     MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
+    MINERU_API_TASK_REGISTRY_MAX_RECORDS,
     MINERU_API_TASK_RETENTION_SECONDS,
     MINERU_API_TRANSPORT_PROFILE,
     MINERU_HEAP_RETURN_POLICY,
@@ -28,7 +31,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_WINDOWS_COLLECTOR_PATH,
     MINERU_WINDOWS_COMPOSE_PATH,
-    RUNTIME_MANIFEST_CONTRACT,
+    STAGED_RUNTIME_MANIFEST_CONTRACT,
     canonical_payload_sha256,
     client_bundle_identity,
     verify_runtime_manifest_payload,
@@ -257,6 +260,9 @@ def _verify_api_compatibility(
         "max_pending_tasks_effective",
         "pipeline_inference_locks_enabled",
         "task_protocol_v2_enabled",
+        "task_registry_max_records",
+        "task_result_reservation_bytes",
+        "max_unacked_result_bytes",
         "image_labels",
     }:
         raise ValueError("remote API compatibility evidence fields drifted")
@@ -301,6 +307,12 @@ def _verify_api_compatibility(
         or value.get("hybrid_batch_ratio_requested") not in {1, 2, 4, 8}
         or value.get("pipeline_inference_locks_enabled") is not True
         or value.get("task_protocol_v2_enabled") is not True
+        or value.get("task_registry_max_records")
+        != MINERU_API_TASK_REGISTRY_MAX_RECORDS
+        or value.get("task_result_reservation_bytes")
+        != MINERU_API_RESULT_RESERVATION_BYTES
+        or value.get("max_unacked_result_bytes")
+        != MINERU_API_MAX_UNACKED_RESULT_BYTES
     ):
         raise ValueError("remote API heap-return marker or source bytes drifted")
     if labels != {
@@ -336,7 +348,7 @@ def build_manifest(
     expected_task_protocol_v2_sha256: str,
     expected_collector_path: str = EXPECTED_COLLECTOR_PATH,
 ) -> dict[str, Any]:
-    if observation.get("schema") != "mineru-windows-runtime-observation.v3":
+    if observation.get("schema") != "mineru-windows-runtime-observation.v4":
         raise ValueError("remote runtime observation contract drifted")
     api = observation.get("api")
     proxy = observation.get("proxy")
@@ -554,6 +566,15 @@ def build_manifest(
             "max_pending_tasks_effective": pending_effective,
             "vllm_max_num_seqs": 128,
             "vllm_version": served_model.get("vllm_version"),
+            "task_registry_max_records": compatibility.get(
+                "task_registry_max_records"
+            ),
+            "task_result_reservation_bytes": compatibility.get(
+                "task_result_reservation_bytes"
+            ),
+            "max_unacked_result_bytes": compatibility.get(
+                "max_unacked_result_bytes"
+            ),
         }
     )
     if (
@@ -569,7 +590,7 @@ def build_manifest(
         raise ValueError("remote API proxy policy drifted")
 
     manifest = {
-        "contract_version": RUNTIME_MANIFEST_CONTRACT,
+        "contract_version": STAGED_RUNTIME_MANIFEST_CONTRACT,
         "client": {
             "package_set_sha256": client.package_set_sha256,
             "writer_code_sha256": code_digest,
@@ -615,6 +636,15 @@ def build_manifest(
             "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
             "task_retention_seconds": MINERU_API_TASK_RETENTION_SECONDS,
             "task_cleanup_interval_seconds": MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
+            "task_registry_max_records": compatibility.get(
+                "task_registry_max_records"
+            ),
+            "task_result_reservation_bytes": compatibility.get(
+                "task_result_reservation_bytes"
+            ),
+            "max_unacked_result_bytes": compatibility.get(
+                "max_unacked_result_bytes"
+            ),
             "output_root_policy": MINERU_API_OUTPUT_ROOT_POLICY,
             "command": api_command,
             "capacity_runtime_compatibility_sha256": (

@@ -100,6 +100,7 @@ class AtomicPublicationRequestFactoryV4Tests(unittest.TestCase):
                 materialized=materialized,
                 claim=claim,
                 claim_guard=_Guard(),
+                stage_guard=guard,
             )
 
             forbidden_builder = _Builder(object())

@@ -81,6 +81,7 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     V4ClaimWitness,
     V4EvidenceReplayContext,
     V4StageGuard,
+    V4ResourceOwnershipError,
     validate_v4_ack_authorization,
     validate_v4_cleanup_authorization,
     validate_v4_materialization_authorization,
@@ -88,6 +89,7 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
 from disclosure_anchor.application.ports.remote_provider_v4 import (
     PinnedSnapshotSourceV4,
 )
+from disclosure_anchor.application.ports.remote_parse_v4_repository import V4HistoricalLocalResources
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
@@ -296,6 +298,14 @@ class _RootLockCoordinator:
         self.local = threading.local()
 
 
+@dataclass(frozen=True, slots=True)
+class _PinnedFilesystemRoot:
+    path: Path
+    identity: tuple[int, int, int, int]
+    name_max: int
+    private_containers: bool
+
+
 _ROOT_COORDINATORS_GUARD = threading.Lock()
 _ROOT_COORDINATORS: dict[tuple[int, int], _RootLockCoordinator] = {}
 
@@ -408,12 +418,14 @@ class MinerUHttpStagedV4:
         self,
         *,
         scratch_root: Path,
+        published_root: Path,
         transport: MinerUV4Transport,
         clock: Callable[[], float],
         artifact_reader: MinerUMediumArtifactReader | None = None,
         fault_hook: Callable[[str], None] | None = None,
     ) -> None:
-        if not isinstance(scratch_root, Path) or not scratch_root.is_absolute():
+        if (not isinstance(scratch_root, Path) or not scratch_root.is_absolute()
+                or ".." in scratch_root.parts):
             raise ValueError("v4 scratch root must be an absolute Path")
         self._root = scratch_root
         self._transport = transport
@@ -433,6 +445,44 @@ class MinerUHttpStagedV4:
         )
         self._active_locks = threading.local()
         self._name_max = int(os.pathconf(self._root, "PC_NAME_MAX"))
+        self._scratch_namespace = _PinnedFilesystemRoot(
+            self._root, self._root_identity, self._name_max, True,
+        )
+        if (
+            not isinstance(published_root, Path)
+            or not published_root.is_absolute()
+            or ".." in published_root.parts
+            or published_root.is_symlink()
+            or not published_root.is_dir()
+        ):
+            raise ValueError(
+                "v4 published root must be an existing absolute directory "
+                f"under DISCLOSURE_DATA_ROOT/data: {published_root}"
+            )
+        published_stat = published_root.stat(follow_symlinks=False)
+        if (
+            published_stat.st_uid != os.getuid()
+            or stat.S_IMODE(published_stat.st_mode) & 0o022
+        ):
+            raise ValueError("v4 published root is not owner-controlled")
+        if published_stat.st_dev != observed_root.st_dev:
+            raise ValueError("v4 publication roots must share one filesystem")
+        scratch_resolved = scratch_root.resolve(strict=True)
+        published_resolved = published_root.resolve(strict=True)
+        if (
+            scratch_resolved.is_relative_to(published_resolved)
+            or published_resolved.is_relative_to(scratch_resolved)
+            or scratch_root.is_relative_to(published_root)
+            or published_root.is_relative_to(scratch_root)
+        ):
+            raise ValueError("v4 scratch and published namespaces must be disjoint")
+        self._published_namespace = _PinnedFilesystemRoot(
+            published_root,
+            (published_stat.st_dev, published_stat.st_ino,
+             published_stat.st_uid, published_stat.st_mode),
+            int(os.pathconf(published_root, "PC_NAME_MAX")),
+            False,
+        )
 
     def create_or_reconcile_snapshot_v4(
         self,
@@ -819,16 +869,20 @@ class MinerUHttpStagedV4:
         )
         if intent.output_manifest_relpath != LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME:
             raise self._fail("v4 output manifest must be rooted at its fixed basename")
-        spool = self._path(intent.spool_relpath)
-        spool_part = self._path(intent.spool_part_relpath)
-        spool_owner = self._path(intent.spool_part_owner_relpath)
-        spool_lock = self._path(intent.spool_lock_relpath)
-        staging = self._path(intent.staging_relpath)
-        marker = self._path(intent.staging_marker_relpath)
-        staging_lock = self._path(intent.staging_lock_relpath)
-        output = self._path(intent.output_relpath)
+        try:
+            spool = self._path(intent.spool_relpath)
+            spool_part = self._path(intent.spool_part_relpath)
+            spool_owner = self._path(intent.spool_part_owner_relpath)
+            spool_lock = self._path(intent.spool_lock_relpath)
+            staging = self._path(intent.staging_relpath)
+            marker = self._path(intent.staging_marker_relpath)
+            staging_lock = self._path(intent.staging_lock_relpath)
+            output = self._path(intent.output_relpath)
+        except (ParserOutputContractError, ValueError) as exc:
+            raise V4ResourceOwnershipError("materialization namespace is unsafe") from exc
         lock_binding = self._resource_binding(intent)
 
+        self._require_no_legacy_quarantine(intent)
         # Lock order is a contract: the spool lock is never acquired after the
         # staging lock.  Both remain held through publication/replay.
         with self._locked(spool_lock, "spool", lock_binding):
@@ -985,6 +1039,10 @@ class MinerUHttpStagedV4:
                     ):
                         raise self._fail("promoted observations drifted")
                     return value
+                except (ParserOutputContractError, ValueError) as exc:
+                    if self._try_path_stat(output) is not None:
+                        raise V4ResourceOwnershipError("promoted output needs ownership recovery") from exc
+                    raise
                 except BaseException:
                     # Exact staging is intentionally retained for restart.  A
                     # later call removes it only while holding both locks and
@@ -992,6 +1050,24 @@ class MinerUHttpStagedV4:
                     raise
 
     def _replay_or_recover_promoted_output(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        intent: MaterializationIntentV4,
+        output: Path,
+        staging: Path,
+    ) -> MaterializedProviderDocumentV4 | None:
+        try:
+            return self._replay_or_recover_promoted_output_unchecked(
+                checkpoint=checkpoint, claim=claim, claim_guard=claim_guard,
+                intent=intent, output=output, staging=staging,
+            )
+        except (ParserOutputContractError, ValueError) as exc:
+            raise V4ResourceOwnershipError("promoted output ownership is unresolved") from exc
+
+    def _replay_or_recover_promoted_output_unchecked(
         self,
         *,
         checkpoint: RemoteParseCheckpointV4,
@@ -1011,12 +1087,18 @@ class MinerUHttpStagedV4:
         marker = output / PurePosixPath(intent.staging_marker_relpath).name
         marker_stat = self._try_path_stat(marker)
         if marker_stat is None:
-            return self._load_exact_output(
-                intent=intent,
-                output=output,
-                expected_output_identity=output_identity,
-                fsync_exact=True,
-            )
+            try:
+                return self._load_exact_output(
+                    intent=intent, output=output,
+                    expected_output_identity=output_identity, fsync_exact=True,
+                )
+            except (ParserOutputContractError, ValueError):
+                self._contain_invalid_promoted_output(
+                    checkpoint=checkpoint, claim=claim, claim_guard=claim_guard,
+                    intent=intent, output=output, staging=staging,
+                    expected_identity=output_identity,
+                )
+                raise AssertionError("containment must retain ownership and stop")
         if (
             not stat.S_ISREG(marker_stat.st_mode)
             or self._read_private(marker) != self._marker_bytes(intent)
@@ -1092,16 +1174,14 @@ class MinerUHttpStagedV4:
             except (ParserOutputContractError, ValueError):
                 if operation_started:
                     raise
-                self._quarantine_marker_bound_tree(
+                self._contain_invalid_promoted_output(
                     checkpoint=checkpoint,
                     claim=claim,
                     claim_guard=claim_guard,
                     intent=intent,
-                    source=output,
-                    staging_lock=self._path(intent.staging_lock_relpath),
+                    output=output,
+                    staging=staging,
                     expected_identity=output_identity,
-                    before_phase="before_invalid_output_quarantine_rename",
-                    after_phase="after_invalid_output_quarantine_rename",
                 )
             return None
         self._finish_promoted_marker(
@@ -1157,7 +1237,7 @@ class MinerUHttpStagedV4:
         replay_context.validate_durable_current(checkpoint)
         stage_guard.checkpoint()
         source = self._path(intent.output_relpath)
-        published = self._path(
+        published = self._published_path(
             intent.provider_envelope_context.parser_artifact_root_relpath
         )
         lock_binding = self._resource_binding(intent)
@@ -1362,6 +1442,24 @@ class MinerUHttpStagedV4:
         staging: Path,
         staging_lock: Path,
     ) -> bool:
+        try:
+            return self._classify_and_resolve_existing_staging_unchecked(
+                checkpoint=checkpoint, claim=claim, claim_guard=claim_guard,
+                intent=intent, staging=staging, staging_lock=staging_lock,
+            )
+        except (ParserOutputContractError, ValueError) as exc:
+            raise V4ResourceOwnershipError("staging ownership is unresolved") from exc
+
+    def _classify_and_resolve_existing_staging_unchecked(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        intent: MaterializationIntentV4,
+        staging: Path,
+        staging_lock: Path,
+    ) -> bool:
         observed = self._try_path_stat(staging)
         if observed is None:
             return False
@@ -1505,60 +1603,48 @@ class MinerUHttpStagedV4:
         staging_lock: Path,
         expected_identity: tuple[int, int],
     ) -> None:
-        self._quarantine_marker_bound_tree(
-            checkpoint=checkpoint,
-            claim=claim,
-            claim_guard=claim_guard,
-            intent=intent,
-            source=staging,
-            staging_lock=staging_lock,
-            expected_identity=expected_identity,
-            before_phase="before_staging_quarantine_rename",
-            after_phase="after_staging_quarantine_rename",
-        )
+        # Ambiguity is quarantined IN PLACE, inside the attempt's reservation.
+        # No detached sibling and no second staging allocation are permitted.
+        self._guard(claim_guard, checkpoint, claim)
+        raise V4ResourceOwnershipError("ambiguous staging retained in its charged namespace")
 
-    def _quarantine_marker_bound_tree(
+    def _contain_invalid_promoted_output(
         self,
         *,
         checkpoint: RemoteParseCheckpointV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
         intent: MaterializationIntentV4,
-        source: Path,
-        staging_lock: Path,
+        output: Path,
+        staging: Path,
         expected_identity: tuple[int, int],
-        before_phase: str,
-        after_phase: str,
     ) -> None:
-        quarantine = self._quarantine_path(intent)
-        if self._try_path_stat(quarantine) is not None:
-            source_relpath = source.relative_to(self._root).as_posix()
-            quarantine_relpath = quarantine.relative_to(self._root).as_posix()
-            raise self._fail(
-                "materialization staging quarantine collision: "
-                f"source={source_relpath} quarantine={quarantine_relpath}"
-            )
+        self._require_scratch_namespace(output)
+        self._require_scratch_namespace(staging)
+        if self._try_path_stat(staging) is not None:
+            raise V4ResourceOwnershipError("output and staging both exist; containment refused")
         self._require_lock_binding(
-            staging_lock,
+            self._path(intent.staging_lock_relpath),
             "staging",
             self._resource_binding(intent),
         )
-        marker = source / PurePosixPath(intent.staging_marker_relpath).name
+        marker = output / PurePosixPath(intent.staging_marker_relpath).name
 
-        def before_quarantine() -> None:
+        def before_containment() -> None:
             self._guard(claim_guard, checkpoint, claim)
-            self._fault_hook(before_phase)
+            self._fault_hook("before_invalid_output_containment_rename")
             self._guard(claim_guard, checkpoint, claim)
-            if self._read_private(marker) != self._marker_bytes(intent):
+            if self._try_path_stat(marker) is not None and self._read_private(marker) != self._marker_bytes(intent):
                 raise self._fail("materialization recovery marker drifted")
 
         self._exclusive_rename(
-            source,
-            quarantine,
+            output,
+            staging,
             expected_source_identity=expected_identity,
-            before_rename=before_quarantine,
-            after_rename=lambda: self._fault_hook(after_phase),
+            before_rename=before_containment,
+            after_rename=lambda: self._fault_hook("after_invalid_output_containment_rename"),
         )
+        raise V4ResourceOwnershipError("invalid promoted output retained in charged staging")
 
     def _quarantine_path(self, intent: MaterializationIntentV4) -> Path:
         staging = PurePosixPath(intent.staging_relpath)
@@ -1568,6 +1654,26 @@ class MinerUHttpStagedV4:
         return self._path(
             (staging.parent / f".agent-v4-quarantine-{digest}").as_posix()
         )
+
+    def _require_no_legacy_quarantine(self, intent: MaterializationIntentV4) -> None:
+        if self._try_path_stat(self._quarantine_path(intent)) is not None:
+            raise V4ResourceOwnershipError("legacy detached quarantine requires offline resolution")
+
+    def verify_historical_local_resources(self, history: V4HistoricalLocalResources) -> None:
+        """Read-only cutover check; never adopt/delete an old detached namespace."""
+        try:
+            self._require_no_legacy_quarantine(history.intent)
+            receipt = history.cleanup_receipt
+            if receipt is not None:
+                for result in receipt.results:
+                    if self._try_path_stat(self._path(result.relpath)) is not None:
+                        raise V4ResourceOwnershipError("historical cleanup source remains present")
+                # Old failure plans could omit a promoted output without a receipt.
+                # Published targets live under the distinct data root, not here.
+                if self._try_path_stat(self._path(history.intent.output_relpath)) is not None:
+                    raise V4ResourceOwnershipError("historical cleanup omitted uncommitted output")
+        except (ParserOutputContractError, ValueError) as exc:
+            raise V4ResourceOwnershipError("historical resource namespace is unsafe") from exc
 
     def _remove_admitted_recovery_tree(
         self,
@@ -1601,6 +1707,7 @@ class MinerUHttpStagedV4:
         tree: PinnedArtifactTree,
         last_files: tuple[PurePosixPath, ...],
     ) -> None:
+        self._require_scratch_namespace(staging)
         root_identity = tree.root_identity
         tree.remove_exact_admitted_contents(
             before_effect=lambda: self._guard(claim_guard, checkpoint, claim),
@@ -1714,6 +1821,7 @@ class MinerUHttpStagedV4:
         expected_identity: tuple[int, int],
         before_effect: Callable[[], object],
     ) -> None:
+        self._require_scratch_namespace(path)
         with self._parent_fd(path) as (parent_fd, name):
             observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             self._require_owned_dir_stat(observed, "empty owned directory")
@@ -1786,6 +1894,10 @@ class MinerUHttpStagedV4:
                 stage_guard.checkpoint()
                 self._guard(claim_guard, checkpoint, claim)
 
+            if intent is not None:
+                self._require_no_legacy_quarantine(intent)
+                if local_receipt is None and self._try_path_stat(self._path(intent.output_relpath)) is not None:
+                    raise V4ResourceOwnershipError("cleanup omits an uncommitted output; credits retained")
             volatile_proofs = self._capture_volatile_cleanup_proofs(
                 plan=plan,
                 reservation=reservation,
@@ -1802,7 +1914,7 @@ class MinerUHttpStagedV4:
                     target_candidate = (
                         None
                         if resource.target_relpath is None
-                        else self._path(resource.target_relpath)
+                        else self._published_path(resource.target_relpath)
                     )
                     source_present = self._try_path_stat(source) is not None
                     if resource.action == "transfer":
@@ -1830,6 +1942,8 @@ class MinerUHttpStagedV4:
                             staging_lock=self._path(intent.staging_lock_relpath),
                         )
                         stage_guard.checkpoint()
+                        if self._try_path_stat(source) is not None:
+                            raise V4ResourceOwnershipError("cleanup staging is not actually absent")
                         results.append(
                             LocalCleanupResourceResultV4(
                                 kind=resource.kind,
@@ -1879,7 +1993,7 @@ class MinerUHttpStagedV4:
                     )
                     continue
                 assert resource.target_relpath is not None
-                target = self._path(resource.target_relpath)
+                target = self._published_path(resource.target_relpath)
                 self._transfer_planned(
                     source=source,
                     target=target,
@@ -1903,6 +2017,13 @@ class MinerUHttpStagedV4:
                     )
                 )
             stage_guard.checkpoint()
+            for resource in plan.resources:
+                if self._try_path_stat(self._path(resource.relpath)) is not None:
+                    raise V4ResourceOwnershipError("cleanup source remains present; receipt refused")
+            if intent is not None:
+                self._require_no_legacy_quarantine(intent)
+                if self._try_path_stat(self._path(intent.output_relpath)) is not None:
+                    raise V4ResourceOwnershipError("cleanup output remains present; receipt refused")
             return build_local_cleanup_receipt_v4(
                 plan=plan,
                 cleanup_pending_checkpoint=checkpoint,
@@ -1917,6 +2038,7 @@ class MinerUHttpStagedV4:
         published_relpath: str,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> None:
         """Transfer the exact materialized tree before transaction P.
 
@@ -1926,6 +2048,8 @@ class MinerUHttpStagedV4:
         the transferred tree before PostgreSQL publication can begin.
         """
 
+        self._validate_stage_guard(stage_guard)
+        stage_guard.checkpoint()
         self._observe_clock()
         if (
             type(checkpoint) is not RemoteParseCheckpointV4
@@ -1957,15 +2081,22 @@ class MinerUHttpStagedV4:
         )
         intent = materialized.intent
         receipt = materialized.receipt
+        if published_relpath != intent.provider_envelope_context.parser_artifact_root_relpath:
+            raise self._fail("publication target drifted from materialization intent")
         source = self._path(intent.output_relpath)
-        target = self._path(published_relpath)
+        target = self._published_path(published_relpath)
         lock_binding = self._resource_binding(intent)
         lock_paths = [
             self._path(intent.spool_lock_relpath),
             self._path(intent.staging_lock_relpath),
         ]
-        with self._ordered_locks(lock_paths, lock_binding):
+        def before_promotion() -> None:
+            stage_guard.checkpoint()
             self._guard(claim_guard, checkpoint, claim)
+            stage_guard.checkpoint()
+
+        with self._ordered_locks(lock_paths, lock_binding):
+            before_promotion()
             evidence_root = (
                 source
                 if self._try_path_stat(source) is not None
@@ -1982,11 +2113,7 @@ class MinerUHttpStagedV4:
                 target=target,
                 expected_sha256=receipt.output_files_sha256,
                 expected_byte_count=receipt.output_byte_count,
-                before_effect=lambda: self._guard(
-                    claim_guard,
-                    checkpoint,
-                    claim,
-                ),
+                before_effect=before_promotion,
                 max_files=receipt.output_file_count,
             )
             replayed = self._load_exact_output(
@@ -2004,7 +2131,7 @@ class MinerUHttpStagedV4:
         expected_file_count: int,
         expected_byte_count: int,
     ) -> None:
-        """Read-only exact inventory verification for readiness/Doctor/GC."""
+        """Verify the immutable published tree and its durability without a scratch gate."""
 
         validate_relative_resource_path_v4(
             published_relpath,
@@ -2012,21 +2139,20 @@ class MinerUHttpStagedV4:
         )
         if type(expected_file_count) is not int or expected_file_count < 1:
             raise self._fail("published parser output file count is invalid")
-        with self._root_lock_coordinator.process_lock:
-            root = self._path(published_relpath)
-            identity = self._require_tree_inventory(
-                root,
-                expected_inventory_sha256,
-                expected_byte_count,
-                max_files=expected_file_count,
-            )
-            self._fsync_exact_tree_and_parent(
-                root,
-                expected_sha256=expected_inventory_sha256,
-                expected_byte_count=expected_byte_count,
-                max_files=expected_file_count,
-                expected_identity=identity,
-            )
+        root = self._published_path(published_relpath)
+        identity = self._require_tree_inventory(
+            root,
+            expected_inventory_sha256,
+            expected_byte_count,
+            max_files=expected_file_count,
+        )
+        self._fsync_exact_tree_and_parent(
+            root,
+            expected_sha256=expected_inventory_sha256,
+            expected_byte_count=expected_byte_count,
+            max_files=expected_file_count,
+            expected_identity=identity,
+        )
 
     def acknowledge_v4(
         self,
@@ -2084,15 +2210,24 @@ class MinerUHttpStagedV4:
         stage_guard: V4StageGuard,
     ) -> ProviderAckReceiptV4:
         self._guard(claim_guard, command.ack_pending_checkpoint, claim)
+
+        def before_ack_post() -> None:
+            self._guard(claim_guard, command.ack_pending_checkpoint, claim)
+            intent = command.replay_context.evidence_value("materialization_intent", MaterializationIntentV4)
+            if intent is not None:
+                if type(intent) is not MaterializationIntentV4:
+                    raise V4ResourceOwnershipError("ACK materialization intent is not exact")
+                self.verify_historical_local_resources(V4HistoricalLocalResources(intent, command.cleanup_receipt))
+            else:
+                for result in command.cleanup_receipt.results:
+                    if self._try_path_stat(self._path(result.relpath)) is not None:
+                        raise V4ResourceOwnershipError("ACK cleanup source remains present")
+
         response = self._transport.acknowledge(
             command=command,
             provider_capability=provider_capability,
             step_guard=stage_guard,
-            before_ack_post=lambda: self._guard(
-                claim_guard,
-                command.ack_pending_checkpoint,
-                claim,
-            ),
+            before_ack_post=before_ack_post,
         )
         if type(response) is not ProviderAckTransportResponseV4:
             raise self._fail("provider ACK transport returned a forged response")
@@ -2934,6 +3069,9 @@ class MinerUHttpStagedV4:
         before_effect: Callable[[], None],
         max_files: int,
     ) -> None:
+        self._require_scratch_namespace(source)
+        if self._namespace(target) is not self._published_namespace:
+            raise self._fail("publication transfer target must be in the published namespace")
         if self._try_path_stat(target) is not None:
             target_identity = self._require_tree_inventory(
                 target,
@@ -2959,6 +3097,7 @@ class MinerUHttpStagedV4:
             expected_byte_count,
             max_files=max_files,
         )
+        before_effect()
         self._ensure_parent(target)
         with self._open_dir(source.parent) as source_parent_fd:
             source_device = os.fstat(source_parent_fd).st_dev
@@ -2990,6 +3129,10 @@ class MinerUHttpStagedV4:
                 != source_identity
             ):
                 raise self._fail("cleanup transfer source was replaced")
+
+            # Hashing the tree can outlive stage authorization. Recheck at
+            # the effect boundary, while leaving post-rename fsync intact.
+            before_effect()
 
         self._exclusive_rename(
             source,
@@ -3024,6 +3167,8 @@ class MinerUHttpStagedV4:
         last_file_bytes: bytes | None,
         expected_tree_files: tuple[LocalOutputFileV4, ...] | None,
     ) -> None:
+        if self._namespace(path) != self._scratch_namespace:
+            raise self._fail("cleanup must not delete published resources")
         observed = self._try_path_stat(path)
         if observed is None:
             if self._try_path_stat(path.parent) is not None:
@@ -3598,15 +3743,21 @@ class MinerUHttpStagedV4:
         }
 
     def _path(self, relpath: str) -> Path:
-        self._assert_root_stable()
+        return self._path_beneath(relpath, self._scratch_namespace)
+
+    def _published_path(self, relpath: str) -> Path:
+        return self._path_beneath(relpath, self._published_namespace)
+
+    def _path_beneath(self, relpath: str, root: _PinnedFilesystemRoot) -> Path:
+        self._assert_namespace_stable(root)
         validate_relative_resource_path_v4(relpath, "v4 scratch resource")
         if any(
-            len(os.fsencode(part)) > self._name_max
+            len(os.fsencode(part)) > root.name_max
             for part in PurePosixPath(relpath).parts
         ):
             raise self._fail("scratch resource component exceeds NAME_MAX")
-        candidate = self._root.joinpath(*PurePosixPath(relpath).parts)
-        if self._root not in candidate.parents:
+        candidate = root.path.joinpath(*PurePosixPath(relpath).parts)
+        if root.path not in candidate.parents:
             raise self._fail("scratch resource escaped root")
         self._assert_existing_ancestors(candidate.parent)
         return candidate
@@ -3624,20 +3775,34 @@ class MinerUHttpStagedV4:
         ):
             raise ValueError("v4 scratch root is not private to the current user")
 
-    def _assert_root_stable(self) -> None:
-        observed = self._root.stat(follow_symlinks=False)
+    def _assert_namespace_stable(self, root: _PinnedFilesystemRoot) -> None:
+        observed = root.path.stat(follow_symlinks=False)
         if (
             observed.st_dev,
             observed.st_ino,
             observed.st_uid,
             observed.st_mode,
-        ) != self._root_identity:
-            raise self._fail("scratch root identity changed")
+        ) != root.identity:
+            raise self._fail("filesystem root identity changed")
+
+    def _namespace(self, path: Path) -> _PinnedFilesystemRoot:
+        # Construction proves disjoint roots. A Path has exactly one pinned
+        # namespace; publication changes the locator root, never file policy.
+        for root in (self._scratch_namespace, self._published_namespace):
+            if path.is_relative_to(root.path):
+                return root
+        raise self._fail("resource path escaped pinned roots")
+
+    def _require_scratch_namespace(self, path: Path) -> None:
+        if self._namespace(path) is not self._scratch_namespace:
+            raise self._fail("private mutation must not delete or alter published resources")
 
     def _assert_existing_ancestors(self, path: Path) -> None:
-        current = self._root
+        root = self._namespace(path)
+        self._assert_namespace_stable(root)
+        current = root.path
         try:
-            parts = path.relative_to(self._root).parts
+            parts = path.relative_to(root.path).parts
         except ValueError as exc:
             raise self._fail("scratch path escaped root") from exc
         for part in parts:
@@ -3649,21 +3814,23 @@ class MinerUHttpStagedV4:
                 raise self._fail("scratch path has an unsafe ancestor")
             if (
                 observed.st_uid != os.getuid()
-                or observed.st_dev != self._root_identity[0]
-                or stat.S_IMODE(observed.st_mode) != 0o700
+                or observed.st_dev != root.identity[0]
+                or (stat.S_IMODE(observed.st_mode) != 0o700
+                    if root.private_containers else stat.S_IMODE(observed.st_mode) & 0o022)
             ):
                 raise self._fail("scratch path ancestor is not private")
 
     def _relative_parts(self, path: Path) -> tuple[str, ...]:
+        root = self._namespace(path)
         try:
-            parts = path.relative_to(self._root).parts
+            parts = path.relative_to(root.path).parts
         except ValueError as exc:
             raise self._fail("scratch path escaped root") from exc
         if any(
             not part
             or part in {".", ".."}
             or part != unicodedata.normalize("NFC", part)
-            or len(os.fsencode(part)) > self._name_max
+            or len(os.fsencode(part)) > root.name_max
             for part in parts
         ):
             raise self._fail("scratch path has an unsafe component")
@@ -3723,11 +3890,12 @@ class MinerUHttpStagedV4:
                 raise self._fail("scratch directory path was replaced")
 
     def _open_dir_fd(self, path: Path, *, create: bool = False) -> int:
-        self._assert_root_stable()
+        root = self._namespace(path)
+        self._assert_namespace_stable(root)
         parts = self._relative_parts(path)
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
-            current_fd = os.open(self._root, flags)
+            current_fd = os.open(root.path, flags)
         except OSError as exc:
             raise self._fail("cannot pin scratch root") from exc
         try:
@@ -3737,7 +3905,7 @@ class MinerUHttpStagedV4:
                 root_stat.st_ino,
                 root_stat.st_uid,
                 root_stat.st_mode,
-            ) != self._root_identity:
+            ) != root.identity:
                 raise self._fail("scratch root changed while opening")
             for part in parts:
                 try:
@@ -3747,15 +3915,25 @@ class MinerUHttpStagedV4:
                         raise self._fail("scratch directory is absent") from None
                     try:
                         os.mkdir(part, 0o700, dir_fd=current_fd)
-                        os.fsync(current_fd)
+                    except FileExistsError:
+                        # Another document may create this shared container
+                        # after open saw ENOENT. Reopen and validate its fd;
+                        # EEXIST alone never establishes ownership or safety.
+                        pass
                     except OSError as exc:
-                        raise self._fail("cannot create safe scratch directory") from exc
-                    next_fd = os.open(part, flags, dir_fd=current_fd)
+                        raise self._fail("cannot create safe resource directory") from exc
+                    try:
+                        os.fsync(current_fd)
+                        next_fd = os.open(part, flags, dir_fd=current_fd)
+                    except OSError as exc:
+                        raise self._fail("created resource directory is unsafe") from exc
                 except OSError as exc:
                     raise self._fail("scratch directory is unsafe") from exc
                 try:
                     observed = os.fstat(next_fd)
-                    self._require_owned_dir_stat(observed, "scratch directory")
+                    self._require_owned_dir_stat(
+                        observed, "resource directory", private=root.private_containers,
+                    )
                     self._require_entry_identity(
                         current_fd, part, observed, "scratch directory"
                     )
@@ -3840,8 +4018,8 @@ class MinerUHttpStagedV4:
             return not os.listdir(directory_fd)
 
     def _try_path_stat(self, path: Path) -> os.stat_result | None:
-        if path == self._root:
-            with self._open_dir(self._root) as root_fd:
+        if path == self._namespace(path).path:
+            with self._open_dir(path) as root_fd:
                 return os.fstat(root_fd)
         try:
             with self._parent_fd(path) as (parent_fd, name):
@@ -3873,107 +4051,18 @@ class MinerUHttpStagedV4:
         return observed.st_dev, observed.st_ino
 
     def _require_owned_dir_stat(
-        self, observed: os.stat_result, label: str
+        self, observed: os.stat_result, label: str, *, private: bool = True,
     ) -> None:
         if (
             not stat.S_ISDIR(observed.st_mode)
             or observed.st_uid != os.getuid()
             or observed.st_dev != self._root_identity[0]
-            or stat.S_IMODE(observed.st_mode) != 0o700
+            # Match ImmutableArtifactStore's owner-controlled container policy;
+            # resource trees themselves still require 0700/0600 via pinned IO.
+            or (stat.S_IMODE(observed.st_mode) != 0o700
+                if private else stat.S_IMODE(observed.st_mode) & 0o022)
         ):
             raise self._fail(f"{label} is unsafe")
-
-    def _remove_tree_contents(
-        self,
-        directory_fd: int,
-        *,
-        before_effect: Callable[[], None] | None,
-        last_file_name: str | None = None,
-    ) -> None:
-        names = sorted(os.listdir(directory_fd))
-        if last_file_name is not None and last_file_name in names:
-            names.remove(last_file_name)
-            names.append(last_file_name)
-        for name in names:
-            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            identity = self._identity(observed)
-            if stat.S_ISDIR(observed.st_mode):
-                self._require_owned_dir_stat(observed, "owned tree directory")
-                child_fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=directory_fd,
-                )
-                try:
-                    if self._identity(os.fstat(child_fd)) != identity:
-                        raise self._fail("owned tree directory changed while opening")
-                    self._remove_tree_contents(
-                        child_fd,
-                        before_effect=before_effect,
-                        last_file_name=None,
-                    )
-                    if before_effect is not None:
-                        before_effect()
-                    current = os.stat(
-                        name, dir_fd=directory_fd, follow_symlinks=False
-                    )
-                    if self._identity(current) != identity or os.listdir(child_fd):
-                        raise self._fail("owned tree directory changed before deletion")
-                    os.rmdir(name, dir_fd=directory_fd)
-                finally:
-                    os.close(child_fd)
-                continue
-            self._require_owned_regular_stat(observed, "owned tree file")
-            if before_effect is not None:
-                before_effect()
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            self._require_owned_regular_stat(current, "owned tree file")
-            if self._identity(current) != identity:
-                raise self._fail("owned tree file was replaced before deletion")
-            os.unlink(name, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-
-    def _measure_private_tree(
-        self,
-        directory_fd: int,
-        *,
-        max_files: int,
-        max_bytes: int,
-        totals: list[int],
-    ) -> None:
-        casefold_names: set[str] = set()
-        for name in sorted(os.listdir(directory_fd)):
-            if name != unicodedata.normalize("NFC", name):
-                raise self._fail("private output path is not NFC")
-            portable_name = name.casefold()
-            if portable_name in casefold_names:
-                raise self._fail("private output has a case-insensitive collision")
-            casefold_names.add(portable_name)
-            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if stat.S_ISDIR(observed.st_mode):
-                self._require_owned_dir_stat(observed, "private output directory")
-                child_fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=directory_fd,
-                )
-                try:
-                    if self._identity(os.fstat(child_fd)) != self._identity(observed):
-                        raise self._fail("private output directory changed while opening")
-                    self._measure_private_tree(
-                        child_fd,
-                        max_files=max_files,
-                        max_bytes=max_bytes,
-                        totals=totals,
-                    )
-                finally:
-                    os.close(child_fd)
-                continue
-            self._require_owned_regular_stat(observed, "private output file")
-            totals[0] += 1
-            totals[1] += observed.st_size
-            if totals[0] > max_files or totals[1] > max_bytes:
-                raise self._fail("private output exceeded its allowance")
 
     def _fsync_tree_fd(self, directory_fd: int) -> None:
         for name in sorted(os.listdir(directory_fd)):
@@ -4158,6 +4247,7 @@ class MinerUHttpStagedV4:
         before_effect: Callable[[], None] | None = None,
         expected_identity: tuple[int, int] | None = None,
     ) -> None:
+        self._require_scratch_namespace(path)
         with self._parent_fd(path) as (parent_fd, name):
             try:
                 observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -4177,58 +4267,6 @@ class MinerUHttpStagedV4:
                 raise self._fail("owned file was replaced before deletion")
             os.unlink(name, dir_fd=parent_fd)
             os.fsync(parent_fd)
-
-    def _remove_owned_tree(
-        self,
-        path: Path,
-        *,
-        before_effect: Callable[[], None] | None = None,
-        expected_identity: tuple[int, int] | None = None,
-        last_file_name: str | None = None,
-    ) -> None:
-        with self._parent_fd(path) as (parent_fd, name):
-            observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            self._require_owned_dir_stat(observed, "owned tree")
-            identity = self._identity(observed)
-            if expected_identity is not None and identity != expected_identity:
-                raise self._fail("owned tree identity changed before deletion")
-            root_fd = os.open(
-                name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=parent_fd,
-            )
-            try:
-                if self._identity(os.fstat(root_fd)) != identity:
-                    raise self._fail("owned tree changed while opening")
-                self._remove_tree_contents(
-                    root_fd,
-                    before_effect=before_effect,
-                    last_file_name=last_file_name,
-                )
-                if before_effect is not None:
-                    before_effect()
-                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                if self._identity(current) != identity or os.listdir(root_fd):
-                    raise self._fail("owned tree changed before deletion")
-                os.rmdir(name, dir_fd=parent_fd)
-                os.fsync(parent_fd)
-            finally:
-                os.close(root_fd)
-
-    def _preflight_private_tree(
-        self,
-        root: Path,
-        *,
-        max_files: int,
-        max_bytes: int,
-    ) -> None:
-        with self._open_dir(root) as root_fd:
-            self._measure_private_tree(
-                root_fd,
-                max_files=max_files,
-                max_bytes=max_bytes,
-                totals=[0, 0],
-            )
 
     def _exclusive_rename(
         self,

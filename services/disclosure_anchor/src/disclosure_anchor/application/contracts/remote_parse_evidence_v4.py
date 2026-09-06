@@ -94,6 +94,8 @@ class PreparationIntentV4:
     request_sha256: str
     runtime_epoch_sha256: str
     process_profile_sha256: str
+    execution_spec_sha256: str
+    execution_spec_byte_count: int
     reservation_sha256: str
     snapshot_relpath: str
     snapshot_part_relpath: str
@@ -115,11 +117,13 @@ class PreparationIntentV4:
             (self.request_sha256, "request"),
             (self.runtime_epoch_sha256, "runtime epoch"),
             (self.process_profile_sha256, "process profile"),
+            (self.execution_spec_sha256, "execution spec"),
             (self.reservation_sha256, "reservation"),
         ):
             _sha(value, label)
         _positive(self.source_byte_count, "source byte count")
         _positive(self.source_page_count, "source page count")
+        _positive(self.execution_spec_byte_count, "execution spec byte count")
         for value, label in (
             (self.snapshot_relpath, "snapshot"),
             (self.snapshot_part_relpath, "snapshot part"),
@@ -639,7 +643,11 @@ class EncodedRemoteParseEvidenceV4:
 
 
 def build_preparation_intent_v4(
-    *, reservation: ResourceReservationV4, parser_target_sha256: str
+    *,
+    reservation: ResourceReservationV4,
+    parser_target_sha256: str,
+    execution_spec_sha256: str,
+    execution_spec_byte_count: int,
 ) -> PreparationIntentV4:
     return PreparationIntentV4(
         attempt_id=reservation.attempt_id,
@@ -653,6 +661,8 @@ def build_preparation_intent_v4(
         request_sha256=reservation.request_sha256,
         runtime_epoch_sha256=reservation.runtime_epoch_sha256,
         process_profile_sha256=reservation.process_profile_sha256,
+        execution_spec_sha256=execution_spec_sha256,
+        execution_spec_byte_count=execution_spec_byte_count,
         reservation_sha256=reservation.sha256,
         snapshot_relpath=reservation.snapshot_relpath,
         snapshot_part_relpath=reservation.snapshot_part_relpath,

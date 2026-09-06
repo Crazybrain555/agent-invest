@@ -235,11 +235,14 @@ frontend snapshot 2 s；durable heartbeat 10–15 s。缺失/不支持显式 una
 2. 落 final-POST global c7、process credits/A/C gates/model locks、bounded FastAPI admission 和 strict drain；
 3. 落 Mac parse/finalize 解耦，移除 huge 与 finalize Future 人为屏障；
 4. 当前 serial v1 始终保持 `task_slots=pending=1`；任何多 owner 调度都必须另起版本化执行合同和验证面；
-5. 用独立 held-out 文档做 10–20 分钟验证：先 ratio 1/2/4/8 单槽隔离，再 slots/window/C 一次一维粗到细；
+5. 在明确 runtime 授权与实际旧 writer 排空后，用独立 held-out 完整 PDF 验证当前版本化 profile；
+   根据同步 lane/queue/CPU/GPU/内存证据识别具体瓶颈，每项调参须有单独假设、安全预算和验收依据；
+   不预设 ratio 1/2/4/8、固定 arms、ABBA 或固定试验时长，也不把重复旧慢基线作为必经步骤；
 6. correctness、memory、PSI、OOM、restart、preemption、drain 任一失败立即停止该 setting；
-7. 两次相邻提高的 goodput 改善均小于 `max(5%, 2×CV)`，或 GPU 在正 backlog 下持续忙且 ready queue
-   为正，即到平台期；
-8. 最终 static winner 才进入真实 backlog + PostgreSQL publication soak。
+7. 用完整主机 wall span 的正确整文档发布 goodput、资源稳定性和观测不确定性判断收益；
+   utilization 或 ready queue 单项不能证明达到平台期，不强制固定改善阈值或调参轮数；
+8. 通过完整性和恢复门的 exact profile 才在授权范围内进入真实 backlog + PostgreSQL publication soak，
+   覆盖持续资源周转、重启与清理；源码/隔离测试通过不替代实际吞吐验收。
 
 探索只在新 telemetry 下做一个短 anchor，除非 epoch/measurement path 漂移
 或噪声超阈值，否则不重复。验证集必须含 regular/heavy/huge、OCR、table/formula、跨 page/window 表格、

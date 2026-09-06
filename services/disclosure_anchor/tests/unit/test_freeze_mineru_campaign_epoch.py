@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -39,11 +40,11 @@ class FreezeMineruServiceEpochTests(unittest.TestCase):
             ), self.assertRaisesRegex(ValueError, "changed while reading"):
                 _read_private_json(path)
 
-    def test_freeze_records_clean_epoch_without_memory_reserve(self) -> None:
+    def _run_freeze(self, contract_version: str) -> tuple[int, dict[str, Any]]:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = {
-                "contract_version": "mineru-runtime-bundle.v8",
+                "contract_version": contract_version,
                 "topology": {
                     "windows_collector_sha256": COLLECTOR,
                     "windows_node_identity_sha256": NODE,
@@ -97,10 +98,25 @@ class FreezeMineruServiceEpochTests(unittest.TestCase):
                 )
             payload = json.loads(receipt.read_bytes())
 
+        return result, payload
+
+    def test_freeze_records_clean_epoch_without_memory_reserve(self) -> None:
+        result, payload = self._run_freeze("mineru-runtime-bundle.v8")
+
         self.assertEqual(result, 0)
         self.assertEqual(payload["schema"], "mineru-service-epoch-freeze.v2")
         self.assertEqual(payload["safety"]["restart_count_total"], 0)
         self.assertNotIn("reserve", json.dumps(payload, sort_keys=True))
+
+    def test_freeze_accepts_staged_v9_runtime_manifest(self) -> None:
+        result, payload = self._run_freeze("mineru-runtime-bundle.v9")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(payload["status"], "pass")
+
+    def test_freeze_rejects_unknown_runtime_manifest_contract(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "runtime manifest identity is invalid"):
+            self._run_freeze("mineru-runtime-bundle.v10")
 
 if __name__ == "__main__":
     unittest.main()

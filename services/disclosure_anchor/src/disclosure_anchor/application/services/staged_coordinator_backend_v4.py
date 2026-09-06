@@ -78,9 +78,6 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     V4ClaimWitness,
     seal_provider_ack_command_v4,
 )
-from disclosure_anchor.application.services.atomic_publication_request_factory_v4 import (
-    RecoverableAtomicPublicationRequestFactoryV4,
-)
 from disclosure_anchor.application.services.staged_coordinator_persistence_v4 import (
     DurableStagedCoordinatorPersistenceV4,
 )
@@ -103,6 +100,12 @@ class V4StageInputResolver(Protocol):
     ``RemoteParseV4Authority``.  Current mutable settings are not a legal
     substitute after a restart.
     """
+
+    def bind_stage(
+        self, authority: RemoteParseV4Authority, *, stage_guard: StageLeaseGuard,
+    ) -> V4StageInputResolver:
+        """Reopen H0 identity once for this exact stage; never a cross-stage cache."""
+        ...
 
     def source_pdf(self, authority: RemoteParseV4Authority) -> Path: ...
 
@@ -198,6 +201,15 @@ class V4SubmissionSnapshotPort(V4MaterializationPort, Protocol):
     ) -> PinnedSnapshotSourceV4: ...
 
 
+class V4NewWorkAdmissionPort(Protocol):
+    def admit_new(
+        self,
+        *,
+        limit: int,
+        available_credits: ResourceCreditVector,
+    ) -> AdmissionOutcome: ...
+
+
 _EvidenceT = TypeVar("_EvidenceT")
 
 
@@ -213,9 +225,10 @@ class DurableStagedCoordinatorBackendV4:
         materialization: V4SubmissionSnapshotPort,
         secret_cipher: ProviderSecretCipherPort,
         claim_guard: V4ClaimGuard,
-        publication_requests: RecoverableAtomicPublicationRequestFactoryV4,
         publisher: PrepareAndPublishWholeDocumentV4,
         poll_seconds: float,
+        new_work_admitter: V4NewWorkAdmissionPort | None = None,
+        publication_committed: Callable[[bool], None] = lambda _replaced: None,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
         if not 0 < poll_seconds <= 300:
@@ -228,8 +241,15 @@ class DurableStagedCoordinatorBackendV4:
         self._materialization = materialization
         self._secret_cipher = secret_cipher
         self._claim_guard = claim_guard
-        self._publication_requests = publication_requests
         self._publisher = publisher
+        if new_work_admitter is not None and not callable(
+            getattr(new_work_admitter, "admit_new", None)
+        ):
+            raise ValueError("v4 backend new-work admitter is invalid")
+        self._new_work_admitter = new_work_admitter or persistence
+        if not callable(publication_committed):
+            raise ValueError("v4 publication callback is invalid")
+        self._publication_committed = publication_committed
         self._poll_seconds = float(poll_seconds)
         self._wall_clock = wall_clock
 
@@ -255,7 +275,7 @@ class DurableStagedCoordinatorBackendV4:
         limit: int,
         available_credits: ResourceCreditVector,
     ) -> AdmissionOutcome:
-        return self._persistence.admit_new(
+        return self._new_work_admitter.admit_new(
             limit=limit,
             available_credits=available_credits,
         )
@@ -278,7 +298,7 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
-        authority = self._authority(work, "prepared", stage_guard)
+        authority, inputs = self._authority(work, "prepared", stage_guard)
         reservation = self._reservation(authority)
         preparation = self._evidence(
             authority,
@@ -296,14 +316,14 @@ class DurableStagedCoordinatorBackendV4:
                     checkpoint=authority.checkpoint,
                     reservation=reservation,
                     preparation_intent=preparation,
-                    source_pdf=self._inputs.source_pdf(authority),
+                    source_pdf=inputs.source_pdf(authority),
                     evidence=authority.evidence,
                     resourceful_checkpoint_history=authority.checkpoint_history,
                     claim=authority.claim_witness,
                     claim_guard=self._claim_guard,
                     stage_guard=stage_guard,
                 )
-            intent = self._inputs.submission_intent(authority, snapshot)
+            intent = inputs.submission_intent(authority, snapshot)
         except (ExpectedV4AttemptFailure, ParserOutputContractError) as exc:
             return self._fail_attempt(
                 work,
@@ -370,7 +390,7 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
-        authority = self._authority(work, "remote_terminal", stage_guard)
+        authority, inputs = self._authority(work, "remote_terminal", stage_guard)
         accepted = self._evidence(
             authority,
             "accepted_submission",
@@ -383,7 +403,7 @@ class DurableStagedCoordinatorBackendV4:
         )
         capability = self._capability(authority, accepted, "result_download")
         try:
-            intent = self._inputs.materialization_intent(
+            intent = inputs.materialization_intent(
                 authority,
                 accepted=accepted,
                 terminal=terminal,
@@ -425,7 +445,7 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
-        authority = self._authority(work, "materializing", stage_guard)
+        authority, inputs = self._authority(work, "materializing", stage_guard)
         reservation = self._reservation(authority)
         preparation = self._evidence(
             authority,
@@ -469,8 +489,8 @@ class DurableStagedCoordinatorBackendV4:
                 claim=authority.claim_witness,
                 claim_guard=self._claim_guard,
                 stage_guard=stage_guard,
-                result_lease_seconds=self._inputs.result_lease_seconds(authority),
-                allowance=self._inputs.materialization_allowance(authority, intent),
+                result_lease_seconds=inputs.result_lease_seconds(authority),
+                allowance=inputs.materialization_allowance(authority, intent),
                 replay_context=self._replay_context(authority),
             )
         except RemoteProviderUnavailableV4 as exc:
@@ -526,28 +546,31 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
-        authority = self._authority(work, "local_materialized", stage_guard)
+        authority, _inputs = self._authority(work, "local_materialized", stage_guard)
         self._require_credit_transition(
             authority.checkpoint,
             authority.checkpoint,
             credit_allowance,
         )
         materialized = self._reopen_materialized(authority, stage_guard)
-        request = self._publication_requests.build_or_reopen(
-            checkpoint=authority.checkpoint,
-            materialized=materialized,
-            stage_guard=stage_guard,
-        )
-        stage_guard.checkpoint()
-        self._publisher.execute(
-            request=request,
+        winner = self._publisher.execute(
             checkpoint=authority.checkpoint,
             materialized=materialized,
             claim=authority.claim_witness,
             claim_guard=self._claim_guard,
+            stage_guard=stage_guard,
         )
         stage_guard.checkpoint()
-        return self._persistence.reload_claim(work)
+        committed = self._persistence.reload_stage_claim(work, stage_guard=stage_guard)
+        if committed.state != "publish_committed":
+            raise RuntimeError(
+                "transaction P returned without a durable publish_committed head"
+            )
+        # Projection pruning is an idempotent generation signal. Replays can
+        # notify again, but may never notify before both transaction P and its
+        # durable lifecycle head are observable.
+        self._publication_committed(winner.previous_active_run_id is not None)
+        return committed
 
     def cleanup(
         self,
@@ -557,7 +580,7 @@ class DurableStagedCoordinatorBackendV4:
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
         if work.state == "publish_committed":
-            authority = self._authority(work, "publish_committed", stage_guard)
+            authority, _inputs = self._authority(work, "publish_committed", stage_guard)
             plan = self._build_cleanup_plan(authority, outcome="success")
             successor = advance_remote_parse_checkpoint_v4(
                 authority.checkpoint,
@@ -579,7 +602,7 @@ class DurableStagedCoordinatorBackendV4:
             )
         if work.state != "cleanup_pending":
             raise ValueError("cleanup lane received an unsupported V4 state")
-        authority = self._authority(work, "cleanup_pending", stage_guard)
+        authority, _inputs = self._authority(work, "cleanup_pending", stage_guard)
         source = authority.checkpoint_history[-2]
         plan = self._evidence(authority, "cleanup_plan", LocalCleanupPlanV4)
         intent = self._optional_evidence(
@@ -643,7 +666,7 @@ class DurableStagedCoordinatorBackendV4:
         *,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
-        authority = self._authority(work, "ack_pending", stage_guard)
+        authority, _inputs = self._authority(work, "ack_pending", stage_guard)
         accepted = self._evidence(
             authority,
             "accepted_submission",
@@ -713,7 +736,7 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
-        authority = self._authority(work, "reconciling", stage_guard)
+        authority, inputs = self._authority(work, "reconciling", stage_guard)
         snapshot = self._evidence(
             authority,
             "snapshot_receipt",
@@ -734,7 +757,7 @@ class DurableStagedCoordinatorBackendV4:
             claim=authority.claim_witness,
             claim_guard=self._claim_guard,
         )
-        command = self._inputs.submission_command(
+        command = inputs.submission_command(
             authority,
             snapshot=snapshot,
             intent=intent,
@@ -793,7 +816,7 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
-        authority = self._authority(work, "submitted", stage_guard)
+        authority, inputs = self._authority(work, "submitted", stage_guard)
         intent = self._evidence(
             authority,
             "submission_intent",
@@ -809,7 +832,7 @@ class DurableStagedCoordinatorBackendV4:
             accepted,
             "submitted_task_resume",
         )
-        command = self._inputs.poll_command(
+        command = inputs.poll_command(
             authority,
             intent=intent,
             accepted=accepted,
@@ -834,7 +857,7 @@ class DurableStagedCoordinatorBackendV4:
                 stage_guard=stage_guard,
             )
         if type(outcome) is RemoteProviderWaitingV4:
-            runaway = self._remote_runaway_failure(authority, intent)
+            runaway = self._remote_runaway_failure(authority, intent, inputs=inputs)
             if runaway is not None:
                 return self._fail_attempt(
                     work,
@@ -896,8 +919,9 @@ class DurableStagedCoordinatorBackendV4:
         self,
         authority: RemoteParseV4Authority,
         intent: SubmissionIntentV4,
+        *, inputs: V4StageInputResolver,
     ) -> ExpectedV4AttemptFailure | None:
-        limit = self._inputs.remote_runaway_seconds(authority)
+        limit = inputs.remote_runaway_seconds(authority)
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("V4 remote runaway limit is invalid")
         observed = self._wall_clock()
@@ -1192,13 +1216,15 @@ class DurableStagedCoordinatorBackendV4:
         work: CoordinatorWork,
         expected_state: str,
         stage_guard: StageLeaseGuard,
-    ) -> RemoteParseV4Authority:
+    ) -> tuple[RemoteParseV4Authority, V4StageInputResolver]:
         stage_guard.checkpoint()
         authority = self._persistence.load_owned_authority(work)
         stage_guard.checkpoint()
         if authority.state != expected_state:
             raise ValueError("durable V4 stage state changed before execution")
-        return authority
+        inputs = self._inputs.bind_stage(authority, stage_guard=stage_guard)
+        stage_guard.checkpoint()
+        return authority, inputs
 
     def _append(
         self,
@@ -1217,7 +1243,7 @@ class DurableStagedCoordinatorBackendV4:
             new_evidence=new_evidence,
             sealed_secret=sealed_secret,
         )
-        result = self._persistence.append_successor(work, append)
+        result = self._persistence.append_successor(work, append, stage_guard=stage_guard)
         stage_guard.checkpoint()
         return result
 

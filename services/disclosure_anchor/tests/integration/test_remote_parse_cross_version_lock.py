@@ -68,6 +68,7 @@ class RemoteParseCrossVersionLockIntegrationTests(unittest.TestCase):
     @staticmethod
     def _v4_creation(fixture: V4AuthorityFixture) -> V4PreparedCreation:
         return V4PreparedCreation(
+            execution_spec=fixture.execution_spec,
             checkpoint=fixture.prepared,
             reservation=fixture.reservation,
             preparation_intent=fixture.preparation,

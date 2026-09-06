@@ -5,6 +5,7 @@ from dataclasses import fields, replace
 import threading
 import time
 import unittest
+from unittest import mock
 
 from disclosure_anchor.application.contracts.staged_resource_credit import (
     STAGED_RESOURCE_STATE_TRANSITIONS,
@@ -258,6 +259,7 @@ class _Backend:
         self.claim_lease_seconds_override: float | None = None
         self.block_local_prepare = False
         self.local_prepare_entered = 0
+        self.local_prepare_exited = 0
         self.local_prepare_release = threading.Event()
         self.block_local = False
         self.local_entered = 0
@@ -466,6 +468,9 @@ class _Backend:
         updated = replace(
             _work(work.attempt_id, "reconciling", work.lifecycle_version + 1),
             claim_generation=work.claim_generation,
+            claim_owner_identity=work.claim_owner_identity,
+            lease_expires_monotonic=work.lease_expires_monotonic,
+            credit_reservation=work.credit_reservation,
         )
         self._assert_credit_grant(work, updated, credit_allowance)
         if self.transition_violation == "equal_version":
@@ -521,7 +526,13 @@ class _Backend:
             target = _work(
                 work.attempt_id, "remote_terminal", work.lifecycle_version + 1
             )
-        updated = replace(target, claim_generation=work.claim_generation)
+        updated = replace(
+            target,
+            claim_generation=work.claim_generation,
+            claim_owner_identity=work.claim_owner_identity,
+            lease_expires_monotonic=work.lease_expires_monotonic,
+            credit_reservation=work.credit_reservation,
+        )
         self._assert_credit_grant(work, updated, credit_allowance)
         return updated
 
@@ -536,7 +547,8 @@ class _Backend:
         stage_guard.checkpoint()
         self.local_prepare_entered += 1
         if self.block_local_prepare:
-            self.local_prepare_release.wait(timeout=2)
+            self.local_prepare_release.wait(timeout=10)
+        self.local_prepare_exited += 1
         if self.fail_local_prepare:
             self.outcome_by_attempt[work.attempt_id] = "local_failure"
             target = _work(
@@ -1043,6 +1055,101 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.credits_in_use, ResourceCreditVector())
         self.assertNotIn("remote:attempt-a", backend.calls)
 
+    def test_sustained_backlog_keeps_only_a_bounded_recent_final_sample(self) -> None:
+        for count in (16, 128):
+            with self.subTest(completions=count):
+                backend = _Backend(new=tuple(
+                    _work(f"attempt-{index:04}", "prepared") for index in range(count)
+                ))
+                result = StagedParseCoordinator(
+                    backend=backend,
+                    limits=_limits(recovery_page_size=4, admission_batch_size=4),
+                ).run()
+                self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+                self.assertEqual(result.completed, count)
+                self.assertLessEqual(len(result.final_states), 4)
+                self.assertEqual(result.credits_in_use, ResourceCreditVector())
+
+    def test_incomplete_admission_scan_does_not_quiesce_or_wait_for_credit(self) -> None:
+        class PagedBackend(_Backend):
+            pages = 0
+
+            def admit_new(self, *, limit, available_credits):
+                self.pages += 1
+                if self.pages < 4:
+                    return AdmissionOutcome(
+                        work=(), backlog_exists=True,
+                        blocked_dimensions=("output_pages",), scan_incomplete=True,
+                    )
+                return super().admit_new(limit=limit, available_credits=available_credits)
+
+        backend = PagedBackend(new=(_work("fitting", "prepared"),))
+        result = StagedParseCoordinator(backend=backend, limits=_limits()).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(result.completed, 1)
+        self.assertGreaterEqual(backend.pages, 4)
+
+    def test_profile_ineligible_backlog_is_visible_without_hot_retry(self) -> None:
+        class IneligibleBackend(_Backend):
+            pages = 0
+
+            def admit_new(self, *, limit, available_credits):
+                self.pages += 1
+                return AdmissionOutcome(
+                    work=(), backlog_exists=True, ineligible_dimensions=("output_pages",),
+                )
+
+        backend = IneligibleBackend()
+        snapshots = []
+        result = StagedParseCoordinator(
+            backend=backend, limits=_limits(), progress=snapshots.append,
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(backend.pages, 1)
+        self.assertEqual(snapshots[-1].blocked_reason, "profile_ineligible:output_pages")
+
+    def test_exhausted_scan_is_bounded_but_observes_arrivals_during_active_work(self) -> None:
+        for temporary_shortage in (False, True):
+            with self.subTest(temporary_shortage=temporary_shortage):
+                clock = _Clock()
+                probes = []
+
+                class ProbedBackend(_Backend):
+                    def admit_new(self, *, limit, available_credits):
+                        probes.append(clock())
+                        if clock() >= 1001.0 and self.new:
+                            return super().admit_new(
+                                limit=limit, available_credits=available_credits,
+                            )
+                        return AdmissionOutcome(
+                            work=(), backlog_exists=True,
+                            blocked_dimensions=("output_pages",) if temporary_shortage else (),
+                            ineligible_dimensions=() if temporary_shortage else ("output_pages",),
+                        )
+
+                backend = ProbedBackend(
+                    recoverable=(_work("running", "submitted", 2),),
+                    new=(_work("arriving", "prepared"),),
+                )
+                backend.clock = clock
+                backend.block_remote = True
+
+                def progress(_snapshot):
+                    clock.advance(0.05)
+                    if clock() >= 1003.0:
+                        backend.remote_release.set()
+
+                result = StagedParseCoordinator(
+                    backend=backend,
+                    limits=_limits(admission_probe_seconds=1.0, idle_open_circuit_seconds=30),
+                    monotonic=clock,
+                    progress=progress,
+                ).run()
+                self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+                self.assertEqual(result.completed, 2)
+                self.assertGreaterEqual(probes[1] - probes[0], 1.0)
+                self.assertLess(len(probes), 12)
+
     def test_recovery_barrier_renews_earlier_claims_before_they_expire(
         self,
     ) -> None:
@@ -1110,8 +1217,110 @@ class StagedParseCoordinatorTests(unittest.TestCase):
             backend.calls.index("ack:attempt-5:ack_pending"),
         )
 
-    def test_retry_timer_claim_is_renewed_before_it_reenters_the_lane(self) -> None:
+    def test_dispatch_budget_starts_after_admission_and_claim_renewal(self) -> None:
+        for short_claim in (False, True):
+            with self.subTest(short_claim=short_claim):
+                clock = _Clock()
+                remaining_at_entry: list[float] = []
+
+                class SlowAdmission(_Backend):
+                    did_admit = False
+
+                    def admit_new(
+                        self, *, limit: int, available_credits: ResourceCreditVector,
+                    ) -> AdmissionOutcome:
+                        if self.did_admit:
+                            return AdmissionOutcome(work=(), backlog_exists=False)
+                        self.did_admit = True
+                        clock.advance(61.0)
+                        work = replace(
+                            _work("slow-observation", "prepared"),
+                            lease_expires_monotonic=clock() + (15 if short_claim else 120),
+                        )
+                        return AdmissionOutcome(work=(work,), backlog_exists=False)
+
+                    def renew_claim(
+                        self, work: CoordinatorWork, *, lease_seconds: int,
+                    ) -> CoordinatorWork:
+                        clock.advance(9.0)
+                        return super().renew_claim(work, lease_seconds=lease_seconds)
+
+                    def prepare_remote_io(
+                        self, work: CoordinatorWork, *,
+                        credit_allowance: ResourceCreditVector, stage_guard: StageLeaseGuard,
+                    ) -> CoordinatorWork:
+                        remaining_at_entry.append(stage_guard.remaining_seconds())
+                        return super().prepare_remote_io(
+                            work, credit_allowance=credit_allowance, stage_guard=stage_guard,
+                        )
+
+                backend = SlowAdmission()
+                backend.clock = clock
+                result = StagedParseCoordinator(
+                    backend=backend,
+                    limits=_limits(max_stage_step_seconds=60, claim_lease_seconds=120),
+                    monotonic=clock,
+                ).run()
+                self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+                self.assertEqual(result.completed, 1)
+                self.assertEqual(result.errors, ())
+                self.assertEqual(remaining_at_entry, [60.0])
+
+    def test_dispatch_rechecks_lease_after_another_waiting_claim_renews(self) -> None:
         clock = _Clock()
+        dispatched_leases: list[tuple[float | None, float]] = []
+
+        class SlowRenewal(_Backend):
+            def renew_claim(
+                self, work: CoordinatorWork, *, lease_seconds: int,
+            ) -> CoordinatorWork:
+                clock.advance(9.0)
+                return super().renew_claim(work, lease_seconds=lease_seconds)
+
+            def prepare_remote_io(
+                self, work: CoordinatorWork, *,
+                credit_allowance: ResourceCreditVector, stage_guard: StageLeaseGuard,
+            ) -> CoordinatorWork:
+                if work.attempt_id == "second":
+                    dispatched_leases.append((
+                        work.lease_expires_monotonic, stage_guard.deadline_monotonic,
+                    ))
+                return super().prepare_remote_io(
+                    work, credit_allowance=credit_allowance, stage_guard=stage_guard,
+                )
+
+        backend = SlowRenewal(new=(
+            replace(_work("first", "prepared"), lease_expires_monotonic=clock() + 15),
+            replace(_work("second", "prepared"), lease_expires_monotonic=clock() + 70),
+        ))
+        backend.clock = clock
+        # The waiting scan sees second above the 65-second threshold. Renewing
+        # first takes nine seconds, so second needs renewal before dispatch.
+        # Two slots ensure the next waiting scan cannot mask a stale dispatch.
+        result = StagedParseCoordinator(
+            backend=backend,
+            limits=_limits(
+                preflight_workers=2, max_stage_step_seconds=60,
+                claim_renew_margin_seconds=5, claim_lease_seconds=120,
+            ),
+            monotonic=clock,
+        ).run()
+
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(result.completed, 2)
+        self.assertEqual(result.errors, ())
+        # Assert the immutable work actually submitted to the stage. A later
+        # in-flight renewal may race ahead of its body, masking stale dispatch
+        # in a calls-order assertion, but cannot replace this captured input.
+        self.assertEqual(len(dispatched_leases), 1)
+        lease, deadline = dispatched_leases[0]
+        assert lease is not None
+        self.assertGreater(lease, deadline + 5)
+
+    def test_retry_timer_claim_is_renewed_before_it_reenters_the_lane(self) -> None:
+        # A fake clock origin must be independent of host uptime. A successor
+        # rebuilt with time.monotonic() would spuriously expire at this origin.
+        clock = _Clock(1_000_000_000_000.0)
         backend = _Backend(recoverable=(_work("attempt-1", "submitted", 2),))
         backend.clock = clock
         backend.advance_clock = clock.advance
@@ -1380,6 +1589,63 @@ class StagedParseCoordinatorTests(unittest.TestCase):
                 in dict(snapshot.credit_blocked_by_lane)["remote"]
                 for snapshot in snapshots
             )
+        )
+        backend.local_prepare_release.set()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result_box[0].terminal, CoordinatorTerminal.QUIESCENT)
+
+    def test_remote_terminal_releases_wait_slot_for_next_provider_submit(
+        self,
+    ) -> None:
+        backend = _Backend(
+            new=(
+                _work("attempt-a", "prepared"),
+                _work("attempt-b", "prepared"),
+            )
+        )
+        # Hold A after the provider has returned.  A still owns its provider
+        # task/result/ACK credits, but it no longer owns the single remote-wait
+        # slot.  B must therefore reach the actual reconciling->submitted
+        # provider step instead of waiting for A's local tail to finish.
+        backend.block_local_prepare = True
+        result_box: list[CoordinatorResult] = []
+        thread = threading.Thread(
+            target=lambda: result_box.append(
+                StagedParseCoordinator(
+                    backend=backend,
+                    limits=_limits(
+                        preflight_workers=1,
+                        remote_workers=1,
+                        local_prepare_workers=1,
+                        credits=replace(
+                            _LIMIT,
+                            documents=2,
+                            snapshot_items=2,
+                            snapshot_bytes=200,
+                            remote_waits=1,
+                            provider_tasks=2,
+                            provider_result_bytes=200,
+                            ack_items=2,
+                        ),
+                    ),
+                ).run()
+            )
+        )
+        thread.start()
+        deadline = time.monotonic() + 2
+        while (
+            "remote:attempt-b:reconciling" not in backend.calls
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+
+        self.assertIn("local_prepare:attempt-a", backend.calls)
+        self.assertIn("remote:attempt-b:reconciling", backend.calls)
+        self.assertEqual(backend.local_prepare_exited, 0)
+        self.assertLess(
+            backend.calls.index("remote:attempt-a:submitted"),
+            backend.calls.index("remote:attempt-b:reconciling"),
         )
         backend.local_prepare_release.set()
         thread.join(timeout=2)
@@ -2173,6 +2439,55 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         result = result_box[0]
         self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
         self.assertEqual(result.errors, ())
+
+    def test_controller_probe_loss_revokes_and_actually_drains_running_stage(self) -> None:
+        from disclosure_anchor.cli import worker as worker_cli
+
+        controller_thread = threading.get_ident()
+        stage_drained = threading.Event()
+        probe_threads: list[int] = []
+        worker_threads: list[int] = []
+        backend = _Backend(recoverable=(_work("attempt-1", "submitted", 3),))
+        backend.block_remote = True
+        original_remote = backend.run_remote
+
+        def remote(work, *, credit_allowance, stage_guard):
+            worker_threads.append(threading.get_ident())
+            try:
+                return original_remote(
+                    work, credit_allowance=credit_allowance, stage_guard=stage_guard,
+                )
+            finally:
+                stage_drained.set()
+
+        def probe() -> None:
+            probe_threads.append(threading.get_ident())
+            worker_cli._assert_worker_admission(
+                lock_conn, mineru_checker=None,
+                singleton_guard=lambda: worker_cli._assert_staged_singleton(lock_conn),
+            )
+
+        backend.run_remote = remote  # type: ignore[method-assign]
+        lock_conn = mock.Mock()
+        lock_conn.execute.return_value.scalar_one.side_effect = (
+            lambda: not backend.remote_entered.is_set()
+        )
+        with (
+            mock.patch.object(worker_cli, "terminate_active_mineru_processes") as mineru_stop,
+            mock.patch.object(worker_cli, "terminate_active_semantic_processes") as semantic_stop,
+            self.assertRaisesRegex(RuntimeError, "singleton advisory lock was lost"),
+        ):
+            StagedParseCoordinator(
+                backend=backend, limits=_limits(), process_guard=probe,
+            ).run()
+        mineru_stop.assert_not_called()
+        semantic_stop.assert_not_called()
+        self.assertTrue(stage_drained.is_set())
+        self.assertFalse(backend.remote_release.is_set())
+        self.assertEqual(set(probe_threads), {controller_thread})
+        self.assertTrue(worker_threads)
+        self.assertNotIn(controller_thread, worker_threads)
+        self.assertFalse(any(call.startswith("commit:") for call in backend.calls))
 
     def test_inflight_claim_loss_revokes_the_running_stage_guard(self) -> None:
         initial = replace(

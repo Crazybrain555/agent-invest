@@ -16,6 +16,12 @@ from sqlalchemy.orm import Session
 from disclosure_anchor.adapters.db.postgres.remote_parse_v4_repository import (
     RemoteParseV4Repository as PostgresRemoteParseV4Repository,
 )
+from disclosure_anchor.adapters.db.postgres.remote_parse_v4_failure_committer import (
+    RemoteParseV4FailureCommitter as PostgresRemoteParseV4FailureCommitter,
+)
+from disclosure_anchor.adapters.db.postgres.remote_parse_v4_ingress import (
+    RemoteParseV4IngressCommitter as PostgresRemoteParseV4IngressCommitter,
+)
 from disclosure_anchor.adapters.db.postgres.repositories import (
     CompanyIdentifierRepository,
     CompanyRepository,
@@ -33,6 +39,12 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
 from disclosure_anchor.application.ports import repositories as ports_repos
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Repository as RemoteParseV4RepositoryPort,
+)
+from disclosure_anchor.application.ports.remote_parse_v4_failure_committer import (
+    RemoteParseV4FailureCommitter as RemoteParseV4FailureCommitterPort,
+)
+from disclosure_anchor.application.ports.remote_parse_v4_ingress import (
+    RemoteParseV4IngressCommitter as RemoteParseV4IngressCommitterPort,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.worker.locks import (
@@ -57,6 +69,8 @@ class SqlAlchemyUnitOfWork:
     processing_runs: ports_repos.ProcessingRunRepository
     remote_parse_attempts: ports_repos.RemoteParseAttemptRepository
     remote_parse_v4: RemoteParseV4RepositoryPort
+    remote_parse_v4_failures: RemoteParseV4FailureCommitterPort
+    remote_parse_v4_ingress: RemoteParseV4IngressCommitterPort
     document_units: ports_repos.DocumentUnitRepository
     outbox: ports_repos.OutboxRepository
     publish_evidence: ports_repos.PublishEvidenceRepository
@@ -157,7 +171,16 @@ class SqlAlchemyUnitOfWork:
         self.documents = DocumentRepository(session)
         self.processing_runs = ProcessingRunRepository(session)
         self.remote_parse_attempts = RemoteParseAttemptRepository(session)
-        self.remote_parse_v4 = PostgresRemoteParseV4Repository(session)
+        remote_parse_v4 = PostgresRemoteParseV4Repository(session)
+        self.remote_parse_v4 = remote_parse_v4
+        self.remote_parse_v4_failures = PostgresRemoteParseV4FailureCommitter(
+            session,
+            remote_parse_v4=remote_parse_v4,
+        )
+        self.remote_parse_v4_ingress = PostgresRemoteParseV4IngressCommitter(
+            session,
+            remote_parse_v4=remote_parse_v4,
+        )
         self.document_units = DocumentUnitRepository(session)
         self.outbox = OutboxRepository(session)
         self.publish_evidence = PublishEvidenceRepository(session)

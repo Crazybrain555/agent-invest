@@ -11,6 +11,9 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import models
+from disclosure_anchor.application.contracts.v4_prepared_execution_spec import (
+    V4PreparedExecutionSpec, decode_v4_prepared_execution_spec,
+)
 from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import (
     ProviderSecretBindingV4,
     SealedProviderSecretV4,
@@ -21,6 +24,7 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     EncodedRemoteParseEvidenceV4,
     LocalCleanupPlanV4,
     LocalCleanupReceiptV4,
+    MaterializationIntentV4,
     PreparationIntentV4,
     ProviderAckReceiptV4,
     SnapshotReceiptV4,
@@ -51,6 +55,8 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Authority,
     RemoteParseV4AuthorityViolation,
     V4AttemptFinal,
+    V4ExecutionSpecBackfillCandidate,
+    V4HistoricalLocalResources,
     V4ClaimGenerationExhausted,
     V4ClaimHeldByOther,
     V4ClaimLost,
@@ -61,6 +67,7 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4HeadNotFound,
     V4HeadStale,
     V4PreparedCreation,
+    V4PreparedProposal,
     V4ResourceFreeFailureCreation,
     V4ResourceFreeSupersessionCreation,
     V4SecretRevisionConflict,
@@ -69,6 +76,8 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4SuccessorNotCommitted,
     V4SuccessorReconciliation,
     V4SupersessionLinkAuthority,
+    bind_v4_prepared_proposal,
+    require_v4_execution_spec_binding,
 )
 from disclosure_anchor.application.ports.staged_provider_parser import (
     V4ClaimWitness,
@@ -126,6 +135,10 @@ _HELD_CREDIT_FIELDS = (
     "ack_items",
 )
 _V4_DEFERRED_CONSTRAINTS = (
+    "fk_v4_execution_spec_parent",
+    "fk_v4_execution_spec_preparation",
+    "fk_v4_checkpoint_execution_spec",
+    "ck_v4_execution_spec_closure",
     "fk_remote_parse_attempt_v4_current_checkpoint",
     "fk_remote_parse_v4_evidence_parent",
     "fk_remote_parse_v4_checkpoint_parent",
@@ -162,6 +175,121 @@ _V4_DEFERRED_CONSTRAINTS = (
 class RemoteParseV4Repository:
     def __init__(self, session: Session) -> None:
         self._session = session
+
+    def list_historical_local_resources(
+        self, *, after_attempt_id: str | None, limit: int,
+    ) -> tuple[V4HistoricalLocalResources, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("historical local resource page must be 1..100")
+        table = models.RemoteParseV4Evidence.__table__
+        query = sa.select(table.c.attempt_id).where(table.c.evidence_kind == "materialization_intent")
+        if after_attempt_id is not None:
+            _identity(after_attempt_id, "historical local resource cursor")
+            query = query.where(table.c.attempt_id.collate("C") > after_attempt_id)
+        attempts = self._session.execute(query.order_by(table.c.attempt_id.collate("C")).limit(limit)).scalars()
+        results = []
+        for attempt_id in attempts:
+            authority = self.load(attempt_id)
+            by_kind: dict[str, EncodedRemoteParseEvidenceV4] = {item.kind: item for item in authority.evidence}
+            intent = _evidence_value(by_kind, "materialization_intent", MaterializationIntentV4)
+            if intent is None:
+                raise RemoteParseV4AuthorityViolation("historical materialization intent disappeared")
+            results.append(V4HistoricalLocalResources(
+                intent, _evidence_value(by_kind, "cleanup_receipt", LocalCleanupReceiptV4),
+            ))
+        return tuple(results)
+
+    def list_execution_spec_backfill(
+        self, *, after_attempt_id: str | None, limit: int,
+    ) -> tuple[V4ExecutionSpecBackfillCandidate, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("execution spec backfill limit must be 1..100")
+        h0 = models.RemoteParseV4Checkpoint.__table__
+        query = sa.select(h0.c.attempt_id).where(
+            h0.c.lifecycle_version == 0,
+            h0.c.preparation_intent_sha256.is_not(None),
+        )
+        if after_attempt_id is not None:
+            _identity(after_attempt_id, "backfill cursor")
+            query = query.where(h0.c.attempt_id.collate("C") > after_attempt_id)
+        attempts = self._session.execute(
+            query.order_by(h0.c.attempt_id.collate("C")).limit(limit)
+        ).scalars().all()
+        result = []
+        for attempt_id in attempts:
+            head = self._select_head(attempt_id, lock="share")
+            preparation, reservation = self._backfill_h0(attempt_id)
+            exists = self._session.execute(sa.select(
+                models.RemoteParseV4ExecutionSpec.attempt_id
+            ).where(models.RemoteParseV4ExecutionSpec.attempt_id == attempt_id)).scalar_one_or_none()
+            spec = None
+            if exists is not None:
+                spec = self._load_execution_spec(head, preparation, reservation)
+                self._strict_authority(head)
+            result.append(V4ExecutionSpecBackfillCandidate(preparation, spec))
+        return tuple(result)
+
+    def _backfill_h0(self, attempt_id: str) -> tuple[PreparationIntentV4, ResourceReservationV4]:
+        table = models.RemoteParseV4Checkpoint.__table__
+        row = self._session.execute(sa.select(table).where(
+            table.c.attempt_id == attempt_id, table.c.lifecycle_version == 0,
+        )).mappings().one()
+        checkpoint, reservation = self._decode_checkpoint_row(row)
+        evidence = models.RemoteParseV4Evidence.__table__
+        preparation = self._decode_evidence_row(self._session.execute(
+            sa.select(evidence).where(
+                evidence.c.attempt_id == attempt_id,
+                evidence.c.evidence_sha256 == checkpoint.preparation_intent_sha256,
+            )
+        ).mappings().one()).value
+        if type(preparation) is not PreparationIntentV4 or reservation is None:
+            raise RemoteParseV4AuthorityViolation("backfill requires exact resourceful H0")
+        return preparation, reservation
+
+    def backfill_execution_spec(
+        self, *, attempt_id: str, spec: V4PreparedExecutionSpec,
+    ) -> None:
+        head = self._lock_authority_heads(attempt_id)
+        preparation, reservation = self._backfill_h0(attempt_id)
+        require_v4_execution_spec_binding(
+            spec, reservation, preparation,
+            parser_target_sha256=head["parser_target_sha256"],
+            client_submit_key=head["client_submit_key"],
+        )
+        table = models.RemoteParseV4ExecutionSpec.__table__
+        exists = self._session.execute(sa.select(table.c.attempt_id).where(
+            table.c.attempt_id == attempt_id,
+        )).scalar_one_or_none()
+        if exists is None:
+            self._session.execute(sa.insert(models.RemoteParseV4ExecutionSpec).values(
+                attempt_id=attempt_id, fence_identity=head["fence_identity"],
+                preparation_intent_sha256=preparation.sha256,
+                execution_spec_sha256=spec.sha256, execution_spec_bytes=spec.exact_bytes,
+                execution_spec_byte_count=spec.byte_count,
+            ))
+        authority = self._strict_authority(head)
+        if authority.execution_spec != spec:
+            raise RemoteParseV4AuthorityViolation("backfill replay bytes conflict")
+        self._force_v4_constraints()
+
+    def require_execution_spec_cutover(self) -> None:
+        validated = self._session.execute(sa.text(
+            "SELECT convalidated FROM pg_constraint WHERE conrelid="
+            "'disclosure_ops.remote_parse_v4_checkpoint'::regclass "
+            "AND conname='fk_v4_checkpoint_execution_spec'"
+        )).scalar_one_or_none()
+        if validated is not True:
+            raise RemoteParseV4AuthorityViolation("legacy retirement requires validated execution-spec cutover")
+
+    def require_legacy_execution_spec_retirable(self, spec: V4PreparedExecutionSpec) -> None:
+        self.require_execution_spec_cutover()
+        try:
+            authority = self.load(spec.prepared_submission.attempt_identity)
+        except V4HeadNotFound:
+            # Offline old-writer drain, not lease age, authorizes an orphan decision.
+            return
+        if authority.execution_spec != spec:
+            raise RemoteParseV4AuthorityViolation("legacy spec does not match the exact durable copy")
 
     def load(self, attempt_id: str) -> RemoteParseV4Authority:
         _identity(attempt_id, "attempt")
@@ -412,6 +540,56 @@ class RemoteParseV4Repository:
                 self._force_v4_constraints()
                 authority = self._strict_authority(
                     self._select_head(checkpoint.attempt_id, lock="update")
+                )
+        except IntegrityError as exc:
+            self._raise_creation_integrity(exc)
+        except DBAPIError as exc:
+            self._raise_authority_dbapi(
+                exc,
+                "v4 prepared creation violated durable authority",
+            )
+        return authority
+
+    def create_next_prepared(
+        self,
+        proposal: V4PreparedProposal,
+    ) -> RemoteParseV4Authority:
+        if type(proposal) is not V4PreparedProposal:
+            raise ValueError("v4 prepared proposal must be exact")
+        rows = self._lock_creation_chain(proposal.document_id)
+        existing = self._creation_row(rows, proposal.attempt_id)
+        if existing is not None:
+            authority = self._strict_authority(existing)
+            creation = bind_v4_prepared_proposal(
+                proposal,
+                attempt_generation=authority.attempt_generation,
+            )
+            self._require_prepared_replay(authority, creation)
+            return authority
+        next_generation = (
+            1
+            if not rows
+            else max(
+                cast(int, row["attempt_generation"])
+                for row in rows
+            )
+            + 1
+        )
+        self._guard_creation_chain(
+            rows=rows,
+            generations=(next_generation,),
+            allow_existing_current=False,
+        )
+        creation = bind_v4_prepared_proposal(
+            proposal,
+            attempt_generation=next_generation,
+        )
+        try:
+            with self._session.begin_nested():
+                self._insert_prepared_creation(creation, is_current=True)
+                self._force_v4_constraints()
+                authority = self._strict_authority(
+                    self._select_head(proposal.attempt_id, lock="update")
                 )
         except IntegrityError as exc:
             self._raise_creation_integrity(exc)
@@ -1435,6 +1613,15 @@ class RemoteParseV4Repository:
             != tuple(range(generations[0], generations[0] + len(generations)))
         ):
             raise ValueError("v4 creation generations are invalid")
+        stored_generations = tuple(
+            cast(int, row["attempt_generation"]) for row in rows
+        )
+        if stored_generations and stored_generations != tuple(
+            range(1, max(stored_generations) + 1)
+        ):
+            raise V4GenerationConflict(
+                "stored v4 generation chain is not contiguous"
+            )
         if not allow_existing_current and any(row["is_current"] for row in rows):
             raise V4DocumentCurrentConflict(
                 "document already has a current remote-parse attempt"
@@ -1471,6 +1658,7 @@ class RemoteParseV4Repository:
             or authority.reservation != creation.reservation
             or authority.parser_target_sha256 != creation.parser_target_sha256
             or authority.client_submit_key != creation.client_submit_key
+            or authority.execution_spec != creation.execution_spec
             or not _evidence_subset_exact(authority.evidence, tuple(expected))
         ):
             raise V4GenerationConflict(
@@ -1558,6 +1746,13 @@ class RemoteParseV4Repository:
         self._insert_evidence(
             encode_remote_parse_evidence_v4(creation.preparation_intent)
         )
+        spec = creation.execution_spec
+        self._session.execute(sa.insert(models.RemoteParseV4ExecutionSpec).values(
+            attempt_id=checkpoint.attempt_id, fence_identity=checkpoint.fence_identity,
+            preparation_intent_sha256=creation.preparation_intent.sha256,
+            execution_spec_sha256=spec.sha256, execution_spec_bytes=spec.exact_bytes,
+            execution_spec_byte_count=spec.byte_count,
+        ))
         if creation.snapshot_receipt is not None:
             self._insert_evidence(
                 encode_remote_parse_evidence_v4(creation.snapshot_receipt)
@@ -1960,7 +2155,39 @@ class RemoteParseV4Repository:
             source_supersession_link=source_link,
             staged_by_link=staged_by_link,
             database_lease=database_lease,
+            execution_spec=self._load_execution_spec(head, preparation, reservation),
         )
+
+    def _load_execution_spec(
+        self, head: Mapping[Any, Any], preparation: PreparationIntentV4 | None,
+        reservation: ResourceReservationV4 | None,
+    ) -> V4PreparedExecutionSpec | None:
+        table = models.RemoteParseV4ExecutionSpec.__table__
+        row = self._session.execute(
+            sa.select(table).where(table.c.attempt_id == head["attempt_id"])
+        ).mappings().one_or_none()
+        if preparation is None:
+            if row is not None:
+                raise RemoteParseV4AuthorityViolation("resource-free H0 has a spec row")
+            return None
+        if row is None:
+            raise RemoteParseV4AuthorityViolation("resourceful H0 lacks execution spec; cutover incomplete")
+        spec = decode_v4_prepared_execution_spec(_exact_bytes(row["execution_spec_bytes"], "execution spec"))
+        if (
+            row["fence_identity"] != head["fence_identity"]
+            or row["preparation_intent_sha256"] != preparation.sha256
+            or row["execution_spec_sha256"] != spec.sha256
+            or row["execution_spec_byte_count"] != spec.byte_count
+        ):
+            raise RemoteParseV4AuthorityViolation("execution spec row projection drifted")
+        if reservation is None:
+            raise RemoteParseV4AuthorityViolation("execution spec lacks H0 reservation")
+        require_v4_execution_spec_binding(
+            spec, reservation, preparation,
+            parser_target_sha256=head["parser_target_sha256"],
+            client_submit_key=head["client_submit_key"],
+        )
+        return spec
 
     @staticmethod
     def _decode_checkpoint_row(

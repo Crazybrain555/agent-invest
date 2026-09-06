@@ -67,6 +67,14 @@ class SubmissionAcceptanceAmbiguous(ParserOutputContractError):
     """Remote POST began but its acceptance cannot yet be reconciled."""
 
 
+class V4ResourceOwnershipError(RuntimeError):
+    """Unresolved local namespace ownership: circuit open, durable credits held.
+
+    Not a parser/item failure. Never authorize a fresh allocation, cleanup
+    receipt, successor, or ACK from this exception.
+    """
+
+
 _DURABLE_CHECKPOINT_STATES = frozenset(
     {
         "prepared",

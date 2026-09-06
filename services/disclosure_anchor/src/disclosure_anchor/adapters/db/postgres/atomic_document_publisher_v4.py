@@ -15,7 +15,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from disclosure_anchor.adapters.db.postgres import models
+from disclosure_anchor.adapters.db.postgres import mappers, models
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
     AtomicPublicationRequestV4,
@@ -52,10 +52,13 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Authority,
     V4SuccessorAppend,
 )
-from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness
+from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness, V4StageGuard
 from disclosure_anchor.application.worker.locks import acquire_document_xact_lock
 from disclosure_anchor.domain import entities as e
-from disclosure_anchor.domain.services.unit_hashing import query_projection
+from disclosure_anchor.application.services.atomic_publication_inventory_v4 import (
+    PreviousActiveUnitInventoryV4Error,
+    previous_active_unit_inventory_v4,
+)
 
 
 class PostgresAtomicWholeDocumentPublisherV4:
@@ -70,6 +73,7 @@ class PostgresAtomicWholeDocumentPublisherV4:
         *,
         claim: V4ClaimWitness,
         artifacts_ready: AtomicPublicationArtifactsReadyV4,
+        stage_guard: V4StageGuard,
     ) -> AtomicPublicationWinnerV4:
         if type(request) is not AtomicPublicationRequestV4:
             raise ValueError("transaction-P request must be exact V4")
@@ -117,6 +121,7 @@ class PostgresAtomicWholeDocumentPublisherV4:
                 )
                 return winner
 
+            stage_guard.checkpoint()
             authority = uow.remote_parse_v4.reload_claimed(
                 claim,
                 lock_for_transition=True,
@@ -203,6 +208,9 @@ class PostgresAtomicWholeDocumentPublisherV4:
                     "transaction-P previous active Unit inventory drifted"
                 )
 
+            # All lock waits above may outlive this stage. The winner-replay
+            # path is read-only; a new transaction-P write needs live authority.
+            stage_guard.checkpoint()
             publish_at = datetime.now(UTC)
             asset_ids = tuple(
                 item.asset_id
@@ -284,6 +292,9 @@ class PostgresAtomicWholeDocumentPublisherV4:
                 request=request,
                 context=context,
             )
+            # Everything before COMMIT is still rollback-safe, including
+            # writes that waited on indexes, constraints or the outbox.
+            stage_guard.checkpoint()
             commit_state.attempted = True
             uow.commit()
             commit_state.acknowledged = True
@@ -451,9 +462,14 @@ class PostgresAtomicWholeDocumentPublisherV4:
         projection: dict[str, Any],
         context: ProviderEnvelopeContextV4,
     ) -> None:
-        if candidate.is_active or candidate.status != "succeeded":
+        if (
+            candidate.is_active
+            or candidate.status != "running"
+            or candidate.finished_at is not None
+            or candidate.artifact_hash is not None
+        ):
             raise AtomicPublicationUniqueConflict(
-                "transaction-P candidate is not succeeded and inactive"
+                "transaction-P candidate is not an untouched running V4 ingress"
             )
         if (
             document.provider != context.provider
@@ -481,8 +497,6 @@ class PostgresAtomicWholeDocumentPublisherV4:
             != projection["parser_target_identity"]
             or candidate.input_raw_file_hash
             != request.upstream_evidence.source_pdf_sha256
-            or candidate.artifact_hash
-            != request.upstream_evidence.provider_document_sha256
             or candidate.unit_build_status
             != request.expected_unit_build_status_before
             or candidate.unit_build_attempt_count
@@ -522,40 +536,14 @@ class PostgresAtomicWholeDocumentPublisherV4:
     def _previous_inventory(
         rows: tuple[models.DocumentUnit, ...],
     ) -> tuple[PreviousActiveUnitV4, ...]:
-        result: list[PreviousActiveUnitV4] = []
-        for row in rows:
-            projection = query_projection(
-                payload_kind=row.payload_kind,
-                title=row.title,
-                heading_path=list(row.heading_path),
-                semantic_keys=(
-                    None if row.semantic_keys is None else list(row.semantic_keys)
-                ),
-                section_keys=(
-                    None if row.section_keys is None else list(row.section_keys)
-                ),
-                quality_status=row.quality_status,
-                applicability=row.applicability,
-                payload=cast(dict[str, Any], row.payload),
+        try:
+            return previous_active_unit_inventory_v4(
+                tuple(mappers.document_unit_to_entity(row) for row in rows)
             )
-            canonical = _canonical_json_text(projection)
-            if row.query_projection_hash != _digest(canonical.encode("utf-8")):
-                raise AtomicPublicationUniqueConflict(
-                    "transaction-P stored active Unit projection drifted"
-                )
-            result.append(
-                PreviousActiveUnitV4(
-                    asset_id=row.asset_id,
-                    processing_run_id=row.processing_run_id,
-                    order_index=row.order_index,
-                    payload_kind=row.payload_kind,
-                    heading_path=tuple(row.heading_path),
-                    content_hash=row.content_hash,
-                    query_projection_hash=cast(str, row.query_projection_hash),
-                    canonical_query_projection_json=canonical,
-                )
-            )
-        return tuple(result)
+        except PreviousActiveUnitInventoryV4Error as exc:
+            raise AtomicPublicationUniqueConflict(
+                "transaction-P stored active Unit projection drifted"
+            ) from exc
 
     @staticmethod
     def _apply_processing_projection(
@@ -568,6 +556,8 @@ class PostgresAtomicWholeDocumentPublisherV4:
             str,
             projection["artifact_owner_processing_run_id"],
         )
+        run.artifact_hash = cast(str, projection["provider_document_sha256"])
+        run.finished_at = publish_at
         run.status = cast(str, projection["status"])
         run.normalized_ir_relpath = cast(str | None, projection["normalized_ir_relpath"])
         run.parser_name = cast(str, projection["parser_name"])

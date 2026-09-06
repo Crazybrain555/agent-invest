@@ -22,6 +22,7 @@ import httpx
 
 from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import (
     MinerUHttpStagedParser,
+    prepare_submission_identity_v2,
 )
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     AcceptedSubmissionReceipt,
@@ -466,6 +467,37 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                     prepared_submission=prepared,
                 )
             self.assertEqual(calls, 0)
+
+    def test_public_v2_identity_builder_is_byte_identical_to_parser_method(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parser = MinerUHttpStagedParser(
+                api_url="http://mineru.test:30000/",
+                server_url="http://vlm.test:30000/v1",
+                spool_root=Path(directory) / "spool",
+            )
+            source_sha256 = "sha256:" + "b" * 64
+            expected = parser.prepare_submission_identity(
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
+            )
+
+            actual = prepare_submission_identity_v2(
+                api_url="http://mineru.test:30000/",
+                server_url="http://vlm.test:30000/v1",
+                options=PINNED_OPTIONS,
+                source_pdf_sha256=source_sha256,
+                attempt_identity="attempt-1",
+                fence_identity="fence-1",
+                submission_epoch_unix=1_000_000,
+            )
+
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual.exact_bytes, expected.exact_bytes)
+            self.assertEqual(actual.sha256, expected.sha256)
+            self.assertEqual(actual.request_sha256, expected.request_sha256)
 
     def test_post_ambiguous_responses_reconcile_delayed_acceptance(self) -> None:
         for mode in ("500", "truncated", "timeout-delayed"):

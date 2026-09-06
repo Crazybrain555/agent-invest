@@ -20,24 +20,37 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     AcceptedSubmissionReceiptV4,
     EncodedRemoteParseEvidenceV4,
     FailureReceiptV4,
+    MaterializationIntentV4,
+    LocalCleanupReceiptV4,
     PreparationIntentV4,
     SnapshotReceiptV4,
     SupersessionReceiptV4,
+    build_preparation_intent_v4,
     encode_remote_parse_evidence_v4,
     validate_durable_remote_parse_evidence_bundle_v4,
 )
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     RemoteParseCheckpointV4,
     ResourceReservationV4,
+    build_initial_remote_parse_checkpoint_v4,
+    build_resource_reservation_v4,
 )
 from disclosure_anchor.application.contracts.staged_credit import (
     DatabaseLeaseSnapshot,
+)
+from disclosure_anchor.application.contracts.staged_resource_credit import (
+    ResourceCreditVector,
+    StagedResourceCreditEnvelope,
 )
 from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     AtomicPublicationWinnerV4,
 )
 from disclosure_anchor.application.ports.staged_provider_parser import (
+    PreparedSubmissionIdentity,
     V4ClaimWitness,
+)
+from disclosure_anchor.application.contracts.v4_prepared_execution_spec import (
+    V4PreparedExecutionSpec,
 )
 
 _MAX_INT = (1 << 63) - 1
@@ -285,6 +298,7 @@ class RemoteParseV4Authority:
     source_supersession_link: V4SupersessionLinkAuthority | None
     staged_by_link: V4SupersessionLinkAuthority | None
     database_lease: DatabaseLeaseSnapshot | None
+    execution_spec: V4PreparedExecutionSpec | None = None
 
     def __post_init__(self) -> None:
         if type(self.checkpoint_history) is not tuple or not self.checkpoint_history:
@@ -319,6 +333,8 @@ class RemoteParseV4Authority:
             or self.claim_lease_until != self.database_lease.lease_until_utc
         ):
             raise ValueError("v4 authority database lease drifted")
+        if self.execution_spec is not None and type(self.execution_spec) is not V4PreparedExecutionSpec:
+            raise ValueError("v4 authority execution spec is not exact")
 
     @property
     def checkpoint(self) -> RemoteParseCheckpointV4:
@@ -347,6 +363,7 @@ class V4PreparedCreation:
     snapshot_receipt: SnapshotReceiptV4 | None
     parser_target_sha256: str
     client_submit_key: str
+    execution_spec: V4PreparedExecutionSpec
 
     def __post_init__(self) -> None:
         if (
@@ -395,6 +412,160 @@ class V4PreparedCreation:
             reservation=self.reservation,
             resourceful_checkpoint_history=(self.checkpoint,),
         )
+        require_v4_execution_spec_binding(
+            self.execution_spec, self.reservation, self.preparation_intent,
+            parser_target_sha256=self.parser_target_sha256,
+            client_submit_key=self.client_submit_key,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class V4PreparedProposal:
+    """Frozen generation-independent facts for one initial V4 head.
+
+    The repository allocates the document generation while holding the
+    document creation lock.  This value is deliberately data-only so no
+    caller-controlled IO, clock sampling, configuration lookup, or nested
+    transaction can run inside that lock.
+    """
+
+    document_id: str
+    processing_run_id: str
+    prepared_submission: PreparedSubmissionIdentity
+    credit_envelope: StagedResourceCreditEnvelope
+    execution_spec: V4PreparedExecutionSpec
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.document_id, "document"),
+            (self.processing_run_id, "processing run"),
+        ):
+            if type(value) is not str or not value.strip():
+                raise ValueError(f"v4 prepared proposal {label} is invalid")
+        if type(self.prepared_submission) is not PreparedSubmissionIdentity:
+            raise ValueError("v4 prepared proposal submission identity is invalid")
+        if type(self.credit_envelope) is not StagedResourceCreditEnvelope:
+            raise ValueError("v4 prepared proposal credit envelope is invalid")
+        if (type(self.execution_spec) is not V4PreparedExecutionSpec
+            or self.execution_spec.prepared_submission != self.prepared_submission):
+            raise ValueError("v4 prepared proposal execution spec is invalid")
+        source = self.credit_envelope.reservation_input.value
+        if self.prepared_submission.source_pdf_sha256 != source.source_pdf_sha256:
+            raise ValueError("v4 prepared proposal source identity drifted")
+
+    @property
+    def attempt_id(self) -> str:
+        return self.prepared_submission.attempt_identity
+
+    @property
+    def fence_identity(self) -> str:
+        return self.prepared_submission.fence_identity
+
+    @property
+    def prepared_submission_identity_sha256(self) -> str:
+        return self.prepared_submission.sha256
+
+    @property
+    def parser_target_sha256(self) -> str:
+        return self.prepared_submission.parser_target_identity_sha256
+
+    @property
+    def request_sha256(self) -> str:
+        return self.prepared_submission.request_sha256
+
+    @property
+    def runtime_epoch_sha256(self) -> str:
+        return self.prepared_submission.runtime_bundle_identity_sha256
+
+    @property
+    def client_submit_key(self) -> str:
+        return self.prepared_submission.client_submit_key
+
+
+def bind_v4_prepared_proposal(
+    proposal: V4PreparedProposal,
+    *,
+    attempt_generation: int,
+) -> V4PreparedCreation:
+    """Purely bind one locked document generation into a prepared H0."""
+
+    if type(proposal) is not V4PreparedProposal:
+        raise ValueError("v4 prepared proposal must be exact")
+    reservation_input = proposal.credit_envelope.reservation_input
+    source = reservation_input.value
+    reservation = build_resource_reservation_v4(
+        attempt_id=proposal.attempt_id,
+        attempt_generation=attempt_generation,
+        fence_identity=proposal.fence_identity,
+        document_id=proposal.document_id,
+        processing_run_id=proposal.processing_run_id,
+        source_pdf_sha256=source.source_pdf_sha256,
+        source_byte_count=source.source_byte_count,
+        source_page_count=source.source_page_count,
+        prepared_submission_identity_sha256=(
+            proposal.prepared_submission_identity_sha256
+        ),
+        request_sha256=proposal.request_sha256,
+        runtime_epoch_sha256=proposal.runtime_epoch_sha256,
+        process_profile_sha256=proposal.credit_envelope.process_profile_sha256,
+        credit_policy_sha256=proposal.credit_envelope.credit_policy_sha256,
+        reservation_bucket=source.bucket,
+        reservation_input_sha256=reservation_input.sha256,
+        reserved_credit=proposal.credit_envelope.reservation,
+    )
+    preparation_intent = build_preparation_intent_v4(
+        reservation=reservation,
+        parser_target_sha256=proposal.parser_target_sha256,
+        execution_spec_sha256=proposal.execution_spec.sha256,
+        execution_spec_byte_count=proposal.execution_spec.byte_count,
+    )
+    checkpoint = build_initial_remote_parse_checkpoint_v4(
+        reservation=reservation,
+        preparation_intent_sha256=preparation_intent.sha256,
+        held_resource_credit=ResourceCreditVector(
+            documents=1,
+            snapshot_items=1,
+            snapshot_bytes=source.source_byte_count,
+        ),
+    )
+    return V4PreparedCreation(
+        checkpoint=checkpoint,
+        reservation=reservation,
+        preparation_intent=preparation_intent,
+        snapshot_receipt=None,
+        parser_target_sha256=proposal.parser_target_sha256,
+        client_submit_key=proposal.client_submit_key,
+        execution_spec=proposal.execution_spec,
+    )
+
+
+def require_v4_execution_spec_binding(
+    spec: V4PreparedExecutionSpec | None,
+    reservation: ResourceReservationV4,
+    preparation: PreparationIntentV4,
+    *,
+    parser_target_sha256: str,
+    client_submit_key: str,
+) -> None:
+    """Bind immutable control bytes to the original H0, never current settings."""
+    if type(spec) is not V4PreparedExecutionSpec:
+        raise ValueError("resourceful v4 authority lacks an exact execution spec")
+    prepared = spec.prepared_submission
+    if (
+        spec.sha256 != preparation.execution_spec_sha256
+        or spec.byte_count != preparation.execution_spec_byte_count
+        or prepared.attempt_identity != reservation.attempt_id
+        or prepared.fence_identity != reservation.fence_identity
+        or prepared.source_pdf_sha256 != reservation.source_pdf_sha256
+        or prepared.sha256 != reservation.prepared_submission_identity_sha256
+        or prepared.request_sha256 != reservation.request_sha256
+        or prepared.runtime_bundle_identity_sha256 != reservation.runtime_epoch_sha256
+        or prepared.parser_target_identity_sha256 != parser_target_sha256
+        or prepared.client_submit_key != client_submit_key
+        or spec.process_profile_sha256 != reservation.process_profile_sha256
+        or preparation.reservation_sha256 != reservation.sha256
+    ):
+        raise ValueError("v4 execution spec drifted from immutable H0 authority")
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,6 +772,18 @@ class V4SecretRewrap:
             raise ValueError("v4 secret rewrap shape is invalid")
 
 
+@dataclass(frozen=True, slots=True)
+class V4ExecutionSpecBackfillCandidate:
+    preparation: PreparationIntentV4
+    execution_spec: V4PreparedExecutionSpec | None
+
+
+@dataclass(frozen=True, slots=True)
+class V4HistoricalLocalResources:
+    intent: MaterializationIntentV4
+    cleanup_receipt: LocalCleanupReceiptV4 | None
+
+
 class RemoteParseV4Repository(Protocol):
     """Transaction-scoped exact-CAS authority.
 
@@ -610,6 +793,27 @@ class RemoteParseV4Repository(Protocol):
     Claim/renew/reload/rewrap never acquire that lock after taking a head lock;
     document-authority mutations own the ``DOC_NS -> head`` order.
     """
+
+    def list_historical_local_resources(
+        self, *, after_attempt_id: str | None, limit: int,
+    ) -> tuple[V4HistoricalLocalResources, ...]:
+        """Exact all-intent history, including final and superseded attempts."""
+
+    def list_execution_spec_backfill(
+        self, *, after_attempt_id: str | None, limit: int,
+    ) -> tuple[V4ExecutionSpecBackfillCandidate, ...]:
+        """One all-history H0 page, including final/noncurrent attempts."""
+
+    def backfill_execution_spec(
+        self, *, attempt_id: str, spec: V4PreparedExecutionSpec,
+    ) -> None:
+        """Insert or reconcile exact legacy bytes; validate complete authority."""
+
+    def require_execution_spec_cutover(self) -> None:
+        """Require the historical spec FK validation before legacy retirement."""
+
+    def require_legacy_execution_spec_retirable(self, spec: V4PreparedExecutionSpec) -> None:
+        """Exact PG copy or no attempt at all; callers must prove old-writer drain."""
 
     def list_recoverable_heads(
         self,
@@ -654,6 +858,12 @@ class RemoteParseV4Repository(Protocol):
         self,
         creation: V4PreparedCreation,
     ) -> RemoteParseV4Authority: ...
+
+    def create_next_prepared(
+        self,
+        proposal: V4PreparedProposal,
+    ) -> RemoteParseV4Authority:
+        """Allocate the next generation and create H0 under one chain lock."""
 
     def create_resource_free_failure(
         self,
@@ -745,6 +955,7 @@ __all__ = [
     "V4HeadNotFound",
     "V4HeadStale",
     "V4PreparedCreation",
+    "V4PreparedProposal",
     "V4ResourceFreeFailureCreation",
     "V4ResourceFreeSupersessionCreation",
     "V4SecretRevisionConflict",
@@ -753,4 +964,5 @@ __all__ = [
     "V4SuccessorNotCommitted",
     "V4SuccessorReconciliation",
     "V4SupersessionLinkAuthority",
+    "bind_v4_prepared_proposal",
 ]

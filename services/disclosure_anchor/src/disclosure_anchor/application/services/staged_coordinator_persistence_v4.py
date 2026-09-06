@@ -1,9 +1,9 @@
 """Durable claim and admission slice for the staged V4 coordinator.
 
 This service deliberately implements only the PostgreSQL-backed persistence
-half of the coordinator backend.  It is not production-composable until the
-bounded remote, materialization, publication, cleanup, and ACK stage methods
-are added.  PostgreSQL remains the only authority: claim witnesses are rebuilt
+half of the coordinator backend. The default-off runtime composes it with
+bounded remote, materialization, publication, cleanup, and ACK stage methods.
+PostgreSQL remains the only authority: claim witnesses are rebuilt
 from a fresh durable load rather than kept in a process-local cache.
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, fields
+from datetime import UTC, datetime
 from math import isfinite
 import time
 
@@ -37,8 +38,13 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4SuccessorNotCommitted,
     V4SuccessorReconciliation,
 )
+from disclosure_anchor.application.ports.remote_parse_v4_failure_committer import (
+    V4FinalFailureCommit,
+    V4FinalFailureReconciliation,
+)
 from disclosure_anchor.application.ports.staged_provider_parser import (
     V4ClaimWitness,
+    V4StageGuard,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.staged_parse_coordinator import (
@@ -48,6 +54,7 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     CoordinatorWork,
     RecoveryDeferred,
 )
+from disclosure_anchor.domain import ids
 
 
 class StagedClaimLost(RuntimeError):
@@ -123,7 +130,10 @@ class DurableStagedCoordinatorPersistenceV4:
         uow_factory: Callable[[], UnitOfWork],
         limits: CoordinatorLimits,
         owner_identity: str,
+        process_guard: Callable[[], None] = lambda: None,
         monotonic: Callable[[], float] = time.monotonic,
+        utc_now: Callable[[], datetime] | None = None,
+        outbox_event_id_factory: Callable[[], str] = ids.new_outbox_event_id,
     ) -> None:
         if type(limits) is not CoordinatorLimits:
             raise ValueError("staged persistence requires exact coordinator limits")
@@ -133,12 +143,24 @@ class DurableStagedCoordinatorPersistenceV4:
             or len(owner_identity.encode("utf-8")) > 128
         ):
             raise ValueError("staged persistence owner identity is invalid")
-        if not callable(uow_factory) or not callable(monotonic):
+        if (
+            not callable(uow_factory)
+            or not callable(process_guard)
+            or not callable(monotonic)
+            or (utc_now is not None and not callable(utc_now))
+            or not callable(outbox_event_id_factory)
+        ):
             raise ValueError("staged persistence dependencies are invalid")
         self._uow_factory = uow_factory
         self._limits = limits
         self._owner_identity = owner_identity
+        self._process_guard = process_guard
         self._monotonic = monotonic
+        self._utc_now = utc_now or (lambda: datetime.now(UTC))
+        self._outbox_event_id_factory = outbox_event_id_factory
+        self._prepared_cursor: str | None = None
+        self._prepared_blocked_at: dict[str, int] = {}
+        self._prepared_ineligible: set[str] = set()
 
     def list_recoverable(
         self,
@@ -146,6 +168,7 @@ class DurableStagedCoordinatorPersistenceV4:
         after_attempt_id: str | None,
         limit: int,
     ) -> Sequence[RecoveryCandidate]:
+        self._process_guard()
         with self._uow_factory() as uow:
             return uow.remote_parse_v4.list_recoverable_heads(
                 after_attempt_id=after_attempt_id,
@@ -153,6 +176,7 @@ class DurableStagedCoordinatorPersistenceV4:
             )
 
     def claim_recovery(self, candidate: RecoveryCandidate) -> CoordinatorWork:
+        self._process_guard()
         if type(candidate) is not RecoveryCandidate:
             raise ValueError("recovery claim requires an exact candidate")
         observed = self._load(candidate.attempt_id)
@@ -164,6 +188,7 @@ class DurableStagedCoordinatorPersistenceV4:
         *,
         lease_seconds: int,
     ) -> CoordinatorWork:
+        self._process_guard()
         if type(work) is not CoordinatorWork:
             raise ValueError("claim renewal requires exact coordinator work")
         if (
@@ -229,6 +254,25 @@ class DurableStagedCoordinatorPersistenceV4:
         ) from last_unknown
 
     def reload_claim(self, work: CoordinatorWork) -> CoordinatorWork:
+        self._process_guard()
+        return self._reload_claim(work)
+
+    def reload_stage_claim(
+        self, work: CoordinatorWork, *, stage_guard: V4StageGuard,
+    ) -> CoordinatorWork:
+        """Reload on an executor connection without probing the singleton connection.
+
+        The controller owns the process probe and revokes running stage guards
+        before draining if that probe fails. Durable claim continuity is still
+        checked from a fresh, separately scoped unit of work.
+        """
+
+        stage_guard.checkpoint()
+        projected = self._reload_claim(work)
+        stage_guard.checkpoint()
+        return projected
+
+    def _reload_claim(self, work: CoordinatorWork) -> CoordinatorWork:
         if type(work) is not CoordinatorWork:
             raise ValueError("claim reload requires exact coordinator work")
         observed = self._load(work.attempt_id)
@@ -257,6 +301,8 @@ class DurableStagedCoordinatorPersistenceV4:
         self,
         work: CoordinatorWork,
         append: V4SuccessorAppend,
+        *,
+        stage_guard: V4StageGuard,
     ) -> CoordinatorWork:
         """Commit one exact successor and close a lost outer commit response."""
 
@@ -267,13 +313,31 @@ class DurableStagedCoordinatorPersistenceV4:
         self._require_same_work(work, baseline_work, ignore_lease=True)
         if append.claim != baseline.authority.claim_witness:
             raise StagedClaimLost("successor append claim drifted from durable work")
+        final_failure = (
+            V4FinalFailureCommit(
+                append=append,
+                failed_at=self._utc_now(),
+                outbox_event_id=self._outbox_event_id_factory(),
+            )
+            if append.successor.state
+            in {"pre_submission_failed", "remote_failed", "local_failed"}
+            else None
+        )
 
         for write_number in range(2):
+            stage_guard.checkpoint()
             try:
-                observed = self._append_transaction(append)
+                observed = self._append_transaction(
+                    append,
+                    final_failure=final_failure,
+                    stage_guard=stage_guard,
+                )
             except _MutationOutcomeUnknown as exc:
                 try:
-                    reconciled = self._reconcile_append(append)
+                    reconciled = self._reconcile_append(
+                        append,
+                        final_failure=final_failure,
+                    )
                 except V4SuccessorNotCommitted:
                     if write_number == 0:
                         continue
@@ -284,8 +348,10 @@ class DurableStagedCoordinatorPersistenceV4:
                     raise StagedClaimResponseLost(
                         f"{work.attempt_id}: successor outcome could not be reconciled"
                     ) from reconcile_exc
-                if not reconciled.authorization_still_live and not _is_final(
-                    reconciled.authority
+                if (
+                    type(reconciled) is V4SuccessorReconciliation
+                    and not reconciled.authorization_still_live
+                    and not _is_final(reconciled.authority)
                 ):
                     raise StagedClaimResponseLost(
                         f"{work.attempt_id}: successor committed after claim expiry"
@@ -300,6 +366,7 @@ class DurableStagedCoordinatorPersistenceV4:
         limit: int,
         available_credits: ResourceCreditVector,
     ) -> AdmissionOutcome:
+        self._process_guard()
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("admission limit must be a positive integer")
         if type(available_credits) is not ResourceCreditVector:
@@ -333,115 +400,103 @@ class DurableStagedCoordinatorPersistenceV4:
     ) -> AdmissionOutcome:
         selected: list[CoordinatorWork] = []
         selected_credits = ResourceCreditVector()
-        globally_blocked: list[ResourceCreditVector] = []
-        presently_blocked: list[ResourceCreditVector] = []
-        unprocessed_page_tail = False
-        unscanned_page_exists = False
-        cursor: str | None = None
-
-        while len(selected) < limit:
-            page = self._list_unclaimed_prepared(after_attempt_id=cursor)
-            if not page:
-                break
-            for index, candidate in enumerate(page):
-                cursor = candidate.attempt_id
-                if len(selected) >= limit:
-                    unprocessed_page_tail = True
-                    break
-                try:
-                    observed = self._load(candidate.attempt_id)
-                except V4HeadNotFound:
-                    continue
-                authority = observed.authority
-                if not self._is_unclaimed_prepared(authority):
-                    continue
-                reservation = authority.reservation
-                if reservation is None:
-                    raise RemoteParseV4AuthorityViolation(
-                        "unclaimed prepared head lacks its resource reservation"
-                    )
-                if not reservation.reserved_credit.fits(self._limits.credits):
-                    globally_blocked.append(reservation.reserved_credit)
-                    continue
-                remaining = available_credits - selected_credits
-                held = authority.checkpoint.held_resource_credit
-                if not held.fits(remaining):
-                    presently_blocked.append(held)
-                    continue
-                try:
-                    claimed = self._claim_observed(observed)
-                except RecoveryDeferred:
-                    continue
-                except (V4HeadStale, V4AttemptFinal):
-                    continue
-                if (
-                    claimed.state in STAGED_RESOURCE_STATE_TRANSITIONS
-                    and claimed.claim_owner_identity == self._owner_identity
-                ):
-                    durably_claimed.append(claimed)
-                if (
-                    claimed.state != "prepared"
-                    or claimed.lifecycle_version != 0
-                    or claimed.claim_owner_identity != self._owner_identity
-                ):
-                    if claimed.state in STAGED_RESOURCE_STATE_TRANSITIONS:
-                        raise RemoteParseV4AuthorityViolation(
-                            "admission claim returned a noninitial durable head"
-                        )
-                    continue
-                next_credits = selected_credits + claimed.credits
-                if not next_credits.fits(available_credits):
-                    raise RemoteParseV4AuthorityViolation(
-                        "admission claim exceeded the granted credits"
-                    )
-                selected.append(claimed)
-                selected_credits = next_credits
-                if index + 1 < len(page) and len(selected) >= limit:
-                    unprocessed_page_tail = True
-                    break
-            if unprocessed_page_tail or len(page) < self._limits.recovery_page_size:
-                break
-
+        if self._prepared_cursor is None:
+            self._prepared_blocked_at.clear()
+            self._prepared_ineligible.clear()
+        page = self._list_unclaimed_prepared(after_attempt_id=self._prepared_cursor)
+        ids_in_page = tuple(candidate.attempt_id for candidate in page)
         if (
-            len(selected) >= limit
-            and not unprocessed_page_tail
-            and not globally_blocked
-            and not presently_blocked
-            and cursor is not None
+            ids_in_page != tuple(sorted(set(ids_in_page)))
+            or (self._prepared_cursor is not None
+                and any(item <= self._prepared_cursor for item in ids_in_page))
         ):
-            unscanned_page_exists = bool(
-                self._list_unclaimed_prepared(
-                    after_attempt_id=cursor,
-                    limit=1,
+            raise RemoteParseV4AuthorityViolation("prepared admission cursor did not advance")
+        unprocessed = False
+        for candidate in page:
+            if len(selected) >= limit:
+                unprocessed = True
+                break
+            self._prepared_cursor = candidate.attempt_id
+            try:
+                observed = self._load(candidate.attempt_id)
+            except V4HeadNotFound:
+                continue
+            authority = observed.authority
+            if not self._is_unclaimed_prepared(authority):
+                continue
+            reservation = authority.reservation
+            if reservation is None:
+                raise RemoteParseV4AuthorityViolation(
+                    "unclaimed prepared head lacks its resource reservation"
                 )
-            )
+            if not reservation.reserved_credit.fits(self._limits.credits):
+                self._prepared_ineligible.update(
+                    item.name for item in fields(ResourceCreditVector)
+                    if getattr(reservation.reserved_credit, item.name)
+                    > getattr(self._limits.credits, item.name)
+                )
+                continue
+            remaining = available_credits - selected_credits
+            held = authority.checkpoint.held_resource_credit
+            if not held.fits(remaining):
+                for item in fields(ResourceCreditVector):
+                    available = getattr(remaining, item.name)
+                    if getattr(held, item.name) > available:
+                        self._prepared_blocked_at[item.name] = min(
+                            available, self._prepared_blocked_at.get(item.name, available),
+                        )
+                continue
+            try:
+                claimed = self._claim_observed(observed)
+            except (RecoveryDeferred, V4HeadStale, V4AttemptFinal):
+                continue
+            if (
+                claimed.state in STAGED_RESOURCE_STATE_TRANSITIONS
+                and claimed.claim_owner_identity == self._owner_identity
+            ):
+                durably_claimed.append(claimed)
+            if (
+                claimed.state != "prepared"
+                or claimed.lifecycle_version != 0
+                or claimed.claim_owner_identity != self._owner_identity
+            ):
+                if claimed.state in STAGED_RESOURCE_STATE_TRANSITIONS:
+                    raise RemoteParseV4AuthorityViolation(
+                        "admission claim returned a noninitial durable head"
+                    )
+                continue
+            next_credits = selected_credits + claimed.credits
+            if not next_credits.fits(available_credits):
+                raise RemoteParseV4AuthorityViolation(
+                    "admission claim exceeded the granted credits"
+                )
+            selected.append(claimed)
+            selected_credits = next_credits
 
-        remaining = available_credits - selected_credits
-        blocked = {
-            item.name
-            for vector in globally_blocked
-            for item in fields(ResourceCreditVector)
-            if getattr(vector, item.name) > getattr(self._limits.credits, item.name)
-        }
-        blocked.update(
-            item.name
-            for vector in presently_blocked
-            for item in fields(ResourceCreditVector)
-            if getattr(vector, item.name) > getattr(remaining, item.name)
+        # Exact-size pages need a later read to prove exhaustion. Never read
+        # the next page (or retain skipped-row vectors) within this tick.
+        incomplete = unprocessed or len(page) == self._limits.recovery_page_size
+        if not incomplete:
+            self._prepared_cursor = None
+            remaining = available_credits - selected_credits
+            incomplete = any(
+                getattr(remaining, name) > available
+                for name, available in self._prepared_blocked_at.items()
+            )
+        blocked = tuple(
+            item.name for item in fields(ResourceCreditVector)
+            if item.name in self._prepared_blocked_at
         )
-        canonical_blocked = tuple(
-            item.name for item in fields(ResourceCreditVector) if item.name in blocked
-        )
-        backlog_exists = bool(
-            globally_blocked
-            or presently_blocked
-            or unprocessed_page_tail
-            or unscanned_page_exists
+        ineligible = tuple(
+            item.name for item in fields(ResourceCreditVector)
+            if item.name in self._prepared_ineligible
         )
         return AdmissionOutcome(
             work=tuple(selected),
-            backlog_exists=backlog_exists,
-            blocked_dimensions=canonical_blocked,
+            backlog_exists=bool(incomplete or blocked or ineligible),
+            blocked_dimensions=blocked,
+            scan_incomplete=incomplete,
+            ineligible_dimensions=ineligible,
         )
 
     def _list_unclaimed_prepared(
@@ -523,12 +578,23 @@ class DurableStagedCoordinatorPersistenceV4:
     def _append_transaction(
         self,
         append: V4SuccessorAppend,
+        *,
+        final_failure: V4FinalFailureCommit | None,
+        stage_guard: V4StageGuard,
     ) -> _ObservedAuthority:
         before = self._now()
         mutation_returned = False
         try:
             with self._uow_factory() as uow:
-                authority = uow.remote_parse_v4.append_successor(append)
+                stage_guard.checkpoint()
+                authority = (
+                    uow.remote_parse_v4.append_successor(append)
+                    if final_failure is None
+                    else uow.remote_parse_v4_failures.commit(final_failure)
+                )
+                # A connection/row-lock wait may consume the stage budget.
+                # Before commit these mutations are still rollback-safe.
+                stage_guard.checkpoint()
                 mutation_returned = True
                 uow.commit()
         except Exception as exc:
@@ -544,9 +610,13 @@ class DurableStagedCoordinatorPersistenceV4:
     def _reconcile_append(
         self,
         append: V4SuccessorAppend,
-    ) -> V4SuccessorReconciliation:
+        *,
+        final_failure: V4FinalFailureCommit | None,
+    ) -> V4SuccessorReconciliation | V4FinalFailureReconciliation:
         with self._uow_factory() as uow:
-            return uow.remote_parse_v4.reconcile_successor(append)
+            if final_failure is None:
+                return uow.remote_parse_v4.reconcile_successor(append)
+            return uow.remote_parse_v4_failures.reconcile(final_failure)
 
     def _project_transition_result(
         self,

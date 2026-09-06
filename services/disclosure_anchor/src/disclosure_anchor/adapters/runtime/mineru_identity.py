@@ -13,6 +13,7 @@ from typing import Any
 
 
 RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v8"
+STAGED_RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v9"
 MINERU_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_PROTOCOL_VERSION = 2
 MINERU_API_DEFAULT_TASK_SLOTS = 1
@@ -22,6 +23,9 @@ MINERU_HYBRID_BATCH_RATIO = 1
 MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED = True
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS = 30
+MINERU_API_TASK_REGISTRY_MAX_RECORDS = 128
+MINERU_API_RESULT_RESERVATION_BYTES = 256 * 1024 * 1024
+MINERU_API_MAX_UNACKED_RESULT_BYTES = 2 * 1024 * 1024 * 1024
 MINERU_API_OUTPUT_ROOT_POLICY = "dedicated-scratch-retention.v1"
 MINERU_API_TRANSPORT_PROFILE = "pinned-ssh-local-forward.v1"
 MINERU_API_EXPOSURE_POLICY = "windows-loopback-only.v1"
@@ -85,6 +89,11 @@ _ORCHESTRATOR_MANIFEST_FIELDS = {
     "task_cleanup_interval_seconds",
     "output_root_policy",
     "command",
+}
+_STAGED_ORCHESTRATOR_MANIFEST_FIELDS = _ORCHESTRATOR_MANIFEST_FIELDS | {
+    "task_registry_max_records",
+    "task_result_reservation_bytes",
+    "max_unacked_result_bytes",
 }
 _INFERENCE_SERVER_MANIFEST_FIELDS = {
     "container_image_digest",
@@ -152,6 +161,7 @@ class MinerUClientIdentity:
 @dataclass(frozen=True)
 class VerifiedMinerURuntimeManifest:
     manifest: dict[str, Any]
+    contract_version: str
     identity_sha256: str
     orchestrator_identity_sha256: str
     provider_identity_sha256: str
@@ -259,9 +269,13 @@ def verify_runtime_manifest_payload(
     manifest = payload.get("manifest")
     if not isinstance(manifest, dict):
         raise ValueError("runtime attestation manifest must be an object")
-    if manifest.get("contract_version") != RUNTIME_MANIFEST_CONTRACT:
+    contract_version = manifest.get("contract_version")
+    if contract_version not in {
+        RUNTIME_MANIFEST_CONTRACT,
+        STAGED_RUNTIME_MANIFEST_CONTRACT,
+    }:
         raise ValueError(
-            f"runtime manifest contract must be {RUNTIME_MANIFEST_CONTRACT}"
+            "runtime manifest contract is unsupported"
         )
     if set(manifest) != _MANIFEST_FIELDS:
         raise ValueError("runtime manifest fields are not closed")
@@ -289,7 +303,12 @@ def verify_runtime_manifest_payload(
         )
     if set(local) != _CLIENT_MANIFEST_FIELDS:
         raise ValueError("runtime manifest client fields are not closed")
-    if set(orchestrator) != _ORCHESTRATOR_MANIFEST_FIELDS:
+    expected_orchestrator_fields = (
+        _STAGED_ORCHESTRATOR_MANIFEST_FIELDS
+        if contract_version == STAGED_RUNTIME_MANIFEST_CONTRACT
+        else _ORCHESTRATOR_MANIFEST_FIELDS
+    )
+    if set(orchestrator) != expected_orchestrator_fields:
         raise ValueError("runtime manifest orchestrator fields are not closed")
     if set(inference_server) != _INFERENCE_SERVER_MANIFEST_FIELDS:
         raise ValueError("runtime manifest inference-server fields are not closed")
@@ -311,12 +330,14 @@ def verify_runtime_manifest_payload(
     _verify_orchestrator_manifest(
         orchestrator,
         expected_processing_window_size=local_processing_window_size,
+        contract_version=contract_version,
     )
     _verify_inference_server_manifest(inference_server)
     _verify_topology_manifest(topology)
     served_model_id = inference_server["served_model_id"]
     return VerifiedMinerURuntimeManifest(
         manifest=dict(manifest),
+        contract_version=contract_version,
         identity_sha256=manifest_identity,
         orchestrator_identity_sha256=canonical_payload_sha256(orchestrator),
         provider_identity_sha256=canonical_payload_sha256(inference_server),
@@ -330,6 +351,7 @@ def _verify_orchestrator_manifest(
     orchestrator: dict[str, Any],
     *,
     expected_processing_window_size: int,
+    contract_version: str,
 ) -> None:
     _require_sha256(
         orchestrator.get("container_image_digest"),
@@ -402,6 +424,18 @@ def _verify_orchestrator_manifest(
         )
     if orchestrator.get("output_root_policy") != MINERU_API_OUTPUT_ROOT_POLICY:
         raise ValueError("runtime manifest orchestrator output-root policy drifted")
+    if contract_version == STAGED_RUNTIME_MANIFEST_CONTRACT:
+        staged_capacity = {
+            "task_registry_max_records": MINERU_API_TASK_REGISTRY_MAX_RECORDS,
+            "task_result_reservation_bytes": MINERU_API_RESULT_RESERVATION_BYTES,
+            "max_unacked_result_bytes": MINERU_API_MAX_UNACKED_RESULT_BYTES,
+        }
+        for field, expected in staged_capacity.items():
+            value = orchestrator.get(field)
+            if isinstance(value, bool) or value != expected:
+                raise ValueError(
+                    f"runtime manifest orchestrator {field} must be {expected}"
+                )
     command = _verified_command(
         orchestrator.get("command"),
         component="orchestrator",
@@ -576,6 +610,9 @@ __all__ = [
     "MINERU_API_PROTOCOL_VERSION",
     "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS",
+    "MINERU_API_TASK_REGISTRY_MAX_RECORDS",
+    "MINERU_API_RESULT_RESERVATION_BYTES",
+    "MINERU_API_MAX_UNACKED_RESULT_BYTES",
     "MINERU_API_TRANSPORT_PROFILE",
     "MINERU_CONTENT_PACKAGE_VERSIONS",
     "MINERU_HEAP_RETURN_POLICY",
@@ -587,6 +624,7 @@ __all__ = [
     "MINERU_WINDOWS_COLLECTOR_PATH",
     "MINERU_WINDOWS_COMPOSE_PATH",
     "RUNTIME_MANIFEST_CONTRACT",
+    "STAGED_RUNTIME_MANIFEST_CONTRACT",
     "MinerUClientIdentity",
     "VerifiedMinerURuntimeManifest",
     "canonical_payload_sha256",

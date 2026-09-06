@@ -67,7 +67,7 @@ def _observation() -> dict[str, Any]:
         item.partition("=")[0]: item.partition("=")[2] for item in api_environment
     }
     return {
-        "schema": "mineru-windows-runtime-observation.v3",
+        "schema": "mineru-windows-runtime-observation.v4",
         "collector_path": EXPECTED_COLLECTOR_PATH,
         "collector_sha256": "sha256:" + "7" * 64,
         "compose_path": r"C:\ProgramData\compose.tailnet.yaml",
@@ -150,6 +150,9 @@ def _observation() -> dict[str, Any]:
             "max_pending_tasks_effective": 1,
             "pipeline_inference_locks_enabled": True,
             "task_protocol_v2_enabled": True,
+            "task_registry_max_records": 128,
+            "task_result_reservation_bytes": 256 * 1024 * 1024,
+            "max_unacked_result_bytes": 2 * 1024 * 1024 * 1024,
             "image_labels": {
                 "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
                 "io.agent-invest.mineru.capacity-policy": (
@@ -307,6 +310,10 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                 "max_pending_tasks_requested",
                 "phase_trace_enabled",
                 "pipeline_inference_locks_enabled",
+                "task_protocol_v2_enabled",
+                "task_registry_max_records",
+                "task_result_reservation_bytes",
+                "max_unacked_result_bytes",
             },
         )
 
@@ -397,6 +404,9 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             "task_slots_drift",
             "pending_health_drift",
             "pending_compatibility_drift",
+            "registry_capacity_drift",
+            "result_reservation_drift",
+            "unacked_bytes_drift",
         ):
             with self.subTest(tamper=tamper):
                 observation = _observation()
@@ -430,6 +440,18 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                     observation["api_compatibility"][
                         "max_pending_tasks_effective"
                     ] = 2
+                elif tamper == "registry_capacity_drift":
+                    observation["api_compatibility"][
+                        "task_registry_max_records"
+                    ] = 127
+                elif tamper == "result_reservation_drift":
+                    observation["api_compatibility"][
+                        "task_result_reservation_bytes"
+                    ] = 1
+                elif tamper == "unacked_bytes_drift":
+                    observation["api_compatibility"][
+                        "max_unacked_result_bytes"
+                    ] = 1
                 else:
                     observation["api_compatibility"]["heap_trim_enabled"] = False
                 with (

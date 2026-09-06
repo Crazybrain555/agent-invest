@@ -64,6 +64,16 @@ _RECORD_RELPATH = Path(
 
 
 class ProviderDocumentAdmissionTests(unittest.TestCase):
+    def test_source_pdf_observation_requires_exact_positive_byte_count(self) -> None:
+        for invalid in (True, 0, -1, 1.5):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "byte count"):
+                    SourcePdfObservation(
+                        sha256=_SOURCE_SHA,
+                        byte_count=invalid,  # type: ignore[arg-type]
+                        page_count=1,
+                    )
+
     def test_m4_admission_requires_and_verifies_v2_readiness(self) -> None:
         envelope = _envelope()
         record = provider_document_envelope_to_bytes(envelope)
@@ -246,6 +256,68 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_materialized_admission_delegates_the_same_source_projection(self) -> None:
+        envelope = _envelope()
+        record = provider_document_envelope_to_bytes(envelope)
+        run = _run(artifact_hash=_sha_bytes(record))
+        durable = _admission(
+            _FakeSource(record=record, rebuilt=envelope.provider_document)
+        ).admit(
+            document=_document(),
+            run=run,
+            artifact_owner=run,
+            security_code="000001",
+        )
+        materialized_source = _FakeSource(
+            record=b"unused",
+            rebuilt=envelope.provider_document,
+        )
+
+        materialized = _admission(materialized_source).admit_materialized(
+            document=_document(),
+            envelope=envelope,
+            provider_document_sha256=_sha_bytes(record),
+            expected_source_byte_count=1,
+            security_code="000001",
+        )
+
+        self.assertEqual(materialized, durable)
+        self.assertEqual(
+            materialized_source.calls,
+            [
+                ("pdf", Path(envelope.source_pdf_relpath)),
+                (
+                    "native_text",
+                    Path(envelope.source_pdf_relpath),
+                    envelope.provider_document,
+                    _SOURCE_SHA,
+                ),
+            ],
+        )
+
+    def test_materialized_admission_rejects_receipt_or_source_size_drift(self) -> None:
+        envelope = _envelope()
+        record = provider_document_envelope_to_bytes(envelope)
+        cases = (
+            (_sha_bytes(b"different"), 1, "provider document bytes"),
+            (_sha_bytes(record), 2, "source PDF bytes"),
+        )
+        for record_hash, byte_count, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ProviderDocumentAdmissionError, message):
+                    _admission(
+                        _FakeSource(
+                            record=b"unused",
+                            rebuilt=envelope.provider_document,
+                        )
+                    ).admit_materialized(
+                        document=_document(),
+                        envelope=envelope,
+                        provider_document_sha256=record_hash,
+                        expected_source_byte_count=byte_count,
+                        security_code="000001",
+                    )
 
     def test_reconciles_only_exact_skeleton_numeric_source_text(self) -> None:
         original = _provider_document()
@@ -1095,6 +1167,7 @@ class ProviderDocumentAdmissionTests(unittest.TestCase):
                     rebuilt=envelope.provider_document,
                     observation=SourcePdfObservation(
                         sha256="sha256:" + "0" * 64,
+                        byte_count=1,
                         page_count=1,
                     ),
                 ),
@@ -1484,6 +1557,7 @@ class _FakeSource:
         self.rebuilt = rebuilt
         self.observation = observation or SourcePdfObservation(
             sha256=_SOURCE_SHA,
+            byte_count=1,
             page_count=1,
         )
         self.text_observations = text_observations

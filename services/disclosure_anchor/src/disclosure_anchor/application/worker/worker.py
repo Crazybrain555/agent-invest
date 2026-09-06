@@ -45,6 +45,9 @@ from disclosure_anchor.application.ports.file_store import (
     RawDocumentStorePort,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.new_work_admission import (
+    NewWorkAdmissionUnavailable,
+)
 from disclosure_anchor.application.ports.provider_document_source import (
     ProviderDocumentSourcePort,
 )
@@ -121,7 +124,7 @@ PARSER_READINESS_RETRY_SECONDS = 5.0
 DOWNSTREAM_CONTROL_EVIDENCE_SECONDS = 300.0
 
 
-class WorkerAdmissionUnavailableError(RuntimeError):
+class WorkerAdmissionUnavailableError(NewWorkAdmissionUnavailable):
     """A typed transient service outage paused new resident admissions."""
 
 

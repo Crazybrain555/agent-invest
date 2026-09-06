@@ -12,6 +12,12 @@ from typing import Protocol, Self, runtime_checkable
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Repository,
 )
+from disclosure_anchor.application.ports.remote_parse_v4_failure_committer import (
+    RemoteParseV4FailureCommitter,
+)
+from disclosure_anchor.application.ports.remote_parse_v4_ingress import (
+    RemoteParseV4IngressCommitter,
+)
 from disclosure_anchor.application.ports.repositories import (
     CompanyIdentifierRepository,
     CompanyRepository,
@@ -40,6 +46,8 @@ class UnitOfWork(Protocol):
     processing_runs: ProcessingRunRepository
     remote_parse_attempts: RemoteParseAttemptRepository
     remote_parse_v4: RemoteParseV4Repository
+    remote_parse_v4_failures: RemoteParseV4FailureCommitter
+    remote_parse_v4_ingress: RemoteParseV4IngressCommitter
     document_units: DocumentUnitRepository
     outbox: OutboxRepository
     publish_evidence: PublishEvidenceRepository

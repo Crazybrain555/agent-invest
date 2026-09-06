@@ -73,7 +73,7 @@ class MigrationStateTests(unittest.TestCase):
             "0057_remote_parse_v4_authority",
         )
 
-    def test_0059_is_adjacent_to_0058_and_is_the_only_head(self) -> None:
+    def test_0059_is_adjacent_to_0058(self) -> None:
         migration = importlib.import_module(
             "disclosure_anchor.adapters.db.postgres.migrations.versions."
             "0059_v4_delayed_snapshot_transition"
@@ -87,7 +87,18 @@ class MigrationStateTests(unittest.TestCase):
             migration.down_revision,
             "0058_v4_supersession_stage",
         )
-        self.assertEqual(migration_heads(), (migration.revision,))
+
+    def test_execution_spec_migrations_extend_0059(self) -> None:
+        artifact = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0060_v4_execution_spec_artifact"
+        )
+        validation = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0061_validate_v4_execution_spec_artifact"
+        )
+        self.assertEqual(artifact.down_revision, "0059_v4_delayed_snapshot")
+        self.assertEqual(validation.down_revision, artifact.revision)
 
     def test_0059_changes_only_delayed_snapshot_evidence_allowance(self) -> None:
         migration = importlib.import_module(

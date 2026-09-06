@@ -57,6 +57,7 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     MaterializedProviderDocumentV4,
     V4ClaimGuard,
     V4ClaimWitness,
+    V4StageGuard,
 )
 from disclosure_anchor.domain.ids import new_asset_id
 
@@ -87,7 +88,9 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         materialized: MaterializedProviderDocumentV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> AtomicPublicationReadinessReferenceV1:
+        stage_guard.checkpoint()
         self._validate_input_evidence(
             request=request,
             checkpoint=checkpoint,
@@ -102,6 +105,7 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
                 materialized=materialized,
             )
             try:
+                stage_guard.checkpoint()
                 self._store.create_or_verify(
                     relpath=preparation_relpath,
                     payload=candidate.canonical_bytes,
@@ -122,12 +126,14 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
 
         # The parser tree is installed first; each derived file follows using
         # immutable create-or-verify.  Readiness is the sole last write.
+        stage_guard.checkpoint()
         self._promotion.promote_or_replay(
             checkpoint=checkpoint,
             materialized=materialized,
             published_relpath=preparation.parser_output_plan.published_relpath,
             claim=claim,
             claim_guard=claim_guard,
+            stage_guard=stage_guard,
         )
         provider_bytes = provider_document_envelope_to_bytes(
             materialized.provider_envelope
@@ -148,6 +154,7 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
                 raise AtomicPublicationArtifactReadinessError(
                     f"{plan.role} bytes drifted from preparation"
                 )
+            stage_guard.checkpoint()
             self._store.create_or_verify(
                 relpath=Path(plan.relpath),
                 payload=payload,
@@ -157,6 +164,7 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
             preparation=preparation,
             preparation_relpath=preparation_relpath,
         )
+        stage_guard.checkpoint()
         self._store.create_or_verify(
             relpath=readiness_relpath,
             payload=manifest.canonical_bytes,

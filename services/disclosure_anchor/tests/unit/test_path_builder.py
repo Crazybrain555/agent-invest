@@ -242,6 +242,75 @@ class PathBuilderTests(unittest.TestCase):
                 ),
             )
 
+    def test_v4_parser_run_path_closes_source_and_target_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            builder = FileStorePathBuilder(_settings(Path(tmp)))
+            source_sha256 = "sha256:" + "a" * 64
+
+            relpath = builder.parser_run_artifacts_v4_relpath(
+                provider="cninfo",
+                security_code="002484",
+                provider_document_id="1225087169",
+                processing_run_id="run_01K0000000000000000000000",
+                source_pdf_sha256=source_sha256,
+                parser_backend="hybrid-http-client",
+                parser_method="auto",
+            )
+
+            self.assertEqual(
+                relpath,
+                Path(
+                    "parser_artifacts/cninfo/002484/1225087169/"
+                    "run_01K0000000000000000000000/"
+                    f"sha256_{'a' * 64}/hybrid_auto"
+                ),
+            )
+            self.assertEqual(len(relpath.parts), 7)
+
+    def test_v4_parser_run_path_rejects_noncanonical_or_unsafe_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            builder = FileStorePathBuilder(_settings(Path(tmp)))
+            valid = {
+                "provider": "cninfo",
+                "security_code": "002484",
+                "provider_document_id": "1225087169",
+                "processing_run_id": "run_01K0000000000000000000000",
+                "source_pdf_sha256": "sha256:" + "a" * 64,
+                "parser_backend": "hybrid-http-client",
+                "parser_method": "auto",
+            }
+            invalid = (
+                ("source_pdf_sha256", "sha256:" + "A" * 64),
+                ("parser_backend", "hybrid/http-client"),
+                ("parser_method", "../auto"),
+            )
+
+            for field, value in invalid:
+                with self.subTest(field=field):
+                    with self.assertRaises(PathSafetyError):
+                        builder.parser_run_artifacts_v4_relpath(
+                            **{**valid, field: value}
+                        )
+
+    def test_v4_execution_spec_path_is_content_addressed_and_sharded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            builder = FileStorePathBuilder(_settings(Path(tmp)))
+            digest = "ab" + "c" * 62
+
+            self.assertEqual(
+                builder.v4_execution_spec_relpath(
+                    spec_sha256="sha256:" + digest,
+                ),
+                Path(
+                    "derived/v4_execution_specs/ab/"
+                    f"sha256_{digest}.json"
+                ),
+            )
+            with self.assertRaises(PathSafetyError):
+                builder.v4_execution_spec_relpath(
+                    spec_sha256="sha256:" + digest.upper(),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,6 +62,12 @@ def _hash_digest(raw_file_hash: str) -> str:
     return digest
 
 
+def _sha256_digest(value: str, *, label: str) -> str:
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", value):
+        raise PathSafetyError(f"{label} must be canonical sha256")
+    return value.removeprefix("sha256:")
+
+
 def _assert_relative(path: Path) -> Path:
     if path.is_absolute() or ".." in path.parts:
         raise PathSafetyError(f"path is not a safe relative path: {path}")
@@ -137,6 +143,47 @@ class FileStorePathBuilder:
             / _safe_component(processing_run_id, label="processing_run_id")
         )
         return _assert_relative(relpath)
+
+    def parser_run_artifacts_v4_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+        source_pdf_sha256: str,
+        parser_backend: str,
+        parser_method: str,
+    ) -> Path:
+        safe_backend = _safe_component(parser_backend, label="parser_backend")
+        safe_method = _safe_component(parser_method, label="parser_method")
+        target_profile = _safe_component(
+            f"{safe_backend.split('-', 1)[0]}_{safe_method}",
+            label="parser_target_profile",
+        )
+        source_digest = _sha256_digest(
+            source_pdf_sha256,
+            label="source_pdf_sha256",
+        )
+        relpath = (
+            Path("parser_artifacts")
+            / _safe_component(provider, label="provider")
+            / _safe_component(security_code, label="security_code")
+            / _safe_provider_document_id(provider_document_id)
+            / _safe_component(processing_run_id, label="processing_run_id")
+            / f"sha256_{source_digest}"
+            / target_profile
+        )
+        return _assert_relative(relpath)
+
+    def v4_execution_spec_relpath(self, *, spec_sha256: str) -> Path:
+        digest = _sha256_digest(spec_sha256, label="execution_spec_sha256")
+        return _assert_relative(
+            Path("derived")
+            / "v4_execution_specs"
+            / digest[:2]
+            / f"sha256_{digest}.json"
+        )
 
     def normalized_ir_relpath(self, *, document_id: str, processing_run_id: str) -> Path:
         relpath = (

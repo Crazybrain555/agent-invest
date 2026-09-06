@@ -18,6 +18,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -77,6 +78,7 @@ from disclosure_anchor.application.contracts.provider_unit import (
     PROVIDER_UNIT_BUILDER_VERSION,
 )
 from disclosure_anchor.application.worker.locks import WORKER_NS
+from disclosure_anchor.application.worker import queries as worker_queries
 from disclosure_anchor.application.worker.worker import (
     WorkerConfig,
     WorkerDeps,
@@ -91,6 +93,11 @@ from disclosure_anchor.application.worker.worker import (
     run_resident_parse,
 )
 from disclosure_anchor.settings import Settings, load_settings
+
+if TYPE_CHECKING:
+    from disclosure_anchor.adapters.runtime.mineru_process_profile import (
+        LoadedMineruProcessProfile,
+    )
 
 SKIP_MESSAGE = "[skip] another worker holds the singleton lock"
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -126,14 +133,58 @@ class WorkerDatabasePoolBudget:
         return self.pool_size + self.max_overflow
 
 
-def worker_database_pool_budget(settings: Settings) -> WorkerDatabasePoolBudget:
-    """Cover every intentional concurrent checkout without a fixed machine size.
+def _load_staged_process_profile(settings: Settings) -> LoadedMineruProcessProfile:
+    """Load the one exact staged profile without entering the legacy graph."""
 
-    ``pool_size`` retains the long-lived producer leases plus four control
-    checkouts: maintenance's nested registration, the resident coordinator,
-    and the report plane. ``max_overflow`` covers one short transaction
-    connection per active parse/finalize and is discarded when the burst ends.
+    if settings.worker_parse_execution_mode != "staged-v4":
+        raise ValueError("staged process profile requires staged-v4 mode")
+    from disclosure_anchor.adapters.runtime.mineru_process_profile import (
+        load_mineru_process_profile,
+    )
+    from disclosure_anchor.settings import load_staged_v4_settings
+
+    staged = load_staged_v4_settings()
+    return load_mineru_process_profile(
+        staged.process_profile_file,
+        expected_sha256=staged.process_profile_sha256,
+        expected_owner_uid=os.getuid(),
+    )
+
+
+def worker_database_pool_budget(settings: Settings) -> WorkerDatabasePoolBudget:
+    """Cover every intentional concurrent checkout from the selected topology.
+
+    Legacy retains its long-lived producer leases plus control checkouts.
+    Staged V4 derives all seven lane widths from the immutable process profile.
+    ``max_overflow`` covers the nested atomic publication transaction and is
+    discarded when that short burst ends.
     """
+
+    if settings.worker_parse_execution_mode == "staged-v4":
+        # Keep the staged profile/keyring path completely absent from the
+        # legacy startup graph. Explicit staged mode, however, must size the
+        # shared pool for all seven concurrently active lanes rather than the
+        # legacy parse/finalize pair.
+        from disclosure_anchor.application.services.staged_v4_capacity import (
+            staged_v4_database_concurrency,
+        )
+        from disclosure_anchor.settings import load_staged_v4_settings
+
+        loaded = _load_staged_process_profile(settings)
+        concurrency = staged_v4_database_concurrency(
+            loaded.profile,
+            worker_profile=load_staged_v4_settings().worker_profile(
+                process_profile_sha256=loaded.profile.sha256,
+                mac_preflight_workers=settings.worker_parse_concurrency,
+                mac_finalize_workers=settings.worker_finalize_concurrency,
+            ),
+        )
+        return WorkerDatabasePoolBudget(
+            pool_size=(
+                concurrency.primary_stage_checkouts + WORKER_DB_CONTROL_CONNECTIONS
+            ),
+            max_overflow=concurrency.nested_commit_checkouts,
+        )
 
     parse = max(
         1,
@@ -183,6 +234,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     if args.command == "status":
         return _print_worker_status(settings, output_format=args.format)
+    if args.command == "once" and settings.worker_parse_execution_mode == "staged-v4":
+        parser.error(
+            "worker once has no bounded staged-v4 semantic; use worker loop "
+            "or select legacy-sync"
+        )
     if args.command == "loop":
         return run_resident_worker(settings, progress_output=args.progress)
     if args.command == "backfill-publish-kpi" and args.limit < 1:
@@ -242,9 +298,7 @@ def _run_publish_kpi_backfill(settings: Settings, *, limit: int) -> int:
         )
         print(render_report_section(report))
         return (
-            1
-            if report.failed or report.durable_published_page_count_incomplete
-            else 0
+            1 if report.failed or report.durable_published_page_count_incomplete else 0
         )
     finally:
         if deps is not None:
@@ -366,7 +420,19 @@ def run_resident_worker(
     # As in once mode, static identity is checked here; live availability is
     # checked by the resident admission controller after singleton ownership
     # and reporting are established.
-    mineru_checker = MinerUDeploymentChecker(settings)
+    process_profile = (
+        _load_staged_process_profile(settings).profile
+        if settings.worker_parse_execution_mode == "staged-v4"
+        else None
+    )
+    # Resident parse admission is independent of the bounded worker-once
+    # batch size. Even WORKER_BATCH_PARSE=0 must never bypass static or live
+    # MinerU proof when a resident parse plane is selected.
+    mineru_checker = MinerUDeploymentChecker(
+        settings,
+        parse_enabled=True,
+        process_profile=process_profile,
+    )
     _print_version_banner(settings)
     lock_engine = sqlalchemy.create_engine(
         _database_url(settings),
@@ -416,10 +482,14 @@ def _run_loop(
         _assert_worker_admission(
             lock_conn,
             mineru_checker=mineru_checker,
+            singleton_guard=ownership_guard,
         )
 
     def ownership_guard() -> None:
-        _assert_singleton_or_cancel(lock_conn)
+        if settings.worker_parse_execution_mode == "staged-v4":
+            _assert_staged_singleton(lock_conn)
+        else:
+            _assert_singleton_or_cancel(lock_conn)
 
     try:
         base_deps = _deps(
@@ -509,9 +579,11 @@ def _run_loop(
         except Exception:
             # Observability must never become a new admission dependency.
             traceback.print_exc()
-        # Stale runs belong to a prior singleton owner. Recover them and any
-        # crash leftovers exactly once before the first resident admission;
-        # periodic age-based reclaim would kill legitimate >1h whole PDFs.
+        staged_mode = settings.worker_parse_execution_mode == "staged-v4"
+        # Both modes must drain legacy build/publish tails and complete one
+        # prune-capable projection before any new parse admission. Only the
+        # legacy mode may reclaim generic running rows: staged V4 owns its
+        # running-attempt recovery through the exact V4 checkpoint authority.
         _run_startup_recovery(
             settings,
             lock_conn=lock_conn,
@@ -519,6 +591,7 @@ def _run_loop(
             base_limits=base_limits,
             should_stop=should_stop,
             reports=reports,
+            reclaim_running=not staged_mode,
         )
         if should_stop():
             return 0
@@ -535,18 +608,31 @@ def _run_loop(
             name="worker-maintenance",
         )
         maintenance_thread.start()
-        run_resident_parse(
-            deps,
-            limit=base_limits.parse,
-            should_stop=should_stop,
-            report_interval_seconds=settings.worker_report_interval_seconds,
-            emit_report=reports.put,
-            work_available=work_available,
-            build_recovery_limit=base_limits.build,
-            publish_recovery_limit=base_limits.publish,
-            outage_backoff_initial_seconds=PARSE_COOLDOWN_BASE_SECONDS,
-            outage_backoff_max_seconds=settings.worker_loop_max_interval_seconds,
-        )
+        if staged_mode:
+            _run_staged_v4_resident(
+                settings,
+                engine=engine,
+                deps=deps,
+                should_stop=should_stop,
+                ownership_guard=ownership_guard,
+                admission_guard=admission_guard,
+                work_available=work_available,
+                prune_tracker=prune_tracker,
+                progress_output=progress_output,
+            )
+        else:
+            run_resident_parse(
+                deps,
+                limit=base_limits.parse,
+                should_stop=should_stop,
+                report_interval_seconds=settings.worker_report_interval_seconds,
+                emit_report=reports.put,
+                work_available=work_available,
+                build_recovery_limit=base_limits.build,
+                publish_recovery_limit=base_limits.publish,
+                outage_backoff_initial_seconds=PARSE_COOLDOWN_BASE_SECONDS,
+                outage_backoff_max_seconds=settings.worker_loop_max_interval_seconds,
+            )
         maintenance_thread.join()
         maintenance_thread = None
         if not fatal_errors.empty():
@@ -567,6 +653,106 @@ def _run_loop(
         report_thread.join()
         base_deps.close_source()
         engine.dispose()
+
+
+def _run_staged_v4_resident(
+    settings: Settings,
+    *,
+    engine: Engine,
+    deps: WorkerDeps,
+    should_stop: Callable[[], bool],
+    ownership_guard: Callable[[], None],
+    admission_guard: Callable[[], None],
+    work_available: threading.Event,
+    prune_tracker: _ProjectionPruneTracker,
+    progress_output: str,
+) -> None:
+    """Run only the V4 parse/finalize path until process shutdown."""
+
+    # Lazy imports are part of the default-off contract: legacy-sync never
+    # constructs or even imports the V4 profile/keyring/scratch composition.
+    from disclosure_anchor.adapters.runtime.staged_worker_v4 import (
+        build_staged_worker_v4_runtime,
+    )
+    from disclosure_anchor.application.services.staged_parse_coordinator import (
+        CoordinatorSnapshot,
+        CoordinatorTerminal,
+    )
+
+    last_snapshot: list[CoordinatorSnapshot | None] = [None]
+
+    def progress(snapshot: CoordinatorSnapshot) -> None:
+        deps.heartbeat()
+        if snapshot == last_snapshot[0]:
+            return
+        last_snapshot[0] = snapshot
+        if progress_output == "off":
+            return
+        payload = {
+            "mode": "staged-v4",
+            "recovery_complete": snapshot.recovery_complete,
+            "admission_open": snapshot.admission_open,
+            "circuit_open": snapshot.circuit_open,
+            "queued": dict(snapshot.queued),
+            "in_flight": dict(snapshot.in_flight),
+            "credits_in_use": snapshot.credits_in_use.nonzero(),
+            "credits_limit": snapshot.credits_limit.nonzero(),
+            "completed": snapshot.completed,
+            "blocked_reason": snapshot.blocked_reason,
+            "credit_blocked_by_lane": dict(snapshot.credit_blocked_by_lane),
+        }
+        if progress_output == "jsonl":
+            import json
+
+            print(json.dumps(payload, sort_keys=True), flush=True)
+        else:
+            active = sum(dict(snapshot.in_flight).values())
+            queued = sum(dict(snapshot.queued).values())
+            print(
+                "[staged-v4] "
+                f"recovery={'done' if snapshot.recovery_complete else 'scan'} "
+                f"admission={'open' if snapshot.admission_open else 'closed'} "
+                f"active={active} queued={queued} completed={snapshot.completed} "
+                f"blocked={snapshot.blocked_reason or '-'}",
+                flush=True,
+            )
+
+    runtime = build_staged_worker_v4_runtime(
+        settings=settings,
+        engine=engine,
+        ownership_guard=ownership_guard,
+        admission_guard=admission_guard,
+        process_scope_classes=(
+            deps.config.process_scope_classes
+            if isinstance(deps.config.process_scope_classes, tuple)
+            else None
+        ),
+        progress=progress,
+        publication_committed=lambda replaced: prune_tracker.mark(1 if replaced else 0),
+    )
+    try:
+        runtime.verify_startup()
+        while not should_stop():
+            # Clear only before the authoritative DB scan. Any acquisition
+            # signal that races with or follows that scan remains set and
+            # forces an immediate next pass; clearing after QUIESCENT would
+            # lose that wakeup and unnecessarily idle for a full poll period.
+            work_available.clear()
+            # Each run performs an exhaustive V4 recovery barrier before it
+            # can admit from ordinary pending_parse. A quiescent return is an
+            # idle observation, not a resident-process exit.
+            result = runtime.coordinator.run(stop_requested=should_stop)
+            if result.terminal is not CoordinatorTerminal.QUIESCENT:
+                raise RuntimeError(
+                    "staged V4 coordinator opened its circuit: "
+                    + "; ".join(result.errors or ("unknown staged failure",))
+                )
+            if should_stop():
+                return
+            last_snapshot[0] = None
+            work_available.wait(timeout=settings.worker_loop_interval_seconds)
+    finally:
+        runtime.close()
 
 
 class _ProjectionPruneTracker:
@@ -698,8 +884,9 @@ def _run_startup_recovery(
     base_limits: WorkerLimits,
     should_stop: Callable[[], bool],
     reports: queue.SimpleQueue[WorkerReport | None],
+    reclaim_running: bool = True,
 ) -> None:
-    """Recover prior-owner state and drain leftovers before parse admission."""
+    """Drain finalize/projection tails before any new parse admission."""
 
     recovery_limits = replace(
         base_limits,
@@ -708,7 +895,7 @@ def _run_startup_recovery(
         parse=0,
         acquisition_seconds=0,
     )
-    reclaim_stale = True
+    reclaim_stale = reclaim_running
     # A deactivation can commit after the maintenance thread has stopped, or
     # immediately before a process crash. The in-memory steady-state signal
     # cannot survive either boundary, so every new singleton owner performs
@@ -725,11 +912,9 @@ def _run_startup_recovery(
                 deps,
                 should_stop=should_stop,
                 reclaim_stale=reclaim_stale,
-                # No current-process parse has been admitted yet, and this
-                # process owns the singleton. Every running row therefore
-                # belongs to the exited prior owner, even if it is seconds
-                # old; an age threshold here would strand fresh crash runs
-                # forever because steady maintenance never reclaims.
+                # Only the legacy mode owns generic running-row recovery.
+                # Staged V4 must leave those rows to its exact checkpoint,
+                # lease and fence recovery rather than age-reclaiming them.
                 stale_threshold_seconds=0 if reclaim_stale else None,
                 run_projection=True,
                 projection_prune=projection_recovery_pending,
@@ -770,6 +955,29 @@ def _run_startup_recovery(
                 )
                 continue
             projection_recovery_pending = False
+        try:
+            with deps.engine.connect() as tail_conn:
+                pending_build = worker_queries.pending_build_count(
+                    tail_conn,
+                    max_retries=settings.disclosure_max_build_retries,
+                )
+                pending_publish = worker_queries.pending_publish_count(tail_conn)
+        except Exception as exc:
+            traceback.print_exc()
+            reports.put(
+                _system_failure_report(
+                    started_at=started_at,
+                    duration_seconds=time.monotonic() - started_monotonic,
+                    exc=exc,
+                )
+            )
+            _wait_while(
+                delay,
+                should_stop=should_stop,
+                heartbeat=deps.heartbeat,
+            )
+            delay = min(float(settings.worker_loop_max_interval_seconds), delay * 2)
+            continue
         shared_failure = build_failures_indicate_outage(
             report.failures
         ) or publish_failures_indicate_outage(report.failures)
@@ -783,6 +991,20 @@ def _run_startup_recovery(
             continue
         if report.built or report.published:
             delay = float(PARSE_COOLDOWN_BASE_SECONDS)
+            continue
+        if pending_build or pending_publish:
+            # A task-local build/publish failure can leave retryable durable
+            # work even when a round made no progress and no shared outage was
+            # detected.  Startup admission therefore follows the authoritative
+            # selectors' counts rather than interpreting an idle report as an
+            # empty queue.  Retry/quarantine changes those same counts; until
+            # then the staged parse plane stays fail-closed.
+            _wait_while(
+                delay,
+                should_stop=should_stop,
+                heartbeat=deps.heartbeat,
+            )
+            delay = min(float(settings.worker_loop_max_interval_seconds), delay * 2)
             continue
         return
 
@@ -1003,10 +1225,7 @@ def _source_infrastructure_outage(report: WorkerReport) -> bool:
 
 
 def _local_infrastructure_outage(report: WorkerReport) -> bool:
-    return any(
-        failure.error_code == "DB_POOL_EXHAUSTED"
-        for failure in report.failures
-    )
+    return any(failure.error_code == "DB_POOL_EXHAUSTED" for failure in report.failures)
 
 
 def _system_failure_report(
@@ -1044,14 +1263,31 @@ def _assert_singleton_or_cancel(lock_conn: Connection) -> None:
         raise WorkerSingletonGuardError(str(exc)) from exc
 
 
+def _assert_staged_singleton(lock_conn: Connection) -> None:
+    """Raise immediately so the controller revokes stage fences before drain.
+
+    The resident's outer failure handler still terminates external processes;
+    waiting for those processes here would leave executor permissions live.
+    """
+
+    try:
+        _assert_singleton_lock(lock_conn)
+    except Exception as exc:
+        raise WorkerSingletonGuardError(str(exc)) from exc
+
+
 def _assert_worker_admission(
     lock_conn: Connection,
     *,
     mineru_checker: MinerUDeploymentChecker | None,
+    singleton_guard: Callable[[], None] | None = None,
 ) -> None:
     """Keep the singleton and current MinerU identity valid before new parses."""
 
-    _assert_singleton_or_cancel(lock_conn)
+    if singleton_guard is None:
+        _assert_singleton_or_cancel(lock_conn)
+    else:
+        singleton_guard()
     if mineru_checker is not None:
         try:
             mineru_checker.assert_admission()
@@ -1275,6 +1511,7 @@ def _print_version_banner(settings: Settings) -> None:
     """
 
     scope = _process_scope_classes(settings)
+    pool_budget = worker_database_pool_budget(settings)
     line = (
         f"[versions] policy={settings.disclosure_processing_policy_path.name} "
         f"scope_classes={len(scope)} "
@@ -1288,8 +1525,7 @@ def _print_version_banner(settings: Settings) -> None:
         f"parse_runaway={settings.disclosure_parse_runaway_timeout_seconds}s "
         f"resident_dispatch=continuous "
         f"report_interval={settings.worker_report_interval_seconds}s"
-        f" db_pool={worker_database_pool_budget(settings).pool_size}+"
-        f"{worker_database_pool_budget(settings).max_overflow}"
+        f" db_pool={pool_budget.pool_size}+{pool_budget.max_overflow}"
     )
     engine: Engine | None = None
     try:

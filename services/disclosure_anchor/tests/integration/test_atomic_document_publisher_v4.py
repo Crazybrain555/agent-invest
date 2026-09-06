@@ -10,7 +10,7 @@ from pathlib import Path
 import os
 import stat
 import tempfile
-from threading import Barrier
+from threading import Barrier, Event
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +21,7 @@ from disclosure_anchor.adapters.db.postgres.atomic_document_publisher_v4 import 
     PostgresAtomicWholeDocumentPublisherV4,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
+from disclosure_anchor.application.services.staged_parse_coordinator import StageLeaseGuard, StageLeaseLost
 from disclosure_anchor.adapters.storage.atomic_publication_artifact_readiness_v4 import (
     FilesystemAtomicPublicationArtifactReadinessV4,
 )
@@ -146,6 +147,7 @@ class _Guard:
 class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = engine_or_skip()
+        self.stage_guard = StageLeaseGuard(deadline_monotonic=60.0, _revoked=Event(), _monotonic=lambda: 0.0)
         self.fixture = build_v4_authority_fixture()
         self.request = build_atomic_publication_request_v4(self.fixture)
         self.tempdir = tempfile.TemporaryDirectory()
@@ -201,18 +203,6 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                     "provider_document_id": context.provider_document_id,
                     "source_relpath": context.source_pdf_relpath,
                     "source_sha": self.fixture.source_pdf_sha256,
-                },
-            )
-            conn.execute(
-                sa.text(
-                    "UPDATE disclosure_core.processing_run SET "
-                    "status='succeeded',artifact_hash=:provider_sha,"
-                    "unit_build_status='running' "
-                    "WHERE processing_run_id=:processing_run_id"
-                ),
-                {
-                    "processing_run_id": self.fixture.processing_run_id,
-                    "provider_sha": self.request.upstream_evidence.provider_document_sha256,
                 },
             )
 
@@ -271,6 +261,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
             materialized=self.materialized,
             claim=self._claim(),
             claim_guard=_Guard(),
+            stage_guard=StageLeaseGuard(deadline_monotonic=60.0, _revoked=Event(), _monotonic=lambda: 0.0),
         )
         return self.readiness.verify_ready(
             reference=reference,
@@ -442,6 +433,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
         winner = publisher.commit_whole_document(
             self.request,
             claim=claim,
+            stage_guard=self.stage_guard,
             artifacts_ready=ready,
         )
 
@@ -476,6 +468,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
         replay = publisher.commit_whole_document(
             self.request,
             claim=claim,
+            stage_guard=self.stage_guard,
             artifacts_ready=ready,
         )
         reloaded = publisher.reload_commit_winner(
@@ -539,6 +532,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
         winner = publisher.commit_whole_document(
             request,
             claim=self._claim(),
+            stage_guard=self.stage_guard,
             artifacts_ready=self._ready(request),
         )
 
@@ -584,6 +578,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                 publisher.commit_whole_document(
                     self.request,
                     claim=self._claim(),
+                    stage_guard=self.stage_guard,
                     artifacts_ready=self._ready(),
                 )
 
@@ -611,7 +606,17 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
             ).one()
         self.assertEqual(
             tuple(row),
-            ("parsed", None, False, "running", "local_materialized", 0, 0, 0, 0),
+                (
+                    "parsed",
+                    None,
+                    False,
+                    "not_started",
+                    "local_materialized",
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
         )
 
     def test_previous_inventory_drift_fails_before_publication(self) -> None:
@@ -638,6 +643,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
             publisher.commit_whole_document(
                 request,
                 claim=self._claim(),
+                stage_guard=self.stage_guard,
                 artifacts_ready=self._ready(request),
             )
 
@@ -666,6 +672,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
         publisher.commit_whole_document(
             self.request,
             claim=self._claim(),
+            stage_guard=self.stage_guard,
             artifacts_ready=self._ready(),
         )
         with self.engine.begin() as conn:
@@ -716,6 +723,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                 publisher.commit_whole_document(
                     self.request,
                     claim=self._claim(),
+                    stage_guard=self.stage_guard,
                     artifacts_ready=self._ready(),
                 )
 
@@ -726,6 +734,41 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
         self.assertIsNotNone(winner)
         assert winner is not None
         self.assertEqual(winner.request_sha256, self.request.request_sha256)
+
+    def test_cancellation_after_sql_wait_rolls_back_without_a_winner(self) -> None:
+        publisher = PostgresAtomicWholeDocumentPublisherV4(engine=self.engine)
+        claim, ready = self._claim(), self._ready()
+        for phase in ("for update", "set constraints all immediate"):
+            with self.subTest(phase=phase):
+                stage = StageLeaseGuard(deadline_monotonic=60.0, _revoked=Event(), _monotonic=lambda: 0.0)
+                revoked: list[str] = []
+
+                def after_sql(conn, cursor, statement, parameters, context, executemany):  # type: ignore[no-untyped-def]
+                    if not revoked and phase in statement.lower():
+                        revoked.append(phase)
+                        stage.revoke()
+
+                sa.event.listen(self.engine, "after_cursor_execute", after_sql)
+                try:
+                    with self.assertRaises(StageLeaseLost):
+                        publisher.commit_whole_document(
+                            self.request, claim=claim, artifacts_ready=ready, stage_guard=stage,
+                        )
+                finally:
+                    sa.event.remove(self.engine, "after_cursor_execute", after_sql)
+                self.assertEqual(revoked, [phase])
+                self.assertIsNone(publisher.reload_commit_winner(
+                    processing_run_id=self.fixture.processing_run_id,
+                    attempt_id=self.fixture.attempt_id,
+                ))
+                with self.engine.connect() as conn:
+                    counts = tuple(conn.execute(sa.text(
+                        "SELECT "
+                        "(SELECT count(*) FROM disclosure_core.document_unit WHERE document_id=:doc),"
+                        "(SELECT count(*) FROM disclosure_ops.outbox_event WHERE document_id=:doc),"
+                        "(SELECT count(*) FROM disclosure_ops.durable_publish_base WHERE document_id=:doc)"
+                    ), {"doc": self.fixture.document_id}).one())
+                self.assertEqual(counts, (0, 0, 0))
 
     def test_precommit_hashes_the_actual_persisted_unit_row(self) -> None:
         from disclosure_anchor.adapters.db.postgres import (
@@ -750,6 +793,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                 publisher.commit_whole_document(
                     self.request,
                     claim=self._claim(),
+                    stage_guard=self.stage_guard,
                     artifacts_ready=self._ready(),
                 )
         with self.engine.connect() as conn:
@@ -822,6 +866,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
             publisher.commit_whole_document(
                 drifted_request,
                 claim=self._claim(),
+                stage_guard=self.stage_guard,
                 artifacts_ready=self._ready(drifted_request),
             )
 
@@ -856,6 +901,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                         publisher.commit_whole_document(
                             self.request,
                             claim=self._claim(),
+                            stage_guard=self.stage_guard,
                             artifacts_ready=self._ready(),
                         )
                 finally:
@@ -992,6 +1038,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                         publisher.commit_whole_document(
                             self.request,
                             claim=self._claim(),
+                            stage_guard=self.stage_guard,
                             artifacts_ready=self._ready(),
                         )
                 finally:
@@ -1038,6 +1085,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                 publisher.commit_whole_document(
                     self.request,
                     claim=claim,
+                    stage_guard=self.stage_guard,
                     artifacts_ready=ready,
                 )
 
@@ -1079,6 +1127,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
             return publisher.commit_whole_document(
                 self.request,
                 claim=claim,
+                stage_guard=self.stage_guard,
                 artifacts_ready=ready,
             )
 
@@ -1120,6 +1169,7 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                     publisher.commit_whole_document(
                         request,
                         claim=claim,
+                        stage_guard=self.stage_guard,
                         artifacts_ready=(
                             first_ready
                             if request is self.request

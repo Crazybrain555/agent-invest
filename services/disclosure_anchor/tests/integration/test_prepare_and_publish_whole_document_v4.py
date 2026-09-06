@@ -37,6 +37,9 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
 from disclosure_anchor.application.ports.staged_provider_parser import (
     MaterializedProviderDocumentV4,
 )
+from disclosure_anchor.application.services.atomic_publication_request_factory_v4 import (
+    RecoverableAtomicPublicationRequestFactoryV4,
+)
 from disclosure_anchor.application.use_cases.prepare_and_publish_whole_document_v4 import (
     PrepareAndPublishWholeDocumentV4,
 )
@@ -122,6 +125,22 @@ class _Guard:
         return None
 
 
+class _StageGuard:
+    def checkpoint(self) -> None:
+        return None
+
+    def remaining_seconds(self) -> float:
+        return 60.0
+
+
+class _RequestBuilder:
+    def __init__(self, request: object) -> None:
+        self.request = request
+
+    def build(self, **_: object) -> object:
+        return self.request
+
+
 class PrepareAndPublishWholeDocumentV4IntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = engine_or_skip()
@@ -143,20 +162,6 @@ class PrepareAndPublishWholeDocumentV4IntegrationTests(unittest.TestCase):
                     "provider_document_id": context.provider_document_id,
                     "source_relpath": context.source_pdf_relpath,
                     "source_sha": self.fixture.source_pdf_sha256,
-                },
-            )
-            conn.execute(
-                sa.text(
-                    "UPDATE disclosure_core.processing_run SET "
-                    "status='succeeded',artifact_hash=:provider_sha,"
-                    "unit_build_status='running' "
-                    "WHERE processing_run_id=:processing_run_id"
-                ),
-                {
-                    "processing_run_id": self.fixture.processing_run_id,
-                    "provider_sha": (
-                        self.request.upstream_evidence.provider_document_sha256
-                    ),
                 },
             )
         self.tempdir = tempfile.TemporaryDirectory()
@@ -245,16 +250,20 @@ class PrepareAndPublishWholeDocumentV4IntegrationTests(unittest.TestCase):
             claim = uow.remote_parse_v4.load(self.fixture.attempt_id).claim_witness
         use_case = PrepareAndPublishWholeDocumentV4(
             uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine),
+            publication_requests=RecoverableAtomicPublicationRequestFactoryV4(
+                readiness=readiness,
+                new_request_builder=_RequestBuilder(self.request),  # type: ignore[arg-type]
+            ),
             readiness=readiness,
             publisher=publisher,
         )
 
         winner = use_case.execute(
-            request=self.request,
             checkpoint=self.fixture.local_materialized,
             materialized=self.materialized,
             claim=claim,
             claim_guard=_Guard(),
+            stage_guard=_StageGuard(),
         )
 
         self.assertEqual(winner.winner_row_version, 2)

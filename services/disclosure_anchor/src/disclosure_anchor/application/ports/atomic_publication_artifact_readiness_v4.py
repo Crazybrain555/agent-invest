@@ -21,6 +21,7 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     MaterializedProviderDocumentV4,
     V4ClaimGuard,
     V4ClaimWitness,
+    V4StageGuard,
 )
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ class MaterializedOutputPromotionV4Port(Protocol):
         published_relpath: str,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> None: ...
 
     def verify_published(
@@ -83,6 +85,7 @@ class AtomicPublicationArtifactReadinessV4Port(Protocol):
         materialized: MaterializedProviderDocumentV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> AtomicPublicationReadinessReferenceV1: ...
 
     def load_preparation(

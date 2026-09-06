@@ -24,13 +24,21 @@ from disclosure_anchor.adapters.runtime.mineru_canary import (
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
+    MINERU_API_MAX_UNACKED_RESULT_BYTES,
+    MINERU_API_RESULT_RESERVATION_BYTES,
+    MINERU_API_TASK_REGISTRY_MAX_RECORDS,
+    MINERU_HYBRID_BATCH_RATIO,
     MINERU_PROCESSING_WINDOW_SIZE,
     MINERU_SMOKE_INPUT_NAME,
     MINERU_SMOKE_INPUT_SHA256,
+    STAGED_RUNTIME_MANIFEST_CONTRACT,
     canonical_payload_sha256,
     client_bundle_identity,
     verify_runtime_manifest_payload,
     writer_code_digest,
+)
+from disclosure_anchor.application.contracts.mineru_process_profile import (
+    MineruProcessProfile,
 )
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
@@ -151,6 +159,7 @@ class MinerUDeploymentChecker:
         settings: Settings,
         *,
         parse_enabled: bool | None = None,
+        process_profile: MineruProcessProfile | None = None,
         wall_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
@@ -159,6 +168,7 @@ class MinerUDeploymentChecker:
         self._evidence = verify_mineru_deployment_gate(
             settings,
             parse_enabled=parse_enabled,
+            process_profile=process_profile,
             now=self._wall_clock(),
         )
         self._probe_interval_seconds = (
@@ -199,8 +209,7 @@ class MinerUDeploymentChecker:
             if (
                 not changed
                 and self._last_probe_success is not None
-                and observed - self._last_probe_success
-                < self._probe_interval_seconds
+                and observed - self._last_probe_success < self._probe_interval_seconds
             ):
                 return
             evidence.probe_orchestrator(
@@ -279,10 +288,150 @@ def _load_evidence(
     return payload, (metadata.st_dev, metadata.st_ino)
 
 
+def _verify_configured_capacity(
+    settings: Settings,
+    *,
+    process_profile: MineruProcessProfile | None,
+) -> None:
+    if (
+        "mineru_processing_window_size" not in settings.model_fields_set
+        or settings.mineru_processing_window_size != MINERU_PROCESSING_WINDOW_SIZE
+    ):
+        raise MinerUDeploymentGateError(
+            "MINERU_PROCESSING_WINDOW_SIZE is required and must equal the deployment contract"
+        )
+    if process_profile is None:
+        if (
+            settings.worker_parse_concurrency > MINERU_PROCESSING_WINDOW_SIZE
+            or settings.worker_mineru_client_outstanding_window
+            > settings.disclosure_mineru_api_task_slots
+            or settings.disclosure_mineru_api_task_slots != 1
+            or settings.disclosure_mineru_api_inference_concurrency
+            != MINERU_API_INFERENCE_MAX_CONCURRENCY
+            or settings.worker_gpu_request_budget
+            != settings.mineru_effective_inference_request_upper_bound
+            or settings.worker_gpu_max_sequences != 128
+        ):
+            raise MinerUDeploymentGateError(
+                "MinerU worker/API fan-out exceeds the attested service envelope"
+            )
+        return
+
+    if type(process_profile) is not MineruProcessProfile:
+        raise MinerUDeploymentGateError(
+            "staged V4 requires an exact MinerU process profile"
+        )
+    expected = {
+        "runtime_bundle_identity_sha256": (
+            settings.disclosure_mineru_runtime_bundle_identity_sha256
+        ),
+        "api_task_slots": settings.disclosure_mineru_api_task_slots,
+        "api_max_pending_tasks": settings.disclosure_mineru_api_task_slots,
+        "registry_nonterminal_cap": settings.disclosure_mineru_api_task_slots,
+        "registry_terminal_cap": (
+            MINERU_API_TASK_REGISTRY_MAX_RECORDS
+            - settings.disclosure_mineru_api_task_slots
+        ),
+        "processing_window_size": settings.mineru_processing_window_size,
+        "requested_hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
+        "effective_hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
+        "hybrid_ocr_override": False,
+        "inference_concurrency": (settings.disclosure_mineru_api_inference_concurrency),
+        "vllm_max_num_seqs": settings.worker_gpu_max_sequences,
+        "vllm_max_model_len": 8192,
+        "vllm_mm_processor_cache_bytes": 0,
+        "pipeline_inference_locks": True,
+        "finalizer_slots": settings.disclosure_mineru_api_task_slots,
+        "result_reservation_bytes": MINERU_API_RESULT_RESERVATION_BYTES,
+        "max_unacked_result_bytes": MINERU_API_MAX_UNACKED_RESULT_BYTES,
+        "gpu_request_slots": settings.worker_gpu_request_budget,
+        "task_retention_seconds": (
+            settings.disclosure_mineru_api_task_retention_seconds
+        ),
+        "task_cleanup_interval_seconds": (
+            settings.disclosure_mineru_api_cleanup_interval_seconds
+        ),
+    }
+    drifted = tuple(
+        name
+        for name, value in expected.items()
+        if getattr(process_profile, name) != value
+    )
+    if drifted:
+        raise MinerUDeploymentGateError(
+            "staged V4 process profile exceeds the current serial runtime "
+            "contract: " + ", ".join(drifted)
+        )
+
+
+def _verify_staged_profile_manifest(
+    profile: MineruProcessProfile,
+    manifest: dict[str, Any],
+) -> None:
+    if manifest.get("contract_version") != STAGED_RUNTIME_MANIFEST_CONTRACT:
+        raise MinerUDeploymentGateError(
+            "staged V4 requires the independently measured v9 runtime manifest"
+        )
+    orchestrator = manifest.get("orchestrator")
+    inference = manifest.get("inference_server")
+    topology = manifest.get("topology")
+    if not all(
+        isinstance(value, dict) for value in (orchestrator, inference, topology)
+    ):
+        raise MinerUDeploymentGateError(
+            "staged V4 runtime manifest identity sections are unavailable"
+        )
+    assert isinstance(orchestrator, dict)
+    assert isinstance(inference, dict)
+    assert isinstance(topology, dict)
+    model_identity = canonical_payload_sha256(
+        {
+            "model_repository": inference.get("model_repository"),
+            "model_snapshot_revision": inference.get("model_snapshot_revision"),
+        }
+    )
+    vllm_args_identity = canonical_payload_sha256(inference.get("command"))
+    registry_max_records = orchestrator.get("task_registry_max_records")
+    expected_registry_terminal = (
+        registry_max_records - profile.registry_nonterminal_cap
+        if type(registry_max_records) is int
+        else None
+    )
+    expected = {
+        "orchestrator_image_identity_sha256": orchestrator.get(
+            "container_image_digest"
+        ),
+        "inference_image_identity_sha256": inference.get("container_image_digest"),
+        "model_snapshot_identity_sha256": model_identity,
+        "host_runtime_identity_sha256": topology.get("windows_node_identity_sha256"),
+        "vllm_engine_args_sha256": vllm_args_identity,
+        "registry_terminal_cap": expected_registry_terminal,
+        "result_reservation_bytes": orchestrator.get(
+            "task_result_reservation_bytes"
+        ),
+        "max_unacked_result_bytes": orchestrator.get(
+            "max_unacked_result_bytes"
+        ),
+    }
+    drifted = tuple(
+        name for name, value in expected.items() if getattr(profile, name) != value
+    )
+    if drifted:
+        raise MinerUDeploymentGateError(
+            "staged V4 process profile identity differs from the attested "
+            "runtime manifest: " + ", ".join(drifted)
+        )
+    if orchestrator.get("max_pending_tasks_effective") != profile.api_max_pending_tasks:
+        raise MinerUDeploymentGateError(
+            "staged V4 pending-task capacity differs from the runtime manifest"
+        )
+
+
 def verify_mineru_deployment_gate(
     settings: Settings,
     *,
     parse_enabled: bool | None = None,
+    process_profile: MineruProcessProfile | None = None,
     now: datetime | None = None,
 ) -> VerifiedMinerUDeployment | None:
     """Prove exact runtime, fixed smoke, held-out PDFs, and live boundaries."""
@@ -292,27 +441,7 @@ def verify_mineru_deployment_gate(
     )
     if not enabled:
         return None
-    if (
-        "mineru_processing_window_size" not in settings.model_fields_set
-        or settings.mineru_processing_window_size != MINERU_PROCESSING_WINDOW_SIZE
-    ):
-        raise MinerUDeploymentGateError(
-            "MINERU_PROCESSING_WINDOW_SIZE is required and must equal the deployment contract"
-        )
-    if (
-        settings.worker_parse_concurrency > MINERU_PROCESSING_WINDOW_SIZE
-        or settings.worker_mineru_client_outstanding_window
-        > settings.disclosure_mineru_api_task_slots
-        or settings.disclosure_mineru_api_task_slots != 1
-        or settings.disclosure_mineru_api_inference_concurrency
-        != MINERU_API_INFERENCE_MAX_CONCURRENCY
-        or settings.worker_gpu_request_budget
-        != settings.mineru_effective_inference_request_upper_bound
-        or settings.worker_gpu_max_sequences != 128
-    ):
-        raise MinerUDeploymentGateError(
-            "MinerU worker/API fan-out exceeds the attested service envelope"
-        )
+    _verify_configured_capacity(settings, process_profile=process_profile)
     api_url = settings.disclosure_mineru_api_url
     observability_url = settings.disclosure_mineru_observability_url
     inference_upstream_url = settings.disclosure_mineru_inference_upstream_url
@@ -335,13 +464,16 @@ def verify_mineru_deployment_gate(
             "MinerU exact topology, executable, runtime identity, smoke/cache and "
             "held-out validation receipt are required"
         )
-    if len(
-        {
-            smoke_path.resolve(strict=False),
-            cache_path.resolve(strict=False),
-            validation_path.resolve(strict=False),
-        }
-    ) != 3:
+    if (
+        len(
+            {
+                smoke_path.resolve(strict=False),
+                cache_path.resolve(strict=False),
+                validation_path.resolve(strict=False),
+            }
+        )
+        != 3
+    ):
         raise MinerUDeploymentGateError("MinerU evidence paths must differ")
     smoke, smoke_file = _load_evidence(smoke_path, label="MinerU smoke receipt")
     cache, cache_file = _load_evidence(cache_path, label="MinerU canary cache")
@@ -372,7 +504,24 @@ def verify_mineru_deployment_gate(
         raise MinerUDeploymentGateError(
             f"MinerU exact runtime identity cannot be verified: {exc}"
         ) from exc
-    if manifest.max_concurrent_requests != settings.disclosure_mineru_api_task_slots:
+    if process_profile is not None:
+        _verify_staged_profile_manifest(process_profile, manifest.manifest)
+    expected_task_slots = (
+        settings.disclosure_mineru_api_task_slots
+        if process_profile is None
+        else process_profile.api_task_slots
+    )
+    expected_retention_seconds = (
+        settings.disclosure_mineru_api_task_retention_seconds
+        if process_profile is None
+        else process_profile.task_retention_seconds
+    )
+    expected_cleanup_seconds = (
+        settings.disclosure_mineru_api_cleanup_interval_seconds
+        if process_profile is None
+        else process_profile.task_cleanup_interval_seconds
+    )
+    if manifest.max_concurrent_requests != expected_task_slots:
         raise MinerUDeploymentGateError(
             "runtime manifest task slots drifted from worker configuration"
         )
@@ -382,9 +531,7 @@ def verify_mineru_deployment_gate(
         "local_processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
         "local_writer_code_sha256": local_code_digest,
         "runtime_manifest_identity_sha256": runtime_identity,
-        "orchestrator_runtime_identity_sha256": (
-            manifest.orchestrator_identity_sha256
-        ),
+        "orchestrator_runtime_identity_sha256": (manifest.orchestrator_identity_sha256),
         "provider_runtime_identity_sha256": manifest.provider_identity_sha256,
         "served_model_id": manifest.served_model_id,
         "orchestrator_task_slots": manifest.max_concurrent_requests,
@@ -405,13 +552,9 @@ def verify_mineru_deployment_gate(
         "expected_topology": expected_topology,
         "expected_runtime_manifest": manifest.manifest,
         "runtime_identity": runtime_identity,
-        "task_slots": settings.disclosure_mineru_api_task_slots,
-        "task_retention_seconds": (
-            settings.disclosure_mineru_api_task_retention_seconds
-        ),
-        "cleanup_interval_seconds": (
-            settings.disclosure_mineru_api_cleanup_interval_seconds
-        ),
+        "task_slots": expected_task_slots,
+        "task_retention_seconds": expected_retention_seconds,
+        "cleanup_interval_seconds": expected_cleanup_seconds,
         "observability_url": observability_url,
         "max_age_seconds": settings.disclosure_mineru_canary_max_age_seconds,
         "current": current,
@@ -435,14 +578,21 @@ def verify_mineru_deployment_gate(
         served_model_id=manifest.served_model_id,
         canary_passed_at_utc=passed_at,
         canary_max_age_seconds=settings.disclosure_mineru_canary_max_age_seconds,
-        task_retention_seconds=settings.disclosure_mineru_api_task_retention_seconds,
-        task_cleanup_interval_seconds=(
-            settings.disclosure_mineru_api_cleanup_interval_seconds
-        ),
-        task_slots=settings.disclosure_mineru_api_task_slots,
+        task_retention_seconds=expected_retention_seconds,
+        task_cleanup_interval_seconds=expected_cleanup_seconds,
+        task_slots=expected_task_slots,
     )
     evidence.assert_fresh(now=current)
     return evidence
+
+
+def verify_staged_process_profile_configuration(
+    settings: Settings,
+    process_profile: MineruProcessProfile,
+) -> None:
+    """Reject a staged profile outside the currently attested runtime version."""
+
+    _verify_configured_capacity(settings, process_profile=process_profile)
 
 
 def verify_mineru_heldout_validation(
@@ -473,9 +623,7 @@ def verify_mineru_heldout_validation(
         or value.get("queue_access") != "none"
         or isinstance(document_count, bool)
         or not isinstance(document_count, int)
-        or not _MIN_HELDOUT_DOCUMENTS
-        <= document_count
-        <= _MAX_HELDOUT_DOCUMENTS
+        or not _MIN_HELDOUT_DOCUMENTS <= document_count <= _MAX_HELDOUT_DOCUMENTS
         or not isinstance(documents, list)
         or len(documents) != document_count
     ):
@@ -562,9 +710,7 @@ def verify_mineru_heldout_validation(
         finished_at_utc=latest_finish,
         runtime_identity_sha256=smoke_contract["runtime_identity"],
         collector_sha256=str(before_epoch["collector_sha256"]),
-        windows_node_identity_sha256=str(
-            before_epoch["windows_node_identity_sha256"]
-        ),
+        windows_node_identity_sha256=str(before_epoch["windows_node_identity_sha256"]),
         api_container_id=str(before_epoch["api_container_id"]),
         document_count=document_count,
         page_count=page_count,
@@ -637,15 +783,12 @@ def _verify_epoch_wrapper(
         }
         or epoch.get("schema") != "mineru-service-epoch.v1"
         or epoch.get("runtime_manifest_identity_sha256") != runtime_identity
-        or epoch.get("collector_sha256")
-        != topology.get("windows_collector_sha256")
+        or epoch.get("collector_sha256") != topology.get("windows_collector_sha256")
         or epoch.get("windows_node_identity_sha256")
         != topology.get("windows_node_identity_sha256")
-        or epoch.get("windows_compose_sha256")
-        != topology.get("windows_compose_sha256")
+        or epoch.get("windows_compose_sha256") != topology.get("windows_compose_sha256")
         or epoch.get("writer_code_sha256") != client.get("writer_code_sha256")
-        or epoch.get("api_image_digest")
-        != orchestrator.get("container_image_digest")
+        or epoch.get("api_image_digest") != orchestrator.get("container_image_digest")
         or any(
             not _is_prefixed_sha256(epoch.get(field))
             for field in (
@@ -660,7 +803,10 @@ def _verify_epoch_wrapper(
         )
         or not isinstance(epoch.get("api_container_id"), str)
         or len(epoch["api_container_id"]) != 64
-        or any(character not in "0123456789abcdef" for character in epoch["api_container_id"])
+        or any(
+            character not in "0123456789abcdef"
+            for character in epoch["api_container_id"]
+        )
         or receipt.get("service_epoch_sha256") != canonical_payload_sha256(epoch)
         or safety != expected_safety
     ):
@@ -950,10 +1096,15 @@ def require_mineru_deployment_gate(
     settings: Settings,
     *,
     parse_enabled: bool | None = None,
+    process_profile: MineruProcessProfile | None = None,
 ) -> None:
     """Entry point used by one-shot and resident workers."""
 
-    verify_mineru_deployment_gate(settings, parse_enabled=parse_enabled)
+    verify_mineru_deployment_gate(
+        settings,
+        parse_enabled=parse_enabled,
+        process_profile=process_profile,
+    )
 
 
 __all__ = [
@@ -964,5 +1115,6 @@ __all__ = [
     "VerifiedMinerUHeldoutValidation",
     "require_mineru_deployment_gate",
     "verify_mineru_deployment_gate",
+    "verify_staged_process_profile_configuration",
     "verify_mineru_heldout_validation",
 ]

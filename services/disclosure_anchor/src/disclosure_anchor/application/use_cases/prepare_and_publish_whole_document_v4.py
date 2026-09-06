@@ -25,6 +25,10 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     MaterializedProviderDocumentV4,
     V4ClaimGuard,
     V4ClaimWitness,
+    V4StageGuard,
+)
+from disclosure_anchor.application.services.atomic_publication_request_factory_v4 import (
+    RecoverableAtomicPublicationRequestFactoryV4,
 )
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.worker.locks import exclusive_document_producer
@@ -43,30 +47,39 @@ class PrepareAndPublishWholeDocumentV4:
         self,
         *,
         uow_factory: Callable[[], UnitOfWork],
+        publication_requests: RecoverableAtomicPublicationRequestFactoryV4,
         readiness: AtomicPublicationArtifactReadinessV4Port,
         publisher: AtomicWholeDocumentPublisherV4Port,
     ) -> None:
         self._uow_factory = uow_factory
+        self._publication_requests = publication_requests
         self._readiness = readiness
         self._publisher = publisher
 
     def execute(
         self,
         *,
-        request: AtomicPublicationRequestV4,
         checkpoint: RemoteParseCheckpointV4,
         materialized: MaterializedProviderDocumentV4,
         claim: V4ClaimWitness,
         claim_guard: V4ClaimGuard,
+        stage_guard: V4StageGuard,
     ) -> AtomicPublicationWinnerV4:
-        document_id = request.identity.document_id
+        document_id = checkpoint.document_id
         with exclusive_document_producer(self._uow_factory, document_id):
+            request = self._publication_requests.build_or_reopen(
+                checkpoint=checkpoint,
+                materialized=materialized,
+                stage_guard=stage_guard,
+            )
+            stage_guard.checkpoint()
             reference = self._readiness.prepare_or_replay(
                 request=request,
                 checkpoint=checkpoint,
                 materialized=materialized,
                 claim=claim,
                 claim_guard=claim_guard,
+                stage_guard=stage_guard,
             )
             ready = self._readiness.verify_ready(
                 reference=reference,
@@ -76,6 +89,7 @@ class PrepareAndPublishWholeDocumentV4:
                 request=request,
                 claim=claim,
                 ready=ready,
+                stage_guard=stage_guard,
             )
             # The winner is not usable until its exact readiness bundle still
             # verifies after P (including response-loss recovery).
@@ -92,15 +106,21 @@ class PrepareAndPublishWholeDocumentV4:
         request: AtomicPublicationRequestV4,
         claim: V4ClaimWitness,
         ready: AtomicPublicationArtifactsReadyV4,
+        stage_guard: V4StageGuard,
     ) -> AtomicPublicationWinnerV4:
         # Keep the retry bound literal and visible: the first P plus at most
         # one exact retry after a read-only lookup proves there is no winner.
         for attempt in range(2):
+            # Preparation or the preceding response-loss lookup may outlive
+            # this stage. Revocation forbids another write, not read-only
+            # reconciliation of a write whose outcome is already unknown.
+            stage_guard.checkpoint()
             try:
                 return self._publisher.commit_whole_document(
                     request,
                     claim=claim,
                     artifacts_ready=ready,
+                    stage_guard=stage_guard,
                 )
             except AtomicPublicationCommitResponseLost:
                 winner = self._publisher.reload_commit_winner(

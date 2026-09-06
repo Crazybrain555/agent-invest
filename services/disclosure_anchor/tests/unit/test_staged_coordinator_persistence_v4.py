@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import unittest
+from unittest import mock
 
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     advance_remote_parse_checkpoint_v4,
@@ -43,6 +46,8 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     AdmissionInterrupted,
     CoordinatorLimits,
     RecoveryDeferred,
+    StageLeaseGuard,
+    StageLeaseLost,
 )
 
 
@@ -508,6 +513,72 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
         self.assertEqual(repository.claim_calls, 1)
         self.assertEqual(repository.renew_calls, 1)
 
+    def test_process_guard_precedes_every_main_thread_authority_operation(self) -> None:
+        authority = _prepared_authority(
+            "attempt-guard",
+            snapshot_bytes=100,
+            database_now=self.database_now,
+        )
+        repository = _Repository((authority,))
+        factory = _Factory(repository)
+        backend = DurableStagedCoordinatorPersistenceV4(
+            uow_factory=factory,  # type: ignore[arg-type]
+            limits=_limits(),
+            owner_identity="worker-boot-guard",
+            process_guard=mock.Mock(side_effect=RuntimeError("singleton lost")),
+            monotonic=self.clock,
+        )
+
+        operations = (
+            lambda: backend.list_recoverable(after_attempt_id=None, limit=1),
+            lambda: backend.claim_recovery(
+                repository._candidate(repository.load(authority.attempt_id))
+            ),
+            lambda: backend.admit_new(
+                limit=1,
+                available_credits=_limits().credits,
+            ),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                RuntimeError,
+                "singleton lost",
+            ):
+                operation()
+        self.assertEqual(repository.claim_calls, 0)
+
+    def test_executor_reload_uses_stage_fence_not_singleton_connection(self) -> None:
+        authority = _prepared_authority(
+            "attempt-thread", snapshot_bytes=100, database_now=self.database_now,
+        )
+        repository = _Repository((authority,))
+        factory = _Factory(repository)
+        backend = self._backend(repository, factory)
+        work = backend.claim_recovery(repository._candidate(authority))
+        probe = mock.Mock(side_effect=RuntimeError("controller-only singleton"))
+        backend._process_guard = probe
+        guard = StageLeaseGuard(
+            deadline_monotonic=self.clock() + 10,
+            _revoked=Event(), _monotonic=self.clock,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            actual = executor.submit(
+                backend.reload_stage_claim, work, stage_guard=guard,
+            ).result(timeout=2)
+            self.assertEqual(
+                replace(actual, lease_expires_monotonic=work.lease_expires_monotonic),
+                work,
+            )
+            probe.assert_not_called()
+            guard.revoke()
+            with self.assertRaises(StageLeaseLost):
+                executor.submit(
+                    backend.reload_stage_claim, work, stage_guard=guard,
+                ).result(timeout=2)
+        with self.assertRaisesRegex(RuntimeError, "controller-only singleton"):
+            backend.reload_claim(work)
+        probe.assert_called_once_with()
+
     def test_foreign_live_claim_is_accounting_only_and_not_rewritten(self) -> None:
         authority = _prepared_authority(
             "attempt-foreign",
@@ -661,11 +732,92 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
                 claim=durable.claim_witness,
                 successor=successor,
             ),
+            stage_guard=StageLeaseGuard(
+                deadline_monotonic=self.clock() + 60,
+                _revoked=Event(), _monotonic=self.clock,
+            ),
         )
 
         self.assertEqual(updated.state, "reconciling")
         self.assertEqual(updated.lifecycle_version, 1)
         self.assertEqual(repository.heads[authority.attempt_id].checkpoint, successor)
+
+    def test_revoked_successor_rolls_back_or_reconciles_without_retry_write(self) -> None:
+        for phase in ("connection", "before-commit", "unknown-absent", "unknown-committed"):
+            with self.subTest(phase=phase):
+                stage = StageLeaseGuard(
+                    deadline_monotonic=self.clock() + 60,
+                    _revoked=Event(), _monotonic=self.clock,
+                )
+                armed = [False]
+                opened = [0]
+                commits: list[str] = []
+                reconciles: list[str] = []
+
+                class Repository(_Repository):
+                    def append_successor(self, append: V4SuccessorAppend) -> RemoteParseV4Authority:
+                        result = super().append_successor(append)
+                        if armed[0] and phase == "before-commit":
+                            stage.revoke()
+                        return result
+
+                    def reconcile_successor(self, append: V4SuccessorAppend) -> V4SuccessorReconciliation:
+                        reconciles.append(phase)
+                        return super().reconcile_successor(append)
+
+                class Transaction(_UnitOfWork):
+                    def __enter__(self) -> Transaction:
+                        self.before = dict(self._owner.repository.heads)
+                        self.committed = False
+                        if armed[0]:
+                            opened[0] += 1
+                            if phase == "connection" and opened[0] == 2:
+                                stage.revoke()
+                        return self
+
+                    def __exit__(self, *_args: object) -> None:
+                        if not self.committed:
+                            self._owner.repository.heads = self.before
+
+                    def commit(self) -> None:
+                        if armed[0]:
+                            commits.append(phase)
+                            self.committed = phase == "unknown-committed"
+                            stage.revoke()
+                            raise RuntimeError("unknown commit outcome")
+                        self.committed = True
+
+                class Factory(_Factory):
+                    def __call__(self) -> Transaction:
+                        return Transaction(self)
+
+                initial = _prepared_authority(
+                    "cancel-successor", snapshot_bytes=100, database_now=self.database_now,
+                )
+                repository = Repository((initial,))
+                backend = self._backend(repository, Factory(repository))
+                work = backend.claim_recovery(repository._candidate(repository.load(initial.attempt_id)))
+                authority = repository.load(initial.attempt_id)
+                successor = advance_remote_parse_checkpoint_v4(
+                    authority.checkpoint, state="reconciling",
+                    held_resource_credit=replace(authority.checkpoint.held_resource_credit, remote_waits=1),
+                    submission_intent_sha256=_sha("cancel-successor-submission"),
+                )
+                append = V4SuccessorAppend(claim=authority.claim_witness, successor=successor)
+                armed[0] = True
+                if phase == "unknown-committed":
+                    updated = backend.append_successor(work, append, stage_guard=stage)
+                    self.assertEqual(updated.state, "reconciling")
+                    self.assertEqual(repository.heads[initial.attempt_id].checkpoint, successor)
+                else:
+                    with self.assertRaises(StageLeaseLost):
+                        backend.append_successor(work, append, stage_guard=stage)
+                    self.assertEqual(repository.heads[initial.attempt_id].checkpoint, authority.checkpoint)
+                expected_calls = 0 if phase in {"connection", "before-commit"} else 1
+                self.assertEqual(len(commits), expected_calls)
+                self.assertEqual(len(reconciles), expected_calls)
+                if phase == "connection":
+                    self.assertEqual(opened[0], 2)
 
     def test_claim_guard_reloads_live_exact_head_under_resource_lock(self) -> None:
         authority = _prepared_authority(
@@ -796,7 +948,7 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
         self.assertEqual(repository.heads[first.attempt_id].claim_generation, 1)
         self.assertEqual(repository.heads[second.attempt_id].claim_generation, 0)
 
-    def test_admission_exposes_all_claims_when_the_next_page_fails(self) -> None:
+    def test_admission_returns_owned_page_before_a_later_page_fails(self) -> None:
         heads = tuple(
             _prepared_authority(
                 f"attempt-{index}",
@@ -809,17 +961,16 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
         repository.admission_list_fail_after = 1
         factory = _Factory(repository)
 
-        with self.assertRaises(AdmissionInterrupted) as raised:
-            self._backend(repository, factory).admit_new(
-                limit=3,
-                available_credits=_limits().credits,
-            )
-
+        backend = self._backend(repository, factory)
+        first = backend.admit_new(limit=3, available_credits=_limits().credits)
+        self.assertTrue(first.scan_incomplete)
+        self.assertEqual(repository.admission_list_calls, 1)
         self.assertEqual(
-            tuple(work.attempt_id for work in raised.exception.claimed_work),
+            tuple(work.attempt_id for work in first.work),
             ("attempt-0", "attempt-1"),
         )
-        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        with self.assertRaisesRegex(RuntimeError, "admission page failure"):
+            backend.admit_new(limit=3, available_credits=_limits().credits)
         self.assertEqual(
             tuple(repository.heads[f"attempt-{index}"].claim_generation for index in range(3)),
             (1, 1, 0),
@@ -851,6 +1002,78 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
         self.assertTrue(first.backlog_exists)
         self.assertEqual(tuple(item.attempt_id for item in second.work), ("attempt-2",))
         self.assertFalse(second.backlog_exists)
+
+    def test_prepared_prefix_scan_has_one_page_and_fixed_dimension_memory(self) -> None:
+        for prefix_count in (8, 128):
+            with self.subTest(prefix_count=prefix_count):
+                heads = tuple(
+                    _prepared_authority(
+                        f"attempt-{index:04}", snapshot_bytes=2000,
+                        database_now=self.database_now,
+                    ) for index in range(prefix_count)
+                ) + (_prepared_authority(
+                    "fitting-tail", snapshot_bytes=50, database_now=self.database_now,
+                ),)
+                repository = _Repository(heads)
+                backend = self._backend(repository, _Factory(repository))
+                for index in range(prefix_count // 2):
+                    result = backend.admit_new(limit=2, available_credits=_limits().credits)
+                    self.assertEqual(repository.admission_list_calls, index + 1)
+                    self.assertTrue(result.scan_incomplete)
+                    self.assertEqual(result.work, ())
+                    self.assertEqual(result.ineligible_dimensions, ("snapshot_bytes",))
+                    self.assertLessEqual(len(backend._prepared_ineligible), 14)
+                    self.assertLessEqual(len(backend._prepared_blocked_at), 14)
+                tail = backend.admit_new(limit=2, available_credits=_limits().credits)
+                self.assertEqual(tuple(work.attempt_id for work in tail.work), ("fitting-tail",))
+                self.assertFalse(tail.scan_incomplete)
+
+    def test_prepared_partial_page_and_exact_page_exhaustion(self) -> None:
+        heads = tuple(_prepared_authority(
+            f"attempt-{index}", snapshot_bytes=50, database_now=self.database_now,
+        ) for index in range(3))
+        repository = _Repository(heads)
+        backend = self._backend(repository, _Factory(repository))
+        results = [backend.admit_new(limit=1, available_credits=_limits().credits)
+                   for _ in range(3)]
+        self.assertEqual([r.work[0].attempt_id for r in results],
+                         ["attempt-0", "attempt-1", "attempt-2"])
+        self.assertEqual(repository.admission_list_calls, 3)
+        self.assertFalse(results[-1].scan_incomplete)
+
+        repository = _Repository(heads[:2])
+        backend = self._backend(repository, _Factory(repository))
+        full = backend.admit_new(limit=2, available_credits=_limits().credits)
+        empty = backend.admit_new(limit=2, available_credits=_limits().credits)
+        self.assertTrue(full.scan_incomplete)
+        self.assertFalse(empty.scan_incomplete)
+        self.assertEqual(empty.work, ())
+        self.assertEqual(repository.admission_list_calls, 2)
+
+    def test_prepared_credit_release_revisits_skipped_and_behind_cursor_rows(self) -> None:
+        heads = tuple(_prepared_authority(
+            f"attempt-{index}", snapshot_bytes=50, database_now=self.database_now,
+        ) for index in range(2))
+        repository = _Repository(heads)
+        backend = self._backend(repository, _Factory(repository))
+        first = backend.admit_new(
+            limit=2, available_credits=replace(_limits().credits, snapshot_bytes=0),
+        )
+        self.assertTrue(first.scan_incomplete)
+        self.assertEqual(first.blocked_dimensions, ("snapshot_bytes",))
+        arriving = _prepared_authority(
+            "attempt--before", snapshot_bytes=50, database_now=self.database_now,
+        )
+        repository.heads[arriving.attempt_id] = arriving
+        # Exhaustion sees the credit increase and explicitly schedules a wrap.
+        wrapped = backend.admit_new(limit=2, available_credits=_limits().credits)
+        self.assertTrue(wrapped.scan_incomplete)
+        self.assertEqual(wrapped.work, ())
+        claimed = []
+        for _ in range(2):
+            claimed.extend(backend.admit_new(limit=2, available_credits=_limits().credits).work)
+        self.assertEqual({work.attempt_id for work in claimed},
+                         {"attempt-0", "attempt-1", "attempt--before"})
 
 
 if __name__ == "__main__":

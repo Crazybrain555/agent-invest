@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,7 @@ from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
 )
 from disclosure_anchor.application.contracts.staged_resource_credit import (
     ResourceCreditVector,
+    StagedResourceCreditEnvelope,
 )
 from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
     AtomicPublicationWinnerV4,
@@ -59,6 +61,7 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4HeadExpectation,
     V4HeadStale,
     V4PreparedCreation,
+    V4PreparedProposal,
     V4ResourceFreeFailureCreation,
     V4ResourceFreeSupersessionCreation,
     V4SecretRevisionConflict,
@@ -147,12 +150,28 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
     @staticmethod
     def _prepared_creation(fixture: V4AuthorityFixture) -> V4PreparedCreation:
         return V4PreparedCreation(
+            execution_spec=fixture.execution_spec,
             checkpoint=fixture.prepared,
             reservation=fixture.reservation,
             preparation_intent=fixture.preparation,
             snapshot_receipt=fixture.snapshot,
             parser_target_sha256=fixture.parser_target_sha256,
             client_submit_key=fixture.client_submit_key,
+        )
+
+    @staticmethod
+    def _prepared_proposal(fixture: V4AuthorityFixture) -> V4PreparedProposal:
+        return V4PreparedProposal(
+            document_id=fixture.document_id,
+            processing_run_id=fixture.processing_run_id,
+            prepared_submission=fixture.prepared_submission,
+            credit_envelope=StagedResourceCreditEnvelope(
+                process_profile_sha256=fixture.process_profile_sha256,
+                credit_policy_sha256=fixture.credit_policy_sha256,
+                reservation_input=fixture.reservation_input,
+                reservation=fixture.reservation.reserved_credit,
+            ),
+            execution_spec=fixture.execution_spec,
         )
 
     @staticmethod
@@ -246,6 +265,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
         legacy = build_v4_authority_fixture()
         successor = build_v4_supersession_stage_fixture(legacy)
         creation = V4PreparedCreation(
+            execution_spec=successor.execution_spec,
             checkpoint=successor.prepared,
             reservation=successor.reservation,
             preparation_intent=successor.preparation,
@@ -304,6 +324,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
             ),
         )
         creation = V4PreparedCreation(
+            execution_spec=fixture.execution_spec,
             checkpoint=checkpoint,
             reservation=fixture.reservation,
             preparation_intent=fixture.preparation,
@@ -356,6 +377,29 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
             tuple(item.kind for item in progressed.evidence),
             ("preparation_intent", "snapshot_receipt", "submission_intent"),
         )
+
+    def test_create_next_prepared_allocates_and_replays_generation_one(self) -> None:
+        fixture = build_v4_authority_fixture()
+        proposal = self._prepared_proposal(fixture)
+        with self.engine.begin() as conn:
+            insert_core_rows(conn, fixture)
+            session, repository = self._repository(conn)
+            try:
+                created = repository.create_next_prepared(proposal)
+                replayed = repository.create_next_prepared(proposal)
+                with self.assertRaises(V4GenerationConflict):
+                    repository.create_next_prepared(
+                        replace(
+                            proposal,
+                            processing_run_id="run_changed-prepared-proposal",
+                        )
+                    )
+            finally:
+                session.close()
+
+        self.assertEqual(created, replayed)
+        self.assertEqual(created.attempt_generation, 1)
+        self.assertIsNone(created.checkpoint.snapshot_receipt_sha256)
 
     def test_strict_reload_rejects_head_projection_drift(self) -> None:
         fixture = build_v4_authority_fixture()
@@ -1733,6 +1777,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                                 supersession_source.client_submit_key
                             ),
                             superseding=V4PreparedCreation(
+                                execution_spec=supersession.target.execution_spec,
                                 checkpoint=supersession.target.prepared,
                                 reservation=supersession.target.reservation,
                                 preparation_intent=(
@@ -1768,6 +1813,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                             supersession_source.client_submit_key
                         ),
                         superseding=V4PreparedCreation(
+                            execution_spec=supersession.target.execution_spec,
                             checkpoint=supersession.target.prepared,
                             reservation=supersession.target.reservation,
                             preparation_intent=supersession.target.preparation,
@@ -1799,6 +1845,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                 with self.assertRaises(V4DocumentCurrentConflict):
                     repository.create_prepared(
                         V4PreparedCreation(
+                            execution_spec=conflicting.execution_spec,
                             checkpoint=conflicting.prepared,
                             reservation=conflicting.reservation,
                             preparation_intent=conflicting.preparation,
@@ -1928,7 +1975,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                         authority.claim_generation,
                     ),
                 )
-                with self.assertRaises(V4GenerationConflict):
+                with self.assertRaisesRegex(ValueError, "execution spec drifted"):
                     repository.create_prepared(
                         replace(
                             self._prepared_creation(fixture),
@@ -2123,6 +2170,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
             processing_run_id=target_run_id,
         )
         staged_creation = V4PreparedCreation(
+            execution_spec=stage.execution_spec,
             checkpoint=stage.prepared,
             reservation=stage.reservation,
             preparation_intent=stage.preparation,
@@ -2269,16 +2317,13 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
         source = build_v4_authority_fixture()
         stage = build_v4_supersession_stage_fixture(source)
         valid_creation = V4PreparedCreation(
+            execution_spec=stage.execution_spec,
             checkpoint=stage.prepared,
             reservation=stage.reservation,
             preparation_intent=stage.preparation,
             snapshot_receipt=stage.snapshot,
             parser_target_sha256=stage.parser_target_sha256,
             client_submit_key=stage.client_submit_key,
-        )
-        invalid_creation = replace(
-            valid_creation,
-            client_submit_key=source.client_submit_key,
         )
         no_snapshot_checkpoint = build_initial_remote_parse_checkpoint_v4(
             reservation=stage.reservation,
@@ -2287,6 +2332,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
             held_resource_credit=stage.prepared.held_resource_credit,
         )
         no_snapshot_creation = V4PreparedCreation(
+            execution_spec=stage.execution_spec,
             checkpoint=no_snapshot_checkpoint,
             reservation=stage.reservation,
             preparation_intent=stage.preparation,
@@ -2318,6 +2364,14 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                     encode_remote_parse_evidence_v4(item)
                     for item in (stage.supersession, stage.cleanup_plan)
                 )
+                insert_head = repository._insert_head
+
+                def insert_duplicate_key(**values):
+                    # Inject a real SQL uniqueness failure after successor writes;
+                    # invalid immutable commands now fail before persistence.
+                    values["client_submit_key"] = source.client_submit_key
+                    return insert_head(**values)
+
                 with self.assertRaises(V4GenerationConflict):
                     repository.append_successor(
                         V4SuccessorAppend(
@@ -2327,13 +2381,16 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                             staged_superseder=no_snapshot_creation,
                         )
                     )
-                with self.assertRaises(V4GenerationConflict):
+                with (
+                    patch.object(repository, "_insert_head", side_effect=insert_duplicate_key),
+                    self.assertRaises(V4GenerationConflict),
+                ):
                     repository.append_successor(
                         V4SuccessorAppend(
                             claim=authority.claim_witness,
                             successor=stage.source_cleanup_pending,
                             new_evidence=encoded_stage_evidence,
-                            staged_superseder=invalid_creation,
+                            staged_superseder=valid_creation,
                         )
                     )
                 unchanged = repository.load(source.attempt_id)
@@ -2536,6 +2593,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
         source = build_v4_authority_fixture()
         stage = build_v4_supersession_stage_fixture(source)
         staged_creation = V4PreparedCreation(
+            execution_spec=stage.execution_spec,
             checkpoint=stage.prepared,
             reservation=stage.reservation,
             preparation_intent=stage.preparation,
@@ -2624,6 +2682,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
         source = build_v4_authority_fixture()
         stage = build_v4_supersession_stage_fixture(source)
         staged_creation = V4PreparedCreation(
+            execution_spec=stage.execution_spec,
             checkpoint=stage.prepared,
             reservation=stage.reservation,
             preparation_intent=stage.preparation,
@@ -2740,6 +2799,7 @@ class RemoteParseV4RepositoryIntegrationTests(unittest.TestCase):
                     source_parser_target_sha256=pair_source.parser_target_sha256,
                     source_client_submit_key=pair_source.client_submit_key,
                     superseding=V4PreparedCreation(
+                        execution_spec=pair.target.execution_spec,
                         checkpoint=pair.target.prepared,
                         reservation=pair.target.reservation,
                         preparation_intent=pair.target.preparation,

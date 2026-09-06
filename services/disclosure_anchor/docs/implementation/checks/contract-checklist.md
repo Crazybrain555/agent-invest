@@ -243,6 +243,16 @@ at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果
 
 ## 6. 契约变更记录（append-only）
 
+2026-09-06（0060/0061 私有 V4 execution spec 生命周期）——public view/API/change feed 不变：
+
+`remote_parse_v4_execution_spec` 保存每个 resourceful H0 至多 512 KiB exact canonical control bytes；
+attempt/fence/preparation 的 deferred closure、不可变约束与 H0 UoW 同步。源 PDF 不进入该表。
+最终态/非 current 历史均保留；0060 添加历史 NOT VALID FK，显式全历史回填后由 0061 验证。
+strict reload 重新核对 hash/length/identity，worker 无文件系统 spec fallback。旧文件退役需实际
+writer drain、validated FK 和 exact copied/orphan 证明；不改写已应用迁移或既有 cleanup receipt。
+本地 ambiguity 原地保留，所有权异常开启 circuit 并保留信用；历史残留启动门与 ACK 前实际
+absence 检查见 [V4 resource lifetime](../design/v4-resource-lifetime.md)。这不是上线或吞吐 GO。
+
 2026-09-01（0057 私有 remote parse v4 authority）——不改变 public view/API/change feed：
 
 ```text

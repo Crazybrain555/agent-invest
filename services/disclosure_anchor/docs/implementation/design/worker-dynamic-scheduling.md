@@ -2,7 +2,7 @@
 id: disclosure_anchor_worker_dynamic_scheduling
 title: Worker 动态调度、GPU 锯齿根因与发布验收
 date: 2026-07-09
-updated_at: 2026-09-04
+updated_at: 2026-09-06
 status: continuous-resident-candidate-pending-cutover
 authority: tracked implementation design; live runtime values must be re-verified
 ---
@@ -14,6 +14,9 @@ authority: tracked implementation design; live runtime values must be re-verifie
 > 改为生命周期常驻、把报告改为只读快照；尚未完成本次受控重启和新 A/B。因此“代码
 > 覆盖”不等于发布验收完成。
 > GPU、backlog、版本和并发数字都是带日期的运维证据，每次发布都必须重新核验。
+>
+> staged-v4 当前装配与验证边界见 §10。前文的固定槽数、保留量和 A/B 时长是特定历史
+> 部署的记录，不是 staged-v4 的固定参数或重新执行慢基线/ABBA 的发布要求。
 
 # Worker 动态调度与 GPU 锯齿根因报告
 
@@ -731,3 +734,58 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
 2026-07-13 用 16 份真实小 PDF 的 scratch 验收曾得到 16/16 parse/build/publish、
 零失败和 1,585 docs/h，下一轮 0.017 秒确认空队列并进入 idle sleep。它只证明 resident
  loop 不再受固定 2 小时节拍限制和 idle CPU 接近零，不能外推到当前异构大 PDF 吞吐。
+
+## 10. staged-v4 装配、容量身份与有界调度
+
+`WORKER_PARSE_EXECUTION_MODE=legacy-sync` 仍是默认路径；显式 `staged-v4` 与它互斥。
+本节描述 source candidate，不宣称已切换真实 GPU。目标是稳定提高完整 PDF 正确原子发布
+的页数/主机小时；CPU/GPU 利用率用于解释空档，不能替代完整性或吞吐验证。
+
+- Windows `MineruProcessProfile` 只描述远端进程及资源上限。本机
+  `staged-worker-composition.v1` 另行绑定它的 SHA，以及 preflight/finalize 并发上限、
+  provider 状态轮询与 admission 探测间隔；七条 lane、物化信用和 DB primary/nested
+  checkout 均从这两个 exact profile 投影。运行时可在上限内按实时信用派工，不固定占满槽数。
+- `v4-prepared-execution-spec.v2` 将两份 exact profile 与 request/source/runtime 关联，
+  由 H0 的 spec SHA/byte count 绑定。未发布的旧 spec v1 不做默默兼容。恢复时所有阶段，
+  包括 publish、cleanup、ACK，在副作用前验证当前本机 profile；不同则明确失败。
+  必须恢复原配置并排空旧 attempt，不能在同一身份下偷偷改容量。尾部检查仅依赖 H0/spec，
+  不重新要求已清理的源/临时文件存在。
+  每个阶段只 hydrate 一次 immutable H0/spec；局部 context 绑定本次 exact authority 和阶段
+  guard，不由共享 resolver 保留，不得重新授权另一个阶段。下一阶段必须重新读 spec，
+  document/run 可变事实及副作用前源文件/claim/FS 检查仍在原调用点执行。
+  exact spec bytes 与 H0 原子入 PG；旧文件只用于离线全历史回填，不作为 worker fallback。
+  迁移、历史隔离残留启动门、原地保留信用及 ACK 前检查见 [V4 资源生命周期](v4-resource-lifetime.md)。
+- `WORKER_PARSE_CONCURRENCY` / `WORKER_FINALIZE_CONCURRENCY` 决定本机 lane 上限；
+  `DISCLOSURE_V4_PROVIDER_POLL_MILLISECONDS` 和
+  `DISCLOSURE_V4_ADMISSION_PROBE_MILLISECONDS` 默认均为 `1000`，范围 `1..60000`。
+  它们不复用调度器 `0.1s` wake tick；archive member count 的配置/执行合同统一为
+  `1..100000`，不能把字节信用当成文件数量来静默截断。
+- 单例数据库连接只由协调线程探测；执行线程提交后的 claim 重读使用独立 UoW 与阶段 guard。
+  staged 单例探测失败立即抛出，协调器先撤销全部在途阶段许可、等待实际退出，再由 resident
+  外层清理进程；不得先等待进程终止而让其他阶段在已知失锁期间继续启动副作用。
+- prepared-H0 与普通 pending-parse 分别使用固定大小 keyset 页，每次每个源至多推进一个固定大小页，
+  不缓存整库候选或逐行 blocked vector。两源共享一轮完成状态，游标只越过实际检查的行；
+  完整扫描后按间隔探测新数据，信用释放可提前唤醒，未完成分页不得提前判空。
+  临时信用不足与当前 profile 永远装不下的 PDF 分开报告；超大源不应终止整轮扫描。
+- 新任务 readiness 的类型化暂不可用只暂停普通源准入；已领取 prepared-H0、远端轮询、
+  publication、cleanup、ACK 不以新任务健康检查为执行许可。单例/身份丢失仍立即 fail closed。
+  准入暂停按独立探测间隔恢复，遥测在暂停期间保持 closed，成功探测后清除旧原因。
+- 普通 PDF 的 stat/hash/物理页数检查是至多一个临时 observation，运行于现有 preflight 池，
+  与持久任务共享槽位、document/snapshot-item/字节信用。全部源 IO/native PDFium 在只读子进程，
+  无 DB/provider 凭据；父层限制输出和阶段期限，取消后 kill/wait 到实际退出再释放信用。
+  字节上限是输入预算，不冒充 native RAM 或 IO 延迟上限；观察结果仅在协调线程接收和消费，
+  H0 eligibility/源身份/写入许可必须在事务中重新核对，不新增第二 durable backlog。
+- 精确 hash/length 身份下已确认格式/加密不可读的 PDF 使用已有非 retryable failed parse run
+  与 created/failed outbox 事件原子处置；不制造页数、spec 或 H0。重启后普通队列依据已有
+  last-failure retryability 排除它，后续正常 PDF 继续前进。文件缺失、身份漂移和未知 IO/native
+  错误不伪装成内容拒绝；响应丢失只核对同一 episode，写入重试仍需当前所有权许可。
+- 最终状态列表只是有界近期诊断样本，累计 completed 单独计数；PG 仍是完整任务历史和
+  唯一 durable backlog。领取后的校验/IO 异常必须携带已领取的全部 ownership，不得漏记。
+- scratch 与 canonical `data` 目录必须存在明确、互不包含且同文件系统的 pinned namespace。
+  canonical data root 预先建立且 owner-controlled；共享容器目录可为 0755，资源树保持
+  0700/0600。原子 no-replace rename、双父目录 fsync、精确 claim/文件身份检查不放宽。
+  发布读者使用 `FileStorePathBuilder.data_path`；私有清理不得删除已转移的正式资源。
+- 验证包括真实文件系统/隔离 PostgreSQL/伪外部 HTTP 的普通队列→实际 coordinator→
+  原子发布→清理→ACK，以及独立消费者重读。手动 backend 逐步调用仍用于响应丢失、
+  claim 重建和 KEK rewrap 的机制验证，但不再等同于完整装配验证。真实 GPU 吞吐、
+  held-out PDF 质量和长期内存稳定性须在单独 runtime 授权/claim 下实测。

@@ -16,7 +16,7 @@ from disclosure_anchor.application.contracts.atomic_publication_artifact_readine
     AtomicPublicationUnitBindingV4,
     validate_preparation_readiness_pair_v1,
 )
-from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness
+from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness, V4StageGuard
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain.services.unit_hashing import query_projection
@@ -334,6 +334,7 @@ class AtomicWholeDocumentPublisherV4Port(
         *,
         claim: V4ClaimWitness,
         artifacts_ready: AtomicPublicationArtifactsReadyV4,
+        stage_guard: V4StageGuard,
     ) -> AtomicPublicationWinnerV4: ...
 
     def reload_commit_winner(

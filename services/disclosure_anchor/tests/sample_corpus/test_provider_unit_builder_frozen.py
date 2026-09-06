@@ -239,6 +239,7 @@ class _FrozenSource:
             raise AssertionError("admission requested the wrong source PDF")
         return SourcePdfObservation(
             sha256=_sha_file(self.source_path),
+            byte_count=self.source_path.stat().st_size,
             page_count=count_pdf_pages(self.source_path),
         )
 

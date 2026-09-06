@@ -1095,6 +1095,8 @@ def _happy_path_for_port() -> _PortHappyPathFixture:
     preparation = build_preparation_intent_v4(
         reservation=reservation,
         parser_target_sha256=provider_context.parser_target_sha256,
+        execution_spec_sha256=reservation.prepared_submission_identity_sha256,
+        execution_spec_byte_count=128,
     )
     snapshot = SnapshotReceiptV4(
         attempt_id=reservation.attempt_id,

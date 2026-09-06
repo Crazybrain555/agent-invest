@@ -42,7 +42,6 @@ from disclosure_anchor.application.contracts.atomic_document_publication_v4 impo
     seal_atomic_publication_request_v4,
     seal_pre_id_unit_publication_v4,
 )
-from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     PROVIDER_DOCUMENT_FILENAME,
     ProviderDocumentEnvelope,
@@ -107,6 +106,15 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
     ResourceReservationInput,
     encode_resource_reservation_input,
 )
+from disclosure_anchor.application.ports.staged_provider_parser import (
+    PreparedSubmissionIdentity,
+)
+from disclosure_anchor.application.contracts.v4_prepared_execution_spec import V4PreparedExecutionSpec
+from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
+    submission_form_v2, submission_request_exact_bytes_v2,
+)
+from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import prepare_submission_identity_v2
+from tests.unit.test_v4_prepared_execution_spec import _spec
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPT_V3,
     SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME,
@@ -160,12 +168,16 @@ class V4AuthorityFixture:
     attempt_id: str
     fence_identity: str
     client_submit_key: str
+    prepared_submission: PreparedSubmissionIdentity
     source_pdf_sha256: str
     parser_target_identity_json: str
     parser_target_sha256: str
     request_sha256: str
     runtime_epoch_sha256: str
     process_profile_sha256: str
+    execution_spec_sha256: str
+    execution_spec_byte_count: int
+    execution_spec: V4PreparedExecutionSpec
     credit_policy_sha256: str
     reservation_input: EncodedResourceReservationInput
     reservation: ResourceReservationV4
@@ -283,6 +295,7 @@ class V4AuthorityFixture:
 @dataclass(frozen=True, slots=True)
 class V4SupersessionStageFixture:
     source: V4AuthorityFixture
+    execution_spec: V4PreparedExecutionSpec
     attempt_id: str
     fence_identity: str
     client_submit_key: str
@@ -525,7 +538,7 @@ def build_atomic_publication_request_v4(
         processing_run_projection_sha256=sha256_bytes(projection.encode("utf-8")),
         semantic_route_receipts_contract_version=SEMANTIC_ROUTE_RECEIPT_V3,
         semantic_route_receipts=(route,),
-        expected_unit_build_status_before="running",
+        expected_unit_build_status_before="not_started",
         expected_unit_build_attempt_count_before=0,
         previous_active_units=previous_active_units,
         previous_active_units_sha256=previous_active_units_sha256_v4(
@@ -543,9 +556,11 @@ def build_v4_supersession_stage_fixture(
 ) -> V4SupersessionStageFixture:
     attempt_id = "rpa_" + ids.new_ulid()
     fence_identity = "fence-" + ids.new_ulid()
-    client_submit_key = "submit-" + ids.new_ulid()
-    request_sha256 = sha256_bytes((attempt_id + ":request").encode())
-    runtime_epoch_sha256 = sha256_bytes((attempt_id + ":epoch").encode())
+    execution_spec = _execution_spec(attempt_id, fence_identity, source.source_pdf_sha256)
+    prepared_submission = execution_spec.prepared_submission
+    client_submit_key = prepared_submission.client_submit_key
+    request_sha256 = execution_spec.request_sha256
+    runtime_epoch_sha256 = prepared_submission.runtime_bundle_identity_sha256
     target_processing_run_id = (
         source.processing_run_id
         if processing_run_id is None
@@ -560,9 +575,7 @@ def build_v4_supersession_stage_fixture(
         source_pdf_sha256=source.source_pdf_sha256,
         source_byte_count=source.reservation.source_byte_count,
         source_page_count=source.reservation.source_page_count,
-        prepared_submission_identity_sha256=sha256_bytes(
-            (attempt_id + ":prepared-submission").encode()
-        ),
+        prepared_submission_identity_sha256=prepared_submission.sha256,
         request_sha256=request_sha256,
         runtime_epoch_sha256=runtime_epoch_sha256,
         process_profile_sha256=source.process_profile_sha256,
@@ -574,6 +587,8 @@ def build_v4_supersession_stage_fixture(
     preparation = build_preparation_intent_v4(
         reservation=reservation,
         parser_target_sha256=source.parser_target_sha256,
+        execution_spec_sha256=execution_spec.sha256,
+        execution_spec_byte_count=execution_spec.byte_count,
     )
     snapshot = SnapshotReceiptV4(
         attempt_id=attempt_id,
@@ -652,6 +667,7 @@ def build_v4_supersession_stage_fixture(
     )
     return V4SupersessionStageFixture(
         source=source,
+        execution_spec=execution_spec,
         attempt_id=attempt_id,
         fence_identity=fence_identity,
         client_submit_key=client_submit_key,
@@ -713,6 +729,24 @@ def build_v4_resource_free_supersession_fixture(
     )
 
 
+def _execution_spec(attempt_id: str, fence_identity: str, source_sha: str) -> V4PreparedExecutionSpec:
+    template = _spec()
+    prepared = prepare_submission_identity_v2(
+        api_url=template.api_origin, server_url=template.server_url,
+        options=template.parser_options, source_pdf_sha256=source_sha,
+        attempt_identity=attempt_id, fence_identity=fence_identity,
+        submission_epoch_unix=1,
+    )
+    request = submission_request_exact_bytes_v2(
+        api_origin=template.api_origin,
+        form=submission_form_v2(template.parser_options, server_url=template.server_url),
+        upload_filename=source_sha[7:] + ".pdf",
+    )
+    return replace(template, parser_identity=replace(template.parser_identity, name="MinerU"),
+                   prepared_submission=prepared, request_exact_bytes=request,
+                   request_sha256=sha256_bytes(request))
+
+
 def build_v4_authority_fixture(
     *,
     attempt_id: str | None = None,
@@ -721,30 +755,24 @@ def build_v4_authority_fixture(
     processing_run_id = ids.new_processing_run_id()
     attempt_id = attempt_id or "rpa_" + ids.new_ulid()
     fence_identity = "fence-" + ids.new_ulid()
-    client_submit_key = "submit-" + ids.new_ulid()
     source_pdf_sha256 = sha256_bytes((attempt_id + ":source").encode())
-    parser_target_identity = ParserTargetIdentity(
-        name="MinerU",
-        package_version="3.4.4",
-        backend="hybrid-http-client",
-        method="auto",
-        language="ch",
-        formula=True,
-        table=True,
-        effort="medium",
-        runtime_bundle_identity_sha256=sha256_bytes(
-            (attempt_id + ":runtime-bundle").encode()
-        ),
-    )
+    execution_spec = _execution_spec(attempt_id, fence_identity, source_pdf_sha256)
+    prepared_submission = execution_spec.prepared_submission
+    client_submit_key = prepared_submission.client_submit_key
+    parser_target_identity = execution_spec.parser_options.target_identity(execution_spec.parser_identity)
     parser_target_identity_json = json.dumps(
         parser_target_identity.to_payload(),
         sort_keys=True,
         separators=(",", ":"),
     )
     parser_target_sha256 = sha256_bytes(parser_target_identity_json.encode())
-    request_sha256 = sha256_bytes((attempt_id + ":request").encode())
-    runtime_epoch_sha256 = sha256_bytes((attempt_id + ":epoch").encode())
-    process_profile_sha256 = sha256_bytes((attempt_id + ":profile").encode())
+    request_sha256 = execution_spec.request_sha256
+    runtime_epoch_sha256 = (
+        parser_target_identity.runtime_bundle_identity_sha256
+    )
+    process_profile_sha256 = execution_spec.process_profile_sha256
+    execution_spec_sha256 = execution_spec.sha256
+    execution_spec_byte_count = execution_spec.byte_count
     credit_policy_sha256 = sha256_bytes((attempt_id + ":credit").encode())
 
     reservation_credit = ResourceCreditVector(
@@ -783,9 +811,7 @@ def build_v4_authority_fixture(
         source_pdf_sha256=source_pdf_sha256,
         source_byte_count=100,
         source_page_count=2,
-        prepared_submission_identity_sha256=sha256_bytes(
-            (attempt_id + ":prepared-submission").encode()
-        ),
+        prepared_submission_identity_sha256=prepared_submission.sha256,
         request_sha256=request_sha256,
         runtime_epoch_sha256=runtime_epoch_sha256,
         process_profile_sha256=process_profile_sha256,
@@ -797,6 +823,8 @@ def build_v4_authority_fixture(
     preparation = build_preparation_intent_v4(
         reservation=reservation,
         parser_target_sha256=parser_target_sha256,
+        execution_spec_sha256=execution_spec_sha256,
+        execution_spec_byte_count=execution_spec_byte_count,
     )
     snapshot = SnapshotReceiptV4(
         attempt_id=attempt_id,
@@ -1473,13 +1501,17 @@ def build_v4_authority_fixture(
         attempt_id=attempt_id,
         fence_identity=fence_identity,
         client_submit_key=client_submit_key,
+        prepared_submission=prepared_submission,
         source_pdf_sha256=source_pdf_sha256,
         parser_target_identity_json=parser_target_identity_json,
         parser_target_sha256=parser_target_sha256,
         request_sha256=request_sha256,
         runtime_epoch_sha256=runtime_epoch_sha256,
         process_profile_sha256=process_profile_sha256,
+        execution_spec_sha256=execution_spec_sha256,
+        execution_spec_byte_count=execution_spec_byte_count,
         credit_policy_sha256=credit_policy_sha256,
+        execution_spec=execution_spec,
         reservation_input=reservation_input,
         reservation=reservation,
         preparation=preparation,
@@ -1664,6 +1696,20 @@ def insert_evidence(
             "byte_count": len(exact_bytes),
         },
     )
+    # Historical migration tests intentionally stop before the spec revision.
+    # Only fixture setup is version-aware; the production loader never falls back.
+    if encoded.kind == "preparation_intent" and conn.execute(text(
+        "SELECT to_regclass('disclosure_ops.remote_parse_v4_execution_spec')"
+    )).scalar_one() is not None:
+        spec = fixture.execution_spec
+        conn.execute(text(
+            "INSERT INTO disclosure_ops.remote_parse_v4_execution_spec "
+            "(attempt_id,fence_identity,preparation_intent_sha256,execution_spec_sha256,"
+            "execution_spec_bytes,execution_spec_byte_count) VALUES "
+            "(:attempt,:fence,:preparation,:sha,:payload,:size)"
+        ), {"attempt": fixture.attempt_id, "fence": fixture.fence_identity,
+            "preparation": encoded.sha256, "sha": spec.sha256,
+            "payload": spec.exact_bytes, "size": spec.byte_count})
     return encoded
 
 

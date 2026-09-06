@@ -18,7 +18,7 @@
   },
   "tests/integration/test_atomic_document_publisher_v4.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 15
   },
   "tests/integration/test_cninfo_download.py": {
    "private_imports": [],
@@ -88,7 +88,7 @@
   },
   "tests/integration/test_remote_parse_v4_repository.py": {
    "private_imports": [],
-   "tests": 38
+   "tests": 39
   },
   "tests/integration/test_repository_uow.py": {
    "private_imports": [],
@@ -104,11 +104,19 @@
   },
   "tests/integration/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 14
+  },
+  "tests/integration/test_staged_v4_end_to_end.py": {
+   "private_imports": [],
+   "tests": 4
   },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [],
    "tests": 4
+  },
+  "tests/integration/test_v4_execution_spec_backfill.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/sample_corpus/test_provider_unit_builder_frozen.py": {
    "private_imports": [],
@@ -132,7 +140,15 @@
   },
   "tests/unit/test_atomic_publication_artifact_readiness_adapter_v4.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 4
+  },
+  "tests/unit/test_atomic_publication_inventory_v4.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_atomic_publication_request_builder_v4.py": {
+   "private_imports": [],
+   "tests": 4
   },
   "tests/unit/test_atomic_publication_request_factory_v4.py": {
    "private_imports": [],
@@ -283,7 +299,7 @@
   },
   "tests/unit/test_freeze_mineru_campaign_epoch.py": {
    "private_imports": [],
-   "tests": 2
+   "tests": 4
   },
   "tests/unit/test_full_host_hour_kpi.py": {
    "private_imports": [],
@@ -335,7 +351,7 @@
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 34
+   "tests": 35
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
@@ -343,7 +359,7 @@
   },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
@@ -355,17 +371,17 @@
   },
   "tests/unit/test_mineru_http_staged.py": {
    "private_imports": [],
-   "tests": 28
+   "tests": 29
   },
   "tests/unit/test_mineru_http_staged_v4.py": {
    "private_imports": [
     "_ZipPathCollisionIndex"
    ],
-   "tests": 74
+   "tests": 65
   },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 15
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
@@ -413,7 +429,7 @@
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 11
   },
   "tests/unit/test_pending_download_predicate.py": {
    "private_imports": [
@@ -431,11 +447,11 @@
   },
   "tests/unit/test_prepare_and_publish_whole_document_v4.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_provider_document_admission.py": {
    "private_imports": [],
-   "tests": 33
+   "tests": 36
   },
   "tests/unit/test_provider_document_envelope.py": {
    "private_imports": [],
@@ -501,7 +517,7 @@
   },
   "tests/unit/test_remote_parse_v4_recovery_projection.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 8
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
@@ -559,23 +575,31 @@
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 9
+  },
+  "tests/unit/test_staged_admission_observation.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_staged_coordinator_backend_v4.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 12
   },
   "tests/unit/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 20
   },
   "tests/unit/test_staged_credit.py": {
    "private_imports": [],
    "tests": 11
   },
+  "tests/unit/test_staged_new_work_admission_v4.py": {
+   "private_imports": [],
+   "tests": 12
+  },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
-   "tests": 68
+   "tests": 76
   },
   "tests/unit/test_staged_provider_parser_v4.py": {
    "private_imports": [],
@@ -588,6 +612,18 @@
   "tests/unit/test_staged_resource_paths.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_staged_v4_capacity.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_staged_worker_profile_v4.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_staged_worker_v4_runtime.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],
@@ -617,6 +653,38 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/unit/test_v4_execution_spec_catalog.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_v4_initial_ingress.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_v4_legacy_spec_retirement.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_v4_local_resource_cutover.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_v4_prepared_execution_spec.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/unit/test_v4_resource_ownership.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_v4_source_observation.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_v4_stage_input_resolver.py": {
+   "private_imports": [],
+   "tests": 9
+  },
   "tests/unit/test_value_objects.py": {
    "private_imports": [],
    "tests": 14
@@ -627,7 +695,7 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 28
+   "tests": 35
   },
   "tests/unit/test_worker_progress.py": {
    "private_imports": [],

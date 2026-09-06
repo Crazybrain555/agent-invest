@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_SMOKE_INPUT_SHA256,
     MINERU_WINDOWS_COLLECTOR_PATH,
     MINERU_WINDOWS_COMPOSE_PATH,
+    STAGED_RUNTIME_MANIFEST_CONTRACT,
     MinerUClientIdentity,
     canonical_payload_sha256,
 )
@@ -40,6 +42,7 @@ from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
 )
 from disclosure_anchor.settings import Settings
+from tests.unit.test_mineru_process_profile import _profile
 
 
 LOCAL_DIGEST = "sha256:" + "1" * 64
@@ -127,6 +130,9 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "processing_window_size": 16,
             "task_retention_seconds": 600,
             "task_cleanup_interval_seconds": 30,
+            "task_registry_max_records": 128,
+            "task_result_reservation_bytes": 256 * 1024 * 1024,
+            "max_unacked_result_bytes": 2 * 1024 * 1024 * 1024,
             "output_root_policy": "dedicated-scratch-retention.v1",
             "command": ["mineru-api", "--max-concurrency", "7"],
         }
@@ -138,9 +144,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "observability_endpoint_sha256": endpoint_sha256(
                 observability_url, prefixed=True
             ),
-            "inference_upstream_sha256": endpoint_sha256(
-                inference_url, prefixed=True
-            ),
+            "inference_upstream_sha256": endpoint_sha256(inference_url, prefixed=True),
             "ssh_host_key_sha256": "sha256:" + "b" * 64,
             "windows_node_identity_sha256": "sha256:" + "c" * 64,
             "windows_compose_path": MINERU_WINDOWS_COMPOSE_PATH,
@@ -149,7 +153,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "windows_collector_sha256": "sha256:" + "e" * 64,
         }
         manifest = {
-            "contract_version": "mineru-runtime-bundle.v8",
+            "contract_version": STAGED_RUNTIME_MANIFEST_CONTRACT,
             "client": {
                 "package_set_sha256": LOCAL_DIGEST,
                 "writer_code_sha256": CODE_DIGEST,
@@ -279,9 +283,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "schema": "mineru-service-epoch.v1",
             "runtime_manifest_identity_sha256": runtime_identity,
             "collector_sha256": topology["windows_collector_sha256"],
-            "windows_node_identity_sha256": topology[
-                "windows_node_identity_sha256"
-            ],
+            "windows_node_identity_sha256": topology["windows_node_identity_sha256"],
             "windows_compose_sha256": topology["windows_compose_sha256"],
             "writer_code_sha256": manifest["client"]["writer_code_sha256"],
             "api_image_digest": manifest["orchestrator"]["container_image_digest"],
@@ -372,12 +374,130 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             ),
         )
 
+    @staticmethod
+    def _staged_profile(settings: Settings):
+        assert settings.disclosure_mineru_smoke_receipt is not None
+        payload = json.loads(
+            settings.disclosure_mineru_smoke_receipt.read_text(encoding="utf-8")
+        )
+        manifest = payload["runtime_manifest"]
+        orchestrator = manifest["orchestrator"]
+        inference = manifest["inference_server"]
+        topology = manifest["topology"]
+        return replace(
+            _profile(),
+            runtime_bundle_identity_sha256=(
+                settings.disclosure_mineru_runtime_bundle_identity_sha256
+            ),
+            orchestrator_image_identity_sha256=orchestrator["container_image_digest"],
+            inference_image_identity_sha256=inference["container_image_digest"],
+            model_snapshot_identity_sha256=canonical_payload_sha256(
+                {
+                    "model_repository": inference["model_repository"],
+                    "model_snapshot_revision": inference["model_snapshot_revision"],
+                }
+            ),
+            host_runtime_identity_sha256=topology["windows_node_identity_sha256"],
+            vllm_engine_args_sha256=canonical_payload_sha256(inference["command"]),
+            api_task_slots=1,
+            api_max_pending_tasks=1,
+            registry_nonterminal_cap=1,
+            registry_terminal_cap=127,
+            processing_window_size=16,
+            raster_stage_slots=1,
+            layout_stage_slots=1,
+            postprocess_stage_slots=1,
+            native_owner_slots=1,
+            requested_hybrid_batch_ratio=1,
+            effective_hybrid_batch_ratio=1,
+            inference_concurrency=7,
+            vllm_max_num_seqs=128,
+            vllm_max_model_len=8192,
+            vllm_mm_processor_cache_bytes=0,
+            pipeline_inference_locks=True,
+            finalizer_slots=1,
+            result_reservation_bytes=256 * 1024 * 1024,
+            max_unacked_result_bytes=2 * 1024 * 1024 * 1024,
+            gpu_request_slots=7,
+            task_retention_seconds=600,
+            task_cleanup_interval_seconds=30,
+        )
+
     def test_matching_current_validation_allows_composition(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings, client, _ = self._fixture(Path(tmp), now=datetime.now(UTC))
             client_patch, code_patch = self._identity_patches(client)
             with client_patch, code_patch:
                 require_mineru_deployment_gate(settings)
+
+    def test_staged_profile_must_match_current_runtime_contract_and_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, client, _ = self._fixture(Path(tmp), now=datetime.now(UTC))
+            profile = self._staged_profile(settings)
+            client_patch, code_patch = self._identity_patches(client)
+            with client_patch, code_patch:
+                require_mineru_deployment_gate(
+                    settings,
+                    parse_enabled=True,
+                    process_profile=profile,
+                )
+
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                client_patch,
+                code_patch,
+                self.assertRaisesRegex(
+                    MinerUDeploymentGateError, "serial runtime contract"
+                ),
+            ):
+                require_mineru_deployment_gate(
+                    settings,
+                    parse_enabled=True,
+                    process_profile=replace(
+                        profile,
+                        api_max_pending_tasks=2,
+                        registry_nonterminal_cap=2,
+                    ),
+                )
+
+            for update in (
+                {"registry_terminal_cap": 126},
+                {"result_reservation_bytes": 128 * 1024 * 1024},
+                {"max_unacked_result_bytes": 1024 * 1024 * 1024},
+            ):
+                with self.subTest(update=update):
+                    client_patch, code_patch = self._identity_patches(client)
+                    with (
+                        client_patch,
+                        code_patch,
+                        self.assertRaisesRegex(
+                            MinerUDeploymentGateError, "serial runtime contract"
+                        ),
+                    ):
+                        require_mineru_deployment_gate(
+                            settings,
+                            parse_enabled=True,
+                            process_profile=replace(profile, **update),
+                        )
+
+            client_patch, code_patch = self._identity_patches(client)
+            with (
+                client_patch,
+                code_patch,
+                self.assertRaisesRegex(
+                    MinerUDeploymentGateError, "attested runtime manifest"
+                ),
+            ):
+                require_mineru_deployment_gate(
+                    settings,
+                    parse_enabled=True,
+                    process_profile=replace(
+                        profile,
+                        host_runtime_identity_sha256="sha256:" + "0" * 64,
+                    ),
+                )
 
     def test_parse_admission_fails_closed_without_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -389,9 +509,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             with (
                 client_patch,
                 code_patch,
-                self.assertRaisesRegex(
-                    MinerUDeploymentGateError, "validation receipt"
-                ),
+                self.assertRaisesRegex(MinerUDeploymentGateError, "validation receipt"),
             ):
                 require_mineru_deployment_gate(settings)
 
@@ -416,22 +534,18 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "max_pending_tasks_effective",
         ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
-                settings, client, _ = self._fixture(
-                    Path(tmp), now=datetime.now(UTC)
-                )
+                settings, client, _ = self._fixture(Path(tmp), now=datetime.now(UTC))
                 assert settings.disclosure_mineru_smoke_receipt is not None
-                payload = json.loads(settings.disclosure_mineru_smoke_receipt.read_bytes())
-                payload["orchestrator"]["after"][field] = 2
-                settings.disclosure_mineru_smoke_receipt.write_text(
-                    json.dumps(payload)
+                payload = json.loads(
+                    settings.disclosure_mineru_smoke_receipt.read_bytes()
                 )
+                payload["orchestrator"]["after"][field] = 2
+                settings.disclosure_mineru_smoke_receipt.write_text(json.dumps(payload))
                 client_patch, code_patch = self._identity_patches(client)
                 with (
                     client_patch,
                     code_patch,
-                    self.assertRaisesRegex(
-                        MinerUDeploymentGateError, "pending"
-                    ),
+                    self.assertRaisesRegex(MinerUDeploymentGateError, "pending"),
                 ):
                     require_mineru_deployment_gate(settings)
 
@@ -454,9 +568,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             "bad_container_id",
         ):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
-                settings, client, _ = self._fixture(
-                    Path(tmp), now=datetime.now(UTC)
-                )
+                settings, client, _ = self._fixture(Path(tmp), now=datetime.now(UTC))
                 assert settings.disclosure_mineru_validation_receipt is not None
                 value = json.loads(
                     settings.disclosure_mineru_validation_receipt.read_bytes()
@@ -476,28 +588,24 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     )
                 elif tamper == "epoch":
                     after = value["epoch_after"]
-                    after["receipt"]["service_epoch"][
-                        "container_epoch_sha256"
-                    ] = "sha256:" + "7" * 64
-                    after["receipt"]["service_epoch_sha256"] = (
-                        canonical_payload_sha256(after["receipt"]["service_epoch"])
+                    after["receipt"]["service_epoch"]["container_epoch_sha256"] = (
+                        "sha256:" + "7" * 64
                     )
-                    after["receipt_sha256"] = canonical_payload_sha256(
-                        after["receipt"]
+                    after["receipt"]["service_epoch_sha256"] = canonical_payload_sha256(
+                        after["receipt"]["service_epoch"]
                     )
+                    after["receipt_sha256"] = canonical_payload_sha256(after["receipt"])
                 elif tamper == "document_hash":
                     documents[0]["receipt"]["provider"]["block_count"] += 1
                 elif tamper == "epoch_hash":
                     value["epoch_after"]["receipt"]["service_epoch"][
                         "api_container_id"
                     ] = "7" * 64
-                    value["epoch_after"]["receipt_sha256"] = (
-                        canonical_payload_sha256(value["epoch_after"]["receipt"])
+                    value["epoch_after"]["receipt_sha256"] = canonical_payload_sha256(
+                        value["epoch_after"]["receipt"]
                     )
                 elif tamper == "input_profile":
-                    documents[0]["receipt"]["input"]["profile"] = (
-                        "deployment_frozen_v1"
-                    )
+                    documents[0]["receipt"]["input"]["profile"] = "deployment_frozen_v1"
                     documents[0]["receipt_sha256"] = canonical_payload_sha256(
                         documents[0]["receipt"]
                     )
@@ -508,8 +616,8 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                         else "cgroup_oom_kill_total"
                     )
                     value["epoch_after"]["receipt"]["safety"][field] = 1
-                    value["epoch_after"]["receipt_sha256"] = (
-                        canonical_payload_sha256(value["epoch_after"]["receipt"])
+                    value["epoch_after"]["receipt_sha256"] = canonical_payload_sha256(
+                        value["epoch_after"]["receipt"]
                     )
                 else:
                     field = {
@@ -617,9 +725,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
     def test_evidence_files_are_private_and_not_hardlinked(self) -> None:
         for tamper in ("mode", "hardlink"):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
-                settings, client, _ = self._fixture(
-                    Path(tmp), now=datetime.now(UTC)
-                )
+                settings, client, _ = self._fixture(Path(tmp), now=datetime.now(UTC))
                 assert settings.disclosure_mineru_smoke_receipt is not None
                 assert settings.disclosure_mineru_validation_receipt is not None
                 if tamper == "mode":

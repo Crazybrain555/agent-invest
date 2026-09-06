@@ -20,7 +20,9 @@ from disclosure_anchor.application.contracts.provider_document_admission import 
 from disclosure_anchor.application.contracts.html_visible_text import html_visible_text
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.contracts.provider_document_envelope import (
+    ProviderDocumentEnvelope,
     provider_document_envelope_from_bytes,
+    provider_document_envelope_to_bytes,
 )
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.application.ports.provider_document_source import (
@@ -176,10 +178,122 @@ class ProviderDocumentAdmission:
                 "provider_document_projection_mismatch",
                 "provider document projection differs from the frozen MinerU bundle",
             )
+        return self._admit_verified_projection(
+            provider_document_relpath=provider_document_relpath,
+            provider_document_sha256=record_sha256,
+            envelope=envelope,
+            provider_document=rebuilt,
+            source_pdf_relpath=Path(source_pdf_relpath),
+        )
+
+    def admit_materialized(
+        self,
+        *,
+        document: e.Document,
+        envelope: ProviderDocumentEnvelope,
+        provider_document_sha256: str,
+        expected_source_byte_count: int,
+        security_code: str,
+    ) -> AdmittedProviderDocument:
+        """Admit an already V4-verified materialized provider envelope.
+
+        The staged path has not yet selected transaction P, so its candidate
+        processing run is deliberately still ``running`` and the provider
+        record has not been promoted into the durable derived namespace.  This
+        entry point validates that exact in-memory envelope and then delegates
+        to the same native-PDF reconciliation/quality projection used by the
+        post-publication ``admit`` path.
+        """
+
+        if type(envelope) is not ProviderDocumentEnvelope:
+            self._fail(
+                "provider_document_contract_invalid",
+                "materialized provider envelope is not exact",
+            )
+        provider = _required(document.provider, "document provider")
+        provider_document_id = _required(
+            document.provider_document_id,
+            "provider document id",
+        )
+        source_pdf_relpath = _required(document.raw_file_relpath, "source PDF path")
+        source_pdf_sha256 = _required(document.raw_file_hash, "source PDF hash")
+        if not security_code:
+            self._fail("document_identity_invalid", "security code is missing")
+        source_parts = PurePosixPath(source_pdf_relpath).parts
+        if len(source_parts) < 3 or source_parts[2] != security_code:
+            self._fail(
+                "document_identity_invalid",
+                "source PDF path differs from the document security code",
+            )
+        expected_envelope_facts = {
+            "document_id": document.document_id,
+            "provider": provider,
+            "provider_document_id": provider_document_id,
+            "source_pdf_relpath": source_pdf_relpath,
+            "input_raw_file_hash": source_pdf_sha256,
+        }
+        for field, expected in expected_envelope_facts.items():
+            if getattr(envelope, field) != expected:
+                self._fail(
+                    "provider_document_identity_mismatch",
+                    f"provider document field {field} differs from its source",
+                )
+        record_sha256 = _sha256(provider_document_envelope_to_bytes(envelope))
+        if record_sha256 != provider_document_sha256:
+            self._fail(
+                "provider_document_hash_mismatch",
+                "materialized provider document bytes differ from its receipt",
+            )
+        try:
+            source_observation = self._source.observe_source_pdf(
+                Path(source_pdf_relpath)
+            )
+        except ProviderDocumentSourceError as exc:
+            raise ProviderDocumentAdmissionError(
+                exc.reason_code,
+                str(exc),
+                retryable=exc.retryable,
+            ) from exc
+        if (
+            source_observation.sha256 != envelope.input_raw_file_hash
+            or source_observation.byte_count != expected_source_byte_count
+            or source_observation.page_count != envelope.source_pdf_page_count
+        ):
+            self._fail(
+                "source_pdf_identity_mismatch",
+                "source PDF bytes, byte count, or page count differ from the provider record",
+            )
+        provider_document_relpath = self._paths.provider_document_relpath(
+            provider=provider,
+            security_code=security_code,
+            provider_document_id=provider_document_id,
+            artifact_owner_processing_run_id=(
+                envelope.artifact_owner_processing_run_id
+            ),
+        )
+        return self._admit_verified_projection(
+            provider_document_relpath=provider_document_relpath,
+            provider_document_sha256=record_sha256,
+            envelope=envelope,
+            provider_document=envelope.provider_document,
+            source_pdf_relpath=Path(source_pdf_relpath),
+        )
+
+    def _admit_verified_projection(
+        self,
+        *,
+        provider_document_relpath: Path,
+        provider_document_sha256: str,
+        envelope: ProviderDocumentEnvelope,
+        provider_document: ProviderDocument,
+        source_pdf_relpath: Path,
+    ) -> AdmittedProviderDocument:
+        """Apply the sole source-text reconciliation and quality semantics."""
+
         try:
             native_text = self._source.observe_source_pdf_text(
-                Path(source_pdf_relpath),
-                document=rebuilt,
+                source_pdf_relpath,
+                document=provider_document,
                 expected_sha256=envelope.input_raw_file_hash,
             )
         except ProviderDocumentSourceError as exc:
@@ -190,11 +304,11 @@ class ProviderDocumentAdmission:
             ) from exc
         try:
             reconciliations = _source_text_reconciliations(
-                rebuilt,
+                provider_document,
                 native_text,
             )
             quality_findings = _source_quality_findings(
-                rebuilt,
+                provider_document,
                 native_text,
                 reconciliations=reconciliations,
             )
@@ -205,7 +319,7 @@ class ProviderDocumentAdmission:
             ) from exc
         return AdmittedProviderDocument(
             provider_document_relpath=provider_document_relpath,
-            provider_document_sha256=record_sha256,
+            provider_document_sha256=provider_document_sha256,
             envelope=envelope,
             source_text_reconciliations=reconciliations,
             source_quality_findings=quality_findings,

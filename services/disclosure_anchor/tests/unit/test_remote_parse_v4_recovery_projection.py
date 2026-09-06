@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
 import unittest
 
 from disclosure_anchor.adapters.db.postgres.remote_parse_v4_repository import (
+    RemoteParseV4Repository,
     recovery_candidate_from_head_row,
 )
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RecoveryCandidate,
     RemoteParseV4AuthorityViolation,
+    V4GenerationConflict,
+    V4PreparedProposal,
+    bind_v4_prepared_proposal,
 )
+from disclosure_anchor.application.contracts.staged_resource_credit import (
+    ResourceCreditVector,
+    ResourceReservationInput,
+    StagedResourceCreditEnvelope,
+    encode_resource_reservation_input,
+)
+from tests.integration._remote_parse_v4_factory import _execution_spec
 from disclosure_anchor.application.services.staged_parse_coordinator import (
     RecoveryCandidate as CoordinatorRecoveryCandidate,
 )
@@ -57,6 +69,24 @@ class RemoteParseV4RecoveryProjectionTests(unittest.TestCase):
                 lease_remaining_seconds=None,
             ),
         )
+
+    def test_creation_guard_rejects_a_historical_generation_gap(self) -> None:
+        with self.assertRaisesRegex(
+            V4GenerationConflict,
+            "not contiguous",
+        ):
+            RemoteParseV4Repository._guard_creation_chain(
+                rows=(
+                    {
+                        "attempt_generation": 2,
+                        "is_current": False,
+                        "checkpoint_contract_version": 4,
+                        "state": "acked",
+                    },
+                ),
+                generations=(3,),
+                allow_existing_current=False,
+            )
 
     def test_owned_lease_projection_preserves_negative_zero_and_positive_signs(
         self,
@@ -144,6 +174,87 @@ class RemoteParseV4RecoveryProjectionTests(unittest.TestCase):
                 self._claimed_row(),
                 database_observed_at="not-a-clock",  # type: ignore[arg-type]
             )
+
+    def test_prepared_proposal_binds_generation_into_exact_h0(self) -> None:
+        proposal = _prepared_proposal()
+
+        creation = bind_v4_prepared_proposal(
+            proposal,
+            attempt_generation=4,
+        )
+
+        self.assertEqual(creation.checkpoint.attempt_generation, 4)
+        self.assertEqual(creation.reservation.attempt_generation, 4)
+        self.assertEqual(creation.checkpoint.state, "prepared")
+        self.assertEqual(creation.checkpoint.lifecycle_version, 0)
+        self.assertIsNone(creation.snapshot_receipt)
+        self.assertIsNone(creation.checkpoint.snapshot_receipt_sha256)
+        self.assertEqual(
+            creation.checkpoint.held_resource_credit,
+            ResourceCreditVector(
+                documents=1,
+                snapshot_items=1,
+                snapshot_bytes=100,
+            ),
+        )
+
+    def test_prepared_proposal_generation_binding_is_pure_and_distinct(self) -> None:
+        proposal = _prepared_proposal()
+
+        first = bind_v4_prepared_proposal(proposal, attempt_generation=1)
+        second = bind_v4_prepared_proposal(proposal, attempt_generation=2)
+
+        self.assertEqual(proposal, _prepared_proposal())
+        self.assertNotEqual(first.reservation.sha256, second.reservation.sha256)
+        self.assertNotEqual(first.checkpoint.sha256, second.checkpoint.sha256)
+        self.assertEqual(first.preparation_intent.parser_target_sha256, proposal.parser_target_sha256)
+
+
+def _sha(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _prepared_proposal() -> V4PreparedProposal:
+    spec = _execution_spec("rpa_prepared-proposal", "fence-prepared-proposal", _sha("source"))
+    reserved = ResourceCreditVector(
+        documents=1,
+        snapshot_items=1,
+        snapshot_bytes=100,
+        remote_waits=1,
+        provider_tasks=1,
+        provider_result_bytes=200,
+        materialization_items=1,
+        compressed_bytes=200,
+        decoded_bytes=300,
+        temp_disk_bytes=400,
+        output_items=1,
+        output_bytes=300,
+        output_pages=2,
+        ack_items=1,
+    )
+    encoded = encode_resource_reservation_input(
+        ResourceReservationInput(
+            source_pdf_sha256=_sha("source"),
+            source_byte_count=100,
+            source_page_count=2,
+            process_profile_sha256=spec.process_profile_sha256,
+            credit_policy_sha256=_sha("policy"),
+            bucket="regular",
+            reservation=reserved,
+        )
+    )
+    return V4PreparedProposal(
+        document_id="doc_prepared-proposal",
+        processing_run_id="run_prepared-proposal",
+        prepared_submission=spec.prepared_submission,
+        credit_envelope=StagedResourceCreditEnvelope(
+            process_profile_sha256=spec.process_profile_sha256,
+            credit_policy_sha256=_sha("policy"),
+            reservation_input=encoded,
+            reservation=reserved,
+        ),
+        execution_spec=spec,
+    )
 
 
 if __name__ == "__main__":

@@ -775,6 +775,43 @@ class RemoteParseAttempt(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
+class RemoteParseV4ExecutionSpec(Base):
+    __tablename__ = "remote_parse_v4_execution_spec"
+    __table_args__ = (
+        UniqueConstraint("attempt_id", "fence_identity", "preparation_intent_sha256",
+                         name="uq_v4_execution_spec_preparation"),
+        ForeignKeyConstraint(
+            ["attempt_id", "fence_identity"],
+            [f"{OPS_SCHEMA}.remote_parse_attempt.attempt_id",
+             f"{OPS_SCHEMA}.remote_parse_attempt.fence_identity"],
+            name="fk_v4_execution_spec_parent", onupdate="RESTRICT", ondelete="RESTRICT",
+            deferrable=True, initially="DEFERRED",
+        ),
+        ForeignKeyConstraint(
+            ["attempt_id", "preparation_intent_sha256"],
+            [f"{OPS_SCHEMA}.remote_parse_v4_evidence.attempt_id",
+             f"{OPS_SCHEMA}.remote_parse_v4_evidence.evidence_sha256"],
+            name="fk_v4_execution_spec_preparation", onupdate="RESTRICT", ondelete="RESTRICT",
+            deferrable=True, initially="DEFERRED",
+        ),
+        CheckConstraint(
+            "execution_spec_sha256 ~ '^sha256:[0-9a-f]{64}$' AND "
+            "preparation_intent_sha256 ~ '^sha256:[0-9a-f]{64}$' AND "
+            "execution_spec_byte_count=octet_length(execution_spec_bytes) AND "
+            "execution_spec_byte_count BETWEEN 1 AND 524288",
+            name="ck_v4_execution_spec_identity",
+        ),
+        {"schema": OPS_SCHEMA},
+    )
+    attempt_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fence_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    preparation_intent_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    execution_spec_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    execution_spec_bytes: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    execution_spec_byte_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class RemoteParseV4Evidence(Base):
     __tablename__ = "remote_parse_v4_evidence"
     __table_args__ = (
@@ -836,6 +873,14 @@ class RemoteParseV4Evidence(Base):
 class RemoteParseV4Checkpoint(Base):
     __tablename__ = "remote_parse_v4_checkpoint"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["attempt_id", "fence_identity", "preparation_intent_sha256"],
+            [f"{OPS_SCHEMA}.remote_parse_v4_execution_spec.attempt_id",
+             f"{OPS_SCHEMA}.remote_parse_v4_execution_spec.fence_identity",
+             f"{OPS_SCHEMA}.remote_parse_v4_execution_spec.preparation_intent_sha256"],
+            name="fk_v4_checkpoint_execution_spec", onupdate="RESTRICT", ondelete="RESTRICT",
+            deferrable=True, initially="DEFERRED",
+        ),
         UniqueConstraint(
             "attempt_id",
             "lifecycle_version",

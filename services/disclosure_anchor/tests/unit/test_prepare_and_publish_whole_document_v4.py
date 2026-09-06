@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from threading import Event
 from typing import Any, cast
 import unittest
 
@@ -25,6 +26,10 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.prepare_and_publish_whole_document_v4 import (
     PrepareAndPublishWholeDocumentV4,
+)
+from disclosure_anchor.application.services.staged_parse_coordinator import (
+    StageLeaseGuard,
+    StageLeaseLost,
 )
 
 
@@ -55,6 +60,27 @@ class _Readiness:
             "verify-post" if kwargs.get("expected_winner") is not None else "verify-pre"
         )
         return self.ready
+
+
+class _RequestFactory:
+    def __init__(self, events: list[str], request: AtomicPublicationRequestV4) -> None:
+        self.events = events
+        self.request = request
+
+    def build_or_reopen(self, **_: object) -> AtomicPublicationRequestV4:
+        self.events.append("build-or-reopen")
+        return self.request
+
+
+class _StageGuard:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def checkpoint(self) -> None:
+        self.events.append("stage-checkpoint")
+
+    def remaining_seconds(self) -> float:
+        return 1.0
 
 
 class _Publisher:
@@ -95,7 +121,10 @@ class PrepareAndPublishWholeDocumentV4Tests(unittest.TestCase):
             ),
         )
         self.winner = cast(AtomicPublicationWinnerV4, object())
-        self.checkpoint = cast(RemoteParseCheckpointV4, object())
+        self.checkpoint = cast(
+            RemoteParseCheckpointV4,
+            SimpleNamespace(document_id="doc_1"),
+        )
         self.materialized = cast(MaterializedProviderDocumentV4, object())
         self.claim = cast(V4ClaimWitness, object())
         self.guard = cast(V4ClaimGuard, object())
@@ -107,17 +136,21 @@ class PrepareAndPublishWholeDocumentV4Tests(unittest.TestCase):
                 Any,
                 lambda: cast(UnitOfWork, _Uow(self.events)),
             ),
+            publication_requests=cast(
+                Any,
+                _RequestFactory(self.events, self.request),
+            ),
             readiness=cast(Any, readiness),
             publisher=cast(Any, publisher),
         )
 
     def _execute(self, publisher: _Publisher) -> AtomicPublicationWinnerV4:
         return self._use_case(publisher).execute(
-            request=self.request,
             checkpoint=self.checkpoint,
             materialized=self.materialized,
             claim=self.claim,
             claim_guard=self.guard,
+            stage_guard=cast(Any, _StageGuard(self.events)),
         )
 
     def test_holds_producer_lease_through_postcommit_readiness_verification(self) -> None:
@@ -128,8 +161,11 @@ class PrepareAndPublishWholeDocumentV4Tests(unittest.TestCase):
             self.events,
             [
                 "lease-enter",
+                "build-or-reopen",
+                "stage-checkpoint",
                 "prepare",
                 "verify-pre",
+                "stage-checkpoint",
                 "commit",
                 "verify-post",
                 "lease-exit",
@@ -176,6 +212,55 @@ class PrepareAndPublishWholeDocumentV4Tests(unittest.TestCase):
         self.assertEqual(self.events.count("reload"), 2)
         self.assertNotIn("verify-post", self.events)
         self.assertEqual(self.events[-1], "lease-exit")
+
+    def test_revocation_blocks_new_commit_but_preserves_winner_reconciliation(self) -> None:
+        for phase in ("readiness", "retry-absent", "retry-committed"):
+            with self.subTest(phase=phase):
+                events: list[str] = []
+                stage = StageLeaseGuard(
+                    deadline_monotonic=60.0, _revoked=Event(), _monotonic=lambda: 0.0,
+                )
+
+                class Readiness(_Readiness):
+                    def prepare_or_replay(self, **kwargs: object) -> object:
+                        result = super().prepare_or_replay(**kwargs)
+                        if phase == "readiness":
+                            stage.revoke()
+                        return result
+
+                class Publisher(_Publisher):
+                    def commit_whole_document(self, *args: object, **kwargs: object) -> object:
+                        if phase.startswith("retry"):
+                            stage.revoke()
+                        return super().commit_whole_document(*args, **kwargs)
+
+                publisher = Publisher(
+                    events,
+                    commits=[AtomicPublicationCommitResponseLost("lost"), self.winner],
+                    reloads=[self.winner if phase == "retry-committed" else None],
+                )
+                use_case = PrepareAndPublishWholeDocumentV4(
+                    uow_factory=cast(Any, lambda: _Uow(events)),
+                    publication_requests=cast(Any, _RequestFactory(events, self.request)),
+                    readiness=cast(Any, Readiness(events)), publisher=cast(Any, publisher),
+                )
+
+                def execute() -> AtomicPublicationWinnerV4:
+                    return use_case.execute(
+                        checkpoint=self.checkpoint, materialized=self.materialized,
+                        claim=self.claim, claim_guard=self.guard, stage_guard=stage,
+                    )
+
+                if phase == "retry-committed":
+                    self.assertIs(execute(), self.winner)
+                    self.assertIn("verify-post", events)
+                else:
+                    with self.assertRaises(StageLeaseLost):
+                        execute()
+                    self.assertNotIn("verify-post", events)
+                self.assertEqual(events.count("commit"), 0 if phase == "readiness" else 1)
+                self.assertEqual(events.count("reload"), 0 if phase == "readiness" else 1)
+                self.assertEqual(events[-1], "lease-exit")
 
 
 if __name__ == "__main__":

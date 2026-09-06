@@ -25,17 +25,20 @@ class SourcePdfObservation:
     """Independent facts measured from one immutable source PDF."""
 
     sha256: str
+    byte_count: int
     page_count: int
 
     def __post_init__(self) -> None:
         if not _SHA256_RE.fullmatch(self.sha256):
             raise ValueError("source PDF observation hash must be canonical")
-        if (
-            isinstance(self.page_count, bool)
-            or not isinstance(self.page_count, int)
-            or self.page_count < 1
+        for value, label in (
+            (self.byte_count, "byte count"),
+            (self.page_count, "page count"),
         ):
-            raise ValueError("source PDF observation page count must be positive")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"source PDF observation {label} must be positive"
+                )
 
 
 @dataclass(frozen=True, slots=True)

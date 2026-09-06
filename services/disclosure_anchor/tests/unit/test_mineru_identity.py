@@ -26,6 +26,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_WINDOWS_COLLECTOR_PATH,
     MINERU_WINDOWS_COMPOSE_PATH,
     RUNTIME_MANIFEST_CONTRACT,
+    STAGED_RUNTIME_MANIFEST_CONTRACT,
     MinerUClientIdentity,
     canonical_payload_sha256,
     verify_runtime_manifest_payload,
@@ -133,6 +134,21 @@ def _payload(manifest: dict[str, object]) -> tuple[dict[str, object], str]:
     return {"identity_sha256": identity, "manifest": manifest}, identity
 
 
+def _staged_manifest() -> dict[str, object]:
+    manifest = _manifest()
+    manifest["contract_version"] = STAGED_RUNTIME_MANIFEST_CONTRACT
+    orchestrator = manifest["orchestrator"]
+    assert isinstance(orchestrator, dict)
+    orchestrator.update(
+        {
+            "task_registry_max_records": 128,
+            "task_result_reservation_bytes": 256 * 1024 * 1024,
+            "max_unacked_result_bytes": 2 * 1024 * 1024 * 1024,
+        }
+    )
+    return manifest
+
+
 def _verify(manifest: dict[str, object]):  # type: ignore[no-untyped-def]
     payload, identity = _payload(manifest)
     return verify_runtime_manifest_payload(
@@ -164,6 +180,26 @@ class MinerURuntimeIdentityV6Tests(unittest.TestCase):
             verified.served_model_id,
             manifest["inference_server"]["served_model_id"],  # type: ignore[index]
         )
+
+    def test_staged_v9_binds_independently_measured_task_capacity(self) -> None:
+        manifest = _staged_manifest()
+        verified = _verify(manifest)
+        self.assertEqual(
+            verified.contract_version,
+            STAGED_RUNTIME_MANIFEST_CONTRACT,
+        )
+        for field, value in (
+            ("task_registry_max_records", 127),
+            ("task_result_reservation_bytes", 1),
+            ("max_unacked_result_bytes", 1),
+        ):
+            with self.subTest(field=field):
+                drifted = _staged_manifest()
+                orchestrator = drifted["orchestrator"]
+                assert isinstance(orchestrator, dict)
+                orchestrator[field] = value
+                with self.assertRaisesRegex(ValueError, field):
+                    _verify(drifted)
 
     def test_rejects_v2_or_unknown_top_level_fields(self) -> None:
         for mutate in ("v2", "extra", "missing"):

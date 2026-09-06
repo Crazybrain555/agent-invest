@@ -1278,7 +1278,7 @@ def _request(
         ),
         semantic_route_receipts_contract_version=SEMANTIC_ROUTE_RECEIPT_V3,
         semantic_route_receipts=(route,),
-        expected_unit_build_status_before="running",
+        expected_unit_build_status_before="not_started",
         expected_unit_build_attempt_count_before=0,
         previous_active_units=previous_active_units,
         previous_active_units_sha256=previous_active_units_sha256_v4(

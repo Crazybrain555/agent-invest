@@ -57,25 +57,31 @@ class ProviderDocumentFileSource:
     def observe_source_pdf(self, relpath: Path) -> SourcePdfObservation:
         try:
             path = self._checked_file(relpath)
-            first_hash = _hash_regular_file(path)
+            first_hash, first_byte_count = _hash_regular_file(path)
             if _read_regular_prefix(path, size=5) != b"%PDF-":
                 raise ValueError("source file has no PDF signature")
             page_count = self._page_counter(path)
-            second_hash = _hash_regular_file(self._checked_file(relpath))
+            second_hash, second_byte_count = _hash_regular_file(
+                self._checked_file(relpath)
+            )
         except (OSError, PathSafetyError, RuntimeError, ValueError) as exc:
             raise ProviderDocumentSourceError(
                 "source_pdf_read_failed",
                 f"cannot inspect source PDF: {exc}",
                 retryable=isinstance(exc, OSError),
             ) from exc
-        if first_hash != second_hash:
+        if (first_hash, first_byte_count) != (second_hash, second_byte_count):
             raise ProviderDocumentSourceError(
                 "source_pdf_changed",
                 "source PDF changed while it was inspected",
                 retryable=False,
             )
         try:
-            return SourcePdfObservation(sha256=first_hash, page_count=page_count)
+            return SourcePdfObservation(
+                sha256=first_hash,
+                byte_count=first_byte_count,
+                page_count=page_count,
+            )
         except ValueError as exc:
             raise ProviderDocumentSourceError(
                 "source_pdf_read_failed",
@@ -119,10 +125,13 @@ class ProviderDocumentFileSource:
 
         try:
             path = self._checked_file(relpath)
-            if _hash_regular_file(path) != expected_sha256:
+            if _hash_regular_file(path)[0] != expected_sha256:
                 raise PathSafetyError("source PDF hash changed before native text read")
             observations = self._text_reader(path, document=document)
-            if _hash_regular_file(self._checked_file(relpath)) != expected_sha256:
+            if (
+                _hash_regular_file(self._checked_file(relpath))[0]
+                != expected_sha256
+            ):
                 raise PathSafetyError("source PDF hash changed during native text read")
             return observations
         except (OSError, PathSafetyError, RuntimeError, ValueError) as exc:
@@ -175,19 +184,20 @@ def _read_regular_file(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def _hash_regular_file(path: Path) -> str:
+def _hash_regular_file(path: Path) -> tuple[str, int]:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     digest = hashlib.sha256()
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        observation = os.fstat(descriptor)
+        if not stat.S_ISREG(observation.st_mode):
             raise OSError(f"path is not a regular file: {path}")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             for chunk in iter(lambda: handle.read(_CHUNK_SIZE), b""):
                 digest.update(chunk)
     finally:
         os.close(descriptor)
-    return "sha256:" + digest.hexdigest()
+    return "sha256:" + digest.hexdigest(), observation.st_size
 
 
 def _read_regular_prefix(path: Path, *, size: int) -> bytes:

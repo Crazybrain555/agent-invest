@@ -1446,7 +1446,12 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn('schema = "mineru-windows-install-receipt.v2"', installer)
         self.assertIn("mineru-runtime-v6", installer)
         self.assertNotIn("versioned v4 evidence paths", installer)
-        self.assertIn('schema = "mineru-windows-runtime-observation.v3"', collector)
+        self.assertIn('schema = "mineru-windows-runtime-observation.v4"', collector)
+        self.assertIn(
+            'collectorObservation.schema -ne "mineru-windows-runtime-observation.v4"',
+            installer,
+        )
+        self.assertNotIn("mineru-windows-runtime-observation.v3", installer)
         self.assertIn('schema = "mineru-phase-trace-capture.v2"', collector)
         self.assertIn("$traceLines.Count -gt $MaxTraceLines", collector)
         self.assertIn("$traceByteCount -gt $MaxTraceBytes", collector)

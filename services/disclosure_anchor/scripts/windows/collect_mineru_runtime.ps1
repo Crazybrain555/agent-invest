@@ -616,6 +616,7 @@ from mineru.utils.model_utils import (
     serial_runtime_status,
 )
 from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
+from mineru.cli import agent_task_protocol_v2
 from mineru.cli.agent_task_protocol_v2 import DurableTaskRegistry, SplitTaskExecutor
 from mineru.cli.fast_api import get_max_pending_tasks, get_task_manager
 
@@ -653,6 +654,11 @@ print(json.dumps({
         isinstance(task_manager.task_protocol_v2, DurableTaskRegistry)
         and isinstance(task_manager.task_protocol_executor, SplitTaskExecutor)
     ),
+    "task_registry_max_records": agent_task_protocol_v2._MAX_RECORDS,
+    "task_result_reservation_bytes": (
+        task_manager.task_protocol_executor._result_reservation_bytes
+    ),
+    "max_unacked_result_bytes": task_manager.task_protocol_v2._limit,
     "mineru_version": importlib.metadata.version("mineru"),
     "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),
 }, sort_keys=True, separators=(",", ":")))
@@ -757,7 +763,7 @@ if ($inferenceNetwork.Count -ne 1 -or $runtimeNetwork.Count -ne 1) {
 }
 
 $result = [ordered]@{
-    schema = "mineru-windows-runtime-observation.v3"
+    schema = "mineru-windows-runtime-observation.v4"
     observed_at_utc = (Get-Date).ToUniversalTime().ToString("o")
     collector_path = $PSCommandPath
     collector_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.ToLowerInvariant())"
@@ -788,6 +794,10 @@ $result = [ordered]@{
         max_pending_tasks_requested = [int]$compatProbe.max_pending_tasks_requested
         max_pending_tasks_effective = [int]$compatProbe.max_pending_tasks_effective
         pipeline_inference_locks_enabled = [bool]$compatProbe.pipeline_inference_locks_enabled
+        task_protocol_v2_enabled = [bool]$compatProbe.task_protocol_v2_enabled
+        task_registry_max_records = [int]$compatProbe.task_registry_max_records
+        task_result_reservation_bytes = [long]$compatProbe.task_result_reservation_bytes
+        max_unacked_result_bytes = [long]$compatProbe.max_unacked_result_bytes
         image_labels = $compatLabels
     }
     proxy = [ordered]@{

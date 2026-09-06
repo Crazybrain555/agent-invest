@@ -123,6 +123,8 @@ class RemoteParseEvidenceV4Tests(unittest.TestCase):
         intent = build_preparation_intent_v4(
             reservation=reservation,
             parser_target_sha256=SHA_A,
+            execution_spec_sha256=reservation.prepared_submission_identity_sha256,
+            execution_spec_byte_count=128,
         )
         self.assertEqual(intent.snapshot_relpath, reservation.snapshot_relpath)
         self.assertEqual(
@@ -1543,6 +1545,8 @@ def _records():
     preparation = build_preparation_intent_v4(
         reservation=reservation,
         parser_target_sha256=SHA_B,
+        execution_spec_sha256=reservation.prepared_submission_identity_sha256,
+        execution_spec_byte_count=128,
     )
     snapshot = SnapshotReceiptV4(
         attempt_id="attempt-1",
@@ -1657,6 +1661,8 @@ def _typed_happy_bundle():
     preparation = build_preparation_intent_v4(
         reservation=reservation,
         parser_target_sha256=provider_envelope_context.parser_target_sha256,
+        execution_spec_sha256=reservation.prepared_submission_identity_sha256,
+        execution_spec_byte_count=128,
     )
     snapshot = SnapshotReceiptV4(
         attempt_id="attempt-1",
@@ -2258,6 +2264,8 @@ def _superseding_checkpoint_seed():
     preparation = build_preparation_intent_v4(
         reservation=reservation,
         parser_target_sha256=SHA_B,
+        execution_spec_sha256=reservation.prepared_submission_identity_sha256,
+        execution_spec_byte_count=128,
     )
     snapshot = SnapshotReceiptV4(
         attempt_id=reservation.attempt_id,

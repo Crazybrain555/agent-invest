@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, BaseModel, Field, SecretStr, model_validator
@@ -15,6 +15,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 SENTINEL_NAME = "MOUNT_SENTINEL_DO_NOT_CREATE_ON_INTERNAL"
+
+if TYPE_CHECKING:
+    from disclosure_anchor.application.contracts.staged_worker_profile_v4 import StagedWorkerProfileV4
 
 
 def _validate_mineru_endpoint(
@@ -69,6 +72,72 @@ class SemanticProviderConfig(BaseModel):
             if self.canonical_model != "claude-sonnet-5":
                 raise ValueError("claude_cli requires canonical_model=claude-sonnet-5")
         return self
+
+
+class StagedV4Settings(BaseSettings):
+    """Configuration read only when the staged-V4 execution mode is selected.
+
+    Keeping this separate from :class:`Settings` is an activation boundary:
+    the default legacy worker neither parses nor validates staged profile
+    configuration. Remote ceilings and a separately bound local composition
+    profile jointly determine the complete scheduler capacity.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=None,
+        extra="ignore",
+        populate_by_name=True,
+        case_sensitive=False,
+    )
+
+    process_profile_file: Path = Field(
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_PROCESS_PROFILE_FILE",
+            "process_profile_file",
+        )
+    )
+    process_profile_sha256: str = Field(
+        pattern=r"^sha256:[a-f0-9]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_PROCESS_PROFILE_SHA256",
+            "process_profile_sha256",
+        ),
+    )
+    archive_member_count_limit: int = Field(
+        ge=1,
+        le=100_000,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_ARCHIVE_MEMBER_COUNT_LIMIT",
+            "archive_member_count_limit",
+        ),
+    )
+    provider_poll_milliseconds: int = Field(
+        default=1000, ge=1, le=60_000,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_PROVIDER_POLL_MILLISECONDS", "provider_poll_milliseconds",
+        ),
+    )
+    admission_probe_milliseconds: int = Field(
+        default=1000, ge=1, le=60_000,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_ADMISSION_PROBE_MILLISECONDS", "admission_probe_milliseconds",
+        ),
+    )
+
+    def worker_profile(
+        self, *, process_profile_sha256: str,
+        mac_preflight_workers: int, mac_finalize_workers: int,
+    ) -> StagedWorkerProfileV4:
+        from disclosure_anchor.application.contracts.staged_worker_profile_v4 import (
+            StagedWorkerProfileV4,
+        )
+        return StagedWorkerProfileV4(
+            process_profile_sha256=process_profile_sha256,
+            mac_preflight_workers=mac_preflight_workers,
+            mac_finalize_workers=mac_finalize_workers,
+            provider_poll_milliseconds=self.provider_poll_milliseconds,
+            admission_probe_milliseconds=self.admission_probe_milliseconds,
+        )
 
 
 class Settings(BaseSettings):
@@ -590,6 +659,17 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_PARSE", "worker_batch_parse"),
     )
+    # One process selects exactly one parse execution model at boot.  The
+    # legacy path remains the safe default and must not compose any V4 secret,
+    # catalog, scratch, or remote capability.  Staged V4 is an explicit
+    # operator activation after its independent milestone gate passes.
+    worker_parse_execution_mode: Literal["legacy-sync", "staged-v4"] = Field(
+        default="legacy-sync",
+        validation_alias=AliasChoices(
+            "WORKER_PARSE_EXECUTION_MODE",
+            "worker_parse_execution_mode",
+        ),
+    )
     # Parallel parse chains per round (1 = serial). Meant for the
     # *-http-client backends where the GPU server absorbs concurrency;
     # capped to keep local memory/subprocess fan-out bounded (raised 8→16
@@ -979,6 +1059,12 @@ class Settings(BaseSettings):
 
 def load_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]  # pydantic-settings 从环境变量填充
+
+
+def load_staged_v4_settings() -> StagedV4Settings:
+    """Load the explicit staged-only bootstrap reference on demand."""
+
+    return StagedV4Settings()  # type: ignore[call-arg]
 
 
 @lru_cache(maxsize=1)

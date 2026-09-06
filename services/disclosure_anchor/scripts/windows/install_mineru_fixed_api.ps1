@@ -1077,7 +1077,7 @@ try {
         throw "formal runtime collector did not return one observation"
     }
     $collectorObservation = ([string]$collectorOutput[0]) | ConvertFrom-Json
-    if ([string]$collectorObservation.schema -ne "mineru-windows-runtime-observation.v3") {
+    if ([string]$collectorObservation.schema -ne "mineru-windows-runtime-observation.v4") {
         throw "formal runtime collector contract drifted"
     }
     Remove-CompatBuildTag

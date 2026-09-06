@@ -122,6 +122,7 @@ class _ProviderSource:
     ) -> None:
         self.observation = observation or SourcePdfObservation(
             sha256=_RAW_HASH,
+            byte_count=1,
             page_count=1,
         )
         self.error = error
@@ -305,6 +306,7 @@ class ParseDocumentTests(unittest.TestCase):
                 _ProviderSource(
                     observation=SourcePdfObservation(
                         sha256="sha256:" + "0" * 64,
+                        byte_count=1,
                         page_count=1,
                     )
                 ),

@@ -154,6 +154,72 @@ def _target_identity(options: ParserOptions) -> ParserTargetIdentity:
     )
 
 
+def prepare_submission_identity_v2(
+    *,
+    api_url: str,
+    server_url: str,
+    options: ParserOptions,
+    source_pdf_sha256: str,
+    attempt_identity: str,
+    fence_identity: str,
+    submission_epoch_unix: int,
+) -> PreparedSubmissionIdentity:
+    """Build the exact protocol-v2 submission identity without parser state or IO."""
+
+    _validate_submission_facts(
+        options=options,
+        source_pdf_sha256=source_pdf_sha256,
+        attempt_identity=attempt_identity,
+        fence_identity=fence_identity,
+        submission_epoch_unix=submission_epoch_unix,
+    )
+    target = _target_identity(options)
+    target_exact = json.dumps(
+        target.to_payload(), sort_keys=True, separators=(",", ":")
+    ).encode()
+    try:
+        request_exact = submission_request_exact_bytes_v2(
+            api_origin=api_url,
+            form=_submission_form(options, server_url=server_url),
+            upload_filename=f"{source_pdf_sha256[7:]}.pdf",
+        )
+    except MinerUProtocolV2WireError as exc:
+        raise _fail("submission request escaped protocol v2") from exc
+    parser_target_sha256 = "sha256:" + hashlib.sha256(target_exact).hexdigest()
+    request_sha256 = "sha256:" + hashlib.sha256(request_exact).hexdigest()
+    client_submit_key = _make_idempotency_key(
+        source_pdf_sha256,
+        attempt_identity,
+        fence_identity,
+        observed_unix=float(submission_epoch_unix),
+    )
+    projection = {
+        "schema": "mineru-prepared-submission.v1",
+        "attempt_identity": attempt_identity,
+        "fence_identity": fence_identity,
+        "source_pdf_sha256": source_pdf_sha256,
+        "parser_target_identity_sha256": parser_target_sha256,
+        "runtime_bundle_identity_sha256": options.runtime_bundle_identity_sha256,
+        "request_sha256": request_sha256,
+        "client_submit_key": client_submit_key,
+        "submission_epoch_unix": submission_epoch_unix,
+    }
+    exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
+    return PreparedSubmissionIdentity(
+        schema="mineru-prepared-submission.v1",
+        attempt_identity=attempt_identity,
+        fence_identity=fence_identity,
+        source_pdf_sha256=source_pdf_sha256,
+        parser_target_identity_sha256=parser_target_sha256,
+        runtime_bundle_identity_sha256=options.runtime_bundle_identity_sha256 or "",
+        request_sha256=request_sha256,
+        client_submit_key=client_submit_key,
+        submission_epoch_unix=submission_epoch_unix,
+        exact_bytes=exact,
+        sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
+    )
+
+
 def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
     return (
         value.st_dev,
@@ -1817,57 +1883,14 @@ class MinerUHttpStagedParser:
         fence_identity: str,
         submission_epoch_unix: int,
     ) -> PreparedSubmissionIdentity:
-        _validate_submission_facts(
+        return prepare_submission_identity_v2(
+            api_url=self._api_url,
+            server_url=self._server_url,
             options=options,
             source_pdf_sha256=source_pdf_sha256,
             attempt_identity=attempt_identity,
             fence_identity=fence_identity,
             submission_epoch_unix=submission_epoch_unix,
-        )
-        target = _target_identity(options)
-        target_exact = json.dumps(
-            target.to_payload(), sort_keys=True, separators=(",", ":")
-        ).encode()
-        try:
-            request_exact = submission_request_exact_bytes_v2(
-                api_origin=self._api_url,
-                form=_submission_form(options, server_url=self._server_url),
-                upload_filename=f"{source_pdf_sha256[7:]}.pdf",
-            )
-        except MinerUProtocolV2WireError as exc:
-            raise _fail("submission request escaped protocol v2") from exc
-        parser_target_sha256 = "sha256:" + hashlib.sha256(target_exact).hexdigest()
-        request_sha256 = "sha256:" + hashlib.sha256(request_exact).hexdigest()
-        client_submit_key = _make_idempotency_key(
-            source_pdf_sha256,
-            attempt_identity,
-            fence_identity,
-            observed_unix=float(submission_epoch_unix),
-        )
-        projection = {
-            "schema": "mineru-prepared-submission.v1",
-            "attempt_identity": attempt_identity,
-            "fence_identity": fence_identity,
-            "source_pdf_sha256": source_pdf_sha256,
-            "parser_target_identity_sha256": parser_target_sha256,
-            "runtime_bundle_identity_sha256": options.runtime_bundle_identity_sha256,
-            "request_sha256": request_sha256,
-            "client_submit_key": client_submit_key,
-            "submission_epoch_unix": submission_epoch_unix,
-        }
-        exact = json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()
-        return PreparedSubmissionIdentity(
-            schema="mineru-prepared-submission.v1",
-            attempt_identity=attempt_identity,
-            fence_identity=fence_identity,
-            source_pdf_sha256=source_pdf_sha256,
-            parser_target_identity_sha256=parser_target_sha256,
-            runtime_bundle_identity_sha256=options.runtime_bundle_identity_sha256 or "",
-            request_sha256=request_sha256,
-            client_submit_key=client_submit_key,
-            submission_epoch_unix=submission_epoch_unix,
-            exact_bytes=exact,
-            sha256="sha256:" + hashlib.sha256(exact).hexdigest(),
         )
 
     def prepare_local_submission(
@@ -2894,4 +2917,8 @@ def _fsync_tree(root: Path) -> None:
             os.close(directory_fd)
 
 
-__all__ = ["MinerUHttpRemoteHandle", "MinerUHttpStagedParser"]
+__all__ = [
+    "MinerUHttpRemoteHandle",
+    "MinerUHttpStagedParser",
+    "prepare_submission_identity_v2",
+]

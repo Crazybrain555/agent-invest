@@ -72,6 +72,19 @@ class FileStorePathPort(Protocol):
     ) -> Path:
         ...
 
+    def parser_run_artifacts_v4_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        provider_document_id: str,
+        processing_run_id: str,
+        source_pdf_sha256: str,
+        parser_backend: str,
+        parser_method: str,
+    ) -> Path:
+        ...
+
     def normalized_ir_relpath(self, *, document_id: str, processing_run_id: str) -> Path:
         ...
 

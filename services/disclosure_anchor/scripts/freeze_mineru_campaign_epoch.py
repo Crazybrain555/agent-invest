@@ -16,6 +16,8 @@ from disclosure_anchor.adapters.runtime.mineru_host_capacity_observer import (
     project_host_service_epoch,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
+    RUNTIME_MANIFEST_CONTRACT,
+    STAGED_RUNTIME_MANIFEST_CONTRACT,
     canonical_payload_sha256,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
@@ -23,6 +25,9 @@ from disclosure_anchor.application.contracts.strict_json import strict_json_load
 
 FREEZE_SCHEMA = "mineru-service-epoch-freeze.v2"
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_ACCEPTED_RUNTIME_MANIFEST_CONTRACTS = frozenset(
+    {RUNTIME_MANIFEST_CONTRACT, STAGED_RUNTIME_MANIFEST_CONTRACT}
+)
 
 
 def _read_private_json(path: Path) -> dict[str, object]:
@@ -113,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         runtime_identity = wrapper.get("identity_sha256")
         if (
             not isinstance(manifest, dict)
-            or manifest.get("contract_version") != "mineru-runtime-bundle.v8"
+            or manifest.get("contract_version")
+            not in _ACCEPTED_RUNTIME_MANIFEST_CONTRACTS
             or runtime_identity != canonical_payload_sha256(manifest)
         ):
             raise ValueError("runtime manifest identity is invalid")

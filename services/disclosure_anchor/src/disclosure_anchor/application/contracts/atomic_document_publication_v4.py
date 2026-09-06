@@ -605,10 +605,7 @@ class AtomicPublicationRequestV4:
             raise WholeDocumentPublicationV4Error(
                 "publication source page count drifted"
             )
-        if self.expected_unit_build_status_before not in {
-            "not_started",
-            "running",
-        }:
+        if self.expected_unit_build_status_before != "not_started":
             raise WholeDocumentPublicationV4Error(
                 "publication Unit-build precondition is unsupported"
             )
@@ -619,6 +616,10 @@ class AtomicPublicationRequestV4:
         if self.expected_unit_build_attempt_count_before >= _MAX_INT:
             raise WholeDocumentPublicationV4Error(
                 "publication Unit-build attempt cannot advance"
+            )
+        if self.expected_unit_build_attempt_count_before != 0:
+            raise WholeDocumentPublicationV4Error(
+                "initial V4 publication cannot inherit a Unit-build attempt"
             )
         if (
             self.identity.attempt_id != self.upstream_evidence.attempt_id

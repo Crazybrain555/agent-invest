@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime import capacity_runtime_identity as identity
 from disclosure_anchor.adapters.runtime.mineru_identity import (
+    RUNTIME_MANIFEST_CONTRACT,
     VerifiedMinerURuntimeManifest,
 )
 from tests.unit.test_capacity_observer import _settings
@@ -47,6 +48,7 @@ class CapacityRuntimeIdentityTests(unittest.TestCase):
         api_identity: str | None = None,
     ) -> VerifiedMinerURuntimeManifest:
         return VerifiedMinerURuntimeManifest(
+            contract_version=RUNTIME_MANIFEST_CONTRACT,
             manifest={
                 "topology": {
                     "api_endpoint_sha256": api_identity or _endpoint(urls["api"]),

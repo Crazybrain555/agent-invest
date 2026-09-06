@@ -14,6 +14,9 @@ from disclosure_anchor.application.dto.worker_report import (
     WorkerReport,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.services.staged_parse_coordinator import (
+    CoordinatorTerminal,
+)
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentGateError,
     MinerUDeploymentUnavailableError,
@@ -165,9 +168,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             ) as backfill,
             mock.patch("builtins.print"),
         ):
-            result = worker_cli._run_publish_kpi_backfill(
-                mock.MagicMock(), limit=17
-            )
+            result = worker_cli._run_publish_kpi_backfill(mock.MagicMock(), limit=17)
 
         self.assertEqual(result, 1)
         backfill.assert_called_once()
@@ -184,7 +185,10 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             worker_cli.worker_database_url(settings)
 
     def test_startup_recovery_retries_before_first_admission(self) -> None:
-        settings = mock.MagicMock(worker_loop_max_interval_seconds=1800)
+        settings = mock.MagicMock(
+            worker_loop_max_interval_seconds=1800,
+            disclosure_max_build_retries=3,
+        )
         projection_failed = _report(failed=1)
         projection_failed.failures.append(
             WorkerFailure(
@@ -214,6 +218,16 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 ],
             ) as run_once,
             mock.patch.object(worker_cli, "_wait_while") as wait,
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_build_count",
+                side_effect=[1, 0],
+            ) as pending_build_count,
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_publish_count",
+                side_effect=[0, 0],
+            ) as pending_publish_count,
             mock.patch.object(worker_cli.traceback, "print_exc"),
         ):
             worker_cli._run_startup_recovery(
@@ -262,6 +276,178 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             [True, True, True, False],
         )
         self.assertEqual(wait.call_count, 2)
+        self.assertEqual(pending_build_count.call_count, 2)
+        self.assertEqual(pending_publish_count.call_count, 2)
+
+    def test_staged_startup_drains_legacy_tails_and_prunes_without_reclaim(
+        self,
+    ) -> None:
+        settings = mock.MagicMock(
+            worker_loop_max_interval_seconds=1800,
+            disclosure_max_build_retries=3,
+        )
+        built = _report(built=1)
+        published = _report(published=1)
+        drained = _report()
+        reports: worker_cli.queue.SimpleQueue[WorkerReport | None] = (
+            worker_cli.queue.SimpleQueue()
+        )
+
+        with (
+            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
+            mock.patch.object(
+                worker_cli,
+                "run_once",
+                side_effect=[built, published, drained],
+            ) as run_once,
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_build_count",
+                side_effect=[1, 0, 0],
+            ),
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_publish_count",
+                side_effect=[1, 1, 0],
+            ),
+        ):
+            worker_cli._run_startup_recovery(
+                settings,
+                lock_conn=mock.MagicMock(),
+                deps=mock.MagicMock(),
+                base_limits=WorkerLimits(
+                    sync=1, download=2, parse=3, build=4, publish=5
+                ),
+                should_stop=lambda: False,
+                reports=reports,
+                reclaim_running=False,
+            )
+
+        self.assertEqual(run_once.call_count, 3)
+        self.assertEqual(
+            [call.args[0].build for call in run_once.call_args_list],
+            [4, 4, 4],
+        )
+        self.assertEqual(
+            [call.args[0].publish for call in run_once.call_args_list],
+            [5, 5, 5],
+        )
+        self.assertEqual(
+            [call.kwargs["reclaim_stale"] for call in run_once.call_args_list],
+            [False, False, False],
+        )
+        self.assertEqual(
+            [
+                call.kwargs["stale_threshold_seconds"]
+                for call in run_once.call_args_list
+            ],
+            [None, None, None],
+        )
+        self.assertEqual(
+            [call.kwargs["projection_prune"] for call in run_once.call_args_list],
+            [True, False, False],
+        )
+
+    def test_startup_recovery_does_not_hide_item_local_finalize_tail(self) -> None:
+        settings = mock.MagicMock(
+            worker_loop_max_interval_seconds=1800,
+            disclosure_max_build_retries=3,
+        )
+        failed = _report(failed=1)
+        failed.failures.append(
+            WorkerFailure("build", "run-1", "content_contract_error", False)
+        )
+        drained = _report()
+        reports: worker_cli.queue.SimpleQueue[WorkerReport | None] = (
+            worker_cli.queue.SimpleQueue()
+        )
+
+        with (
+            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
+            mock.patch.object(
+                worker_cli,
+                "run_once",
+                side_effect=[failed, drained],
+            ) as run_once,
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_build_count",
+                side_effect=[1, 0],
+            ),
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_publish_count",
+                side_effect=[0, 0],
+            ),
+            mock.patch.object(worker_cli, "_wait_while") as wait,
+        ):
+            worker_cli._run_startup_recovery(
+                settings,
+                lock_conn=mock.MagicMock(),
+                deps=mock.MagicMock(),
+                base_limits=WorkerLimits(
+                    sync=1, download=2, parse=3, build=4, publish=5
+                ),
+                should_stop=lambda: False,
+                reports=reports,
+                reclaim_running=False,
+            )
+
+        self.assertEqual(run_once.call_count, 2)
+        wait.assert_called_once()
+        self.assertIs(reports.get(), failed)
+        self.assertIs(reports.get(), drained)
+
+    def test_startup_recovery_count_failure_stays_fail_closed(self) -> None:
+        settings = mock.MagicMock(
+            worker_loop_max_interval_seconds=1800,
+            disclosure_max_build_retries=3,
+        )
+        first = _report()
+        second = _report()
+        reports: worker_cli.queue.SimpleQueue[WorkerReport | None] = (
+            worker_cli.queue.SimpleQueue()
+        )
+
+        with (
+            mock.patch.object(worker_cli, "_assert_singleton_or_cancel"),
+            mock.patch.object(
+                worker_cli,
+                "run_once",
+                side_effect=[first, second],
+            ) as run_once,
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_build_count",
+                side_effect=[RuntimeError("count unavailable"), 0],
+            ),
+            mock.patch.object(
+                worker_cli.worker_queries,
+                "pending_publish_count",
+                return_value=0,
+            ),
+            mock.patch.object(worker_cli, "_wait_while") as wait,
+            mock.patch.object(worker_cli.traceback, "print_exc"),
+        ):
+            worker_cli._run_startup_recovery(
+                settings,
+                lock_conn=mock.MagicMock(),
+                deps=mock.MagicMock(),
+                base_limits=WorkerLimits(
+                    sync=1, download=2, parse=3, build=4, publish=5
+                ),
+                should_stop=lambda: False,
+                reports=reports,
+                reclaim_running=False,
+            )
+
+        self.assertEqual(run_once.call_count, 2)
+        wait.assert_called_once()
+        self.assertIs(reports.get(), first)
+        count_failure = reports.get()
+        assert count_failure is not None
+        self.assertEqual(count_failure.failures[0].stage, "system")
+        self.assertIs(reports.get(), second)
 
     def test_report_io_failure_does_not_stop_later_reports(self) -> None:
         reports: worker_cli.queue.SimpleQueue[WorkerReport | None] = (
@@ -607,11 +793,122 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         lock_conn.close.assert_called_once_with()
         lock_engine.dispose.assert_called_once_with()
 
+    def test_once_rejects_staged_mode_before_any_database_or_mineru_io(
+        self,
+    ) -> None:
+        settings = mock.MagicMock(worker_parse_execution_mode="staged-v4")
+
+        with (
+            mock.patch.object(worker_cli, "load_settings", return_value=settings),
+            mock.patch.object(worker_cli, "MinerUDeploymentChecker") as checker,
+            mock.patch.object(worker_cli.sqlalchemy, "create_engine") as create_engine,
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            worker_cli.main(["once"])
+
+        self.assertEqual(stopped.exception.code, 2)
+        checker.assert_not_called()
+        create_engine.assert_not_called()
+
+    def test_staged_loop_drains_legacy_tails_without_legacy_parse_reclaim(
+        self,
+    ) -> None:
+        stop = mock.MagicMock()
+        stop.is_set.return_value = False
+        engine = mock.MagicMock()
+        deps = mock.MagicMock()
+        deps.config.process_scope_classes = ("annual_report",)
+        settings = mock.MagicMock(
+            worker_parse_execution_mode="staged-v4",
+            worker_loop_interval_seconds=900,
+            worker_loop_max_interval_seconds=1800,
+            worker_wedge_timeout_seconds=0,
+        )
+        limits = WorkerLimits(sync=1, download=1, parse=9, build=1, publish=1)
+
+        with (
+            mock.patch.object(worker_cli, "_StopFlag", return_value=stop),
+            mock.patch.object(
+                worker_cli, "_create_worker_db_engine", return_value=engine
+            ),
+            mock.patch.object(worker_cli, "require_runtime_app_engine"),
+            mock.patch.object(worker_cli, "_deps", return_value=deps),
+            mock.patch.object(worker_cli, "_limits", return_value=limits),
+            mock.patch.object(worker_cli, "_emit_progress_snapshot"),
+            mock.patch.object(worker_cli, "_run_maintenance_loop"),
+            mock.patch.object(worker_cli, "_run_startup_recovery") as recovery,
+            mock.patch.object(worker_cli, "run_resident_parse") as legacy_parse,
+            mock.patch.object(worker_cli, "_run_staged_v4_resident") as staged_parse,
+        ):
+            result = worker_cli._run_loop(
+                settings,
+                lock_conn=mock.MagicMock(),
+                progress_output="off",
+            )
+
+        self.assertEqual(result, 0)
+        recovery.assert_called_once()
+        self.assertFalse(recovery.call_args.kwargs["reclaim_running"])
+        legacy_parse.assert_not_called()
+        staged_parse.assert_called_once()
+        self.assertIn("prune_tracker", staged_parse.call_args.kwargs)
+        deps.close_source.assert_called_once_with()
+        engine.dispose.assert_called_once_with()
+
+    def test_staged_resident_does_not_lose_arrival_wakeup_at_quiescence(
+        self,
+    ) -> None:
+        state = {"signalled": False}
+        work_available = mock.MagicMock()
+        work_available.clear.side_effect = lambda: state.__setitem__("signalled", False)
+
+        def wait_for_arrival(*, timeout: float) -> bool:
+            self.assertEqual(timeout, 900)
+            self.assertTrue(state["signalled"])
+            return True
+
+        work_available.wait.side_effect = wait_for_arrival
+        runtime = mock.MagicMock()
+        result = mock.MagicMock(
+            terminal=CoordinatorTerminal.QUIESCENT,
+            errors=(),
+        )
+
+        def run(**_kwargs: object):
+            if runtime.coordinator.run.call_count == 1:
+                state["signalled"] = True
+            return result
+
+        runtime.coordinator.run.side_effect = run
+        should_stop = mock.Mock(side_effect=[False, False, False, True])
+        deps = mock.MagicMock()
+        deps.config.process_scope_classes = ("annual_report",)
+
+        with mock.patch(
+            "disclosure_anchor.adapters.runtime.staged_worker_v4."
+            "build_staged_worker_v4_runtime",
+            return_value=runtime,
+        ):
+            worker_cli._run_staged_v4_resident(
+                mock.MagicMock(worker_loop_interval_seconds=900),
+                engine=mock.MagicMock(),
+                deps=deps,
+                should_stop=should_stop,
+                ownership_guard=lambda: None,
+                admission_guard=lambda: None,
+                work_available=work_available,
+                prune_tracker=worker_cli._ProjectionPruneTracker(),
+                progress_output="off",
+            )
+
+        self.assertEqual(runtime.coordinator.run.call_count, 2)
+        runtime.verify_startup.assert_called_once_with()
+        work_available.wait.assert_called_once_with(timeout=900)
+        runtime.close.assert_called_once_with()
+
     def test_once_static_mineru_gate_fails_before_database_connection(self) -> None:
         settings = mock.MagicMock()
-        gate_error = MinerUDeploymentGateError(
-            "GPU identity unavailable"
-        )
+        gate_error = MinerUDeploymentGateError("GPU identity unavailable")
 
         with (
             mock.patch.object(worker_cli, "load_settings", return_value=settings),
@@ -626,6 +923,47 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             worker_cli.main(["once"])
 
         create_engine.assert_not_called()
+
+    def test_resident_never_bypasses_mineru_gate_when_once_parse_is_zero(
+        self,
+    ) -> None:
+        for mode in ("legacy-sync", "staged-v4"):
+            with self.subTest(mode=mode):
+                settings = mock.MagicMock(
+                    worker_batch_parse=0,
+                    worker_parse_execution_mode=mode,
+                )
+                profile = mock.MagicMock()
+                loaded = mock.MagicMock(profile=profile)
+                gate_error = MinerUDeploymentGateError("proof required")
+                with (
+                    mock.patch.object(
+                        worker_cli,
+                        "_load_staged_process_profile",
+                        return_value=loaded,
+                    ) as profile_loader,
+                    mock.patch.object(
+                        worker_cli,
+                        "MinerUDeploymentChecker",
+                        side_effect=gate_error,
+                    ) as checker,
+                    mock.patch.object(
+                        worker_cli.sqlalchemy, "create_engine"
+                    ) as create_engine,
+                    self.assertRaisesRegex(MinerUDeploymentGateError, "proof required"),
+                ):
+                    worker_cli.run_resident_worker(settings)
+
+                checker.assert_called_once_with(
+                    settings,
+                    parse_enabled=True,
+                    process_profile=(profile if mode == "staged-v4" else None),
+                )
+                if mode == "staged-v4":
+                    profile_loader.assert_called_once_with(settings)
+                else:
+                    profile_loader.assert_not_called()
+                create_engine.assert_not_called()
 
     def test_worker_admission_checks_lock_before_live_mineru(self) -> None:
         lock_conn = mock.MagicMock()

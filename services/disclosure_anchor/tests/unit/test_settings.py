@@ -7,7 +7,11 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from disclosure_anchor.settings import Settings, load_settings
+from disclosure_anchor.settings import (
+    Settings,
+    load_settings,
+    load_staged_v4_settings,
+)
 
 
 def _env(root: Path) -> dict[str, str]:
@@ -35,6 +39,62 @@ def _mineru_topology() -> dict[str, str]:
 
 
 class SettingsTests(unittest.TestCase):
+    def test_staged_bootstrap_is_lazy_and_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            # Invalid staged-only values cannot change the default worker's
+            # Settings construction because that mode never reads them.
+            with patch.dict(
+                os.environ,
+                {
+                    **base,
+                    "DISCLOSURE_V4_PROCESS_PROFILE_SHA256": "not-a-hash",
+                },
+                clear=True,
+            ):
+                self.assertEqual(
+                    load_settings().worker_parse_execution_mode,
+                    "legacy-sync",
+                )
+                with self.assertRaises(ValidationError):
+                    load_staged_v4_settings()
+
+            profile = Path(tmp) / "profile.json"
+            with patch.dict(
+                os.environ,
+                {
+                    **base,
+                    "DISCLOSURE_V4_PROCESS_PROFILE_FILE": str(profile),
+                    "DISCLOSURE_V4_PROCESS_PROFILE_SHA256": "sha256:" + "a" * 64,
+                    "DISCLOSURE_V4_ARCHIVE_MEMBER_COUNT_LIMIT": "8192",
+                },
+                clear=True,
+            ):
+                staged = load_staged_v4_settings()
+                self.assertEqual(staged.process_profile_file, profile)
+                self.assertEqual(staged.archive_member_count_limit, 8192)
+
+    def test_parse_execution_mode_is_single_valued_and_default_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            with patch.dict(os.environ, base, clear=True):
+                self.assertEqual(load_settings().worker_parse_execution_mode, "legacy-sync")
+            with patch.dict(
+                os.environ,
+                {**base, "WORKER_PARSE_EXECUTION_MODE": "staged-v4"},
+                clear=True,
+            ):
+                self.assertEqual(load_settings().worker_parse_execution_mode, "staged-v4")
+            with (
+                patch.dict(
+                    os.environ,
+                    {**base, "WORKER_PARSE_EXECUTION_MODE": "both"},
+                    clear=True,
+                ),
+                self.assertRaises(ValidationError),
+            ):
+                load_settings()
+
     def test_parallel_parse_requires_remote_http_backend_and_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = _env(Path(tmp))

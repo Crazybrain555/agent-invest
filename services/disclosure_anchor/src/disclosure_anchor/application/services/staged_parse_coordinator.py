@@ -31,6 +31,12 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RecoveryCandidate,
 )
+from disclosure_anchor.application.ports.staged_new_work_v4 import (
+    V4AdmissionObservationPort,
+    V4AdmissionObservationRequest,
+)
+from disclosure_anchor.application.services.staged_admission_observation import StagedAdmissionObservation
+from disclosure_anchor.application.services.staged_execution_guard import StageLeaseGuard, StageLeaseLost
 
 
 class CoordinatorLane(str, Enum):
@@ -129,6 +135,10 @@ class AdmissionOutcome:
     work: tuple[CoordinatorWork, ...]
     backlog_exists: bool
     blocked_dimensions: tuple[str, ...] = ()
+    scan_incomplete: bool = False
+    ineligible_dimensions: tuple[str, ...] = ()
+    deferred_reason: str | None = None
+    observation_request: V4AdmissionObservationRequest | None = None
 
     def __post_init__(self) -> None:
         credit_names = tuple(item.name for item in fields(ResourceCreditVector))
@@ -139,11 +149,31 @@ class AdmissionOutcome:
             type(self.work) is not tuple
             or any(type(item) is not CoordinatorWork for item in self.work)
             or type(self.backlog_exists) is not bool
+            or type(self.scan_incomplete) is not bool
+            or (self.observation_request is not None and (
+                type(self.observation_request) is not V4AdmissionObservationRequest
+                or not self.backlog_exists or not self.scan_incomplete
+                or self.deferred_reason is not None
+            ))
+            or (self.deferred_reason is not None and (
+                type(self.deferred_reason) is not str or not self.deferred_reason.strip()
+                or self.scan_incomplete
+            ))
+            or type(self.ineligible_dimensions) is not tuple
+            or self.ineligible_dimensions != tuple(
+                name for name in credit_names if name in self.ineligible_dimensions
+            )
             or type(self.blocked_dimensions) is not tuple
             or canonical_blocked != self.blocked_dimensions
             or any(name not in credit_names for name in self.blocked_dimensions)
-            or (not self.backlog_exists and self.blocked_dimensions)
-            or (self.backlog_exists and not self.work and not self.blocked_dimensions)
+            or (not self.backlog_exists and (
+                self.blocked_dimensions or self.ineligible_dimensions or self.scan_incomplete
+                or self.deferred_reason is not None
+            ))
+            or (self.backlog_exists and not self.work and not (
+                self.blocked_dimensions or self.ineligible_dimensions or self.scan_incomplete
+                or self.deferred_reason is not None
+            ))
         ):
             raise ValueError("admission outcome is not closed")
 
@@ -233,48 +263,6 @@ class StageWaiting(RuntimeError):
         ):
             raise ValueError("stage wait delay must be positive")
         self.retry_after_seconds = float(retry_after_seconds)
-
-
-class StageLeaseLost(RuntimeError):
-    """A bounded backend step lost its execution fence before a side effect."""
-
-
-@dataclass(frozen=True, slots=True)
-class StageLeaseGuard:
-    """Cooperative hard boundary checked around every backend IO chunk."""
-
-    deadline_monotonic: float
-    _revoked: Event
-    _monotonic: Callable[[], float]
-
-    def __post_init__(self) -> None:
-        if (
-            isinstance(self.deadline_monotonic, bool)
-            or not isinstance(self.deadline_monotonic, (int, float))
-            or not isfinite(self.deadline_monotonic)
-            or self.deadline_monotonic <= 0
-        ):
-            raise ValueError("stage lease deadline must be finite and positive")
-
-    def checkpoint(self) -> None:
-        self.remaining_seconds()
-
-    def remaining_seconds(self) -> float:
-        """Return the live bounded-stage budget after checking the claim fence."""
-
-        observed = self._monotonic()
-        if (
-            isinstance(observed, bool)
-            or not isinstance(observed, (int, float))
-            or not isfinite(observed)
-            or self._revoked.is_set()
-            or observed >= self.deadline_monotonic
-        ):
-            raise StageLeaseLost("bounded stage lease expired")
-        return max(0.0, float(self.deadline_monotonic - observed))
-
-    def revoke(self) -> None:
-        self._revoked.set()
 
 
 class StagedCoordinatorBackend(Protocol):
@@ -398,6 +386,7 @@ class CoordinatorLimits:
     cleanup_workers: int = 2
     ack_workers: int = 2
     poll_seconds: float = 0.1
+    admission_probe_seconds: float = 1.0
     idle_open_circuit_seconds: float = 300.0
     claim_lease_seconds: int = 120
     claim_renew_margin_seconds: float = 30.0
@@ -431,6 +420,7 @@ class CoordinatorLimits:
             raise ValueError("recovery page size must fit the DB 1..1000 contract")
         for timing_value, label in (
             (self.poll_seconds, "poll seconds"),
+            (self.admission_probe_seconds, "admission probe seconds"),
             (self.idle_open_circuit_seconds, "idle open-circuit seconds"),
             (self.claim_renew_margin_seconds, "claim renewal margin seconds"),
             (self.max_stage_step_seconds, "maximum stage step seconds"),
@@ -483,6 +473,7 @@ class CoordinatorSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class CoordinatorResult:
+    """Aggregate totals and a bounded recent-final diagnostic sample, not history."""
     terminal: CoordinatorTerminal
     recovery_complete: bool
     admitted: int
@@ -601,11 +592,15 @@ class StagedParseCoordinator:
         limits: CoordinatorLimits,
         progress: Callable[[CoordinatorSnapshot], None] = lambda _snapshot: None,
         monotonic: Callable[[], float] = time.monotonic,
+        process_guard: Callable[[], None] = lambda: None,
+        admission_observer: V4AdmissionObservationPort | None = None,
     ) -> None:
         self._backend = backend
         self._limits = limits
         self._progress = progress
         self._monotonic = monotonic
+        self._process_guard = process_guard
+        self._admission_observer = admission_observer
 
     def run(
         self,
@@ -620,6 +615,9 @@ class StagedParseCoordinator:
         retry_degraded = False
         known: dict[str, CoordinatorWork] = {}
         final: dict[str, str] = {}
+        final_history_limit = max(
+            self._limits.recovery_page_size, self._limits.admission_batch_size,
+        )
         errors: list[str] = []
         ledger = _CreditLedger(self._limits.credits)
         oversubscribed_recovery: set[str] = set()
@@ -627,7 +625,10 @@ class StagedParseCoordinator:
         completed = 0
         admission_open = False
         admission_blocked_dimensions: tuple[str, ...] = ()
-        admission_blocked_available: ResourceCreditVector | None = None
+        admission_scan_incomplete = False
+        admission_probe_at = 0.0
+        admission_deferred = False
+        last_admission_available: ResourceCreditVector | None = None
         recovery_complete = False
         circuit_open = False
         blocked_reason: str | None = "recovery_barrier"
@@ -649,6 +650,7 @@ class StagedParseCoordinator:
             )
             for lane in CoordinatorLane
         }
+        observation = StagedAdmissionObservation(self._admission_observer)
         in_flight: dict[
             Future[CoordinatorWork],
             tuple[
@@ -673,7 +675,10 @@ class StagedParseCoordinator:
                     recovery_complete=recovery_complete,
                     circuit_open=circuit_open,
                     queued=tuple(
-                        (lane.value, len(queues[lane])) for lane in CoordinatorLane
+                        (lane.value, len(queues[lane]) + int(
+                            lane == CoordinatorLane.PREFLIGHT
+                            and observation.pending and not observation.active_slots
+                        )) for lane in CoordinatorLane
                     ),
                     in_flight=tuple(
                         (
@@ -682,11 +687,11 @@ class StagedParseCoordinator:
                                 1
                                 for active_lane, _, _, _ in in_flight.values()
                                 if active_lane == lane
-                            ),
+                            ) + (observation.active_slots if lane == CoordinatorLane.PREFLIGHT else 0),
                         )
                         for lane in CoordinatorLane
                     ),
-                    credits_in_use=ledger.in_use + provisional_local_total,
+                    credits_in_use=ledger.in_use + provisional_local_total + observation.credits,
                     credits_limit=ledger.limit,
                     completed=completed,
                     blocked_reason=blocked_reason,
@@ -735,8 +740,12 @@ class StagedParseCoordinator:
             if work.state in _FINAL_STATES:
                 ledger.release(work.attempt_id)
                 final[work.attempt_id] = work.state
+                if len(final) > final_history_limit:
+                    del final[next(iter(final))]
                 known.pop(work.attempt_id, None)
                 retry_at.pop(work.attempt_id, None)
+                retry_attempts.pop(work.attempt_id, None)
+                retry_started_at.pop(work.attempt_id, None)
                 oversubscribed_recovery.discard(work.attempt_id)
                 completed += 1
                 last_progress = self._monotonic()
@@ -1186,6 +1195,7 @@ class StagedParseCoordinator:
             barrier_exhausted = False
             deferred_claims: dict[str, tuple[float, RecoveryCandidate]] = {}
             while True:
+                self._process_guard()
                 page = tuple(
                     self._backend.list_recoverable(
                         after_attempt_id=after,
@@ -1248,6 +1258,12 @@ class StagedParseCoordinator:
             emit()
 
             while True:
+                self._process_guard()
+                if stop_requested() or circuit_open:
+                    observation.cancel()
+                if observation.collect():
+                    admission_probe_at = 0.0
+                    last_progress = self._monotonic()
                 now = self._monotonic()
                 if stop_requested():
                     admission_open = False
@@ -1289,7 +1305,7 @@ class StagedParseCoordinator:
                     and not circuit_open
                     and not stop_requested()
                 ):
-                    admission_open = True
+                    admission_open = not admission_deferred or now >= admission_probe_at
                     if blocked_reason == "recovery_barrier":
                         blocked_reason = None
                 elif (
@@ -1311,11 +1327,12 @@ class StagedParseCoordinator:
                         queues[lane].append(work)
 
                 active_ids = set(known)
-                if admission_open and not circuit_open:
-                    if oversubscribed_recovery or not ledger.in_use.fits(ledger.limit):
+                if admission_open and not circuit_open and not observation.pending:
+                    committed_and_transient = ledger.in_use + provisional_local_total
+                    if oversubscribed_recovery or not committed_and_transient.fits(ledger.limit):
                         blocked_reason = "oversubscribed_recovery_drain"
                     else:
-                        available_credits = ledger.limit - ledger.in_use
+                        available_credits = ledger.limit - committed_and_transient
                         saturated = tuple(
                             item.name
                             for item in fields(ResourceCreditVector)
@@ -1327,22 +1344,23 @@ class StagedParseCoordinator:
                         )
                         if capacity == 0:
                             admission_blocked_dimensions = saturated or ("documents",)
-                            admission_blocked_available = available_credits
                             blocked_reason = "credit_backpressure:" + ",".join(
                                 admission_blocked_dimensions
                             )
                         elif (
-                            admission_blocked_dimensions
-                            and admission_blocked_available is not None
+                            not admission_scan_incomplete
+                            and now < admission_probe_at
+                            and last_admission_available is not None
                             and not any(
-                                getattr(available_credits, name)
-                                > getattr(admission_blocked_available, name)
-                                for name in admission_blocked_dimensions
+                                getattr(available_credits, item.name)
+                                > getattr(last_admission_available, item.name)
+                                for item in fields(ResourceCreditVector)
                             )
                         ):
-                            blocked_reason = "credit_backpressure:" + ",".join(
-                                admission_blocked_dimensions
-                            )
+                            # A completed empty scan is not useful every scheduler
+                            # tick. Probe periodically for new rows even if credits
+                            # stay unchanged; a released credit wakes it early.
+                            pass
                         else:
                             if blocked_reason is not None and (
                                 blocked_reason.startswith("credit_backpressure:")
@@ -1385,6 +1403,19 @@ class StagedParseCoordinator:
                                         "backend returned an invalid admission outcome"
                                     )
                                 admitted_batch = admission.work
+                                admission_deferred = admission.deferred_reason is not None
+                                if not admission_deferred and blocked_reason is not None and (
+                                    blocked_reason.startswith("admission_deferred:")
+                                ):
+                                    blocked_reason = None
+                                admission_scan_incomplete = admission.scan_incomplete
+                                admission_probe_at = (
+                                    self._monotonic() + self._limits.admission_probe_seconds
+                                    if admission.deferred_reason is not None or (
+                                        not admitted_batch and not admission.scan_incomplete
+                                    )
+                                    else 0.0
+                                )
                                 if len(admitted_batch) > capacity:
                                     raise RuntimeError(
                                         "backend exceeded its admission count grant"
@@ -1428,28 +1459,46 @@ class StagedParseCoordinator:
                                     active_ids.add(work.attempt_id)
                                     admitted += 1
                                     last_progress = now
-                                if (
+                                if admission.observation_request is not None:
+                                    requested = admission.observation_request.credits
+                                    if not (ledger.in_use + provisional_local_total + requested).fits(ledger.limit):
+                                        raise RuntimeError("admission observation exceeded shared credit grant")
+                                    observation.enqueue(admission.observation_request)
+                                held_after_admission = ledger.in_use + provisional_local_total + observation.credits
+                                last_admission_available = (
+                                    ledger.limit - held_after_admission
+                                    if held_after_admission.fits(ledger.limit) else None
+                                )
+                                if admission.deferred_reason is not None:
+                                    admission_open = False
+                                    blocked_reason = "admission_deferred:" + admission.deferred_reason
+                                elif (
                                     admission.backlog_exists
                                     and admission.blocked_dimensions
                                 ):
                                     admission_blocked_dimensions = (
                                         admission.blocked_dimensions
                                     )
-                                    admission_blocked_available = (
-                                        ledger.limit - ledger.in_use
-                                    )
                                     blocked_reason = "credit_backpressure:" + ",".join(
                                         admission_blocked_dimensions
                                     )
                                 else:
                                     admission_blocked_dimensions = ()
-                                    admission_blocked_available = None
+                                    if admission.ineligible_dimensions:
+                                        blocked_reason = "profile_ineligible:" + ",".join(
+                                            admission.ineligible_dimensions
+                                        )
+                                    elif blocked_reason is not None and blocked_reason.startswith(
+                                        "profile_ineligible:"
+                                    ):
+                                        blocked_reason = None
 
                 # Claims returned by recovery/admission may have less time
                 # remaining than this coordinator's configured lease.  Guard
                 # them before any lane selection or poll sleep, not merely on
                 # the next loop turn.
                 guard_waiting(self._monotonic())
+                self._process_guard()
                 credit_blocked_by_lane = {lane: set() for lane in CoordinatorLane}
                 for lane in _LANE_PRIORITY:
                     if circuit_open:
@@ -1459,6 +1508,8 @@ class StagedParseCoordinator:
                         for active_lane, _, _, _ in in_flight.values()
                         if active_lane == lane
                     )
+                    if lane == CoordinatorLane.PREFLIGHT:
+                        active += observation.active_slots
                     while queues[lane] and active < lane_limits[lane]:
                         queue = queues[lane]
                         priorities = _STATE_PRIORITY_WITHIN_LANE.get(lane)
@@ -1494,6 +1545,7 @@ class StagedParseCoordinator:
                                 shortages = exceeded_dimensions(
                                     ledger.in_use
                                     + provisional_local_total
+                                    + observation.credits
                                     + candidate_hold,
                                     ledger.limit,
                                 )
@@ -1509,7 +1561,10 @@ class StagedParseCoordinator:
                         index, work, local_hold = selected
                         del queue[index]
                         try:
-                            if needs_renewal(work, now):
+                            # Admission and preceding dispatch/renewal work may
+                            # have consumed the tick's original clock budget.
+                            # Decide against current time, not that stale tick.
+                            if needs_renewal(work, self._monotonic()):
                                 work = renew(work, lane)
                         except Exception as exc:  # noqa: BLE001 - claim loss is fatal
                             circuit_open = True
@@ -1521,7 +1576,7 @@ class StagedParseCoordinator:
                             break
                         stage_guard = StageLeaseGuard(
                             deadline_monotonic=(
-                                now + self._limits.max_stage_step_seconds
+                                self._monotonic() + self._limits.max_stage_step_seconds
                             ),
                             _revoked=Event(),
                             _monotonic=self._monotonic,
@@ -1582,12 +1637,30 @@ class StagedParseCoordinator:
                             )
                         active += 1
 
+                preflight_active = sum(
+                    1 for lane, _, _, _ in in_flight.values()
+                    if lane == CoordinatorLane.PREFLIGHT
+                )
+                if (
+                    observation.pending and not observation.active_slots
+                    and not circuit_open and not stop_requested()
+                    and preflight_active < lane_limits[CoordinatorLane.PREFLIGHT]
+                ):
+                    observation.dispatch(
+                        pools[CoordinatorLane.PREFLIGHT],
+                        stage_guard=StageLeaseGuard(
+                            deadline_monotonic=self._monotonic() + self._limits.max_stage_step_seconds,
+                            _revoked=Event(), _monotonic=self._monotonic,
+                        ),
+                    )
+
                 if not in_flight:
                     if (
                         any(queues.values())
                         and not circuit_open
                         and not retry_at
                         and not deferred_claims
+                        and not observation.pending
                     ):
                         circuit_open = True
                         admission_open = False
@@ -1601,6 +1674,8 @@ class StagedParseCoordinator:
                         and not any(queues.values())
                         and not retry_at
                         and not known
+                        and not observation.pending
+                        and (not admission_scan_incomplete or stop_requested())
                     ):
                         emit()
                         return CoordinatorResult(
@@ -1612,11 +1687,11 @@ class StagedParseCoordinator:
                             errors=tuple(errors),
                             credits_in_use=ledger.in_use,
                         )
-                    if circuit_open or (
+                    if not observation.pending and (circuit_open or (
                         stop_requested()
                         and now - last_progress
                         >= self._limits.idle_open_circuit_seconds
-                    ):
+                    )):
                         emit()
                         return CoordinatorResult(
                             terminal=CoordinatorTerminal.STUCK_OPEN_CIRCUIT,
@@ -1636,6 +1711,7 @@ class StagedParseCoordinator:
                     timeout=self._limits.poll_seconds,
                     return_when=FIRST_COMPLETED,
                 )
+                self._process_guard()
                 if not done:
                     guard_in_flight(self._monotonic())
                     emit()
@@ -1759,10 +1835,15 @@ class StagedParseCoordinator:
                 guard_in_flight(self._monotonic())
                 emit()
         finally:
-            # Running IO is never cancelled.  Executor shutdown waits for every
-            # owner that entered a thread, preserving the drain contract.
+            # Revoke permission for further effects before waiting for actual
+            # completion, including when the controller/singleton probe raises.
+            # A running Future is not cancelled or treated as drained early.
+            observation.cancel()
+            for _, _, stage_guard, _ in in_flight.values():
+                stage_guard.revoke()
             for pool in pools.values():
                 pool.shutdown(wait=True, cancel_futures=False)
+            observation.drained()
 
 
 __all__ = [
