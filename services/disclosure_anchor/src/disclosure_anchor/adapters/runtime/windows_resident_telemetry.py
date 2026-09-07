@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import time
 from typing import Literal, cast
+from urllib.parse import urlsplit
 
 from disclosure_anchor.adapters.runtime.bounded_http import (
     BoundedHTTPProtocolError,
@@ -44,6 +45,7 @@ class _Config:
     nominal_interval_ms: int
     collector_identity_sha256: str
     expected_identity: ResidentIdentity
+    ssh: dict[str, object] | None = None
 
 
 class WindowsResidentTelemetrySampler:
@@ -51,11 +53,31 @@ class WindowsResidentTelemetrySampler:
 
     def __init__(self, config: _Config) -> None:
         self._config = config
-        self._client = ThreadOwnedPersistentHTTPClient(
-            config.base_url,
-            maximum_response_bytes=config.maximum_response_bytes,
-            user_agent="disclosure-anchor-resident-telemetry/1",
-        )
+        self._client: ThreadOwnedPersistentHTTPClient
+        if config.ssh is None:
+            self._client = ThreadOwnedPersistentHTTPClient(
+                config.base_url,
+                maximum_response_bytes=config.maximum_response_bytes,
+                user_agent="disclosure-anchor-resident-telemetry/1",
+            )
+        else:
+            from disclosure_anchor.adapters.runtime.resident_ssh_http import (
+                ResidentSSHConfig,
+                ResidentSSHHTTPClient,
+            )
+            parsed = urlsplit(config.base_url)
+            if (
+                parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+                or parsed.port is None or parsed.path not in {"", "/"}
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment
+            ):
+                raise ValueError("SSH resident HTTP destination must be one explicit loopback port")
+            self._client = ResidentSSHHTTPClient(
+                ResidentSSHConfig(**config.ssh),  # type: ignore[arg-type]
+                remote_port=parsed.port,
+                maximum_response_bytes=config.maximum_response_bytes,
+            )
         self._last_sequence = 0
         self._last_wire_monotonic_ns: int | None = None
         self._last_wire_observed_at: datetime | None = None
@@ -162,8 +184,16 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
         "collector_identity_sha256",
         "expected_identity",
     }
-    if set(config) != expected_keys:
+    if set(config) not in (expected_keys, expected_keys | {"ssh"}):
         raise ValueError("resident telemetry collector config shape is invalid")
+    ssh = config.get("ssh")
+    if "ssh" in config and (
+        not isinstance(ssh, dict)
+        or set(ssh) != {"address", "port", "username", "private_key_path", "known_hosts_path"}
+        or any(not isinstance(ssh[name], str) for name in ssh if name != "port")
+        or type(ssh["port"]) is not int
+    ):
+        raise ValueError("resident SSH private configuration shape is invalid")
     lane = config["lane"]
     if lane not in {"gpu_fast", "host_slow"}:
         raise ValueError("resident telemetry lane is invalid")
@@ -202,6 +232,7 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
             nominal_interval,
             collector_identity,
             identity,
+            cast(dict[str, object] | None, ssh),
         )
     )
 
@@ -220,6 +251,7 @@ def windows_resident_collector_spec(
     maximum_sample_age_ms: int,
     nominal_interval_ms: int,
     expected_identity: ResidentIdentity,
+    ssh: dict[str, object] | None = None,
 ) -> ResidentTelemetryCollectorSpec:
     """Build the closed default-off spec; the config contains no credential."""
 
@@ -235,6 +267,7 @@ def windows_resident_collector_spec(
             nominal_interval_ms=nominal_interval_ms,
             collector_identity_sha256=collector_identity_sha256,
             expected_identity=expected_identity.model_dump(mode="json"),
+            **({"ssh": ssh} if ssh is not None else {}),
         ),
         expected_collector_identity_sha256=collector_identity_sha256,
         descendants_capability="forbidden",

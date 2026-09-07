@@ -12,6 +12,19 @@ exporter/supervisor 源码和纯 replay 合同；它们没有 installer/worker/A
 Object、真实 4 Hz GPU backend、WSL/Docker 1 Hz backend、observer+exporter 总开销或完整 3600 秒实机门禁。
 源码存在不等于生产支持。
 
+Mac resident collector 可显式选择 `resident-ssh` extra（Paramiko 5.0.0），使用进程内常驻 SSH
+访问配置中唯一固定的 `127.0.0.1:port` HTTP 目标。IP、用户、key/known_hosts 的绝对路径是私有
+config 引用，密钥 bytes 不进入 collector spec 或 telemetry；仅读取指定文件，不读取 SSH config、
+agent、邻接 certificate 或其他密钥。文件须当前用户所有、有限 regular file；key 禁止其他用户权限，
+known_hosts 禁止 group/world write；未知/冲突/不匹配 host key 在认证前失败。
+只尝试一次 Ed25519 public-key auth，部分认证直接失败，无密码/交互 fallback，无 shell、远程命令、
+子进程、新监听或每 tick SSH 握手。Transport 启动在 factory/READY 内，close 有界 join 并确认线程退出
+后才允许 observer preseal；SSH 客户端线程计入所属 collector process CPU，Windows sshd 转发 CPU
+不在 Mac `RUSAGE_SELF` 中，不能由该值宣称两端 SSH 的完整成本。
+机制依据为 Paramiko 5.0.0 commit `710cc5c02e2ded370d8d24e261e2baa8317a20fa` 的
+[Transport](https://github.com/paramiko/paramiko/blob/710cc5c02e2ded370d8d24e261e2baa8317a20fa/paramiko/transport.py)；
+低层 handshake/key check/auth_publickey 避开 SSHClient 旧认证路径的 partial-auth interactive fallback。
+
 默认关闭的原生 backend 分片在 `scripts/windows/linux_resident_host_sampler.py` 与
 `scripts/windows/mineru_nvml_backend.cs`。Linux backend 仅依赖 stdlib：进程/cgroup 目录 FD 固定，
 每次采样前后核对 boot/PID/starttime/cgroup/父目录身份，有限输入输出与 kernel read；stdin EOF、

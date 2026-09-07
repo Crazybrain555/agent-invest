@@ -155,7 +155,8 @@ class LinuxResidentHostSamplerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeded bound"):
             sampler.read_kernel_file(self.parent / "memory.stat")
 
-    def _child(self, *, lease: int = 1000, lifetime: int = 3000, large_sample: bool = False) -> subprocess.Popen[bytes]:
+    def _child(self, *, lease: int = 1000, lifetime: int = 3000, large_sample: bool = False,
+               blocking_sample: bool = False, delayed_fuse: bool = False) -> subprocess.Popen[bytes]:
         # Inject only the kernel source for deterministic protocol/lifetime
         # tests. The production main has no fake mode or configurable roots.
         config = {**self.config, "lease_ms": lease, "lifetime_ms": lifetime}
@@ -164,6 +165,10 @@ class LinuxResidentHostSamplerTests(unittest.TestCase):
             "from pathlib import Path\n"
             "real=m.HostSampler\n"
             + ("real.sample=lambda s:{'bounded_backpressure_probe':'x'*60000}\n" if large_sample else "") +
+            ("real.sample=lambda s:__import__('time').sleep(30)\n" if blocking_sample else "") +
+            ("original_timer=m.signal.setitimer\n"
+             "m.signal.setitimer=lambda kind,seconds:original_timer(kind,seconds+0.05)\n"
+             if delayed_fuse else "") +
             f"m.HostSampler=lambda c:real(c,proc_root=Path({str(self.proc)!r}),cgroup_root=Path({str(self.cg)!r}))\n"
             # /proc is unavailable on macOS; replace only startup identity
             # queries while keeping real timers, process and nonblocking stdio.
@@ -214,7 +219,7 @@ class LinuxResidentHostSamplerTests(unittest.TestCase):
     def test_real_lease_and_hard_lifetime_are_terminal(self) -> None:
         child = self._child()
         self._read(child)
-        self.assertEqual(child.wait(timeout=2), -signal.SIGALRM)
+        self._assert_deadline_exit(child, timeout=2)
         child = self._child(lease=1000, lifetime=1500)
         self._read(child)
         assert child.stdin is not None
@@ -224,8 +229,32 @@ class LinuxResidentHostSamplerTests(unittest.TestCase):
             child.stdin.flush()
             self._read(child)
             time.sleep(0.4)
-        self.assertEqual(child.wait(timeout=1), -signal.SIGALRM)
+        self._assert_deadline_exit(child, timeout=1)
         self.assertLess(time.monotonic() - start, 2)
+
+    def _assert_deadline_exit(self, child: subprocess.Popen[bytes], *, timeout: float) -> None:
+        code = child.wait(timeout=timeout)
+        assert child.stderr is not None
+        stderr = child.stderr.read().decode()
+        if code == -signal.SIGALRM:
+            return
+        self.assertEqual(code, 1, stderr)
+        self.assertTrue(stderr.startswith("Traceback (most recent call last):"), stderr)
+        self.assertEqual(stderr.splitlines()[-1], "TimeoutError: lease expired", stderr)
+
+    def test_explicit_timeout_and_native_blocking_fuse_both_remain_terminal(self) -> None:
+        # Test-only timer offset deterministically chooses the legal select
+        # deadline path. Production uses the original simultaneous deadline.
+        explicit = self._child(delayed_fuse=True)
+        self._read(explicit)
+        self.assertEqual(explicit.wait(timeout=2), 1)
+        self._assert_deadline_exit(explicit, timeout=1)
+        blocked = self._child(blocking_sample=True)
+        self._read(blocked)
+        assert blocked.stdin is not None
+        blocked.stdin.write(b'{"command":"sample","sequence":1}\n')
+        blocked.stdin.flush()
+        self.assertEqual(blocked.wait(timeout=2), -signal.SIGALRM)
 
     def test_stdout_backpressure_cannot_hold_linux_process_past_lease(self) -> None:
         child = self._child(large_sample=True)

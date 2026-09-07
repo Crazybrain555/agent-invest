@@ -350,7 +350,7 @@
   },
   "tests/unit/test_linux_resident_host_sampler.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_linux_resident_host_supervisor.py": {
    "private_imports": [],
@@ -539,6 +539,12 @@
   "tests/unit/test_remote_parse_v4_recovery_projection.py": {
    "private_imports": [],
    "tests": 8
+  },
+  "tests/unit/test_resident_ssh_http.py": {
+   "private_imports": [
+    "_read_private_config"
+   ],
+   "tests": 7
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
