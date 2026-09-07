@@ -4,12 +4,14 @@ function Import-MineruTelemetryPreparedAssembly {
         [Parameter(Mandatory = $true)][string]$ManifestPath,
         [Parameter(Mandatory = $true)][string]$ExpectedManifestSha256,
         [Parameter(Mandatory = $true)][string]$ExpectedNvmlSourceSha256,
+        [Parameter(Mandatory = $true)][string]$ExpectedWireSourceSha256,
         [Parameter(Mandatory = $true)][string]$ExpectedSupervisorSourceSha256
     )
-    foreach ($hash in @($ExpectedManifestSha256, $ExpectedNvmlSourceSha256, $ExpectedSupervisorSourceSha256)) {
+    foreach ($hash in @($ExpectedManifestSha256, $ExpectedNvmlSourceSha256, $ExpectedWireSourceSha256, $ExpectedSupervisorSourceSha256)) {
         if ($hash -cnotmatch '\Asha256:[0-9a-f]{64}\z') { throw 'canonical expected SHA required' }
     }
-    if ($null -ne ('MineruTelemetryJobSupervisor' -as [type]) -or $null -ne ('MineruNvmlBackend' -as [type])) {
+    if ($null -ne ('MineruTelemetryJobSupervisor' -as [type]) -or $null -ne ('MineruNvmlBackend' -as [type]) -or
+        $null -ne ('MineruResidentWire' -as [type])) {
         throw 'telemetry assembly already loaded; fresh process required'
     }
     $pins = [Collections.Generic.List[IO.FileStream]]::new()
@@ -40,13 +42,14 @@ function Import-MineruTelemetryPreparedAssembly {
         # not independent evidence that arbitrary compiler output is trusted.
         $manifest = [Text.UTF8Encoding]::new($false, $true).GetString($manifestBytes) | ConvertFrom-Json
         $expectedFields = @('assembly_name','assembly_sha256','compiler_arguments','compiler_path','compiler_sha256',
-            'contract_version','powershell_version','preparation_recipe_sha256','runtime_version','sources','system_assembly_sha256')
+            'contract_version','http_assembly_sha256','powershell_version','preparation_recipe_sha256','runtime_version','sources','system_assembly_sha256')
         if (@(Compare-Object @($manifest.PSObject.Properties.Name | Sort-Object) $expectedFields).Count -ne 0) {
             throw 'prepared manifest shape mismatch'
         }
-        if ($manifest.contract_version -cne 'mineru.telemetry-prepared-assembly.v1' -or
-            $manifest.assembly_name -cne 'mineru-telemetry.dll' -or $manifest.sources.Count -ne 2) { throw 'prepared manifest identity mismatch' }
-        $expected = @{'mineru_nvml_backend.cs' = $ExpectedNvmlSourceSha256; 'mineru_telemetry_job_supervisor.cs' = $ExpectedSupervisorSourceSha256}
+        if ($manifest.contract_version -cne 'mineru.telemetry-prepared-assembly.v2' -or
+            $manifest.assembly_name -cne 'mineru-telemetry.dll' -or $manifest.sources.Count -ne 3) { throw 'prepared manifest identity mismatch' }
+        $expected = @{'mineru_nvml_backend.cs' = $ExpectedNvmlSourceSha256; 'mineru_resident_wire.cs' = $ExpectedWireSourceSha256;
+            'mineru_telemetry_job_supervisor.cs' = $ExpectedSupervisorSourceSha256}
         $seen = @{}
         foreach ($source in $manifest.sources) {
             if (@(Compare-Object @($source.PSObject.Properties.Name | Sort-Object) @('name','sha256')).Count -ne 0 -or
@@ -59,7 +62,8 @@ function Import-MineruTelemetryPreparedAssembly {
         if ((Get-MineruBytesSha $assemblyBytes) -cne $manifest.assembly_sha256) { throw 'prepared DLL SHA mismatch' }
         $assembly = [Reflection.Assembly]::Load($assemblyBytes)
         if ($null -eq $assembly.GetType('MineruTelemetryJobSupervisor', $false) -or
-            $null -eq $assembly.GetType('MineruNvmlBackend', $false)) { throw 'prepared types absent' }
+            $null -eq $assembly.GetType('MineruNvmlBackend', $false) -or
+            $null -eq $assembly.GetType('MineruResidentWire', $false)) { throw 'prepared types absent' }
         # Caller retains pins through shutdown and disposes each only at exit.
         return [pscustomobject]@{ Pins = $pins; Manifest = $manifest; ManifestSha256 = $ExpectedManifestSha256; Assembly = $assembly }
     } catch {

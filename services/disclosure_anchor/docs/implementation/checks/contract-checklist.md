@@ -18,6 +18,11 @@ created_at: 2026-06-26
   Supervisor CPU is pre-attestation, not full-run; repeated process cumulative CPU is never double-counted.
 - Prepared DLL/source/recipe bindings are verified before measured runtime byte-array loading;
   runtime cannot compile. Backend smoke and these receipts do not alone qualify combined CPU or host-hour.
+- Prepared v2 pins three C# sources and System.Net.Http; strict recursive JSON/raw slices and bounded LF
+  coalescing/flush retain actual wire bytes. A poisoned stdio/HTTP instance cannot resume or replace pending I/O.
+  HTTP uses one frozen loopback port, bounded headers/body/deadline and verified cancellation quiescence.
+  Queue health/PID and exact engine/model metric identities fail closed; no summed aliases or rounded counts.
+  Explicit PS5.1 wire/loopback tests remain mechanism gates, not deployment or combined CPU qualification.
   Detailed boundaries and official mechanism references: `../design/synchronized-capacity-telemetry.md`.
 
 ## Private MinerU outgoing HTTP telemetry

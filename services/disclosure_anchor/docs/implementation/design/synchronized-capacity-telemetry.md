@@ -66,15 +66,35 @@ utilization/memory/power；只有 NVML NOT_SUPPORTED 可投影 unsupported。原
 源码 SHA 字段是待核验绑定，单独回显它不能证明运行代码。
 
 `build_mineru_telemetry_assembly.ps1` 是测量之外的显式准备步骤：固定 source/recipe/compiler
-文件 handle，直接调用所固定的 csc，有限编译与退出，记录源、参数、编译器、System assembly 和
+文件 handle，直接调用所固定的 csc，有限编译与退出，记录三个 C# 源、参数、编译器、System/System.Net.Http assembly 和
 实际 DLL SHA，输出至新 GUID 子目录；不覆盖已有构建。失败保留诊断，但不返回成功 manifest。
 运行进程仅经 `load_mineru_telemetry_assembly.ps1` 读取有限且固定的 manifest/DLL bytes，核验外部
 owner 已严格验证并绑定构建的 manifest SHA 与预期源码 SHA，随后 `Assembly.Load(byte[])`，
 全程持有 deny-write/delete pins；fresh process 才允许加载。运行阶段不得 Add-Type 编译或起 compiler。
 编译准备不计入受测进程生命周期，但加载与启动 CPU 要计入；这不改变 observer preseal 的原有边界。
+prepared manifest v2 固定 NVML、Job supervisor 与 `mineru_resident_wire.cs`；后者提供有限递归
+JSON parser、raw subtree、LF framing 和单个 Docker stdio child。所有子树均验证 UTF-8/重复键/
+grammar/depth/node/byte bounds，raw slice 保留 Python/NVML 浮点拼写；最终 canonical bytes 仍由
+Python owner 验证，C# parser 不是通用 Python 浮点 canonicalizer。连续的 close/closed 帧可在一次 OS
+read 中到达，必须保留尾部。写 BaseStream 后显式 bounded Flush；失败后禁止复用或覆盖 pending task。
+CLI exit0/EOF/空且已结束的 stderr 是必要但非充分条件，不能替代 exact container absence。
+
+同源 `MineruBoundedHttp` 固定实际加载的 System.Net.Http DLL hash/handle，每实例只访问一个
+loopback port 和 health/private HTTP/metrics 三个路径；禁用 proxy/redirect/cookies/default credentials/
+自动解压。ResponseHeadersRead 的完成不是 body 完成：同一绝对 QPC deadline 覆盖请求和逐段 body
+读取，响应头上限 16 KiB、body 至多 192 KiB、严格 UTF-8，拒绝状态/编码/长度异常。
+失败永久停用该实例，cancel/dispose 后等待 pending I/O 结束；无法 quiesce 必须暴露失败。
+native startup/disposal 的最终 hard fuse 仍是外层 Job。
+`MineruQueueTelemetry` 镜像既有 closed wire health/runtime；HTTP PID 由 owner 从已固定 host PID 的
+实际 NSpid 映射取得并绑定 boot/starttime，禁止猜测 PID 1。vLLM 只接受四个精确 metric 名称，各唯一
+`engine="0"`/固定 `model_name` series，无 alias/sum/stale fallback；计数使用精确十进制数位处理，
+不通过 float/decimal 四舍五入；仅 preemption 是单调 counter，health terminal registry gauge 允许下降。
+`test_mineru_resident_wire.ps1` 和 `test_mineru_bounded_http.ps1` 是显式独立机制测试；其中 test-only
+Add-Type/loopback server 不得进入 measured exporter，也不替代正常退出/联合 CPU/hour 门禁。
 机制依据：Microsoft [Job accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)、
 [creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)、
-[PowerShell 5.1 Add-Type](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/add-type?view=powershell-5.1)。
+[PowerShell 5.1 Add-Type](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/add-type?view=powershell-5.1)、
+[ResponseHeadersRead body timeout boundary](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpcompletionoption?view=netframework-4.8.1)。
 
 API outgoing HTTP 的只读快照由 patched serving process 内的
 `GET /agent/telemetry/http-requests/v1` 返回，不加入原有 closed `/health`。

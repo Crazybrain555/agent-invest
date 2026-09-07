@@ -25,7 +25,7 @@ function Get-StreamSha256([IO.Stream]$Stream) {
     } finally { $algorithm.Dispose(); $Stream.Position = 0 }
 }
 try {
-    $sourceNames = [string[]]@('mineru_nvml_backend.cs', 'mineru_telemetry_job_supervisor.cs')
+    $sourceNames = [string[]]@('mineru_nvml_backend.cs', 'mineru_resident_wire.cs', 'mineru_telemetry_job_supervisor.cs')
     $sourcePaths = [Collections.Generic.List[string]]::new()
     $sources = @()
     foreach ($name in $sourceNames) {
@@ -47,8 +47,11 @@ try {
     $systemAssemblyPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($compilerPath), 'System.dll')
     $systemPin = [IO.FileStream]::new($systemAssemblyPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $pins.Add($systemPin)
+    $httpAssemblyPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($compilerPath), 'System.Net.Http.dll')
+    $httpPin = [IO.FileStream]::new($httpAssemblyPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $pins.Add($httpPin)
     $compilerArguments = @('/nologo', '/noconfig', '/target:library', '/warnaserror+',
-        ('/out:' + $assemblyPath), ('/reference:' + $systemAssemblyPath)) + $sourcePaths.ToArray()
+        ('/out:' + $assemblyPath), ('/reference:' + $systemAssemblyPath), ('/reference:' + $httpAssemblyPath)) + $sourcePaths.ToArray()
     $quotedArguments = @($compilerArguments | ForEach-Object {
         if ($_.Contains('"') -or $_.Contains([char]0)) { throw 'invalid compiler argument' }
         '"' + $_ + '"'
@@ -93,7 +96,8 @@ try {
         compiler_arguments = $compilerArguments
         compiler_path = $compilerPath
         compiler_sha256 = $compilerSha
-        contract_version = 'mineru.telemetry-prepared-assembly.v1'
+        contract_version = 'mineru.telemetry-prepared-assembly.v2'
+        http_assembly_sha256 = Get-StreamSha256 $httpPin
         powershell_version = $PSVersionTable.PSVersion.ToString()
         preparation_recipe_sha256 = $recipeSha
         runtime_version = [Environment]::Version.ToString()
