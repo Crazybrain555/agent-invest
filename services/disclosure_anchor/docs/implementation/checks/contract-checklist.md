@@ -8,6 +8,30 @@ created_at: 2026-06-26
 
 # API / public view / source_ref 契约检查清单
 
+## Private resident lifecycle backends
+
+- Default-off Linux supervisor v1 owns one fixed-source sampler child; normal close/EOF/exact wait4
+  exit0 precede exit CPU. Failure emits no successful closed receipt. A separate +2s native-hang fuse
+  does not extend sampling or the KPI denominator; external owner still proves exact container absence.
+- Default-off Windows Job accounting v1 uses creation-time JOB_LIST membership and actual active0
+  totals including dead descendants. Forced termination/nonzero exit disqualify normal closure.
+  Supervisor CPU is pre-attestation, not full-run; repeated process cumulative CPU is never double-counted.
+- Prepared DLL/source/recipe bindings are verified before measured runtime byte-array loading;
+  runtime cannot compile. Backend smoke and these receipts do not alone qualify combined CPU or host-hour.
+  Detailed boundaries and official mechanism references: `../design/synchronized-capacity-telemetry.md`.
+
+## Private MinerU outgoing HTTP telemetry
+
+- Patched serving process exposes read-only `GET /agent/telemetry/http-requests/v1` with
+  `contract_version=mineru.api-http-request-snapshot.v1`, nonnegative `active_requests` /
+  `pending_requests`, and its real namespace `process_id`. Original closed `/health` is unchanged.
+- Counters surround only the existing final async POST semaphore; pending/acquire/exception/cancel
+  conserve across loop threads. Transport retries remain one logical active call; no inbound-task or
+  socket-count substitution. No task-manager initialization or side effect; `Cache-Control: no-store`.
+- Exact upstream preimages, repeated-patch rejection, actual patched POST error/waiter-cancel/retry,
+  multi-loop snapshots and real FastAPI read-only route are deterministic gates. Deployment still needs
+  current-source image/epoch attestation; source tests alone do not qualify resident telemetry.
+
 ## 私有部署证明：输出静止性（2026-09-06）
 
 - `mineru-windows-runtime-observation.v5` 的 output_root 保留物理文件数/字节数，并要求

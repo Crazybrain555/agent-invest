@@ -12,6 +12,69 @@ exporter/supervisor 源码和纯 replay 合同；它们没有 installer/worker/A
 Object、真实 4 Hz GPU backend、WSL/Docker 1 Hz backend、observer+exporter 总开销或完整 3600 秒实机门禁。
 源码存在不等于生产支持。
 
+默认关闭的原生 backend 分片在 `scripts/windows/linux_resident_host_sampler.py` 与
+`scripts/windows/mineru_nvml_backend.cs`。Linux backend 仅依赖 stdlib：进程/cgroup 目录 FD 固定，
+每次采样前后核对 boot/PID/starttime/cgroup/父目录身份，有限输入输出与 kernel read；stdin EOF、
+有限租约或不可续期的 hard lifetime 结束进程。native SIGALRM 使用默认终止动作，不能换成可能延迟的
+Python signal handler。执行 owner 按实际 container ID 核验 pinned image、host PID/cgroup namespace、
+无网络、只读、cap-drop 和退出后不存在；Windows Job 退出不能替代 Linux absence。自身 namespace ID
+由 helper 实读，host 模式由 Docker 实际配置证明；不为读取 `/proc/1/ns` 增加权限。
+父 cgroup 指整个共同父层级，可能包含其他容器和 helper，不冒充三个服务之和；不再次累加子组。
+CPU throttle 仅代表该父层级自身带宽限制，VmRSS/HWM 与 MemAvailable 是内核近似统计。
+缺失字段只令所属 section unsupported；malformed、身份变化、累计计数回退不能变成成功或补零。
+helper 的 `cpu` 是本进程自启动至该次 snapshot 的 user/system 累计，不覆盖后续 emit/退出开销，
+因此不能独自证明完整联合生命周期的 2% 门禁。
+`scripts/windows/linux_resident_host_supervisor.py` 提供独立的默认关闭
+`mineru.linux-resident-supervisor.v1`：在全新单线程 stdlib interpreter 中仅 fork 一次，
+子进程执行 SHA 固定的 sampler；父进程有界转发 canonical READY/sample/close。
+正常 close 后必须读到子 stdout EOF，并对直接创建的精确 PID 执行 `wait4` 得到 exit 0，
+才发送 closed 核算帧。该帧的 `sampler_exit_cpu` 覆盖子进程从 fork 到退出的全部 user/system CPU，
+包括最后一帧之后的收尾；不再重复加采样帧中的子 CPU，也不使用聚合 `RUSAGE_CHILDREN`。
+`supervisor_pre_attestation_cpu` 仅是父进程自启动至该帧生成前的 `RUSAGE_SELF`，
+不包括该帧编码/写出与父进程退出，禁止称为所有进程的 full-run CPU。
+操作 deadline 先触发有界 TERM/KILL/精确 reap，另留 2 秒默认动作 ALRM 兜底原生阻塞，
+故 supervisor 最长为配置 lifetime 加 2 秒（上限 7202 秒）；采样 lifetime 与 KPI 分母不延长。
+EOF、非法命令、异常子退出、超时或未回收均不能生成成功 closed receipt。
+外部 owner 仍须验证实际容器消失；源码中这项明确的一次子进程能力不放宽 observer collector
+的禁止 descendants 边界，也不引入 per-tick fork 或新镜像。
+NVML backend 固定 System32 DLL bytes 并全程持有 deny-write/delete handle，UUID 选卡，直接读取
+utilization/memory/power；只有 NVML NOT_SUPPORTED 可投影 unsupported。原生调用仍须外层 Job/deadline
+约束。power 保留驱动提供的平均语义，不把以 250ms 读取误称为 250ms 瞬时功耗。
+这些 backend 的独立实机 smoke 不替代 exporter 接线、联合退出/CPU 或完整 host-hour 验收。
+
+`mineru_telemetry_job_supervisor.cs` 是独立的默认关闭 Windows 生命周期 backend，尚未替换旧 PS
+入口。它使用 Windows 10+ `STARTUPINFOEX/PROC_THREAD_ATTRIBUTE_JOB_LIST`，使 suspended child
+在创建时即属于非继承 handle 的 unnamed kill-on-close Job；核验 `IsProcessInJob` 后才 Resume。
+禁止降级为 Create 后再 Assign（owner 在两者之间退出会遗留 suspended child）。有限 wait 后必须
+实读 Job `ActiveProcesses=0`，才读取包含已退出成员的 `TotalUserTime/TotalKernelTime`，100ns 转 ns。
+`mineru.windows-job-accounting.v1` 中 `forced_termination=true` 或 child exit 非 0 均不能通过正常
+关闭验收；active0 不替代 Linux container absence。父进程 CPU 使用原生 `GetProcessTimes`，
+只标为 pre-attestation；同一父 process/creation 的累计值不能在多张 Job receipt 中重复加总。
+源码 SHA 字段是待核验绑定，单独回显它不能证明运行代码。
+
+`build_mineru_telemetry_assembly.ps1` 是测量之外的显式准备步骤：固定 source/recipe/compiler
+文件 handle，直接调用所固定的 csc，有限编译与退出，记录源、参数、编译器、System assembly 和
+实际 DLL SHA，输出至新 GUID 子目录；不覆盖已有构建。失败保留诊断，但不返回成功 manifest。
+运行进程仅经 `load_mineru_telemetry_assembly.ps1` 读取有限且固定的 manifest/DLL bytes，核验外部
+owner 已严格验证并绑定构建的 manifest SHA 与预期源码 SHA，随后 `Assembly.Load(byte[])`，
+全程持有 deny-write/delete pins；fresh process 才允许加载。运行阶段不得 Add-Type 编译或起 compiler。
+编译准备不计入受测进程生命周期，但加载与启动 CPU 要计入；这不改变 observer preseal 的原有边界。
+机制依据：Microsoft [Job accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)、
+[creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)、
+[PowerShell 5.1 Add-Type](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/add-type?view=powershell-5.1)。
+
+API outgoing HTTP 的只读快照由 patched serving process 内的
+`GET /agent/telemetry/http-requests/v1` 返回，不加入原有 closed `/health`。
+闭合字段为 `contract_version=mineru.api-http-request-snapshot.v1`、`active_requests`、
+`pending_requests`、`process_id`；计数非负，PID 是实际 serving namespace 的进程号。
+每个请求仅在现有 final `client.post` semaphore 前计入 pending，acquire 后原子移至 active，
+返回/异常/取消后归还；transport 内部重试始终属于该次 logical POST。所有 loop 的计数用同一个
+短持有 thread lock 汇总，原 loop semaphore 容量与 outer predict semaphore 保持不变。
+它既不是 TCP 连接数，也不是入站 PDF task 数；无流量时真实 0 是有效观测。
+端点不初始化 task manager、不写状态，响应 `Cache-Control: no-store`，不进入 OpenAPI 文档。
+“private”指运维接口范围，不是新增鉴权；沿用 serving service 既有访问边界。
+collector 必须检查部署/进程 identity，不能从另起 Python 进程的全局变量取得这些计数。
+
 目标指标是 `unique correct durably published source pages / full GPU-host-hour`。GPU 利用率、CPU、
 队列和内存是解释吞吐损失的信号，不是独立优化目标。缺失采样必须写成 `unsupported + reason`，
 不得补零、沿用旧值或伪造支持。

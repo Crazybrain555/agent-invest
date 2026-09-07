@@ -185,32 +185,65 @@ class _ProcessAsyncRequestLimiter:
         self.capacity = capacity
         self.semaphore = asyncio.Semaphore(capacity)
         self.active = 0
+        self.pending = 0
         self.peak = 0
 
     async def __aenter__(self):
-        await self.semaphore.acquire()
-        self.active += 1
-        self.peak = max(self.peak, self.active)
+        with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+            self.pending += 1
+            _PROCESS_ASYNC_REQUEST_STATS["pending"] += 1
+        try:
+            await self.semaphore.acquire()
+        except BaseException:
+            with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+                self.pending -= 1
+                _PROCESS_ASYNC_REQUEST_STATS["pending"] -= 1
+            raise
+        with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+            self.pending -= 1
+            _PROCESS_ASYNC_REQUEST_STATS["pending"] -= 1
+            self.active += 1
+            _PROCESS_ASYNC_REQUEST_STATS["active"] += 1
+            self.peak = max(self.peak, self.active)
         return self
 
     async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
-        if self.active < 1:
-            raise RuntimeError("global VLM request limiter underflowed")
-        self.active -= 1
+        with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+            if self.active < 1 or _PROCESS_ASYNC_REQUEST_STATS["active"] < 1:
+                raise RuntimeError("global VLM request limiter underflowed")
+            self.active -= 1
+            _PROCESS_ASYNC_REQUEST_STATS["active"] -= 1
         self.semaphore.release()
 
 
+import os as _agent_request_os
+import threading as _agent_request_threading
+
+_PROCESS_ASYNC_REQUEST_STATS_LOCK = _agent_request_threading.Lock()
+_PROCESS_ASYNC_REQUEST_STATS = {"active": 0, "pending": 0}
 _PROCESS_ASYNC_REQUEST_LIMITERS = {}
+
+
+def _process_async_request_snapshot() -> dict:
+    """Logical final POST calls, including transport retries; not sockets/tasks."""
+    with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+        return {
+            "contract_version": "mineru.api-http-request-snapshot.v1",
+            "active_requests": _PROCESS_ASYNC_REQUEST_STATS["active"],
+            "pending_requests": _PROCESS_ASYNC_REQUEST_STATS["pending"],
+            "process_id": _agent_request_os.getpid(),
+        }
 
 
 def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter:
     loop = asyncio.get_running_loop()
-    limiter = _PROCESS_ASYNC_REQUEST_LIMITERS.get(loop)
-    if limiter is None:
-        limiter = _ProcessAsyncRequestLimiter(capacity)
-        _PROCESS_ASYNC_REQUEST_LIMITERS[loop] = limiter
-    elif limiter.capacity != capacity:
-        raise RuntimeError("global VLM request concurrency drifted within one process")
+    with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+        limiter = _PROCESS_ASYNC_REQUEST_LIMITERS.get(loop)
+        if limiter is None:
+            limiter = _ProcessAsyncRequestLimiter(capacity)
+            _PROCESS_ASYNC_REQUEST_LIMITERS[loop] = limiter
+        elif limiter.capacity != capacity:
+            raise RuntimeError("global VLM request concurrency drifted within one process")
     return limiter
 '''
         source = _replace_exact(
@@ -771,6 +804,20 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        \"processing_window_size\": strict_processing_window_size(),\n",
             count=1,
             label="FastAPI pending depth health identity",
+        )
+        source = _replace_exact(
+            source,
+            '@app.get(path="/health")\n',
+            '@app.get(path="/agent/telemetry/http-requests/v1", include_in_schema=False)\n'
+            "async def agent_http_request_telemetry():\n"
+            "    from mineru_vl_utils.vlm_client.http_client import _process_async_request_snapshot\n"
+            "    return JSONResponse(\n"
+            "        content=_process_async_request_snapshot(),\n"
+            '        headers={"Cache-Control": "no-store"},\n'
+            "    )\n\n\n"
+            '@app.get(path="/health")\n',
+            count=1,
+            label="FastAPI same-process outgoing HTTP telemetry",
         )
         source = _replace_exact_fixture_optional(
             source,

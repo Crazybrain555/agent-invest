@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import ast
 from contextlib import redirect_stderr
+from enum import Enum
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -262,6 +264,19 @@ def health_payload(task_manager):
             default=DEFAULT_PROCESSING_WINDOW_SIZE
         ),
     }
+
+
+class _FixtureTelemetryApp:
+    def get(self, **kwargs):
+        return lambda function: function
+
+
+app = _FixtureTelemetryApp()
+
+
+@app.get(path="/health")
+async def health_check():
+    return health_payload(None)
 '''
 
 
@@ -575,6 +590,10 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 await waiter
             self.assertEqual(limiter.active, 2)
             self.assertEqual(limiter.peak, 2)
+            self.assertEqual(limiter.pending, 0)
+            snapshot = namespace["_process_async_request_snapshot"]()
+            self.assertEqual(snapshot["active_requests"], 2)
+            self.assertEqual(snapshot["pending_requests"], 0)
             release.set()
             await asyncio.gather(*holders)
             self.assertEqual(limiter.active, 0)
@@ -584,6 +603,128 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             asyncio.run(exercise())
         self.assertIn("async with limiter:", patched)
         self.assertNotIn("async with semaphore:\n            response = await client.post", patched)
+
+    def test_actual_patched_post_counts_waiters_retry_error_and_cancellation(self) -> None:
+        patched = patch_source("mineru_vl_utils/vlm_client/http_client.py", _http_client_fixture())
+        namespace = {"asyncio": asyncio, "Enum": Enum}
+        exec(compile(patched, "instrumented-http-client", "exec"), namespace)
+        snapshot = namespace["_process_async_request_snapshot"]
+        calls = []
+
+        async def exercise() -> None:
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def post(_url, *, json):
+                ordinal = len(calls)
+                calls.append(ordinal)
+                self.assertEqual(snapshot()["active_requests"], 1)
+                if ordinal == 0:
+                    entered.set()
+                    await release.wait()
+                    # Retries occur within one logical client.post call. They
+                    # do not release capacity or manufacture extra active calls.
+                    for _attempt in range(3):
+                        await asyncio.sleep(0)
+                        self.assertEqual(snapshot()["active_requests"], 1)
+                    raise RuntimeError("transport retries exhausted")
+                return {"result": "ok"}
+
+            client = namespace["HttpVlmClient"]()
+            client.client = SimpleNamespace(post=post)
+            client.debug, client.max_concurrency = False, 1
+            client.chat_url = "http://fixture.invalid/chat"
+            client.get_response_data = lambda value: value
+            client.get_response_content = lambda value: value["result"]
+            first = asyncio.create_task(client.aio_predict(object()))
+            await entered.wait()
+            cancelled = asyncio.create_task(client.aio_predict(object()))
+            next_request = asyncio.create_task(client.aio_predict(object()))
+            await asyncio.sleep(0)
+            self.assertEqual(snapshot()["pending_requests"], 2)
+            cancelled.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await cancelled
+            self.assertEqual(snapshot()["pending_requests"], 1)
+            release.set()
+            with self.assertRaisesRegex(RuntimeError, "retries exhausted"):
+                await first
+            self.assertEqual(await next_request, "ok")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(snapshot()["active_requests"], 0)
+            self.assertEqual(snapshot()["pending_requests"], 0)
+
+        asyncio.run(asyncio.wait_for(exercise(), timeout=2))
+        with self.assertRaisesRegex(RuntimeError, "patch anchor count drifted"):
+            patch_source("mineru_vl_utils/vlm_client/http_client.py", patched)
+
+    def test_request_snapshot_is_atomic_across_two_event_loop_threads(self) -> None:
+        patched = patch_source("mineru_vl_utils/vlm_client/http_client.py", _http_client_fixture())
+        namespace = {"asyncio": asyncio, "Enum": Enum}
+        exec(compile(patched, "multi-loop-http-client", "exec"), namespace)
+        snapshot = namespace["_process_async_request_snapshot"]
+        ready, release = threading.Barrier(3), threading.Event()
+        failures = []
+
+        def run() -> None:
+            async def exercise() -> None:
+                limiter = namespace["_process_async_request_limiter"](1)
+                async with limiter:
+                    waiter = asyncio.create_task(limiter.__aenter__())
+                    await asyncio.sleep(0)
+                    ready.wait(timeout=3)
+                    if not release.wait(timeout=3):
+                        raise TimeoutError("test release missing")
+                    waiter.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await waiter
+            try:
+                asyncio.run(exercise())
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            ready.wait(timeout=3)
+            for _ in range(100):
+                observed = snapshot()
+                self.assertEqual((observed["active_requests"], observed["pending_requests"]), (2, 2))
+                observed["active_requests"] = 100  # returned object is a copy
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=3)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(failures, [])
+        self.assertEqual((snapshot()["active_requests"], snapshot()["pending_requests"]), (0, 0))
+
+    def test_private_request_endpoint_uses_same_module_readonly_no_health_shape_change(self) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from starlette.responses import JSONResponse
+
+        patched = patch_source("mineru/cli/fast_api.py", _fast_api_fixture())
+        handler = next(node for node in ast.parse(patched).body
+                       if isinstance(node, ast.AsyncFunctionDef) and node.name == "agent_http_request_telemetry")
+        module = ModuleType("mineru_vl_utils.vlm_client.http_client")
+        payload = {"contract_version": "mineru.api-http-request-snapshot.v1",
+                   "active_requests": 2, "pending_requests": 3, "process_id": os.getpid()}
+        module._process_async_request_snapshot = lambda: dict(payload)
+        app = FastAPI()
+        namespace = {"app": app, "JSONResponse": JSONResponse}
+        exec(compile(ast.Module(body=[handler], type_ignores=[]), "private-telemetry-route", "exec"), namespace)
+        with patch.dict(sys.modules, {module.__name__: module}), TestClient(app) as client:
+            route = "/agent/telemetry/http-requests/v1"
+            response = client.get(route)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), payload)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertEqual(client.post(route).status_code, 405)
+            self.assertNotIn(route, client.get("/openapi.json").json()["paths"])
+            payload["active_requests"] = 0
+            self.assertEqual(client.get(route).json()["active_requests"], 0)
+        self.assertNotIn("get_task_manager", ast.unparse(handler))
 
 
     def test_cross_page_transport_and_cardinality_fail_visible(self) -> None:

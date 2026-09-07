@@ -348,6 +348,14 @@
    "private_imports": [],
    "tests": 16
   },
+  "tests/unit/test_linux_resident_host_sampler.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/unit/test_linux_resident_host_supervisor.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_local_materialization_manifest_v4.py": {
    "private_imports": [],
    "tests": 4
@@ -370,7 +378,7 @@
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 22
   },
   "tests/unit/test_mineru_http_remote_v4.py": {
    "private_imports": [],
