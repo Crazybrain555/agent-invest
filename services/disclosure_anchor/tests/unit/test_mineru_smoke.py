@@ -124,7 +124,7 @@ class MinerUSmokeCliReceiptTests(unittest.TestCase):
             health(completed=0, failed=0),
         )
 
-        self.assertEqual(RECEIPT_SCHEMA, "mineru_smoke_receipt.v5")
+        self.assertEqual(RECEIPT_SCHEMA, "mineru_smoke_receipt.v6")
         self.assertEqual(
             evidence["task_registry_semantics"],
             "retained-terminal-gauges.v1",

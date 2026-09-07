@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 from contextlib import redirect_stderr
 import hashlib
 import io
@@ -12,6 +13,7 @@ from pathlib import Path
 import stat
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -496,6 +498,50 @@ def _hybrid_document_fixture(*, asynchronous: bool) -> str:
 
 
 class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
+    def test_patched_serving_health_passes_wire_parser_without_process_global_probe(self) -> None:
+        from disclosure_anchor.application.contracts.mineru_api_health import (
+            MINERU_API_HEALTH_FIELDS, parse_mineru_api_health, validate_mineru_api_health,
+        )
+        from scripts.windows.mineru_heap_trim_compat.agent_task_protocol_v2 import (
+            DurableTaskRegistry, SplitTaskExecutor, task_protocol_runtime_status,
+        )
+
+        patched = patch_source("mineru/cli/fast_api.py", _fast_api_fixture())
+        function = next(node for node in ast.parse(patched).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "health_payload")
+        namespace = {
+            "get_max_concurrent_requests": lambda: 1, "get_max_pending_tasks": lambda: 1,
+            "strict_processing_window_size": lambda: 16,
+            "task_protocol_runtime_status": task_protocol_runtime_status,
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "patched-health", "exec"), namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            manager = SimpleNamespace(
+                task_protocol_v2=DurableTaskRegistry(
+                    root / "registry.json", output_root=root, max_unacked_result_bytes=2147483648,
+                ),
+                task_protocol_executor=SplitTaskExecutor(parse_slots=1, finalizer_slots=1),
+                max_nonterminal_tasks=1,
+            )
+            payload = {
+                "status": "healthy", "version": "3.4.4", "protocol_version": 2,
+                "queued_tasks": 0, "processing_tasks": 0, "completed_tasks": 0,
+                "failed_tasks": 0, "task_retention_seconds": 600,
+                "task_cleanup_interval_seconds": 30, **namespace["health_payload"](manager),
+            }
+            normalized = parse_mineru_api_health(json.dumps(payload).encode(), expected_task_slots=1)
+            self.assertEqual(set(normalized), MINERU_API_HEALTH_FIELDS)
+            self.assertEqual(validate_mineru_api_health(normalized, expected_task_slots=1), normalized)
+            with self.assertRaisesRegex(ValueError, "wire health"):
+                parse_mineru_api_health(json.dumps(normalized).encode(), expected_task_slots=1)
+            self.assertEqual(list(root.iterdir()), [])
+        collector = (Path(__file__).resolve().parents[2] / "scripts/windows/collect_mineru_runtime.ps1").read_text()
+        self.assertNotIn("get_task_manager", collector)
+        self.assertNotIn("from mineru.cli.fast_api", collector)
+        self.assertIn('serving_health["max_pending_tasks_effective"]', collector)
+        self.assertIn('response.read(65537)', collector)
+
     def test_final_post_limiter_is_process_shared_drift_closed_and_cancel_safe(self) -> None:
         patched = patch_source(
             "mineru_vl_utils/vlm_client/http_client.py",
@@ -1446,9 +1492,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn('schema = "mineru-windows-install-receipt.v2"', installer)
         self.assertIn("mineru-runtime-v6", installer)
         self.assertNotIn("versioned v4 evidence paths", installer)
-        self.assertIn('schema = "mineru-windows-runtime-observation.v4"', collector)
+        self.assertIn('schema = "mineru-windows-runtime-observation.v5"', collector)
         self.assertIn(
-            'collectorObservation.schema -ne "mineru-windows-runtime-observation.v4"',
+            'collectorObservation.schema -ne "mineru-windows-runtime-observation.v5"',
             installer,
         )
         self.assertNotIn("mineru-windows-runtime-observation.v3", installer)

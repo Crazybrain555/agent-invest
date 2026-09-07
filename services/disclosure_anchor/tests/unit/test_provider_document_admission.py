@@ -1596,7 +1596,9 @@ class _FakeReader:
         self.document = document
         self.calls: list[tuple[Path, str]] = []
 
-    def read(self, output_dir: Path, *, source_pdf_sha256: str) -> ProviderDocument:
+    def read_published(
+        self, output_dir: Path, *, bundle_relpath: Path, source_pdf_sha256: str
+    ) -> ProviderDocument:
         self.calls.append((output_dir, source_pdf_sha256))
         return self.document
 

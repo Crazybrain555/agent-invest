@@ -40,6 +40,8 @@ class StagedWorkerV4RuntimeTests(unittest.TestCase):
                 registry_nonterminal_cap=1,
                 registry_terminal_cap=127,
                 processing_window_size=16,
+                cpu_worker_threads=3,
+                omp_thread_count=1,
                 raster_stage_slots=1,
                 layout_stage_slots=1,
                 postprocess_stage_slots=1,

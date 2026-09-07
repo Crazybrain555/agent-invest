@@ -1063,7 +1063,7 @@ artifact owner，也禁止从文件存在性或路径词面猜版本。
 contract-checklist §2 为准：
 
 - 0010：`applicability`（'applicable'|'not_applicable'|NULL，节适用性一等筛选列，部分索引）
-  与 `page_no`（artifact_locator 首页码提升列）；
+  与 `page_no`（Unit 本身首个 source block 的页码；完整 locator 的祖先标题证据可在更早页）；
 - 0011：`is_active_run` 成为 `document_units_v1` / `source_refs_v1` 的真实视图列
   （DB 直读方可直接过滤 active run）；同迁移将 `payload_kind` CHECK 扩为含 `mixed`（§6.5）；
 - 0033：开发期误把当时 duplicate-only 的观测推广为 schema 结论，删除了 plural route；

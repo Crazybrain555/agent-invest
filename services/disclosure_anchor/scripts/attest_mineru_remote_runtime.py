@@ -13,6 +13,9 @@ import stat
 import subprocess
 from typing import Any
 
+from disclosure_anchor.application.contracts.mineru_api_health import (
+    validate_mineru_api_wire_health,
+)
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_EGRESS_POLICY,
     MINERU_API_EXPOSURE_POLICY,
@@ -82,6 +85,7 @@ COMPAT_LABEL_KEYS = {
 API_ENV_KEYS = {
     "MINERU_MODEL_SOURCE",
     "MINERU_MALLOC_TRIM",
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MINERU_PDF_RENDER_THREADS",
     "MINERU_PHASE_TRACE",
     "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_API_MAX_PENDING_TASKS",
@@ -252,6 +256,7 @@ def _verify_api_compatibility(
     if not isinstance(value, dict) or set(value) != {
         "marker",
         "actual_source_sha256",
+        "task_protocol_v2_actual_sha256",
         "capacity_runtime",
         "heap_trim_enabled",
         "phase_trace_enabled",
@@ -300,6 +305,7 @@ def _verify_api_compatibility(
         or not isinstance(patched, dict)
         or set(patched) != set(EXPECTED_COMPAT_PREIMAGES)
         or actual != patched
+        or value.get("task_protocol_v2_actual_sha256") != expected_task_protocol_v2_sha256
         or any(SHA256_RE.fullmatch(str(item)) is None for item in patched.values())
         or not isinstance(value.get("capacity_runtime"), dict)
         or value.get("heap_trim_enabled") is not True
@@ -348,7 +354,7 @@ def build_manifest(
     expected_task_protocol_v2_sha256: str,
     expected_collector_path: str = EXPECTED_COLLECTOR_PATH,
 ) -> dict[str, Any]:
-    if observation.get("schema") != "mineru-windows-runtime-observation.v4":
+    if observation.get("schema") != "mineru-windows-runtime-observation.v5":
         raise ValueError("remote runtime observation contract drifted")
     api = observation.get("api")
     proxy = observation.get("proxy")
@@ -364,6 +370,7 @@ def build_manifest(
     assert isinstance(inference, dict)
     assert isinstance(health, dict)
     assert isinstance(served_model, dict)
+    validate_mineru_api_wire_health(health, expected_task_slots=1)
     if (
         observation.get("compose_sha256") != expected_compose_sha256
         or observation.get("collector_sha256") != expected_collector_sha256
@@ -489,10 +496,40 @@ def build_manifest(
     if (
         not isinstance(output_root, dict)
         or _windows_path(output_root.get("path")) != _windows_path(EXPECTED_OUTPUT_ROOT)
-        or output_root.get("file_count") != 0
-        or output_root.get("total_bytes") != 0
+        or set(output_root) != {"path", "file_count", "total_bytes", "quiescence"}
+        or type(output_root.get("file_count")) is not int
+        or output_root.get("file_count") != 1
+        or type(output_root.get("total_bytes")) is not int
+        or not 0 < output_root["total_bytes"] <= 16 * 1024 * 1024
     ):
         raise ValueError("remote MinerU output root drifted")
+    quiescence = output_root.get("quiescence")
+    if (
+        not isinstance(quiescence, dict)
+        or set(quiescence) != {
+            "schema", "root_identity", "registry_sha256", "record_count",
+            "submission_watermark_bucket",
+        }
+        or quiescence.get("schema") != "mineru-output-quiescence.v1"
+        or not isinstance(quiescence.get("registry_sha256"), str)
+        or re.fullmatch(r"sha256:[a-f0-9]{64}", quiescence["registry_sha256"]) is None
+        or type(quiescence.get("record_count")) is not int
+        or not 0 <= quiescence["record_count"] <= 128 + 8192
+        or type(quiescence.get("submission_watermark_bucket")) is not int
+        or quiescence["submission_watermark_bucket"] < -1
+    ):
+        raise ValueError("remote MinerU output quiescence is invalid")
+    root_identity = quiescence["root_identity"]
+    if (
+        not isinstance(root_identity, dict)
+        or set(root_identity) != {"path", "device", "inode", "uid", "mode"}
+        or root_identity.get("path") != "/var/lib/mineru-api-output"
+        or any(type(root_identity.get(key)) is not int
+               for key in ("device", "inode", "uid", "mode"))
+        or root_identity["device"] < 0 or root_identity["inode"] < 1
+        or root_identity["uid"] != 0 or not stat.S_ISDIR(root_identity["mode"])
+    ):
+        raise ValueError("remote MinerU output root identity is invalid")
     expected_model_id = (
         "/root/.cache/huggingface/hub/"
         "models--opendatalab--MinerU2.5-Pro-2605-1.2B/snapshots/"
@@ -523,6 +560,10 @@ def build_manifest(
         raise ValueError("remote API pending depth compatibility drifted")
     if api_environment.get("MINERU_MALLOC_TRIM") != "1":
         raise ValueError("remote API heap-return switch is not enabled")
+    for field, expected in {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+                            "OPENBLAS_NUM_THREADS": "1", "MINERU_PDF_RENDER_THREADS": "3"}.items():
+        if api_environment.get(field) != expected:
+            raise ValueError(f"remote API thread policy drifted: {field}")
     if api_environment.get("MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS") != "1":
         raise ValueError("remote API pipeline inference locks are not enabled")
     ratio_raw = api_environment.get("MINERU_HYBRID_BATCH_RATIO")

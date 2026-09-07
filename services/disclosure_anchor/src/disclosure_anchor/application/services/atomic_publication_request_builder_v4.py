@@ -556,10 +556,8 @@ def _unit_page_numbers(
         raise AtomicPublicationRequestBuilderV4Error(
             "publication Unit locator cites an unknown provider block"
         ) from exc
-    if pages[0] != draft.page_no:
-        raise AtomicPublicationRequestBuilderV4Error(
-            "publication Unit primary page differs from full locator lineage"
-        )
+    # Ancestor headings are full provenance, not the Unit-local starting page.
+    # Keep them even when they precede this Unit's own primary page.
     return pages
 
 

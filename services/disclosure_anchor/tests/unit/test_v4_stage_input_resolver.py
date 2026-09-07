@@ -200,7 +200,7 @@ class V4StageInputResolverTests(unittest.TestCase):
             fence_identity="fence-1",
             submission_epoch_unix=self.submission_epoch,
         )
-        upload_filename = self.source_sha256.removeprefix("sha256:") + ".pdf"
+        upload_filename = "sha256_" + self.source_sha256.removeprefix("sha256:") + ".pdf"
         request = submission_request_exact_bytes_v2(
             api_origin=self.options.api_url or "",
             form=submission_form_v2(

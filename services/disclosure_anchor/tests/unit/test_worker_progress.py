@@ -112,8 +112,11 @@ def _event() -> dict[str, object]:
 
 
 def _api_health_payload() -> bytes:
+    from tests._mineru_health_fixture import protocol_health_fields
+
     return json.dumps(
         {
+            **protocol_health_fields(),
             "status": "healthy",
             "version": "3.4.4",
             "protocol_version": 2,

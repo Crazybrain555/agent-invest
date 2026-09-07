@@ -174,7 +174,7 @@ class ProductionV4StageInputResolver:
         # returning the POST command.  A changed byte/page/hash fact fails closed.
         self._verified_source_path(bound)
         upload_filename = (
-            bound.reservation.source_pdf_sha256.removeprefix("sha256:") + ".pdf"
+            "sha256_" + bound.reservation.source_pdf_sha256.removeprefix("sha256:") + ".pdf"
         )
         request = submission_request_exact_bytes_v2(
             api_origin=bound.spec.api_origin,
@@ -430,7 +430,7 @@ class ProductionV4StageInputResolver:
             fence_identity=prepared.fence_identity,
             submission_epoch_unix=prepared.submission_epoch_unix,
         )
-        upload_filename = prepared.source_pdf_sha256.removeprefix("sha256:") + ".pdf"
+        upload_filename = "sha256_" + prepared.source_pdf_sha256.removeprefix("sha256:") + ".pdf"
         expected_request = submission_request_exact_bytes_v2(
             api_origin=spec.api_origin,
             form=submission_form_v2(spec.parser_options, server_url=spec.server_url),

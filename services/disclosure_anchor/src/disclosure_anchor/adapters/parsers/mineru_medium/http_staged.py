@@ -27,6 +27,7 @@ import httpx
 
 from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
     MinerUMediumArtifactReader,
+    PinnedArtifactReadResult,
 )
 from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
     MinerUProtocolV2WireError,
@@ -181,7 +182,7 @@ def prepare_submission_identity_v2(
         request_exact = submission_request_exact_bytes_v2(
             api_origin=api_url,
             form=_submission_form(options, server_url=server_url),
-            upload_filename=f"{source_pdf_sha256[7:]}.pdf",
+            upload_filename=f"sha256_{source_pdf_sha256[7:]}.pdf",
         )
     except MinerUProtocolV2WireError as exc:
         raise _fail("submission request escaped protocol v2") from exc
@@ -2220,6 +2221,7 @@ class MinerUHttpStagedParser:
             }
         )
         submit_allowed = {
+            "message",
             "task_id",
             "status",
             "backend",
@@ -2537,6 +2539,8 @@ def _task_from_submission_payload(
     idempotency_key: str,
     submission_epoch_unix: int,
 ) -> _Task:
+    if "message" in payload and payload["message"] != "Task submitted successfully":
+        raise _fail("task submission message drifted")
     if not all(
         isinstance(payload.get(key), str)
         for key in ("task_id", "status_url", "result_url")
@@ -2875,6 +2879,27 @@ def _tree_file_receipts_excluding_manifest(root: Path) -> list[dict[str, object]
         for item in _tree_file_receipts(root)
         if item["path"] not in {_MANIFEST_NAME, _INFLIGHT_MARKER_NAME}
     ]
+
+
+def read_diagnostic_retained_archive(
+    *, zip_path: Path, output_dir: Path, source_pdf_sha256: str,
+    reader: MinerUMediumArtifactReader | None = None,
+) -> PinnedArtifactReadResult:
+    """Read official retained artifacts without issuing lifecycle authority.
+
+    Only the DB-free commissioning owner uses this boundary. It neither creates
+    a production checkpoint nor acknowledges/deletes a remote task. The caller
+    owns a new private directory and has already verified the retained ZIP hash.
+    """
+    _inspect_zip(zip_path)
+    output_dir.mkdir(mode=0o700)
+    _safe_extract(zip_path, output_dir)
+    admitted = (reader or MinerUMediumArtifactReader()).read_with_location(
+        output_dir, source_pdf_sha256=source_pdf_sha256,
+    )
+    # The caller supplies its independently attested target; this helper returns
+    # only the source-bound admission, not a manufactured parser target.
+    return admitted
 
 
 def _safe_extract(zip_path: Path, output_dir: Path) -> None:

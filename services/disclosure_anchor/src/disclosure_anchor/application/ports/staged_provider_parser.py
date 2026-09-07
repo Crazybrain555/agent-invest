@@ -663,7 +663,7 @@ class PreparedLocalSubmission:
             snapshot_nlink=snapshot_nlink,
             snapshot_mtime_ns=snapshot_mtime_ns,
             snapshot_ctime_ns=snapshot_ctime_ns,
-            upload_filename=f"{identity.source_pdf_sha256[7:]}.pdf",
+            upload_filename=f"sha256_{identity.source_pdf_sha256[7:]}.pdf",
         )
 
     def __post_init__(self) -> None:
@@ -687,7 +687,7 @@ class PreparedLocalSubmission:
                 raise ValueError("submission snapshot facts are invalid")
         if self.snapshot_bytes < 1 or self.snapshot_nlink != 1:
             raise ValueError("submission snapshot identity is unsafe")
-        if self.upload_filename != f"{self.identity.source_pdf_sha256[7:]}.pdf":
+        if self.upload_filename != f"sha256_{self.identity.source_pdf_sha256[7:]}.pdf":
             raise ValueError("submission upload filename drifted")
 
 

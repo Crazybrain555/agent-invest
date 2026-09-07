@@ -1,6 +1,7 @@
 import json
 import unittest
 from unittest.mock import Mock, patch
+from tests._mineru_health_fixture import protocol_health_fields
 
 from disclosure_anchor.adapters.runtime.bounded_http import (
     BoundedHTTPTransportError,
@@ -16,6 +17,7 @@ from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
 
 def _payload(**overrides: object) -> bytes:
     value = {
+        **protocol_health_fields(),
         "status": "healthy",
         "version": "3.4.4",
         "protocol_version": 2,
@@ -70,6 +72,19 @@ class MinerUOrchestratorTests(unittest.TestCase):
             ({"max_pending_tasks_effective": 3}, "task-slot/pending limit drifted"),
             ({"queued_tasks": 14, "processing_tasks": 3}, None),
             ({"extra": 1}, None),
+            ({"task_protocol_schema": "mineru-task-protocol.v1"}, None),
+            ({"task_protocol_runtime": {}}, None),
+            ({"task_protocol_runtime": {
+                **protocol_health_fields()["task_protocol_runtime"],
+                "task_registry_max_records": True,
+            }}, None),
+            ({"task_protocol_runtime": {
+                **protocol_health_fields()["task_protocol_runtime"],
+                "max_unacked_result_bytes": 1024,
+            }}, None),
+            ({"task_protocol_runtime": {
+                **protocol_health_fields()["task_protocol_runtime"], "extra": 1,
+            }}, None),
         )
         for overrides, expected_message in cases:
             with self.subTest(overrides=overrides):

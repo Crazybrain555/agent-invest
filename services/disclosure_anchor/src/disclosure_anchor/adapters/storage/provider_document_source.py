@@ -97,8 +97,9 @@ class ProviderDocumentFileSource:
     ) -> ProviderDocument:
         try:
             bundle_path = self._checked_directory(bundle_relpath)
-            return self._reader.read(
+            return self._reader.read_published(
                 bundle_path,
+                bundle_relpath=bundle_relpath,
                 source_pdf_sha256=source_pdf_sha256,
             )
         except ParserOutputContractError as exc:

@@ -58,6 +58,11 @@ services:
       # Exact-source MinerU 3.4.4 compatibility layer. The derived image
       # refuses an unset/unknown value and the attestor binds the live hook.
       MINERU_MALLOC_TRIM: "1"
+      # Serial process policy: three PDF render workers, one OMP/BLAS thread.
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MINERU_PDF_RENDER_THREADS: "3"
       # Content-free timing is enabled only for controlled capacity trials;
       # the normal runtime stays off and its effective value is attested.
       MINERU_PHASE_TRACE: "0"

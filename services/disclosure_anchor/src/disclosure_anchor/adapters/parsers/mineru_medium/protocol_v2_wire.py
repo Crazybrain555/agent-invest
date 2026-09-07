@@ -22,7 +22,7 @@ from disclosure_anchor.application.ports.parser import ParserOptions
 
 TASK_PROTOCOL_V2 = "mineru-task-protocol.v2"
 RETAINED_RESULT_V1 = "mineru-retained-result.v1"
-STAGED_REQUEST_V1 = "mineru-staged-request.v1"
+STAGED_REQUEST_V2 = "mineru-staged-request.v2"
 TASK_LOOKUP_REQUEST_V1 = "mineru-task-lookup-request.v1"
 MAX_WIRE_JSON_BYTES = 1024 * 1024
 
@@ -71,6 +71,7 @@ TASK_PAYLOAD_FIELDS_V2 = frozenset(
         "status_url",
         "result_url",
         "queued_ahead",
+        "message",
         "task_protocol_schema",
         "idempotency_key",
         "attempt_identity",
@@ -197,14 +198,15 @@ def submission_request_exact_bytes_v2(
         raise MinerUProtocolV2WireError("submission form is not closed")
     if (
         type(upload_filename) is not str
-        or len(upload_filename) != 68
+        or len(upload_filename) != 75
+        or not upload_filename.startswith("sha256_")
         or not upload_filename.endswith(".pdf")
-        or _HEX_64.fullmatch(upload_filename[:-4]) is None
+        or _HEX_64.fullmatch(upload_filename[7:-4]) is None
     ):
         raise MinerUProtocolV2WireError("upload filename is not canonical")
     return _canonical_json(
         {
-            "schema": STAGED_REQUEST_V1,
+            "schema": STAGED_REQUEST_V2,
             "api_origin": origin,
             "form": dict(form),
             "upload_filename": upload_filename,
@@ -396,6 +398,10 @@ def parse_task_payload_v2(
         "attempt_identity": attempt_identity,
         "fence_identity": fence_identity,
     }
+    # MinerU 3.4.4's submission builder adds this informational literal; GET
+    # observations omit it. It carries no status or ownership authority.
+    if "message" in payload and payload["message"] != "Task submitted successfully":
+        raise MinerUProtocolV2WireError("task submission message drifted")
     if any(payload.get(key) != value for key, value in expected.items()):
         raise MinerUProtocolV2WireError("task protocol identity drifted")
     task_id = payload["task_id"]
@@ -635,7 +641,7 @@ __all__ = [
     "MinerUResultLeaseExpiredV2",
     "RETAINED_RESULT_V1",
     "ResultLeaseV2",
-    "STAGED_REQUEST_V1",
+    "STAGED_REQUEST_V2",
     "TASK_LOOKUP_REQUEST_V1",
     "TASK_PAYLOAD_FIELDS_V2",
     "TASK_PROTOCOL_V2",

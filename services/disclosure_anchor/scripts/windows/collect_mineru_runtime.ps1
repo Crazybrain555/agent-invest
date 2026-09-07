@@ -589,6 +589,7 @@ $apiAllowedEnvironment = @(
     "MINERU_API_MAX_PENDING_TASKS",
     "MINERU_API_OUTPUT_ROOT", "MINERU_API_TASK_RETENTION_SECONDS",
     "MINERU_MALLOC_TRIM",
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MINERU_PDF_RENDER_THREADS",
     "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS", "MINERU_HYBRID_BATCH_RATIO",
     "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE"
 )
@@ -608,6 +609,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import urllib.request
 from pathlib import Path
 
 from mineru.utils.model_utils import (
@@ -617,8 +619,6 @@ from mineru.utils.model_utils import (
 )
 from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
 from mineru.cli import agent_task_protocol_v2
-from mineru.cli.agent_task_protocol_v2 import DurableTaskRegistry, SplitTaskExecutor
-from mineru.cli.fast_api import get_max_pending_tasks, get_task_manager
 
 paths = (
     "mineru/cli/api_request.py",
@@ -630,13 +630,34 @@ paths = (
     "mineru_vl_utils/vlm_client/http_client.py",
 )
 root = Path("/usr/local/lib/python3.12/dist-packages")
-task_manager = get_task_manager()
+protocol_source = Path(agent_task_protocol_v2.__file__)
+if protocol_source != root / "mineru/cli/agent_task_protocol_v2.py":
+    raise RuntimeError("task protocol source path drifted")
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open("http://127.0.0.1:8000/health", timeout=10) as response:
+    health_bytes = response.read(65537)
+if len(health_bytes) > 65536:
+    raise RuntimeError("serving API health exceeds bounded envelope")
+serving_health = json.loads(health_bytes)
+runtime = serving_health["task_protocol_runtime"]
+if (
+    serving_health.get("task_protocol_schema") != "mineru-task-protocol.v2"
+    or set(runtime) != {"schema", "enabled", "task_registry_max_records",
+                        "task_result_reservation_bytes", "max_unacked_result_bytes"}
+    or runtime["schema"] != "mineru-task-runtime.v1" or runtime["enabled"] is not True
+    or any(type(runtime[name]) is not int or runtime[name] < 1 for name in (
+        "task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes"
+    ))
+    or type(serving_health.get("max_pending_tasks_effective")) is not int
+):
+    raise RuntimeError("serving API task runtime evidence is invalid")
 marker = json.loads(
     Path("/opt/agent-invest/mineru-serial-v1/compatibility.json")
     .read_text(encoding="utf-8")
 )
 print(json.dumps({
     "marker": marker,
+    "task_protocol_v2_actual_sha256": "sha256:" + hashlib.sha256(protocol_source.read_bytes()).hexdigest(),
     "actual_source_sha256": {
         path: "sha256:" + hashlib.sha256((root / path).read_bytes()).hexdigest()
         for path in paths
@@ -648,17 +669,12 @@ print(json.dumps({
     "phase_trace_enabled": is_phase_trace_enabled(),
     "hybrid_batch_ratio_requested": int(os.environ["MINERU_HYBRID_BATCH_RATIO"]),
     "max_pending_tasks_requested": int(os.environ["MINERU_API_MAX_PENDING_TASKS"]),
-    "max_pending_tasks_effective": get_max_pending_tasks(),
+    "max_pending_tasks_effective": serving_health["max_pending_tasks_effective"],
     "pipeline_inference_locks_enabled": PIPELINE_INFERENCE_LOCKS_ENABLED,
-    "task_protocol_v2_enabled": (
-        isinstance(task_manager.task_protocol_v2, DurableTaskRegistry)
-        and isinstance(task_manager.task_protocol_executor, SplitTaskExecutor)
-    ),
-    "task_registry_max_records": agent_task_protocol_v2._MAX_RECORDS,
-    "task_result_reservation_bytes": (
-        task_manager.task_protocol_executor._result_reservation_bytes
-    ),
-    "max_unacked_result_bytes": task_manager.task_protocol_v2._limit,
+    "task_protocol_v2_enabled": runtime["enabled"],
+    "task_registry_max_records": runtime["task_registry_max_records"],
+    "task_result_reservation_bytes": runtime["task_result_reservation_bytes"],
+    "max_unacked_result_bytes": runtime["max_unacked_result_bytes"],
     "mineru_version": importlib.metadata.version("mineru"),
     "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),
 }, sort_keys=True, separators=(",", ":")))
@@ -734,9 +750,22 @@ if (-not $externalTcpEgressBlocked) {
 
 $machineGuid = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name MachineGuid).MachineGuid
 $nodeIdentity = Get-Sha256Text -Value ([string]$machineGuid).Trim().ToLowerInvariant()
-$outputFiles = @()
-if (Test-Path -LiteralPath $OutputRoot -PathType Container) {
-    $outputFiles = @(Get-ChildItem -LiteralPath $OutputRoot -Recurse -File -Force)
+$outputProbe = @(Invoke-Docker -Arguments @(
+    "exec", "mineru-api", "/usr/bin/python3.12", "-I", "-c",
+    "import json; from pathlib import Path; from mineru.cli.agent_task_protocol_v2 import inspect_quiescent_output_root; print(json.dumps(inspect_quiescent_output_root(Path('/var/lib/mineru-api-output')), sort_keys=True))"
+))
+if ($outputProbe.Count -ne 1) { throw "output inspection must return one witness" }
+$outputState = ([string]$outputProbe[0]) | ConvertFrom-Json
+if ([string]$outputState.quiescence.schema -ne "mineru-output-quiescence.v1") {
+    throw "output quiescence schema drifted"
+}
+$outputHealthAfter = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
+if (
+    [string]$outputHealthAfter.status -ne "healthy" -or
+    $null -eq $outputHealthAfter.queued_tasks -or $null -eq $outputHealthAfter.processing_tasks -or
+    [int]$outputHealthAfter.queued_tasks -ne 0 -or [int]$outputHealthAfter.processing_tasks -ne 0
+) {
+    throw "MinerU API was not idle after output inspection"
 }
 $apiMounts = @($api.Mounts | Select-Object Type,Source,Destination,RW,Propagation)
 $proxyMounts = @($proxy.Mounts | Where-Object { $_.Type -ne "tmpfs" } | Select-Object Type,Source,Destination,RW,Propagation)
@@ -762,8 +791,17 @@ if ($inferenceNetwork.Count -ne 1 -or $runtimeNetwork.Count -ne 1) {
     throw "live MinerU Docker network identities drifted"
 }
 
+$apiEpochAfter = @(Invoke-Docker -Arguments @(
+    "inspect", "--format", "{{.Id}} {{.State.StartedAt}}", "mineru-api"
+))
+if (
+    $apiEpochAfter.Count -ne 1 -or
+    [string]$apiEpochAfter[0] -ne ([string]$api.Id + " " + [string]$api.State.StartedAt)
+) {
+    throw "serving API container epoch changed during collection"
+}
 $result = [ordered]@{
-    schema = "mineru-windows-runtime-observation.v4"
+    schema = "mineru-windows-runtime-observation.v5"
     observed_at_utc = (Get-Date).ToUniversalTime().ToString("o")
     collector_path = $PSCommandPath
     collector_sha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $PSCommandPath).Hash.ToLowerInvariant())"
@@ -787,6 +825,7 @@ $result = [ordered]@{
     api_compatibility = [ordered]@{
         marker = $compatProbe.marker
         actual_source_sha256 = $compatProbe.actual_source_sha256
+        task_protocol_v2_actual_sha256 = [string]$compatProbe.task_protocol_v2_actual_sha256
         capacity_runtime = $compatProbe.capacity_runtime
         heap_trim_enabled = [bool]$compatProbe.heap_trim_enabled
         phase_trace_enabled = [bool]$compatProbe.phase_trace_enabled
@@ -823,8 +862,9 @@ $result = [ordered]@{
         vllm_version = $vllmVersion
     }
     output_root = [ordered]@{
-        path = $OutputRoot; file_count = $outputFiles.Count
-        total_bytes = [long](($outputFiles | Measure-Object -Property Length -Sum).Sum)
+        path = $OutputRoot; file_count = [int]$outputState.file_count
+        total_bytes = [long]$outputState.total_bytes
+        quiescence = $outputState.quiescence
     }
 }
 

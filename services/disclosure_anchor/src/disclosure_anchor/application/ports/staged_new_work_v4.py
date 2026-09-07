@@ -11,6 +11,20 @@ from disclosure_anchor.application.contracts.staged_resource_credit import Resou
 from disclosure_anchor.application.ports.staged_provider_parser import V4StageGuard
 
 
+def validate_admission_document_ids(value: tuple[str, ...] | None) -> None:
+    """Optional commissioning scope, never a filter on durable recovery."""
+    if value is None:
+        return
+    if (
+        type(value) is not tuple or not 1 <= len(value) <= 8
+        or any(type(item) is not str or not 1 <= len(item) <= 64
+               or item != item.strip() or any(ord(char) < 32 for char in item)
+               for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError("commissioning requires 1..8 unique nonempty document IDs")
+
+
 class V4InitialIngressCapacityBlocked(RuntimeError):
     def __init__(
         self, blocked_dimensions: tuple[str, ...], *,

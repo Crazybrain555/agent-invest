@@ -571,6 +571,37 @@ function Wait-Healthy {
     throw "MinerU fixed API did not become healthy before the deadline"
 }
 
+function Get-QuiescentOutputState {
+    param([switch]$CandidateSource)
+    $before = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
+    Assert-IdleHealth -Health $before -Label "output inspection before"
+    if ($CandidateSource) {
+        # The old image may predate protocol-v2. Stream the exact reviewed build
+        # source through stdin, without installing it or constructing a registry.
+        $sourcePath = Join-Path (Split-Path -Parent $CompatPatcherSource) "agent_task_protocol_v2.py"
+        $source = [IO.File]::ReadAllText($sourcePath)
+        $source += "`nprint(json.dumps(inspect_quiescent_output_root(Path('/var/lib/mineru-api-output'), allow_empty=True), sort_keys=True))`n"
+        $probeResult = Invoke-DockerProcess -Arguments @(
+            "exec", "-i", "mineru-api", "/usr/bin/python3.12", "-I", "-"
+        ) -StandardInput $source
+        $output = @(ConvertFrom-NativeProcessText -Value $probeResult.StandardOutput)
+    }
+    else {
+        $output = @(Invoke-Docker -Arguments @(
+            "exec", "mineru-api", "/usr/bin/python3.12", "-I", "-c",
+            "import json; from pathlib import Path; from mineru.cli.agent_task_protocol_v2 import inspect_quiescent_output_root; print(json.dumps(inspect_quiescent_output_root(Path('/var/lib/mineru-api-output')), sort_keys=True))"
+        ))
+    }
+    if ($output.Count -ne 1) { throw "output inspection must return one witness" }
+    $state = ([string]$output[0]) | ConvertFrom-Json
+    if ([string]$state.quiescence.schema -ne "mineru-output-quiescence.v1") {
+        throw "output quiescence schema drifted"
+    }
+    $after = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
+    Assert-IdleHealth -Health $after -Label "output inspection after"
+    return $state
+}
+
 function Get-ValidatedRuntime {
     $healthAndModels = Wait-Healthy
     $health = $healthAndModels[0]
@@ -747,8 +778,7 @@ function Get-ValidatedRuntime {
 
     Assert-ExternalEgressBlocked
 
-    $outputFiles = @(Get-ChildItem -LiteralPath $OutputRoot -Recurse -File -Force)
-    if ($outputFiles.Count -ne 0) { throw "MinerU output root is not empty before commissioning" }
+    $outputState = Get-QuiescentOutputState
 
     return [ordered]@{
         api_health = $health
@@ -759,7 +789,7 @@ function Get-ValidatedRuntime {
         api_networks = $apiNetworks
         proxy_networks = $proxyNetworks
         inference_networks = $inferenceNetworks
-        output_file_count = $outputFiles.Count
+        output_file_count = [int]$outputState.file_count
     }
 }
 
@@ -1003,8 +1033,11 @@ try {
     foreach ($target in @($ComposeTarget, $CollectorTarget, $ReceiptTarget)) {
         Assert-TargetWritable -Path $target
     }
-    if (@(Get-ChildItem -LiteralPath $OutputRoot -Recurse -File -Force).Count -ne 0) {
-        throw "output root must be empty before installation"
+    if ($OldProjectContainers -contains "mineru-api") {
+        Get-QuiescentOutputState -CandidateSource | Out-Null
+    }
+    elseif (@(Get-ChildItem -LiteralPath $OutputRoot -Force).Count -ne 0) {
+        throw "first installation requires a genuinely empty output root"
     }
     if ($ReuseCurrentPublishedImage) {
         $compatImage = Get-ValidatedPublishedApiCompatImage
@@ -1077,7 +1110,7 @@ try {
         throw "formal runtime collector did not return one observation"
     }
     $collectorObservation = ([string]$collectorOutput[0]) | ConvertFrom-Json
-    if ([string]$collectorObservation.schema -ne "mineru-windows-runtime-observation.v4") {
+    if ([string]$collectorObservation.schema -ne "mineru-windows-runtime-observation.v5") {
         throw "formal runtime collector contract drifted"
     }
     Remove-CompatBuildTag

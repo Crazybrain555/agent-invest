@@ -8,8 +8,32 @@ from sqlalchemy.engine import Engine
 from disclosure_anchor.application.ports.staged_new_work_v4 import (
     V4OrdinaryParseCandidate,
     V4OrdinaryParseCandidatePage,
+    validate_admission_document_ids,
 )
 from disclosure_anchor.application.worker.queries import pending_parse
+from disclosure_anchor.application.contracts.staged_resource_credit import (
+    STAGED_RESOURCE_STATE_TRANSITIONS,
+)
+
+
+def require_commissioning_recovery_scope(
+    engine: Engine, document_ids: tuple[str, ...],
+) -> None:
+    """Refuse other owners; never hide them from the complete recovery scan."""
+    validate_admission_document_ids(document_ids)
+    with engine.connect() as connection:
+        outside = connection.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM disclosure_ops.remote_parse_attempt "
+                "WHERE is_current AND checkpoint_contract_version=4 "
+                "AND state=ANY(:resource_states) "
+                "AND NOT (document_id=ANY(:document_ids)))"
+            ),
+            {"resource_states": list(STAGED_RESOURCE_STATE_TRANSITIONS),
+             "document_ids": list(document_ids)},
+        ).scalar_one()
+    if outside:
+        raise RuntimeError("unresolved V4 owner is outside commissioning scope")
 
 
 class PostgresV4OrdinaryParseCandidateSource:
@@ -19,6 +43,7 @@ class PostgresV4OrdinaryParseCandidateSource:
         engine: Engine,
         max_retries: int,
         scope_classes: tuple[str, ...] | None,
+        admission_document_ids: tuple[str, ...] | None = None,
     ) -> None:
         if not isinstance(engine, Engine):
             raise ValueError("V4 candidate source requires a SQLAlchemy engine")
@@ -27,6 +52,8 @@ class PostgresV4OrdinaryParseCandidateSource:
         self._engine = engine
         self._max_retries = max_retries
         self._scope_classes = scope_classes
+        validate_admission_document_ids(admission_document_ids)
+        self._admission_document_ids = admission_document_ids
 
     def list_candidates(
         self,
@@ -44,6 +71,7 @@ class PostgresV4OrdinaryParseCandidateSource:
                 scope_classes=self._scope_classes,
                 require_active_company_scope=True,
                 after_document_id=after_document_id,
+                document_ids=self._admission_document_ids,
             )
             visible = rows[:limit]
             if not visible:
@@ -90,4 +118,4 @@ class PostgresV4OrdinaryParseCandidateSource:
         )
 
 
-__all__ = ["PostgresV4OrdinaryParseCandidateSource"]
+__all__ = ["PostgresV4OrdinaryParseCandidateSource", "require_commissioning_recovery_scope"]

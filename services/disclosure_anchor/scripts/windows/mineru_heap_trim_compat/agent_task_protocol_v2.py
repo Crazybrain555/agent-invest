@@ -946,6 +946,12 @@ class DurableTaskRegistry:
         finally:
             os.close(descriptor)
 
+        return self._decode_registry(raw)
+
+    def _decode_registry(
+        self, raw: bytes, *, require_quiescent: bool = False
+    ) -> dict[str, DurableTaskRecord]:
+        """Decode without repair when used by a read-only commissioning probe."""
         def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             value: dict[str, Any] = {}
             for key, item in pairs:
@@ -976,6 +982,13 @@ class DurableTaskRegistry:
             "uid": self._output_root_identity[2],
             "mode": self._output_root_identity[3],
         }
+        if require_quiescent and (
+            not isinstance(payload.get("output_root"), dict)
+            or any(type(payload["output_root"].get(key)) is not int
+                   for key in ("device", "inode", "uid", "mode"))
+            or json.dumps(payload, sort_keys=True, separators=(",", ":")).encode() != raw
+        ):
+            raise TaskProtocolConflict("quiescent registry is not canonical")
         if payload.get("output_root") != expected_root:
             raise TaskProtocolConflict("configured output root identity drifted")
         watermark = payload.get("submission_watermark_bucket")
@@ -992,6 +1005,18 @@ class DurableTaskRegistry:
         task_ids = set()
         for item in records:
             record = DurableTaskRecord(**item)
+            if require_quiescent and (
+                record.state != "consumed"
+                or record.active_readers != 0
+                or record.reserved_result_bytes != 0
+                or record.consumed_at_unix is None
+                or record.consumed_at_unix < 0
+                or any(value is not None for value in (
+                    record.result_path, record.task_payload, record.lease_until_unix,
+                    record.error, record.cleanup_kind,
+                ))
+            ):
+                raise TaskProtocolConflict("output registry still owns task resources")
             if record.idempotency_key in loaded or record.task_id in task_ids:
                 raise TaskProtocolConflict("task registry identities are not unique")
             if record.state not in {
@@ -1007,7 +1032,8 @@ class DurableTaskRegistry:
             loaded[record.idempotency_key] = record
             task_ids.add(record.task_id)
         for record in loaded.values():
-            record.active_readers = 0
+            if not require_quiescent:
+                record.active_readers = 0
             if record.state in {"completed", "cleanup_pending", "consumed"} and record.result_path:
                 result_path = Path(record.result_path or "")
                 try:
@@ -1084,6 +1110,128 @@ class DurableTaskRegistry:
             temporary.unlink(missing_ok=True)
 
 
+def inspect_quiescent_output_root(
+    root: Path, *, allow_empty: bool = False
+) -> dict[str, Any]:
+    """Read-only point-in-time proof under operator writer exclusion, not a lock.
+
+    Preserve physical inventory and consumed tombstones. Pin/recheck ancestors,
+    both directories and registry; never repair, delete, or recursively scan.
+    """
+    if not root.is_absolute() or ".." in root.parts:
+        raise TaskProtocolConflict("output root must be an absolute canonical path")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    opened: list[int] = []
+    edges: list[tuple[int, str, int]] = []
+
+    def identity(value: os.stat_result) -> tuple[int, ...]:
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+    def entries(descriptor: int) -> set[str]:
+        result: set[str] = set()
+        with os.scandir(descriptor) as iterator:
+            for entry in iterator:
+                result.add(entry.name)
+                if len(result) > 1:
+                    raise TaskProtocolConflict("output directory has unexpected entries")
+        return result
+
+    try:
+        current = os.open("/", directory_flags)
+        opened.append(current)
+        for component in root.parts[1:]:
+            child = os.open(component, directory_flags, dir_fd=current)
+            opened.append(child)
+            edges.append((current, component, child))
+            current = child
+        root_fd = current
+        root_meta = os.fstat(root_fd)
+        if root_meta.st_uid != os.getuid():
+            raise TaskProtocolConflict("output root owner drifted")
+        root_identity = {
+            "path": str(root), "device": root_meta.st_dev, "inode": root_meta.st_ino,
+            "uid": root_meta.st_uid, "mode": root_meta.st_mode,
+        }
+        root_entries = entries(root_fd)
+        control = ".agent-task-protocol-v2"
+        proof: dict[str, Any] = {
+            "schema": "mineru-output-quiescence.v1", "root_identity": root_identity,
+            "registry_sha256": None, "record_count": 0,
+            "submission_watermark_bucket": None,
+        }
+        file_count = total_bytes = 0
+        pinned: list[tuple[int, tuple[int, ...]]] = [(root_fd, identity(root_meta))]
+        if not root_entries:
+            if not allow_empty:
+                raise TaskProtocolConflict("commissioned task registry is absent")
+        else:
+            if root_entries != {control}:
+                raise TaskProtocolConflict("output root has unknown or retained task entries")
+            control_fd = os.open(control, directory_flags, dir_fd=root_fd)
+            opened.append(control_fd)
+            edges.append((root_fd, control, control_fd))
+            control_meta = os.fstat(control_fd)
+            if control_meta.st_uid != os.getuid() or entries(control_fd) != {"registry.json"}:
+                raise TaskProtocolConflict("task control directory is not quiescent")
+            pinned.append((control_fd, identity(control_meta)))
+            descriptor = os.open(
+                "registry.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=control_fd,
+            )
+            opened.append(descriptor)
+            edges.append((control_fd, "registry.json", descriptor))
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600
+                or not 0 < metadata.st_size <= _MAX_REGISTRY_BYTES
+            ):
+                raise TaskProtocolConflict("task registry file identity is unsafe")
+            pinned.append((descriptor, identity(metadata)))
+            chunks: list[bytes] = []
+            remaining = metadata.st_size + 1
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) != metadata.st_size:
+                raise TaskProtocolConflict("task registry changed while reading")
+            reader = object.__new__(DurableTaskRegistry)
+            reader._output_root = root
+            reader._output_root_identity = (
+                root_meta.st_dev, root_meta.st_ino, root_meta.st_uid, root_meta.st_mode
+            )
+            records = reader._decode_registry(raw, require_quiescent=True)
+            proof.update(
+                registry_sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+                record_count=len(records),
+                submission_watermark_bucket=reader._submission_watermark_bucket,
+            )
+            file_count, total_bytes = 1, len(raw)
+            if entries(control_fd) != {"registry.json"}:
+                raise TaskProtocolConflict("task control inventory changed")
+        if entries(root_fd) != root_entries:
+            raise TaskProtocolConflict("output inventory changed")
+        for descriptor, before in pinned:
+            if identity(os.fstat(descriptor)) != before:
+                raise TaskProtocolConflict("output evidence changed during inspection")
+        for parent, name, descriptor in edges:
+            linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            held = os.fstat(descriptor)
+            if (linked.st_dev, linked.st_ino, linked.st_mode, linked.st_uid) != (
+                held.st_dev, held.st_ino, held.st_mode, held.st_uid
+            ):
+                raise TaskProtocolConflict("output evidence path was replaced")
+        return {"file_count": file_count, "total_bytes": total_bytes, "quiescence": proof}
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+
+
 class SplitTaskExecutor:
     """Separate parse and finalizer credits with explicit state transitions."""
 
@@ -1139,6 +1287,22 @@ class SplitTaskExecutor:
             raise
 
 
+def task_protocol_runtime_status(
+    registry: DurableTaskRegistry, executor: SplitTaskExecutor
+) -> dict[str, Any]:
+    """Content-free facts from the serving process's initialized objects."""
+    if not isinstance(registry, DurableTaskRegistry) or not isinstance(executor, SplitTaskExecutor):
+        raise TaskProtocolConflict("task protocol runtime is not initialized")
+    limits = {
+        "task_registry_max_records": _MAX_RECORDS,
+        "task_result_reservation_bytes": executor._result_reservation_bytes,
+        "max_unacked_result_bytes": registry._limit,
+    }
+    if any(type(value) is not int or value < 1 for value in limits.values()):
+        raise TaskProtocolConflict("task protocol runtime limits are invalid")
+    return {"schema": "mineru-task-runtime.v1", "enabled": True, **limits}
+
+
 def evict_consumed_routes(
     registry: DurableTaskRegistry,
     tasks: dict[str, Any],
@@ -1161,4 +1325,6 @@ __all__ = [
     "SplitTaskExecutor",
     "TaskProtocolConflict",
     "evict_consumed_routes",
+    "inspect_quiescent_output_root",
+    "task_protocol_runtime_status",
 ]

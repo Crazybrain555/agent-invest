@@ -1152,6 +1152,7 @@ class MinerUHttpStagedParserTests(unittest.TestCase):
                         "task_id": "task-1",
                         "status_url": "/tasks/task-1",
                         "result_url": result_url,
+                        "message": "Task submitted successfully",
                         "task_protocol_schema": "mineru-task-protocol.v2",
                         "idempotency_key": idempotency_key,
                         "attempt_identity": "attempt-1",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -19,6 +20,17 @@ from disclosure_anchor.adapters.parsers.mineru_medium import (
 from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import (
     PinnedArtifactTree,
 )
+from disclosure_anchor.application.contracts.local_materialization_manifest_v4 import (
+    LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
+    LocalMaterializationManifestV4,
+    LocalMaterializationObservationsV4,
+    LocalMaterializationPayloadFileV4,
+)
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    PROVIDER_DOCUMENT_FILENAME,
+    provider_document_envelope_to_bytes,
+)
+from tests.unit.test_provider_document_admission import _envelope
 from disclosure_anchor.domain.errors import (
     ParserOutputContractError,
 )
@@ -30,6 +42,128 @@ _STEM = f"sha256_{_SOURCE_HEX}"
 
 
 class MinerUMediumArtifactReaderTest(unittest.TestCase):
+    def test_published_v4_replay_preserves_full_projection_and_legacy_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_v4_source_bundle(root)
+            reader = MinerUMediumArtifactReader()
+            before = reader.read(root, source_pdf_sha256=_SOURCE_SHA)
+            legacy = reader.read_published(root, bundle_relpath=Path("legacy"), source_pdf_sha256=_SOURCE_SHA)
+            self.assertEqual(legacy, before)
+            self.assertIn("notes.bin", [f.relative_path for f in legacy.artifacts])
+            envelope, _manifest = _seal_published_bundle(root)
+            self.assertNotEqual(reader.read(root, source_pdf_sha256=_SOURCE_SHA), before)
+            self.assertEqual(reader.read_published(
+                root, bundle_relpath=Path(envelope.parser_artifact_root_relpath),
+                source_pdf_sha256=_SOURCE_SHA,
+            ), before)
+            self.assertEqual(before, envelope.provider_document)
+
+    def test_published_v4_rejects_incomplete_tampered_or_aliased_tree(self) -> None:
+        for failure in ("extra", "missing", "tamper", "no_manifest", "no_envelope",
+                        "bad_manifest", "bad_envelope", "marker", "alias", "link"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_v4_source_bundle(root)
+                envelope, _manifest = _seal_published_bundle(root)
+                manifest_path = root / LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME
+                envelope_path = root / PROVIDER_DOCUMENT_FILENAME
+                if failure == "extra":
+                    (root / "unexpected.bin").write_bytes(b"extra")
+                elif failure == "missing":
+                    (root / "notes.bin").unlink()
+                elif failure == "tamper":
+                    (root / "notes.bin").write_bytes(b"tampered")
+                elif failure == "no_manifest":
+                    manifest_path.unlink()
+                elif failure == "no_envelope":
+                    envelope_path.unlink()
+                elif failure == "bad_manifest":
+                    manifest_path.write_bytes(b"{}")
+                elif failure == "bad_envelope":
+                    # Reseal the file triple: structural validation, not just hash mismatch.
+                    envelope_path.write_bytes(b"{}")
+                    _reseal_envelope_triple(root, _manifest)
+                elif failure == "marker":
+                    (root / ".agent-materialization-inflight.v4.json").write_bytes(b"{}")
+                elif failure == "alias":
+                    manifest_path.rename(root / LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME.upper())
+                elif failure == "link":
+                    (root / "notes.bin").unlink()
+                    (root / "notes.bin").symlink_to(root / PROVIDER_DOCUMENT_FILENAME)
+                with self.assertRaises(ParserOutputContractError):
+                    MinerUMediumArtifactReader().read_published(
+                        root, bundle_relpath=Path(envelope.parser_artifact_root_relpath),
+                        source_pdf_sha256=_SOURCE_SHA,
+                    )
+
+    def test_published_v4_cross_binds_identity_and_reparses_semantics(self) -> None:
+        for failure in ("document", "run", "source", "pages", "target", "requested_path",
+                        "requested_source", "projection", "control_as_payload"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_v4_source_bundle(root)
+                envelope, manifest = _seal_published_bundle(root)
+                changes = {
+                    "document": {"document_id": "doc-other"},
+                    "run": {"processing_run_id": "run-other"},
+                    "source": {"source_pdf_sha256": "sha256:" + "b" * 64},
+                    "pages": {"source_page_count": 3},
+                    "target": {"parser_target_sha256": "sha256:" + "b" * 64},
+                }
+                bundle_relpath = Path(envelope.parser_artifact_root_relpath)
+                source_sha = _SOURCE_SHA
+                if failure in changes:
+                    manifest = replace(manifest, **changes[failure])
+                    (root / LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME).write_bytes(manifest.canonical_bytes)
+                elif failure == "requested_path":
+                    bundle_relpath = Path("parser_artifacts/other")
+                elif failure == "requested_source":
+                    source_sha = "sha256:" + "b" * 64
+                elif failure == "projection":
+                    changed = replace(envelope, provider_document=replace(envelope.provider_document, ocr_enabled=True))
+                    (root / PROVIDER_DOCUMENT_FILENAME).write_bytes(provider_document_envelope_to_bytes(changed))
+                    _reseal_envelope_triple(root, manifest)
+                elif failure == "control_as_payload":
+                    name = "nested/" + PROVIDER_DOCUMENT_FILENAME
+                    (root / "nested").mkdir()
+                    payload = b"{}"
+                    (root / name).write_bytes(payload)
+                    files = tuple(sorted((*manifest.payload_files, LocalMaterializationPayloadFileV4(
+                        "parser_artifact", name, _digest(payload), len(payload),
+                    )), key=lambda item: item.relpath))
+                    manifest = replace(manifest, payload_files=files, observations=replace(manifest.observations,
+                        output_file_count=len(files), output_byte_count=sum(f.byte_count for f in files)))
+                    (root / LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME).write_bytes(manifest.canonical_bytes)
+                with self.assertRaises(ParserOutputContractError):
+                    MinerUMediumArtifactReader().read_published(
+                        root, bundle_relpath=bundle_relpath, source_pdf_sha256=source_sha,
+                    )
+
+    def test_published_v4_keeps_complete_pin_through_semantic_replay(self) -> None:
+        for mutation in ("manifest", "root"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                root = base / "published"
+                root.mkdir()
+                _write_v4_source_bundle(root)
+                envelope, _manifest = _seal_published_bundle(root)
+                reader = MinerUMediumArtifactReader()
+                original = reader._read_pinned
+
+                def change_after_verification(*args: Any, **kwargs: Any) -> Any:
+                    if mutation == "manifest":
+                        (root / LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME).write_bytes(b"{}")
+                    else:
+                        root.rename(base / "retained")
+                        root.mkdir()
+                    return original(*args, **kwargs)
+
+                with mock.patch.object(reader, "_read_pinned", side_effect=change_after_verification):
+                    with self.assertRaises(ParserOutputContractError):
+                        reader.read_published(root, bundle_relpath=Path(envelope.parser_artifact_root_relpath),
+                                              source_pdf_sha256=_SOURCE_SHA)
+
     def test_reads_primary_blocks_and_page_local_table_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -613,6 +747,56 @@ class MinerUMediumArtifactReaderTest(unittest.TestCase):
                 PurePosixPath("nested/mineru"),
             )
             self.assertEqual(len(result.document.pages), 2)
+
+
+def _digest(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _write_v4_source_bundle(root: Path) -> None:
+    _write_bundle(root)
+    for path in (root / "images/owner.jpg", root / "images/continuation.jpg"):
+        path.write_bytes(b"\xff\xd8\xff" + path.read_bytes())
+
+
+def _seal_published_bundle(root: Path) -> tuple[Any, LocalMaterializationManifestV4]:
+    document = MinerUMediumArtifactReader().read(root, source_pdf_sha256=_SOURCE_SHA)
+    envelope = replace(_envelope(), provider_document=document, source_pdf_page_count=len(document.pages))
+    exact = provider_document_envelope_to_bytes(envelope)
+    (root / PROVIDER_DOCUMENT_FILENAME).write_bytes(exact)
+    files = tuple(sorted((
+        *(LocalMaterializationPayloadFileV4("parser_artifact", f.relative_path, f.sha256, f.size_bytes)
+          for f in document.artifacts),
+        LocalMaterializationPayloadFileV4("provider_envelope", PROVIDER_DOCUMENT_FILENAME, _digest(exact), len(exact)),
+    ), key=lambda f: f.relpath))
+    byte_count = sum(f.byte_count for f in files)
+    manifest = LocalMaterializationManifestV4(
+        attempt_id="attempt-test", fence_identity="fence-test", document_id=envelope.document_id,
+        processing_run_id=envelope.artifact_owner_processing_run_id,
+        materialization_intent_sha256=_SOURCE_SHA, terminal_receipt_sha256=_SOURCE_SHA,
+        remote_task_identity="remote-test", artifact_owner_identity="owner-test",
+        artifact_sha256=_SOURCE_SHA, artifact_byte_count=1, source_pdf_sha256=_SOURCE_SHA,
+        source_page_count=len(document.pages),
+        parser_target_sha256=_digest(json.dumps(envelope.parser_target_identity.to_payload(),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()),
+        spool_relpath="retired/source.zip", output_relpath="retired/output",
+        provider_envelope_relpath=PROVIDER_DOCUMENT_FILENAME, provider_envelope_sha256=_digest(exact),
+        provider_envelope_byte_count=len(exact),
+        observations=LocalMaterializationObservationsV4(len(files), byte_count, byte_count, byte_count, len(files), byte_count),
+        payload_files=files,
+    )
+    (root / LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME).write_bytes(manifest.canonical_bytes)
+    return envelope, manifest
+
+
+def _reseal_envelope_triple(root: Path, manifest: LocalMaterializationManifestV4) -> None:
+    exact = (root / PROVIDER_DOCUMENT_FILENAME).read_bytes()
+    files = tuple(replace(f, sha256=_digest(exact), byte_count=len(exact)) if f.role == "provider_envelope" else f
+                  for f in manifest.payload_files)
+    updated = replace(manifest, payload_files=files, provider_envelope_sha256=_digest(exact),
+        provider_envelope_byte_count=len(exact), observations=replace(manifest.observations,
+            output_byte_count=sum(f.byte_count for f in files)))
+    (root / LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME).write_bytes(updated.canonical_bytes)
 
 
 def _write_bundle(

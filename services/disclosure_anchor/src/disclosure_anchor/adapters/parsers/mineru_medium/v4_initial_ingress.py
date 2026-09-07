@@ -250,7 +250,7 @@ class MinerUV4InitialIngressFactory:
         request_exact = submission_request_exact_bytes_v2(
             api_origin=api_origin,
             form=submission_form_v2(self._parser_options, server_url=server_url),
-            upload_filename=f"{observed.sha256[7:]}.pdf",
+            upload_filename=f"sha256_{observed.sha256[7:]}.pdf",
         )
         spec = V4PreparedExecutionSpec(
             contract_version=V4_PREPARED_EXECUTION_SPEC_CONTRACT,

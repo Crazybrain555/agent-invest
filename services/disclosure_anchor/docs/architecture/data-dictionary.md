@@ -99,7 +99,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/完整直接主题 routes/section routes/quality/applicability，structure 绑定 kind/path/order。locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核；旧快照兼容 lead 只从 `semantic_keys[0]` 派生，不是现行 DB 列 |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL；只列化当前叶标题自有 selector，或第一个实质/视觉 part 之前 declaration-only leading part 的受控成对勾选。普通 paragraph 不因整句匹配变成标题或 prompt role；实质、visual/table carrier 之后以及嵌套 child 的 selector 不提升为整个 Unit 状态；不跨 Unit 继承（见 §5 讨论） |
-| page_no | 定位列（artifact_locator 首页码） |
+| page_no | Unit 本身首个 source block 的页码；完整 locator 的祖先标题证据可能在更早页 |
 | artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v9`：保留 v8 的 ProviderDocument hash、source heading block + payload ordinal、parts、逻辑表 owner/physical segment、evidence/search bindings、`continuation_fragments`、native-PDF reconciliation 与 quality findings，不凭普通 paragraph 的整句词面发明标题；只新增 finding-only 的完整 token omission、截断后仍至少两位的单数字末位截断和 cell-scoped 畸形数字分组证据，不改 payload。历史 v1-v8 继续按各自 vocabulary 只读；v7 可解码其历史 `statutory_template` placement，v8/v9 不发出，v8 也不得声明 v9 quality kind；v1-v3 不得声明 v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；上一页表尾 exact `page_footnote` 只可作为 physical boundary，下一页 leading footnote 仍阻断；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
 
 ### classification_rule（0016，词表的库内查询副本）

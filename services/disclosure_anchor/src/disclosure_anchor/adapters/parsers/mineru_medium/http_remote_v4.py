@@ -112,9 +112,11 @@ class MinerUHttpRemoteV4:
         token_factory: Callable[[int], bytes] = os.urandom,
         wall_clock: Callable[[], float] = time.time,
         request_timeout_seconds: float,
+        allow_task_submission: bool = True,
     ) -> None:
         if (
-            not callable(token_factory)
+            type(allow_task_submission) is not bool
+            or not callable(token_factory)
             or not callable(wall_clock)
             or isinstance(request_timeout_seconds, bool)
             or not isinstance(request_timeout_seconds, (int, float))
@@ -125,6 +127,7 @@ class MinerUHttpRemoteV4:
         self._token_factory = token_factory
         self._wall_clock = wall_clock
         self._request_timeout_seconds = float(request_timeout_seconds)
+        self._allow_task_submission = allow_task_submission
         self._client = httpx.Client(
             timeout=httpx.Timeout(self._request_timeout_seconds),
             follow_redirects=False,
@@ -149,6 +152,8 @@ class MinerUHttpRemoteV4:
     def reconcile_or_submit(
         self, command: RemoteSubmissionCommandV4
     ) -> AcceptedProviderSubmissionV4:
+        if not self._allow_task_submission:
+            raise RemoteProviderProtocolErrorV4("recovery-only transport forbids task submission")
         self._validate_submission_command(command)
         parser_timeout_seconds = cast(int, command.parser_options.timeout_seconds)
         token = self._new_capability_token()
@@ -538,6 +543,7 @@ class MinerUHttpRemoteV4:
         request = self._client.build_request(
             "GET",
             accepted_submission.result_url,
+            headers={"Accept-Encoding": "identity"},
             timeout=httpx.Timeout(timeout),
         )
         response: httpx.Response | None = None
@@ -562,6 +568,7 @@ class MinerUHttpRemoteV4:
                 or response.headers.get("X-MinerU-Result-Owner") != expected_owner
                 or response.headers.get("Content-Type", "").split(";", 1)[0].strip()
                 != "application/zip"
+                or response.headers.get("Content-Encoding", "identity") != "identity"
             ):
                 raise RemoteProviderProtocolErrorV4(
                     "MinerU V4 result headers drifted from terminal evidence"

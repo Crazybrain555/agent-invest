@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import yaml
+from tests._mineru_health_fixture import protocol_health_fields
 
 from scripts.attest_mineru_remote_runtime import (
     API_ENV_KEYS,
@@ -51,6 +52,7 @@ def _observation() -> dict[str, Any]:
     api_environment = [
         "MINERU_MODEL_SOURCE=local",
         "MINERU_MALLOC_TRIM=1",
+        "OMP_NUM_THREADS=1", "MKL_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1", "MINERU_PDF_RENDER_THREADS=3",
         "MINERU_PHASE_TRACE=0",
         "MINERU_HYBRID_BATCH_RATIO=1",
         "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS=1",
@@ -67,7 +69,7 @@ def _observation() -> dict[str, Any]:
         item.partition("=")[0]: item.partition("=")[2] for item in api_environment
     }
     return {
-        "schema": "mineru-windows-runtime-observation.v4",
+        "schema": "mineru-windows-runtime-observation.v5",
         "collector_path": EXPECTED_COLLECTOR_PATH,
         "collector_sha256": "sha256:" + "7" * 64,
         "compose_path": r"C:\ProgramData\compose.tailnet.yaml",
@@ -116,6 +118,7 @@ def _observation() -> dict[str, Any]:
             "external_tcp_egress_blocked": True,
         },
         "api_compatibility": {
+            "task_protocol_v2_actual_sha256": TASK_PROTOCOL_DIGEST,
             "marker": {
                 "schema": "mineru-runtime-compatibility.v5",
                 "policy": "glibc-malloc-trim-per-window.v1",
@@ -225,6 +228,7 @@ def _observation() -> dict[str, Any]:
             "health_state": "healthy",
         },
         "api_health": {
+            **protocol_health_fields(),
             "status": "healthy",
             "version": "3.4.4",
             "protocol_version": 2,
@@ -252,8 +256,16 @@ def _observation() -> dict[str, Any]:
         },
         "output_root": {
             "path": r"C:\ProgramData\agent-invest\mineru-api-output",
-            "file_count": 0,
-            "total_bytes": 0,
+            "file_count": 1,
+            "total_bytes": 194,
+            "quiescence": {
+                "schema": "mineru-output-quiescence.v1",
+                "root_identity": {"path": "/var/lib/mineru-api-output", "device": 1,
+                                  "inode": 2, "uid": 0, "mode": 16832},
+                "registry_sha256": "sha256:" + "f" * 64,
+                "record_count": 0,
+                "submission_watermark_bucket": -1,
+            },
         },
     }
 
@@ -301,6 +313,7 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             compatibility_fields,
             {
                 "actual_source_sha256",
+                "task_protocol_v2_actual_sha256",
                 "capacity_runtime",
                 "heap_trim_enabled",
                 "hybrid_batch_ratio_requested",
@@ -348,6 +361,8 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
 
     def test_build_manifest_binds_live_remote_observation(self) -> None:
         observation = _observation()
+        observation["output_root"]["quiescence"]["record_count"] = 5
+        observation["output_root"]["quiescence"]["submission_watermark_bucket"] = 42
         with (
             patch(
                 "scripts.attest_mineru_remote_runtime.client_bundle_identity",
@@ -407,10 +422,20 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             "registry_capacity_drift",
             "result_reservation_drift",
             "unacked_bytes_drift",
+            "old_observation", "missing_quiescence", "boolean_inventory",
+            "boolean_records", "quiescence_hash", "quiescence_root",
+            "actual_protocol_bytes",
+            "omp_threads", "render_threads", "missing_threads",
         ):
             with self.subTest(tamper=tamper):
                 observation = _observation()
-                if tamper == "network":
+                if tamper == "omp_threads":
+                    observation["api"]["environment"]["OMP_NUM_THREADS"] = "2"
+                elif tamper == "render_threads":
+                    observation["api"]["environment"]["MINERU_PDF_RENDER_THREADS"] = "4"
+                elif tamper == "missing_threads":
+                    del observation["api"]["environment"]["MKL_NUM_THREADS"]
+                elif tamper == "network":
                     observation["proxy"]["networks"] = ["public"]
                 elif tamper == "busy":
                     observation["api_health"]["processing_tasks"] = 1
@@ -419,7 +444,21 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
                 elif tamper == "mount":
                     observation["api"]["mounts"][0]["Source"] = r"C:\temp"
                 elif tamper == "output":
-                    observation["output_root"]["file_count"] = 1
+                    observation["output_root"]["file_count"] = 2
+                elif tamper == "old_observation":
+                    observation["schema"] = "mineru-windows-runtime-observation.v4"
+                elif tamper == "missing_quiescence":
+                    del observation["output_root"]["quiescence"]
+                elif tamper == "boolean_inventory":
+                    observation["output_root"]["file_count"] = True
+                elif tamper == "boolean_records":
+                    observation["output_root"]["quiescence"]["record_count"] = False
+                elif tamper == "quiescence_hash":
+                    observation["output_root"]["quiescence"]["registry_sha256"] = "unknown"
+                elif tamper == "quiescence_root":
+                    observation["output_root"]["quiescence"]["root_identity"]["uid"] = False
+                elif tamper == "actual_protocol_bytes":
+                    observation["api_compatibility"]["task_protocol_v2_actual_sha256"] = "sha256:" + "e" * 64
                 elif tamper == "collector":
                     observation["collector_path"] = r"C:\temp\collector.ps1"
                 elif tamper == "model":

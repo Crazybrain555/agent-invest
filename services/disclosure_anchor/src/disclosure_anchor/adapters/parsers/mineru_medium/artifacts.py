@@ -26,6 +26,14 @@ from disclosure_anchor.application.contracts.provider_document import (
     provider_artifact_bundle_sha256,
     provider_payload_field_contract,
 )
+from disclosure_anchor.application.contracts.local_materialization_manifest_v4 import (
+    LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
+    decode_local_materialization_manifest_v4,
+)
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    PROVIDER_DOCUMENT_FILENAME,
+    provider_document_envelope_from_bytes,
+)
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
 
@@ -1301,6 +1309,86 @@ class MinerUMediumArtifactReader:
     def read_pinned(
         self, tree: PinnedArtifactTree, *, source_pdf_sha256: str
     ) -> PinnedArtifactReadResult:
+        return self._read_pinned(
+            tree, source_pdf_sha256=source_pdf_sha256, parser_files=tree.files
+        )
+
+    def read_published(
+        self, output_dir: Path, *, bundle_relpath: Path, source_pdf_sha256: str
+    ) -> ProviderDocument:
+        """Replay a published tree, verifying V4 management evidence before filtering.
+
+        This proves source projection only, not ownership, promotion or readiness.
+        The outer admission still binds its authoritative frozen envelope.
+        """
+        with PinnedArtifactTree.open_path(output_dir) as tree:
+            controls = {
+                LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME.casefold(),
+                PROVIDER_DOCUMENT_FILENAME.casefold(),
+                ".agent-materialization-inflight.v1.json",
+                ".agent-materialization-inflight.v4.json",
+            }
+            if not any(f.relative_path.name.casefold() in controls for f in tree.files):
+                return self.read_pinned(tree, source_pdf_sha256=source_pdf_sha256).document
+            try:
+                manifest = decode_local_materialization_manifest_v4(tree.read_bytes(
+                    PurePosixPath(LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME),
+                    max_bytes=1024 * 1024,
+                ))
+                expected = {
+                    item.relpath: (item.sha256, item.byte_count)
+                    for item in manifest.payload_files
+                }
+                actual = {
+                    item.relative_path.as_posix(): (item.sha256, item.size_bytes)
+                    for item in tree.files
+                    if item.relative_path.as_posix() != LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME
+                }
+                if actual != expected:
+                    raise ValueError("V4 published payload inventory differs from manifest")
+                parser_paths = {
+                    item.relpath for item in manifest.payload_files
+                    if item.role == "parser_artifact"
+                }
+                if any(PurePosixPath(path).name.casefold() in controls for path in parser_paths):
+                    raise ValueError("V4 management file cannot be parser payload")
+                envelope = provider_document_envelope_from_bytes(tree.read_bytes(
+                    PurePosixPath(manifest.provider_envelope_relpath),
+                    max_bytes=manifest.provider_envelope_byte_count,
+                ))
+                target_sha256 = _sha256(json.dumps(
+                    envelope.parser_target_identity.to_payload(), ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8"))
+                if (
+                    manifest.document_id != envelope.document_id
+                    or manifest.processing_run_id != envelope.artifact_owner_processing_run_id
+                    or manifest.source_pdf_sha256 != source_pdf_sha256
+                    or manifest.source_pdf_sha256 != envelope.input_raw_file_hash
+                    or manifest.source_page_count != envelope.source_pdf_page_count
+                    or manifest.parser_target_sha256 != target_sha256
+                    or bundle_relpath.as_posix() != envelope.parser_artifact_root_relpath
+                ):
+                    raise ValueError("V4 published manifest/envelope identity differs")
+                parser_files = tuple(f for f in tree.files if f.relative_path.as_posix() in parser_paths)
+                if tuple((f.relative_path.as_posix(), f.sha256, f.size_bytes) for f in parser_files) != tuple(
+                    (f.relative_path, f.sha256, f.size_bytes) for f in envelope.provider_document.artifacts
+                ):
+                    raise ValueError("V4 parser inventory differs from envelope")
+            except ValueError as exc:
+                raise ParserOutputContractError(str(exc)) from exc
+            rebuilt = self._read_pinned(
+                tree, source_pdf_sha256=source_pdf_sha256, parser_files=parser_files
+            )
+            if rebuilt.artifact_root_relpath != PurePosixPath(".") or rebuilt.document != envelope.provider_document:
+                raise ParserOutputContractError("V4 published provider projection differs from source")
+            tree.verify_unchanged()
+            return rebuilt.document
+
+    def _read_pinned(
+        self, tree: PinnedArtifactTree, *, source_pdf_sha256: str,
+        parser_files: tuple[PinnedArtifactFile, ...],
+    ) -> PinnedArtifactReadResult:
         if not _SHA256_RE.fullmatch(source_pdf_sha256):
             raise ParserOutputContractError("source PDF sha256 must be canonical")
         content_file = _locate_content_list_pinned(tree)
@@ -1325,7 +1413,7 @@ class MinerUMediumArtifactReader:
 
         tree_files = tuple(
             file
-            for file in tree.files
+            for file in parser_files
             if _relative_to_or_none(file.relative_path, artifact_root) is not None
         )
         relative_roles = _artifact_roles_pinned(

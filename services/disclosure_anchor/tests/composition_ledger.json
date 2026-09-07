@@ -107,8 +107,11 @@
    "tests": 14
   },
   "tests/integration/test_staged_v4_end_to_end.py": {
-   "private_imports": [],
-   "tests": 4
+   "private_imports": [
+    "_documents",
+    "_unit_page_numbers"
+   ],
+   "tests": 7
   },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [],
@@ -136,7 +139,7 @@
   },
   "tests/unit/test_atomic_document_publication_v4.py": {
    "private_imports": [],
-   "tests": 17
+   "tests": 18
   },
   "tests/unit/test_atomic_publication_artifact_readiness_adapter_v4.py": {
    "private_imports": [],
@@ -148,7 +151,7 @@
   },
   "tests/unit/test_atomic_publication_request_builder_v4.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_atomic_publication_request_factory_v4.py": {
    "private_imports": [],
@@ -361,13 +364,17 @@
    "private_imports": [],
    "tests": 11
   },
+  "tests/unit/test_mineru_diagnostic.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
-   "tests": 18
+   "tests": 19
   },
   "tests/unit/test_mineru_http_remote_v4.py": {
    "private_imports": [],
-   "tests": 42
+   "tests": 44
   },
   "tests/unit/test_mineru_http_staged.py": {
    "private_imports": [],
@@ -385,7 +392,7 @@
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 26
   },
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
@@ -405,7 +412,13 @@
   },
   "tests/unit/test_mineru_protocol_v2_wire.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 14
+  },
+  "tests/unit/test_mineru_recovery_gate.py": {
+   "private_imports": [
+    "_RecoveryOnlyAdmission"
+   ],
+   "tests": 8
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
@@ -417,7 +430,7 @@
   },
   "tests/unit/test_mineru_task_protocol_v2.py": {
    "private_imports": [],
-   "tests": 29
+   "tests": 37
   },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],
@@ -581,6 +594,12 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_staged_commission.py": {
+   "private_imports": [
+    "_outcomes"
+   ],
+   "tests": 7
+  },
   "tests/unit/test_staged_coordinator_backend_v4.py": {
    "private_imports": [],
    "tests": 12
@@ -595,7 +614,7 @@
   },
   "tests/unit/test_staged_new_work_admission_v4.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 13
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],

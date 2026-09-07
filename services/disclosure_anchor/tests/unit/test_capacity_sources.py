@@ -92,8 +92,11 @@ class CapacitySourcesTests(unittest.TestCase):
             )
 
     def test_samplers_project_only_closed_content_free_fields(self) -> None:
+        from tests._mineru_health_fixture import protocol_health_fields
+
         health = json.dumps(
             {
+                **protocol_health_fields(),
                 "status": "healthy",
                 "version": "3.4.4",
                 "protocol_version": 2,
@@ -175,7 +178,10 @@ class CapacitySourcesTests(unittest.TestCase):
             )
 
     def test_capacity_api_rejects_pending_depth_drift(self) -> None:
+        from tests._mineru_health_fixture import protocol_health_fields
+
         base = {
+            **protocol_health_fields(),
             "status": "healthy",
             "version": "3.4.4",
             "protocol_version": 2,
@@ -206,7 +212,10 @@ class CapacitySourcesTests(unittest.TestCase):
                 )
 
     def test_both_api_health_consumers_reject_impossible_slot_state(self) -> None:
+        from tests._mineru_health_fixture import protocol_health_fields
+
         payload = {
+            **protocol_health_fields(),
             "status": "healthy",
             "version": "3.4.4",
             "protocol_version": 2,

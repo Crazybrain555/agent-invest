@@ -110,7 +110,7 @@ class RemoteSubmissionCommandV4:
         if (
             type(self.upload_filename) is not str
             or self.upload_filename
-            != f"{intent.source_pdf_sha256.removeprefix('sha256:')}.pdf"
+            != f"sha256_{intent.source_pdf_sha256.removeprefix('sha256:')}.pdf"
         ):
             raise ValueError("remote submission filename is not deterministic")
         if (

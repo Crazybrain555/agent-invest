@@ -324,7 +324,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "from mineru.cli.api_request import ParseRequestOptions, parse_request_form\n"
             "from mineru.cli.agent_task_protocol_v2 import (\n"
             "    DurableTaskRegistry, SplitTaskExecutor, TaskProtocolConflict,\n"
-            "    evict_consumed_routes,\n"
+            "    evict_consumed_routes, task_protocol_runtime_status,\n"
             ")\n",
             count=1,
             label="FastAPI task protocol v2 import",
@@ -765,6 +765,9 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        \"max_pending_tasks_requested\": get_max_pending_tasks(),\n"
             "        \"max_pending_tasks_effective\": task_manager.max_nonterminal_tasks,\n"
             '        "task_protocol_schema": "mineru-task-protocol.v2",\n'
+            '        "task_protocol_runtime": task_protocol_runtime_status(\n'
+            "            task_manager.task_protocol_v2, task_manager.task_protocol_executor\n"
+            "        ),\n"
             "        \"processing_window_size\": strict_processing_window_size(),\n",
             count=1,
             label="FastAPI pending depth health identity",

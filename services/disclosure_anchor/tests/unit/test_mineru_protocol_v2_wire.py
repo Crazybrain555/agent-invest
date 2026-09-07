@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
@@ -41,15 +44,15 @@ class MinerUProtocolV2WireTests(unittest.TestCase):
         exact = submission_request_exact_bytes_v2(
             api_origin=self.api_origin + "/",
             form=form,
-            upload_filename="c" * 64 + ".pdf",
+            upload_filename="sha256_" + "c" * 64 + ".pdf",
         )
         self.assertEqual(
             json.loads(exact),
             {
-                "schema": "mineru-staged-request.v1",
+                "schema": "mineru-staged-request.v2",
                 "api_origin": self.api_origin,
                 "form": form,
-                "upload_filename": "c" * 64 + ".pdf",
+                "upload_filename": "sha256_" + "c" * 64 + ".pdf",
             },
         )
         self.assertEqual(
@@ -57,9 +60,18 @@ class MinerUProtocolV2WireTests(unittest.TestCase):
             submission_request_exact_bytes_v2(
                 api_origin=self.api_origin,
                 form=dict(reversed(tuple(form.items()))),
-                upload_filename="c" * 64 + ".pdf",
+                upload_filename="sha256_" + "c" * 64 + ".pdf",
             ),
         )
+
+    def test_bare_hash_filename_cannot_create_new_request_identity(self) -> None:
+        options = ParserOptions()
+        with self.assertRaises(ValueError):
+            submission_request_exact_bytes_v2(
+                api_origin=self.api_origin,
+                form=submission_form_v2(options, server_url="http://vlm.invalid/v1"),
+                upload_filename="c" * 64 + ".pdf",
+            )
 
     def test_client_submit_key_has_frozen_golden_vector(self) -> None:
         self.assertEqual(
@@ -205,6 +217,34 @@ class MinerUProtocolV2WireTests(unittest.TestCase):
                     fence_identity=self.fence,
                     artifact_byte_limit=123,
                 )
+
+    def test_frozen_official_submit_builder_and_closed_message_contract(self) -> None:
+        source = Path(__file__).parents[1] / "fixtures/mineru_344_preimages/mineru/cli/fast_api.py"
+        function = next(node for node in ast.parse(source.read_text()).body
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "build_task_submission_response")
+        function.returns = None
+        for argument in function.args.args:
+            argument.annotation = None
+        namespace = {"JSONResponse": lambda *, status_code, content: (status_code, content)}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+        payload = self._task_payload(status="pending")
+        code, submitted = namespace["build_task_submission_response"](  # type: ignore[operator]
+            None, None, SimpleNamespace(build_status_payload=lambda *_: dict(payload)))
+        self.assertEqual(code, 202)
+        self.assertEqual(submitted["message"], "Task submitted successfully")
+        def parse(value: dict[str, object]) -> object:
+            return parse_task_payload_v2(self._exact(value), api_origin=self.api_origin,
+                                         idempotency_key=self.key, attempt_identity=self.attempt,
+                                         fence_identity=self.fence)
+        self.assertEqual(parse(payload), parse(submitted))
+        for changed in ({**submitted, "message": value} for value in (None, True, 1, {}, "other")):
+            with self.subTest(changed=changed), self.assertRaises(MinerUProtocolV2WireError):
+                parse(changed)
+        for changed in ({**submitted, "extra": True},
+                        {key: value for key, value in submitted.items() if key != "protocol_state"}):
+            with self.assertRaises(MinerUProtocolV2WireError):
+                parse(changed)
 
     def test_noncompleted_task_cannot_carry_result_identity(self) -> None:
         payload = self._task_payload(status="pending")

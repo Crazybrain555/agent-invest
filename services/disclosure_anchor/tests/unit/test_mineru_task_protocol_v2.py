@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.util
+import json
 import os
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _SOURCE = (
     Path(__file__).resolve().parents[2]
@@ -1043,6 +1045,177 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
             (replacement_uploads / "input.pdf").write_bytes(b"pdf")
             with self.assertRaisesRegex(TaskProtocolConflict, "directory identity"):
                 self._registry(root).recoverable_payloads()
+
+
+class MinerUOutputQuiescenceTests(unittest.TestCase):
+    def test_serving_runtime_reports_actual_objects_without_initializing_or_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            registry, path = self._empty_registry(root)
+            executor = SplitTaskExecutor(parse_slots=1, finalizer_slots=1, result_reservation_bytes=257)
+            before = path.read_bytes()
+            with patch.object(DurableTaskRegistry, "__init__", side_effect=AssertionError("constructor")):
+                proof = _MODULE.task_protocol_runtime_status(registry, executor)
+            self.assertEqual(proof, {
+                "schema": "mineru-task-runtime.v1", "enabled": True,
+                "task_registry_max_records": 128, "task_result_reservation_bytes": 257,
+                "max_unacked_result_bytes": 1024,
+            })
+            self.assertEqual(path.read_bytes(), before)
+            for left, right in ((None, executor), (registry, None), (object(), object())):
+                with self.assertRaises(TaskProtocolConflict):
+                    _MODULE.task_protocol_runtime_status(left, right)
+            executor._result_reservation_bytes = True
+            with self.assertRaises(TaskProtocolConflict):
+                _MODULE.task_protocol_runtime_status(registry, executor)
+
+    def _empty_registry(self, root: Path):
+        path = root / ".agent-task-protocol-v2" / "registry.json"
+        registry = DurableTaskRegistry(path, output_root=root, max_unacked_result_bytes=1024)
+        registry._persist()
+        return registry, path
+
+    def _consumed_registry(self, root: Path):
+        registry, path = self._empty_registry(root)
+        registry._records["key"] = _MODULE.DurableTaskRecord(
+            "key", "task", "attempt", "fence", state="consumed", consumed_at_unix=1000.0,
+            result_sha256="a" * 64, result_owner="b" * 64, result_bytes=12,
+        )
+        registry._submission_watermark_bucket = 42
+        registry._persist()
+        return registry, path
+
+    def test_empty_preinstall_but_commissioning_requires_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            proof = _MODULE.inspect_quiescent_output_root(root, allow_empty=True)
+            self.assertEqual((proof["file_count"], proof["total_bytes"]), (0, 0))
+            with self.assertRaises(TaskProtocolConflict):
+                _MODULE.inspect_quiescent_output_root(root)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_empty_and_consumed_registry_keep_physical_inventory_and_bytes(self) -> None:
+        for consumed in (False, True):
+            with self.subTest(consumed=consumed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                _, path = (self._consumed_registry if consumed else self._empty_registry)(root)
+                before = path.read_bytes()
+                proof = _MODULE.inspect_quiescent_output_root(root)
+                self.assertEqual(proof["file_count"], 1)
+                self.assertEqual(proof["total_bytes"], len(before))
+                self.assertEqual(proof["quiescence"]["registry_sha256"],
+                                 "sha256:" + hashlib.sha256(before).hexdigest())
+                self.assertEqual(proof["quiescence"]["record_count"], int(consumed))
+                self.assertEqual(proof["quiescence"]["submission_watermark_bucket"],
+                                 42 if consumed else -1)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_resource_states_and_uncleared_consumed_fields_are_rejected(self) -> None:
+        mutations = [("state", state) for state in (
+            "pending", "processing", "finalizing", "completed", "failed", "cleanup_pending"
+        )] + [
+            ("active_readers", 1), ("active_readers", False),
+            ("reserved_result_bytes", 1), ("task_payload", {}),
+            ("result_path", "/must-not-be-read"), ("lease_until_unix", 2),
+            ("error", "error"), ("cleanup_kind", "result"),
+            ("consumed_at_unix", -1), ("consumed_at_unix", True),
+        ]
+        for key, value in mutations:
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                _, path = self._consumed_registry(root)
+                payload = json.loads(path.read_bytes())
+                payload["records"][0][key] = value
+                raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                path.write_bytes(raw)
+                with self.assertRaises(TaskProtocolConflict):
+                    _MODULE.inspect_quiescent_output_root(root)
+                self.assertEqual(path.read_bytes(), raw)
+
+    def test_unknown_directories_hidden_files_and_temp_records_are_rejected(self) -> None:
+        for name, is_directory in (("task", True), (".unknown", False),
+                                   (".agent-task-protocol-v2/.registry.tmp", False),
+                                   (".agent-task-protocol-v2/empty", True)):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self._empty_registry(root)
+                target = root / name
+                if is_directory:
+                    target.mkdir()
+                else:
+                    target.write_bytes(b"unknown")
+                with self.assertRaises(TaskProtocolConflict):
+                    _MODULE.inspect_quiescent_output_root(root)
+                self.assertTrue(target.exists())
+
+    def test_symlinks_hardlinks_fifo_and_permissions_fail_closed(self) -> None:
+        for kind in ("registry_link", "control_link", "root_link", "hardlink", "fifo", "mode"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                root = base / "output"
+                root.mkdir()
+                _, path = self._empty_registry(root)
+                if kind == "hardlink":
+                    os.link(path, base / "other")
+                elif kind == "mode":
+                    path.chmod(0o644)
+                elif kind == "fifo":
+                    path.unlink()
+                    os.mkfifo(path)
+                else:
+                    target = {"registry_link": path, "control_link": path.parent,
+                              "root_link": root}[kind]
+                    other = base / "moved"
+                    target.rename(other)
+                    target.symlink_to(other, target_is_directory=other.is_dir())
+                with self.assertRaises((TaskProtocolConflict, OSError)):
+                    _MODULE.inspect_quiescent_output_root(root)
+
+    def test_strict_registry_bytes_and_root_identity(self) -> None:
+        for kind in ("duplicate", "nonfinite", "truncated", "boolean_root", "root_drift", "oversize"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                _, path = self._empty_registry(root)
+                payload = json.loads(path.read_bytes())
+                if kind == "boolean_root":
+                    payload["output_root"]["uid"] = False
+                elif kind == "root_drift":
+                    payload["output_root"]["inode"] += 1
+                raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                if kind == "duplicate":
+                    raw = raw.replace(b'"records":[]', b'"records":[],"records":[]')
+                elif kind == "nonfinite":
+                    raw = raw.replace(b'"submission_watermark_bucket":-1',
+                                      b'"submission_watermark_bucket":NaN')
+                elif kind == "truncated":
+                    raw = raw[:-1]
+                elif kind == "oversize":
+                    raw = b" " * (_MODULE._MAX_REGISTRY_BYTES + 1)
+                path.write_bytes(raw)
+                with self.assertRaises((TaskProtocolConflict, ValueError)):
+                    _MODULE.inspect_quiescent_output_root(root)
+
+    def test_registry_replacement_during_read_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _, path = self._empty_registry(root)
+            original_read = os.read
+            replaced = False
+
+            def replace_on_read(descriptor, size):
+                nonlocal replaced
+                raw = original_read(descriptor, size)
+                if not replaced:
+                    replaced = True
+                    replacement = path.with_name("replacement")
+                    replacement.write_bytes(path.read_bytes())
+                    replacement.chmod(0o600)
+                    os.replace(replacement, path)
+                return raw
+
+            with patch.object(_MODULE.os, "read", side_effect=replace_on_read):
+                with self.assertRaises(TaskProtocolConflict):
+                    _MODULE.inspect_quiescent_output_root(root)
 
 
 if __name__ == "__main__":

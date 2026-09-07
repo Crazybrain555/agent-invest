@@ -866,7 +866,6 @@ class RunOnceSchedulingTests(unittest.TestCase):
         self,
     ) -> None:
         import threading
-        import time
 
         deps = _deps()
         object.__setattr__(
@@ -883,9 +882,19 @@ class RunOnceSchedulingTests(unittest.TestCase):
             {"document_id": f"doc_{index}", "oversized": False} for index in range(20)
         ]
         first_failure_reported = threading.Event()
+        all_parsed = threading.Event()
         build_call_lock = threading.Lock()
         build_calls = 0
+        parse_calls = 0
         emitted: list[worker_module.WorkerReport] = []
+
+        def parse(_command: object) -> object:
+            nonlocal parse_calls
+            with build_call_lock:
+                parse_calls += 1
+                if parse_calls == len(pending):
+                    all_parsed.set()
+            return mock.MagicMock(status="succeeded", processing_run_id="run_unknown")
 
         def build(_command: object) -> object:
             nonlocal build_calls
@@ -893,7 +902,9 @@ class RunOnceSchedulingTests(unittest.TestCase):
                 build_calls += 1
                 call_number = build_calls
             if call_number == 1:
-                time.sleep(0.02)
+                # Specify the intended fast-parse interleaving, rather than
+                # assuming the OS schedules twenty parses within twenty ms.
+                self.assertTrue(all_parsed.wait(timeout=2))
             elif call_number == 2:
                 self.assertTrue(first_failure_reported.wait(timeout=2))
             raise RuntimeError("regression")
@@ -910,9 +921,7 @@ class RunOnceSchedulingTests(unittest.TestCase):
             mock.patch.object(worker_module, "ParseDocument") as parse_cls,
             mock.patch.object(worker_module, "BuildUnits") as build_cls,
         ):
-            parse_cls.return_value.execute.return_value = mock.MagicMock(
-                status="succeeded", processing_run_id="run_unknown"
-            )
+            parse_cls.return_value.execute.side_effect = parse
             build_cls.return_value.execute.side_effect = build
             report = worker_module.WorkerReport(started_at=datetime.now(timezone.utc))
             result = worker_module._parse_one_batch(

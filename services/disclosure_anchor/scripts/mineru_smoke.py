@@ -3,7 +3,7 @@
 This command is a deployment gate, not a benchmark.  It binds a frozen PDF,
 the local client venv, a complete operator/provider runtime manifest, repeated
 multimodal canaries, and the official full-PDF provider artifact reader into
-one receipt.  Its temporary parse tree is always removed.
+one receipt. Failed protocol-v2 attempts retain private recovery evidence.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -23,10 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from disclosure_anchor.adapters.parsers.mineru_medium import (
-    MinerUMediumDocumentParser,
-    MinerUProcess,
-)
+from disclosure_anchor.adapters.runtime.mineru_diagnostic import run_diagnostic_pdf
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     run_mineru_multimodal_canary,
@@ -54,7 +50,7 @@ from disclosure_anchor.application.contracts.strict_json import strict_json_load
 from disclosure_anchor.domain.errors import DisclosureAnchorError
 
 
-RECEIPT_SCHEMA = "mineru_smoke_receipt.v5"
+RECEIPT_SCHEMA = "mineru_smoke_receipt.v6"
 TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 DEFAULT_INPUT = (
     Path(__file__).resolve().parents[1]
@@ -498,66 +494,28 @@ def main(argv: list[str] | None = None) -> int:
         http_request_concurrency=None,
         runtime_bundle_identity_sha256=runtime_identity,
     )
-    smoke_path: Path | None = None
     parse_failure: DisclosureAnchorError | OSError | ValueError | None = None
     provider_evidence: dict[str, Any] | None = None
+    disposal_evidence: dict[str, Any] | None = None
+    diagnostic_root = args.receipt_out.absolute().with_name(
+        args.receipt_out.name + ".diagnostic"
+    )
     try:
-        with tempfile.TemporaryDirectory(
-            prefix="disclosure-mineru-smoke-",
-            dir=args.work_root,
-        ) as tmp:
-            smoke_path = Path(tmp)
-            private_tmp = smoke_path / "tmp"
-            private_tmp.mkdir()
-            process = MinerUProcess(
-                executable=mineru_bin,
-                extra_env={
-                    "TEMP": str(private_tmp),
-                    "TMP": str(private_tmp),
-                    "TMPDIR": str(private_tmp),
-                },
-            )
-            document_parser = MinerUMediumDocumentParser(
-                process=process,
-                api_url=api_url,
-                server_url=inference_upstream_url,
-            )
-            source = smoke_path / f"sha256_{input_sha256}.pdf"
-            shutil.copyfile(input_snapshot, source)
-            result = document_parser.parse(
-                input_pdf=source,
-                output_dir=smoke_path / "output",
-                options=options,
-                source_pdf_sha256=f"sha256:{input_sha256}",
-            )
-            provider_document = result.provider_document
-            if not provider_document.pages:
-                raise ValueError("provider smoke returned no pages")
-            if provider_document.parser_version != "3.4.4":
-                raise ValueError("provider smoke parser version drifted")
-            if len(provider_document.pages) != input_page_count:
-                raise ValueError(
-                    "provider smoke did not preserve the complete source page count"
-                )
-            if (
-                provider_document.backend != "hybrid"
-                or provider_document.effort != "medium"
-            ):
-                raise ValueError("provider smoke target drifted from Hybrid-medium")
-            provider_evidence = {
-                "target_identity": result.target_identity.to_payload(),
-                "provider_bundle_sha256": provider_document.bundle_sha256,
-                "page_count": len(provider_document.pages),
-                "block_count": len(provider_document.blocks),
-                "artifact_count": len(provider_document.artifacts),
-            }
+        provider_evidence, disposal_evidence = run_diagnostic_pdf(
+            input_pdf=input_snapshot, source_pdf_sha256=f"sha256:{input_sha256}",
+            source_page_count=input_page_count, api_url=api_url,
+            server_url=inference_upstream_url, options=options, journal_root=diagnostic_root,
+        )
     except (DisclosureAnchorError, OSError, ValueError) as exc:
         parse_failure = exc
     finally:
         snapshot_root.cleanup()
-    cleanup_proved = smoke_path is not None and not smoke_path.exists()
-    if not cleanup_proved:
-        raise SystemExit("[abort] MinerU smoke temporary tree was not removed")
+    if parse_failure is not None:
+        raise SystemExit(
+            f"[abort] MinerU protocol-v2 diagnostic failed; preserve {diagnostic_root}: {parse_failure}"
+        ) from parse_failure
+    if (diagnostic_root / "resources").exists():
+        raise SystemExit("[abort] MinerU smoke local resource tree was not removed")
     cleanup_deadline = time.monotonic() + 5
     new_mineru_processes: dict[int, str] = {}
     while True:
@@ -576,11 +534,7 @@ def main(argv: list[str] | None = None) -> int:
             "[abort] MinerU smoke left external processes or temp directories: "
             f"pids={sorted(new_mineru_processes)} temp_dirs={len(new_api_temp_dirs)}"
         )
-    if parse_failure is not None:
-        raise SystemExit(
-            f"[abort] MinerU DB-free PDF smoke failed after cleanup: {parse_failure}"
-        ) from parse_failure
-    if provider_evidence is None:
+    if provider_evidence is None or disposal_evidence is None:
         raise SystemExit("[abort] MinerU provider evidence was not produced")
 
     api_after = fetch_mineru_orchestrator_health(
@@ -642,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
         "runtime_manifest": runtime_manifest,
         "canary": canary_cache,
         "provider": provider_evidence,
+        "diagnostic_disposal": disposal_evidence,
         "cleanup": {
             "external_api_temp_dirs_created": 0,
             "external_mineru_processes_after": 0,

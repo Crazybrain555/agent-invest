@@ -213,8 +213,8 @@ worker-backfill-publish-kpi:
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker backfill-publish-kpi --limit "$(LIMIT)"
 
 # DB-free deployment gate: repeated multimodal canary + one frozen full-PDF
-# official writer parse. The command removes its temporary parse tree and
-# persists only explicit receipt/cache paths.
+# official server writer parse. Success removes owned diagnostic artifacts;
+# private new-only journals remain, and failures preserve recovery evidence.
 mineru-smoke:
 	@test -n "$(RUNTIME_MANIFEST)" || (echo 'usage: make mineru-smoke RUNTIME_MANIFEST=/path/runtime.json RECEIPT=/path/receipt.json CANARY_CACHE=/path/canary.json [INPUT=/path/file.pdf EXPECTED_SHA256=...]' && exit 2)
 	@test -n "$(RECEIPT)" || (echo 'mineru-smoke: RECEIPT is required' && exit 2)
@@ -239,7 +239,7 @@ mineru-service-epoch-freeze:
 		--ssh-host "$(SSH_HOST)" --ssh-user "$(SSH_USER)" --ssh-port "$(SSH_PORT)" \
 		--ssh-identity "$(SSH_IDENTITY)" --ssh-known-hosts "$(SSH_KNOWN_HOSTS)"
 
-# Seal independently produced custom-input v5 smoke receipts. Each input must
+# Seal independently produced custom-input v6 smoke receipts. Each input must
 # be a distinct complete multi-page held-out PDF.
 mineru-validation-receipt:
 	@test -n "$(SMOKE_RECEIPTS)" || (echo 'mineru-validation-receipt: SMOKE_RECEIPTS="/path/a.json /path/b.json" is required' && exit 2)

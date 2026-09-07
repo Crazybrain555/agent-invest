@@ -5,11 +5,16 @@ from __future__ import annotations
 from disclosure_anchor.application.contracts.staged_worker_profile_v4 import StagedWorkerProfileV4
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import io
+import json
 import os
+import re
+import time
+from types import SimpleNamespace
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -25,6 +30,10 @@ from disclosure_anchor.adapters.db.postgres.atomic_document_publisher_v4 import 
     PostgresAtomicWholeDocumentPublisherV4,
 )
 from disclosure_anchor.adapters.db.postgres.staged_new_work_v4 import PostgresV4OrdinaryParseCandidateSource
+from disclosure_anchor.adapters.db.postgres.staged_recovery_scope_v4 import (
+    inspect_accepted_recovery_scope, require_accepted_recovery_scope,
+)
+from disclosure_anchor.adapters.runtime.staged_worker_v4 import build_staged_worker_v4_runtime
 from disclosure_anchor.adapters.db.postgres.unit_of_work import (
     SqlAlchemyUnitOfWork,
     unit_of_work_factory,
@@ -68,6 +77,9 @@ from disclosure_anchor.adapters.storage.v4_source_observation import BoundedV4So
 from disclosure_anchor.application.contracts.mineru_process_profile import (
     encode_mineru_process_profile,
 )
+from disclosure_anchor.application.contracts.provider_document_envelope import (
+    provider_document_envelope_from_bytes,
+)
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPT_VERSION,
 )
@@ -82,7 +94,9 @@ from disclosure_anchor.application.ports.staged_new_work_v4 import (
     V4OrdinaryParseCandidate,
 )
 from disclosure_anchor.application.services.atomic_publication_request_builder_v4 import (
+    AtomicPublicationRequestBuilderV4Error,
     ProductionAtomicPublicationRequestBuilderV4,
+    _unit_page_numbers,
 )
 from disclosure_anchor.application.services.atomic_publication_request_factory_v4 import (
     RecoverableAtomicPublicationRequestFactoryV4,
@@ -115,6 +129,7 @@ from disclosure_anchor.application.use_cases.prepare_and_publish_whole_document_
 )
 from disclosure_anchor.domain import ids
 from disclosure_anchor.settings import load_settings
+from disclosure_anchor.cli.staged_commission import _documents
 from tests.integration._support import engine_or_skip
 from tests.unit._semantic_routes import _fallback_receipt
 from tests.unit.test_mineru_medium_artifacts import _write_bundle
@@ -310,7 +325,7 @@ class _FakeMinerU:
         return payload
 
 
-def _official_result_zip(source_pdf_sha256: str) -> bytes:
+def _official_result_zip(source_pdf_sha256: str, *, cross_page_heading: bool = False) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         _write_bundle(root)
@@ -319,6 +334,24 @@ def _official_result_zip(source_pdf_sha256: str) -> bytes:
             b"\xff\xd8\xffcontinuation-crop"
         )
         content_list = next(root.glob("*_content_list.json"))
+        if cross_page_heading:
+            content = json.loads(content_list.read_text())
+            content[0].update(text="一、考核安排", text_level=1)
+            content.extend([
+                {"type": "text", "page_idx": 1, "bbox": [100, 500, 900, 550],
+                 "text": "（一）考核次数", "text_level": 2},
+                {"type": "text", "page_idx": 1, "bbox": [100, 600, 900, 650],
+                 "text": "每个会计年度考核一次。"},
+            ])
+            content_list.write_text(json.dumps(content, ensure_ascii=False))
+            typed_file = next(root.glob("*_content_list_v2.json"))
+            typed = json.loads(typed_file.read_text())
+            typed[0][0].update(type="title", level=1)
+            typed[1].extend([
+                {"type": "title", "bbox": [100, 500, 900, 550], "level": 2},
+                {"type": "paragraph", "bbox": [100, 600, 900, 650]},
+            ])
+            typed_file.write_text(json.dumps(typed, ensure_ascii=False))
         fixture_stem = content_list.name.removesuffix("_content_list.json")
         source_stem = source_pdf_sha256.replace("sha256:", "sha256_", 1)
         for path in tuple(root.iterdir()):
@@ -498,6 +531,196 @@ class StagedV4EndToEndIntegrationTests(unittest.TestCase):
 
     def test_markerless_invalid_output_keeps_pg_credits_and_blocks_ack_across_three_boots(self) -> None:
         self._run_closure(coordinator_owned=True, ownership_failure=True)
+
+    def test_scoped_production_runtime_builder_publishes_only_selected_document(self) -> None:
+        self._run_scoped_builder(recover_encoding_failure=False)
+
+    def test_accepted_result_recovery_uses_original_h0_and_no_new_post_or_admission(self) -> None:
+        self._run_scoped_builder(recover_encoding_failure=True)
+
+    def test_cross_page_publication_tail_recovery_preserves_h0_and_materialization(self) -> None:
+        self._run_scoped_builder(recover_encoding_failure=False, recover_lineage_failure=True)
+
+    def _run_scoped_builder(self, *, recover_encoding_failure: bool,
+                            recover_lineage_failure: bool = False) -> None:
+        recovering = recover_encoding_failure or recover_lineage_failure
+        profile = replace(_profile(), api_task_slots=1, api_max_pending_tasks=1,
+            cpu_worker_threads=3, omp_thread_count=1,
+            registry_nonterminal_cap=1, registry_terminal_cap=127, processing_window_size=16,
+            raster_stage_slots=1, layout_stage_slots=1, postprocess_stage_slots=1,
+            native_owner_slots=1, requested_hybrid_batch_ratio=1, effective_hybrid_batch_ratio=1,
+            finalizer_slots=1, gpu_request_slots=7)
+        profile_path, keyring_path = self.root / "profile.json", self.root / "keyring.json"
+        profile_path.write_bytes(profile.exact_bytes)
+        keyring_path.write_text(json.dumps({"format": "disclosure-v4-secret-keyring.v1",
+            "primary_kek_id": "fixture", "keks": {"fixture": "11"*32}}))
+        profile_path.chmod(0o600)
+        keyring_path.chmod(0o600)
+        outside = "doc_000_" + ids.new_ulid()
+        self.extra_document_ids.append(outside)
+        with self.engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO disclosure_core.document (document_id,security_id,provider,provider_document_id,"
+                "raw_file_relpath,raw_file_hash,status) VALUES (:doc,:sec,'cninfo','outside-scope',"
+                ":path,:sha,'registered')"
+            ), {"doc": outside, "sec": self.security_id, "path": self.source_relpath.as_posix(), "sha": self.source_sha256})
+        fake = _FakeMinerU(attempt_id="pending", fence_identity="pending", client_submit_key="pending",
+                           source_pdf=self.source_bytes, artifact=_official_result_zip(
+                               self.source_sha256, cross_page_heading=recover_lineage_failure))
+        fail_encoding = recover_encoding_failure
+
+        def http(request: httpx.Request) -> httpx.Response:
+            nonlocal fail_encoding
+            if request.method == "POST" and request.url.path == "/tasks":
+                body = request.read()
+                for field, attribute in (("agent_attempt_identity", "attempt_id"),
+                                         ("agent_fence_identity", "fence_identity"),
+                                         ("agent_idempotency_key", "client_submit_key")):
+                    match = re.search(b'name="'+field.encode()+b'"\r\n\r\n([^\r\n]+)', body)
+                    self.assertIsNotNone(match)
+                    setattr(fake, attribute, match.group(1).decode())
+            response = fake(request)
+            if request.url.path.endswith("/lease"):
+                response = httpx.Response(200, json={**response.json(), "lease_until_unix": time.time()+600})
+            if request.url.path.endswith("/result") and fail_encoding:
+                # Adjacent bad-server case: the client must reject the encoding
+                # before reading, retain the owner, and recover the same result.
+                fail_encoding = False
+                response.headers["Content-Encoding"] = "gzip"
+            return response
+
+        def make_remote(**kwargs: Any) -> MinerUHttpRemoteV4:
+            self.remote = MinerUHttpRemoteV4(transport=httpx.MockTransport(http), **kwargs)
+            return self.remote
+        normal_uow = unit_of_work_factory(self.engine)
+        scratch = self.settings.disclosure_runtime_root / "staged_v4" / "scratch"
+
+        def cleanup_probe() -> bool:
+            with normal_uow() as uow:
+                authority = uow.remote_parse_v4.load(fake.attempt_id)
+            intent = next(e.value for e in authority.evidence if e.kind == "materialization_intent")
+            return authority.state == "ack_pending" and all(not (scratch/relpath).exists() for relpath in (
+                authority.reservation.snapshot_relpath, intent.spool_relpath, intent.output_relpath))
+
+        fake.cleanup_probe = cleanup_probe
+
+        def old_lineage_check(**kwargs: Any) -> tuple[int, ...]:
+            pages = _unit_page_numbers(**kwargs)
+            if pages[0] != kwargs["draft"].page_no:
+                raise AtomicPublicationRequestBuilderV4Error(
+                    "publication Unit primary page differs from full locator lineage")
+            return pages
+
+        with (
+            patch.dict(os.environ, {**_env(self.root), **_mineru_topology(),
+                "WORKER_PARSE_EXECUTION_MODE": "staged-v4",
+                "WORKER_PARSE_CONCURRENCY": "1", "WORKER_FINALIZE_CONCURRENCY": "1",
+                "DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256": profile.runtime_bundle_identity_sha256,
+                "DISCLOSURE_V4_PROCESS_PROFILE_FILE": str(profile_path),
+                "DISCLOSURE_V4_PROCESS_PROFILE_SHA256": profile.sha256,
+                "DISCLOSURE_V4_SECRET_KEYRING_FILE": str(keyring_path),
+                "DISCLOSURE_V4_ARCHIVE_MEMBER_COUNT_LIMIT": "8192"}, clear=True),
+            patch("disclosure_anchor.adapters.runtime.staged_worker_v4.MinerUHttpRemoteV4", side_effect=make_remote),
+            patch("disclosure_anchor.adapters.runtime.staged_worker_v4.build_semantic_runtime",
+                  return_value=SimpleNamespace(router=_V4SemanticRouter())),
+        ):
+            runtime = build_staged_worker_v4_runtime(settings=load_settings(), engine=self.engine,
+                ownership_guard=lambda: None, admission_guard=lambda: None, process_scope_classes=None,
+                progress=lambda _: None, admission_document_ids=(self.document_id,))
+            try:
+                runtime.verify_startup()
+                deadline = time.monotonic()+30
+                with (patch(
+                    "disclosure_anchor.application.services.atomic_publication_request_builder_v4._unit_page_numbers",
+                    side_effect=old_lineage_check,
+                ) if recover_lineage_failure else nullcontext()):
+                    result = runtime.coordinator.run(stop_requested=lambda: time.monotonic() >= deadline)
+            finally:
+                runtime.close()
+            if recovering:
+                self.assertEqual(result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT, result.errors)
+                self.assertEqual((result.admitted, result.completed, fake.task_posts, fake.ack_posts), (1, 0, 1, 0))
+                expected_error = ("primary page differs" if recover_lineage_failure else "result headers drifted")
+                self.assertTrue(any(expected_error in error for error in result.errors), result.errors)
+                rows = inspect_accepted_recovery_scope(self.engine, document_ids=(self.document_id,))
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["state"], "local_materialized" if recover_lineage_failure else "materializing")
+                pinned = tuple({key: value for key, value in row.items()
+                                if key not in {"state", "runtime_epoch_sha256", "is_current"}} for row in rows)
+                original = pinned[0].copy()
+                with normal_uow() as uow:
+                    before_authority = uow.remote_parse_v4.load(fake.attempt_id)
+                before_materialization = next((e.sha256 for e in before_authority.evidence
+                                               if e.kind == "local_materialization_receipt"), None)
+                with self.engine.begin() as conn:
+                    conn.execute(sa.text("UPDATE disclosure_ops.remote_parse_attempt SET claim_lease_until=:expired WHERE attempt_id=:attempt"),
+                                 {"attempt": fake.attempt_id, "expired": datetime.now(UTC)-timedelta(seconds=1)})
+
+                def guard() -> None:
+                    require_accepted_recovery_scope(self.engine, attempts=pinned,
+                                                   runtime_sha256=profile.runtime_bundle_identity_sha256)
+
+                def no_admission() -> None:
+                    raise AssertionError("recovery must never call ordinary or prepared admission")
+
+                recovered = build_staged_worker_v4_runtime(settings=load_settings(), engine=self.engine,
+                    ownership_guard=guard, admission_guard=no_admission, process_scope_classes=None,
+                    progress=lambda _: None, admission_document_ids=(self.document_id,), recovery_only=True)
+                try:
+                    self.assertFalse(recovered.remote._allow_task_submission)
+                    recovered.verify_startup()
+                    deadline = time.monotonic()+30
+                    result = recovered.coordinator.run(stop_requested=lambda: time.monotonic() >= deadline)
+                finally:
+                    recovered.close()
+                guard()
+                after = inspect_accepted_recovery_scope(self.engine, document_ids=(self.document_id,),
+                                                       accepted_attempt_ids=(fake.attempt_id,))[0]
+                self.assertEqual({key: after[key] for key in original}, original)
+                self.assertFalse(after["is_current"])
+                if recover_lineage_failure:
+                    self.assertIsNotNone(before_materialization)
+                    with normal_uow() as uow:
+                        after_authority = uow.remote_parse_v4.load(fake.attempt_id)
+                    self.assertEqual(next(e.sha256 for e in after_authority.evidence
+                                          if e.kind == "local_materialization_receipt"), before_materialization)
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT, result.errors)
+        self.assertEqual((result.admitted, result.completed), (0 if recovering else 1, 1))
+        self.assertEqual(result.credits_in_use.nonzero(), {})
+        self.assertEqual((fake.task_posts, fake.ack_posts), (1, 1))
+        self.assertEqual(_documents(self.engine, (self.document_id,))[self.document_id]["attempt_state"], "acked")
+        with self.engine.connect() as conn:
+            row = conn.execute(sa.text("SELECT status,current_processing_run_id FROM disclosure_core.document WHERE document_id=:doc"),
+                               {"doc": self.document_id}).mappings().one()
+            self.assertEqual(row["status"], "published")
+            self.processing_run_id = row["current_processing_run_id"]
+            if recover_lineage_failure:
+                child = conn.execute(sa.text(
+                    "SELECT page_no,artifact_locator FROM disclosure_public.document_units_v1 "
+                    "WHERE document_id=:doc AND is_active_run AND title='（一）考核次数'"
+                ), {"doc": self.document_id}).mappings().one()
+                self.assertEqual(child["page_no"], 2)
+                self.assertEqual([h["source_index"] for h in child["artifact_locator"]["heading_chain"]], [0, 3])
+            self.assertEqual(conn.execute(sa.text("SELECT status FROM disclosure_core.document WHERE document_id=:doc"), {"doc": outside}).scalar_one(), "registered")
+            self.assertEqual(conn.execute(sa.text("SELECT count(*) FROM disclosure_ops.remote_parse_attempt WHERE document_id=:doc"), {"doc": outside}).scalar_one(), 0)
+        self._assert_generic_published_admission()
+
+    def _assert_generic_published_admission(self) -> None:
+        with unit_of_work_factory(self.engine)() as uow:
+            document = uow.documents.get(self.document_id)
+            assert document is not None and document.current_processing_run_id is not None
+            run = uow.processing_runs.get(document.current_processing_run_id)
+        assert run is not None and run.provider_document_relpath is not None
+        envelope = provider_document_envelope_from_bytes(
+            self.source.read_provider_document_record(Path(run.provider_document_relpath))
+        )
+        admitted = ProviderDocumentAdmission(path_builder=self.paths, source=self.source).admit(
+            document=document, run=run, artifact_owner=run, security_code="000001",
+        )
+        self.assertEqual(admitted.envelope, envelope)
+        self.assertEqual(self.source.rebuild_provider_document(
+            Path(envelope.parser_artifact_root_relpath), source_pdf_sha256=self.source_sha256,
+        ), envelope.provider_document)
 
     def _run_closure(self, *, coordinator_owned: bool, malformed_first: bool = False, ownership_failure: bool = False) -> None:
         profile = _profile()
@@ -949,10 +1172,7 @@ class StagedV4EndToEndIntegrationTests(unittest.TestCase):
             expected_file_count=receipt.output_file_count,
             expected_byte_count=receipt.output_byte_count,
         )
-        rebuilt = self.source.rebuild_provider_document(
-            Path(published_relpath), source_pdf_sha256=self.source_sha256,
-        )
-        self.assertEqual(rebuilt.source_pdf_sha256, self.source_sha256)
+        self._assert_generic_published_admission()
         self.assertEqual(fake.task_posts, 1)
         self.assertEqual(fake.result_gets, 1)
         self.assertEqual(fake.lease_posts, 2)

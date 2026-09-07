@@ -1,6 +1,7 @@
 """Held-out MinerU validation receipt builder regressions."""
 
 from __future__ import annotations
+from tests._mineru_diagnostic_fixture import diagnostic_disposal_fixture
 
 from datetime import UTC, datetime, timedelta
 import json
@@ -42,7 +43,7 @@ def _smoke(*, index: int, start: datetime) -> dict[str, object]:
         runtime_bundle_identity_sha256=RUNTIME,
     )
     return {
-        "schema": "mineru_smoke_receipt.v5",
+        "schema": "mineru_smoke_receipt.v6",
         "status": "pass",
         "started_at_utc": start.isoformat(),
         "finished_at_utc": (start + timedelta(seconds=2)).isoformat(),
@@ -56,7 +57,12 @@ def _smoke(*, index: int, start: datetime) -> dict[str, object]:
         "provider": {
             "page_count": 2 + index,
             "target_identity": target.to_payload(),
+            "provider_bundle_sha256": "sha256:" + "b" * 64,
         },
+        "diagnostic_disposal": diagnostic_disposal_fixture(
+            source="sha256:" + f"{index:064x}", runtime=RUNTIME, pages=2 + index,
+            bundle="sha256:" + "b" * 64,
+        ),
         "identity": {"runtime_manifest_identity_sha256": RUNTIME},
         "topology": {"identity": "same"},
         "runtime_manifest": {"identity": "same"},
@@ -118,7 +124,7 @@ class BuildMineruValidationReceiptTests(unittest.TestCase):
                 epoch_after_path=after,
             )
 
-        self.assertEqual(receipt["schema"], "mineru_heldout_validation_receipt.v1")
+        self.assertEqual(receipt["schema"], "mineru_heldout_validation_receipt.v2")
         self.assertEqual(receipt["document_count"], 2)
         for wrapper in receipt["documents"]:
             self.assertEqual(

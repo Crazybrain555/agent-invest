@@ -122,8 +122,10 @@ class _RecordingStream(httpx.SyncByteStream):
     def __init__(self, chunks: tuple[bytes, ...]) -> None:
         self._chunks = chunks
         self.closed = False
+        self.read = False
 
     def __iter__(self) -> Iterator[bytes]:
+        self.read = True
         yield from self._chunks
 
     def close(self) -> None:
@@ -167,7 +169,8 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
             self.assertIn(b"agent_idempotency_key", body)
             self.assertIn(self.key.encode(), body)
             self.assertIn(self.source, body)
-            return httpx.Response(202, json=self._task_payload("pending"))
+            return httpx.Response(202, json={**self._task_payload("pending"),
+                                           "message": "Task submitted successfully"})
 
         with MinerUHttpRemoteV4(
             transport=httpx.MockTransport(handler),
@@ -765,6 +768,7 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
             if request.method == "POST":
                 self.assertEqual(request.url.params["seconds"], "300")
                 return httpx.Response(200, json=self._lease_payload(10_100.0))
+            self.assertEqual(request.headers["Accept-Encoding"], "identity")
             return httpx.Response(
                 200,
                 content=body,
@@ -797,6 +801,49 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
                 "GET /tasks/task-1/result",
             ],
         )
+
+    def test_result_encoding_and_length_drift_rejected_before_stream_read(self) -> None:
+        body = b"artifact"
+        accepted, terminal, capability = self._result_evidence(body)
+        for changed in (
+            {"Content-Encoding": "gzip"}, {"Content-Encoding": "deflate"},
+            {"Content-Encoding": "unknown"}, {"Content-Length": "7"},
+            {"Content-Length": None},
+        ):
+            with self.subTest(changed=changed):
+                stream = _RecordingStream((body,))
+                headers = self._result_headers(terminal)
+                for key, value in changed.items():
+                    if value is None:
+                        headers.pop(key)
+                    else:
+                        headers[key] = value
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    if request.method == "POST":
+                        return httpx.Response(200, json=self._lease_payload(10_100.0))
+                    self.assertEqual(request.headers["Accept-Encoding"], "identity")
+                    return httpx.Response(200, stream=stream, headers=headers)
+
+                with MinerUHttpRemoteV4(
+                    transport=httpx.MockTransport(handler), wall_clock=lambda: 10_000.0,
+                ) as provider, self.assertRaises(RemoteProviderProtocolErrorV4):
+                    list(provider.stream_result(
+                        accepted_submission=accepted, terminal_receipt=terminal,
+                        provider_capability=capability, result_lease_seconds=300,
+                        step_guard=self.guard, before_result_get=lambda: None,
+                    ))
+                self.assertTrue(stream.closed)
+                self.assertFalse(stream.read)
+
+    def test_recovery_only_transport_forbids_submission_before_any_io(self) -> None:
+        calls: list[str] = []
+        with MinerUHttpRemoteV4(
+            allow_task_submission=False,
+            transport=httpx.MockTransport(lambda request: calls.append(str(request.url))),
+        ) as provider, self.assertRaisesRegex(RemoteProviderProtocolErrorV4, "forbids task"):
+            provider.reconcile_or_submit(self._submission_command())
+        self.assertEqual(calls, [])
 
     def test_result_lease_expiring_during_claim_recheck_makes_zero_gets(self) -> None:
         body = b"artifact"
@@ -1319,7 +1366,7 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
             allow_nan=False,
         ).encode()
         target_sha = "sha256:" + hashlib.sha256(target_exact).hexdigest()
-        filename = self.source_sha.removeprefix("sha256:") + ".pdf"
+        filename = "sha256_" + self.source_sha.removeprefix("sha256:") + ".pdf"
         request_exact = submission_request_exact_bytes_v2(
             api_origin=options.api_url or "",
             form=submission_form_v2(options, server_url=options.server_url or ""),

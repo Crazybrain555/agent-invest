@@ -120,9 +120,10 @@ readiness、restart、故障和恢复均留在分母。coverage gap/overlap、id
 原 publish commit hour 回填。host goodput 可跨 profile 汇总；profile-eligible goodput 只在整小时 profile
 单一且所有 publish evidence 同 profile 时给出。
 
-当前 relay checkpoint 只是 owner-only、canonical 的本地 cache；它没有独立 anchored head，不能单独证明
-restart continuity。生产接线前必须用 append-only evidence ledger/DB cursor 固化最新 head，并从同一事务的
-publish evidence replay 推导 first durable publish；调用者布尔值或事后补写文件都不能使 host-hour complete。
+本地 relay checkpoint 只是 owner-only、canonical 的 cache，不能单独证明 restart continuity。
+0054 已提供 append-only publish evidence ledger 与 DB relay head，V4 publisher 已在整文档事务中写入
+base evidence；后续生产入口须接入这些现有机制并从其 replay 推导 first durable publish，不另造 ledger。
+调用者布尔值或事后补写文件都不能使 host-hour complete。
 同理，当前 artifact adapter 把 resident exporter overhead 固定为 unverified，因此只能生成 incomplete KPI。
 
 receipt 的 lane sample count、边界/相邻最大 gap、late、missed deadline、supported frame 和 required

@@ -11,6 +11,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from disclosure_anchor.application.contracts.mineru_api_health import (
+    MINERU_API_TASK_REGISTRY_MAX_RECORDS,
+    MINERU_API_RESULT_RESERVATION_BYTES,
+    MINERU_API_MAX_UNACKED_RESULT_BYTES,
+)
 
 RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v8"
 STAGED_RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v9"
@@ -23,9 +28,6 @@ MINERU_HYBRID_BATCH_RATIO = 1
 MINERU_PIPELINE_INFERENCE_LOCKS_ENABLED = True
 MINERU_API_TASK_RETENTION_SECONDS = 600
 MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS = 30
-MINERU_API_TASK_REGISTRY_MAX_RECORDS = 128
-MINERU_API_RESULT_RESERVATION_BYTES = 256 * 1024 * 1024
-MINERU_API_MAX_UNACKED_RESULT_BYTES = 2 * 1024 * 1024 * 1024
 MINERU_API_OUTPUT_ROOT_POLICY = "dedicated-scratch-retention.v1"
 MINERU_API_TRANSPORT_PROFILE = "pinned-ssh-local-forward.v1"
 MINERU_API_EXPOSURE_POLICY = "windows-loopback-only.v1"
@@ -136,11 +138,15 @@ _WRITER_CODE_RELPATHS = (
     "scripts/freeze_mineru_campaign_epoch.py",
     "scripts/mineru_smoke.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/artifacts.py",
+    "src/disclosure_anchor/adapters/parsers/mineru_medium/http_staged.py",
+    "src/disclosure_anchor/adapters/parsers/mineru_medium/protocol_v2_wire.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/parser.py",
     "src/disclosure_anchor/adapters/parsers/mineru_medium/process.py",
     "src/disclosure_anchor/adapters/runtime/bounded_http.py",
     "src/disclosure_anchor/adapters/runtime/mineru_canary.py",
     "src/disclosure_anchor/adapters/runtime/mineru_deployment_gate.py",
+    "src/disclosure_anchor/adapters/runtime/mineru_diagnostic.py",
+    "src/disclosure_anchor/application/ports/staged_provider_parser.py",
     "src/disclosure_anchor/adapters/runtime/mineru_identity.py",
     "src/disclosure_anchor/adapters/runtime/mineru_orchestrator.py",
     "src/disclosure_anchor/adapters/runtime/mineru_process_isolation.py",
@@ -148,6 +154,23 @@ _WRITER_CODE_RELPATHS = (
     "src/disclosure_anchor/application/ports/parser.py",
     "src/disclosure_anchor/application/contracts/mineru_api_health.py",
     "src/disclosure_anchor/application/contracts/strict_json.py",
+    "src/disclosure_anchor/cli/staged_commission.py",
+    "src/disclosure_anchor/cli/staged_recover.py",
+    "src/disclosure_anchor/adapters/runtime/mineru_recovery_gate.py",
+    "src/disclosure_anchor/application/services/atomic_publication_request_builder_v4.py",
+    "src/disclosure_anchor/application/contracts/atomic_document_publication_v4.py",
+    "src/disclosure_anchor/application/contracts/local_materialization_manifest_v4.py",
+    "src/disclosure_anchor/application/contracts/provider_document_envelope.py",
+    "src/disclosure_anchor/adapters/db/postgres/staged_recovery_scope_v4.py",
+    "src/disclosure_anchor/adapters/runtime/staged_worker_v4.py",
+    "src/disclosure_anchor/adapters/db/postgres/staged_new_work_v4.py",
+    "src/disclosure_anchor/application/worker/queries.py",
+    "src/disclosure_anchor/application/ports/staged_new_work_v4.py",
+    "src/disclosure_anchor/application/services/staged_new_work_admission_v4.py",
+    "src/disclosure_anchor/adapters/parsers/mineru_medium/http_remote_v4.py",
+    "src/disclosure_anchor/adapters/parsers/mineru_medium/http_staged_v4.py",
+    "src/disclosure_anchor/adapters/parsers/mineru_medium/v4_initial_ingress.py",
+    "src/disclosure_anchor/adapters/parsers/mineru_medium/v4_stage_input_resolver.py",
 )
 
 

@@ -6,6 +6,10 @@ from typing import TypedDict
 
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
+MINERU_API_TASK_REGISTRY_MAX_RECORDS = 128
+MINERU_API_RESULT_RESERVATION_BYTES = 256 * 1024 * 1024
+MINERU_API_MAX_UNACKED_RESULT_BYTES = 2 * 1024 * 1024 * 1024
+
 
 MINERU_API_HEALTH_FIELDS = frozenset(
     {
@@ -131,8 +135,55 @@ def parse_mineru_api_health(
         decoded = strict_json_loads(payload)
     except (UnicodeDecodeError, ValueError) as exc:
         raise ValueError("MinerU API health is not valid strict UTF-8 JSON") from exc
-    return validate_mineru_api_health(
+    return validate_mineru_api_wire_health(
         decoded,
+        expected_task_slots=expected_task_slots,
+        expected_task_retention_seconds=expected_task_retention_seconds,
+        expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+    )
+
+
+def validate_mineru_task_runtime(decoded: object) -> None:
+    """The exact serving-process capacity subproof, never configured guesses."""
+    limits = {
+        "task_registry_max_records": MINERU_API_TASK_REGISTRY_MAX_RECORDS,
+        "task_result_reservation_bytes": MINERU_API_RESULT_RESERVATION_BYTES,
+        "max_unacked_result_bytes": MINERU_API_MAX_UNACKED_RESULT_BYTES,
+    }
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"schema", "enabled", *limits}
+        or decoded.get("schema") != "mineru-task-runtime.v1"
+        or decoded.get("enabled") is not True
+        or any(type(decoded.get(key)) is not int or decoded[key] != value
+               for key, value in limits.items())
+    ):
+        raise ValueError("MinerU serving task runtime identity or limits drifted")
+
+
+def validate_mineru_api_wire_health(
+    decoded: object,
+    *,
+    expected_task_slots: int | None,
+    expected_task_retention_seconds: int | None = 600,
+    expected_cleanup_interval_seconds: int | None = 30,
+) -> MineruApiHealth:
+    """Validate the versioned wire shape before projecting existing receipt fields.
+
+    validate_mineru_api_health remains the closed normalized receipt contract;
+    no wire caller may silently drop unknown fields or accept that projection.
+    """
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != MINERU_API_HEALTH_FIELDS | {
+            "task_protocol_schema", "task_protocol_runtime"
+        }
+        or decoded.get("task_protocol_schema") != "mineru-task-protocol.v2"
+    ):
+        raise ValueError("MinerU API wire health fields are not closed")
+    validate_mineru_task_runtime(decoded["task_protocol_runtime"])
+    return validate_mineru_api_health(
+        {name: decoded[name] for name in MINERU_API_HEALTH_FIELDS},
         expected_task_slots=expected_task_slots,
         expected_task_retention_seconds=expected_task_retention_seconds,
         expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
@@ -143,4 +194,6 @@ __all__ = [
     "MINERU_API_HEALTH_FIELDS",
     "parse_mineru_api_health",
     "validate_mineru_api_health",
+    "validate_mineru_api_wire_health",
+    "validate_mineru_task_runtime",
 ]

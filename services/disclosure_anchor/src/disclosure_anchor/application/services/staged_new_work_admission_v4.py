@@ -20,6 +20,7 @@ from disclosure_anchor.application.ports.staged_new_work_v4 import (
     V4InitialIngressCapacityBlocked, V4OrdinaryParseCandidate,
     V4OrdinaryParseCandidateSourcePort,
     V4RejectedSourcePdf, V4SourcePdfOverLimit,
+    validate_admission_document_ids,
 )
 from disclosure_anchor.application.ports.remote_parse_v4_source_rejection import V4SourceRejectionCommit
 from disclosure_anchor.application.ports.staged_provider_parser import V4StageGuard
@@ -72,6 +73,7 @@ class StagedV4NewWorkAdmitter:
         ingress: DurableStagedIngressV4, candidate_page_size: int,
         admission_guard: Callable[[], None] = lambda: None,
         process_guard: Callable[[], None] = lambda: None,
+        admission_document_ids: tuple[str, ...] | None = None,
     ) -> None:
         if (
             not callable(getattr(prepared_claims, "admit_new", None))
@@ -92,6 +94,8 @@ class StagedV4NewWorkAdmitter:
         self._candidate_page_size = candidate_page_size
         self._admission_guard = admission_guard
         self._process_guard = process_guard
+        validate_admission_document_ids(admission_document_ids)
+        self._admission_document_ids = admission_document_ids
         self._after_document_id: str | None = None
         self._scan_blocked_at: dict[str, int] = {}
         self._scan_ineligible: set[str] = set()
@@ -107,7 +111,13 @@ class StagedV4NewWorkAdmitter:
     ) -> V4AdmissionObservationResult:
         # Read-only immutable factory inputs; do not access mutable cursor/claim
         # state here. The future transports the completed result to controller.
+        self._require_candidate_scope(request.candidate)
         return self._ingress_factory.observe(request, stage_guard=stage_guard)
+
+    def _require_candidate_scope(self, candidate: V4OrdinaryParseCandidate) -> None:
+        if (self._admission_document_ids is not None
+                and candidate.document_id not in self._admission_document_ids):
+            raise ValueError("V4 ordinary candidate is outside commissioning scope")
 
     def accept_observation(self, result: V4AdmissionObservationResult) -> None:
         if (type(result) is not V4AdmissionObservationResult
@@ -157,6 +167,7 @@ class StagedV4NewWorkAdmitter:
             if self._ready_observation is not None:
                 ready = self._ready_observation
                 candidate = ready.request.candidate
+                self._require_candidate_scope(candidate)
                 if isinstance(ready.source, V4SourcePdfOverLimit):
                     self._record_blocked(
                         V4InitialIngressCapacityBlocked(
@@ -204,6 +215,7 @@ class StagedV4NewWorkAdmitter:
             ):
                 raise ValueError("V4 ordinary candidate cursor did not advance within its bound")
             for index, candidate in enumerate(page.candidates):
+                self._require_candidate_scope(candidate)
                 try:
                     request = self._ingress_factory.observation_request(
                         candidate, available_credits=remaining,

@@ -125,7 +125,7 @@ fresh deployment 必须先在 worker/GC 保持 unloaded + persistently disabled 
 ```bash
 make mineru-smoke \
   RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
-  RECEIPT=/private/path/mineru-smoke-receipt.v5.json \
+  RECEIPT=/private/path/mineru-smoke-receipt.v6.json \
   CANARY_CACHE=/private/path/mineru-canary.v2.json
 ```
 
@@ -135,11 +135,17 @@ make mineru-smoke \
 API image/config/env/mount/network、inference image/model/config/env、live served model ID、唯一出现的
 `max_num_seqs=128` 与 `mm_processor_cache_gb=0`，并要求 API health 固定为 MinerU 3.4.4/protocol 2、
 task slots 与 pending 必须同时等于 versioned serial manifest/worker profile 的 1，window=16、retention=600s、cleanup=30s；2/2、3/3 与 1/3 均 fail-closed。它连续三次走 96×48 `M7` PNG 的精确 OCR
-多模态请求，再通过固定 API 对冻结单页 PDF 跑一次官方 full-PDF Hybrid-medium writer/artifact reader。
+多模态请求，再通过 protocol-v2 固定 API 对冻结单页 PDF 跑一次官方服务端
+full-PDF Hybrid-medium writer / 共用 artifact reader，不再用缺少任务身份字段的官方 CLI 提交。
 API before/after 必须原样保留 retained terminal gauges 且两端 queued=processing=0；smoke 成功由
-official writer、ProviderDocument 和清理证据证明，不对 completed/failed 人口 gauge 做差值推断。独立 `TMPDIR`、MinerU 进程和
-外部 `mineru-api-client-*` 差集
-必须在 PASS 前都证明为零，只保留新建且路径不同的显式 receipt/cache；已有输出路径会 fail closed，
+official writer、ProviderDocument 和清理证据证明，不对 completed/failed 人口 gauge 做差值推断。
+MinerU 进程和外部 `mineru-api-client-*` 差集必须在 PASS 前证明为零。
+每次以 `<receipt>.diagnostic/` 的 new-only 0700 私有目录保留 0600 intent/accepted/terminal/
+validated/disposal 审计记录。先验证任务身份、ZIP hash/bytes、完整源/输出页数和产物，
+清理本次生成的本地副本后落盘独立诊断处置意图，再 ACK 这个 exact task，并核验 consumed
+响应及同 key 的精确 404。它不伪造 PG `finish_committed`，不能被生产发布路径用作 ACK 权限。
+失败或响应不确定时保留原 episode 和残留，不自动换 key 重提、不 ACK 未验证任务、不删除未知树；
+停止后续提交，按私有意图中的原 key 做只读恢复核对。原始 PDF 不在清理范围。已有输出路径会 fail closed，
 不能覆盖旧 PASS。smoke 成功只产生 bootstrap 证据，此时仍不得启动 worker；还要完成下述短
 held-out validation。最终把三条新路径分别写入 `DISCLOSURE_MINERU_SMOKE_RECEIPT`、
 `DISCLOSURE_MINERU_CANARY_CACHE` 与 `DISCLOSURE_MINERU_VALIDATION_RECEIPT`，并固定
@@ -190,6 +196,22 @@ health、网络、egress、空 output-root 或 formal collector 校验失败都�
 显式 `ExitCode/stdout/stderr`，并并行排空双流、以 UTF-8 字节写入 `docker exec -i`；不得改回依赖
 `$LASTEXITCODE` 的调用运算符，也不得跳过 exact source preflight。
 
+protocol-v2 启动后的输出根并非物理零文件：唯一控制树
+`.agent-task-protocol-v2/registry.json` 保存提交水位与已消费 tombstone，不能删除来通过安装门。
+runtime observation v5 保留真实 `file_count/total_bytes`，另附 `mineru-output-quiescence.v1`：
+在 Linux bind-mount 命名空间固定根/目录/文件身份、读取有界稳定 canonical registry-v2 字节，
+只接受空登记或已完全清理的 consumed 记录；未知目录（包括空目录）、链接、临时文件和任何
+仍持有资源的记录均拒绝。首次旧 API 安装前才允许真正空根；新 API commissioning 必须有登记。
+安装器与 collector 调用同一已绑定源码的只读检查，前后核对 API idle；这不代替停用 producer
+和实际 writer drain，也不把瞬时快照当成防止新提交的锁。旧 v4 observation 不能用于新 attestation。
+
+collector 的独立 Python 进程只检查安装字节/package/marker，不能读取服务进程的
+`get_task_manager()`。真实对象容量由正在服务的 `/health` 返回闭合
+`task_protocol_runtime`（`mineru-task-runtime.v1`）；包含实际 registry/executor 的容量，
+effective pending 也取自同一 HTTP 证据。collector 有界读取并复核 API container/start epoch。
+所有 wire health 消费者先严格验证 protocol-v2 标记与 runtime 子证明，再显式投影为原有
+13 字段 receipt/observer 形状；旧规范化 receipt 可继续读取，但不能冒充 live wire health。
+
 bootstrap 与 steady state 是两个独立 profile：bootstrap 不启动 resident worker、不开放 queue
 admission；steady state 只在当前 runtime smoke 与短 held-out validation 通过后使用已验证包络。
 当前候选 steady 参数是 `WORKER_BATCH_SYNC=13`、download/parse=`50/50`、
@@ -211,12 +233,12 @@ make mineru-service-epoch-freeze \
   SSH_IDENTITY=/private/path/operator-key \
   SSH_KNOWN_HOSTS=/private/path/known_hosts
 
-# 逐份生成新路径的 diagnostic_custom smoke v5；示例只列两份。
+# 逐份生成新路径的 diagnostic_custom smoke v6；示例只列两份。
 make mineru-smoke RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
-  INPUT=/private/path/heldout-a.pdf RECEIPT=/private/path/heldout-a-v5.json \
+  INPUT=/private/path/heldout-a.pdf EXPECTED_SHA256=<exact-source-sha256> RECEIPT=/private/path/heldout-a-v6.json \
   CANARY_CACHE=/private/path/heldout-a-canary.json
 make mineru-smoke RUNTIME_MANIFEST=/private/path/mineru-runtime-bundle.v8.json \
-  INPUT=/private/path/heldout-b.pdf RECEIPT=/private/path/heldout-b-v5.json \
+  INPUT=/private/path/heldout-b.pdf EXPECTED_SHA256=<exact-source-sha256> RECEIPT=/private/path/heldout-b-v6.json \
   CANARY_CACHE=/private/path/heldout-b-canary.json
 
 make mineru-service-epoch-freeze \
@@ -227,10 +249,10 @@ make mineru-service-epoch-freeze \
   SSH_KNOWN_HOSTS=/private/path/known_hosts
 
 make mineru-validation-receipt \
-  SMOKE_RECEIPTS="/private/path/heldout-a-v5.json /private/path/heldout-b-v5.json" \
+  SMOKE_RECEIPTS="/private/path/heldout-a-v6.json /private/path/heldout-b-v6.json" \
   EPOCH_BEFORE=/private/path/epoch-before.json \
   EPOCH_AFTER=/private/path/epoch-after.json \
-  RECEIPT=/private/path/mineru-heldout-validation-v1.json
+  RECEIPT=/private/path/mineru-heldout-validation-v2.json
 ```
 
 validation builder 与 resident gate 都要求输入/输出为 owner-only、单链接、稳定读取的新文件；每份 PDF
@@ -245,15 +267,15 @@ deployment ritual。
 `DEGRADED_TRANSPORT`、关闭后续 admission 并继续当前 owner 的自然 drain；恢复后的样本必须原样保留，
 但该阶段仍是 evidence-incomplete。health JSON/identity/slot/window 的严格合同错误仍是 operational failure。
 `completed_tasks`/`failed_tasks` 是保留期内 terminal registry 的人口 gauge，可随 600 秒 retention/30 秒
-cleanup 合法下降，不能把它们解释为累计任务账。当前 deployment gate 只接受 smoke v5 与 held-out
-validation v1；其他历史 receipt 不具备 admission 权限。
-每份输入是否成功改由 exact input SHA、official writer 零退出、完整源/输出页数相等和 provider bundle hash
+cleanup 合法下降，不能把它们解释为累计任务账。当前 deployment gate 只接受 smoke v6 与 held-out
+validation v2；v5 及其他历史 receipt 不具备 admission 权限。
+每份输入是否成功改由 exact input SHA、严格 protocol-v2 completed 证据、完整源/输出页数相等和 provider bundle hash
 逐文档证明；每阶段仍必须自然 drain 到 queued=processing=0。API 没有 cancel endpoint；observer-only
 failure 只能关闭新 admission，不能终止当前本地 CLI 来冒充远端 cancel。文档自身失败或 operator 本地中止
 可以终止本地 CLI，但两种路径都必须在同一 deadline 内容忍短暂 health transport failure，并等待远端自然
 drain。无法证明 drain 就 FAIL，不能重启服务、进入下一阶段或把 receipt 用于 admission。
 metrics 持续不可用、waiting≥64 连续 30 秒、preemption counter 任意变化，以及任一解析失败、429/5xx、
-overload、OOM 或 EngineCore failure 都立即 FAIL，清理本地子进程/临时目录且不进入下一阶段。
+overload、OOM 或 EngineCore failure 都立即 FAIL，不进入下一阶段；诊断 owner 按上述失败规则保留恢复证据。
 每阶段 receipt 除 min/max 外还保留 running/waiting/KV 的 p95；当前只作容量诊断，不在没有现场
 证据时把历史经验阈值升级成正确性门禁。
 receipt 必须是不存在的新路径，按 mode 0600 创建；FAIL receipt 不能用于开启 steady state。
@@ -263,9 +285,58 @@ parse-capable worker/pipeline/admin 会在连 DB 前重算并核验当前 PASS �
 
 ### Staged-v4 resource cutover (default-off)
 
+当前 serial process profile 的 `cpu_worker_threads=3` 指 `MINERU_PDF_RENDER_THREADS` 的
+PDF 渲染 worker 配置上限，不是整个进程的 OS 线程数；`omp_thread_count=1` 对应显式
+OMP/MKL/OpenBLAS 单线程策略。Compose、collector 的闭合环境清单和 attester 同步核验，
+不能把新 probe 进程的默认值或某时刻 `/proc` 线程人口当作这个配置。容器内存上限从实际
+Docker/cgroup 读取；v1 要求有限正数，`max`/未设置不能编造为机器总内存或测试 fixture。
+现场资源 cap 写私有 compose 并经原安装器在 quiescent 状态应用，重采集后才建新 profile。
+
 staged-v4 的默认关闭 source candidate 另有 [V4 资源生命周期与离线切换步骤](../design/v4-resource-lifetime.md)：
 0060→全历史 spec 回填→0061 验证；实际旧 writer 退出是前置，不可用 PG lease 代替。
 启动历史隔离残留门或 ACK 前残留检查失败时保留证据/信用，不手工伪造清理回执或删除未知树。
+
+上线前有界验证使用 `python -m disclosure_anchor.cli.staged_commission --document-id <id>`
+（可重复该参数，1..8 个唯一 ID）`--max-seconds <1..86400> --receipt-out <runtime下的新路径>`。
+要求显式 staged-v4、真实 process profile/keyring、当前部署证明和完整旧 writer 排空。
+只运行一次生产 coordinator，不启动采集、维护或常驻循环。ID 范围在普通 backlog SQL 的
+keyset/LIMIT 前生效，并在源 IO、H0、源拒绝前检查；它不放宽原有公司/分类/重试 eligibility。
+prepared/recovery 保持全量；有范围外未闭合 V4 owner 就在构造/控制器边界拒绝，不隐藏 owner。
+文档数不是 attempt 次数限制，选择内重试沿用原有规则。截止/信号关闭 admission 并走原协调器
+撤权/实际排空，不声称远端取消。异常保留 intent、DB owner 和资源，不能删除后重提以掩盖失败。
+私有 `staged-v4-commissioning.v1` receipt 逐文档报告 `published|recovered_published|already_ineligible|failed|blocked`。
+PASS 要求相对开始时新建的 active+succeeded run、同 run 的 acked attempt、完整恢复、QUIESCENT、
+零 held credits 和无 errors；同 run 的恢复发布单独列出，不冒充新 run 证明。它不是吞吐/整小时资格。
+
+本地 writer 热修复后，禁止把新 runtime/profile 写回已有 H0，或跳过普通部署门。只对已 accepted
+的结果取回/发布尾部提供显式 `python -m disclosure_anchor.cli.staged_recover`：
+`--grant <private-json> --review <private-json> --current-runtime-manifest <private-json>`，
+另传 `--ssh-host`、`--ssh-user`、`--ssh-identity`、`--ssh-known-hosts`、`--max-seconds`、
+`--receipt-out`。保持原 settings/profile/keyring/资格回执；不启动常驻 worker，不自动签发 grant。
+`mineru-accepted-result-recovery-grant.v1` 是仓外 0600、有效期不超过一天的操作员兼容批准，
+精确绑定旧/新 runtime 与 writer SHA、原 process/worker profile、1..8 个原 document/attempt/run/
+fence/source/H0/spec/accepted receipt SHA，以及独立 GO review 的规范 JSON SHA。
+review 绑定新旧 writer 和已审查差异 SHA；没有独立审查不能生成这份批准。
+只允许 `identity-content-encoding-recovery` 或在同一尾部另发现跨页祖先定位校验错误时使用
+`identity-content-encoding-and-publication-lineage-recovery`；每次代码变化均须新 exact GO/grant。
+其他升级不能复用这份窄批准。
+`--current-runtime-manifest` 只接受 `mineru-recovery-runtime-manifest.v1`：从原已验证 manifest
+仅替换当前 client writer SHA，显式绑定历史 runtime/writer SHA 与原 heldout container epoch SHA。
+这是派生恢复身份，不是新的正常部署 attestation；保留的 accepted 输出不可为取得普通资格而删除。
+执行前另存只读远端代码核验：实际源文件/兼容 marker、collector/compose SHA 和容器 image/epoch
+必须与原观察一致，且不存在代码 bind mount。排空前不得把派生身份冒充新的 smoke/heldout PASS。
+恢复门验证旧资格为历史证据、新代码为当前执行身份；除 writer 外，client/model/image/compose/
+topology 必须完全相同，并实时检查原容器 epoch 与安全计数。数据库全量责任检查仍保留，
+范围外 owner、prepared/reconciling、新 attempt/H0/spec、过期批准或 source/runtime 漂移均拒绝。
+普通与 prepared admission 均关闭，transport 在任何 task submit/reconcile IO 前拒绝；lease/GET/
+原发布/cleanup/ACK 保留既有 claim/fence/信用保护。私有恢复收据仅可给出 `RECOVERY_PASS`，
+要求原 attempt/run active+succeeded+acked、admitted=0、QUIESCENT、无 errors/held credits；
+`deployment_qualification=false`。排空后必须重新执行正常 attestation/smoke/heldout 才可接纳新任务。
+
+V4 ZIP 下载显式请求 `Accept-Encoding: identity` 并拒绝非 identity 响应；保留精确 Content-Length、
+流字节数、owner/header hash 及落盘 SHA 校验。HTTPX 的 `iter_bytes` 会按 Content-Encoding 解码，
+MinerU 的 GZip middleware 会让编码后的响应长度不同，不能拿它与原 ZIP 终态长度比较。
+参见 [HTTPX streaming](https://www.python-httpx.org/quickstart/#streaming-responses)。
 
 ### 1.1b Semantic provider chain
 
@@ -364,18 +435,19 @@ runtime/profile identity，并重新通过 multimodal canary、epoch、OOM/resta
 新的受控容量搜索必须满足：
 
 - 使用独立 held-out 完整真实 PDF，覆盖 regular/heavy/huge、OCR、表格/公式、跨页结构和
-  controlled failure；单轮目标 10--20 分钟，不机械重复数小时 baseline；
+  controlled failure；按具体证据问题确定试验范围，不固定单轮时长或机械重复数小时 baseline；
 - 仅当 current synchronized evidence 缺失、超过允许时效、无法与当前 epoch 对齐，或噪声导致证据
   不可用时，才补采一个短串行 anchor；已有可用 current evidence 时不得机械重跑；
-- 先在单 task slot 下隔离 sweep effective hybrid ratio `1/2/4/8`，再一次只改变 slots、pending、window、
-  C-stage 或 credit envelope 的一个相邻值；不得预设某个候选是局部最优；
+- 从当前已验证 exact profile 出发，只对实测瓶颈提出有明确假设、安全预算和验收依据的调参；
+  不要求 ratio `1/2/4/8`、固定 arms 或 ABBA，不能用本轮授权绕过 profile 变更和实际 drain 门；
 - 全程用 synchronized telemetry 记录 GPU 250--500 ms、host/queue 1 s、phase transition 与 durable commit；
   主指标是同一完整 GPU-host wall span 内按 source identity 去重、成功整文档发布的页数/小时；
 - Docker/WSL/CPU/GPU 各资源域使用实测 baseline、active leases 和动态 guard；7 GiB 不是下限或目标；
 - 任一 source/page/structure closure、顺序、fallback、OOM、restart、epoch、credit、drain 或 telemetry
   completeness 失败立即停止该 setting；GPU 峰值或均值本身不能宣告胜出；
-- 连续相邻提高已进入证据定义的平台期，或 backlog-rich 时 GPU/CPU 已稳定工作且没有可调度 ready
-  work 被闲置，即停止搜索并冻结 practical winner。当前没有在线自调执行面。
+- 用正确整文档发布 goodput、资源稳定性和观测不确定性判断是否继续，不强制平台期阈值或固定轮数；
+  utilization 或 queue 单项不能宣告胜出。完整 UTC 主机小时覆盖仍是 KPI 证据门，不是固定调参仪式。
+  当前没有在线自调执行面。
 
 安装器仍必须以 `--provenance=false` 构建并闭合 base digest、Dockerfile/patcher hash、image
 labels/marker、安装 receipt 与 runtime attestation。复用已发布镜像时，只允许既有

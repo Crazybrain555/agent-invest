@@ -8,7 +8,61 @@ created_at: 2026-06-26
 
 # API / public view / source_ref 契约检查清单
 
+## 私有部署证明：输出静止性（2026-09-06）
+
+- `mineru-windows-runtime-observation.v5` 的 output_root 保留物理文件数/字节数，并要求
+  `mineru-output-quiescence.v1`；不改公共 Unit/Filing/API 或 registry-v2 持久化语义。
+- 固定 bind-mount 根身份与稳定原始登记 hash；只允许唯一登记控制树及零资源 consumed 历史，
+  保留 tombstone/提交水位，不删除状态或把文件数伪造为零。
+- 安装前旧 runtime 可为空根；新 runtime 必须有登记。拒绝未知目录/文件、链接、并发替换、
+  非 canonical/重复字段/非有限数值、根身份漂移、未清理记录；API 前后 idle 加实际 writer 排空。
+- 检查器复用协议的只读 decoder，不创建 registry、不执行启动修复；源码 hash、collector 版本、
+  installer、attester 与正负例同步。旧 observation v4 拒绝；新 Windows/held-out gate 仍需现场证明。
+- serving `/health` 新增闭合 `task_protocol_runtime` v1，以已初始化的真实 registry/executor
+  对象报告容量；collector 不在新进程构造或读取服务 globals。wire 的 v2 标记及容量子证明完整
+  验证后才投影原有 13 字段健康 receipt；拒绝缺失/未知字段/错误类型/漂移，不改变旧 receipt 形状。
+
 ## 1. 对外契约对象
+
+已发布 V4 bundle 的通用 source admission 必须在同一个完整 pinned tree 中验证闭合 canonical
+materialization manifest、provider envelope 及全部 payload hash/bytes；只对经过验证的 parser
+payload 重建语义，并要求完整 `ProviderDocument` 相等。请求路径绑定 envelope 的 canonical
+published 路径；manifest 的历史 scratch output/spool 不要求仍存在，也不冒充 promotion/readiness
+证明。document/run/source/pages/parser target 必须交叉匹配；外层仍核对 processing run 登记的
+权威 envelope hash/身份。控制文件缺失、伪装 parser payload、额外文件、链接、篡改或读取途中
+换根均失败关闭，不降级 legacy。无管理文件的 legacy bundle 仍保留所有普通 sidecar。
+不删除/重写已发布控制文件、不改公共 Unit/Filing/API。回归包含发布/ACK 后真实 PG 通用 admission、
+完整重建 equality，以及控制文件/identity/projection/race 正负例；真实来源只读重放另行记录。
+
+私有 `staged-v4-commissioning.v1` CLI 只允许显式 1..8 唯一 document IDs 和有限截止时间，
+一轮真实 coordinator；默认 resident 组合仍使用 None/全普通队列，worker once 仍拒绝 staged。
+allowlist 在 SQL keyset/LIMIT 前筛选并在 IO/H0/源拒绝前复核；prepared/recovery 不筛选，
+范围外未闭合 owner 阻止启动/继续。新 active+succeeded run 和同 run acked 才是新发布证明，
+QUIESCENT/零 credit 单独不等于 PASS。scope/组合/CLI/V4 wire source 纳入 writer identity。
+验证包含 SQL 合并 cursor/allowlist、注入范围外 candidate、恢复 owner 拒绝，以及 managed scratch
+真实 runtime builder→PG→全七阶段→发布→清理/ACK；HTTP/语义 fake 不能冒充真实 GPU/PDF 质量。
+
+私有部署 smoke v6 / heldout validation v2 以闭合 `mineru-diagnostic-disposal.v1`
+证明独立诊断 task 的 source/runtime/attempt/fence/key、terminal ZIP hash/bytes/owner、
+完整 source/provider 页数、bundle、local resource absence、consumed ACK 和同 key 404。
+bootstrap 保持 DB/queue-free；这不是生产 `finish_committed`，不得构造或替代其 durable witness。
+意图在提交前持久化；validated evidence 与 local cleanup/处置意图先于 ACK。响应不确定时
+保留原 key/episode 并停止，不新 key 重提或清理未知资源。原始输入保留；成功只清理本次诊断副本。
+新-only audit records 使用 0700 目录/0600 文件。v5 smoke 不升级冒充 v6，writer hash 覆盖
+新 adapter、共享 wire/ZIP/reader、gate/receipt builders 与所用 ports；版本/消费者/负例同时更新。
+有界提交响应在解析前留存 exact bytes/hash/status。显式 `reconcile_submitted=True` 仅允许
+尚未记录 accepted、且原 intent/完整 snapshot/resource inode/source/runtime 均相等的诊断恢复；
+只 GET 原 key，404 或漂移不得重提。后续阶段失败仍保留证据，不由此入口推断处置权限。
+MinerU 3.4.4 POST builder 的可选 `message` 只接受 `Task submitted successfully` 精确值；
+GET 无此字段同样有效，所有身份字段仍必需，未知字段继续拒绝；V3/V4/诊断同步。
+
+私有 staged 请求摘要 `mineru-staged-request.v2` 固定上传名为
+`sha256_<64hex>.pdf`，与源身份 reader/官方 writer 产物 stem 一致。这个版本不是远端
+task-protocol.v2 的变更，也不新增公共 API/Unit/Filing 字段。bare-hash v1 请求摘要不能
+静默重算或升级；旧 attempt/证据保持原字节并 fail closed，只有全新 attempt 使用新摘要。
+V3 prepared port、V4 ingress/resolver/command 与纯 wire codec 必须同时验证精确命名；
+禁止下载后重命名官方产物或放宽 reader 到任意 stem。已有数据库若存在历史请求，先按
+原证据排空/关闭后再切换；不改写已应用迁移。生产部署仍需 scratch/完整/独立及真实门。
 
 只允许对外稳定发布：
 
@@ -84,7 +138,7 @@ scope keys 过滤参数可用（filing_type / payload_kind / heading_prefix（�
   仅由当前叶标题自身，或第一个实质/visual part 前 declaration-only leading part 中受控、成对且一致的
   勾选声明确定；不跨 Unit 继承，实质/视觉 carrier 后的 child-local selector、普通文字、双选、
   双空或冲突均为 NULL；部分索引 ix_document_unit_applicability；
-  page_no：artifact_locator 首页码提升列）。
+  page_no：Unit 本身首个 source block 的页码，非完整 locator 祖先证据的最小页）。
 0007 起 document_units_v1 追加 6 列：asset_kind / observed_at / source_tier /
   trace_level / raw_file_hash / query_projection_hash
   （0039 当前唯一 v1 为 **40 列**，以 Unit 自有 `body_status` 取代 Document-only
@@ -181,6 +235,18 @@ view 列集不变。
 ```
 
 ## 4. source_ref 检查
+
+私有 accepted-result recovery 不改变 source_ref/public view：历史 H0/spec/runtime/profile 不重写，
+当前执行代码另记在 `staged-v4-accepted-result-recovery.v1` receipt。验证 versioned private grant +
+独立 GO review + 新旧 exact writer/runtime + 相同远端 epoch；拒绝普通/prepared 新准入和 task POST。
+派生恢复 wrapper 必须绑定历史 runtime/writer 与原 heldout epoch；普通部署 wrapper、来源/epoch
+不匹配和多余字段均拒绝。先核验远端实际代码无漂移；该 wrapper 不构成新部署资格。
+原 attempt/run 发布、cleanup/ACK、零信用均闭合才能 RECOVERY_PASS，且 deployment_qualification=false。
+下载只接受 identity Content-Encoding 与原 ZIP 精确长度/hash；压缩、缺长、错长都在读流前拒绝。
+对应 loader/CLI/全量 scope/transport 负例和 scratch 原 H0 重启恢复测试必须随实现同步。
+V4 publication 保留完整 sorted/unique `page_numbers`（含祖先标题/continuation/reconciliation）；
+`page_no` 保留 Unit 本身首个 source block 的页码，只要求属于完整页集，不要求等于祖先最早页。
+正页码、source 页数上界、未知 block 拒绝和 routed-draft hash 闭合不放宽；既有 public 列语义不变。
 
 source_ref 必须包含：
 

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from disclosure_anchor.application.contracts.provider_document_admission import (
     AdmittedProviderDocument,
 )
+from disclosure_anchor.application.contracts.provider_document import ProviderPayload
 from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitBuildResult,
     ProviderUnitDraft,
@@ -34,13 +35,55 @@ from disclosure_anchor.application.services.atomic_publication_request_builder_v
 from disclosure_anchor.application.services.semantic_router import (
     SemanticRouteBatchResult,
 )
+from disclosure_anchor.application.services.provider_unit_builder import build_provider_units
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
 from tests.integration._remote_parse_v4_factory import build_v4_authority_fixture
 from tests.unit._semantic_routes import _fallback_receipt
+from tests.unit import test_provider_unit_builder as provider_fixture
 
 
 class AtomicPublicationRequestBuilderV4Tests(unittest.TestCase):
+    def test_real_cross_page_child_keeps_own_primary_and_complete_ancestor_lineage(self) -> None:
+        provider = provider_fixture._document(
+            pages=(
+                (
+                    provider_fixture._block(0, 0, "text", (ProviderPayload("text", None, "一、考核安排"),), annotation="title", level=1),
+                    provider_fixture._block(1, 0, "text", (ProviderPayload("text", None, "考核按照年度进行。"),), annotation="paragraph"),
+                ),
+                (
+                    provider_fixture._block(2, 1, "text", (ProviderPayload("text", None, "（一）考核次数"),), annotation="title", level=2),
+                    provider_fixture._block(3, 1, "text", (ProviderPayload("text", None, "每个会计年度考核一次。"),), annotation="paragraph"),
+                ),
+            ),
+            segments=(),
+        )
+        admitted = provider_fixture._admitted(provider)
+        draft = build_provider_units(admitted).units[-1]
+        self.assertEqual(draft.page_no, 2)
+        self.assertEqual(tuple(h.source_index for h in draft.locator.heading_chain), (0, 2))
+        document = e.Document(document_id=admitted.envelope.document_id, status="downloaded",
+                              provider_document_id=admitted.envelope.provider_document_id)
+        unit = ProductionAtomicPublicationRequestBuilderV4._unit(
+            draft=draft, document=document,
+            processing_run_id=admitted.envelope.artifact_owner_processing_run_id,
+            admitted=admitted,
+        )
+        self.assertEqual((unit.page_no, unit.page_numbers), (2, (1, 2)))
+        self.assertEqual(unit.content_hash, draft.content_hash)
+        self.assertEqual(unit.structure_hash, draft.structure_hash)
+        self.assertEqual(unit.query_projection_hash, draft.query_projection_hash)
+        self.assertEqual(json.loads(unit.canonical_artifact_locator_json)["heading_chain"][0]["source_index"], 0)
+        unknown_heading = replace(draft.locator.heading_chain[0], source_index=999)
+        invalid = replace(draft, locator=replace(draft.locator,
+                          heading_chain=(unknown_heading, *draft.locator.heading_chain[1:])))
+        with self.assertRaisesRegex(AtomicPublicationRequestBuilderV4Error, "unknown provider block"):
+            ProductionAtomicPublicationRequestBuilderV4._unit(
+                draft=invalid, document=document,
+                processing_run_id=admitted.envelope.artifact_owner_processing_run_id,
+                admitted=admitted,
+            )
+
     def test_builds_from_exact_materialization_and_untouched_ingress(self) -> None:
         harness = _Harness()
         guard = _Guard()

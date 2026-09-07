@@ -740,7 +740,7 @@ def _execution_spec(attempt_id: str, fence_identity: str, source_sha: str) -> V4
     request = submission_request_exact_bytes_v2(
         api_origin=template.api_origin,
         form=submission_form_v2(template.parser_options, server_url=template.server_url),
-        upload_filename=source_sha[7:] + ".pdf",
+        upload_filename="sha256_" + source_sha[7:] + ".pdf",
     )
     return replace(template, parser_identity=replace(template.parser_identity, name="MinerU"),
                    prepared_submission=prepared, request_exact_bytes=request,

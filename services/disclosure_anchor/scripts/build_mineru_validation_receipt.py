@@ -1,6 +1,6 @@
 """Build one fail-closed held-out MinerU validation receipt.
 
-The inputs are two to eight independently produced ``mineru_smoke_receipt.v5``
+The inputs are two to eight independently produced ``mineru_smoke_receipt.v6``
 receipts for complete, operator-selected PDFs that are not the repository smoke
 fixture.  This command performs no parse and touches no database or queue.  It
 only seals the already-produced receipts into one bounded, new-only artifact
@@ -24,10 +24,11 @@ from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentityError,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+from disclosure_anchor.adapters.runtime.mineru_diagnostic import validate_diagnostic_disposal
 
 
-RECEIPT_SCHEMA = "mineru_heldout_validation_receipt.v1"
-SMOKE_SCHEMA = "mineru_smoke_receipt.v5"
+RECEIPT_SCHEMA = "mineru_heldout_validation_receipt.v2"
+SMOKE_SCHEMA = "mineru_smoke_receipt.v6"
 POLICY = "operator-held-out-complete-pdf.v1"
 MIN_DOCUMENTS = 2
 MAX_DOCUMENTS = 8
@@ -103,7 +104,7 @@ def _positive_int(value: object, *, label: str) -> int:
 
 def _validate_smoke(payload: dict[str, Any]) -> tuple[str, str]:
     if payload.get("schema") != SMOKE_SCHEMA or payload.get("status") != "pass":
-        raise ValueError("held-out smoke receipt is not v5 PASS")
+        raise ValueError("held-out smoke receipt is not v6 PASS")
     if payload.get("database_access") != "none" or payload.get("queue_access") != "none":
         raise ValueError("held-out smoke receipt was not DB/queue free")
     input_evidence = payload.get("input")
@@ -135,6 +136,11 @@ def _validate_smoke(payload: dict[str, Any]) -> tuple[str, str]:
     manifest_identity = runtime_identity.get("runtime_manifest_identity_sha256")
     if not _sha256(manifest_identity):
         raise ValueError("held-out runtime manifest identity is missing")
+    validate_diagnostic_disposal(
+        payload.get("diagnostic_disposal"), source_pdf_sha256=str(source_sha256),
+        runtime_identity=str(manifest_identity), source_page_count=source_pages,
+        provider_bundle_sha256=str(provider.get("provider_bundle_sha256")),
+    )
     return str(source_sha256), str(manifest_identity)
 
 

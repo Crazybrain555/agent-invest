@@ -166,7 +166,8 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
         )
         return replace(second, work=(*first.work, *second.work))
 
-    def _fixture(self, *, oversized_prefix: int = 0, page_size: int = 8):
+    def _fixture(self, *, oversized_prefix: int = 0, page_size: int = 8,
+                 admission_document_ids: tuple[str, ...] | None = None):
         profile = _profile()
         credit = build_staged_resource_credit_envelope(
             profile=profile,
@@ -251,8 +252,17 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
             ingress_factory=_PrefixFactory(),
             ingress=ingress,
             candidate_page_size=page_size,
+            admission_document_ids=admission_document_ids,
         )
         return admitter, candidates, claims, claimed, credit
+
+    def test_commissioning_scope_rejects_injected_candidate_before_observation(self) -> None:
+        admitter, _, claims, _, credit = self._fixture(admission_document_ids=("selected",))
+        with mock.patch.object(admitter._ingress_factory, "observation_request") as observe:
+            with self.assertRaisesRegex(ValueError, "outside commissioning scope"):
+                admitter.admit_new(limit=1, available_credits=credit.reservation)
+            observe.assert_not_called()
+        self.assertEqual(claims.claims, [])
 
     def test_creates_h0_then_claims_it_with_remaining_credit(self) -> None:
         admitter, _, claims, claimed, credit = self._fixture()

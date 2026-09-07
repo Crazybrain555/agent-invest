@@ -1,6 +1,7 @@
 """Resident-worker MinerU deployment gate regressions."""
 
 from __future__ import annotations
+from tests._mineru_diagnostic_fixture import diagnostic_disposal_fixture
 
 from datetime import UTC, datetime, timedelta
 from dataclasses import replace
@@ -212,7 +213,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 else "sha256:" + f"{index:064x}"
             )
             return {
-                "schema": "mineru_smoke_receipt.v5",
+                "schema": "mineru_smoke_receipt.v6",
                 "status": "pass",
                 "started_at_utc": start.isoformat(),
                 "finished_at_utc": (start + timedelta(seconds=2)).isoformat(),
@@ -255,6 +256,10 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                     "block_count": 2,
                     "artifact_count": 0,
                 },
+                "diagnostic_disposal": diagnostic_disposal_fixture(
+                    source=source_sha, runtime=runtime_identity, pages=pages,
+                    bundle="sha256:" + f"{index + 10:064x}",
+                ),
                 "cleanup": {
                     "external_api_temp_dirs_created": 0,
                     "external_mineru_processes_after": 0,
@@ -317,7 +322,7 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             }
 
         validation = {
-            "schema": "mineru_heldout_validation_receipt.v1",
+            "schema": "mineru_heldout_validation_receipt.v2",
             "status": "pass",
             "created_at_utc": (now - timedelta(seconds=30)).isoformat(),
             "policy": "operator-held-out-complete-pdf.v1",
@@ -404,6 +409,8 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             registry_nonterminal_cap=1,
             registry_terminal_cap=127,
             processing_window_size=16,
+            cpu_worker_threads=3,
+            omp_thread_count=1,
             raster_stage_slots=1,
             layout_stage_slots=1,
             postprocess_stage_slots=1,
@@ -463,6 +470,8 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 )
 
             for update in (
+                {"cpu_worker_threads": 4},
+                {"omp_thread_count": 2},
                 {"registry_terminal_cap": 126},
                 {"result_reservation_bytes": 128 * 1024 * 1024},
                 {"max_unacked_result_bytes": 1024 * 1024 * 1024},
@@ -518,13 +527,13 @@ class MinerUDeploymentGateTests(unittest.TestCase):
             settings, client, _ = self._fixture(Path(tmp), now=datetime.now(UTC))
             assert settings.disclosure_mineru_smoke_receipt is not None
             payload = json.loads(settings.disclosure_mineru_smoke_receipt.read_bytes())
-            payload["schema"] = "mineru_smoke_receipt.v4"
+            payload["schema"] = "mineru_smoke_receipt.v5"
             settings.disclosure_mineru_smoke_receipt.write_text(json.dumps(payload))
             client_patch, code_patch = self._identity_patches(client)
             with (
                 client_patch,
                 code_patch,
-                self.assertRaisesRegex(MinerUDeploymentGateError, "v5 PASS"),
+                self.assertRaisesRegex(MinerUDeploymentGateError, "v6 PASS"),
             ):
                 require_mineru_deployment_gate(settings)
 

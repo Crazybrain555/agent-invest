@@ -16,6 +16,7 @@ from disclosure_anchor.adapters.db.postgres.atomic_document_publisher_v4 import 
 )
 from disclosure_anchor.adapters.db.postgres.staged_new_work_v4 import (
     PostgresV4OrdinaryParseCandidateSource,
+    require_commissioning_recovery_scope,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru_medium.http_remote_v4 import (
@@ -59,6 +60,7 @@ from disclosure_anchor.adapters.storage.provider_document_source import (
 )
 from disclosure_anchor.adapters.storage.v4_source_observation import BoundedV4SourcePdfObserver
 from disclosure_anchor.application.ports.parser import ParserIdentity, ParserOptions
+from disclosure_anchor.application.ports.staged_new_work_v4 import validate_admission_document_ids
 from disclosure_anchor.application.services.atomic_publication_request_builder_v4 import (
     ProductionAtomicPublicationRequestBuilderV4,
 )
@@ -82,9 +84,11 @@ from disclosure_anchor.application.services.staged_new_work_admission_v4 import 
     StagedV4NewWorkAdmitter,
 )
 from disclosure_anchor.application.services.staged_parse_coordinator import (
+    AdmissionOutcome,
     CoordinatorSnapshot,
     StagedParseCoordinator,
 )
+from disclosure_anchor.application.contracts.staged_resource_credit import ResourceCreditVector
 from disclosure_anchor.application.services.staged_v4_capacity import (
     staged_v4_coordinator_limits,
 )
@@ -93,6 +97,11 @@ from disclosure_anchor.application.use_cases.prepare_and_publish_whole_document_
     PrepareAndPublishWholeDocumentV4,
 )
 from disclosure_anchor.settings import Settings, load_staged_v4_settings
+
+
+class _RecoveryOnlyAdmission:
+    def admit_new(self, *, limit: int, available_credits: ResourceCreditVector) -> AdmissionOutcome:
+        return AdmissionOutcome(work=(), backlog_exists=False)
 
 
 @dataclass(slots=True)
@@ -125,11 +134,16 @@ def build_staged_worker_v4_runtime(
     progress: Callable[[CoordinatorSnapshot], None],
     publication_committed: Callable[[bool], None] = lambda _replaced: None,
     owner_identity: str | None = None,
+    admission_document_ids: tuple[str, ...] | None = None,
+    recovery_only: bool = False,
 ) -> StagedWorkerV4Runtime:
     """Compose exactly one seven-lane runtime after explicit mode selection."""
 
     if settings.worker_parse_execution_mode != "staged-v4":
         raise ValueError("staged V4 composition requires explicit staged-v4 mode")
+    validate_admission_document_ids(admission_document_ids)
+    if type(recovery_only) is not bool or (recovery_only and admission_document_ids is None):
+        raise ValueError("recovery-only composition requires explicit bounded document scope")
     if (
         not callable(ownership_guard)
         or not callable(admission_guard)
@@ -137,6 +151,18 @@ def build_staged_worker_v4_runtime(
         or not callable(publication_committed)
     ):
         raise ValueError("staged V4 process callbacks are invalid")
+    if admission_document_ids is not None:
+        original_ownership_guard = ownership_guard
+        selected_document_ids = admission_document_ids
+
+        def commissioning_ownership_guard() -> None:
+            original_ownership_guard()
+            require_commissioning_recovery_scope(engine, selected_document_ids)
+
+        ownership_guard = commissioning_ownership_guard
+        # Before profile/keyring/scratch construction and before any recovery
+        # write. The same guard also checks each controller effect boundary.
+        ownership_guard()
     staged = load_staged_v4_settings()
     loaded = load_mineru_process_profile(
         staged.process_profile_file,
@@ -179,6 +205,7 @@ def build_staged_worker_v4_runtime(
     claim_guard = DurableV4ClaimGuard(uow_factory=uow_factory)
     remote = MinerUHttpRemoteV4(
         request_timeout_seconds=limits.max_stage_step_seconds,
+        allow_task_submission=not recovery_only,
     )
     try:
         materialization = MinerUHttpStagedV4(
@@ -257,12 +284,14 @@ def build_staged_worker_v4_runtime(
                 engine=engine,
                 max_retries=settings.disclosure_max_parse_retries,
                 scope_classes=process_scope_classes,
+                admission_document_ids=admission_document_ids,
             ),
             ingress_factory=ingress_factory,
             ingress=ingress,
             candidate_page_size=limits.recovery_page_size,
             admission_guard=admission_guard,
             process_guard=ownership_guard,
+            admission_document_ids=admission_document_ids,
         )
         backend = DurableStagedCoordinatorBackendV4(
             persistence=persistence,
@@ -275,7 +304,7 @@ def build_staged_worker_v4_runtime(
             claim_guard=claim_guard,
             publisher=publisher,
             poll_seconds=worker_profile.provider_poll_milliseconds / 1000,
-            new_work_admitter=new_work,
+            new_work_admitter=_RecoveryOnlyAdmission() if recovery_only else new_work,
             publication_committed=publication_committed,
         )
         return StagedWorkerV4Runtime(
@@ -284,7 +313,7 @@ def build_staged_worker_v4_runtime(
                 limits=limits,
                 progress=progress,
                 process_guard=ownership_guard,
-                admission_observer=new_work,
+                admission_observer=None if recovery_only else new_work,
             ),
             remote=remote,
             owner_identity=exact_owner,

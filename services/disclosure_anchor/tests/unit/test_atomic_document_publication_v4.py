@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -116,6 +116,23 @@ SHA_E = "sha256:" + "e" * 64
 
 
 class AtomicDocumentPublicationV4Tests(unittest.TestCase):
+    def test_primary_page_is_member_of_complete_lineage_not_ancestor_minimum(self) -> None:
+        original = _request().units[0]
+        kwargs = {field.name: getattr(original, field.name) for field in fields(original)
+                  if field.name not in {"contract_version", "routed_draft_sha256"}}
+        kwargs.update(page_no=2, page_numbers=(1, 2))
+        unit = seal_pre_id_unit_publication_v4(**kwargs)
+        self.assertEqual((unit.page_no, unit.page_numbers), (2, (1, 2)))
+        self.assertNotEqual(unit.routed_draft_sha256, original.routed_draft_sha256)
+        for pages in ((1,), (), (2, 1), (1, 1, 2), (0, 2)):
+            with self.subTest(pages=pages), self.assertRaises(WholeDocumentPublicationV4Error):
+                seal_pre_id_unit_publication_v4(**{**kwargs, "page_numbers": pages})
+        with self.assertRaisesRegex(WholeDocumentPublicationV4Error, "routed-draft hash"):
+            replace(unit, routed_draft_sha256=original.routed_draft_sha256)
+        outside = seal_pre_id_unit_publication_v4(**{**kwargs, "page_numbers": (1, 2, 3)})
+        with self.assertRaisesRegex(WholeDocumentPublicationV4Error, "page closure"):
+            replace(_request(), units=(outside,))
+
     def test_publication_claim_is_noncanonical_and_binds_the_cas_identity(self) -> None:
         request = _request()
         claim = V4ClaimWitness(

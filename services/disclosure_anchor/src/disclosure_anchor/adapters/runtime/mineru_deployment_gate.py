@@ -22,6 +22,7 @@ from disclosure_anchor.adapters.runtime.mineru_canary import (
     model_id_sha256,
     probe_mineru_served_model,
 )
+from disclosure_anchor.adapters.runtime.mineru_diagnostic import validate_diagnostic_disposal
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
     MINERU_API_MAX_UNACKED_RESULT_BYTES,
@@ -55,8 +56,8 @@ from disclosure_anchor.application.contracts.strict_json import strict_json_load
 from disclosure_anchor.settings import Settings
 
 
-_SMOKE_SCHEMA = "mineru_smoke_receipt.v5"
-_VALIDATION_SCHEMA = "mineru_heldout_validation_receipt.v1"
+_SMOKE_SCHEMA = "mineru_smoke_receipt.v6"
+_VALIDATION_SCHEMA = "mineru_heldout_validation_receipt.v2"
 _VALIDATION_POLICY = "operator-held-out-complete-pdf.v1"
 _TASK_REGISTRY_SEMANTICS = "retained-terminal-gauges.v1"
 _DEPLOYMENT_INPUT_PROFILE = "deployment_frozen_v1"
@@ -333,6 +334,8 @@ def _verify_configured_capacity(
             - settings.disclosure_mineru_api_task_slots
         ),
         "processing_window_size": settings.mineru_processing_window_size,
+        "cpu_worker_threads": 3,
+        "omp_thread_count": 1,
         "requested_hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
         "effective_hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
         "hybrid_ocr_override": False,
@@ -436,6 +439,24 @@ def verify_mineru_deployment_gate(
 ) -> VerifiedMinerUDeployment | None:
     """Prove exact runtime, fixed smoke, held-out PDFs, and live boundaries."""
 
+    return _verify_mineru_deployment_evidence(
+        settings, parse_enabled=parse_enabled, process_profile=process_profile, now=now,
+        historical_writer_digest=None,
+    )
+
+
+def _verify_mineru_deployment_evidence(
+    settings: Settings, *, parse_enabled: bool | None,
+    process_profile: MineruProcessProfile | None, now: datetime | None,
+    historical_writer_digest: str | None,
+) -> VerifiedMinerUDeployment | None:
+    """Shared evidence parser; historical digest is restricted to the recovery gate.
+
+    Ordinary deployment always supplies None and rehashes the current source.
+    Recovery separately attests the current source and exact compatibility grant;
+    the old qualification is checked as historical, never relabeled current.
+    """
+
     enabled = (
         settings.worker_batch_parse != 0 if parse_enabled is None else parse_enabled
     )
@@ -489,7 +510,7 @@ def verify_mineru_deployment_gate(
     current = (now or datetime.now(UTC)).astimezone(UTC)
     try:
         local_client = client_bundle_identity(mineru_bin)
-        local_code_digest = writer_code_digest()
+        local_code_digest = historical_writer_digest or writer_code_digest()
         manifest = verify_runtime_manifest_payload(
             {
                 "identity_sha256": runtime_identity,
@@ -854,11 +875,12 @@ def _verify_smoke_receipt(
         "canary",
         "provider",
         "cleanup",
+        "diagnostic_disposal",
     }
     if not isinstance(receipt, dict) or set(receipt) != required_receipt_fields:
         raise MinerUDeploymentGateError(f"{label} fields drifted")
     if receipt.get("schema") != _SMOKE_SCHEMA or receipt.get("status") != "pass":
-        raise MinerUDeploymentGateError(f"{label} is not v5 PASS")
+        raise MinerUDeploymentGateError(f"{label} is not v6 PASS")
     canary = receipt.get("canary")
     if not isinstance(canary, dict) or (
         expected_cache is not None and canary != expected_cache
@@ -917,6 +939,14 @@ def _verify_smoke_receipt(
     )
     if provider_pages != source_pages:
         raise MinerUDeploymentGateError(f"{label} did not preserve all source pages")
+    try:
+        validate_diagnostic_disposal(
+            receipt.get("diagnostic_disposal"), source_pdf_sha256=str(source_identity),
+            runtime_identity=runtime_identity, source_page_count=provider_pages,
+            provider_bundle_sha256=receipt["provider"]["provider_bundle_sha256"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise MinerUDeploymentGateError(f"{label} diagnostic disposal was not proved: {exc}") from exc
     _verify_smoke_orchestrator(
         receipt.get("orchestrator"),
         task_retention_seconds=task_retention_seconds,

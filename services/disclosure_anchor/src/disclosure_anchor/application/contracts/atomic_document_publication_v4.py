@@ -549,9 +549,9 @@ class PreIdUnitPublicationV4:
             )
         for page_number in self.page_numbers:
             _positive(page_number, "Unit lineage page number")
-        if self.page_no is not None and self.page_no != self.page_numbers[0]:
+        if self.page_no is not None and self.page_no not in self.page_numbers:
             raise WholeDocumentPublicationV4Error(
-                "Unit primary page differs from its lineage"
+                "Unit primary page is absent from its lineage"
             )
         expected = pre_id_unit_routed_draft_sha256_v4(self)
         if self.routed_draft_sha256 != expected:
