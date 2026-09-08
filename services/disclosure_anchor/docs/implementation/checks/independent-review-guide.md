@@ -8,10 +8,17 @@ created_at: 2026-07-07
 
 # 独立审查大清单
 
-**用法**：新 session 的独立审查按本清单开工。立场 = "L2 拿这些数据能不能直接用"，
-不是"代码能不能跑"。每一节先跑 SQL/命令取证，再下判断；每个 finding 带
-file:line 或行级 SQL 证据。历史经验：**逐案打地鼠不如类扫描**——本清单的
-SQL 都是"抓一整类"的写法。
+**用法**：先确定审查范围，再选适用章节。数据交付审查的立场是“L2 拿这些数据能不能直接用”；
+代理政策或普通文档审查不因此变成全库数据审计。对选定边界先取证再判断，每个 finding 带
+file:line 或必要的行级 SQL 证据。数据审查优先类扫描，避免逐案打地鼠。
+
+**范围选择**：
+
+- 代理指令、权限和工作流：检查指令链、真实任务场景、授权边界、引用路径和适用验证命令；
+  不加载生产凭据，不运行无关 SQL、provider、MinerU 或全量 replay。
+- 代码、API、数据库、解析或发布：只选触及的契约和数据章节；真实边界验证须满足既有环境与授权要求。
+- 独立只读 reviewer 可在本地完成审查。只有用户要求外部 Pro/Fable 审查时才进入 §0.2 的上传流程。
+  下文“新 session”“前置”和 SQL 清单均受此范围选择约束；不适用的检查不执行，也不宣称通过。
 
 ## 0. 审查前置
 
@@ -35,8 +42,9 @@ event_key_map 不得作为当前审查对象，现状勘误见 retrieval 设计�
 ## 0.2 可见 Pro/Fable 外部审查交付
 
 当 ChatGPT/Claude 的仓库连接器不可用、读不到私有历史，或需要把本地未跟踪的质量证据
-一起交给 reviewer 时，不要只粘贴零散代码。建立可复现的 review packet，并把交付事实写入
-`docs/agent/HANDOFF.md`：
+一起交给 reviewer 做 exact-current 审查时，不要只粘贴零散代码。建立可复现的 review packet。
+普通概念建议不触发全仓打包，也不构成当前实现的审查结论。交付事实保存在现有 review receipt，
+适用时由 `docs/agent/HANDOFF.md` 链接，不重复抄入完整历史：
 
 1. 在 `/Users/zhang/Downloads/buddle_code/<review-id>/` 集中准备完整 tracked source snapshot、
    verified Git bundle、当前 staged/unstaged binary patch、全部 in-scope untracked 文件、审查提示、
@@ -44,20 +52,23 @@ event_key_map 不得作为当前审查对象，现状勘误见 retrieval 设计�
    一旦上传即冻结该版本，后续字节变化另建 versioned review-id，禁止覆盖已发 packet。禁止放入
    `.env`、凭据、数据库 URL、HANDOFF/RUNTIME 私有状态、raw PDF 或 AgentSSD artifact tree。
 2. 附件过大时拆为 `source.zip`、`review-evidence.zip`、`review-history.zip`。通过用户指定的
-   Codex App `@Browser` 自有 file/binary upload 接口上传，不切换 Chrome、Computer Use 或 Mac
-   原生 file picker。ChatGPT 可能把附件改成 UUID 文件名，必须在 prompt 中列出“网页文件名 →
+   Codex App `@Browser` 当前支持的 file/binary upload 接口上传；应用内浏览器通过 CUA 暴露时，
+   该 CUA tab 仍属同一授权界面。不得擅自切换其他浏览器、桌面点击或原生 file picker。
+   ChatGPT 可能把附件改成 UUID 文件名，必须在 prompt 中列出“网页文件名 →
    本地逻辑名 → SHA-256”的映射；附件未全部可见前不得发送审查 prompt。
 3. prompt 同时给出公开仓库 URL 与 exact commit，要求 reviewer 先读附件，缺文件时只按该
    commit 从 Web 补读。公开 URL 是缺口补读，不替代附件内的未跟踪证据或精确 commit 绑定。
-4. HANDOFF 记录 exact commit、每个附件 SHA、conversation/session URL、最终 verdict、经本地
+4. 现有 review receipt 记录 exact commit、每个附件 SHA、conversation/session URL、最终 verdict、经本地
    exact bytes 验证的 findings 与采取的修复。acknowledgement、`thinking`、中断、额度耗尽或
    旧 artifact 的结论都不是 verdict；不得据此重复上传、重复清库或重复外部动作。
 5. reviewer 只读；其 finding 是待验证 claim，不是自动改代码的授权。P0/P1 先在当前 tree、
-   public view 和代表性行上复现，再做最小通用修复；P2 必须说明是否值得当前阶段处理。
-6. reviewer 思考期间不得修改被审字节、重生引用证据、追加 prompt 或并行实施。若 target 已变化，
-   原回答只可记为 stale evidence，必须用新 packet 重审。`thinking`、半截回答、超时、中断或额度
-   错误都不是 verdict。完整答复、本地验证和必要复审全部关闭且 HANDOFF 已记 SHA/结论后，才将
-   该 exact review-id packet 移入废纸篓；不得递归删除共享 `buddle_code` 根或其他 active packet。
+   或适用的 public view/代表性行上复现。按正确性、完整性、吞吐量、可维护性和用户验收目标选择
+   有依据的方案，不以最小 diff 限制修复；任务范围和受保护动作授权不变。P2 说明当前处理价值。
+6. reviewer 思考期间冻结已发 packet、被审对象及相关依赖、引用证据和问题；仅可在独立 worktree
+   推进已授权且不影响这些内容的工作。若 target 已变化，原回答只可记为 stale evidence，必须用新
+   packet 重审。`thinking`、半截回答、超时、中断或额度错误都不是 verdict。完整答复、本地验证和
+   必要复审全部关闭且 receipt 已记 SHA/结论后，才执行已获授权的 exact review-id packet 废纸篓清理；
+   尚未授权则报告保留位置，不把清理当作审查交付前置。不得递归删除共享根或其他 active packet。
 7. “live 与 source replay 零差异”必须由仓库内可复跑的只读脚本生成。receipt 至少列明比较字段、
    source/replay 身份、live generation 标记，并给双方规范化行集的独立聚合哈希；只有
    `mismatch_count=0`、没有字段清单/聚合哈希/生成脚本的 JSON 不是可证伪的验收证据。脚本必须从

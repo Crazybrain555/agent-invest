@@ -1,6 +1,6 @@
 # Pre-design research workflow
 
-This is the shared, tool-neutral research protocol referenced by root `AGENTS.md` §3. It defines when the
+This is the shared, tool-neutral research protocol referenced by root `AGENTS.md`. It defines when the
 research gate triggers, what evidence passes it, when it stops, and how conflicts resolve. Task-state and
 runtime protocol live in `docs/agent-workflow.md`.
 
@@ -60,15 +60,17 @@ not evidence.
 
 - Routine, contract-determined fix: inspect the local authority and, when an external mechanism is involved,
   the relevant official external contract.
-- Non-novel design choice: add 1–2 mature analogues.
+- Non-novel design choice: compare mature analogues when they can resolve an actual design question.
 - Material architecture, cross-service contract, dependency, provider framework, security, migration, or
-  ops change: compare 2–4 independent relevant sources or implementations, including at least one competing
-  approach.
+  ops change: compare independent evidence and the strongest relevant competing approach. One or two analogues
+  for ordinary choices, or two to four sources for material changes, are depth heuristics rather than quotas.
+  Record when no viable alternative exists and why; do not invent one just to fill a field.
 - Domain-specific work follows the nearest component `AGENTS.md` research-source requirements.
 
 Source count is not the goal. Stop when the local authority, an available applicable representative case, any
-governing external contract, the adopted invariant, the main rejected alternative, and the validation plan are
-settled.
+governing external contract, the adopted invariant, any consequential alternative, and the validation plan are
+settled. Continue the authorized implementation after that point. A genuinely missing necessary fact blocks only
+the decision or action that depends on it, not independent inspection or already-determined work.
 
 ## 5. Before-edit record
 
@@ -79,7 +81,7 @@ Always:
 
     Research question:
     Governing authority:
-    Invariant adopted / alternative rejected:
+    Invariant adopted / alternative rejected:  # N/A with reason when no consequential alternative exists
     Validation plan:
     Skip reason:            # only when external research was skipped
 
@@ -104,7 +106,7 @@ Material changes additionally:
 - Upstream main, issue, or PR vs deployed runtime: match merged, released, and deployed identities; otherwise
   the upstream material remains comparative evidence.
 - Within conflict resolution, escalate to the user only when product semantics, acceptance criteria, or
-  authorization boundaries must change; broader ask-before duties in root `AGENTS.md` §3 are unaffected.
+  authorization boundaries must change; broader ask-before duties in root `AGENTS.md` are unaffected.
 
 ## 7. Validation
 

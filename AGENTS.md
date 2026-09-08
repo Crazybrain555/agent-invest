@@ -5,16 +5,26 @@ details belong in the nearest component docs; current task/runtime state belongs
 
 ## Scope and authority
 
-- The current user request defines scope and authorizes actions. Read-only work does not authorize writes;
-  edits do not authorize commit, push, publication, remote mutation, service control, or destructive cleanup.
+- The current user request defines scope. Explicit authorization and its limits persist within the same task and
+  authorized continuations unless the user changes them; unrelated tasks do not inherit them. Read-only work does
+  not authorize writes; edits do not authorize commit, push, publication, remote mutation, service control, or
+  destructive cleanup.
 - Product semantics come from `docs/reference/投研预测引擎顶层框架协议_v0.8.md`, then the applicable L1
   plan and nearest component contract. Code, schemas, commands, and observations describe current state; a
   mismatch is drift to reconcile, not an implicit contract change.
-- Preserve unrelated and user-owned changes. Ask before credentials, permissions, costly operations, shared
-  runtime mutation, or a material scope expansion.
+- Preserve unrelated and user-owned changes. Credentials, permissions, costly operations, shared runtime mutation,
+  and material scope expansion require user authorization. Check the existing authorization before asking again;
+  ask again only when the proposed action exceeds its limits, such as a different protected target, broader data
+  access, spending beyond the approved budget, or materially greater risk.
+- For authorized edits, resolve routine implementation choices from the contracts and current evidence, complete
+  the changes and applicable checks, and deliver the result. Ask only for consequential missing input or required
+  authorization. Complete independent authorized work before pausing a dependent action; optional improvements
+  do not become new completion gates. Optimize correctness, completeness, throughput and maintainability against
+  the user's acceptance criteria; choose the justified scope of change rather than a minimum-diff default.
 - Repository layout, component status, and planned services live in `README.md`.
 - At session start and before the first mutation, inspect the root and affected-component HANDOFF/parked records.
-  An unclosed HANDOFF is a write gate even when the requested edit looks small; only its named writer may mutate.
+  An unclosed HANDOFF protects its writer's checkout; RUNTIME coordination and explicit user-scoped exceptions
+  follow docs/agent-workflow.md. Neither exception transfers general ownership.
 
 ## Tool instruction loading
 
@@ -36,9 +46,11 @@ details belong in the nearest component docs; current task/runtime state belongs
 3. Reuse `packages/envelope_kernel` for shared `data_asset` envelopes, kind rules, `asset://` URIs, and exported
    schemas. Breaking shared or public contracts require a versioned change and synchronized consumers/tests/docs.
 4. Applied migrations are append-only. Never rewrite an applied revision or silently reinterpret stored data.
-5. PostgreSQL data, raw files, caches, models, and generated artifacts live under `/Volumes/AgentSSD/agent_system/`
-   and never enter Git. Raw/source identity, hashes, provider/parser provenance, and processing lineage remain
-   reviewable; missing values are not invented.
+5. Service runtime data, raw files, caches, models, and generated runtime artifacts live under
+   `/Volumes/AgentSSD/agent_system/` and never enter Git. Canonical generated contract/schema files follow their
+   package's tracked-export rules; sanitized external-review packets follow the review guide's explicit directory.
+   These exceptions do not permit copying runtime datasets or secrets into Git or review packets. Raw/source
+   identity, hashes, provider/parser provenance, and processing lineage remain reviewable; missing values are not invented.
 6. Credentials come only from environment variables or private user configuration. Tracked files, fixtures,
    examples, logs, and review packets contain placeholders or redacted values.
 7. Default tests are deterministic `unittest` without a live database. DB tests never mutate shared production
@@ -48,20 +60,22 @@ details belong in the nearest component docs; current task/runtime state belongs
 
 ## Conditional workflows
 
-- Before the first mutation, read `docs/agent-workflow.md` in full when work crosses sessions, changes
-  architecture/public contracts/migration or data boundaries, touches shared runtime, resumes durable state,
-  has material unknowns, or pauses for a decision. It owns HANDOFF, parked-task, write-gate, worktree, recovery,
-  and RUNTIME-claim procedures; do not duplicate them in component instructions.
-- After compaction/resume or when history is incomplete, re-read the applicable instructions and HANDOFF, then
-  reconcile the current request with Git/worktree truth and the narrow external state required by the next action.
-  Do not repeat an action merely because a conversation summary lists it as pending.
+- Read docs/agent-workflow.md in full for coordination-policy changes, existing HANDOFF/parked obligations,
+  cross-tool/worktree handoff or shared-runtime operations. It owns the project-specific protections; ordinary
+  progress and continuation use native task history. Do not create a control file merely because work is complex
+  or spans turns, and do not duplicate the workflow in component instructions.
+- Recover from compaction/resume only when history is incomplete, unclear or conflicts with current state:
+  reconcile applicable instructions/HANDOFF, Git truth and the narrow external facts needed by the next action.
+  With intact context, continue; do not repeat work solely because a summary lists it as pending.
 - Read `docs/agent-research-workflow.md` in full when behavior depends on an external mechanism, has material
   unresolved alternatives, or a nearer contract/user requires research. Local contracts and representative
   cases come first; external evidence cannot silently revise product semantics.
 - For material policy, public-contract, runtime, or validation-command changes, use an independent read-only
-  reviewer after implementation. The disclosure service packet format is in
-  `services/disclosure_anchor/docs/implementation/checks/independent-review-guide.md`; reviewer findings are
-  claims to verify, not automatic edits.
+  reviewer after implementation. A local read-only reviewer is sufficient unless the user requests an external
+  review. Select checks for the changed boundary; policy review does not require unrelated production SQL/replay.
+  The disclosure review guide and external packet format are in
+  `services/disclosure_anchor/docs/implementation/checks/independent-review-guide.md`; findings are claims to
+  verify, not automatic edits or authorization for external disclosure.
 
 ## Validation
 
