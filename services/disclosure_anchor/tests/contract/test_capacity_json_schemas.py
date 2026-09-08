@@ -66,6 +66,8 @@ class CapacityJsonSchemaTests(unittest.TestCase):
                 "synchronized-telemetry-frame.v2.schema.json",
                 "synchronized-telemetry-receipt.v2.schema.json",
                 "synchronized-telemetry-seal.v2.schema.json",
+                "synchronized-telemetry-receipt.v3.schema.json",
+                "synchronized-telemetry-seal.v3.schema.json",
             },
         )
         for filename, generated in generated_documents.items():

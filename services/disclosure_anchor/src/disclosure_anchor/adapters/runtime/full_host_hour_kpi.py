@@ -1,16 +1,20 @@
-"""Anchored observer-v2 artifact projection for full-host-hour replay."""
+"""Explicit-version anchored observer projection for full-host-hour replay."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 from pathlib import Path
+from typing import Literal
 
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     verify_synchronized_telemetry_observer,
 )
 from disclosure_anchor.application.contracts.full_host_hour_kpi import (
     VerifiedTelemetryCoverage,
+)
+from disclosure_anchor.application.contracts.synchronized_telemetry import (
+    SynchronizedTelemetryReceiptV3,
 )
 
 
@@ -22,13 +26,14 @@ def _canonical_hash(value: object) -> str:
 
 
 def verified_coverage_from_observer_artifacts(
-    *, artifact_root: Path, run_id: str
+    *, artifact_root: Path, run_id: str, receipt_version: Literal[2, 3] = 2,
 ) -> VerifiedTelemetryCoverage:
     """Reopen anchored files and derive host identity only from sealed frames."""
 
     result = verify_synchronized_telemetry_observer(
         artifact_root=artifact_root,
         run_id=run_id,
+        receipt_version=receipt_version,
     )
     quality = {item.lane: item for item in result.receipt.lane_quality}
     provenance = {
@@ -76,7 +81,11 @@ def verified_coverage_from_observer_artifacts(
         parent_cgroup_epoch_sha256=next(iter(cgroup_epochs)),
         runtime_bundle_identity_sha256=result.receipt.runtime_bundle_identity_sha256,
         process_profile_sha256=result.receipt.process_profile.process_profile_sha256,
-        observer_process_epoch_sha256=result.receipt.process_profile.process_epoch_sha256,
+        observer_process_epoch_sha256=(
+            result.receipt.observer_identity.process_epoch_sha256
+            if isinstance(result.receipt, SynchronizedTelemetryReceiptV3)
+            else result.receipt.process_profile.process_epoch_sha256
+        ),
         observer_run_id=result.receipt.run_id,
         receipt_sha256=_canonical_hash(result.receipt.model_dump(mode="json")),
         seal_sha256=_canonical_hash(result.seal.model_dump(mode="json")),

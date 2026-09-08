@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import re
 import time
 from typing import Literal, cast
 from urllib.parse import urlsplit
@@ -44,6 +45,7 @@ class _Config:
     maximum_sample_age_ms: int
     nominal_interval_ms: int
     collector_identity_sha256: str
+    observer_clock_domain_identity_sha256: str
     expected_identity: ResidentIdentity
     ssh: dict[str, object] | None = None
 
@@ -125,7 +127,7 @@ class WindowsResidentTelemetrySampler:
             raise ValueError("resident exporter identity drifted from the pinned identity")
         if self._identity is not None and sample.identity != self._identity:
             raise ValueError("resident exporter identity changed during the collector lifetime")
-        if self._last_sequence and sample.sequence != self._last_sequence + 1:
+        if sample.sequence != self._last_sequence + 1:
             raise ValueError("resident exporter sequence has a gap or rollback")
         age_ms = (time.time() - sample.observed_at_utc.timestamp()) * 1000
         if age_ms < -1000 or age_ms > self._config.maximum_sample_age_ms:
@@ -149,7 +151,9 @@ class WindowsResidentTelemetrySampler:
         identity = TelemetrySampleIdentity(
             runtime_bundle_identity_sha256=sample.identity.runtime_bundle_identity_sha256,
             process_profile_sha256=sample.identity.process_profile_sha256,
-            clock_domain_identity_sha256=sample.identity.clock_domain_identity_sha256,
+            # The observer brackets this call with its own local monotonic clock.
+            # The remote QPC identity is checked above, never relabelled as local.
+            clock_domain_identity_sha256=self._config.observer_clock_domain_identity_sha256,
         )
         if isinstance(sample, WindowsGpuResidentSample):
             return GpuLaneSnapshot(
@@ -182,6 +186,7 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
         "maximum_sample_age_ms",
         "nominal_interval_ms",
         "collector_identity_sha256",
+        "observer_clock_domain_identity_sha256",
         "expected_identity",
     }
     if set(config) not in (expected_keys, expected_keys | {"ssh"}):
@@ -204,6 +209,7 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
     maximum_age = config["maximum_sample_age_ms"]
     nominal_interval = config["nominal_interval_ms"]
     collector_identity = config["collector_identity_sha256"]
+    observer_clock = config["observer_clock_domain_identity_sha256"]
     if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes < 1:
         raise ValueError("maximum_response_bytes is invalid")
     if isinstance(maximum_age, bool) or not isinstance(maximum_age, int) or maximum_age < 250:
@@ -216,8 +222,10 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
         or (lane == "gpu_fast" and nominal_interval not in {250, 500})
     ):
         raise ValueError("nominal_interval_ms is invalid")
-    if not isinstance(collector_identity, str):
+    if not isinstance(collector_identity, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", collector_identity) is None:
         raise ValueError("collector_identity_sha256 is invalid")
+    if not isinstance(observer_clock, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", observer_clock) is None:
+        raise ValueError("observer_clock_domain_identity_sha256 is invalid")
     base_url = config["base_url"]
     if not isinstance(base_url, str):
         raise ValueError("base_url is invalid")
@@ -231,6 +239,7 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
             maximum_age,
             nominal_interval,
             collector_identity,
+            observer_clock,
             identity,
             cast(dict[str, object] | None, ssh),
         )
@@ -244,6 +253,7 @@ def canonical_collector_config(**values: object) -> bytes:
 def windows_resident_collector_spec(
     *,
     collector_identity_sha256: str,
+    observer_clock_domain_identity_sha256: str,
     lane: Literal["gpu_fast", "host_slow"],
     base_url: str,
     path: str,
@@ -266,6 +276,7 @@ def windows_resident_collector_spec(
             maximum_sample_age_ms=maximum_sample_age_ms,
             nominal_interval_ms=nominal_interval_ms,
             collector_identity_sha256=collector_identity_sha256,
+            observer_clock_domain_identity_sha256=observer_clock_domain_identity_sha256,
             expected_identity=expected_identity.model_dump(mode="json"),
             **({"ssh": ssh} if ssh is not None else {}),
         ),

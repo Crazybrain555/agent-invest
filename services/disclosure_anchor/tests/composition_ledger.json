@@ -62,7 +62,7 @@
   },
   "tests/integration/test_publish_evidence_ledger.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 7
   },
   "tests/integration/test_register_local_pdf.py": {
    "private_imports": [],
@@ -239,6 +239,14 @@
    "private_imports": [],
    "tests": 2
   },
+  "tests/unit/test_dedicated_mac_observer.py": {
+   "private_imports": [
+    "_observer_child",
+    "_read_identity",
+    "_watch_owner"
+   ],
+   "tests": 7
+  },
   "tests/unit/test_disclosure_source_port.py": {
    "private_imports": [],
    "tests": 5
@@ -359,6 +367,12 @@
   "tests/unit/test_local_materialization_manifest_v4.py": {
    "private_imports": [],
    "tests": 4
+  },
+  "tests/unit/test_mac_observer_identity.py": {
+   "private_imports": [
+    "_ProcBsdInfo"
+   ],
+   "tests": 5
   },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
@@ -500,7 +514,7 @@
   },
   "tests/unit/test_publish_evidence_ledger.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_publish_run.py": {
    "private_imports": [
@@ -540,10 +554,30 @@
    "private_imports": [],
    "tests": 8
   },
+  "tests/unit/test_resident_combined_cpu.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_resident_external_observation.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_resident_owner_control.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_resident_session_evidence.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_resident_ssh_http.py": {
    "private_imports": [
     "_read_private_config"
    ],
+   "tests": 7
+  },
+  "tests/unit/test_resident_telemetry_owner.py": {
+   "private_imports": [],
    "tests": 7
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
@@ -673,6 +707,10 @@
   "tests/unit/test_synchronized_telemetry_observer.py": {
    "private_imports": [],
    "tests": 43
+  },
+  "tests/unit/test_synchronized_telemetry_observer_v3.py": {
+   "private_imports": [],
+   "tests": 4
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],

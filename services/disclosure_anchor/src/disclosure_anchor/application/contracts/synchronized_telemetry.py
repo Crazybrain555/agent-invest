@@ -938,23 +938,42 @@ class TelemetryArtifactsV2(_FrozenModel):
         return self
 
 
-class SynchronizedTelemetryReceiptV2(_FrozenModel):
-    """Closed receipt for the default-off resident JSONL observer."""
+class FrozenApiProcessProfile(_FrozenModel):
+    """Actual observed API instance and its startup-frozen configuration.
 
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        allow_inf_nan=False,
-        json_schema_extra={
-            "$id": _SCHEMA_ROOT + "synchronized-telemetry-receipt.v2.schema.json"
-        },
-    )
-    contract_version: Literal["mineru.synchronized-telemetry-receipt.v2"] = (
-        TELEMETRY_RECEIPT_V2_VERSION
-    )
+    No observer clock or invented API creation timestamp is carried here. The
+    external owner binds the API epoch to raw boot/PID/start-tick provenance.
+    """
+
+    lifecycle: Literal["startup_only"] = "startup_only"
+    runtime_bundle_identity_sha256: str
+    process_epoch_sha256: str
+    process_profile_sha256: str
+    parameters: ProcessProfileParameters
+
+    @model_validator(mode="after")
+    def _hashes(self) -> "FrozenApiProcessProfile":
+        for name in ("runtime_bundle_identity_sha256", "process_epoch_sha256", "process_profile_sha256"):
+            _sha256(getattr(self, name), label=name)
+        return self
+
+
+class TelemetryObserverIdentity(_FrozenModel):
+    """Observer process instance and its actual local monotonic clock domain."""
+
+    process_epoch_sha256: str
+    clock_domain_identity_sha256: str
+
+    @model_validator(mode="after")
+    def _hashes(self) -> "TelemetryObserverIdentity":
+        _sha256(self.process_epoch_sha256, label="process_epoch_sha256")
+        _sha256(self.clock_domain_identity_sha256, label="clock_domain_identity_sha256")
+        return self
+
+
+class _ResidentReceiptFields(_FrozenModel):
     run_id: str
     runtime_bundle_identity_sha256: str
-    process_profile: ProcessProfileLifecycle
     observer_source_sha256: str
     clock_domain_identity_sha256: str
     started_at_utc: datetime
@@ -974,7 +993,7 @@ class SynchronizedTelemetryReceiptV2(_FrozenModel):
     maximum_clock_divergence_ppm: Literal[50] = 50
 
     @model_validator(mode="after")
-    def _check_receipt(self) -> "SynchronizedTelemetryReceiptV2":
+    def _check_receipt(self) -> "_ResidentReceiptFields":
         _run_id(self.run_id)
         _utc(self.started_at_utc, label="started_at_utc")
         _utc(self.finished_at_utc, label="finished_at_utc")
@@ -1009,6 +1028,26 @@ class SynchronizedTelemetryReceiptV2(_FrozenModel):
         expected: RunStatus = "unsafe" if unsafe else "incomplete" if incomplete else "complete"
         if self.status != expected:
             raise ValueError("receipt status disagrees with quality evidence")
+        return self
+
+
+class SynchronizedTelemetryReceiptV2(_ResidentReceiptFields):
+    """Closed receipt for the default-off resident JSONL observer."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        # Preserve the exact frozen v2 export, including required-field order,
+        # after moving shared evidence checks into the private base class.
+        json_schema_extra={
+            "$id": _SCHEMA_ROOT + "synchronized-telemetry-receipt.v2.schema.json",
+            "required": ["run_id", "runtime_bundle_identity_sha256", "process_profile", "observer_source_sha256", "clock_domain_identity_sha256", "started_at_utc", "finished_at_utc", "started_monotonic_ns", "finished_monotonic_ns", "status", "lane_quality", "termination_reason", "observed_clock_divergence_ns", "epoch_changed", "safety_drift_reasons", "unsupported_observation_count", "artifacts"],
+        },
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-receipt.v2"] = TELEMETRY_RECEIPT_V2_VERSION
+    process_profile: ProcessProfileLifecycle
+
+    @model_validator(mode="after")
+    def _check_profile(self) -> "SynchronizedTelemetryReceiptV2":
         if self.process_profile.runtime_bundle_identity_sha256 != self.runtime_bundle_identity_sha256:
             raise ValueError("process profile runtime identity drifted")
         if self.process_profile.clock_domain_identity_sha256 != self.clock_domain_identity_sha256:
@@ -1016,18 +1055,27 @@ class SynchronizedTelemetryReceiptV2(_FrozenModel):
         return self
 
 
-class SynchronizedTelemetrySealV2(_FrozenModel):
-    """Non-self-referential attestation created after mandatory receipt replay."""
+class SynchronizedTelemetryReceiptV3(_ResidentReceiptFields):
+    """Separate actual API profile, observer process, and observer sampling clock."""
 
     model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        allow_inf_nan=False,
-        json_schema_extra={
-            "$id": _SCHEMA_ROOT + "synchronized-telemetry-seal.v2.schema.json"
-        },
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-receipt.v3.schema.json"},
     )
-    contract_version: Literal["mineru.synchronized-telemetry-seal.v2"] = TELEMETRY_SEAL_V2_VERSION
+    contract_version: Literal["mineru.synchronized-telemetry-receipt.v3"] = "mineru.synchronized-telemetry-receipt.v3"
+    process_profile: FrozenApiProcessProfile
+    observer_identity: TelemetryObserverIdentity
+
+    @model_validator(mode="after")
+    def _check_identities(self) -> "SynchronizedTelemetryReceiptV3":
+        if self.process_profile.runtime_bundle_identity_sha256 != self.runtime_bundle_identity_sha256:
+            raise ValueError("API process profile runtime identity drifted")
+        if self.observer_identity.clock_domain_identity_sha256 != self.clock_domain_identity_sha256:
+            raise ValueError("observer clock domain drifted")
+        return self
+
+
+class _ResidentSealFields(_FrozenModel):
     run_id: str
     receipt_sha256: str
     frames_jsonl_sha256: str
@@ -1040,7 +1088,7 @@ class SynchronizedTelemetrySealV2(_FrozenModel):
     status: RunStatus
 
     @model_validator(mode="after")
-    def _check_seal(self) -> "SynchronizedTelemetrySealV2":
+    def _check_seal(self) -> "_ResidentSealFields":
         _run_id(self.run_id)
         _sha256(self.receipt_sha256, label="receipt_sha256")
         _sha256(self.frames_jsonl_sha256, label="frames_jsonl_sha256")
@@ -1053,6 +1101,26 @@ class SynchronizedTelemetrySealV2(_FrozenModel):
         if self.status != expected:
             raise ValueError("seal status disagrees with observer overhead")
         return self
+
+
+class SynchronizedTelemetrySealV2(_ResidentSealFields):
+    """Non-self-referential attestation created after mandatory receipt replay."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-seal.v2.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-seal.v2"] = TELEMETRY_SEAL_V2_VERSION
+
+
+class SynchronizedTelemetrySealV3(_ResidentSealFields):
+    """Pre-seal CPU attestation for an identity-separated v3 receipt."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-seal.v3.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-seal.v3"] = "mineru.synchronized-telemetry-seal.v3"
 
 
 class SynchronizedPhaseSummary(_FrozenModel):
@@ -1166,6 +1234,8 @@ OPERATIONAL_TELEMETRY_SCHEMAS: dict[str, type[BaseModel]] = {
     "synchronized-telemetry-frame.v2.schema.json": SynchronizedTelemetryFrameV2,
     "synchronized-telemetry-receipt.v2.schema.json": SynchronizedTelemetryReceiptV2,
     "synchronized-telemetry-seal.v2.schema.json": SynchronizedTelemetrySealV2,
+    "synchronized-telemetry-receipt.v3.schema.json": SynchronizedTelemetryReceiptV3,
+    "synchronized-telemetry-seal.v3.schema.json": SynchronizedTelemetrySealV3,
     "synchronized-phase-summary.v1.schema.json": SynchronizedPhaseSummary,
     "phase-clock-binding.v1.schema.json": PhaseClockBinding,
 }
@@ -1544,6 +1614,8 @@ __all__ = [
     "PressureLine",
     "PressureSample",
     "ProcessProfileLifecycle",
+    "FrozenApiProcessProfile",
+    "TelemetryObserverIdentity",
     "ProcessProfileParameters",
     "ProgressEvent",
     "QueueVllmObservation",
@@ -1555,7 +1627,9 @@ __all__ = [
     "SynchronizedTelemetryFrameV2",
     "SynchronizedTelemetryReceipt",
     "SynchronizedTelemetryReceiptV2",
+    "SynchronizedTelemetryReceiptV3",
     "SynchronizedTelemetrySealV2",
+    "SynchronizedTelemetrySealV3",
     "TelemetryArtifacts",
     "TelemetryArtifactsV2",
     "SafetyDriftReason",

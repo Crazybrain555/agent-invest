@@ -11,6 +11,9 @@ from disclosure_anchor.application.contracts.full_host_hour_kpi import (
     IncompleteReason,
     VerifiedTelemetryCoverage,
 )
+from disclosure_anchor.application.contracts.publish_evidence_ledger import (
+    SUPPORTED_OBSERVER_RECEIPT_VERSIONS,
+)
 
 
 def aggregate_full_gpu_host_hour(
@@ -251,7 +254,7 @@ def reconcile_private_publish_ledger_rows(
             raise ValueError("private publish base projection is invalid")
         status = "incomplete"
         observed = committed
-        projection: tuple[str, str, str, str, str, str, str] | None = None
+        projection: tuple[str, str, str, str, str, str, str, str] | None = None
         conflict = first.get("source_page_variants") != 1
         for row in group:
             if (
@@ -274,6 +277,7 @@ def reconcile_private_publish_ledger_rows(
                 row.get("observer_run_id"),
                 row.get("observer_receipt_sha256"),
                 row.get("observer_seal_sha256"),
+                row.get("observer_contract_version"),
             )
             supplement_observed = row.get("publish_durable_observed_at")
             if isinstance(supplement_observed, datetime):
@@ -286,7 +290,7 @@ def reconcile_private_publish_ledger_rows(
                 or row.get("supplement_source_page_count") != pages
                 or supplement_precommit != committed
                 or row.get("observer_contract_version")
-                != "mineru.synchronized-telemetry-receipt.v2"
+                not in SUPPORTED_OBSERVER_RECEIPT_VERSIONS
                 or not all(isinstance(value, str) for value in candidate)
                 or not isinstance(supplement_observed, datetime)
                 or supplement_observed < committed
@@ -296,7 +300,7 @@ def reconcile_private_publish_ledger_rows(
             typed = (
                 str(candidate[0]), str(candidate[1]), str(candidate[2]),
                 str(candidate[3]), str(candidate[4]), str(candidate[5]),
-                str(candidate[6]),
+                str(candidate[6]), str(candidate[7]),
             )
             if projection is not None and projection != typed:
                 conflict = True

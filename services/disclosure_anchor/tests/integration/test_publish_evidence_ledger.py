@@ -6,6 +6,7 @@ from threading import Event
 import unittest
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from disclosure_anchor.adapters.db.postgres.schema import (
     APP_ROLE, FUTURE_L2_READER_ROLE, READER_ROLE,
@@ -122,6 +123,26 @@ class PublishEvidenceLedgerIntegrationTests(unittest.TestCase):
         evidence = reconcile_private_publish_ledger_rows(rows)
         self.assertEqual(len(evidence), 1)
         self.assertEqual(evidence[0].status, "conflict")
+
+    def test_v3_roundtrip_preserves_version_and_rejects_unknown_contract(self) -> None:
+        supplement = self._supplement(observer_contract_version="mineru.synchronized-telemetry-receipt.v3")
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            uow.publish_evidence.add_base(self._base())
+            self.assertEqual(uow.publish_evidence.append_supplement(supplement), supplement)
+            uow.commit()
+        with self.engine.connect() as conn:
+            rows = durable_publish_ledger_rows(conn, started_at=self.committed - timedelta(seconds=1), finished_at=self.committed + timedelta(seconds=1))
+        self.assertEqual(rows[0]["observer_contract_version"], "mineru.synchronized-telemetry-receipt.v3")
+        self.assertEqual(reconcile_private_publish_ledger_rows(rows)[0].status, "complete")
+        with self.assertRaises(IntegrityError):
+            with self.engine.begin() as conn:
+                conn.execute(text("UPDATE disclosure_ops.durable_publish_supplement SET observer_contract_version='mineru.synchronized-telemetry-receipt.v4' WHERE supplement_id=:s"), {"s": supplement.supplement_id})
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            uow.publish_evidence.append_supplement(self._supplement())
+            uow.commit()
+        with self.engine.connect() as conn:
+            rows = durable_publish_ledger_rows(conn, started_at=self.committed - timedelta(seconds=1), finished_at=self.committed + timedelta(seconds=1))
+        self.assertEqual(reconcile_private_publish_ledger_rows(rows)[0].status, "conflict")
 
     def test_cross_hour_interval_is_returned_for_both_affected_hours(self) -> None:
         hour = self.committed.replace(minute=0, second=0)

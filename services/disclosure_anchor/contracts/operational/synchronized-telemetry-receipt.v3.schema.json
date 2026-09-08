@@ -1,0 +1,338 @@
+{
+  "$defs": {
+    "FrozenApiProcessProfile": {
+      "additionalProperties": false,
+      "description": "Actual observed API instance and its startup-frozen configuration.\n\nNo observer clock or invented API creation timestamp is carried here. The\nexternal owner binds the API epoch to raw boot/PID/start-tick provenance.",
+      "properties": {
+        "lifecycle": {
+          "const": "startup_only",
+          "default": "startup_only",
+          "title": "Lifecycle",
+          "type": "string"
+        },
+        "parameters": {
+          "$ref": "#/$defs/ProcessProfileParameters"
+        },
+        "process_epoch_sha256": {
+          "title": "Process Epoch Sha256",
+          "type": "string"
+        },
+        "process_profile_sha256": {
+          "title": "Process Profile Sha256",
+          "type": "string"
+        },
+        "runtime_bundle_identity_sha256": {
+          "title": "Runtime Bundle Identity Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runtime_bundle_identity_sha256",
+        "process_epoch_sha256",
+        "process_profile_sha256",
+        "parameters"
+      ],
+      "title": "FrozenApiProcessProfile",
+      "type": "object"
+    },
+    "LaneQualitySummary": {
+      "additionalProperties": false,
+      "properties": {
+        "lane": {
+          "enum": [
+            "gpu_fast",
+            "host_slow"
+          ],
+          "title": "Lane",
+          "type": "string"
+        },
+        "late_sample_count": {
+          "minimum": 0,
+          "title": "Late Sample Count",
+          "type": "integer"
+        },
+        "maximum_gap_ms": {
+          "minimum": 0,
+          "title": "Maximum Gap Ms",
+          "type": "number"
+        },
+        "missed_deadline_count": {
+          "minimum": 0,
+          "title": "Missed Deadline Count",
+          "type": "integer"
+        },
+        "nominal_interval_ms": {
+          "maximum": 1000,
+          "minimum": 250,
+          "title": "Nominal Interval Ms",
+          "type": "integer"
+        },
+        "sample_count": {
+          "minimum": 1,
+          "title": "Sample Count",
+          "type": "integer"
+        },
+        "supported_frame_count": {
+          "minimum": 0,
+          "title": "Supported Frame Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "lane",
+        "nominal_interval_ms",
+        "sample_count",
+        "maximum_gap_ms",
+        "late_sample_count",
+        "missed_deadline_count",
+        "supported_frame_count"
+      ],
+      "title": "LaneQualitySummary",
+      "type": "object"
+    },
+    "ProcessProfileParameters": {
+      "additionalProperties": false,
+      "properties": {
+        "api_max_pending_tasks": {
+          "minimum": 1,
+          "title": "Api Max Pending Tasks",
+          "type": "integer"
+        },
+        "api_task_slots": {
+          "minimum": 1,
+          "title": "Api Task Slots",
+          "type": "integer"
+        },
+        "effective_hybrid_batch_ratio": {
+          "minimum": 1,
+          "title": "Effective Hybrid Batch Ratio",
+          "type": "integer"
+        },
+        "inference_concurrency": {
+          "minimum": 1,
+          "title": "Inference Concurrency",
+          "type": "integer"
+        },
+        "processing_window_size": {
+          "minimum": 1,
+          "title": "Processing Window Size",
+          "type": "integer"
+        },
+        "requested_hybrid_batch_ratio": {
+          "minimum": 1,
+          "title": "Requested Hybrid Batch Ratio",
+          "type": "integer"
+        },
+        "vllm_max_num_seqs": {
+          "minimum": 1,
+          "title": "Vllm Max Num Seqs",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requested_hybrid_batch_ratio",
+        "effective_hybrid_batch_ratio",
+        "api_task_slots",
+        "api_max_pending_tasks",
+        "inference_concurrency",
+        "processing_window_size",
+        "vllm_max_num_seqs"
+      ],
+      "title": "ProcessProfileParameters",
+      "type": "object"
+    },
+    "TelemetryArtifactsV2": {
+      "additionalProperties": false,
+      "properties": {
+        "frames_jsonl_sha256": {
+          "title": "Frames Jsonl Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "frames_jsonl_sha256"
+      ],
+      "title": "TelemetryArtifactsV2",
+      "type": "object"
+    },
+    "TelemetryObserverIdentity": {
+      "additionalProperties": false,
+      "description": "Observer process instance and its actual local monotonic clock domain.",
+      "properties": {
+        "clock_domain_identity_sha256": {
+          "title": "Clock Domain Identity Sha256",
+          "type": "string"
+        },
+        "process_epoch_sha256": {
+          "title": "Process Epoch Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "process_epoch_sha256",
+        "clock_domain_identity_sha256"
+      ],
+      "title": "TelemetryObserverIdentity",
+      "type": "object"
+    }
+  },
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-telemetry-receipt.v3.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Separate actual API profile, observer process, and observer sampling clock.",
+  "properties": {
+    "activation_authorized": {
+      "const": false,
+      "default": false,
+      "title": "Activation Authorized",
+      "type": "boolean"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/TelemetryArtifactsV2"
+    },
+    "clock_domain_identity_sha256": {
+      "title": "Clock Domain Identity Sha256",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": "mineru.synchronized-telemetry-receipt.v3",
+      "default": "mineru.synchronized-telemetry-receipt.v3",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "epoch_changed": {
+      "title": "Epoch Changed",
+      "type": "boolean"
+    },
+    "finished_at_utc": {
+      "format": "date-time",
+      "title": "Finished At Utc",
+      "type": "string"
+    },
+    "finished_monotonic_ns": {
+      "minimum": 0,
+      "title": "Finished Monotonic Ns",
+      "type": "integer"
+    },
+    "lane_quality": {
+      "maxItems": 2,
+      "minItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/LaneQualitySummary"
+        },
+        {
+          "$ref": "#/$defs/LaneQualitySummary"
+        }
+      ],
+      "title": "Lane Quality",
+      "type": "array"
+    },
+    "maximum_clock_divergence_fixed_ns": {
+      "const": 50000000,
+      "default": 50000000,
+      "title": "Maximum Clock Divergence Fixed Ns",
+      "type": "integer"
+    },
+    "maximum_clock_divergence_ppm": {
+      "const": 50,
+      "default": 50,
+      "title": "Maximum Clock Divergence Ppm",
+      "type": "integer"
+    },
+    "observed_clock_divergence_ns": {
+      "minimum": 0,
+      "title": "Observed Clock Divergence Ns",
+      "type": "integer"
+    },
+    "observer_identity": {
+      "$ref": "#/$defs/TelemetryObserverIdentity"
+    },
+    "observer_source_sha256": {
+      "title": "Observer Source Sha256",
+      "type": "string"
+    },
+    "process_profile": {
+      "$ref": "#/$defs/FrozenApiProcessProfile"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime_bundle_identity_sha256": {
+      "title": "Runtime Bundle Identity Sha256",
+      "type": "string"
+    },
+    "safety_drift_reasons": {
+      "items": {
+        "enum": [
+          "epoch_drift",
+          "identity_drift",
+          "counter_regression",
+          "oom_increment"
+        ],
+        "type": "string"
+      },
+      "title": "Safety Drift Reasons",
+      "type": "array"
+    },
+    "started_at_utc": {
+      "format": "date-time",
+      "title": "Started At Utc",
+      "type": "string"
+    },
+    "started_monotonic_ns": {
+      "minimum": 0,
+      "title": "Started Monotonic Ns",
+      "type": "integer"
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "unsafe"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "termination_reason": {
+      "enum": [
+        "duration_elapsed",
+        "cancelled",
+        "sampler_or_transport_shutdown",
+        "queue_overflow",
+        "artifact_bound_exceeded",
+        "identity_drift"
+      ],
+      "title": "Termination Reason",
+      "type": "string"
+    },
+    "unsupported_observation_count": {
+      "minimum": 0,
+      "title": "Unsupported Observation Count",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "run_id",
+    "runtime_bundle_identity_sha256",
+    "observer_source_sha256",
+    "clock_domain_identity_sha256",
+    "started_at_utc",
+    "finished_at_utc",
+    "started_monotonic_ns",
+    "finished_monotonic_ns",
+    "status",
+    "lane_quality",
+    "termination_reason",
+    "observed_clock_divergence_ns",
+    "epoch_changed",
+    "safety_drift_reasons",
+    "unsupported_observation_count",
+    "artifacts",
+    "process_profile",
+    "observer_identity"
+  ],
+  "title": "SynchronizedTelemetryReceiptV3",
+  "type": "object"
+}

@@ -20,6 +20,7 @@ from disclosure_anchor.application.ports.synchronized_telemetry import (
 
 
 HASHES = ["sha256:" + character * 64 for character in "abcdef0"]
+OBSERVER_CLOCK = "sha256:" + "1" * 64
 
 
 def _identity() -> dict[str, str]:
@@ -117,6 +118,7 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
                 "maximum_sample_age_ms": 1000,
                 "nominal_interval_ms": 1000 if lane == "host_slow" else 250,
                 "collector_identity_sha256": HASHES[0],
+                "observer_clock_domain_identity_sha256": OBSERVER_CLOCK,
                 "expected_identity": _identity(),
             }
         )
@@ -129,6 +131,11 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
         first = sampler.snapshot(deadline=deadline())
         second = sampler.snapshot(deadline=deadline())
         self.assertEqual(first.identity.runtime_bundle_identity_sha256, HASHES[3])
+        self.assertEqual(first.identity.clock_domain_identity_sha256, OBSERVER_CLOCK)
+        self.assertNotEqual(first.identity.clock_domain_identity_sha256, _identity()["clock_domain_identity_sha256"])
+        assert first.resident_exporter_provenance is not None
+        self.assertEqual(first.resident_exporter_provenance.wire_sampled_monotonic_ns, 250_000_000)
+        self.assertEqual(first.resident_exporter_provenance.exporter_process_epoch_sha256, HASHES[6])
         self.assertEqual(second.gpu.status, "unsupported")
         self.assertEqual(_Handler.requests, 2)
         sampler.close()
@@ -209,13 +216,17 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
             Path(__file__).parents[2]
             / "scripts/windows/mineru_resident_telemetry_exporter.ps1"
         ).read_text()
-        sampling_loop = script.split("while ($listener.IsListening)", 1)[1]
-        for forbidden in ("Start-Process", "docker ", "wsl ", "ssh ", "nvidia-smi"):
+        sampling_loop = script.split("$sampleAction =", 1)[1].split("$closeAction =", 1)[0]
+        for forbidden in ("Start-Process", "docker ", "wsl ", "ssh ", "nvidia-smi", "Add-Type", "::new("):
             self.assertNotIn(forbidden, sampling_loop)
+        self.assertIn("$gpu.ReadJson()", sampling_loop)
+        self.assertIn("Read-MineruLinuxResponse 'sample'", sampling_loop)
+        self.assertIn("$queue.Observe($health,$http,$metrics)", sampling_loop)
 
     def test_spawn_spec_binds_ready_identity_and_closed_config(self) -> None:
         spec = windows_resident_collector_spec(
             collector_identity_sha256=HASHES[0],
+            observer_clock_domain_identity_sha256=OBSERVER_CLOCK,
             lane="gpu_fast",
             base_url=f"http://127.0.0.1:{self.server.server_port}",
             path="/gpu_fast",
@@ -227,17 +238,29 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
         self.assertEqual(spec.expected_collector_identity_sha256, HASHES[0])
         config = json.loads(spec.canonical_config_json)
         self.assertEqual(config["collector_identity_sha256"], HASHES[0])
+        self.assertEqual(config["observer_clock_domain_identity_sha256"], OBSERVER_CLOCK)
         self.assertEqual(set(config), {
             "base_url", "collector_identity_sha256", "expected_identity", "lane",
             "maximum_response_bytes", "maximum_sample_age_ms",
-            "nominal_interval_ms", "path",
+            "nominal_interval_ms", "path", "observer_clock_domain_identity_sha256",
         })
+        for invalid in (None, "", "sha256:" + "G" * 64, 5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "observer_clock"):
+                build_windows_resident_telemetry_sampler({**config, "observer_clock_domain_identity_sha256": invalid})
+        del config["observer_clock_domain_identity_sha256"]
+        with self.assertRaisesRegex(ValueError, "config shape"):
+            build_windows_resident_telemetry_sampler(config)
 
     def test_default_off_supervisor_declares_job_object_and_has_no_activation_caller(self) -> None:
         root = Path(__file__).parents[2]
         supervisor = (root / "scripts/windows/start_mineru_resident_telemetry.ps1").read_text()
-        self.assertIn("AssignProcessToJobObject", supervisor)
-        self.assertIn("KILL_ON_CLOSE=0x2000", supervisor)
+        job = (root / "scripts/windows/mineru_telemetry_job_supervisor.cs").read_text()
+        bootstrap = (root / "scripts/windows/load_mineru_resident_session.ps1").read_text()
+        self.assertIn("[MineruTelemetryJobSupervisor]::Run", supervisor)
+        self.assertNotIn("Add-Type", supervisor)
+        self.assertNotIn("INFINITE", supervisor)
+        self.assertIn("UpdateProcThreadAttribute", job)
+        self.assertIn("KILL_ON_CLOSE = 0x2000", job)
         active_surfaces = "\n".join(
             path.read_text(errors="replace")
             for path in (
@@ -256,13 +279,18 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
             and path.name not in {
                 "mineru_resident_telemetry_exporter.ps1",
                 "start_mineru_resident_telemetry.ps1",
+                "load_mineru_resident_session.ps1",
+                "test_mineru_resident_session.ps1",
                 "windows_resident_telemetry.py",
+                "resident_session_evidence.py",
+                "resident_telemetry_owner.py",
                 "full_host_hour_kpi.py",
             }
         )
-        self.assertNotIn("mineru_resident_telemetry", executable_surface)
-        self.assertIn("ValidateRange(1024, 65535)", supervisor)
-        self.assertIn("$PSHOME, 'powershell.exe'", supervisor)
+        self.assertFalse("mineru_resident_telemetry" in executable_surface, "resident telemetry has an unexpected activation caller")
+        self.assertFalse("run_resident_telemetry_session(" in executable_surface, "explicit diagnostic owner has an automatic activation caller")
+        self.assertIn("Get-MineruInteger $config 'port' 1024 65535", bootstrap)
+        self.assertIn("$PSHOME,'powershell.exe'", bootstrap)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SUPPLEMENT_ID = re.compile(r"pes_[0-9A-HJKMNP-TV-Z]{26}\Z")
+SUPPORTED_OBSERVER_RECEIPT_VERSIONS = frozenset({
+    "mineru.synchronized-telemetry-receipt.v2",
+    "mineru.synchronized-telemetry-receipt.v3",
+})
 
 
 class PublishEvidenceConflict(RuntimeError):
@@ -81,7 +85,7 @@ class DurablePublishSupplementEvidence(_Closed):
         _utc(self.publish_durable_observed_at, "publish_durable_observed_at")
         if self.publish_durable_observed_at < self.publish_precommit_at:
             raise ValueError("supplement predates the publish commit")
-        if self.observer_contract_version != "mineru.synchronized-telemetry-receipt.v2":
+        if self.observer_contract_version not in SUPPORTED_OBSERVER_RECEIPT_VERSIONS:
             raise ValueError("observer contract version is unsupported")
         try:
             observer_run = uuid.UUID(self.observer_run_id)

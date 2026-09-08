@@ -55,8 +55,8 @@ utilization/memory/power；只有 NVML NOT_SUPPORTED 可投影 unsupported。原
 约束。power 保留驱动提供的平均语义，不把以 250ms 读取误称为 250ms 瞬时功耗。
 这些 backend 的独立实机 smoke 不替代 exporter 接线、联合退出/CPU 或完整 host-hour 验收。
 
-`mineru_telemetry_job_supervisor.cs` 是独立的默认关闭 Windows 生命周期 backend，尚未替换旧 PS
-入口。它使用 Windows 10+ `STARTUPINFOEX/PROC_THREAD_ATTRIBUTE_JOB_LIST`，使 suspended child
+`mineru_telemetry_job_supervisor.cs` 是默认关闭 Windows 生命周期 backend，由显式 session PS
+入口加载预编译 DLL 后调用。它使用 Windows 10+ `STARTUPINFOEX/PROC_THREAD_ATTRIBUTE_JOB_LIST`，使 suspended child
 在创建时即属于非继承 handle 的 unnamed kill-on-close Job；核验 `IsProcessInJob` 后才 Resume。
 禁止降级为 Create 后再 Assign（owner 在两者之间退出会遗留 suspended child）。有限 wait 后必须
 实读 Job `ActiveProcesses=0`，才读取包含已退出成员的 `TotalUserTime/TotalKernelTime`，100ns 转 ns。
@@ -91,6 +91,41 @@ native startup/disposal 的最终 hard fuse 仍是外层 Job。
 不通过 float/decimal 四舍五入；仅 preemption 是单调 counter，health terminal registry gauge 允许下降。
 `test_mineru_resident_wire.ps1` 和 `test_mineru_bounded_http.ps1` 是显式独立机制测试；其中 test-only
 Add-Type/loopback server 不得进入 measured exporter，也不替代正常退出/联合 CPU/hour 门禁。
+
+两个 PS session 入口只接受私有 `ConfigJsonPath` 与其 exact SHA。配置闭合绑定新 session GUID、
+lane/cadence/loopback port、有限 lease/不可续期 lifetime、prepared manifest、六份 bootstrap/backend
+脚本源码及 PowerShell executable SHA；config/源码/DLL 全程固定文件 handle，运行期无编译。
+`load_mineru_resident_session.ps1` 构建的 READY 包含实际 PID/creation、QPC frequency、已加载
+manifest/DLL、NVML 设备或 Docker/Linux READY。owner 提供的 host/boot/runtime/profile hashes
+仍是待外部独立核验的 claims；回显配置不是 activation receipt。
+artifact 先在同一私有目录的 new-only pending 文件写完并 Flush(true)，关闭后以不覆盖的
+File.Move 发布最终名，再固定其 bytes。失败保留 pending 证据，不能删除旧 READY 来重试；
+不声称 Windows 文件机制等同于 POSIX anchored directory seal。
+starter 在启动 Job 前先原子发布 new-only `supervisor-started.json`，记录同一 config/session
+和父进程实际 creation；响应丢失只能读取这个 marker 与后续 READY/Job 解决，不得盲目重启同一 session。
+
+`MineruResidentEndpoint` 只监听 `/v1/<session>/<lane>/after/<sequence>` 与 `/close`；READY 后
+尚不采样，首次合法 after/0 才启动绝对 cadence。只保留最新一帧，允许取回 exact next，不重置
+旧 checkpoint；跳过的 slot 保留在 sequence 中暴露缺口，无 catch-up burst。有效请求才续租，
+但过期和 closing 不可复活，hard lifetime 不延长。一个待 accept task 或 held request，等待有界；
+回复 WriteAsync/FlushAsync 共享期限，失败 Abort 后必须确认 pending I/O 结束。仅明确的
+HttpListener Windows error 64 可视为连接丢失；deadline、任意其他异常或未 quiesce 均失败。
+close 先禁止采样/续租，再核对 Linux close→closed→EOF→exit0/空 stderr、释放 backend 并写独立
+closed 文件；回复丢失可从文件恢复，但仍必须有正常 Job 回执和外部 exact container absence。
+同步 native startup/disposal 的最后期限由 atomic Job 提供，不由协作式 callback 假装保证。
+
+`test_mineru_resident_endpoint.ps1` 是合成会话/发布机制测试；
+`test_mineru_resident_session.ps1` 是显式实际 backend 诊断 owner，启动一个有限 Job，独立匹配
+live READY PID/creation 与退出后的 Job accounting。host 检查实际 Docker ID/image/namespace/
+无网络/只读/cap-drop/no-new-privileges，并在正常退出后核验 exact ID 不存在。
+SampleCount=0 仅检验关闭链，不证明 host/queue sample。诊断 owner 的控制 CLI/HTTP 成本不在
+该 Job 的 CPU 中，不能据短测宣布 combined/full-hour 通过。Docker 29.6.1 的
+[generateSecurityOpt](https://github.com/moby/moby/blob/8ec5ab355a34b2a0e2b3238d67bdefe77fefa982/daemon/create.go)
+会为 host PID 自动附加 `label=disable`；该 runtime 诊断要求与 `no-new-privileges` 恰为两项，
+不接受任意额外 security option。代码对应 `docker-v29.6.1`，不是以 upstream main 代替实际版本。
+File.Move 的 [Framework no-replace 合同](https://learn.microsoft.com/en-us/dotnet/api/system.io.file.move?view=netframework-4.8.1)
+不允许覆盖已有目标；listener 的 [Abort](https://learn.microsoft.com/en-us/dotnet/api/system.net.httplistenerresponse.abort?view=netframework-4.8.1)
+关闭响应连接，异步完成仍须单独核验。
 机制依据：Microsoft [Job accounting](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information)、
 [creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)、
 [PowerShell 5.1 Add-Type](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/add-type?view=powershell-5.1)、
@@ -146,6 +181,75 @@ resident runner 发布独立的 v2：`frames.v2.jsonl` 只接受 LF 结尾的逐
 并在 replay 后再次核验目录锚点，且只有最终 replay 对象能够以 `SEALED` 返回。返回值中的
 `run_directory` 仅是事后定位器，不是已验证证据来源；证据完全来自仍打开的原始 write/directory FD。
 任何篡改、缺失或磁盘失败都进入 `FAILED_EVIDENCE`。
+
+跨主机 resident 会话使用显式 `receipt.v3.json` / `seal.v3.json`，继续使用原封不动的
+`frames.v2.jsonl`。v3 的 `FrozenApiProcessProfile` 只保存实际 API epoch、runtime/profile 与
+startup-only parameters，不伪造 API 的启动 UTC 或 Mac 单调时间。独立 `observer_identity`
+保存实际 Mac observer process epoch 与本机 monotonic clock domain；frame/receipt clock 必须
+对应这个本机 domain。Windows QPC 的原始 clock/source/process/config 留在私有 READY 中，
+每帧 exporter provenance 的 source sequence/QPC/UTC 通过同一 exporter epoch 绑定该 READY，
+不得把 Mac clock hash 填成 Windows QPC hash，也不得跨域相减单调时间。
+reader 必须显式选择 v3，旧 v1/v2 bytes、schema、校验和默认 reader 行为不变；不自动升级旧证据。
+已有 v1 phase-trace consumer 不获得 v3 同步资格。历史 v2 coverage 保留历史投影语义，不用于
+这次跨主机的实际 observer 身份证明；v3 coverage 从独立 observer_identity 取值。
+
+`resident_session_evidence.py` 只重放机制，不发放 activation：strict canonical config/READY/
+prepared/source/closed-v2/Job/Linux receipts 相互 hash 绑定，保留精确 Int64；拒绝同 PID、
+父进程晚于子进程、重复 service PID/cgroup、非法 GPU UUID，以及非正常退出。
+observer mapping 除 owner/source/runtime/profile 外，还须逐帧比较 GPU UUID 派生设备身份、
+API 的 `boot_id + members.api` epoch，以及 sampler 的五字段 HostSampler.identity
+（boot/members/parent_path/device/inode）派生父 cgroup epoch；后者不是加了 helper PID/source/
+namespace 的 sampler process epoch。远端 source 首末/closing 与相邻 QPC/UTC 均校验 50ms+50ppm；
+仅 UTC 桥接本机收集 bracket，首帧必须 sequence1，无缺 slot、反向时间或静默重设。
+关闭期间允许 consumed prefix 后的连续采样尾部，但不能延长 observer 分母或补齐缺口。
+执行 owner 另须核验实际 Mac 进程/boot/clock、两个 Windows READY 的共同 host/boot/runtime/profile、
+真实 source/DLL 与 live PID/creation、实际 Docker 配置和退出后 exact ID absence；caller boolean、
+仅自报 hash 或孤立短测均不能代替这些原始证据。
+
+Mac identity reader 通过安装的 Apple SDK `PROC_PIDTBSDINFO` 读取真实 PID/parent/UID/出生秒与微秒，
+通过只读 `sysctlbyname(kern.bootsessionuuid)` 取得 boot UUID，并绑定实际
+`time.get_clock_info('monotonic')` 与 kernel release。原始 process/clock 分别 hash；重复核验
+boot/process 稳定，不调用 shell、不制造启动时间。依据为本机 SDK 的 136-byte `proc_bsdinfo`
+布局和 [Apple sysctlbyname](https://developer.apple.com/documentation/kernel/1387446-sysctlbyname)、
+[Python 3.13 ctypes](https://docs.python.org/3.13/library/ctypes.html)/
+[time](https://docs.python.org/3.13/library/time.html) 接口。
+`dedicated_mac_observer.py` 显式 spawn 一个独立 observer，外层从 kernel 独立读取该子 PID 并
+比较原始 bytes 后才发送一次 GO；此前不创建 collector/观测 artifacts。控制 socket 有消息长度与
+绝对读 deadline，EOF 触发协作取消，非法消息即使到达 drain/seal 阶段也不得返回正常结束。
+正常退出要求 collector 由原 runner 关闭回收、watcher join、前后 observer identity 相同、exit0，
+再由外层做显式 v3 anchored replay。`poll(timeout)` 只限定进程等待，不限定之后的 file replay。
+依据 [Python 3.13 multiprocessing](https://docs.python.org/3.13/library/multiprocessing.html)，
+terminate 父进程不会终止 descendants；故 GO 后若协作回收超时，保留明确 PID/run 的未解决 ownership，
+不以单独 kill observer 冒充完整清理，也不发放 activation。该工具不是强制清理保证。
+
+`resident_combined_cpu.py` 对已完成 canonical replay 的七项成本做整数加总：Mac preseal delta、
+两个 Windows Job 全成员总 CPU、两个不同父进程的 pre-attestation CPU、Linux sampler wait4
+退出 CPU 与 Linux supervisor pre-attestation CPU。每份 closure 必须匹配精确 config/READY hash；
+同 session 的另一个启动实例也不能提供 CPU。两个 lane 的 session/Job/Windows PID 角色不得重叠。
+只以 observer sampling elapsed 为共同分母，使用 `100 * total <= 2 * elapsed` 判定限定成本是否
+不超过 2%；不得重复添加每帧或 collector CPU，也不能延长分母。明确排除 observer 父 bootstrap、
+未回收 resource tracker、外层 owner、SSH server/control CLI、seal/attestation serialization/exit。
+它不是全系统 full-run 开销，且算术通过不替代外部实际身份/退出/absence 证明或 full-hour gate。
+
+`resident_telemetry_owner.py` 是显式调用、default-off 的有限组合运行器，不部署服务、不创建
+业务任务、不签发 activation。调用前必须准备私有远端目录/config/compiled bundle，并另行完成
+适用的真实 runtime/profile 核验。运行器在任何启动前验证两份完整 canonical config、manifest/
+source SHA、互异 session/port/path、共同 host/boot/runtime/profile 与实际计划的寿命预算；
+本 owner 的 lifetime 最大 7,180,000ms，为外层命令保留 20s，不能超过其 7200s 硬上限。
+先写 new-only 私有 intent 和本机 composition 源码快照，再并行持有两个 Windows starter；
+独立 source-pinned READY 控制命令最多等 10s artifact（总命令期限 25s），不采样、不续租。
+原始 STARTED marker 的 SHA 必须贯穿 READY/closed，完整 canonical Job/Windows/Linux closure
+均重算，且最终 Job 父身份必须与同一 marker 精确相等；只检查 absence 字符串不足以闭合。
+两路外部 READY 后才建立 Mac observer/独立 GO；观察器已回收后，同线程拥有的两个独立 HTTP
+客户端并行请求 close，各仅一次。200 body 必须等于原始 closed 文件；仅 transport response
+loss 可依赖原 session 的正常 Job、独立文件重读与 exact helper absence 对账，其他异常仍失败。
+最后验证 source mapping、七项 CPU 与本机 source 未变化，保存原始 stdout/stderr/exit、证据
+SHA 和明确的 diagnostic-only 结果。外层命令采用显式 known-hosts/key、publickey-only，
+禁用 global known-hosts、agent、默认 identity file 与用户 SSH config；不改信任或凭据。
+失败保留原始输出并报告精确 session 待对账；终止本机 SSH 不代表远端已消失，也不得自动重启。
+Darwin 对已退出但未回收的 zombie-only 本机进程组可能返回 EPERM；此时仅回收自己持有的
+Popen leader，再要求 signal 0 明确返回 ESRCH 才视为本机组已消失。live leader、仍存在的
+descendant 或持续 EPERM 均继续报错；清理报错也不能跳过已捕获 stdout/stderr 的保存。
 
 seal 中的 CPU 字段明确命名为 `preseal_observer_*`：区间从 sampling 前开始，累计 observer parent 与已回收
 resident collector child 的 process CPU，覆盖 collector shutdown、frame close、quality derive、receipt
@@ -209,7 +313,7 @@ progress 还必须绑定 receipt 的 process epoch/profile。durable commit 的 
 只能出现一次，累计页数必须严格等于前累计加本次 delta；blocked event 携带闭合的起止 monotonic
 区间，重叠区间或跨 phase 边界区间不得相加，避免把同时发生的多个阻塞原因重复计时。
 
-`full-gpu-host-hour-kpi.v1` 只接受已验证的 v2 observer coverage 摘要和带原 publish commit UTC、source
+`full-gpu-host-hour-kpi.v1` 只接受显式版本验证的 v2/v3 observer coverage 摘要和带原 publish commit UTC、source
 identity、profile identity、闭合页数的 durable evidence。bucket 固定为 UTC `[hour, hour+3600s)`；idle、
 readiness、restart、故障和恢复均留在分母。coverage gap/overlap、identity drift、unsafe observer、页数冲突
 或旧 outbox 缺 profile/runtime 都令结果 incomplete，既不缩短分母，也不补零或外推。late supplement 仍按
@@ -219,6 +323,9 @@ readiness、restart、故障和恢复均留在分母。coverage gap/overlap、id
 本地 relay checkpoint 只是 owner-only、canonical 的 cache，不能单独证明 restart continuity。
 0054 已提供 append-only publish evidence ledger 与 DB relay head，V4 publisher 已在整文档事务中写入
 base evidence；后续生产入口须接入这些现有机制并从其 replay 推导 first durable publish，不另造 ledger。
+append-only 0062 只扩展 supplement 的版本约束，允许 exact v2 或 v3；不重写 0054 或历史行。
+版本属于 conflict identity：同 run/source/receipt/seal 被标成不同版本也必须保留冲突，不当作重复成功。
+存在 v3 数据时降级旧约束必须失败，不能删除/重标证据来降级。
 调用者布尔值或事后补写文件都不能使 host-hour complete。
 同理，当前 artifact adapter 把 resident exporter overhead 固定为 unverified，因此只能生成 incomplete KPI。
 

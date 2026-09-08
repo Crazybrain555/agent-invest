@@ -1455,7 +1455,7 @@ class DurablePublishSupplement(Base):
         CheckConstraint("source_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND host_assignment_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND boot_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND runtime_bundle_identity_sha256 ~ '^sha256:[0-9a-f]{64}$' AND process_profile_sha256 ~ '^sha256:[0-9a-f]{64}$' AND observer_receipt_sha256 ~ '^sha256:[0-9a-f]{64}$' AND observer_seal_sha256 ~ '^sha256:[0-9a-f]{64}$'", name="ck_durable_publish_supplement_hashes"),
         CheckConstraint("source_page_count > 0", name="ck_durable_publish_supplement_pages"),
         CheckConstraint("publish_durable_observed_at >= publish_precommit_at", name="ck_durable_publish_supplement_time"),
-        CheckConstraint("observer_contract_version = 'mineru.synchronized-telemetry-receipt.v2'", name="ck_durable_publish_supplement_contract"),
+        CheckConstraint("observer_contract_version IN ('mineru.synchronized-telemetry-receipt.v2', 'mineru.synchronized-telemetry-receipt.v3')", name="ck_durable_publish_supplement_contract"),
         CheckConstraint("observer_run_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'", name="ck_durable_publish_supplement_observer_run"),
         CheckConstraint("supplement_id ~ '^pes_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_durable_publish_supplement_id"),
         Index("ix_durable_publish_supplement_run", "processing_run_id", "created_at", "supplement_id"),

@@ -10,6 +10,15 @@ created_at: 2026-06-26
 
 ## Private resident lifecycle backends
 
+- Explicit receipt/seal v3 separates actual API profile/epoch from Mac observer process/clock; original
+  v1/v2 schema bytes and frame-v2 remain unchanged. No old-evidence upgrade or phase-clock comparability.
+  Canonical private replay binds native source/QPC/UTC and actual GPU/API/parent-cgroup projections;
+  source-less hashes and self-reported READY alone never qualify activation or combined CPU.
+- Append-only 0062 permits exact receipt v2/v3 supplement versions; projection reconciliation includes
+  version in conflict identity. Existing rows and 0054 are unchanged; v3 rows block a lossy downgrade.
+  Validation includes unchanged exports, separate-epoch spawn/replay, backend identity negative cases,
+  and managed scratch v3 round-trip/unknown-version rejection/mixed-version conflict.
+
 - Default-off Linux supervisor v1 owns one fixed-source sampler child; normal close/EOF/exact wait4
   exit0 precede exit CPU. Failure emits no successful closed receipt. A separate +2s native-hang fuse
   does not extend sampling or the KPI denominator; external owner still proves exact container absence.
@@ -23,6 +32,14 @@ created_at: 2026-06-26
   HTTP uses one frozen loopback port, bounded headers/body/deadline and verified cancellation quiescence.
   Queue health/PID and exact engine/model metric identities fail closed; no summed aliases or rounded counts.
   Explicit PS5.1 wire/loopback tests remain mechanism gates, not deployment or combined CPU qualification.
+- Private session v1 pins config/bootstrap/executable/prepared bytes; READY binds actual process/clock/
+  backend observations, while owner-supplied host/boot/runtime/profile claims still require independent checks.
+  Final artifact names appear only after flushed pending bytes and a same-directory no-replace move.
+  Session-qualified after/close, first-request start, absolute slots, latest-only exact retry and finite
+  lease/hard lifetime prevent old-session revival, silent sequence rebasing, and catch-up bursts.
+  Closed-v2 carries source first/last/closing QPC+UTC/count/sequence/skips for independent mapping.
+  Close artifacts need normal Job exit and exact Docker-ID absence; response loss alone is not failure
+  of already completed cleanup, and file presence alone is not proof of exit or combined CPU safety.
   Detailed boundaries and official mechanism references: `../design/synchronized-capacity-telemetry.md`.
 
 ## Private MinerU outgoing HTTP telemetry

@@ -1,69 +1,59 @@
 param(
-    [Parameter(Mandatory = $true)][string]$ExporterPath,
-    [Parameter(Mandatory = $true)][ValidateSet('gpu_fast', 'host_slow')][string]$Lane,
-    [Parameter(Mandatory = $true)][ValidateSet(250, 500, 1000)][int]$CadenceMilliseconds,
-    [Parameter(Mandatory = $true)][ValidateRange(1024, 65535)][int]$Port,
-    [Parameter(Mandatory = $true)][string]$IdentityJsonPath
+    [Parameter(Mandatory = $true)][string]$ConfigJsonPath,
+    [Parameter(Mandatory = $true)][string]$ExpectedConfigSha256
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if (($Lane -eq 'host_slow' -and $CadenceMilliseconds -ne 1000) -or
-    ($Lane -eq 'gpu_fast' -and $CadenceMilliseconds -notin @(250, 500))) {
-    throw 'lane/cadence combination is invalid'
+$ProgressPreference = 'SilentlyContinue'
+$pins = [Collections.Generic.List[IO.FileStream]]::new()
+$failures = [Collections.Generic.List[Exception]]::new()
+function Get-MineruBootstrapSha([byte[]]$Bytes) {
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return 'sha256:' + ([BitConverter]::ToString($hash.ComputeHash($Bytes))).Replace('-','').ToLowerInvariant() }
+    finally { $hash.Dispose() }
 }
-# Default-off/runtime-unverified. The child starts suspended and enters the
-# kill-on-close Job before its first instruction. Real PS5.1 testing remains an
-# activation gate.
-Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class MineruTelemetrySupervisor {
- const uint SUSPENDED=4, INFINITE=0xffffffff, KILL_ON_CLOSE=0x2000;
- [StructLayout(LayoutKind.Sequential)] struct SI { public uint cb; public string a,b,c; public uint d,e,f,g,h,i,j,k; public ushort l,m; public IntPtr n,o,p,q; }
- [StructLayout(LayoutKind.Sequential)] struct PI { public IntPtr process,thread; public uint processId,threadId; }
- [StructLayout(LayoutKind.Sequential)] struct IO { public ulong a,b,c,d,e,f; }
- [StructLayout(LayoutKind.Sequential)] struct BASIC { public long a,b; public uint flags; public UIntPtr c,d; public uint e; public UIntPtr f; public uint g,h; }
- [StructLayout(LayoutKind.Sequential)] struct EXTENDED { public BASIC basic; public IO io; public UIntPtr a,b,c,d; }
- [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcessW(string app,StringBuilder cmd,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref SI si,out PI pi);
- [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateJobObjectW(IntPtr a,string n);
- [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetInformationJobObject(IntPtr j,int c,ref EXTENDED i,uint n);
- [DllImport("kernel32.dll",SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p);
- [DllImport("kernel32.dll",SetLastError=true)] static extern uint ResumeThread(IntPtr t);
- [DllImport("kernel32.dll",SetLastError=true)] static extern uint WaitForSingleObject(IntPtr h,uint m);
- [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr p,out uint c);
- [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateJobObject(IntPtr j,uint c);
- [DllImport("kernel32.dll",SetLastError=true)] static extern bool TerminateProcess(IntPtr p,uint c);
- [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
- static string Quote(string v) {
-  if(v.IndexOf('\0')>=0) throw new ArgumentException("NUL");
-  StringBuilder b=new StringBuilder("\""); int slashes=0;
-  foreach(char ch in v) {
-   if(ch=='\\') { slashes++; continue; }
-   if(ch=='\"') { b.Append('\\',slashes*2+1).Append(ch); slashes=0; continue; }
-   b.Append('\\',slashes).Append(ch); slashes=0;
-  }
-  b.Append('\\',slashes*2).Append('\"'); return b.ToString();
- }
- public static int Run(string powershell,string[] args) {
-  IntPtr job=IntPtr.Zero; PI pi=new PI(); bool assigned=false;
-  try {
-   job=CreateJobObjectW(IntPtr.Zero,null); if(job==IntPtr.Zero) throw new Win32Exception();
-   EXTENDED limit=new EXTENDED(); limit.basic.flags=KILL_ON_CLOSE;
-   if(!SetInformationJobObject(job,9,ref limit,(uint)Marshal.SizeOf(typeof(EXTENDED)))) throw new Win32Exception();
-   StringBuilder cmd=new StringBuilder(Quote(powershell)); foreach(string arg in args) cmd.Append(" ").Append(Quote(arg));
-   SI si=new SI(); si.cb=(uint)Marshal.SizeOf(typeof(SI));
-   if(!CreateProcessW(powershell,cmd,IntPtr.Zero,IntPtr.Zero,false,SUSPENDED,IntPtr.Zero,null,ref si,out pi)) throw new Win32Exception();
-   if(!AssignProcessToJobObject(job,pi.process)) throw new Win32Exception(); assigned=true;
-   if(ResumeThread(pi.thread)==0xffffffff) throw new Win32Exception();
-   if(WaitForSingleObject(pi.process,INFINITE)!=0) throw new Win32Exception();
-   uint code; if(!GetExitCodeProcess(pi.process,out code)) throw new Win32Exception(); return unchecked((int)code);
-  } catch { if(assigned&&job!=IntPtr.Zero) TerminateJobObject(job,1); else if(pi.process!=IntPtr.Zero) TerminateProcess(pi.process,1); throw; }
-  finally { if(pi.thread!=IntPtr.Zero) CloseHandle(pi.thread); if(pi.process!=IntPtr.Zero) CloseHandle(pi.process); if(job!=IntPtr.Zero) CloseHandle(job); }
- }
+function Read-MineruBootstrap([string]$Path,[string]$ExpectedSha,[int]$Maximum) {
+    if ($ExpectedSha -cnotmatch '\Asha256:[0-9a-f]{64}\z' -or -not [IO.Path]::IsPathRooted($Path)) { throw 'absolute bootstrap path and canonical SHA required' }
+    $pin = [IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $pins.Add($pin)
+    if ($pin.Length -lt 1 -or $pin.Length -gt $Maximum) { throw 'bootstrap file byte bound exceeded' }
+    $bytes = [byte[]]::new([int]$pin.Length); $offset = 0
+    while ($offset -lt $bytes.Length) {
+        $count = $pin.Read($bytes,$offset,$bytes.Length-$offset)
+        if ($count -le 0) { throw 'bootstrap truncated' }
+        $offset += $count
+    }
+    if ((Get-MineruBootstrapSha $bytes) -cne $ExpectedSha) { throw 'bootstrap SHA mismatch' }
+    return ,$bytes
 }
-'@
-$arguments = [string[]]@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$ExporterPath,'-Lane',$Lane,'-CadenceMilliseconds',[string]$CadenceMilliseconds,'-Port',[string]$Port,'-IdentityJsonPath',$IdentityJsonPath)
-$powerShellExe = [System.IO.Path]::Combine($PSHOME, 'powershell.exe')
-exit [MineruTelemetrySupervisor]::Run($powerShellExe,$arguments)
+
+try {
+    # Owner must validate canonical config/preparation and current runtime first.
+    $configBytes = Read-MineruBootstrap $ConfigJsonPath $ExpectedConfigSha256 32768
+    $bootstrapConfig = [Text.UTF8Encoding]::new($false,$true).GetString($configBytes) | ConvertFrom-Json
+    $commonPath = [IO.Path]::Combine($PSScriptRoot,'load_mineru_resident_session.ps1')
+    $null = Read-MineruBootstrap $commonPath $bootstrapConfig.sources.'load_mineru_resident_session.ps1' 65536
+    . $commonPath
+    $state = Initialize-MineruResidentSession
+    $runDirectory = $state.RunDirectory
+    $exporter = [IO.Path]::Combine($state.SourceDirectory,'mineru_resident_telemetry_exporter.ps1')
+    $arguments = [string[]]@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$exporter,'-ConfigJsonPath',$ConfigJsonPath,'-ExpectedConfigSha256',$ExpectedConfigSha256)
+    # One fresh owner per lane. Includes startup and close; no infinite wait or
+    # compilation. Forced/nonzero Job receipts are retained but never qualified.
+    # New-only pre-Job marker makes a lost launch response discoverable. Never
+    # start a second Job under the same session/config or overwrite its parent.
+    $startedReceipt = New-MineruJson @('contract_version','"mineru.windows-resident-supervisor-started.v1"','session',(Quote-MineruJson $state.Session),'config_sha256',(Quote-MineruJson $ExpectedConfigSha256),'supervisor_process',$state.Epoch)
+    Write-MineruSessionArtifact 'supervisor-started.json' $startedReceipt
+    $jobJson = [MineruTelemetryJobSupervisor]::Run($state.PowerShellExe,$arguments,([int]$state.Lifetime+5000),3000,$state.Loaded.Manifest.sources.Where({$_.name -ceq 'mineru_telemetry_job_supervisor.cs'})[0].sha256)
+    $receipt = New-MineruJson @('contract_version','"mineru.windows-resident-job-receipt.v1"','session',(Quote-MineruJson $state.Session),'config_sha256',(Quote-MineruJson $ExpectedConfigSha256),'supervisor_process',$state.Epoch,'job',$jobJson)
+    Write-MineruSessionArtifact 'job-accounting.json' $receipt
+    $job = [MineruResidentWire]::Parse($jobJson,8192)
+    if ($job.Get('forced_termination').Raw -cne 'false' -or $job.Get('child_exit_code').Integer() -ne 0 -or $job.Get('job_active_processes').Integer() -ne 0) { throw 'resident Job did not close normally; retained receipt is unverified' }
+    [Console]::Out.WriteLine($receipt)
+} catch { $failures.Add($_.Exception) }
+finally {
+    foreach ($pin in $pins) {
+        try { $pin.Dispose() } catch { $failures.Add($_.Exception) }
+    }
+}
+if ($failures.Count -gt 0) { throw [AggregateException]::new('resident supervisor failed',$failures) }

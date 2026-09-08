@@ -437,6 +437,256 @@ public sealed class MineruBoundedHttp : IDisposable {
     }
 }
 
+// Explicit owner diagnostics only: one known executable, bounded concurrent
+// stdout/stderr drains and kill + exact-process reap. Not a measured collector.
+public static class MineruDiagnosticProcess {
+    public sealed class Result {
+        public int ExitCode, Pid; public long CreationFiletime100ns;
+        public string StandardOutput, StandardError;
+    }
+    static async Task<string> Drain(Stream stream,int maximumBytes) {
+        byte[] buffer=new byte[4096];
+        using(MemoryStream bytes=new MemoryStream()) {
+            while(true) {
+                int count=await stream.ReadAsync(buffer,0,buffer.Length).ConfigureAwait(false);
+                if(count==0) return MineruResidentWire.Utf8.GetString(bytes.ToArray());
+                if(bytes.Length+count>maximumBytes) throw new FormatException("diagnostic process output bound");
+                bytes.Write(buffer,0,count);
+            }
+        }
+    }
+    public static Result Run(string executable,string expectedSha256,string[] arguments,int timeoutMilliseconds,int maximumBytes) {
+        if(!Path.IsPathRooted(executable) || timeoutMilliseconds<1 || timeoutMilliseconds>30000 || maximumBytes<1 || maximumBytes>65536)
+            throw new ArgumentException("finite diagnostic process configuration required");
+        StringBuilder command=new StringBuilder();
+        foreach(string arg in arguments) { if(command.Length>0) command.Append(' '); command.Append(MineruResidentWire.WindowsArgument(arg)); }
+        if(command.Length+executable.Length+4>32766) throw new ArgumentException("diagnostic argv bound");
+        using(FileStream pin=new FileStream(executable,FileMode.Open,FileAccess.Read,FileShare.Read))
+        using(Process process=new Process()) {
+            using(SHA256 hash=SHA256.Create()) {
+                string actual="sha256:"+BitConverter.ToString(hash.ComputeHash(pin)).Replace("-","").ToLowerInvariant();
+                if(actual!=expectedSha256) throw new InvalidOperationException("diagnostic executable hash drift");
+            }
+            process.StartInfo=new ProcessStartInfo(executable,command.ToString()) {
+                UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true
+            };
+            bool started=false; Task<string> output=null,error=null; Result result=null;
+            List<Exception> failures=new List<Exception>();
+            long deadline=MineruResidentWire.Deadline(timeoutMilliseconds);
+            try {
+                if(!process.Start()) throw new InvalidOperationException("diagnostic process start failed"); started=true;
+                result=new Result { Pid=process.Id,CreationFiletime100ns=process.StartTime.ToUniversalTime().ToFileTimeUtc() };
+                output=Drain(process.StandardOutput.BaseStream,maximumBytes); error=Drain(process.StandardError.BaseStream,maximumBytes);
+                while(!process.WaitForExit(0)) {
+                    if(output.IsFaulted) output.GetAwaiter().GetResult();
+                    if(error.IsFaulted) error.GetAwaiter().GetResult();
+                    process.WaitForExit(Math.Min(25,MineruResidentWire.Remaining(deadline)));
+                }
+                MineruResidentWire.Wait(output,deadline); MineruResidentWire.Wait(error,deadline);
+                result.ExitCode=process.ExitCode; result.StandardOutput=output.GetAwaiter().GetResult(); result.StandardError=error.GetAwaiter().GetResult();
+            } catch(Exception exception) { failures.Add(exception); }
+            finally {
+                if(started) {
+                    try {
+                        if(!process.WaitForExit(0)) {
+                            try { process.Kill(); } catch(InvalidOperationException) { if(!process.WaitForExit(0)) throw; }
+                            if(!process.WaitForExit(3000)) throw new TimeoutException("diagnostic process did not exit after kill");
+                        }
+                    } catch(Exception exception) { failures.Add(exception); }
+                    foreach(Stream stream in new Stream[]{process.StandardOutput.BaseStream,process.StandardError.BaseStream}) {
+                        try { stream.Dispose(); } catch(Exception exception) { failures.Add(exception); }
+                    }
+                }
+                foreach(Task pending in new Task[]{output,error}) if(pending!=null) {
+                    try { if(!pending.Wait(1000)) throw new TimeoutException("diagnostic output did not quiesce"); }
+                    catch(AggregateException exception) { if(!pending.IsCompleted || failures.Count==0) failures.Add(exception); }
+                    catch(Exception exception) { failures.Add(exception); }
+                }
+            }
+            if(failures.Count>0) {
+                AggregateException failure=new AggregateException("diagnostic process failed",failures);
+                if(result!=null) { failure.Data["ProcessId"]=result.Pid; failure.Data["CreationFiletime100ns"]=result.CreationFiletime100ns; }
+                throw failure;
+            }
+            return result;
+        }
+    }
+}
+
+// One owner thread, one outstanding accept or retained request, latest-only
+// samples, and an immutable session path. Native hangs remain bounded by Job.
+public sealed class MineruResidentEndpoint : IDisposable {
+    readonly HttpListener listener=new HttpListener();
+    readonly int owner=Thread.CurrentThread.ManagedThreadId, cadence, lease, responseTimeout;
+    readonly long hardEnd;
+    readonly string path, lane, identity;
+    Task<HttpListenerContext> accepting;
+    HttpListenerContext held;
+    bool disposed, running, closing;
+    public bool CloseReplyDelivered { get; private set; }
+    public string CloseArtifact { get; private set; }
+    public string CloseBoundaryJson { get; private set; }
+    public MineruResidentEndpoint(int port,string session,string requestedLane,int cadenceMilliseconds,
+        int leaseMilliseconds,int lifetimeMilliseconds,int responseMilliseconds,string identityJson) {
+        if(port<1024 || port>65535 || !Regex.IsMatch(session,@"\A[a-f0-9]{32}\z") ||
+           !((requestedLane=="gpu_fast" && (cadenceMilliseconds==250 || cadenceMilliseconds==500)) ||
+             (requestedLane=="host_slow" && cadenceMilliseconds==1000)) ||
+           leaseMilliseconds<2000 || leaseMilliseconds>30000 || lifetimeMilliseconds<leaseMilliseconds ||
+           lifetimeMilliseconds>7190000 || responseMilliseconds<1 || responseMilliseconds>1000)
+            throw new ArgumentException("invalid finite resident endpoint configuration");
+        MineruJsonValue id=MineruResidentWire.Parse(identityJson,4096);
+        id.Keys("exporter_source_sha256","host_assignment_identity_sha256","boot_identity_sha256",
+            "runtime_bundle_identity_sha256","process_profile_sha256","clock_domain_identity_sha256","exporter_process_epoch_sha256");
+        foreach(string key in new string[]{"exporter_source_sha256","host_assignment_identity_sha256","boot_identity_sha256",
+            "runtime_bundle_identity_sha256","process_profile_sha256","clock_domain_identity_sha256","exporter_process_epoch_sha256"})
+            if(!Regex.IsMatch(id.Get(key).String(),@"\Asha256:[0-9a-f]{64}\z")) throw new FormatException("resident identity SHA");
+        cadence=cadenceMilliseconds; lease=leaseMilliseconds; responseTimeout=responseMilliseconds;
+        hardEnd=MineruResidentWire.Deadline(lifetimeMilliseconds);
+        path="/v1/"+session+"/"+requestedLane; lane=requestedLane; identity=identityJson;
+        listener.Prefixes.Add("http://127.0.0.1:"+port.ToString(CultureInfo.InvariantCulture)+"/");
+    }
+    void Check() {
+        if(Thread.CurrentThread.ManagedThreadId!=owner) throw new InvalidOperationException("endpoint crossed owner thread");
+        if(disposed) throw new ObjectDisposedException("MineruResidentEndpoint");
+    }
+    static long Advance(long ticks,int milliseconds) {
+        return checked(ticks+(long)Math.Ceiling(milliseconds*(double)Stopwatch.Frequency/1000));
+    }
+    public static long MonotonicNanoseconds() {
+        long ticks=Stopwatch.GetTimestamp(), frequency=Stopwatch.Frequency;
+        return checked((ticks/frequency)*1000000000L+(long)((decimal)(ticks%frequency)*1000000000m/frequency));
+    }
+    static async Task Send(HttpListenerResponse response,byte[] bytes) {
+        await response.OutputStream.WriteAsync(bytes,0,bytes.Length).ConfigureAwait(false);
+        await response.OutputStream.FlushAsync().ConfigureAwait(false);
+    }
+    // Only an actual peer-disconnect error can be normal transport loss. An
+    // elapsed deadline, incomplete pending I/O, or arbitrary fault stays fatal.
+    static bool PeerDisconnect(Exception error) {
+        AggregateException aggregate=error as AggregateException;
+        if(aggregate!=null) {
+            IList<Exception> errors=aggregate.Flatten().InnerExceptions;
+            return errors.Count==1 && PeerDisconnect(errors[0]);
+        }
+        HttpListenerException http=error as HttpListenerException;
+        return http!=null && http.ErrorCode==64;
+    }
+    bool Reply(HttpListenerContext context,int status,string json,long boundary) {
+        if(Object.ReferenceEquals(held,context)) held=null;
+        long deadline=Math.Min(boundary,MineruResidentWire.Deadline(responseTimeout));
+        Task pending=null; Exception failure=null;
+        try {
+            MineruResidentWire.Remaining(deadline);
+            byte[] bytes=MineruResidentWire.Utf8.GetBytes(json??"");
+            if(bytes.Length>65536) throw new FormatException("resident reply exceeded bound");
+            context.Response.StatusCode=status; context.Response.ContentType="application/json; charset=utf-8";
+            context.Response.Headers["Cache-Control"]="no-store"; context.Response.ContentLength64=bytes.Length;
+            pending=Send(context.Response,bytes); MineruResidentWire.Wait(pending,deadline);
+            context.Response.Close(); return true;
+        } catch(Exception error) { failure=error; }
+        List<Exception> failures=new List<Exception>();
+        try { context.Response.Abort(); } catch(Exception error) { failures.Add(error); }
+        if(pending!=null) {
+            try { if(!pending.Wait(1000)) failures.Add(new TimeoutException("resident response I/O did not quiesce")); }
+            catch(AggregateException error) { if(!pending.IsCompleted) failures.Add(error); }
+        }
+        if(failures.Count==0 && PeerDisconnect(failure)) return false;
+        failures.Insert(0,failure); throw new AggregateException("resident response failed",failures);
+    }
+    public void Run(Action ready,Func<long,string> sample,Func<long,string> close) {
+        Check(); if(running || closing) throw new InvalidOperationException("endpoint cannot be restarted"); running=true;
+        long leaseEnd=Math.Min(hardEnd,MineruResidentWire.Deadline(lease));
+        long next=0, sequence=0, samples=0, skippedSlots=0, firstStamp=0, lastStamp=0;
+        string latest=null, firstUtc=null, lastUtc=null;
+        listener.Start(); ready(); accepting=listener.GetContextAsync();
+        while(!closing) {
+            long boundary=Math.Min(hardEnd,leaseEnd); MineruResidentWire.Remaining(boundary);
+            long now=Stopwatch.GetTimestamp();
+            if(next!=0 && now>=next) {
+                // Preserve cadence slots in the sequence; missed slots are not
+                // hidden by renumbering or filled with a catch-up burst.
+                long slotTicks=Advance(0,cadence), skipped=(now-next)/slotTicks;
+                sequence=checked(sequence+skipped+1); next=checked(next+(skipped+1)*slotTicks);
+                skippedSlots=checked(skippedSlots+skipped);
+                long stamp=MonotonicNanoseconds();
+                string utc=DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'",CultureInfo.InvariantCulture);
+                string observation=sample(boundary);
+                MineruResidentWire.Remaining(boundary);
+                MineruJsonValue value=MineruResidentWire.Parse(observation,65536);
+                List<string> pairs=new List<string>(new string[]{"contract_version","\"mineru.windows-resident-telemetry.v1\"",
+                    "identity",identity,"lane",MineruResidentWire.Quote(lane),"sequence",MineruResidentWire.Integer(sequence),
+                    "observed_at_utc",MineruResidentWire.Quote(utc),"sampled_monotonic_ns",MineruResidentWire.Integer(stamp)});
+                string[] sections=lane=="gpu_fast"?new string[]{"gpu"}:new string[]{"api_process","host_cgroup","queue_vllm"};
+                value.Keys(sections); foreach(string section in sections) { pairs.Add(section); pairs.Add(value.Get(section).Raw); }
+                latest=MineruResidentWire.Object(pairs.ToArray());
+                samples=checked(samples+1); lastStamp=stamp; lastUtc=utc;
+                if(samples==1) { firstStamp=stamp; firstUtc=utc; }
+                if(held!=null) {
+                    HttpListenerContext response=held; held=null;
+                    Reply(response,200,latest,boundary); accepting=listener.GetContextAsync();
+                }
+                continue;
+            }
+            if(held!=null) {
+                int untilNext=Math.Max(1,(int)Math.Ceiling((next-Stopwatch.GetTimestamp())*1000.0/Stopwatch.Frequency));
+                Thread.Sleep(Math.Min(MineruResidentWire.Remaining(boundary),untilNext)); continue;
+            }
+            long wake=next==0?boundary:Math.Min(boundary,next);
+            int untilWake=Math.Max(1,(int)Math.Ceiling((wake-Stopwatch.GetTimestamp())*1000.0/Stopwatch.Frequency));
+            if(!accepting.Wait(untilWake)) continue;
+            HttpListenerContext context=accepting.GetAwaiter().GetResult(); accepting=null;
+            held=context;
+            // A request queued before expiry cannot resurrect an expired lease.
+            MineruResidentWire.Remaining(boundary);
+            string request=context.Request.RawUrl;
+            bool validMethod=context.Request.HttpMethod=="GET" && !context.Request.HasEntityBody;
+            if(validMethod && request==path+"/close") {
+                closing=true; // No sample or lease renewal beyond this point.
+                CloseBoundaryJson=MineruResidentWire.Object(
+                    "first_sampled_monotonic_ns",samples==0?"null":MineruResidentWire.Integer(firstStamp),
+                    "first_observed_at_utc",samples==0?"null":MineruResidentWire.Quote(firstUtc),
+                    "last_sampled_monotonic_ns",samples==0?"null":MineruResidentWire.Integer(lastStamp),
+                    "last_observed_at_utc",samples==0?"null":MineruResidentWire.Quote(lastUtc),
+                    "last_sequence",MineruResidentWire.Integer(sequence),"sample_count",MineruResidentWire.Integer(samples),
+                    "skipped_slots",MineruResidentWire.Integer(skippedSlots),
+                    "closing_monotonic_ns",MineruResidentWire.Integer(MonotonicNanoseconds()),
+                    "closing_at_utc",MineruResidentWire.Quote(DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'",CultureInfo.InvariantCulture)));
+                CloseArtifact=close(boundary); MineruResidentWire.Parse(CloseArtifact,65536);
+                CloseReplyDelivered=Reply(context,200,CloseArtifact,boundary); return;
+            }
+            string prefix=path+"/after/";
+            long after;
+            if(!validMethod || request==null || !request.StartsWith(prefix,StringComparison.Ordinal) ||
+               !Regex.IsMatch(request.Substring(prefix.Length),@"\A(?:0|[1-9][0-9]{0,18})\z") ||
+               !Int64.TryParse(request.Substring(prefix.Length),NumberStyles.None,CultureInfo.InvariantCulture,out after)) {
+                Reply(context,404,null,boundary); accepting=listener.GetContextAsync(); continue;
+            }
+            if(after>sequence || after<sequence-1) {
+                Reply(context,409,null,boundary); accepting=listener.GetContextAsync(); continue;
+            }
+            leaseEnd=Math.Min(hardEnd,MineruResidentWire.Deadline(lease)); boundary=Math.Min(hardEnd,leaseEnd);
+            if(next==0) next=Stopwatch.GetTimestamp(); // first after/0 starts the clock
+            if(latest!=null && after==sequence-1) {
+                Reply(context,200,latest,boundary); accepting=listener.GetContextAsync();
+            } else { held=context; }
+        }
+    }
+    public void Dispose() {
+        if(Thread.CurrentThread.ManagedThreadId!=owner) throw new InvalidOperationException("endpoint crossed owner thread");
+        if(disposed) return;
+        List<Exception> failures=new List<Exception>(); closing=true;
+        try { if(held!=null) held.Response.Abort(); } catch(Exception error) { failures.Add(error); }
+        try { listener.Close(); } catch(Exception error) { failures.Add(error); }
+        if(accepting!=null) {
+            try {
+                if(!accepting.Wait(1000)) failures.Add(new TimeoutException("resident accept did not quiesce"));
+                else accepting.GetAwaiter().GetResult().Response.Abort();
+            } catch(AggregateException error) { if(!accepting.IsCompleted) failures.Add(error); }
+        }
+        disposed=true; if(failures.Count>0) throw new AggregateException("resident endpoint cleanup failed",failures);
+    }
+}
+
 public sealed class MineruQueueTelemetry {
     readonly long servingNamespacePid;
     readonly string model;
