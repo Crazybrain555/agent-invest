@@ -21,6 +21,12 @@ details belong in the nearest component docs; current task/runtime state belongs
   authorization. Complete independent authorized work before pausing a dependent action; optional improvements
   do not become new completion gates. Optimize correctness, completeness, throughput and maintainability against
   the user's acceptance criteria; choose the justified scope of change rather than a minimum-diff default.
+- Instruction priority: the current user request, then the applicable `AGENTS.md` files (nearer files add local
+  constraints; parent safety and authorization rules stay in force), then skill or agent files. If a guide,
+  HANDOFF, or skill makes you pause, ask for confirmation, or leave authorized work unfinished, name the file,
+  quote the line, say how you read it, and continue, unless the line states an authorization requirement, a hard
+  boundary, or a HANDOFF/parked protection; raise those instead of overriding them. Report defects or
+  improvements unrelated to the current request as follow-ups, not as new scope.
 - Repository layout, component status, and planned services live in `README.md`.
 - At session start and before the first mutation, inspect the root and affected-component HANDOFF/parked records.
   An unclosed HANDOFF protects its writer's checkout; RUNTIME coordination and explicit user-scoped exceptions
@@ -81,5 +87,8 @@ details belong in the nearest component docs; current task/runtime state belongs
 
 - `make agent-check` is the default repository gate; use the nearest component's documented integration, live,
   migration, provider, or smoke gate only when that boundary and environment are in scope.
+- Once you have run the selected gates yourself and they pass, rerun or widen them only when new changes,
+  failures, or unresolved concerns justify it; a subagent's claimed pass and the independent review's checks
+  still run.
 - For policy/document changes, also run `git diff --check`, verify referenced paths and commands, and parse any
   changed structured configuration. Report only checks actually run and exact blockers.

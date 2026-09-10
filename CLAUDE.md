@@ -11,6 +11,9 @@
 - After compact or resume, reconcile the current request with HANDOFF, Git/worktree truth, and any narrow
   read-only external observation required by the next action. Preserve `Completed / do not repeat` separately
   from pending work.
+- When compacting, keep verbatim: the user's authorizations and their limits, open HANDOFF obligations, the
+  exact commands run with their results (credentials and raw datasets redacted), touched files, open blockers,
+  and the `Completed / do not repeat` list.
 
 ## Subagents
 
