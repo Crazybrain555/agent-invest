@@ -14,7 +14,7 @@
   },
   "tests/contract/test_m6_run_json_schemas.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 4
   },
   "tests/integration/test_api_ops_surface.py": {
    "private_imports": [],
@@ -372,13 +372,17 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_m6_owner_fixture_generator.py": {
+   "private_imports": [],
+   "tests": 11
+  },
   "tests/unit/test_m6_owner_protocol.py": {
    "private_imports": [],
    "tests": 23
   },
   "tests/unit/test_m6_run_accounting.py": {
    "private_imports": [],
-   "tests": 26
+   "tests": 27
   },
   "tests/unit/test_m6_run_contract.py": {
    "private_imports": [],
@@ -406,9 +410,21 @@
    "private_imports": [],
    "tests": 10
   },
+  "tests/unit/test_mineru_diagnostic_journal.py": {
+   "private_imports": [],
+   "tests": 20
+  },
+  "tests/unit/test_mineru_diagnostic_wire.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
    "tests": 22
+  },
+  "tests/unit/test_mineru_heap_trim_compat_m6.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_mineru_http_remote_v4.py": {
    "private_imports": [],
@@ -472,7 +488,7 @@
   },
   "tests/unit/test_mineru_task_registry_persistence.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 29
   },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],
@@ -727,6 +743,10 @@
   "tests/unit/test_synchronized_telemetry_observer.py": {
    "private_imports": [],
    "tests": 43
+  },
+  "tests/unit/test_synchronized_telemetry_observer_m6.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_synchronized_telemetry_observer_v3.py": {
    "private_imports": [],

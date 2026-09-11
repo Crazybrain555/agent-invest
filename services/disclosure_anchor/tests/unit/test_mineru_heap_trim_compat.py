@@ -1625,9 +1625,40 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             "        $OldApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatImage\n"
         )
         self.assertIn(reuse_selection, installer)
+        # The API-only upgrade adds identity validation between old-image capture
+        # and image build. Preserve published-image reuse as a separate mode.
+        self.assertIn("if ($ReuseCurrentPublishedImage -and $ApiOnlyCompatibilityUpgrade)", installer)
         self.assertIn("API compatibility upgrade and published-image reuse are mutually exclusive", installer)
-        self.assertIn("API-only compatibility upgrade requires unchanged compose bytes", installer)
-        self.assertIn("API-only rollback did not restore the previous API image", installer)
+        self.assertIn("$ApiOnlyOperation = $ReuseCurrentPublishedImage -or $ApiOnlyCompatibilityUpgrade", installer)
+        validation = installer[
+            installer.index("function Assert-ApiOnlyUpgradeInputs") :
+            installer.index("function Invoke-ApiOnlyRecreate")
+        ]
+        self.assertIn("-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted", validation)
+        self.assertIn("API-only compatibility upgrade requires unchanged compose bytes", validation)
+        preparation = installer[
+            installer.index("    if ($ReuseCurrentPublishedImage) {", installer.index("Capture-OldRuntimeState\n")) :
+            installer.index("    $MutationStarted = $true")
+        ]
+        self.assertLess(
+            preparation.index("published tag to match the current API image"),
+            preparation.index("$compatImage = Build-ValidatedApiCompatImage"),
+        )
+        self.assertIn("API image tag drifted before compatibility upgrade", preparation)
+        deployment = installer[
+            installer.index("    $DeploymentAttempted = $true") :
+            installer.index("    $runtime = Get-ValidatedRuntime")
+        ]
+        self.assertIn("if ($ApiOnlyOperation) {\n        Invoke-ApiOnlyRecreate", deployment)
+        rollback = installer[
+            installer.index("    Restore-ApiCompatTag\n") :
+            installer.index("    if ($ComposeExisted) {", installer.index("    Restore-ApiCompatTag\n"))
+        ]
+        self.assertIn("if ($ApiOnlyCompatibilityUpgrade)", rollback)
+        self.assertIn("Invoke-ApiOnlyRecreate", rollback)
+        self.assertIn("Assert-StableServiceEpochs -Expected $StableServiceEpochs", rollback)
+        self.assertIn("[string]$restored[0].Image -ne $OldApiCompatImageId", rollback)
+        self.assertIn("API-only rollback did not restore the previous API image", rollback)
         self.assertLess(
             installer.index("$MutationStarted = $true"),
             installer.index('"tag", $ExpectedApiCompatImageId, $ApiCompatImage'),

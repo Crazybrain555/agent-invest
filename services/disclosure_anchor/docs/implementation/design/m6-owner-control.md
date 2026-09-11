@@ -205,3 +205,35 @@ successful run then closes transport, journal, guard and credentials and writes 
 exit-intent explicitly marked as not externally verified. The controller must
 still verify the exact process handle and PID/birth. A watchdog exit, failed
 startup, socket EOF or missing external proof cannot establish successful closure.
+
+## Independent qualification entrypoints
+
+The independent tests replace the former individual owner/component/parent
+scripts. Generate or verify `tests/fixtures/m6_owner/wire-vectors.v2.json` using
+its documented generator. Those vectors establish Python/native wire parity;
+the native suites separately assert semantic outcomes and observe real files,
+process handles and Job accounting.
+
+Run `scripts/windows/test_mineru_m6_native_suite.ps1` in a fresh 64-bit Windows
+PowerShell 5.1 process with explicit source, fixture and new output roots. It
+builds the twelve production sources into a standalone executable, then builds
+the separate component tests and exercises the finite self-Job cases. The
+resulting `runner-evidence.json` binds source, compiler, fixture and executable
+bytes. An explicit self-Job skip does not qualify that boundary.
+
+Run `scripts/windows/test_mineru_m6_owner_host_live.ps1` with that qualified
+build root, a new output root, the actual source commit, GPU UUID and pinned
+System32 NVML hash. Its independently implemented parent checks normal closure,
+same-boot crash/resume and exact predecessor retry, damaged-tail refusal,
+pre-bind refusal/pending drain, and unbound watchdog expiry. Authenticated
+request evidence excludes credentials. Every launched child is bounded by an
+owned unnamed Job and an original process handle; a deliberate injected crash
+is distinguished from normal exit and unexpected forced cleanup. These are
+zero-PDF control fixtures, with synthetic business receipts; they do not qualify
+G2, document quality, public publication or a measured hour.
+
+`scripts/windows/test_mineru_api_only_installer.ps1` separately exercises an
+allowlisted set of installer functions with stateful Docker mocks. It does not
+deploy or prove an actual service image rollback. All entrypoints retain failed
+artifacts and require new disposable output roots. Use process-local
+`RemoteSigned`; no machine policy change is part of qualification.

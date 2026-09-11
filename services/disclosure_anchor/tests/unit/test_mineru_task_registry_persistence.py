@@ -1,1831 +1,1389 @@
-"""M6 P1 registry persistence, recovery, reader and cleanup regressions."""
+"""Independent durability tests for the MinerU task-registry persistence boundary.
+
+Scope is the M6 P1 contract in
+``docs/implementation/design/mineru-task-registry-persistence.md``.  Every case
+uses a disposable temporary root, synthetic placeholders, the registry's public
+surface and the bytes it leaves on disk.  Storage faults are injected through
+the registry's narrow storage hooks; expected outcomes come from the contract,
+not from re-deriving the implementation.  Nothing here qualifies GPU
+throughput, real PDF processing, PostgreSQL publication, live service operation
+or M6 as a whole.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import ast
-import copy
+import asyncio
 import hashlib
-import importlib.util
 import json
 import os
-import re
-import subprocess
-import sys
+import shutil
 import tempfile
 import unittest
+from contextlib import suppress
+from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
+from unittest.mock import patch
 
-
-SERVICE_ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = (
-    SERVICE_ROOT
-    / "scripts"
-    / "windows"
-    / "mineru_heap_trim_compat"
-    / "agent_task_protocol_v2.py"
+from scripts.windows.mineru_heap_trim_compat.agent_task_protocol_v2 import (
+    DurableTaskRegistry,
+    SplitTaskExecutor,
+    TaskProtocolConflict,
+    TaskRegistryPersistenceError,
 )
-SPEC = importlib.util.spec_from_file_location(
-    "m6_p1_agent_task_protocol_v2", MODULE_PATH
+from scripts.windows.mineru_heap_trim_compat.patch_mineru_344 import (
+    TARGET_PREIMAGE_SHA256,
+    patch_source,
 )
-assert SPEC is not None and SPEC.loader is not None
-protocol = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = protocol
-SPEC.loader.exec_module(protocol)
+from tests._m6_fast_api_fixture import (
+    LoggerStub,
+    TaskStub,
+    build_manager,
+    load_generated_fast_api,
+    stop_manager,
+)
+from tests._m6_registry_lab import (
+    FINALIZER_BUDGET,
+    KEY,
+    MUTATOR_PRECONDITIONS,
+    OTHER_KEY,
+    OTHER_TASK,
+    PERMANENT,
+    PRE_COMMIT_PHASES,
+    TASK,
+    CountedFault,
+    RegistryLab,
+    SyntheticStorageFault,
+    close_descriptor_then_fail,
+    drive,
+    fail_with,
+    instance_hook,
+    persist_override,
+    pre_commit_fault,
+    prepare_mutation,
+    replace_then_fail,
+    snapshot,
+    without_live_readers,
+    write_foreign_then_fail,
+)
 
 
-class RegistryPersistenceFaultTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(
-            prefix="m6-p1-registry-persistence-"
-        )
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.registry_path = self.root / "task-registry.json"
+class _RegistryCase(unittest.TestCase):
+    def lab(self) -> RegistryLab:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return RegistryLab(Path(temporary.name))
 
-    @staticmethod
-    def registry_at(root: Path, *, limit: int = 4096):
-        return protocol.DurableTaskRegistry(
-            root / "task-registry.json",
-            max_unacked_result_bytes=limit,
-            output_root=root,
-        )
-
-    def registry(self, *, limit: int = 4096):
-        return self.registry_at(self.root, limit=limit)
-
-    @staticmethod
-    def identities(suffix: str) -> dict[str, str]:
-        return {
-            "idempotency_key": f"idem-{suffix}",
-            "task_id": f"task-{suffix}",
-            "attempt_identity": f"attempt-{suffix}",
-            "fence_identity": f"fence-{suffix}",
-        }
-
-    def create(self, registry, suffix: str = "a"):
-        return registry.reconcile_or_create(**self.identities(suffix))
-
-    @staticmethod
-    def record_key(suffix: str) -> str:
-        return f"idem-{suffix}"
-
-    def bind(self, registry, root: Path, suffix: str = "a") -> dict[str, object]:
-        task_root = root / f"task-{suffix}"
-        uploads = task_root / "uploads"
-        uploads.mkdir(parents=True)
-        upload = uploads / "input.pdf"
-        upload.write_bytes(f"pdf-{suffix}".encode())
-        payload: dict[str, object] = {
-            "task_id": f"task-{suffix}",
-            "output_dir": str(task_root),
-            "uploads": [str(upload)],
-            "options": {
-                "pages": [1, 2],
-                "nested": {"mode": "strict", "flags": [True, False]},
-            },
-        }
-        registry.bind_task_payload(self.record_key(suffix), payload)
-        return payload
-
-    def prepare_finalizing(
+    def assert_outcome(
         self,
-        registry,
-        suffix: str = "a",
+        raised: BaseException,
         *,
-        byte_budget: int = 128,
+        outcome: str,
+        committed: bool,
+        phase_prefix: str | None = None,
+        cause_type: type[BaseException] | None = SyntheticStorageFault,
     ) -> None:
-        key = self.record_key(suffix)
-        registry.transition(key, "processing")
-        registry.transition(key, "finalizing")
-        registry.reserve_finalizer(key, byte_budget=byte_budget)
+        self.assertIsInstance(raised, TaskRegistryPersistenceError)
+        assert isinstance(raised, TaskRegistryPersistenceError)
+        self.assertEqual(raised.outcome, outcome)
+        self.assertIs(raised.committed, committed)
+        if phase_prefix is not None:
+            self.assertTrue(raised.phase.startswith(phase_prefix), raised.phase)
+        if cause_type is not None:
+            self.assertIsInstance(raised.__cause__, cause_type)
 
-    def complete(
-        self,
-        registry,
-        root: Path,
-        suffix: str = "a",
-        *,
-        data: bytes = b"durable-result",
-        bound: bool = False,
-    ) -> Path:
-        self.create(registry, suffix)
-        task_root = root / f"task-{suffix}"
-        if bound:
-            self.bind(registry, root, suffix)
-            result = task_root / ".retained-result.zip"
-        else:
-            result = root / f"result-{suffix}.zip"
-        self.prepare_finalizing(
-            registry,
-            suffix,
-            byte_budget=max(128, len(data)),
-        )
-        result.write_bytes(data)
-        digest = hashlib.sha256(data).hexdigest()
-        owner = hashlib.sha256(
-            f"task-{suffix}\0{digest}\0{len(data)}".encode()
-        ).hexdigest()
-        registry.complete(
-            self.record_key(suffix),
-            result_path=result,
-            result_sha256=digest,
-            result_bytes=len(data),
-            result_owner=owner,
-        )
-        return result
+    def assert_healthy(self, registry: DurableTaskRegistry) -> None:
+        status = registry.persistence_status()
+        self.assertEqual(status["state"], "healthy")
+        self.assertIsNone(status["last_event"])
+        self.assertIsNone(status["recovery_action"])
+        registry.assert_persistence_healthy()
 
-    @staticmethod
-    def disk_record(path: Path, key: str) -> dict[str, object]:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return next(
-            row for row in payload["records"] if row["idempotency_key"] == key
-        )
 
+class MutatorRollbackTests(_RegistryCase):
     def test_direct_persist_override_rolls_back_every_mutator(self) -> None:
-        cases = (
-            "reconcile_or_create",
-            "bind_task_payload",
-            "transition",
-            "reserve_finalizer",
-            "complete",
-            "fail",
-            "lease",
-            "acquire_result",
-            "release_result",
-            "acknowledge",
-            "cleanup_consumed",
-            "abandon_unbound",
-            "acknowledge_failed",
-            "recoverable_payloads",
-        )
-        for case in cases:
-            with self.subTest(case=case), tempfile.TemporaryDirectory(
-                prefix=f"m6-p1-mutator-{case}-"
-            ) as directory:
-                root = Path(directory)
-                registry = self.registry_at(root)
-                cleanup_probe = None
-
-                if case == "reconcile_or_create":
-                    def operation():
-                        return self.create(registry)
-                elif case == "bind_task_payload":
-                    self.create(registry)
-                    task_root = root / "task-a"
-                    uploads = task_root / "uploads"
-                    uploads.mkdir(parents=True)
-                    upload = uploads / "input.pdf"
-                    upload.write_bytes(b"pdf")
-                    payload = {
-                        "task_id": "task-a",
-                        "output_dir": str(task_root),
-                        "uploads": [str(upload)],
-                        "options": {"nested": {"value": 1}},
-                    }
-
-                    def operation():
-                        return registry.bind_task_payload("idem-a", payload)
-                elif case == "transition":
-                    self.create(registry)
-
-                    def operation():
-                        return registry.transition("idem-a", "processing")
-                elif case == "reserve_finalizer":
-                    self.create(registry)
-                    registry.transition("idem-a", "processing")
-                    registry.transition("idem-a", "finalizing")
-
-                    def operation():
-                        return registry.reserve_finalizer(
-                            "idem-a", byte_budget=64
-                        )
-                elif case == "complete":
-                    self.create(registry)
-                    self.prepare_finalizing(registry)
-                    result = root / "result.zip"
-                    data = b"result"
-                    result.write_bytes(data)
-                    digest = hashlib.sha256(data).hexdigest()
-                    owner = hashlib.sha256(
-                        f"task-a\0{digest}\0{len(data)}".encode()
-                    ).hexdigest()
-
-                    def operation():
-                        return registry.complete(
-                            "idem-a",
-                            result_path=result,
-                            result_sha256=digest,
-                            result_bytes=len(data),
-                            result_owner=owner,
-                        )
-                elif case == "fail":
-                    self.create(registry)
-                    registry.transition("idem-a", "processing")
-
-                    def operation():
-                        return registry.fail(
-                            "idem-a", error='{"code":"synthetic"}'
-                        )
-                elif case == "lease":
-                    self.complete(registry, root)
-
-                    def operation():
-                        return registry.lease("idem-a", seconds=60)
-                elif case == "acquire_result":
-                    self.complete(registry, root)
-                    registry.lease("idem-a", seconds=60)
-
-                    def operation():
-                        return registry.acquire_result("idem-a")
-                elif case == "release_result":
-                    self.complete(registry, root)
-                    registry.lease("idem-a", seconds=60)
-                    registry.acquire_result("idem-a")
-
-                    def operation():
-                        return registry.release_result("idem-a")
-                elif case == "acknowledge":
-                    self.complete(registry, root)
-
-                    def operation():
-                        return registry.acknowledge("idem-a")
-                elif case == "cleanup_consumed":
-                    self.complete(registry, root)
-                    registry.acknowledge("idem-a")
-                    cleanup_probe = mock.patch.object(
-                        registry, "_unlink_owned_result", return_value=None
-                    )
-                    cleanup_probe.start()
-                    self.addCleanup(cleanup_probe.stop)
-                    operation = registry.cleanup_consumed
-                elif case == "abandon_unbound":
-                    self.create(registry)
-
-                    def operation():
-                        return registry.abandon_unbound("idem-a")
-                elif case == "acknowledge_failed":
-                    self.create(registry)
-                    registry.fail("idem-a", error='{"code":"synthetic"}')
-
-                    def operation():
-                        return registry.acknowledge_failed("idem-a")
-                elif case == "recoverable_payloads":
-                    self.create(registry)
-                    self.bind(registry, root)
-                    registry.transition("idem-a", "processing")
-                    cleanup_probe = mock.patch.object(
-                        registry, "_prepare_clean_replay"
-                    )
-                    cleanup_mock = cleanup_probe.start()
-                    self.addCleanup(cleanup_probe.stop)
-                    operation = registry.recoverable_payloads
-                else:  # pragma: no cover - closed case table
-                    raise AssertionError(case)
-
-                before_records = copy.deepcopy(registry._records)
-                before_watermark = registry._submission_watermark_bucket
-                before_bytes = (
-                    (root / "task-registry.json").read_bytes()
-                    if (root / "task-registry.json").exists()
-                    else None
-                )
-                injection_hits = 0
-
-                def fail_before_write() -> None:
-                    nonlocal injection_hits
-                    injection_hits += 1
-                    raise OSError(f"injected-{case}")
-
-                with mock.patch.object(
-                    registry, "_persist", side_effect=fail_before_write
-                ):
-                    with self.assertRaisesRegex(OSError, f"injected-{case}"):
-                        operation()
-
-                self.assertEqual(injection_hits, 1)
-                self.assertEqual(registry._records, before_records)
-                self.assertEqual(
-                    registry._submission_watermark_bucket, before_watermark
-                )
-                observed_bytes = (
-                    (root / "task-registry.json").read_bytes()
-                    if (root / "task-registry.json").exists()
-                    else None
-                )
-                self.assertEqual(observed_bytes, before_bytes)
-                if case == "recoverable_payloads":
-                    cleanup_mock.assert_not_called()
-                if cleanup_probe is not None:
-                    cleanup_probe.stop()
-                    self._cleanups.pop()
+        for name in MUTATOR_PRECONDITIONS:
+            with self.subTest(mutator=name):
+                lab = self.lab()
+                registry = lab.open()
+                invoke = prepare_mutation(lab, registry, name)
+                before = snapshot(registry)
+                disk = lab.disk_bytes()
+                with persist_override(registry), self.assertRaises(SyntheticStorageFault):
+                    invoke()
+                self.assertEqual(snapshot(registry), before)
+                self.assertEqual(lab.disk_bytes(), disk)
+                self.assertEqual(lab.stray_names(), [])
+                status = registry.persistence_status()
+                self.assertNotEqual(status["state"], "durability_uncertain")
+                if status["last_event"] is not None:
+                    self.assertEqual(status["last_event"]["phase"], "persist_call")
+                    self.assertEqual(status["last_event"]["operation"], name)
+                    self.assertFalse(status["last_event"]["committed"])
+                    self.assertEqual(status["recovery_action"], "retry_idempotent_operation")
+                invoke()
+                self.assert_healthy(registry)
+                after = snapshot(registry)
+                self.assertNotEqual(after, before)
+                self.assertNotEqual(lab.disk_bytes(), disk)
+                self.assertEqual(snapshot(lab.open()), without_live_readers(after))
 
     def test_write_flush_file_fsync_close_and_replace_fail_before_commit(self) -> None:
-        stages = (
-            "_write_registry_stream",
-            "_flush_registry_stream",
-            "_fsync_registry_file",
-            "_close_registry_stream",
-            "_replace_registry_file",
-        )
-        for stage in stages:
-            with self.subTest(stage=stage), tempfile.TemporaryDirectory(
-                prefix=f"m6-p1-stage-{stage}-"
-            ) as directory:
-                root = Path(directory)
-                registry = self.registry_at(root)
-                calls = 0
-                original = getattr(registry, stage)
+        expected_phase = {
+            "temp_create": "temp_create",
+            "write": "write",
+            "flush": "flush",
+            "file_fsync": "file_fsync",
+            "file_close": "file_close",
+            "replace_before_rename": "replace",
+        }
+        self.assertEqual(set(expected_phase) | {"short_write"}, set(PRE_COMMIT_PHASES))
+        for phase, prefix in expected_phase.items():
+            with self.subTest(phase=phase):
+                lab = self.lab()
+                registry = lab.open()
+                drive(lab, registry, "bound")
+                before = snapshot(registry)
+                disk = lab.disk_bytes()
+                self.assertIsNotNone(disk)
+                with pre_commit_fault(registry, phase), self.assertRaises(
+                    TaskRegistryPersistenceError
+                ) as raised:
+                    registry.transition(KEY, "processing")
+                self.assert_outcome(
+                    raised.exception,
+                    outcome="not_committed",
+                    committed=False,
+                    phase_prefix=prefix,
+                )
+                self.assertEqual(raised.exception.operation, "transition")
+                self.assertEqual(registry.get(KEY).state, "pending")
+                self.assertEqual(snapshot(registry), before)
+                self.assertEqual(lab.disk_bytes(), disk)
+                self.assertEqual(lab.stray_names(), [])
+                status = registry.persistence_status()
+                self.assertEqual(status["state"], "degraded")
+                self.assertEqual(status["recovery_action"], "retry_idempotent_operation")
+                self.assertEqual(status["last_event"]["cause_type"], "SyntheticStorageFault")
+                self.assertNotIn(KEY, json.dumps(status))
+                registry.transition(KEY, "processing")
+                self.assert_healthy(registry)
+                self.assertEqual(lab.disk_records()[KEY]["state"], "processing")
+                self.assertEqual(lab.open().get(KEY).state, "processing")
 
-                def injected(*args, **kwargs):
-                    nonlocal calls
-                    calls += 1
-                    if stage == "_close_registry_stream" and calls > 1:
-                        return original(*args, **kwargs)
-                    raise OSError(f"injected-{stage}")
-
-                with mock.patch.object(registry, stage, side_effect=injected):
-                    with self.assertRaises(
-                        protocol.TaskRegistryPersistenceError
-                    ) as raised:
-                        self.create(registry)
-                self.assertGreaterEqual(calls, 1)
-                self.assertEqual(raised.exception.outcome, "not_committed")
-                self.assertFalse(raised.exception.committed)
-                self.assertIsInstance(raised.exception.__cause__, OSError)
-                self.assertFalse((root / "task-registry.json").exists())
-                self.assertIsNone(registry.get("idem-a"))
+        with self.subTest(phase="first_persist_write"):
+            lab = self.lab()
+            registry = lab.open()
+            self.assertIsNone(lab.disk_bytes())
+            with pre_commit_fault(registry, "write"), self.assertRaises(
+                TaskRegistryPersistenceError
+            ) as raised:
+                registry.reconcile_or_create(
+                    idempotency_key=KEY,
+                    task_id=TASK,
+                    attempt_identity="a",
+                    fence_identity="f",
+                )
+            self.assert_outcome(raised.exception, outcome="not_committed", committed=False)
+            self.assertIsNone(lab.disk_bytes())
+            self.assertIsNone(registry.get(KEY))
+            self.assertEqual(lab.stray_names(), [])
 
     def test_short_write_is_not_committed(self) -> None:
-        registry = self.registry()
-        injection_hits = 0
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        disk = lab.disk_bytes()
+        with pre_commit_fault(registry, "short_write"), self.assertRaises(
+            TaskRegistryPersistenceError
+        ) as raised:
+            registry.transition(KEY, "processing")
+        self.assert_outcome(
+            raised.exception,
+            outcome="not_committed",
+            committed=False,
+            phase_prefix="write",
+            cause_type=OSError,
+        )
+        self.assertIn("short", str(raised.exception.__cause__))
+        self.assertEqual(registry.get(KEY).state, "pending")
+        self.assertEqual(lab.disk_bytes(), disk)
+        self.assertEqual(lab.stray_names(), [])
+        registry.transition(KEY, "processing")
+        self.assertEqual(lab.open().get(KEY).state, "processing")
 
-        def short_write(stream, payload: bytes) -> None:
-            nonlocal injection_hits
-            injection_hits += 1
-            stream.write(payload[: max(1, len(payload) // 2)])
-            raise OSError("injected-short-write")
 
-        with mock.patch.object(
-            registry, "_write_registry_stream", side_effect=short_write
-        ):
-            with self.assertRaises(protocol.TaskRegistryPersistenceError) as raised:
-                self.create(registry)
-        self.assertEqual(injection_hits, 1)
-        self.assertEqual(raised.exception.outcome, "not_committed")
-        self.assertIsInstance(raised.exception.__cause__, OSError)
-        self.assertFalse(self.registry_path.exists())
-
+class ReplaceAndParentFsyncTests(_RegistryCase):
     def test_replace_then_raise_is_fsynced_and_committed(self) -> None:
-        registry = self.registry()
-        original = registry._replace_registry_file
-        injection_hits = 0
-
-        def replace_then_raise(source: Path, destination: Path) -> None:
-            nonlocal injection_hits
-            injection_hits += 1
-            original(source, destination)
-            raise OSError("injected-after-replace")
-
-        with mock.patch.object(
-            registry, "_replace_registry_file", side_effect=replace_then_raise
-        ):
-            record, created = self.create(registry)
-        self.assertEqual(injection_hits, 1)
-        self.assertTrue(created)
-        self.assertEqual(record.idempotency_key, "idem-a")
-        self.assertEqual(self.disk_record(self.registry_path, "idem-a")["task_id"], "task-a")
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        with instance_hook(registry, "_replace_registry_file", replace_then_fail):
+            self.assertIsNone(registry.transition(KEY, "processing"))
+        self.assertEqual(registry.get(KEY).state, "processing")
+        self.assertEqual(lab.disk_records()[KEY]["state"], "processing")
+        self.assertEqual(lab.stray_names(), [])
         status = registry.persistence_status()
         self.assertEqual(status["state"], "degraded")
-        self.assertEqual(
-            status["last_event"]["outcome"], "committed_after_recovery"
+        self.assertEqual(status["recovery_action"], "do_not_retry_committed_operation")
+        self.assertEqual(status["last_event"]["outcome"], "committed_after_recovery")
+        self.assertTrue(status["last_event"]["committed"])
+        self.assertEqual(status["last_event"]["cause_type"], "SyntheticStorageFault")
+        self.assertEqual(status["candidate_idempotency_keys"], [])
+        self.assertNotIn(KEY, json.dumps(status))
+        with self.assertRaises(TaskRegistryPersistenceError) as raised:
+            registry.assert_persistence_healthy()
+        self.assert_outcome(
+            raised.exception, outcome="committed_after_recovery", committed=True
         )
-        self.assertEqual(status["last_event"]["cause_type"], "OSError")
+        self.assertEqual(lab.open().get(KEY).state, "processing")
+        registry.transition(KEY, "finalizing")
+        self.assert_healthy(registry)
 
     def test_parent_fsync_transient_failure_commits_only_after_retry(self) -> None:
-        registry = self.registry()
-        original = registry._fsync_parent_descriptor
-        calls = 0
-
-        def fail_once(fd: int) -> None:
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise OSError("first-parent-fsync-failed")
-            original(fd)
-
-        with mock.patch.object(
-            registry, "_fsync_parent_descriptor", side_effect=fail_once
-        ):
-            self.create(registry)
-        self.assertEqual(calls, 2)
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        fault = CountedFault(1, os.fsync, message="parent fsync transient failure")
+        with instance_hook(registry, "_fsync_parent_descriptor", fault):
+            registry.transition(KEY, "processing")
+        self.assertEqual(fault.calls, 2)
         status = registry.persistence_status()
-        self.assertEqual(
-            status["last_event"]["outcome"], "committed_after_recovery"
-        )
+        self.assertEqual(status["state"], "degraded")
+        self.assertEqual(status["last_event"]["outcome"], "committed_after_recovery")
         self.assertEqual(status["last_event"]["phase"], "parent_fsync_retry")
+        self.assertTrue(status["last_event"]["committed"])
+        self.assertEqual(registry.get(KEY).state, "processing")
+        self.assertEqual(lab.disk_records()[KEY]["state"], "processing")
+        self.assertEqual(lab.open().get(KEY).state, "processing")
 
     def test_permanent_parent_fsync_failure_recovers_candidate_explicitly(self) -> None:
-        registry = self.registry()
-        calls = 0
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        drive(lab, registry, "pending_unbound", key=OTHER_KEY, task_id=OTHER_TASK)
+        fault = CountedFault(PERMANENT, message="parent fsync permanently failing")
+        with instance_hook(registry, "_fsync_parent_descriptor", fault), self.assertRaises(
+            TaskRegistryPersistenceError
+        ) as raised:
+            registry.transition(KEY, "processing")
+        self.assert_outcome(
+            raised.exception,
+            outcome="durability_uncertain",
+            committed=False,
+            phase_prefix="parent_fsync",
+        )
+        self.assertGreaterEqual(fault.calls, 2)
+        self.assertEqual(lab.disk_records()[KEY]["state"], "processing")
 
-        def fail_parent_fsync(_fd: int) -> None:
-            nonlocal calls
-            calls += 1
-            raise OSError("permanent-parent-fsync-failure")
-
-        with mock.patch.object(
-            registry,
-            "_fsync_parent_descriptor",
-            side_effect=fail_parent_fsync,
+        status = registry.persistence_status()
+        self.assertEqual(status["state"], "durability_uncertain")
+        self.assertEqual(status["recovery_action"], "call recover_persistence_uncertainty")
+        self.assertEqual(status["candidate_idempotency_keys"], sorted([KEY, OTHER_KEY]))
+        for closed_read in (
+            partial(registry.get, KEY),
+            partial(registry.get, OTHER_KEY),
+            partial(registry.get_by_task_id, TASK),
         ):
-            with self.assertRaises(
-                protocol.TaskRegistryPersistenceError
-            ) as raised:
-                self.create(registry)
-        self.assertEqual(calls, 2)
-        self.assertEqual(raised.exception.outcome, "durability_uncertain")
-        self.assertEqual(
-            registry.persistence_status()["recovery_action"],
-            "call recover_persistence_uncertainty",
+            with self.assertRaises(TaskRegistryPersistenceError) as read_error:
+                closed_read()
+            self.assert_outcome(
+                read_error.exception, outcome="durability_uncertain", committed=False
+            )
+        with self.assertRaises(TaskRegistryPersistenceError) as mutation_error:
+            registry.transition(OTHER_KEY, "failed")
+        self.assert_outcome(
+            mutation_error.exception, outcome="durability_uncertain", committed=False
         )
-        with self.assertRaises(protocol.TaskRegistryPersistenceError):
-            registry.get("idem-a")
-        with self.assertRaises(protocol.TaskRegistryPersistenceError):
-            self.create(registry, "b")
+        with self.assertRaises(TaskRegistryPersistenceError):
+            registry.assert_persistence_healthy()
 
-        recovered_status = registry.recover_persistence_uncertainty()
-        self.assertEqual(recovered_status["state"], "degraded")
-        self.assertEqual(
-            recovered_status["last_event"]["outcome"],
-            "committed_after_explicit_recovery",
-        )
-        self.assertEqual(
-            recovered_status["last_event"]["operation"],
-            "reconcile_or_create",
-        )
-        recovered = registry.get("idem-a")
-        self.assertIsNotNone(recovered)
-        assert recovered is not None
-        self.assertEqual(recovered.attempt_identity, "attempt-a")
-        registry.transition("idem-a", "processing")
-        self.assertEqual(registry.persistence_status()["state"], "healthy")
+        recovered = registry.recover_persistence_uncertainty()
+        self.assertEqual(recovered["state"], "degraded")
+        self.assertEqual(recovered["last_event"]["outcome"], "committed_after_explicit_recovery")
+        self.assertTrue(recovered["last_event"]["committed"])
+        self.assertEqual(recovered["last_event"]["operation"], "transition")
+        self.assertEqual(recovered["recovery_action"], "do_not_retry_committed_operation")
+        self.assertEqual(registry.get(KEY).state, "processing")
+        self.assertEqual(registry.get(OTHER_KEY).state, "pending")
+        self.assertEqual(lab.open().get(KEY).state, "processing")
+        registry.transition(KEY, "finalizing")
+        self.assert_healthy(registry)
+        self.assertEqual(registry.recover_persistence_uncertainty()["state"], "healthy")
 
     def test_explicit_recovery_can_select_previous_durable_bytes(self) -> None:
-        registry = self.registry()
-        self.create(registry, "a")
-        replace_hits = 0
-        fsync_hits = 0
-
-        def fail_before_replace(_source: Path, _destination: Path) -> None:
-            nonlocal replace_hits
-            replace_hits += 1
-            raise OSError("replace-call-failed-before-exchange")
-
-        def fail_parent(_fd: int) -> None:
-            nonlocal fsync_hits
-            fsync_hits += 1
-            raise OSError("cannot-establish-parent-durability")
-
-        with mock.patch.object(
-            registry, "_replace_registry_file", side_effect=fail_before_replace
-        ), mock.patch.object(
-            registry, "_fsync_parent_descriptor", side_effect=fail_parent
-        ):
-            with self.assertRaises(
-                protocol.TaskRegistryPersistenceError
-            ) as raised:
-                self.create(registry, "b")
-        self.assertEqual(replace_hits, 1)
-        self.assertGreaterEqual(fsync_hits, 1)
-        self.assertEqual(raised.exception.outcome, "durability_uncertain")
-
-        status = registry.recover_persistence_uncertainty()
-        self.assertEqual(
-            status["last_event"]["outcome"],
-            "not_committed_after_explicit_recovery",
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        disk = lab.disk_bytes()
+        fsync_fault = CountedFault(PERMANENT, message="parent fsync retry failing")
+        with instance_hook(
+            registry, "_replace_registry_file", fail_with("replace failed before rename")
+        ), instance_hook(registry, "_fsync_parent_descriptor", fsync_fault), self.assertRaises(
+            TaskRegistryPersistenceError
+        ) as raised:
+            registry.transition(KEY, "processing")
+        self.assert_outcome(
+            raised.exception,
+            outcome="durability_uncertain",
+            committed=False,
+            phase_prefix="replace",
         )
-        self.assertIsNone(registry.get("idem-b"))
-        record, created = self.create(registry, "b")
-        self.assertTrue(created)
-        self.assertEqual(record.task_id, "task-b")
-        self.assertEqual(registry.persistence_status()["state"], "healthy")
+        self.assertEqual(lab.disk_bytes(), disk)
+        self.assertEqual(lab.stray_names(), [])
+        self.assertEqual(registry.persistence_status()["state"], "durability_uncertain")
 
+        recovered = registry.recover_persistence_uncertainty()
+        self.assertEqual(recovered["state"], "degraded")
+        self.assertEqual(
+            recovered["last_event"]["outcome"], "not_committed_after_explicit_recovery"
+        )
+        self.assertFalse(recovered["last_event"]["committed"])
+        self.assertEqual(recovered["recovery_action"], "retry_idempotent_operation")
+        self.assertEqual(recovered["candidate_idempotency_keys"], [])
+        self.assertEqual(registry.get(KEY).state, "pending")
+        self.assertEqual(lab.disk_bytes(), disk)
+        registry.transition(KEY, "processing")
+        self.assert_healthy(registry)
+        self.assertEqual(lab.open().get(KEY).state, "processing")
+
+    def test_uncertainty_keeps_the_larger_capacity_charge(self) -> None:
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "reserved")
+        path, digest, size, owner = lab.make_result(TASK)
+        self.assertEqual(
+            (registry.reserved_result_bytes, registry.unacked_result_bytes),
+            (FINALIZER_BUDGET, 0),
+        )
+        complete = partial(
+            registry.complete,
+            KEY,
+            result_path=path,
+            result_sha256=digest,
+            result_bytes=size,
+            result_owner=owner,
+        )
+        with instance_hook(
+            registry, "_fsync_parent_descriptor", CountedFault(PERMANENT)
+        ), self.assertRaises(TaskRegistryPersistenceError):
+            complete()
+        self.assertEqual(registry.persistence_status()["state"], "durability_uncertain")
+        self.assertEqual(registry.reserved_result_bytes, FINALIZER_BUDGET)
+        self.assertEqual(registry.unacked_result_bytes, size)
+        registry.recover_persistence_uncertainty()
+        self.assertEqual(registry.get(KEY).state, "completed")
+        self.assertEqual((registry.reserved_result_bytes, registry.unacked_result_bytes), (0, size))
+
+        with self.subTest(selected="previous"):
+            lab = self.lab()
+            registry = lab.open()
+            drive(lab, registry, "reserved")
+            path, digest, size, owner = lab.make_result(TASK)
+            with instance_hook(
+                registry, "_replace_registry_file", fail_with("replace failed before rename")
+            ), instance_hook(
+                registry, "_fsync_parent_descriptor", CountedFault(PERMANENT)
+            ), self.assertRaises(TaskRegistryPersistenceError):
+                registry.complete(
+                    KEY,
+                    result_path=path,
+                    result_sha256=digest,
+                    result_bytes=size,
+                    result_owner=owner,
+                )
+            self.assertEqual(registry.reserved_result_bytes, FINALIZER_BUDGET)
+            self.assertEqual(registry.unacked_result_bytes, size)
+            registry.recover_persistence_uncertainty()
+            self.assertEqual(registry.get(KEY).state, "finalizing")
+            self.assertEqual(
+                (registry.reserved_result_bytes, registry.unacked_result_bytes),
+                (FINALIZER_BUDGET, 0),
+            )
+
+    def test_foreign_bytes_keep_the_registry_closed_until_cold_validation(self) -> None:
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        with instance_hook(
+            registry, "_replace_registry_file", write_foreign_then_fail
+        ), self.assertRaises(TaskRegistryPersistenceError) as raised:
+            registry.transition(KEY, "processing")
+        self.assert_outcome(
+            raised.exception,
+            outcome="durability_uncertain",
+            committed=False,
+            phase_prefix="replace_ambiguous_bytes",
+        )
+        self.assertEqual(lab.disk_bytes(), b'{"schema":"foreign-bytes"}')
+        with self.assertRaises(TaskRegistryPersistenceError) as recovery:
+            registry.recover_persistence_uncertainty()
+        self.assert_outcome(
+            recovery.exception,
+            outcome="durability_uncertain",
+            committed=False,
+            phase_prefix="explicit_parent_fsync",
+            cause_type=TaskProtocolConflict,
+        )
+        self.assertEqual(registry.persistence_status()["state"], "durability_uncertain")
+        with self.assertRaises(TaskRegistryPersistenceError):
+            registry.get(KEY)
+        with self.assertRaises(TaskProtocolConflict):
+            lab.open()
+
+    def test_bytes_changed_during_reconciliation_is_uncertain_then_recoverable(self) -> None:
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        previous = lab.disk_bytes()
+        assert previous is not None
+        fired = []
+
+        def restore_previous_then_fsync(descriptor: int) -> None:
+            if not fired:
+                fired.append(True)
+                lab.registry_path.write_bytes(previous)
+            os.fsync(descriptor)
+
+        with instance_hook(registry, "_replace_registry_file", replace_then_fail), instance_hook(
+            registry, "_fsync_parent_descriptor", restore_previous_then_fsync
+        ), self.assertRaises(TaskRegistryPersistenceError) as raised:
+            registry.transition(KEY, "processing")
+        self.assert_outcome(
+            raised.exception,
+            outcome="durability_uncertain",
+            committed=False,
+            phase_prefix="replace_changed_during_reconciliation",
+        )
+        recovered = registry.recover_persistence_uncertainty()
+        self.assertEqual(
+            recovered["last_event"]["outcome"], "not_committed_after_explicit_recovery"
+        )
+        self.assertEqual(registry.get(KEY).state, "pending")
+        self.assertEqual(lab.disk_bytes(), previous)
+        registry.transition(KEY, "processing")
+        self.assertEqual(lab.open().get(KEY).state, "processing")
+
+
+class CommittedCleanupFailureTests(_RegistryCase):
     def test_post_commit_temp_cleanup_degrades_health_without_rollback(self) -> None:
-        registry = self.registry()
-        injection_hits = 0
-
-        def fail_cleanup(_path: Path) -> None:
-            nonlocal injection_hits
-            injection_hits += 1
-            raise OSError("post-commit-temp-cleanup")
-
-        with mock.patch.object(
-            registry, "_cleanup_temp_path", side_effect=fail_cleanup
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        with instance_hook(
+            registry, "_cleanup_temp_path", fail_with("temp cleanup failed after commit")
         ):
-            record, created = self.create(registry)
-        self.assertTrue(created)
-        self.assertEqual(record.task_id, "task-a")
-        self.assertEqual(injection_hits, 1)
+            self.assertIsNone(registry.transition(KEY, "processing"))
+        self.assertEqual(registry.get(KEY).state, "processing")
+        self.assertEqual(lab.disk_records()[KEY]["state"], "processing")
         status = registry.persistence_status()
+        self.assertEqual(status["state"], "degraded")
+        self.assertEqual(status["recovery_action"], "do_not_retry_committed_operation")
         self.assertEqual(status["last_event"]["outcome"], "committed_cleanup_failed")
-        self.assertEqual(
-            status["recovery_action"], "do_not_retry_committed_operation"
-        )
-        with self.assertRaises(
-            protocol.TaskRegistryPersistenceError
-        ) as health_error:
+        self.assertEqual(status["last_event"]["phase"], "post_commit_cleanup")
+        self.assertTrue(status["last_event"]["committed"])
+        self.assertEqual(status["last_event"]["cleanup_cause_type"], "SyntheticStorageFault")
+        with self.assertRaises(TaskRegistryPersistenceError) as raised:
             registry.assert_persistence_healthy()
-        self.assertTrue(health_error.exception.committed)
-        self.assertIsInstance(health_error.exception.__cause__, OSError)
-        self.assertIsNotNone(registry.get("idem-a"))
-        self.assertEqual(
-            self.disk_record(self.registry_path, "idem-a")["task_id"], "task-a"
+        self.assert_outcome(
+            raised.exception, outcome="committed_cleanup_failed", committed=True
         )
-        restarted = self.registry()
-        self.assertIsNotNone(restarted.get("idem-a"))
+        self.assertEqual(lab.open().get(KEY).state, "processing")
+        registry.transition(KEY, "finalizing")
+        self.assert_healthy(registry)
 
     def test_post_commit_parent_close_degrades_health_without_rollback(self) -> None:
-        registry = self.registry()
-        original = registry._close_parent_descriptor
-        injection_hits = 0
-
-        def close_then_raise(fd: int) -> None:
-            nonlocal injection_hits
-            injection_hits += 1
-            original(fd)
-            raise OSError("post-commit-parent-close")
-
-        with mock.patch.object(
-            registry, "_close_parent_descriptor", side_effect=close_then_raise
-        ):
-            record, created = self.create(registry)
-        self.assertTrue(created)
-        self.assertEqual(record.task_id, "task-a")
-        self.assertEqual(injection_hits, 1)
-        self.assertIsNotNone(registry.get("idem-a"))
-        with self.assertRaises(
-            protocol.TaskRegistryPersistenceError
-        ) as health_error:
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        with instance_hook(registry, "_close_parent_descriptor", close_descriptor_then_fail):
+            self.assertIsNone(registry.transition(KEY, "processing"))
+        self.assertEqual(registry.get(KEY).state, "processing")
+        self.assertEqual(lab.disk_records()[KEY]["state"], "processing")
+        status = registry.persistence_status()
+        self.assertEqual(status["state"], "degraded")
+        self.assertEqual(status["last_event"]["outcome"], "committed_cleanup_failed")
+        self.assertTrue(status["last_event"]["committed"])
+        with self.assertRaises(TaskRegistryPersistenceError) as raised:
             registry.assert_persistence_healthy()
-        self.assertTrue(health_error.exception.committed)
-        self.assertIsInstance(health_error.exception.__cause__, OSError)
-        self.assertIsNotNone(self.registry().get("idem-a"))
+        self.assert_outcome(
+            raised.exception, outcome="committed_cleanup_failed", committed=True
+        )
+        self.assertEqual(lab.stray_names(), [])
+        registry.transition(KEY, "finalizing")
+        self.assert_healthy(registry)
 
+
+class ObservationAndRecoveryTests(_RegistryCase):
     def test_mutable_observations_and_nested_payloads_are_detached(self) -> None:
-        registry = self.registry()
-        returned, created = self.create(registry)
-        self.assertTrue(created)
-        returned.state = "failed"
-        self.assertEqual(registry.get("idem-a").state, "pending")
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "bound")
+        facts["payload"]["options"]["nested"]["list"].append(99)
+        self.assertEqual(
+            registry.get(KEY).task_payload["options"]["nested"]["list"], [1, 2, 3]
+        )
+        observed = registry.get(KEY)
+        observed.state = "failed"
+        observed.task_payload["uploads"].append("/nowhere")
+        observed.task_payload["options"]["nested"]["list"].clear()
+        again = registry.get(KEY)
+        self.assertEqual(again.state, "pending")
+        self.assertEqual(len(again.task_payload["uploads"]), 1)
+        self.assertEqual(again.task_payload["options"]["nested"]["list"], [1, 2, 3])
 
-        original_payload = self.bind(registry, self.root)
-        original_payload["options"]["nested"]["mode"] = "mutated"  # type: ignore[index]
-        observed = registry.get("idem-a")
-        assert observed is not None and observed.task_payload is not None
-        self.assertEqual(
-            observed.task_payload["options"]["nested"]["mode"], "strict"
+        reconciled, created = registry.reconcile_or_create(
+            idempotency_key=KEY,
+            task_id=TASK,
+            attempt_identity=f"attempt-{KEY}",
+            fence_identity=f"fence-{KEY}",
         )
-        observed.task_payload["options"]["nested"]["flags"].append("bad")
-        observed.task_payload["_agent_protocol"]["uploads"][0]["sha256"] = "0" * 64
-        by_task = registry.get_by_task_id("task-a")
-        assert by_task is not None and by_task.task_payload is not None
-        self.assertEqual(
-            by_task.task_payload["options"]["nested"]["flags"], [True, False]
-        )
-        self.assertNotEqual(
-            by_task.task_payload["_agent_protocol"]["uploads"][0]["sha256"],
-            "0" * 64,
-        )
+        self.assertFalse(created)
+        reconciled.task_payload["options"]["nested"]["list"].append(5)
+        self.assertEqual(registry.get(KEY).task_payload["options"]["nested"]["list"], [1, 2, 3])
 
-        route = registry.recoverable_payloads()[0]
-        self.assertNotIn("_agent_protocol", route)
-        route["options"]["nested"]["mode"] = "route-mutated"
-        again = registry.get("idem-a")
-        assert again is not None and again.task_payload is not None
-        self.assertEqual(
-            again.task_payload["options"]["nested"]["mode"], "strict"
-        )
+        hydrated = registry.recoverable_payloads()
+        self.assertEqual(len(hydrated), 1)
+        self.assertNotIn("_agent_protocol", hydrated[0])
+        self.assertEqual(hydrated[0]["status"], "pending")
+        hydrated[0]["options"]["nested"]["list"].append(7)
+        self.assertEqual(registry.get(KEY).task_payload["options"]["nested"]["list"], [1, 2, 3])
+        receipt = lab.disk_records()[KEY]["task_payload"]["_agent_protocol"]
+        self.assertEqual(receipt["schema"], "mineru-task-payload-owner.v1")
+        self.assertEqual(receipt["generation"], 1)
+        self.assertEqual(len(receipt["uploads"]), 1)
 
     def test_recovery_persists_generation_before_filesystem_cleanup(self) -> None:
-        registry = self.registry()
-        self.create(registry)
-        self.bind(registry, self.root)
-        stale = self.root / "task-a" / "partial" / "stale.bin"
-        stale.parent.mkdir()
-        stale.write_bytes(b"stale")
-        registry.transition("idem-a", "processing")
-        before = self.registry_path.read_bytes()
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "processing")
+        stale = lab.task_dir(TASK) / "stale-output.json"
+        stale.write_bytes(b"{}")
 
-        with mock.patch.object(
-            registry, "_persist", side_effect=OSError("pre-cleanup-persist")
-        ), mock.patch.object(registry, "_prepare_clean_replay") as cleanup:
-            with self.assertRaisesRegex(OSError, "pre-cleanup-persist"):
-                registry.recoverable_payloads()
-        cleanup.assert_not_called()
-        self.assertTrue(stale.exists())
-        self.assertEqual(self.registry_path.read_bytes(), before)
-        record = registry.get("idem-a")
-        assert record is not None
-        self.assertEqual(record.state, "processing")
-        self.assertEqual(record.recovery_generation, 1)
+        def refuse_removal(_cls: type, _parent_fd: int, name: str) -> None:
+            raise SyntheticStorageFault(f"refusing to remove {name}")
 
-        payload = registry.recoverable_payloads()[0]
-        self.assertEqual(payload["status"], "pending")
-        self.assertFalse(stale.exists())
-        recovered = registry.get("idem-a")
-        assert recovered is not None
-        self.assertEqual(recovered.recovery_generation, 2)
-
-    def test_live_reader_survives_unrelated_uncertainty_and_recovery(self) -> None:
-        registry = self.registry()
-        result = self.complete(registry, self.root)
-        registry.lease("idem-a", seconds=60)
-        self.assertEqual(registry.acquire_result("idem-a"), result)
-        self.assertEqual(registry.get("idem-a").active_readers, 1)
-
-        with mock.patch.object(
-            registry,
-            "_fsync_parent_descriptor",
-            side_effect=OSError("unrelated-parent-fsync"),
-        ):
-            with self.assertRaises(protocol.TaskRegistryPersistenceError):
-                self.create(registry, "b")
-        with self.assertRaises(protocol.TaskRegistryPersistenceError):
-            registry.get("idem-a")
-
-        status = registry.recover_persistence_uncertainty()
-        self.assertEqual(
-            status["last_event"]["outcome"],
-            "committed_after_explicit_recovery",
-        )
-        observed = registry.get("idem-a")
-        assert observed is not None
-        self.assertEqual(observed.active_readers, 1)
-        with self.assertRaisesRegex(
-            protocol.TaskProtocolConflict, "live result readers"
-        ):
+        with patch.object(
+            DurableTaskRegistry, "_remove_at", classmethod(refuse_removal)
+        ), self.assertRaises(SyntheticStorageFault):
             registry.recoverable_payloads()
-        with self.assertRaisesRegex(protocol.TaskProtocolConflict, "in use"):
-            registry.acknowledge("idem-a")
-        registry.release_result("idem-a")
-        registry.acknowledge("idem-a")
-        self.assertEqual(registry.get("idem-a").state, "cleanup_pending")
-        self.assertTrue(result.exists())
+        self.assertTrue(stale.exists())
+        on_disk = lab.disk_records()[KEY]
+        self.assertEqual(on_disk["state"], "pending")
+        self.assertEqual(on_disk["recovery_generation"], 2)
+        self.assertEqual(on_disk["task_payload"]["_agent_protocol"]["generation"], 2)
+        self.assertEqual(on_disk["reserved_result_bytes"], 0)
+        record = registry.get(KEY)
+        self.assertEqual((record.state, record.recovery_generation), ("pending", 2))
+        self.assertNotEqual(registry.persistence_status()["state"], "durability_uncertain")
+
+        hydrated = registry.recoverable_payloads()
+        self.assertFalse(stale.exists())
+        self.assertTrue((lab.task_dir(TASK) / "uploads" / "source.pdf").exists())
+        self.assertEqual([item["status"] for item in hydrated], ["pending"])
+        self.assertEqual(registry.get(KEY).recovery_generation, 2)
+        self.assertEqual(lab.open().get(KEY).recovery_generation, 2)
+
+
+class ReaderAndAckTests(_RegistryCase):
+    def test_live_reader_survives_unrelated_uncertainty_and_recovery(self) -> None:
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "leased")
+        drive(lab, registry, "bound", key=OTHER_KEY, task_id=OTHER_TASK)
+        result_path = facts["result"][0]
+        self.assertEqual(registry.acquire_result(KEY), result_path)
+        self.assertEqual(registry.get(KEY).active_readers, 1)
+        with self.assertRaisesRegex(TaskProtocolConflict, "live result readers"):
+            registry.recoverable_payloads()
+
+        with instance_hook(
+            registry, "_fsync_parent_descriptor", CountedFault(PERMANENT)
+        ), self.assertRaises(TaskRegistryPersistenceError):
+            registry.transition(OTHER_KEY, "processing")
+        self.assertEqual(registry.persistence_status()["state"], "durability_uncertain")
+        with self.assertRaises(TaskRegistryPersistenceError):
+            registry.get(KEY)
+        self.assertEqual(registry.unacked_result_bytes, facts["result"][2])
+
+        recovered = registry.recover_persistence_uncertainty()
+        self.assertEqual(recovered["last_event"]["outcome"], "committed_after_explicit_recovery")
+        self.assertEqual(registry.get(KEY).active_readers, 1)
+        self.assertEqual(registry.get(OTHER_KEY).state, "processing")
+        with self.assertRaisesRegex(TaskProtocolConflict, "live result readers"):
+            registry.recoverable_payloads()
+        registry.release_result(KEY)
+        self.assertEqual(registry.get(KEY).active_readers, 0)
+        self.assertEqual(lab.disk_records()[KEY]["active_readers"], 0)
+        self.assertEqual(len(registry.recoverable_payloads()), 2)
 
     def test_reader_mutation_uncertainty_requires_cold_restart(self) -> None:
-        registry = self.registry()
-        result = self.complete(registry, self.root)
-        registry.lease("idem-a", seconds=60)
-        with mock.patch.object(
-            registry,
-            "_fsync_parent_descriptor",
-            side_effect=OSError("reader-parent-fsync"),
-        ):
-            with self.assertRaises(
-                protocol.TaskRegistryPersistenceError
-            ) as raised:
-                registry.acquire_result("idem-a")
-        self.assertEqual(raised.exception.outcome, "durability_uncertain")
-        self.assertEqual(
-            registry.persistence_status()["recovery_action"],
-            "restart_registry_process",
-        )
-        with self.assertRaises(
-            protocol.TaskRegistryPersistenceError
-        ) as recovery_error:
-            registry.recover_persistence_uncertainty()
-        self.assertEqual(
-            recovery_error.exception.phase,
-            "reader_mutation_requires_cold_restart",
-        )
-
-        restarted = self.registry()
-        observed = restarted.get("idem-a")
-        assert observed is not None
-        self.assertEqual(observed.active_readers, 0)
-        self.assertEqual(restarted.acquire_result("idem-a"), result)
-        restarted.release_result("idem-a")
+        for operation in ("acquire_result", "release_result"):
+            with self.subTest(operation=operation):
+                lab = self.lab()
+                registry = lab.open()
+                stage = "leased" if operation == "acquire_result" else "acquired"
+                drive(lab, registry, stage)
+                mutate = getattr(registry, operation)
+                with instance_hook(
+                    registry, "_fsync_parent_descriptor", CountedFault(PERMANENT)
+                ), self.assertRaises(TaskRegistryPersistenceError) as raised:
+                    mutate(KEY)
+                self.assert_outcome(
+                    raised.exception, outcome="durability_uncertain", committed=False
+                )
+                status = registry.persistence_status()
+                self.assertEqual(status["state"], "durability_uncertain")
+                self.assertEqual(status["recovery_action"], "restart_registry_process")
+                with self.assertRaises(TaskRegistryPersistenceError) as refused:
+                    registry.recover_persistence_uncertainty()
+                self.assert_outcome(
+                    refused.exception,
+                    outcome="durability_uncertain",
+                    committed=False,
+                    phase_prefix="reader_mutation_requires_cold_restart",
+                )
+                self.assertEqual(refused.exception.operation, operation)
+                self.assertEqual(registry.persistence_status()["state"], "durability_uncertain")
+                with self.assertRaises(TaskRegistryPersistenceError):
+                    registry.release_result(KEY)
+                with self.assertRaises(TaskRegistryPersistenceError):
+                    registry.get(KEY)
+                cold = lab.open()
+                self.assertEqual(cold.persistence_status()["state"], "healthy")
+                self.assertEqual(cold.get(KEY).state, "completed")
+                self.assertEqual(cold.get(KEY).active_readers, 0)
+                self.assertTrue(cold.acquire_result(KEY).is_file())
+                self.assertEqual(cold.get(KEY).active_readers, 1)
 
     def test_committed_reader_cleanup_errors_return_the_durable_outcome(self) -> None:
-        registry = self.registry()
-        result = self.complete(registry, self.root)
-        registry.lease("idem-a", seconds=60)
-
-        with mock.patch.object(
-            registry,
-            "_cleanup_temp_path",
-            side_effect=OSError("acquire-temp-cleanup"),
-        ):
-            self.assertEqual(registry.acquire_result("idem-a"), result)
-        self.assertEqual(registry.get("idem-a").active_readers, 1)
-        self.assertEqual(
-            registry.persistence_status()["last_event"]["outcome"],
-            "committed_cleanup_failed",
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "leased")
+        cleanup_fault = fail_with("temp cleanup failed after commit")
+        with instance_hook(registry, "_cleanup_temp_path", cleanup_fault):
+            self.assertEqual(registry.acquire_result(KEY), facts["result"][0])
+        self.assertEqual(registry.get(KEY).active_readers, 1)
+        self.assertEqual(lab.disk_records()[KEY]["active_readers"], 1)
+        status = registry.persistence_status()
+        self.assertEqual(status["state"], "degraded")
+        self.assertEqual(status["recovery_action"], "do_not_retry_committed_operation")
+        self.assertEqual(status["last_event"]["operation"], "acquire_result")
+        with self.assertRaises(TaskRegistryPersistenceError) as raised:
+            registry.assert_persistence_healthy()
+        self.assert_outcome(
+            raised.exception, outcome="committed_cleanup_failed", committed=True
         )
-        with self.assertRaises(
-            protocol.TaskRegistryPersistenceError
-        ) as health_error:
-            registry.assert_persistence_healthy()
-        self.assertIsInstance(health_error.exception.__cause__, OSError)
-
-        registry.release_result("idem-a")
-        self.assertEqual(registry.get("idem-a").active_readers, 0)
-        self.assertEqual(registry.persistence_status()["state"], "healthy")
-
-        registry.acquire_result("idem-a")
-        original_close = registry._close_parent_descriptor
-
-        def close_then_raise(fd: int) -> None:
-            original_close(fd)
-            raise OSError("release-parent-close")
-
-        with mock.patch.object(
-            registry, "_close_parent_descriptor", side_effect=close_then_raise
-        ):
-            registry.release_result("idem-a")
-        self.assertEqual(registry.get("idem-a").active_readers, 0)
-        with self.assertRaises(
-            protocol.TaskRegistryPersistenceError
-        ) as release_health_error:
-            registry.assert_persistence_healthy()
-        self.assertIsInstance(release_health_error.exception.__cause__, OSError)
-        registry.acknowledge("idem-a")
-        self.assertEqual(registry.get("idem-a").state, "cleanup_pending")
-        self.assertEqual(registry.persistence_status()["state"], "healthy")
+        with self.assertRaises(TaskProtocolConflict):
+            registry.acknowledge(KEY)
+        with instance_hook(registry, "_cleanup_temp_path", cleanup_fault):
+            self.assertIsNone(registry.release_result(KEY))
+        self.assertEqual(registry.get(KEY).active_readers, 0)
+        self.assertEqual(lab.disk_records()[KEY]["active_readers"], 0)
+        registry.lease(KEY, seconds=1)
+        self.assert_healthy(registry)
 
     def test_acquisition_failure_release_failure_and_underflow_preserve_counts(self) -> None:
-        registry = self.registry()
-        self.complete(registry, self.root)
-        registry.lease("idem-a", seconds=60)
-        with mock.patch.object(
-            registry, "_persist", side_effect=OSError("acquire-persist")
-        ):
-            with self.assertRaisesRegex(OSError, "acquire-persist"):
-                registry.acquire_result("idem-a")
-        self.assertEqual(registry.get("idem-a").active_readers, 0)
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "leased")
+        with pre_commit_fault(registry, "write"), self.assertRaises(
+            TaskRegistryPersistenceError
+        ) as raised:
+            registry.acquire_result(KEY)
+        self.assert_outcome(raised.exception, outcome="not_committed", committed=False)
+        self.assertEqual(registry.get(KEY).active_readers, 0)
+        self.assertEqual(lab.disk_records()[KEY]["active_readers"], 0)
+        disk = lab.disk_bytes()
+        with self.assertRaisesRegex(RuntimeError, "underflow"):
+            registry.release_result(KEY)
+        self.assertEqual(registry.get(KEY).active_readers, 0)
+        self.assertEqual(lab.disk_bytes(), disk)
 
-        registry.acquire_result("idem-a")
-        with mock.patch.object(
-            registry, "_persist", side_effect=OSError("release-persist")
+        registry.acquire_result(KEY)
+        self.assertEqual(lab.disk_records()[KEY]["active_readers"], 1)
+        with pre_commit_fault(registry, "flush"), self.assertRaises(
+            TaskRegistryPersistenceError
         ):
-            with self.assertRaisesRegex(OSError, "release-persist"):
-                registry.release_result("idem-a")
-        self.assertEqual(registry.get("idem-a").active_readers, 1)
-        registry.release_result("idem-a")
-        self.assertEqual(registry.get("idem-a").active_readers, 0)
-        with self.assertRaisesRegex(RuntimeError, "underflowed"):
-            registry.release_result("idem-a")
-        self.assertEqual(registry.get("idem-a").active_readers, 0)
+            registry.release_result(KEY)
+        self.assertEqual(registry.get(KEY).active_readers, 1)
+        self.assertEqual(lab.disk_records()[KEY]["active_readers"], 1)
+        with self.assertRaisesRegex(TaskProtocolConflict, "in use"):
+            registry.acknowledge(KEY)
+        self.assertEqual(registry.get(KEY).state, "completed")
+        registry.release_result(KEY)
+        self.assertEqual(registry.get(KEY).active_readers, 0)
+        self.assertEqual(lab.open().get(KEY).active_readers, 0)
+        registry.acknowledge(KEY)
+        self.assertEqual(registry.get(KEY).state, "cleanup_pending")
 
     def test_open_result_preserves_primary_error_when_release_also_fails(self) -> None:
-        registry = self.registry()
-        self.complete(registry, self.root)
-        registry.lease("idem-a", seconds=60)
-        with mock.patch.object(
-            registry,
-            "release_result",
-            side_effect=OSError("secondary-release-error"),
-        ):
-            with self.assertRaisesRegex(ValueError, "primary-download-error") as raised:
-                with registry.open_result("idem-a"):
-                    raise ValueError("primary-download-error")
-        self.assertIsInstance(raised.exception.__cause__, OSError)
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "leased")
+        with registry.open_result(KEY) as path:
+            self.assertEqual(path, facts["result"][0])
+            self.assertEqual(registry.get(KEY).active_readers, 1)
+        self.assertEqual(registry.get(KEY).active_readers, 0)
+
+        original_write = DurableTaskRegistry._write_registry_stream
+        writes: list[int] = []
+
+        def fail_release_persist(stream: object, payload: bytes) -> None:
+            writes.append(1)
+            if len(writes) == 2:
+                raise SyntheticStorageFault("release persist failed")
+            original_write(stream, payload)
+
+        with instance_hook(registry, "_write_registry_stream", fail_release_persist), self.assertRaises(
+            ValueError
+        ) as raised:
+            with registry.open_result(KEY):
+                self.assertEqual(registry.get(KEY).active_readers, 1)
+                raise ValueError("synthetic download failure")
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(str(raised.exception), "synthetic download failure")
+        self.assertIsInstance(raised.exception.__cause__, TaskRegistryPersistenceError)
         self.assertTrue(
-            any("release also failed" in note for note in raised.exception.__notes__)
+            any(
+                "release also failed" in note
+                for note in getattr(raised.exception, "__notes__", [])
+            )
         )
-        self.assertEqual(registry.get("idem-a").active_readers, 1)
-        registry.release_result("idem-a")
+        self.assertEqual(registry.get(KEY).active_readers, 1)
+        self.assertEqual(lab.disk_records()[KEY]["active_readers"], 1)
+        registry.release_result(KEY)
+        self.assertEqual(registry.get(KEY).active_readers, 0)
 
+        with self.assertRaises(ValueError) as plain:
+            with registry.open_result(KEY):
+                raise ValueError("release succeeds")
+        self.assertIsNone(plain.exception.__cause__)
+        self.assertEqual(registry.get(KEY).active_readers, 0)
+
+
+class CleanupIntentTests(_RegistryCase):
     def test_cleanup_retry_handles_disappeared_result_and_upload_tree(self) -> None:
-        registry = self.registry()
-        result = self.complete(registry, self.root, bound=True)
-        task_root = self.root / "task-a"
-        uploads = task_root / "uploads"
-        intermediate = task_root / "intermediate.bin"
-        intermediate.write_bytes(b"partial")
-        registry.acknowledge("idem-a")
-
-        for child in uploads.iterdir():
-            child.unlink()
-        uploads.rmdir()
-        result.unlink()
-        self.assertEqual(registry.cleanup_consumed(), 1)
-        self.assertFalse(task_root.exists())
-        observed = registry.get("idem-a")
-        assert observed is not None
-        self.assertEqual(observed.state, "consumed")
+        with self.subTest(missing="result_and_uploads"):
+            lab = self.lab()
+            registry = lab.open()
+            facts = drive(lab, registry, "acknowledged")
+            facts["result"][0].unlink()
+            shutil.rmtree(lab.task_dir(TASK) / "uploads")
+            self.assertEqual(registry.cleanup_consumed(), 1)
+            self.assertEqual(registry.get(KEY).state, "consumed")
+            self.assertFalse(lab.task_dir(TASK).exists())
+            self.assertEqual(registry.unacked_result_bytes, 0)
+            self.assertEqual(lab.open().get(KEY).state, "consumed")
+        with self.subTest(missing="whole_task_directory"):
+            lab = self.lab()
+            registry = lab.open()
+            drive(lab, registry, "acknowledged")
+            shutil.rmtree(lab.task_dir(TASK))
+            self.assertEqual(registry.cleanup_consumed(), 1)
+            self.assertEqual(registry.get(KEY).state, "consumed")
+            self.assertEqual(lab.disk_records()[KEY]["state"], "consumed")
+            self.assertIsNone(lab.disk_records()[KEY]["result_path"])
 
     def test_cleanup_retry_rejects_renamed_upload_inode(self) -> None:
-        registry = self.registry()
-        self.complete(registry, self.root, bound=True)
-        task_root = self.root / "task-a"
-        (task_root / "uploads").rename(task_root / "uploads-renamed")
-        registry.acknowledge("idem-a")
-        with self.assertRaisesRegex(
-            protocol.TaskProtocolConflict, "uploads directory was renamed"
-        ):
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "acknowledged")
+        size = facts["result"][2]
+        uploads = lab.task_dir(TASK) / "uploads"
+        moved = lab.task_dir(TASK) / "uploads-moved"
+        uploads.rename(moved)
+        with self.assertRaisesRegex(TaskProtocolConflict, "renamed"):
             registry.cleanup_consumed()
-        observed = registry.get("idem-a")
-        assert observed is not None
-        self.assertEqual(observed.state, "cleanup_pending")
+        record = registry.get(KEY)
+        self.assertEqual(record.state, "cleanup_pending")
+        self.assertEqual(record.result_sha256, facts["result"][1])
+        self.assertTrue(facts["result"][0].exists())
+        self.assertTrue((moved / "source.pdf").exists())
+        self.assertEqual(registry.unacked_result_bytes, size)
+        self.assertEqual(lab.disk_records()[KEY]["state"], "cleanup_pending")
+
+        with self.subTest(renamed="task_directory"):
+            task_moved = lab.output_root / "task-moved"
+            moved.rename(uploads)
+            lab.task_dir(TASK).rename(task_moved)
+            with self.assertRaisesRegex(TaskProtocolConflict, "renamed"):
+                registry.cleanup_consumed()
+            self.assertEqual(registry.get(KEY).state, "cleanup_pending")
+            self.assertTrue((task_moved / "result.zip").exists())
+            task_moved.rename(lab.task_dir(TASK))
+
+        self.assertEqual(registry.cleanup_consumed(), 1)
+        self.assertEqual(registry.get(KEY).state, "consumed")
+        self.assertFalse(lab.task_dir(TASK).exists())
+        self.assertEqual(registry.unacked_result_bytes, 0)
 
     def test_cleanup_persist_failure_retains_intent_capacity_and_retries(self) -> None:
-        registry = self.registry()
-        result = self.complete(
-            registry,
-            self.root,
-            bound=True,
-            data=b"retained-result-bytes",
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "acknowledged")
+        size = facts["result"][2]
+        self.assertEqual(registry.unacked_result_bytes, size)
+        with pre_commit_fault(registry, "write"), self.assertRaises(
+            TaskRegistryPersistenceError
+        ) as raised:
+            registry.cleanup_consumed()
+        self.assert_outcome(raised.exception, outcome="not_committed", committed=False)
+        self.assertEqual(raised.exception.operation, "cleanup_consumed")
+        record = registry.get(KEY)
+        self.assertEqual(record.state, "cleanup_pending")
+        self.assertEqual(record.cleanup_kind, "result")
+        self.assertEqual(
+            (record.result_sha256, record.result_bytes, record.result_owner),
+            (facts["result"][1], size, facts["result"][3]),
         )
-        expected_bytes = len(b"retained-result-bytes")
-        registry.acknowledge("idem-a")
-        with mock.patch.object(
-            registry, "_persist", side_effect=OSError("persist-after-unlink")
-        ):
-            with self.assertRaisesRegex(OSError, "persist-after-unlink"):
-                registry.cleanup_consumed()
-        self.assertFalse(result.exists())
-        observed = registry.get("idem-a")
-        assert observed is not None
-        self.assertEqual(observed.state, "cleanup_pending")
-        self.assertEqual(registry.unacked_result_bytes, expected_bytes)
+        self.assertEqual(registry.unacked_result_bytes, size)
+        self.assertEqual(lab.disk_records()[KEY]["state"], "cleanup_pending")
+        self.assertFalse(lab.task_dir(TASK).exists())
         self.assertEqual(registry.cleanup_consumed(), 1)
-        self.assertEqual(registry.get("idem-a").state, "consumed")
-
-    def test_executor_does_not_overwrite_persistence_failure_as_parse_failure(self) -> None:
-        registry = self.registry()
-        self.create(registry)
-        executor = protocol.SplitTaskExecutor(
-            parse_slots=1,
-            finalizer_slots=1,
-            result_reservation_bytes=32,
-        )
-        calls = {"parse": 0, "finalize": 0}
-
-        async def parse() -> None:
-            calls["parse"] += 1
-
-        async def finalize():
-            calls["finalize"] += 1
-            raise AssertionError("finalize must not run")
-
-        with mock.patch.object(
-            registry,
-            "_write_registry_stream",
-            side_effect=OSError("processing-transition-persist"),
-        ):
-            with self.assertRaises(protocol.TaskRegistryPersistenceError):
-                asyncio.run(
-                    executor.run(
-                        registry=registry,
-                        key="idem-a",
-                        parse=parse,
-                        finalize=finalize,
-                    )
-                )
-        observed = registry.get("idem-a")
-        assert observed is not None
-        self.assertEqual(observed.state, "pending")
-        self.assertIsNone(observed.error)
-        self.assertEqual(calls, {"parse": 0, "finalize": 0})
-        with self.assertRaises(protocol.TaskRegistryPersistenceError):
-            protocol.task_protocol_runtime_status(registry, executor)
+        self.assertEqual(registry.get(KEY).state, "consumed")
+        self.assertEqual(registry.unacked_result_bytes, 0)
+        self.assertEqual(lab.open().get(KEY).state, "consumed")
 
     def test_cleanup_syncs_namespaces_before_consumed_capacity_release(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="m6-p1-cleanup-order-"
-        ) as directory:
-            root = Path(directory)
-            control = root / ".agent-task-protocol-v2"
-            control.mkdir()
-            registry = protocol.DurableTaskRegistry(
-                control / "registry.json",
-                max_unacked_result_bytes=4096,
-                output_root=root,
-            )
-            result = self.complete(registry, root, bound=True)
-            task_root = root / "task-a"
-            uploads_root = task_root / "uploads"
-            registry.acknowledge("idem-a")
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "acknowledged")
+        size = facts["result"][2]
+        root_inode = os.stat(lab.output_root).st_ino
+        task_inode = os.stat(lab.task_dir(TASK)).st_ino
+        uploads_inode = os.stat(lab.task_dir(TASK) / "uploads").st_ino
+        events: list[tuple[str, int, int]] = []
+        original_persist = registry._persist
 
-            identities = {
-                os.stat(root).st_ino: "output-root",
-                os.stat(control).st_ino: "registry-parent",
-                os.stat(task_root).st_ino: "task-root",
-                os.stat(uploads_root).st_ino: "uploads-root",
-            }
-            self.assertNotEqual(os.stat(root).st_ino, os.stat(control).st_ino)
-            observed: list[str] = []
-            original_fsync = os.fsync
-            original_persist = registry._persist
+        def record_fsync(descriptor: int) -> None:
+            events.append(("fsync", os.fstat(descriptor).st_ino, registry.unacked_result_bytes))
+            os.fsync(descriptor)
 
-            def trace_fsync(descriptor: int) -> None:
-                observed.append(
-                    identities.get(
-                        os.fstat(descriptor).st_ino,
-                        "registry-temp-or-other",
-                    )
-                )
-                original_fsync(descriptor)
+        def record_persist() -> None:
+            events.append(("persist", 0, registry.get(KEY).result_bytes or 0))
+            original_persist()
 
-            def persist_after_namespace_barrier() -> None:
-                self.assertIn("output-root", observed)
-                original_persist()
+        with patch.object(
+            DurableTaskRegistry, "_fsync_namespace_directory", staticmethod(record_fsync)
+        ), instance_hook(registry, "_persist", record_persist):
+            self.assertEqual(registry.cleanup_consumed(), 1)
 
-            with mock.patch.object(
-                protocol.os, "fsync", side_effect=trace_fsync
-            ), mock.patch.object(
-                registry,
-                "_persist",
-                side_effect=persist_after_namespace_barrier,
-            ):
-                self.assertEqual(registry.cleanup_consumed(), 1)
-
-            self.assertFalse(result.exists())
-            self.assertFalse(task_root.exists())
-            self.assertIn("uploads-root", observed)
-            self.assertIn("task-root", observed)
-            self.assertIn("output-root", observed)
-            self.assertIn("registry-parent", observed)
-            self.assertLess(
-                observed.index("output-root"),
-                observed.index("registry-parent"),
-            )
-            record = registry.get("idem-a")
-            assert record is not None
-            self.assertEqual(record.state, "consumed")
-            self.assertIsNone(record.task_payload)
-            self.assertEqual(registry.unacked_result_bytes, 0)
+        kinds = [kind for kind, _inode, _charge in events]
+        self.assertEqual(kinds.count("persist"), 1)
+        self.assertEqual(kinds[-1], "persist")
+        fsyncs = [(inode, charge) for kind, inode, charge in events if kind == "fsync"]
+        self.assertTrue(fsyncs)
+        self.assertTrue(all(charge == size for _inode, charge in fsyncs))
+        self.assertEqual(fsyncs[-1][0], root_inode)
+        self.assertIn(task_inode, [inode for inode, _charge in fsyncs])
+        self.assertIn(uploads_inode, [inode for inode, _charge in fsyncs])
+        self.assertEqual(registry.get(KEY).state, "consumed")
+        self.assertEqual(registry.unacked_result_bytes, 0)
+        self.assertFalse(lab.task_dir(TASK).exists())
 
     def test_cleanup_namespace_failures_retain_intent_and_retry_absence(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="m6-p1-cleanup-fsync-"
-        ) as directory:
-            root = Path(directory)
-            control = root / ".agent-task-protocol-v2"
-            control.mkdir()
-            registry = protocol.DurableTaskRegistry(
-                control / "registry.json",
-                max_unacked_result_bytes=4096,
-                output_root=root,
-            )
-            result_bytes = b"namespace-fsync-result"
-            self.complete(
-                registry,
-                root,
-                bound=True,
-                data=result_bytes,
-            )
-            task_root = root / "task-a"
-            registry.acknowledge("idem-a")
-            output_inode = os.stat(root).st_ino
-            original_namespace_fsync = registry._fsync_namespace_directory
-            original_close = os.close
-            injection_hits = 0
-            failing_descriptor: int | None = None
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "acknowledged")
+        size = facts["result"][2]
+        task_inode = os.stat(lab.task_dir(TASK)).st_ino
+        original_close = os.close
 
-            def fail_output_parent(descriptor: int) -> None:
-                nonlocal failing_descriptor, injection_hits
-                if os.fstat(descriptor).st_ino == output_inode:
-                    injection_hits += 1
-                    failing_descriptor = descriptor
-                    raise OSError("injected-output-namespace-fsync")
-                original_namespace_fsync(descriptor)
+        def fsync_fails_for_task_dir(descriptor: int) -> None:
+            if os.fstat(descriptor).st_ino == task_inode:
+                raise SyntheticStorageFault("task directory fsync failed")
+            os.fsync(descriptor)
 
-            def close_after_primary(descriptor: int) -> None:
-                original_close(descriptor)
-                if descriptor == failing_descriptor:
-                    raise OSError("injected-output-close")
+        def close_fails_for_task_dir(descriptor: int) -> None:
+            try:
+                inode = os.fstat(descriptor).st_ino
+            except OSError:
+                inode = None
+            original_close(descriptor)
+            if inode == task_inode:
+                raise OSError("synthetic descriptor close failure")
 
-            with mock.patch.object(
-                registry,
+        with patch.object(
+            DurableTaskRegistry,
+            "_fsync_namespace_directory",
+            staticmethod(fsync_fails_for_task_dir),
+        ), patch("scripts.windows.mineru_heap_trim_compat.agent_task_protocol_v2.os.close", close_fails_for_task_dir), self.assertRaises(
+            SyntheticStorageFault
+        ) as raised:
+            registry.cleanup_consumed()
+        self.assertTrue(
+            any(
+                "close also failed: OSError" in note
+                for note in getattr(raised.exception, "__notes__", [])
+            ),
+            getattr(raised.exception, "__notes__", None),
+        )
+        record = registry.get(KEY)
+        self.assertEqual(record.state, "cleanup_pending")
+        self.assertEqual(record.result_sha256, facts["result"][1])
+        self.assertEqual(registry.unacked_result_bytes, size)
+        self.assertEqual(lab.disk_records()[KEY]["state"], "cleanup_pending")
+        self.assertNotEqual(registry.persistence_status()["state"], "durability_uncertain")
+        self.assertTrue(lab.task_dir(TASK).exists())
+
+        with self.subTest(retry="after_task_entry_removed_before_root_barrier"):
+            root_inode = os.stat(lab.output_root).st_ino
+            root_fsyncs: list[int] = []
+
+            def fail_root_barrier(descriptor: int) -> None:
+                if os.fstat(descriptor).st_ino == root_inode:
+                    raise SyntheticStorageFault("output root fsync failed")
+                os.fsync(descriptor)
+
+            with patch.object(
+                DurableTaskRegistry,
                 "_fsync_namespace_directory",
-                side_effect=fail_output_parent,
-            ), mock.patch.object(
-                protocol.os,
-                "close",
-                side_effect=close_after_primary,
-            ):
-                with self.assertRaisesRegex(
-                    OSError, "injected-output-namespace-fsync"
-                ) as raised:
-                    registry.cleanup_consumed()
+                staticmethod(fail_root_barrier),
+            ), self.assertRaises(SyntheticStorageFault):
+                registry.cleanup_consumed()
+            self.assertFalse(lab.task_dir(TASK).exists())
+            self.assertEqual(registry.get(KEY).state, "cleanup_pending")
+            self.assertEqual(registry.unacked_result_bytes, size)
 
-            self.assertEqual(injection_hits, 1)
-            self.assertIsNotNone(failing_descriptor)
-            self.assertTrue(
-                any(
-                    "cleanup output root close also failed: OSError" in note
-                    for note in raised.exception.__notes__
-                )
-            )
-            self.assertFalse(task_root.exists())
-            retained = registry.get("idem-a")
-            assert retained is not None
-            self.assertEqual(retained.state, "cleanup_pending")
-            self.assertIsNotNone(retained.task_payload)
-            self.assertEqual(
-                registry.unacked_result_bytes,
-                len(result_bytes),
-            )
+            def observe_root_barrier(descriptor: int) -> None:
+                if os.fstat(descriptor).st_ino == root_inode:
+                    root_fsyncs.append(descriptor)
+                os.fsync(descriptor)
 
-            retry_syncs = 0
-
-            def trace_absent_retry(descriptor: int) -> None:
-                nonlocal retry_syncs
-                if os.fstat(descriptor).st_ino == output_inode:
-                    retry_syncs += 1
-                original_namespace_fsync(descriptor)
-
-            with mock.patch.object(
-                registry,
+            with patch.object(
+                DurableTaskRegistry,
                 "_fsync_namespace_directory",
-                side_effect=trace_absent_retry,
+                staticmethod(observe_root_barrier),
             ):
                 self.assertEqual(registry.cleanup_consumed(), 1)
-            self.assertEqual(retry_syncs, 1)
-            consumed = registry.get("idem-a")
-            assert consumed is not None
-            self.assertEqual(consumed.state, "consumed")
+            self.assertEqual(len(root_fsyncs), 1)
+            self.assertEqual(registry.get(KEY).state, "consumed")
             self.assertEqual(registry.unacked_result_bytes, 0)
+            self.assertEqual(lab.open().get(KEY).state, "consumed")
 
     def test_partial_cleanup_deletion_failure_retains_identity_and_retries(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix="m6-p1-cleanup-partial-"
-        ) as directory:
-            root = Path(directory)
-            registry = self.registry_at(root)
-            result_bytes = b"partial-deletion-result"
-            self.complete(
-                registry,
-                root,
-                bound=True,
-                data=result_bytes,
-            )
-            task_root = root / "task-a"
-            initial_entries = set(os.listdir(task_root))
-            self.assertEqual(initial_entries, {"uploads", ".retained-result.zip"})
-            registry.acknowledge("idem-a")
-            original_remove = registry._remove_at
-            injection_hits = 0
+        lab = self.lab()
+        registry = lab.open()
+        facts = drive(lab, registry, "acknowledged")
+        result_path, digest, size, owner = facts["result"]
+        original_remove = DurableTaskRegistry.__dict__["_remove_at"].__func__
+        refused: list[str] = []
 
-            def remove_one_then_fail(parent_fd: int, name: str) -> None:
-                nonlocal injection_hits
-                injection_hits += 1
-                if injection_hits == 1:
-                    original_remove(parent_fd, name)
-                    return
-                raise OSError("injected-partial-namespace-delete")
+        def refuse_result_once(cls: type, parent_fd: int, name: str) -> None:
+            if name == "result.zip" and not refused:
+                refused.append(name)
+                raise SyntheticStorageFault("result unlink failed")
+            original_remove(cls, parent_fd, name)
 
-            with mock.patch.object(
-                registry,
-                "_remove_at",
-                side_effect=remove_one_then_fail,
+        with patch.object(
+            DurableTaskRegistry, "_remove_at", classmethod(refuse_result_once)
+        ), self.assertRaises(SyntheticStorageFault):
+            registry.cleanup_consumed()
+        self.assertEqual(refused, ["result.zip"])
+        self.assertTrue(result_path.exists())
+        record = registry.get(KEY)
+        self.assertEqual(record.state, "cleanup_pending")
+        self.assertEqual(record.cleanup_kind, "result")
+        self.assertEqual((record.result_sha256, record.result_bytes, record.result_owner), (digest, size, owner))
+        self.assertEqual(registry.unacked_result_bytes, size)
+        self.assertEqual(lab.disk_records()[KEY]["state"], "cleanup_pending")
+        self.assertEqual(registry.cleanup_consumed(), 1)
+        self.assertFalse(lab.task_dir(TASK).exists())
+        self.assertEqual(registry.get(KEY).state, "consumed")
+        self.assertEqual(registry.unacked_result_bytes, 0)
+
+
+class ExecutorTests(_RegistryCase):
+    @staticmethod
+    def executor() -> SplitTaskExecutor:
+        # One executor per event loop: its semaphores bind to the running loop.
+        return SplitTaskExecutor(
+            parse_slots=1, finalizer_slots=1, result_reservation_bytes=FINALIZER_BUDGET
+        )
+
+    def test_executor_does_not_overwrite_persistence_failure_as_parse_failure(self) -> None:
+        async def parse_ok() -> None:
+            return None
+
+        async def parse_broken() -> None:
+            raise RuntimeError("synthetic parse failure")
+
+        with self.subTest(failure="first_transition"):
+            lab = self.lab()
+            registry = lab.open()
+            drive(lab, registry, "bound")
+
+            async def finalize() -> tuple[Path, str, int, str]:
+                return lab.make_result(TASK)
+
+            with pre_commit_fault(registry, "write"), self.assertRaises(
+                TaskRegistryPersistenceError
             ):
-                with self.assertRaisesRegex(
-                    OSError, "injected-partial-namespace-delete"
-                ):
-                    registry.cleanup_consumed()
+                asyncio.run(
+                    self.executor().run(
+                        registry=registry, key=KEY, parse=parse_ok, finalize=finalize
+                    )
+                )
+            record = registry.get(KEY)
+            self.assertEqual((record.state, record.error), ("pending", None))
 
-            self.assertEqual(injection_hits, 2)
-            self.assertTrue(task_root.is_dir())
-            self.assertLess(len(set(os.listdir(task_root))), len(initial_entries))
-            retained = registry.get("idem-a")
-            assert retained is not None
-            self.assertEqual(retained.state, "cleanup_pending")
-            self.assertIsNotNone(retained.task_payload)
-            self.assertIsNotNone(retained.result_owner)
-            self.assertEqual(
-                registry.unacked_result_bytes,
-                len(result_bytes),
+        with self.subTest(failure="after_parse_before_finalizing"):
+            lab = self.lab()
+            registry = lab.open()
+            drive(lab, registry, "bound")
+            original_write = DurableTaskRegistry._write_registry_stream
+            calls: list[int] = []
+
+            def fail_second_write(stream: object, payload: bytes) -> None:
+                calls.append(1)
+                if len(calls) == 2:
+                    raise SyntheticStorageFault("second persist failed")
+                original_write(stream, payload)
+
+            async def finalize_two() -> tuple[Path, str, int, str]:
+                return lab.make_result(TASK)
+
+            with instance_hook(registry, "_write_registry_stream", fail_second_write), self.assertRaises(
+                TaskRegistryPersistenceError
+            ):
+                asyncio.run(
+                    self.executor().run(
+                        registry=registry, key=KEY, parse=parse_ok, finalize=finalize_two
+                    )
+                )
+            record = registry.get(KEY)
+            self.assertEqual((record.state, record.error), ("processing", None))
+
+        with self.subTest(failure="ordinary_parse_error"):
+            lab = self.lab()
+            registry = lab.open()
+            drive(lab, registry, "bound")
+
+            async def finalize_three() -> tuple[Path, str, int, str]:
+                return lab.make_result(TASK)
+
+            with self.assertRaisesRegex(RuntimeError, "synthetic parse failure"):
+                asyncio.run(
+                    self.executor().run(
+                        registry=registry, key=KEY, parse=parse_broken, finalize=finalize_three
+                    )
+                )
+            record = registry.get(KEY)
+            self.assertEqual(record.state, "failed")
+            self.assertEqual(json.loads(record.error)["code"], "parse_or_finalize_failed")
+            self.assertEqual(record.reserved_result_bytes, 0)
+
+        with self.subTest(failure="none"):
+            lab = self.lab()
+            registry = lab.open()
+            drive(lab, registry, "bound")
+
+            async def finalize_four() -> tuple[Path, str, int, str]:
+                return lab.make_result(TASK)
+
+            asyncio.run(
+                self.executor().run(
+                    registry=registry, key=KEY, parse=parse_ok, finalize=finalize_four
+                )
             )
+            record = registry.get(KEY)
+            self.assertEqual(record.state, "completed")
+            self.assertEqual(registry.unacked_result_bytes, record.result_bytes)
+            self.assertEqual(registry.reserved_result_bytes, 0)
 
-            self.assertEqual(registry.cleanup_consumed(), 1)
-            self.assertFalse(task_root.exists())
-            consumed = registry.get("idem-a")
-            assert consumed is not None
-            self.assertEqual(consumed.state, "consumed")
-            self.assertEqual(registry.unacked_result_bytes, 0)
+
+class GeneratedFastApiWaiterTests(_RegistryCase):
+    """Live generated waiter/processor code over a real registry; HTTP layer is stubbed."""
 
     def test_generated_fastapi_waiters_receive_persistence_outcomes(self) -> None:
-        patcher_path = (
-            SERVICE_ROOT
-            / "scripts"
-            / "windows"
-            / "mineru_heap_trim_compat"
-            / "patch_mineru_344.py"
-        )
-        patcher_spec = importlib.util.spec_from_file_location(
-            "m6_p1_waiter_patch_mineru_344", patcher_path
-        )
-        assert patcher_spec is not None and patcher_spec.loader is not None
-        patcher = importlib.util.module_from_spec(patcher_spec)
-        sys.modules[patcher_spec.name] = patcher
-        patcher_spec.loader.exec_module(patcher)
-        preimage = (
-            SERVICE_ROOT
-            / "tests"
-            / "fixtures"
-            / "mineru_344_preimages"
-            / "mineru"
-            / "cli"
-            / "fast_api.py"
-        ).read_text(encoding="utf-8")
-        patched = patcher.patch_source("mineru/cli/fast_api.py", preimage)
-        tree = ast.parse(patched)
-        manager_node = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "AsyncTaskManager"
-        )
-        selected_names = {
-            "_on_processor_done",
-            "_process_task",
-            "_raise_task_wait_failure",
-            "_signal_task_event",
-            "_wake_waiters",
-            "shutdown",
-            "wait_for_terminal_state",
-        }
-        selected = [
-            node
-            for node in manager_node.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in selected_names
-        ]
-        self.assertEqual({node.name for node in selected}, selected_names)
-
-        class TaskWaitAbortedError(RuntimeError):
-            pass
-
-        class LoggerStub:
-            def exception(self, *_args: object) -> None:
-                return None
-
-            def error(self, *_args: object) -> None:
-                return None
-
-        async def build_retained_task_result(_task: object) -> None:
-            return None
-
-        namespace: dict[str, object] = {
-            "Any": object,
-            "AsyncParseTask": object,
-            "Path": Path,
-            "TASK_COMPLETED": "completed",
-            "TASK_FAILED": "failed",
-            "TaskRegistryPersistenceError": (
-                protocol.TaskRegistryPersistenceError
+        for family, fault_name, expected_outcome, expected_recovery in (
+            ("not_committed", "write", "not_committed", "retry_idempotent_operation"),
+            (
+                "durability_uncertain",
+                "parent_fsync",
+                "durability_uncertain",
+                "call recover_persistence_uncertainty",
             ),
-            "TaskWaitAbortedError": TaskWaitAbortedError,
-            "asyncio": asyncio,
-            "build_retained_task_result": build_retained_task_result,
-            "is_task_terminal": lambda status: status in {"completed", "failed"},
-            "logger": LoggerStub(),
-            "suppress": __import__("contextlib").suppress,
-            "utc_now_iso": lambda: "now",
-        }
-        module = ast.Module(body=selected, type_ignores=[])
-        ast.fix_missing_locations(module)
-        exec(compile(module, "generated-fast-api-methods.py", "exec"), namespace)
-        manager_type = type(
-            "GeneratedAsyncTaskManager",
-            (),
-            {name: namespace[name] for name in selected_names},
-        )
-
-        class Executor:
-            def __init__(self, outcome: BaseException | None) -> None:
-                self.outcome = outcome
-
-            async def run(self, **_kwargs: object) -> None:
-                if isinstance(
-                    self.outcome,
-                    protocol.TaskRegistryPersistenceError,
-                ):
-                    raise self.outcome from OSError(
-                        "original-registry-storage-error"
+        ):
+            with self.subTest(family=family):
+                lab = self.lab()
+                registry = lab.open()
+                drive(lab, registry, "bound")
+                logger = LoggerStub()
+                namespace = load_generated_fast_api(registry=registry, logger=logger)
+                aborted = namespace["TaskWaitAbortedError"]
+                if fault_name == "write":
+                    fault = pre_commit_fault(registry, "write")
+                else:
+                    fault = instance_hook(
+                        registry, "_fsync_parent_descriptor", CountedFault(PERMANENT)
                     )
-                if self.outcome is not None:
-                    raise self.outcome
 
-        def task(task_id: str) -> SimpleNamespace:
-            return SimpleNamespace(
-                task_id=task_id,
-                agent_idempotency_key=f"idem-{task_id}",
-                status="processing",
-                error=None,
-                completed_at=None,
-                result_artifact_path=None,
-                result_artifact_sha256=None,
-                result_artifact_bytes=None,
-                result_artifact_owner=None,
-            )
+                async def scenario() -> None:
+                    manager = await build_manager(namespace)
+                    try:
+                        task = TaskStub(TASK, outcome=partial(registry.transition, KEY, "processing"))
+                        await manager.submit(task)
+                        while task.status != "processing":
+                            await asyncio.sleep(0)
+                        processor = next(iter(manager.active_tasks))
+                        waiter = asyncio.create_task(manager.wait_for_terminal_state(TASK))
+                        for _ in range(5):
+                            await asyncio.sleep(0)
+                        self.assertFalse(waiter.done())
+                        other = TaskStub(OTHER_TASK)
+                        manager.tasks[OTHER_TASK] = other
+                        manager.task_events[OTHER_TASK] = asyncio.Event()
 
-        def manager(outcome: BaseException | None):
-            value = manager_type()
-            value.tasks = {}
-            value.task_events = {}
-            value.task_wait_failures = {}
-            value.manager_wakeup = asyncio.Event()
-            value.last_worker_error = None
-            value.is_shutting_down = False
-            value.active_tasks = set()
-            value.queue = asyncio.Queue()
-            value.dispatcher_task = None
-            value.cleanup_task = None
-            value.task_protocol_executor = Executor(outcome)
-            value.task_protocol_v2 = SimpleNamespace(
-                persistence_status=lambda: {
-                    "state": "degraded",
-                    "recovery_action": "call recover_persistence_uncertainty",
-                },
-                cleanup_consumed=lambda: 0,
-            )
-            return value
+                        with fault:
+                            task.release.set()
+                            with self.assertRaises(aborted) as raised:
+                                await waiter
+                            with suppress(BaseException):
+                                await processor
+                            failure = processor.exception()
+                            self.assertIsInstance(failure, TaskRegistryPersistenceError)
+                            self.assertIs(raised.exception.__cause__, failure)
+                            self.assertEqual(failure.outcome, expected_outcome)
+                            self.assertIn(f"outcome={expected_outcome}", str(raised.exception))
+                            self.assertIn(f"recovery={expected_recovery}", str(raised.exception))
+                            self.assertEqual(task.status, "processing")
+                            self.assertIsNone(task.error)
+                            self.assertIs(manager.task_wait_failures[TASK], failure)
+                            self.assertFalse(manager.task_events[OTHER_TASK].is_set())
+                            self.assertTrue(manager.task_events[TASK].is_set())
+                            self.assertTrue(
+                                any("remains nonterminal" in message for message in logger.messages)
+                            )
+                            before = len(asyncio.all_tasks())
+                            with self.assertRaises(aborted) as late:
+                                await manager.wait_for_terminal_state(TASK)
+                            self.assertIs(late.exception.__cause__, failure)
+                            self.assertEqual(len(asyncio.all_tasks()), before)
+                            self.assertEqual(manager.queue._unfinished_tasks, 0)
+                    finally:
+                        await stop_manager(manager)
 
-        def register(value, *tasks: SimpleNamespace) -> None:
-            for current in tasks:
-                value.tasks[current.task_id] = current
-                value.task_events[current.task_id] = asyncio.Event()
+                asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+                if family == "not_committed":
+                    self.assertEqual(registry.get(KEY).state, "pending")
+                else:
+                    self.assertEqual(registry.persistence_status()["state"], "durability_uncertain")
+                    registry.recover_persistence_uncertainty()
+                    self.assertEqual(registry.get(KEY).state, "processing")
 
-        async def start_processor(value, task_id: str):
-            value.queue.put_nowait(task_id)
-            self.assertEqual(value.queue.get_nowait(), task_id)
-            processor = asyncio.create_task(value._process_task(task_id))
-            value.active_tasks.add(processor)
-            processor.add_done_callback(value._on_processor_done)
-            return processor
+        with self.subTest(family="ordinary_parse_error_stays_terminal"):
+            lab = self.lab()
+            registry = lab.open()
+            drive(lab, registry, "bound")
+            namespace = load_generated_fast_api(registry=registry)
 
-        async def exercise() -> None:
-            persistence_error = protocol.TaskRegistryPersistenceError(
-                operation="transition",
-                phase="file_fsync",
-                outcome="not_committed",
-                committed=False,
-            )
-            persistence_manager = manager(persistence_error)
-            affected = task("affected")
-            unrelated = task("unrelated")
-            register(persistence_manager, affected, unrelated)
-            existing_waiter = asyncio.create_task(
-                persistence_manager.wait_for_terminal_state("affected")
-            )
-            unrelated_waiter = asyncio.create_task(
-                persistence_manager.wait_for_terminal_state("unrelated")
-            )
-            await asyncio.sleep(0)
-            processor = await start_processor(
-                persistence_manager, "affected"
-            )
-            with self.assertRaises(
-                protocol.TaskRegistryPersistenceError
-            ) as processor_error:
-                await processor
-            self.assertIs(processor_error.exception, persistence_error)
-            await asyncio.sleep(0)
+            def explode() -> None:
+                raise RuntimeError("synthetic parse failure")
 
-            with self.assertRaises(TaskWaitAbortedError) as existing_error:
-                await asyncio.wait_for(existing_waiter, timeout=0.25)
-            self.assertIs(existing_error.exception.__cause__, persistence_error)
-            self.assertIsInstance(persistence_error.__cause__, OSError)
-            self.assertIn("outcome=not_committed", str(existing_error.exception))
-            self.assertIn(
-                "recovery=call recover_persistence_uncertainty",
-                str(existing_error.exception),
-            )
-            with self.assertRaises(TaskWaitAbortedError) as later_error:
-                await asyncio.wait_for(
-                    persistence_manager.wait_for_terminal_state("affected"),
-                    timeout=0.25,
-                )
-            self.assertIs(later_error.exception.__cause__, persistence_error)
-            await asyncio.sleep(0)
-            self.assertFalse(unrelated_waiter.done())
-            self.assertFalse(
-                persistence_manager.task_events["unrelated"].is_set()
-            )
-            current_task = asyncio.current_task()
-            assert current_task is not None
-            helper_tasks = {
-                candidate
-                for candidate in asyncio.all_tasks()
-                if candidate not in {current_task, unrelated_waiter}
-                and not candidate.done()
-                and getattr(candidate.get_coro(), "__qualname__", "")
-                == "Event.wait"
-            }
-            self.assertEqual(len(helper_tasks), 2)
-            unrelated_waiter.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await unrelated_waiter
-            self.assertTrue(all(helper.done() for helper in helper_tasks))
-            self.assertTrue(all(helper.cancelled() for helper in helper_tasks))
-            self.assertFalse(helper_tasks & asyncio.all_tasks())
-            self.assertEqual(affected.status, "processing")
-            self.assertIsNone(affected.error)
-            self.assertEqual(
-                persistence_manager.last_worker_error,
-                str(persistence_error),
-            )
-            self.assertNotIn(processor, persistence_manager.active_tasks)
+            async def ordinary() -> None:
+                manager = await build_manager(namespace)
+                try:
+                    task = TaskStub(TASK, outcome=explode)
+                    await manager.submit(task)
+                    waiter = asyncio.create_task(manager.wait_for_terminal_state(TASK))
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    task.release.set()
+                    terminal = await waiter
+                    self.assertIs(terminal, task)
+                    self.assertEqual((task.status, task.error), ("failed", "synthetic parse failure"))
+                    self.assertEqual(manager.task_wait_failures, {})
+                    self.assertIs(await manager.wait_for_terminal_state(TASK), task)
+                    await manager.shutdown()
+                    self.assertEqual(manager.queue._unfinished_tasks, 0)
+                finally:
+                    await stop_manager(manager)
 
-            successful_manager = manager(None)
-            successful = task("successful")
-            register(successful_manager, successful)
-            success_waiter = asyncio.create_task(
-                successful_manager.wait_for_terminal_state("successful")
-            )
-            await asyncio.sleep(0)
-            success_processor = await start_processor(
-                successful_manager, "successful"
-            )
-            await success_processor
-            self.assertIs(
-                await asyncio.wait_for(success_waiter, timeout=0.25),
-                successful,
-            )
-            self.assertEqual(successful.status, "completed")
-            self.assertEqual(successful_manager.task_wait_failures, {})
+            asyncio.run(asyncio.wait_for(ordinary(), timeout=10))
+            self.assertEqual(registry.get(KEY).state, "pending")
 
-            parser_manager = manager(ValueError("ordinary-parser-failure"))
-            parser_task = task("parser")
-            register(parser_manager, parser_task)
-            parser_waiter = asyncio.create_task(
-                parser_manager.wait_for_terminal_state("parser")
-            )
-            await asyncio.sleep(0)
-            parser_processor = await start_processor(parser_manager, "parser")
-            await parser_processor
-            self.assertIs(
-                await asyncio.wait_for(parser_waiter, timeout=0.25),
-                parser_task,
-            )
-            self.assertEqual(parser_task.status, "failed")
-            self.assertEqual(parser_task.error, "ordinary-parser-failure")
-            self.assertEqual(parser_manager.task_wait_failures, {})
+        with self.subTest(family="start_clears_only_the_process_local_map"):
+            lab = self.lab()
+            registry = lab.open()
+            namespace = load_generated_fast_api(registry=registry)
 
-            cancelled_manager = manager(asyncio.CancelledError())
-            cancelled_task = task("cancelled")
-            register(cancelled_manager, cancelled_task)
-            cancelled_waiter = asyncio.create_task(
-                cancelled_manager.wait_for_terminal_state("cancelled")
-            )
-            await asyncio.sleep(0)
-            cancelled_processor = await start_processor(
-                cancelled_manager, "cancelled"
-            )
-            with self.assertRaises(asyncio.CancelledError):
-                await cancelled_processor
-            self.assertIs(
-                await asyncio.wait_for(cancelled_waiter, timeout=0.25),
-                cancelled_task,
-            )
-            self.assertEqual(cancelled_task.status, "failed")
-            self.assertEqual(
-                cancelled_task.error,
-                "Task processor was cancelled",
-            )
-            self.assertEqual(cancelled_manager.task_wait_failures, {})
+            async def restart() -> None:
+                manager = await build_manager(namespace)
+                try:
+                    manager.task_wait_failures["stale"] = TaskRegistryPersistenceError(
+                        operation="transition", phase="write", outcome="not_committed", committed=False
+                    )
+                    manager.tasks["stale"] = TaskStub("stale")
+                    await stop_manager(manager)
+                    await manager.start()
+                    self.assertEqual(manager.task_wait_failures, {})
+                    self.assertIn("stale", manager.tasks)
+                finally:
+                    await stop_manager(manager)
 
-            shutdown_manager = manager(None)
-            shutdown_task = task("shutdown")
-            register(shutdown_manager, shutdown_task)
-            shutdown_waiter = asyncio.create_task(
-                shutdown_manager.wait_for_terminal_state("shutdown")
-            )
-            await asyncio.sleep(0)
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "accepted tasks did not reach terminal state",
-            ):
-                await shutdown_manager.shutdown()
-            with self.assertRaisesRegex(
-                TaskWaitAbortedError,
-                "shutting down",
-            ):
-                await asyncio.wait_for(shutdown_waiter, timeout=0.25)
-
-        asyncio.run(exercise())
+            asyncio.run(asyncio.wait_for(restart(), timeout=10))
 
     def test_generated_fastapi_concurrent_waiter_cancellation_interleaving(self) -> None:
-        patcher_path = (
-            SERVICE_ROOT
-            / "scripts"
-            / "windows"
-            / "mineru_heap_trim_compat"
-            / "patch_mineru_344.py"
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        namespace = load_generated_fast_api(registry=registry)
+        aborted = namespace["TaskWaitAbortedError"]
+        self.assertIn("wait_helpers = (event_wait_task, manager_wait_task)", namespace["__generated_source__"])
+        self.assertNotIn("done, pending = await asyncio.wait", namespace["__generated_source__"])
+
+        async def helpers_of(baseline: set[asyncio.Task[object]], waiter: asyncio.Task[object]) -> set[asyncio.Task[object]]:
+            for _ in range(50):
+                await asyncio.sleep(0)
+                helpers = {
+                    task for task in asyncio.all_tasks() if task not in baseline and task is not waiter
+                }
+                if len(helpers) == 2:
+                    return helpers
+            raise AssertionError("waiter never created both helper tasks")
+
+        async def scenario() -> None:
+            manager = await build_manager(namespace)
+            try:
+                task = TaskStub(TASK, outcome=partial(registry.transition, KEY, "processing"))
+                await manager.submit(task)
+                while task.status != "processing":
+                    await asyncio.sleep(0)
+                baseline = set(asyncio.all_tasks())
+
+                with self.subTest(interleaving="outer_cancel_while_wait_suspended"):
+                    waiter = asyncio.create_task(manager.wait_for_terminal_state(TASK))
+                    helpers = await helpers_of(baseline, waiter)
+                    self.assertTrue(all(not helper.done() for helper in helpers))
+                    waiter.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await waiter
+                    self.assertTrue(all(helper.done() and helper.cancelled() for helper in helpers))
+                    await asyncio.sleep(0)
+                    self.assertEqual(set(asyncio.all_tasks()) - baseline, set())
+                    self.assertEqual(task.status, "processing")
+
+                with self.subTest(interleaving="second_waiter_survives_first_cancellation"):
+                    first = asyncio.create_task(manager.wait_for_terminal_state(TASK))
+                    first_helpers = await helpers_of(baseline, first)
+                    second = asyncio.create_task(manager.wait_for_terminal_state(TASK))
+                    second_helpers = await helpers_of(baseline | first_helpers | {first}, second)
+                    first.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await first
+                    self.assertTrue(all(helper.cancelled() for helper in first_helpers))
+                    self.assertTrue(all(not helper.done() for helper in second_helpers))
+                    self.assertFalse(second.done())
+                    task.release.set()
+                    self.assertIs(await second, task)
+                    self.assertEqual(task.status, "completed")
+                    self.assertTrue(all(helper.done() for helper in second_helpers))
+                    await asyncio.sleep(0)
+                    self.assertEqual(set(asyncio.all_tasks()) - baseline, set())
+
+                with self.subTest(interleaving="shutdown_wake_uses_the_same_cleanup_path"):
+                    self.assertIs(await manager.wait_for_terminal_state(TASK), task)
+                    stuck = TaskStub(OTHER_TASK)
+                    await manager.submit(stuck)
+                    while stuck.status != "processing":
+                        await asyncio.sleep(0)
+                    baseline = set(asyncio.all_tasks())
+                    waiter = asyncio.create_task(manager.wait_for_terminal_state(OTHER_TASK))
+                    helpers = await helpers_of(baseline, waiter)
+                    manager.is_shutting_down = True
+                    manager._wake_waiters()
+                    with self.assertRaisesRegex(aborted, "shutting down"):
+                        await waiter
+                    self.assertTrue(all(helper.done() for helper in helpers))
+                    await asyncio.sleep(0)
+                    self.assertEqual(set(asyncio.all_tasks()) - baseline, set())
+                    self.assertEqual(stuck.status, "processing")
+                    stuck.release.set()
+                    while stuck.status != "completed":
+                        await asyncio.sleep(0)
+            finally:
+                await stop_manager(manager)
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=10))
+        self.assertEqual(registry.get(KEY).state, "processing")
+
+
+class RealPreimageTests(unittest.TestCase):
+    def test_real_fastapi_preimage_has_closed_persistence_integration(self) -> None:
+        relative = "mineru/cli/fast_api.py"
+        preimage = Path(__file__).resolve().parents[1] / "fixtures" / "mineru_344_preimages" / relative
+        if not preimage.is_file():
+            self.skipTest(
+                "missing precondition: pinned MinerU 3.4.4 preimage "
+                "tests/fixtures/mineru_344_preimages/mineru/cli/fast_api.py is not present"
+            )
+        payload = preimage.read_bytes()
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), TARGET_PREIMAGE_SHA256[relative])
+        source = payload.decode("utf-8")
+        preimage_tree = ast.parse(source)
+        self.assertIn(
+            "TaskWaitAbortedError",
+            {node.name for node in preimage_tree.body if isinstance(node, ast.ClassDef)},
         )
-        patcher_spec = importlib.util.spec_from_file_location(
-            "m6_p1_concurrent_waiter_patch_mineru_344", patcher_path
-        )
-        assert patcher_spec is not None and patcher_spec.loader is not None
-        patcher = importlib.util.module_from_spec(patcher_spec)
-        sys.modules[patcher_spec.name] = patcher
-        patcher_spec.loader.exec_module(patcher)
-        preimage = (
-            SERVICE_ROOT
-            / "tests"
-            / "fixtures"
-            / "mineru_344_preimages"
-            / "mineru"
-            / "cli"
-            / "fast_api.py"
-        ).read_text(encoding="utf-8")
-        patched = patcher.patch_source("mineru/cli/fast_api.py", preimage)
-        tree = ast.parse(patched)
-        manager_node = next(
+        generated = patch_source(relative, source)
+        compile(generated, relative, "exec")
+        tree = ast.parse(generated)
+
+        import_block = next(
             node
             for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "AsyncTaskManager"
+            if isinstance(node, ast.ImportFrom) and node.module == "mineru.cli.agent_task_protocol_v2"
         )
-        selected_names = {
-            "_process_task",
-            "_raise_task_wait_failure",
-            "_signal_task_event",
-            "wait_for_terminal_state",
-        }
-        selected = [
-            node
-            for node in manager_node.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in selected_names
+        self.assertIn("TaskRegistryPersistenceError", {alias.name for alias in import_block.names})
+        self.assertEqual(generated.count("self._raise_task_wait_failure(task_id)"), 2)
+        self.assertIn("self.task_wait_failures: dict[str, TaskRegistryPersistenceError] = {}", generated)
+        self.assertIn("self.task_wait_failures.clear()", generated)
+        self.assertIn("self.task_wait_failures[task_id] = exc", generated)
+        self.assertIn("task status remains nonterminal", generated)
+        self.assertIn("wait_helpers = (event_wait_task, manager_wait_task)", generated)
+        self.assertIn("await asyncio.gather(*wait_helpers, return_exceptions=True)", generated)
+        self.assertNotIn("done, pending = await asyncio.wait", generated)
+
+        manager = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AsyncTaskManager"
+        )
+        methods = {node.name: node for node in manager.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.assertIn("_raise_task_wait_failure", methods)
+        processor = methods["_process_task"]
+        handlers = [
+            handler
+            for node in ast.walk(processor)
+            if isinstance(node, ast.Try)
+            for handler in node.handlers
         ]
-        self.assertEqual({node.name for node in selected}, selected_names)
+        names = [ast.unparse(handler.type) if handler.type is not None else None for handler in handlers]
+        self.assertIn("TaskRegistryPersistenceError", names)
+        self.assertLess(names.index("TaskRegistryPersistenceError"), names.index("Exception"))
 
-        helper_barrier: asyncio.Event | None = None
-        helper_target = 0
-        helper_tasks: list[asyncio.Task[object]] = []
-        helper_tasks_by_owner: dict[
-            asyncio.Task[object], list[asyncio.Task[object]]
-        ] = {}
+        conflict_handlers = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            typed = [ast.unparse(handler.type) if handler.type is not None else None for handler in node.handlers]
+            for position, handler in enumerate(node.handlers):
+                if typed[position] == "TaskProtocolConflict" and handler.name == "exc":
+                    conflict_handlers += 1
+                    self.assertIn("TaskRegistryPersistenceError", typed[:position])
+                    persistence = node.handlers[typed.index("TaskRegistryPersistenceError")]
+                    self.assertIn("status_code=503", ast.unparse(persistence))
+        self.assertGreaterEqual(conflict_handlers, 1)
 
-        def tracking_create_task(coroutine):
-            owner = asyncio.current_task()
-            created = asyncio.create_task(coroutine)
-            if getattr(created.get_coro(), "__qualname__", "") == "Event.wait":
-                if owner is None:
-                    raise AssertionError("Event.wait helper has no owning waiter")
-                helper_tasks.append(created)
-                helper_tasks_by_owner.setdefault(owner, []).append(created)
-                if helper_barrier is not None and len(helper_tasks) >= helper_target:
-                    helper_barrier.set()
-            return created
-
-        asyncio_proxy = SimpleNamespace(
-            CancelledError=asyncio.CancelledError,
-            FIRST_COMPLETED=asyncio.FIRST_COMPLETED,
-            Task=asyncio.Task,
-            create_task=tracking_create_task,
-            gather=asyncio.gather,
-            wait=asyncio.wait,
+        allocation = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "create_async_parse_task"
         )
-
-        class TaskWaitAbortedError(RuntimeError):
-            pass
-
-        class LoggerStub:
-            def exception(self, *_args: object) -> None:
-                return None
-
-        async def build_retained_task_result(current: SimpleNamespace) -> None:
-            data = f"result-{current.task_id}".encode()
-            result = self.root / f"generated-{current.task_id}.zip"
-            result.write_bytes(data)
-            digest = hashlib.sha256(data).hexdigest()
-            owner = hashlib.sha256(
-                f"{current.task_id}\0{digest}\0{len(data)}".encode()
-            ).hexdigest()
-            current.result_artifact_path = str(result)
-            current.result_artifact_sha256 = digest
-            current.result_artifact_bytes = len(data)
-            current.result_artifact_owner = owner
-
-        namespace: dict[str, object] = {
-            "Any": object,
-            "AsyncParseTask": object,
-            "Path": Path,
-            "TASK_COMPLETED": "completed",
-            "TASK_FAILED": "failed",
-            "TaskRegistryPersistenceError": protocol.TaskRegistryPersistenceError,
-            "TaskWaitAbortedError": TaskWaitAbortedError,
-            "asyncio": asyncio_proxy,
-            "build_retained_task_result": build_retained_task_result,
-            "is_task_terminal": lambda status: status in {"completed", "failed"},
-            "logger": LoggerStub(),
-            "suppress": __import__("contextlib").suppress,
-            "utc_now_iso": lambda: "now",
-        }
-        module = ast.Module(body=selected, type_ignores=[])
-        ast.fix_missing_locations(module)
-        exec(
-            compile(module, "generated-fast-api-concurrent-methods.py", "exec"),
-            namespace,
-        )
-
-        async def run_parse_stage(
-            _manager: object, _task: SimpleNamespace
-        ) -> None:
-            return None
-
-        manager_type = type(
-            "GeneratedConcurrentAsyncTaskManager",
-            (),
-            {
-                **{name: namespace[name] for name in selected_names},
-                "_run_parse_stage": run_parse_stage,
-            },
-        )
-
-        registry = self.registry()
-        self.create(registry, "affected")
-        self.create(registry, "unrelated")
-
-        def task(task_id: str) -> SimpleNamespace:
-            return SimpleNamespace(
-                task_id=task_id,
-                agent_idempotency_key=f"idem-{task_id}",
-                status="processing",
-                error=None,
-                completed_at=None,
-                result_artifact_path=None,
-                result_artifact_sha256=None,
-                result_artifact_bytes=None,
-                result_artifact_owner=None,
-            )
-
-        async def exercise() -> None:
-            nonlocal helper_barrier, helper_target
-
-            inner_executor = protocol.SplitTaskExecutor(
-                parse_slots=2,
-                finalizer_slots=2,
-                result_reservation_bytes=64,
-            )
-
-            class ControlledExecutor:
-                def __init__(self) -> None:
-                    self.affected_entered = asyncio.Event()
-                    self.release_failure = asyncio.Event()
-                    self.injection_hits = 0
-                    self.persistence_error: (
-                        protocol.TaskRegistryPersistenceError | None
-                    ) = None
-
-                def inject_storage_failure(self, *_args: object) -> None:
-                    self.injection_hits += 1
-                    raise OSError("generated-waiter-storage-failure")
-
-                async def run(self, **kwargs: object) -> None:
-                    key = kwargs.get("key")
-                    if key == "idem-affected":
-                        self.affected_entered.set()
-                        await self.release_failure.wait()
-                        try:
-                            with mock.patch.object(
-                                registry,
-                                "_write_registry_stream",
-                                side_effect=self.inject_storage_failure,
-                            ):
-                                await inner_executor.run(**kwargs)  # type: ignore[arg-type]
-                        except protocol.TaskRegistryPersistenceError as exc:
-                            self.persistence_error = exc
-                            raise
-                        raise AssertionError("affected persistence fault did not fire")
-                    if key == "idem-unrelated":
-                        await inner_executor.run(**kwargs)  # type: ignore[arg-type]
-                        return
-                    raise AssertionError(f"unexpected executor key: {key!r}")
-
-            controlled = ControlledExecutor()
-            value = manager_type()
-            value.tasks = {}
-            value.task_events = {}
-            value.task_wait_failures = {}
-            value.manager_wakeup = asyncio.Event()
-            value.last_worker_error = None
-            value.is_shutting_down = False
-            value.queue = asyncio.Queue()
-            value.task_protocol_executor = controlled
-            value.task_protocol_v2 = registry
-
-            affected = task("affected")
-            unrelated = task("unrelated")
-            for current in (affected, unrelated):
-                value.tasks[current.task_id] = current
-                value.task_events[current.task_id] = asyncio.Event()
-
-            helper_barrier = asyncio.Event()
-            helper_target = 6
-            affected_waiters = [
-                asyncio.create_task(value.wait_for_terminal_state("affected"))
-                for _ in range(3)
-            ]
-            await asyncio.wait_for(helper_barrier.wait(), timeout=0.5)
-            self.assertEqual(len(helper_tasks), 6)
-            self.assertTrue(
-                all(len(helper_tasks_by_owner[waiter]) == 2 for waiter in affected_waiters)
-            )
-
-            value.queue.put_nowait("affected")
-            affected_processor = asyncio.create_task(value._process_task("affected"))
-            await asyncio.wait_for(controlled.affected_entered.wait(), timeout=0.5)
-            self.assertEqual(controlled.injection_hits, 0)
-
-            cancelled_waiter, *surviving_waiters = affected_waiters
-            cancelled_helpers = tuple(helper_tasks_by_owner[cancelled_waiter])
-            cancelled_waiter.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await cancelled_waiter
-            self.assertTrue(all(helper.done() for helper in cancelled_helpers))
-            self.assertTrue(all(helper.cancelled() for helper in cancelled_helpers))
-            self.assertFalse(value.task_events["affected"].is_set())
-            self.assertTrue(all(not waiter.done() for waiter in surviving_waiters))
-            self.assertTrue(
-                all(
-                    not helper.done()
-                    for waiter in surviving_waiters
-                    for helper in helper_tasks_by_owner[waiter]
-                )
-            )
-
-            helper_target = 8
-            helper_barrier.clear()
-            unrelated_waiter = asyncio.create_task(
-                value.wait_for_terminal_state("unrelated")
-            )
-            await asyncio.wait_for(helper_barrier.wait(), timeout=0.5)
-            value.queue.put_nowait("unrelated")
-            unrelated_processor = asyncio.create_task(
-                value._process_task("unrelated")
-            )
-            await asyncio.wait_for(unrelated_processor, timeout=0.5)
-            self.assertIs(
-                await asyncio.wait_for(unrelated_waiter, timeout=0.5),
-                unrelated,
-            )
-            unrelated_record = registry.get("idem-unrelated")
-            assert unrelated_record is not None
-            self.assertEqual(unrelated_record.state, "completed")
-            self.assertTrue(Path(unrelated_record.result_path or "").is_file())
-            self.assertTrue(all(not waiter.done() for waiter in surviving_waiters))
-
-            controlled.release_failure.set()
-            with self.assertRaises(
-                protocol.TaskRegistryPersistenceError
-            ) as processor_error:
-                await asyncio.wait_for(affected_processor, timeout=0.5)
-            persistence_error = controlled.persistence_error
-            assert persistence_error is not None
-            self.assertIs(processor_error.exception, persistence_error)
-            self.assertEqual(controlled.injection_hits, 1)
-            self.assertEqual(persistence_error.outcome, "not_committed")
-            self.assertFalse(persistence_error.committed)
-            self.assertIsInstance(persistence_error.__cause__, OSError)
-            self.assertEqual(
-                str(persistence_error.__cause__),
-                "generated-waiter-storage-failure",
-            )
-
-            waiter_results = await asyncio.wait_for(
-                asyncio.gather(*surviving_waiters, return_exceptions=True),
-                timeout=0.5,
-            )
-            status = registry.persistence_status()
-            expected_recovery = (
-                status.get("recovery_action") or "restart task manager"
-            )
-            for result in waiter_results:
-                self.assertIs(type(result), TaskWaitAbortedError)
-                assert isinstance(result, TaskWaitAbortedError)
-                self.assertIs(result.__cause__, persistence_error)
-                self.assertIn("outcome=not_committed", str(result))
-                self.assertIn(f"recovery={expected_recovery}", str(result))
-
-            affected_record = registry.get("idem-affected")
-            assert affected_record is not None
-            self.assertEqual(affected_record.state, "pending")
-            self.assertIsNone(affected_record.error)
-            self.assertEqual(affected.status, "processing")
-            self.assertIsNone(affected.error)
-
-            helper_count_before_late_wait = len(helper_tasks)
-            with self.assertRaises(TaskWaitAbortedError) as late_error:
-                await value.wait_for_terminal_state("affected")
-            self.assertIs(late_error.exception.__cause__, persistence_error)
-            self.assertEqual(len(helper_tasks), helper_count_before_late_wait)
-
-            self.assertIs(
-                await value.wait_for_terminal_state("unrelated"),
-                unrelated,
-            )
-            self.assertEqual(len(helper_tasks), helper_count_before_late_wait)
-            self.assertEqual(unrelated.status, "completed")
-
-            self.assertEqual(len(helper_tasks), 8)
-            self.assertTrue(all(helper.done() for helper in helper_tasks))
-            self.assertFalse(set(helper_tasks) & asyncio.all_tasks())
-
-        asyncio.run(exercise())
-
-    def test_real_fastapi_preimage_has_closed_persistence_integration(self) -> None:
-        patcher_path = (
-            SERVICE_ROOT
-            / "scripts"
-            / "windows"
-            / "mineru_heap_trim_compat"
-            / "patch_mineru_344.py"
-        )
-        patcher_spec = importlib.util.spec_from_file_location(
-            "m6_p1_patch_mineru_344", patcher_path
-        )
-        assert patcher_spec is not None and patcher_spec.loader is not None
-        patcher = importlib.util.module_from_spec(patcher_spec)
-        sys.modules[patcher_spec.name] = patcher
-        patcher_spec.loader.exec_module(patcher)
-        preimages = SERVICE_ROOT / "tests" / "fixtures" / "mineru_344_preimages"
-        fastapi_source = (preimages / "mineru" / "cli" / "fast_api.py").read_text(
-            encoding="utf-8"
-        )
-        patched_fastapi = patcher.patch_source(
-            "mineru/cli/fast_api.py", fastapi_source
-        )
-        self.assertIn("    TaskRegistryPersistenceError,", patched_fastapi)
-        self.assertIn(
-            "Task registry persistence failed; task status remains nonterminal",
-            patched_fastapi,
-        )
-        self.assertIn(
-            "self.task_wait_failures: dict[str, TaskRegistryPersistenceError]",
-            patched_fastapi,
-        )
-        self.assertIn(
-            "self.task_wait_failures[task_id] = exc\n"
-            "            self._signal_task_event(task_id)",
-            patched_fastapi,
-        )
-        self.assertEqual(
-            patched_fastapi.count("self._raise_task_wait_failure(task_id)"),
-            2,
-        )
-        self.assertIn(
-            "outcome={failure.outcome}; recovery={recovery_action}",
-            patched_fastapi,
-        )
-        self.assertRegex(
-            patched_fastapi,
-            re.compile(r"except TaskProtocolConflict:\n\s+pass"),
-        )
-        compile(patched_fastapi, "patched-fast-api.py", "exec")
-
-        api_source = (preimages / "mineru" / "cli" / "api_request.py").read_text(
-            encoding="utf-8"
-        )
-        patched_api = patcher.patch_source(
-            "mineru/cli/api_request.py", api_source
-        )
-        self.assertNotIn("TaskRegistryPersistenceError", patched_api)
-        compile(patched_api, "patched-api-request.py", "exec")
-
-    def test_attached_root_reproductions_are_fixed_regressions(self) -> None:
-        regression_root = (
-            SERVICE_ROOT
-            / "tests"
-            / "regressions"
-            / "m6_p1_registry_persistence"
-        )
-        env = os.environ.copy()
-        env["M6_PROTOCOL_MODULE"] = str(MODULE_PATH)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        for wrapper in (
-            regression_root / "run_registry_fault_regression.py",
-            regression_root / "run_postreplace_fault_regression.py",
-        ):
-            completed = subprocess.run(
-                [sys.executable, str(wrapper)],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env,
-                timeout=30,
-                check=False,
-            )
-            self.assertEqual(
-                completed.returncode,
-                0,
-                msg=f"{wrapper.name} failed:\n{completed.stdout}",
-            )
-            observation = json.loads(completed.stdout)
-            self.assertEqual(observation["injection_hits"], 1)
-            self.assertEqual(
-                observation["source_sha256"],
-                hashlib.sha256(MODULE_PATH.read_bytes()).hexdigest(),
-            )
+        allocation_source = ast.get_source_segment(generated, allocation) or ""
+        self.assertNotIn("with suppress(TaskProtocolConflict):", allocation_source)
+        self.assertGreaterEqual(allocation_source.count("if protocol_record is None:"), 2)
+        self.assertGreaterEqual(allocation_source.count("except TaskRegistryPersistenceError:"), 2)
 
 
 if __name__ == "__main__":

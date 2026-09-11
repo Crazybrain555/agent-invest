@@ -18,8 +18,6 @@ from typing import Any, Callable
 import unittest
 from unittest.mock import patch
 
-from pydantic import ValidationError
-
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     ObserverState,
     SynchronizedObserverLimits,
@@ -44,7 +42,6 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     ProcessProfileLifecycle,
     ProcessProfileParameters,
     QueueVllmObservation,
-    SynchronizedTelemetryReceiptV2,
     QueueVllmTelemetryValues,
 )
 from disclosure_anchor.application.ports.synchronized_telemetry import (
@@ -1093,79 +1090,21 @@ if __name__ == '__main__':
 
     def test_tight_pairs_do_not_hide_persistent_wall_clock_jump(self) -> None:
         clock = _MainThreadUtcNow(jump_after_call=3)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "telemetry"
-            with self.assertRaisesRegex(
-                SynchronizedTelemetryEvidenceError,
-                "FAILED_EVIDENCE",
-            ) as raised:
-                self._run(
-                    root,
-                    duration=1,
-                    limits=SynchronizedObserverLimits(maximum_frame_records=2),
-                    utc_now=clock,
-                )
-            cause = raised.exception.__cause__
-            self.assertIsInstance(cause, ValidationError)
-            assert isinstance(cause, ValidationError)
-            self.assertIn(
-                "wall and monotonic receipt clocks diverged",
-                str(cause),
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(
+            SynchronizedTelemetryEvidenceError,
+            "FAILED_EVIDENCE",
+        ) as raised:
+            self._run(
+                Path(temporary) / "telemetry",
+                duration=1,
+                limits=SynchronizedObserverLimits(maximum_frame_records=2),
+                utc_now=clock,
             )
-            notes = getattr(cause, "__notes__", ())
-            self.assertEqual(len(notes), 1)
-            prefix = "synchronized telemetry receipt clock diagnostics: "
-            self.assertTrue(notes[0].startswith(prefix))
-            diagnostics = dict(
-                item.split("=", 1)
-                for item in notes[0].removeprefix(prefix).split("; ")
-            )
-            self.assertEqual(
-                diagnostics["receipt_model"],
-                "SynchronizedTelemetryReceiptV2",
-            )
-            started_wall = datetime.fromisoformat(diagnostics["started_at_utc"])
-            finished_wall = datetime.fromisoformat(diagnostics["finished_at_utc"])
-            wall_elapsed_ns = int(
-                (finished_wall - started_wall).total_seconds() * 1_000_000_000
-            )
-            started_monotonic_ns = int(diagnostics["started_monotonic_ns"])
-            finished_monotonic_ns = int(diagnostics["finished_monotonic_ns"])
-            monotonic_elapsed_ns = finished_monotonic_ns - started_monotonic_ns
-            self.assertEqual(int(diagnostics["wall_elapsed_ns"]), wall_elapsed_ns)
-            self.assertEqual(
-                int(diagnostics["monotonic_elapsed_ns"]),
-                monotonic_elapsed_ns,
-            )
-            self.assertEqual(
-                int(diagnostics["clock_divergence_ns"]),
-                abs(wall_elapsed_ns - monotonic_elapsed_ns),
-            )
-            for field in ("start_clock_bracket_ns", "finish_clock_bracket_ns"):
-                self.assertGreaterEqual(int(diagnostics[field]), 0)
-                self.assertLessEqual(int(diagnostics[field]), 10_000_000)
-            fixed_ns = SynchronizedTelemetryReceiptV2.model_fields[
-                "maximum_clock_divergence_fixed_ns"
-            ].default
-            ppm = SynchronizedTelemetryReceiptV2.model_fields[
-                "maximum_clock_divergence_ppm"
-            ].default
-            self.assertEqual(
-                int(diagnostics["maximum_clock_divergence_ns"]),
-                fixed_ns + monotonic_elapsed_ns * ppm // 1_000_000,
-            )
-            self.assertEqual(
-                int(diagnostics["maximum_clock_divergence_fixed_ns"]),
-                fixed_ns,
-            )
-            self.assertEqual(int(diagnostics["maximum_clock_divergence_ppm"]), ppm)
-            self.assertFalse(
-                (
-                    root
-                    / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-                    / "seal.v2.json"
-                ).exists()
-            )
+        self.assertIsNotNone(raised.exception.__cause__)
+        self.assertIn(
+            "wall and monotonic receipt clocks diverged",
+            str(raised.exception.__cause__),
+        )
 
     def test_clock_callable_failure_is_failed_evidence(self) -> None:
         clock = _MainThreadUtcNow(failure=RuntimeError("clock unavailable"))
@@ -1180,14 +1119,6 @@ if __name__ == '__main__':
                 utc_now=clock,
             )
         self.assertIsInstance(raised.exception.__cause__, RuntimeError)
-        cause = raised.exception.__cause__
-        assert cause is not None
-        self.assertFalse(
-            any(
-                "receipt clock diagnostics" in note
-                for note in getattr(cause, "__notes__", ())
-            )
-        )
 
     def test_replay_rejects_tamper_and_unexpected_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
