@@ -11,12 +11,17 @@ param(
     [string]$ExpectedRepoDigest = "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [switch]$ReuseCurrentPublishedImage,
+    [switch]$ApiOnlyCompatibilityUpgrade,
     [string]$CampaignApiCompatImageId = "",
     [ValidateSet(1)][int]$ExpectedApiTaskSlots = 1,
     [ValidateSet(1)][int]$ExpectedApiMaxPendingTasks = 1
 )
 
 $ErrorActionPreference = "Stop"
+if ($ReuseCurrentPublishedImage -and $ApiOnlyCompatibilityUpgrade) {
+    throw "API compatibility upgrade and published-image reuse are mutually exclusive"
+}
+$ApiOnlyOperation = $ReuseCurrentPublishedImage -or $ApiOnlyCompatibilityUpgrade
 $ProgressPreference = "SilentlyContinue"
 if ($ExpectedApiTaskSlots -ne 1 -or $ExpectedApiMaxPendingTasks -ne 1) {
     throw "serial MinerU requires task slots and pending depth to both equal 1"
@@ -321,6 +326,24 @@ function Assert-StableServiceEpochs {
     }
 }
 
+function Assert-ApiOnlyUpgradeInputs {
+    if (-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
+        throw "API-only compatibility upgrade requires a complete existing deployment"
+    }
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeSource).Hash -ne
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash) {
+        throw "API-only compatibility upgrade requires unchanged compose bytes"
+    }
+}
+
+function Invoke-ApiOnlyRecreate {
+    Invoke-Docker -Arguments @(
+        "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
+        "up", "--detach", "--no-build", "--no-deps", "--force-recreate",
+        "mineru-api"
+    ) | Out-Null
+}
+
 function Write-Utf8NoBom {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -528,7 +551,7 @@ function Capture-OldRuntimeState {
             Assert-VllmIdle
         }
     }
-    if ($ReuseCurrentPublishedImage) {
+    if ($ApiOnlyOperation) {
         $required = @("mineru-api", "mineru-api-proxy", "mineru-openai-server")
         if (
             (@($script:OldProjectContainers | Sort-Object) -join ",") -ne
@@ -536,7 +559,7 @@ function Capture-OldRuntimeState {
             (@($script:OldRunningContainers | Sort-Object) -join ",") -ne
                 (@($required | Sort-Object) -join ",")
         ) {
-            throw "reuse mode requires exactly three running MinerU containers"
+            throw "API-only operation requires exactly three running MinerU containers"
         }
         $script:StableServiceEpochs = Get-StableServiceEpochs
     }
@@ -958,6 +981,17 @@ function Restore-PreviousDeployment {
     }
 
     Restore-ApiCompatTag
+    if ($ApiOnlyCompatibilityUpgrade) {
+        Invoke-ApiOnlyRecreate
+        Wait-Healthy | Out-Null
+        Assert-StableServiceEpochs -Expected $StableServiceEpochs
+        $restored = (Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json
+        if (@($restored).Count -ne 1 -or [string]$restored[0].Image -ne $OldApiCompatImageId) {
+            throw "API-only rollback did not restore the previous API image"
+        }
+        Remove-CompatBuildTag
+        return
+    }
 
     if ($ComposeExisted) {
         if ($OldProjectContainers.Count -eq 0) {
@@ -1021,6 +1055,7 @@ try {
         throw "local Docker image does not match the expected repo digest and image ID"
     }
 
+    if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
     Capture-OldRuntimeState
     foreach ($directory in @(
         (Split-Path -Parent $ComposeTarget), (Split-Path -Parent $CollectorTarget),
@@ -1046,6 +1081,12 @@ try {
     }
     else {
         $OldApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatImage
+        if ($ApiOnlyCompatibilityUpgrade) {
+            $oldApi = (Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json
+            if (@($oldApi).Count -ne 1 -or [string]$oldApi[0].Image -ne $OldApiCompatImageId) {
+                throw "API-only upgrade requires published tag to match the current API image"
+            }
+        }
         $compatImage = Build-ValidatedApiCompatImage
     }
     if ($ComposeExisted) {
@@ -1061,6 +1102,13 @@ try {
         $ReceiptBackupCreated = $true
     }
 
+    if ($ApiOnlyCompatibilityUpgrade) {
+        Assert-ApiOnlyUpgradeInputs
+        Assert-StableServiceEpochs -Expected $StableServiceEpochs
+        if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $OldApiCompatImageId) {
+            throw "API image tag drifted before compatibility upgrade"
+        }
+    }
     $MutationStarted = $true
     if (-not $ReuseCurrentPublishedImage) {
         Invoke-Docker -Arguments @(
@@ -1083,12 +1131,8 @@ try {
     }
 
     $DeploymentAttempted = $true
-    if ($ReuseCurrentPublishedImage) {
-        Invoke-Docker -Arguments @(
-            "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
-            "up", "--detach", "--no-build", "--no-deps", "--force-recreate",
-            "mineru-api"
-        ) | Out-Null
+    if ($ApiOnlyOperation) {
+        Invoke-ApiOnlyRecreate
     }
     else {
         Invoke-Docker -Arguments @(
@@ -1097,6 +1141,7 @@ try {
         ) | Out-Null
     }
     $runtime = Get-ValidatedRuntime
+    if ($ApiOnlyOperation) { Assert-StableServiceEpochs -Expected $StableServiceEpochs }
     if ($ReuseCurrentPublishedImage) {
         Assert-StableServiceEpochs -Expected $StableServiceEpochs
         if ((Get-OptionalImageId -Reference $ApiCompatImage) -ne $CampaignApiCompatImageId) {

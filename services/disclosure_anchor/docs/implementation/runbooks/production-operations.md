@@ -196,6 +196,19 @@ health、网络、egress、空 output-root 或 formal collector 校验失败都�
 显式 `ExitCode/stdout/stderr`，并并行排空双流、以 UTF-8 字节写入 `docker exec -i`；不得改回依赖
 `$LASTEXITCODE` 的调用运算符，也不得跳过 exact source preflight。
 
+仅升级兼容层源码、且必须保留现有推理服务与代理进程时，追加
+`-ApiOnlyCompatibilityUpgrade`。此模式要求完整旧部署和与 live target **完全相同**的
+compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurrentPublishedImage` 同用。
+它仍从审核后的源码构建新镜像、备份旧文件及 tag；部署和失败回滚均只执行
+`up --detach --no-build --no-deps --force-recreate mineru-api`。回滚先恢复旧 tag 与文件，
+再重建 API、验证旧 API image、健康状态以及推理服务/代理的原 ID、image、started_at。
+机器断线或监督进程超时仍须核对 daemon 状态；不能把客户端退出当作完成回滚。
+完整项目安装模式保留给明确授权的初装或拓扑变更，不能借 dry-run 代替此 API 单独升级边界。
+`scripts/windows/test_mineru_api_only_installer.ps1 -InstallerPath <reviewed-installer.ps1>`
+在 Windows PowerShell 5.1 中抽取并执行真实安装器函数，使用独立临时文件和模拟 Docker
+验证配置保护、旧 tag/文件恢复顺序以及健康/镜像不符的失败路径；不调用真实 Docker。
+它是部署前回归，不能替代安装后的实际镜像、服务 identity、容量与输出根验证。
+
 protocol-v2 启动后的输出根并非物理零文件：唯一控制树
 `.agent-task-protocol-v2/registry.json` 保存提交水位与已消费 tombstone，不能删除来通过安装门。
 runtime observation v5 保留真实 `file_count/total_bytes`，另附 `mineru-output-quiescence.v1`：

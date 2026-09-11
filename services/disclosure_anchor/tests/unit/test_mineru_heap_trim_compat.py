@@ -1460,6 +1460,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("[Parameter(Mandatory = $true)][string]$CompatDockerfileSource", installer)
         self.assertIn("[Parameter(Mandatory = $true)][string]$CompatPatcherSource", installer)
         self.assertIn("[switch]$ReuseCurrentPublishedImage", installer)
+        self.assertIn("[switch]$ApiOnlyCompatibilityUpgrade", installer)
         self.assertIn('[string]$CampaignApiCompatImageId = ""', installer)
         self.assertIn(
             "reuse mode requires one canonical campaign API compatibility image ID",
@@ -1622,10 +1623,11 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             "    }\n"
             "    else {\n"
             "        $OldApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatImage\n"
-            "        $compatImage = Build-ValidatedApiCompatImage\n"
-            "    }"
         )
         self.assertIn(reuse_selection, installer)
+        self.assertIn("API compatibility upgrade and published-image reuse are mutually exclusive", installer)
+        self.assertIn("API-only compatibility upgrade requires unchanged compose bytes", installer)
+        self.assertIn("API-only rollback did not restore the previous API image", installer)
         self.assertLess(
             installer.index("$MutationStarted = $true"),
             installer.index('"tag", $ExpectedApiCompatImageId, $ApiCompatImage'),
