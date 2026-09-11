@@ -24,6 +24,13 @@ Same-boot recovery verifies the original journal and deadline, uses an explicit
 new incarnation and `owner_resumed`, and keeps admission stopped. No client silently
 accepts another owner/anchor, and no cross-host UTC subtraction is used.
 
+The client accepts a changed owner only with an explicit bounded chain of
+owner-resumed records obtained from the independently read original journal.
+Each record binds the same run/spec/boot/clock/T0/deadline and the preceding
+incarnation. This authorizes drain and exact retries of known predecessor stamps;
+it permanently disables new admission. A failed status may advance to closed
+after cleanup, which confirms closure without making the run eligible for credit.
+
 ## Authentication, transport and retry
 
 One pinned SSH session opens one persistent `direct-tcpip` channel to a configured
@@ -98,6 +105,24 @@ transport after closing the old one; there is no silent reconnect.
 Late admissions still obey WP-B: responsibility/cost remains, eligible pages are
 zero, and exceeding the stop budget makes the entire measurement incomplete.
 No adapter drops late evidence to manufacture a complete receipt.
+
+A newly refused, authenticated business observation with the correct role binds
+one permanent observation_refused measurement incident to its producer-byte hash.
+The owner stores at most one such incident per run, stops admission, and reports
+failed; the host retains the refused raw requests in its bounded private
+diagnostics. A typo or unexpected late observation cannot be silently discarded to
+produce a complete run. Ordinary verifier_drain_pending is flow control and does
+not create an incident. Before open and after actual effective stop, new admission
+is rejected; a distinct sequence cannot admit the same attempt twice.
+
+The journal reserves eight owner-event slots and their worst-case record bytes
+before accepting another producer record. Bootstrap must make its journal limits
+match the anchor, account for indexes within the actual process memory limit, and
+bound recovery attempts explicitly. This reserve does not promise unlimited crash
+recovery. Exhaustion, orphaned/torn sidecars and uncertain IO remain visible and
+may require offline reconciliation. Native resource closure precedes immutable
+closure-receipt publication; changed orphaned ACK/closure sidecars raise an IO
+failure and close the connection. They are never rewritten into clean evidence.
 
 ## Native implementation qualification
 

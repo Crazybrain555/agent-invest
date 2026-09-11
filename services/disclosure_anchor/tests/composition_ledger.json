@@ -374,7 +374,7 @@
   },
   "tests/unit/test_m6_owner_protocol.py": {
    "private_imports": [],
-   "tests": 20
+   "tests": 23
   },
   "tests/unit/test_m6_run_accounting.py": {
    "private_imports": [],

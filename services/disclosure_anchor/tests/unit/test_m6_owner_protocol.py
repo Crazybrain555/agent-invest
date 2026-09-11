@@ -16,6 +16,7 @@ from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConf
 from disclosure_anchor.application.contracts.m6_owner import (
     M6AdmissionClosedAck, M6CloseOwner, M6OwnerAnchor, M6OwnerControl, M6OwnerReply, M6OwnerRequest, M6OwnerStatus,
 )
+from disclosure_anchor.application.contracts.m6_run_events import M6OwnerResumed
 from tests.m6_support import RunExample, changed, sha
 
 
@@ -261,6 +262,65 @@ class M6OwnerProtocolTests(unittest.TestCase):
         self.wire.record = changed(record, stamp=changed(record.stamp, received_qpc_ticks=99))
         with self.assertRaises(M6OwnerProtocolError):
             self.client.append(record.event)
+
+    def test_failed_run_can_acknowledge_native_cleanup_and_close_without_state_regression(self):
+        controller = M6OwnerClient(anchor=self.wire.anchor, spec=self.example.spec, transport=self.wire,
+            caller_role="controller", producer_epoch_sha256=sha("controller"), continuous_ns=self.clock,
+            lease_policy=M6LeasePolicy(stop_propagation_reserve_ns=500_000_000))
+        close = M6CloseOwner(ownership_receipt_sha256=sha("failed-run-closure"), residual_count=0,
+                            children_exited=True, reason="failed")
+        self.wire.status = changed(self.wire.status, state="failed", admission_valid_until_ticks=None)
+        self.wire.outcome, self.wire.error = "rejected", "native_resources_pending"
+        with self.assertRaises(M6OwnerRejected):
+            controller.request(close)
+        self.wire.outcome, self.wire.error = "ok", None
+        self.wire.status = changed(self.wire.status, state="closed")
+        self.assertEqual(controller.request(close).status.state, "closed")
+        self.assertEqual(controller.request(close).status.state, "closed")
+        self.wire.status = changed(self.wire.status, state="failed")
+        with self.assertRaisesRegex(M6OwnerProtocolError, "state regressed"):
+            controller.request(M6OwnerControl(kind="status"))
+
+    def test_explicit_resume_chain_allows_old_stamp_retry_and_never_reopens_admission(self):
+        self.example.start()
+        self.example.document()
+        old = next(r for r in self.example.records if r.event.payload.kind == "attempt_admitted")
+        first = self.example.add(M6OwnerResumed(clock=self.example.spec.clock, t0_ticks=100, deadline_ticks=36100,
+            previous_owner_epoch_sha256=self.example.owner_epoch), 500, owner_epoch=sha("resumed-1"))
+        second = self.example.add(M6OwnerResumed(clock=self.example.spec.clock, t0_ticks=100, deadline_ticks=36100,
+            previous_owner_epoch_sha256=self.example.owner_epoch), 501, owner_epoch=sha("resumed-2"))
+        self.wire.status = changed(self.wire.status, owner_process_epoch_sha256=sha("resumed-2"),
+                                  state="draining", admission_valid_until_ticks=None)
+        with self.assertRaisesRegex(M6OwnerProtocolError, "incarnation changed"):
+            self.client.request(M6OwnerControl(kind="status"))
+        client = M6OwnerClient(anchor=self.wire.anchor, spec=self.example.spec, transport=self.wire,
+            caller_role="service_runner", producer_epoch_sha256=sha("service_runner"), continuous_ns=self.clock,
+            lease_policy=M6LeasePolicy(stop_propagation_reserve_ns=500_000_000), recovery_chain=(first, second))
+        self.wire.record = old
+        self.assertEqual(client.append(old.event), old)
+        self.assertFalse(client.admission_allowed())
+        self.wire.record = changed(old, stamp=changed(old.stamp, owner_process_epoch_sha256=sha("not-in-chain")))
+        with self.assertRaises(M6OwnerProtocolError):
+            client.append(old.event)
+        self.wire.record = None
+        self.wire.status = changed(self.wire.status, state="open", admission_valid_until_ticks=1010)
+        with self.assertRaisesRegex(M6OwnerProtocolError, "state regressed"):
+            client.refresh_admission()
+
+    def test_resume_proof_rejects_wrong_boot_missing_predecessor_repeated_epoch_and_interval_drift(self):
+        self.example.start()
+        first = self.example.add(M6OwnerResumed(clock=self.example.spec.clock, t0_ticks=100, deadline_ticks=36100,
+            previous_owner_epoch_sha256=self.example.owner_epoch), 500, owner_epoch=sha("resumed-1"))
+        second = self.example.add(M6OwnerResumed(clock=self.example.spec.clock, t0_ticks=100, deadline_ticks=36100,
+            previous_owner_epoch_sha256=self.example.owner_epoch), 501, owner_epoch=sha("resumed-2"))
+        wrong_interval = self.example.add(M6OwnerResumed(clock=self.example.spec.clock, t0_ticks=100, deadline_ticks=36101,
+            previous_owner_epoch_sha256=self.wire.anchor.owner_process_epoch_sha256), 502, owner_epoch=sha("wrong-interval"))
+        for chain in ((second,), (second, first), (first, first), (wrong_interval,),
+                      (changed(first, stamp=changed(first.stamp, boot_identity_sha256=sha("other-boot"))),)):
+            with self.subTest(chain=chain), self.assertRaises(M6OwnerProtocolError):
+                M6OwnerClient(anchor=self.wire.anchor, spec=self.example.spec, transport=self.wire,
+                    caller_role="service_runner", producer_epoch_sha256=sha("service_runner"), continuous_ns=self.clock,
+                    lease_policy=M6LeasePolicy(stop_propagation_reserve_ns=500_000_000), recovery_chain=chain)
 
 
 class M6OwnerLineTransportTests(unittest.TestCase):

@@ -36,6 +36,7 @@ public sealed class MineruM6Journal : IDisposable {
     readonly MineruM6WriterGuard guard;
     readonly Dictionary<string,string> original=new Dictionary<string,string>(StringComparer.Ordinal);
     readonly Dictionary<string,Index> variants=new Dictionary<string,Index>(StringComparer.Ordinal);
+    readonly List<Index> physicalRecords=new List<Index>();
     bool poisoned,disposed,closed;
     public long LastSequence { get; private set; }
     public long LastTick { get; private set; }
@@ -43,6 +44,9 @@ public sealed class MineruM6Journal : IDisposable {
     public long Bytes { get; private set; }
     public bool HasConflicts { get; private set; }
     public bool IsClosed { get { return closed; } }
+    public int MaximumEvents { get { return maximumEvents; } }
+    public int MaximumRecordBytes { get { return maximumRecord; } }
+    public long MaximumLogBytes { get { return maximumBytes; } }
     string lastRecordSha;
     string originalClock;
     long originalT0,originalDeadline;
@@ -158,7 +162,9 @@ public sealed class MineruM6Journal : IDisposable {
             if(first!=sha) HasConflicts=true;
         } else original.Add(key,sha);
         string variant=key+"\0"+sha;
-        if(!variants.ContainsKey(variant)) variants.Add(variant,new Index { Offset=offset, Length=bytes, Hash=Hash(raw) });
+        Index index=new Index { Offset=offset, Length=bytes, Hash=Hash(raw) };
+        physicalRecords.Add(index);
+        if(!variants.ContainsKey(variant)) variants.Add(variant,index);
         LastSequence=sequence; LastTick=tick; LastOwnerEpoch=owner;
         lastRecordSha=Hash(raw);
         if(kind=="run_closed") closed=true;
@@ -177,6 +183,23 @@ public sealed class MineruM6Journal : IDisposable {
             if(Hash(result)!=index.Hash) throw new IOException("M6 original stamp bytes changed");
             return result;
         } finally { stream.Position=Bytes; }
+    }
+    public IEnumerable<string> ReadRecords() {
+        // Reconstruct control from the same exclusively owned bytes, verified
+        // against their recovered hashes, never a separately supplied snapshot.
+        AssertLive();
+        long count=LastSequence;
+        foreach(Index record in physicalRecords) {
+            AssertLive();
+            if(count!=LastSequence) throw new InvalidOperationException("M6 journal changed during replay");
+            yield return ReadOriginal(record);
+        }
+    }
+    public bool HasAppendHeadroom(int reservedOwnerRecords) {
+        AssertLive();
+        if(reservedOwnerRecords<0) throw new ArgumentOutOfRangeException("reservedOwnerRecords");
+        return LastSequence+reservedOwnerRecords+1<=maximumEvents &&
+               Bytes+(long)(reservedOwnerRecords+1)*(maximumRecord+1)<=maximumBytes;
     }
     public MineruM6AppendResult Append(string producerRaw,long receivedTicks,string ownerEpoch) {
         AssertLive();

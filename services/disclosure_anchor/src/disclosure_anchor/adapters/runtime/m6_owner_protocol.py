@@ -20,7 +20,7 @@ from disclosure_anchor.application.contracts.m6_owner import (
     M6OwnerReply, M6OwnerRequest, M6OwnerStatus,
 )
 from disclosure_anchor.application.contracts.m6_run import M6RunSpec
-from disclosure_anchor.application.contracts.m6_run_events import M6ProducerEvent, M6RunEvent
+from disclosure_anchor.application.contracts.m6_run_events import M6OwnerResumed, M6ProducerEvent, M6RunEvent
 
 
 M6CallerRole = Literal["controller", "e2e_runner", "service_runner", "public_verifier", "quality_verifier"]
@@ -68,6 +68,7 @@ class M6OwnerClient:
         caller_role: M6CallerRole, producer_epoch_sha256: str,
         continuous_ns: Callable[[], int], lease_policy: M6LeasePolicy,
         maximum_wire_bytes: int = 65536,
+        recovery_chain: tuple[M6RunEvent, ...] = (),
     ) -> None:
         anchor.assert_spec(spec)
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", producer_epoch_sha256):
@@ -94,6 +95,37 @@ class M6OwnerClient:
         self._lease_until_ns = 0
         self._admission_halted = False
         self._closed = False
+        # Only explicit, original-anchor-bound resume records can authorize a
+        # different live owner. The caller obtains these from its independently
+        # read journal; status alone never silently changes the expected epoch.
+        if type(recovery_chain) is not tuple or len(recovery_chain) > 8:
+            raise ValueError("M6 explicit recovery chain is over bound")
+        epochs = {anchor.owner_process_epoch_sha256}
+        self._owner_epoch = anchor.owner_process_epoch_sha256
+        for record in recovery_chain:
+            if not isinstance(record, M6RunEvent):
+                raise TypeError("M6 recovery requires canonical run records")
+            event, stamp = record.event, record.stamp
+            payload = event.payload
+            if (not isinstance(payload, M6OwnerResumed) or event.producer_kind != "owner"
+                    or event.run_id != spec.run_id or event.spec_sha256 != self._spec_sha
+                    or stamp.boot_identity_sha256 != spec.clock.boot_identity_sha256
+                    or payload.clock != spec.clock or payload.t0_ticks != spec.t0_ticks
+                    or payload.deadline_ticks != spec.deadline_ticks
+                    or payload.previous_owner_epoch_sha256 != self._owner_epoch
+                    or stamp.owner_process_epoch_sha256 in epochs
+                    or event.producer_epoch_sha256 != stamp.owner_process_epoch_sha256
+                    or stamp.producer_event_sha256 != event.canonical_sha256()
+                    or stamp.sequence <= self._last_owner_sequence
+                    or stamp.received_qpc_ticks < self._last_qpc):
+                raise M6OwnerProtocolError("M6 explicit recovery chain differs from original owner interval")
+            self._owner_epoch = stamp.owner_process_epoch_sha256
+            epochs.add(self._owner_epoch)
+            self._last_owner_sequence, self._last_qpc = stamp.sequence, stamp.received_qpc_ticks
+        self._owner_epochs = frozenset(epochs)
+        if recovery_chain:
+            self._admission_halted = True
+            self._state_rank = 2  # Recovery permits drain/failed/closed only.
 
     def _now(self) -> int:
         now = self._clock()
@@ -111,11 +143,11 @@ class M6OwnerClient:
     def _status(self, status: M6OwnerStatus) -> None:
         if (status.run_id != self.spec.run_id or status.spec_sha256 != self._spec_sha
                 or status.anchor_sha256 != self._anchor_sha
-                or status.owner_process_epoch_sha256 != self.anchor.owner_process_epoch_sha256):
+                or status.owner_process_epoch_sha256 != self._owner_epoch):
             raise M6OwnerProtocolError("M6 owner run/spec/anchor/incarnation changed")
         if status.observed_qpc_ticks < self._last_qpc or status.last_sequence < self._last_owner_sequence:
             raise M6OwnerProtocolError("M6 owner receipt clock/sequence regressed")
-        ranks = {"bound": 0, "open": 1, "stopping": 2, "draining": 3, "closed": 4, "failed": 5}
+        ranks = {"bound": 0, "open": 1, "stopping": 2, "draining": 3, "failed": 4, "closed": 5}
         rank = ranks[status.state]
         if rank < self._state_rank:
             raise M6OwnerProtocolError("M6 owner control state regressed")
@@ -167,6 +199,7 @@ class M6OwnerClient:
             if reply.record is not None:
                 stamp = reply.record.stamp
                 if (stamp.boot_identity_sha256 != self.spec.clock.boot_identity_sha256
+                        or stamp.owner_process_epoch_sha256 not in self._owner_epochs
                         or stamp.received_qpc_ticks < self.anchor.t0_ticks):
                     raise M6OwnerProtocolError("M6 stamped observation belongs to another boot or precedes T0")
                 # An exact retry may legitimately return a predecessor owner's
