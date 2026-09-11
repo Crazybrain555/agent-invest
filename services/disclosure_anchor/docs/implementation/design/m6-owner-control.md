@@ -131,3 +131,77 @@ append before ACK, conflict retention, damaged-tail preservation, original-deadl
 recovery, finite storage/process bounds and actual child/resource closure. An
 accepted client package does not establish these gates or automatic PDF/E2E/hour
 acceptance. Public contracts and legacy telemetry clocks remain unchanged.
+
+## Native startup prerequisites
+
+The physical identity probe uses a typed Registry64 `BootId` DWORD, the actual
+MachineGuid-derived node hash, and the pinned System32 NVML device UUID. Boot
+identity v1 hashes the contract version, node hash and unsigned BootId; the outer
+physical identity evidence is v2. Missing or mistyped values fail without a UTC
+fallback. Microsoft documents this counter as incrementing on a successful boot
+in [its Windows boot-counter documentation](https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/oem-hvci-enablement).
+This is a local identity label, not a tamper-proof attestation. WMI LastBootUpTime
+remains a diagnostic field and its availability is still a startup prerequisite;
+it does not enter the QPC clock-domain hash. Exactly one capture attempt is allowed
+per process, including a failed attempt. Resumption requires a new process.
+
+Native bootstrap validates the complete closed run-spec projection against the
+Python contract and compares every shared anchor field before constructing the
+already-bound control. Its bounded JSON reader accepts at most 65,536 bytes and
+8,192 parsed values; a Python-valid larger spec is not qualified for this native
+owner. Unicode carry-in ordering follows scalar order, not UTF-16 ordinal order.
+The controller must reject unsupported native bounds before sending a bind.
+
+The endpoint diagnostic sink aggregates no-body transport noise into a fixed set
+of saturating counters. Sealing stores one bounded summary; post-seal no-body
+noise is a bounded count for the exit-intent metadata. Authenticated raw bytes and
+non-success control replies are retained in the private store. A storage budget or
+IO failure propagates; it cannot become a success reply or a clean measurement.
+These records exclude authentication headers. The fixed host wires this sink
+into both endpoint refusals and non-success control replies. A tested standalone
+sink does not prove that the host composition is installed.
+
+Repeated `verifier_drain_pending` replies are a narrowly defined no-effect flow
+control case: the same canonical command/producer bytes, run and spec retain the
+first complete raw request, aggregate a saturating count, and bind all request
+hashes in arrival order. Changing only the request nonce does not allocate a new
+artifact pair. Changed business bytes get a separate original record; conflicts
+and all other rejections remain fully retained. At most 32 distinct pending-drain
+commands can be tracked, with no eviction. Summary v2 contains these groups.
+A diagnostic storage failure poisons the sink; even summary sealing cannot be
+retried after uncertain IO. The host must reserve fixed sidecar/summary capacity
+before assigning the remaining diagnostic budget.
+
+The fixed `mineru_m6_owner_host.cs` executable captures T0 at its first controlled
+entry and enters its finite self-Job before reading the private deployment. Its
+eight arguments bind configuration path/hash, executable hash, planned seconds,
+close grace, memory bound, and the explicit original-deadline/anchor resume pair.
+Build all production dependencies into that executable before a measured run;
+test libraries are not production dependencies. The immutable deployment binding
+contains only configuration and executable hashes. It does not contain tokens.
+
+The private deployment file must explicitly belong to the current Windows user,
+with access limited to that user and SYSTEM. A protected directory DACL alone
+does not guarantee the file owner: an elevated SSH token can create a file owned
+by Administrators. Provision the file owner and DACL together, then independently
+verify them and the content hash. Use the system machine identity, not optional
+environment variables, for the deployment host check. These requirements do not
+change SSH account policy or machine-wide PowerShell execution policy.
+
+For a fresh run, the controller publishes the canonical spec only after observing
+the original anchor; the host accepts only a matching controller bind before
+constructing control. A resumed process reads the existing spec and constructs
+recovered control before READY. READY advertises a flushed journal prefix length
+and hash. The controller independently reads exactly that prefix, verifies its
+records and original owner chain, and only then constructs a recovered client.
+The journal writer permits read sharing; a concurrent read-only handle must allow
+ReadWrite sharing to coexist with it. Other writers and deletion remain denied.
+
+The host reserves 64 artifact entries and 4 MiB for fixed closure/recovery records
+when persisting ordinary diagnostics. Exhaustion propagates, including on resume.
+The final closure callback seals diagnostics, releases receipt/binary read pins
+and checks the native no-child invariant before the finite metadata tail. A
+successful run then closes transport, journal, guard and credentials and writes an
+exit-intent explicitly marked as not externally verified. The controller must
+still verify the exact process handle and PID/birth. A watchdog exit, failed
+startup, socket EOF or missing external proof cannot establish successful closure.
