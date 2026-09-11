@@ -1,0 +1,82 @@
+{
+  "$id": "urn:disclosure-anchor:operational:m6-source-history-fact.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "audit_receipt_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Audit Receipt Sha256",
+      "type": "string"
+    },
+    "first_ledger_seq": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "First Ledger Seq"
+    },
+    "first_processing_run_id": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "First Processing Run Id"
+    },
+    "first_source_page_count": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "First Source Page Count"
+    },
+    "scan_complete": {
+      "title": "Scan Complete",
+      "type": "boolean"
+    },
+    "source_page_variants": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Source Page Variants",
+      "type": "integer"
+    },
+    "source_pdf_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Source Pdf Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "source_pdf_sha256",
+    "scan_complete",
+    "first_processing_run_id",
+    "first_ledger_seq",
+    "first_source_page_count",
+    "source_page_variants",
+    "audit_receipt_sha256"
+  ],
+  "title": "M6SourceHistoryFact",
+  "type": "object"
+}

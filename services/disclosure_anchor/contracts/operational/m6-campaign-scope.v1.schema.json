@@ -1,0 +1,45 @@
+{
+  "$id": "urn:disclosure-anchor:operational:m6-campaign-scope.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "campaign_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": "m6.campaign-scope.v1",
+      "default": "m6.campaign-scope.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "document_ids": {
+      "items": {
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 10000,
+      "minItems": 1,
+      "title": "Document Ids",
+      "type": "array"
+    },
+    "manifest_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Manifest Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "campaign_id",
+    "manifest_sha256",
+    "document_ids"
+  ],
+  "title": "M6CampaignScope",
+  "type": "object"
+}

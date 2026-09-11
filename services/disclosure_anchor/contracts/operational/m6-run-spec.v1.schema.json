@@ -1,0 +1,317 @@
+{
+  "$defs": {
+    "M6ClockDomain": {
+      "additionalProperties": false,
+      "properties": {
+        "boot_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Boot Identity Sha256",
+          "type": "string"
+        },
+        "clock_domain_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Clock Domain Identity Sha256",
+          "type": "string"
+        },
+        "host_assignment_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Host Assignment Identity Sha256",
+          "type": "string"
+        },
+        "qpc_frequency_hz": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Qpc Frequency Hz",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host_assignment_identity_sha256",
+        "boot_identity_sha256",
+        "qpc_frequency_hz",
+        "clock_domain_identity_sha256"
+      ],
+      "title": "M6ClockDomain",
+      "type": "object"
+    },
+    "M6ResourceEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": {
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "max_events": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Max Events",
+          "type": "integer"
+        },
+        "max_log_bytes": {
+          "maximum": 1073741824,
+          "minimum": 1,
+          "title": "Max Log Bytes",
+          "type": "integer"
+        },
+        "max_record_bytes": {
+          "maximum": 1048576,
+          "minimum": 1,
+          "title": "Max Record Bytes",
+          "type": "integer"
+        },
+        "max_verifier_backlog_bytes": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Max Verifier Backlog Bytes",
+          "type": "integer"
+        },
+        "stop_admission_budget_ticks": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Stop Admission Budget Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_events",
+        "max_record_bytes",
+        "max_log_bytes",
+        "max_attempts",
+        "max_verifier_backlog_bytes",
+        "stop_admission_budget_ticks"
+      ],
+      "title": "M6ResourceEnvelope",
+      "type": "object"
+    },
+    "M6RuntimeIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "deployment_qualification_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Deployment Qualification Sha256",
+          "type": "string"
+        },
+        "gpu_device_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Gpu Device Identity Sha256",
+          "type": "string"
+        },
+        "owner_source_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Owner Source Sha256",
+          "type": "string"
+        },
+        "process_profile_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Process Profile Sha256",
+          "type": "string"
+        },
+        "runtime_bundle_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Runtime Bundle Identity Sha256",
+          "type": "string"
+        },
+        "source_commit": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Source Commit",
+          "type": "string"
+        },
+        "source_manifest_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Manifest Sha256",
+          "type": "string"
+        },
+        "worker_profile_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Worker Profile Sha256"
+        }
+      },
+      "required": [
+        "source_commit",
+        "source_manifest_sha256",
+        "runtime_bundle_identity_sha256",
+        "process_profile_sha256",
+        "worker_profile_sha256",
+        "owner_source_sha256",
+        "gpu_device_identity_sha256",
+        "deployment_qualification_sha256"
+      ],
+      "title": "M6RuntimeIdentity",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-run-spec.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "campaign_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "carry_in_attempt_ids": {
+      "items": {
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[^\\x00-\\x20\\x7f]+$",
+        "type": "string"
+      },
+      "maxItems": 100000,
+      "title": "Carry In Attempt Ids",
+      "type": "array"
+    },
+    "clock": {
+      "$ref": "#/$defs/M6ClockDomain"
+    },
+    "contract_version": {
+      "const": "m6.run-spec.v1",
+      "default": "m6.run-spec.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "deadline_ticks": {
+      "exclusiveMinimum": 0,
+      "maximum": 9223372036854775807,
+      "title": "Deadline Ticks",
+      "type": "integer"
+    },
+    "manifest_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Manifest Sha256",
+      "type": "string"
+    },
+    "max_close_ticks": {
+      "exclusiveMinimum": 0,
+      "maximum": 9223372036854775807,
+      "title": "Max Close Ticks",
+      "type": "integer"
+    },
+    "mode": {
+      "enum": [
+        "service_diagnostic",
+        "e2e_publication"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "phase": {
+      "enum": [
+        "short_batch",
+        "hour_baseline",
+        "stability_repeat",
+        "recovery_experiment"
+      ],
+      "title": "Phase",
+      "type": "string"
+    },
+    "planned_seconds": {
+      "exclusiveMinimum": 0,
+      "maximum": 9223372036854775807,
+      "title": "Planned Seconds",
+      "type": "integer"
+    },
+    "quality_plan_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Quality Plan Sha256",
+      "type": "string"
+    },
+    "resources": {
+      "$ref": "#/$defs/M6ResourceEnvelope"
+    },
+    "run_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime": {
+      "$ref": "#/$defs/M6RuntimeIdentity"
+    },
+    "scope_sha256": {
+      "anyOf": [
+        {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Scope Sha256"
+    },
+    "start_condition": {
+      "enum": [
+        "cold",
+        "resident_warm",
+        "warm_service_disclosed"
+      ],
+      "title": "Start Condition",
+      "type": "string"
+    },
+    "t0_ticks": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "T0 Ticks",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "run_id",
+    "campaign_id",
+    "mode",
+    "phase",
+    "start_condition",
+    "clock",
+    "runtime",
+    "manifest_sha256",
+    "scope_sha256",
+    "quality_plan_sha256",
+    "t0_ticks",
+    "planned_seconds",
+    "deadline_ticks",
+    "max_close_ticks",
+    "carry_in_attempt_ids",
+    "resources"
+  ],
+  "title": "M6RunSpec",
+  "type": "object"
+}

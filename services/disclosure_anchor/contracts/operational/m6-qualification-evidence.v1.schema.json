@@ -1,0 +1,271 @@
+{
+  "$defs": {
+    "M6CheckResult": {
+      "additionalProperties": false,
+      "properties": {
+        "check_id": {
+          "enum": [
+            "source_identity",
+            "page_closure",
+            "block_conservation",
+            "table_segment_conservation",
+            "logical_table_conservation",
+            "retrieval_target_binding",
+            "repair_binding",
+            "finding_binding",
+            "reading_order_contiguity",
+            "heading_occurrence_closure",
+            "artifact_closure",
+            "independent_rebuild_match",
+            "public_units_hash_match"
+          ],
+          "title": "Check Id",
+          "type": "string"
+        },
+        "evidence_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Evidence Sha256"
+        },
+        "outcome": {
+          "enum": [
+            "pass",
+            "fail",
+            "unverified"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        }
+      },
+      "required": [
+        "check_id",
+        "outcome",
+        "evidence_sha256"
+      ],
+      "title": "M6CheckResult",
+      "type": "object"
+    },
+    "M6QualificationObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "checks": {
+          "items": {
+            "$ref": "#/$defs/M6CheckResult"
+          },
+          "maxItems": 13,
+          "title": "Checks",
+          "type": "array"
+        },
+        "mode": {
+          "enum": [
+            "service_diagnostic",
+            "e2e_publication"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "needs_review_unit_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Needs Review Unit Count",
+          "type": "integer"
+        },
+        "processing_run_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\x00-\\x20\\x7f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Processing Run Id"
+        },
+        "provider_bundle_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Provider Bundle Sha256",
+          "type": "string"
+        },
+        "provider_document_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Provider Document Sha256",
+          "type": "string"
+        },
+        "provider_page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Provider Page Count",
+          "type": "integer"
+        },
+        "public_units_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Public Units Sha256"
+        },
+        "review_reasons": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Review Reasons",
+          "type": "array"
+        },
+        "source_byte_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Byte Count",
+          "type": "integer"
+        },
+        "source_page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Page Count",
+          "type": "integer"
+        },
+        "source_pdf_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Pdf Sha256",
+          "type": "string"
+        },
+        "unit_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Unit Count",
+          "type": "integer"
+        },
+        "unusable_unit_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Unusable Unit Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "source_pdf_sha256",
+        "source_byte_count",
+        "source_page_count",
+        "provider_page_count",
+        "processing_run_id",
+        "provider_bundle_sha256",
+        "provider_document_sha256",
+        "public_units_sha256",
+        "unit_count",
+        "unusable_unit_count",
+        "needs_review_unit_count",
+        "review_reasons",
+        "checks"
+      ],
+      "title": "M6QualificationObservation",
+      "type": "object"
+    },
+    "M6ReviewRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "enum": [
+            "accept",
+            "reject"
+          ],
+          "title": "Decision",
+          "type": "string"
+        },
+        "evidence_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Evidence Sha256",
+          "type": "string"
+        },
+        "observation_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Observation Sha256",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Reason",
+          "type": "string"
+        },
+        "reviewer_identity": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Reviewer Identity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "observation_sha256",
+        "reason",
+        "reviewer_identity",
+        "decision",
+        "evidence_sha256"
+      ],
+      "title": "M6ReviewRecord",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-qualification-evidence.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "m6.qualification-evidence.v1",
+      "default": "m6.qualification-evidence.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "observation": {
+      "$ref": "#/$defs/M6QualificationObservation"
+    },
+    "reviews": {
+      "items": {
+        "$ref": "#/$defs/M6ReviewRecord"
+      },
+      "maxItems": 256,
+      "title": "Reviews",
+      "type": "array"
+    }
+  },
+  "required": [
+    "observation",
+    "reviews"
+  ],
+  "title": "M6QualificationEvidence",
+  "type": "object"
+}

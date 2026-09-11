@@ -1,0 +1,68 @@
+{
+  "$id": "urn:disclosure-anchor:operational:m6-document-qualification.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "m6.document-qualification.v1",
+      "default": "m6.document-qualification.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "evidence_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Evidence Sha256",
+      "type": "string"
+    },
+    "plan_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Plan Sha256",
+      "type": "string"
+    },
+    "reasons": {
+      "items": {
+        "maxLength": 256,
+        "minLength": 1,
+        "pattern": "^[^\\x00-\\x20\\x7f]+$",
+        "type": "string"
+      },
+      "title": "Reasons",
+      "type": "array"
+    },
+    "scorable_page_count": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Scorable Page Count"
+    },
+    "verdict": {
+      "enum": [
+        "scorable",
+        "review_pending",
+        "not_scorable"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    }
+  },
+  "required": [
+    "evidence_sha256",
+    "plan_sha256",
+    "verdict",
+    "reasons",
+    "scorable_page_count"
+  ],
+  "title": "M6DocumentQualification",
+  "type": "object"
+}

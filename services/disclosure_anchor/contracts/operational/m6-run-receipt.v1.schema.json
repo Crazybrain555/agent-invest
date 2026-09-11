@@ -1,0 +1,396 @@
+{
+  "$defs": {
+    "M6PublicationMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "carry_in_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Carry In Pages",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "first_qualified_publication",
+          "default": "first_qualified_publication",
+          "title": "Kind",
+          "type": "string"
+        },
+        "whole_run_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Whole Run Pages",
+          "type": "integer"
+        },
+        "window_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "window_pages",
+        "whole_run_pages",
+        "carry_in_pages"
+      ],
+      "title": "M6PublicationMetrics",
+      "type": "object"
+    },
+    "M6ServiceMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "carry_in_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Carry In Pages",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "service_validated_source_pages",
+          "default": "service_validated_source_pages",
+          "title": "Kind",
+          "type": "string"
+        },
+        "replay_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Replay Pages",
+          "type": "integer"
+        },
+        "whole_run_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Whole Run Pages",
+          "type": "integer"
+        },
+        "window_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "window_pages",
+        "whole_run_pages",
+        "replay_pages",
+        "carry_in_pages"
+      ],
+      "title": "M6ServiceMetrics",
+      "type": "object"
+    },
+    "M6SourceOutcome": {
+      "additionalProperties": false,
+      "properties": {
+        "admission_received_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Admission Received Ticks",
+          "type": "integer"
+        },
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "credited_window",
+            "credited_whole_run_only",
+            "carry_in",
+            "replay",
+            "not_first_publish",
+            "novelty_unverified",
+            "quality_not_scorable",
+            "quality_review_pending",
+            "confirmation_missing",
+            "page_count_conflict",
+            "failed",
+            "qualification_missing",
+            "admitted_after_deadline"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Page Count",
+          "type": "integer"
+        },
+        "ready_received_ticks": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Ready Received Ticks"
+        },
+        "source_pdf_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Pdf Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_pdf_sha256",
+        "attempt_id",
+        "outcome",
+        "page_count",
+        "ready_received_ticks",
+        "admission_received_ticks"
+      ],
+      "title": "M6SourceOutcome",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-run-receipt.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "close_reason": {
+      "anyOf": [
+        {
+          "enum": [
+            "deadline_drained",
+            "stop_requested",
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Close Reason"
+    },
+    "contract_version": {
+      "const": "m6.run-receipt.v1",
+      "default": "m6.run-receipt.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "deadline_ticks": {
+      "exclusiveMinimum": 0,
+      "maximum": 9223372036854775807,
+      "title": "Deadline Ticks",
+      "type": "integer"
+    },
+    "duplicate_events": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Duplicate Events",
+      "type": "integer"
+    },
+    "elapsed_ticks": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Elapsed Ticks"
+    },
+    "events_total": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Events Total",
+      "type": "integer"
+    },
+    "incomplete_reasons": {
+      "items": {
+        "maxLength": 256,
+        "minLength": 1,
+        "pattern": "^[^\\x00-\\x20\\x7f]+$",
+        "type": "string"
+      },
+      "title": "Incomplete Reasons",
+      "type": "array"
+    },
+    "invalid_reasons": {
+      "items": {
+        "maxLength": 256,
+        "minLength": 1,
+        "pattern": "^[^\\x00-\\x20\\x7f]+$",
+        "type": "string"
+      },
+      "title": "Invalid Reasons",
+      "type": "array"
+    },
+    "journal_bytes_consumed": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Journal Bytes Consumed",
+      "type": "integer"
+    },
+    "journal_prefix_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Journal Prefix Sha256",
+      "type": "string"
+    },
+    "metrics": {
+      "anyOf": [
+        {
+          "discriminator": {
+            "mapping": {
+              "first_qualified_publication": "#/$defs/M6PublicationMetrics",
+              "service_validated_source_pages": "#/$defs/M6ServiceMetrics"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/M6PublicationMetrics"
+            },
+            {
+              "$ref": "#/$defs/M6ServiceMetrics"
+            }
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Metrics"
+    },
+    "mode": {
+      "enum": [
+        "service_diagnostic",
+        "e2e_publication"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "phase": {
+      "enum": [
+        "short_batch",
+        "hour_baseline",
+        "stability_repeat",
+        "recovery_experiment"
+      ],
+      "title": "Phase",
+      "type": "string"
+    },
+    "qpc_frequency_hz": {
+      "exclusiveMinimum": 0,
+      "maximum": 9223372036854775807,
+      "title": "Qpc Frequency Hz",
+      "type": "integer"
+    },
+    "run_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/M6SourceOutcome"
+      },
+      "title": "Sources",
+      "type": "array"
+    },
+    "spec_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Spec Sha256",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "invalid"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "stop_effective_ticks": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Stop Effective Ticks"
+    },
+    "stop_requested_ticks": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Stop Requested Ticks"
+    },
+    "t0_ticks": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "T0 Ticks",
+      "type": "integer"
+    },
+    "tclose_ticks": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Tclose Ticks"
+    }
+  },
+  "required": [
+    "run_id",
+    "spec_sha256",
+    "journal_prefix_sha256",
+    "journal_bytes_consumed",
+    "mode",
+    "phase",
+    "status",
+    "incomplete_reasons",
+    "invalid_reasons",
+    "t0_ticks",
+    "deadline_ticks",
+    "tclose_ticks",
+    "elapsed_ticks",
+    "qpc_frequency_hz",
+    "stop_requested_ticks",
+    "stop_effective_ticks",
+    "close_reason",
+    "metrics",
+    "sources",
+    "events_total",
+    "duplicate_events"
+  ],
+  "title": "M6RunReceipt",
+  "type": "object"
+}

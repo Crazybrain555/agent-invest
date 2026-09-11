@@ -1,0 +1,109 @@
+{
+  "$defs": {
+    "M6CorpusEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "document_id": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Document Id"
+        },
+        "origin": {
+          "enum": [
+            "fresh",
+            "replay",
+            "carry_in"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "source_byte_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Byte Count",
+          "type": "integer"
+        },
+        "source_page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Page Count",
+          "type": "integer"
+        },
+        "source_pdf_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Pdf Sha256",
+          "type": "string"
+        },
+        "stratum": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Stratum",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_pdf_sha256",
+        "source_byte_count",
+        "source_page_count",
+        "document_id",
+        "stratum",
+        "origin"
+      ],
+      "title": "M6CorpusEntry",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-corpus-manifest.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "campaign_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": "m6.corpus-manifest.v1",
+      "default": "m6.corpus-manifest.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/M6CorpusEntry"
+      },
+      "maxItems": 10000,
+      "minItems": 1,
+      "title": "Entries",
+      "type": "array"
+    },
+    "mode": {
+      "enum": [
+        "service_diagnostic",
+        "e2e_publication"
+      ],
+      "title": "Mode",
+      "type": "string"
+    }
+  },
+  "required": [
+    "campaign_id",
+    "mode",
+    "entries"
+  ],
+  "title": "M6CorpusManifest",
+  "type": "object"
+}

@@ -1261,15 +1261,17 @@ def operational_schema_documents() -> dict[str, dict[str, Any]]:
     from disclosure_anchor.application.contracts.capacity import (
         operational_schema_documents as capacity_schema_documents,
     )
+    from disclosure_anchor.application.contracts.m6_schemas import operational_m6_schema_documents
 
     documents = capacity_schema_documents()
-    telemetry = operational_telemetry_schema_documents()
-    duplicates = set(documents) & set(telemetry)
-    if duplicates:
-        raise ValueError(
-            "operational schema filenames overlap: " + ", ".join(sorted(duplicates))
-        )
-    return {**documents, **telemetry}
+    for additional in (operational_telemetry_schema_documents(), operational_m6_schema_documents()):
+        duplicates = set(documents) & set(additional)
+        if duplicates:
+            raise ValueError(
+                "operational schema filenames overlap: " + ", ".join(sorted(duplicates))
+            )
+        documents.update(additional)
+    return documents
 
 
 def canonical_json_sha256(value: object) -> str:

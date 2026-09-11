@@ -1,0 +1,89 @@
+{
+  "$defs": {
+    "M6ReasonPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "enum": [
+            "score_hard_fail",
+            "review_required",
+            "accepted_noncritical"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "disposition"
+      ],
+      "title": "M6ReasonPolicy",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-quality-plan.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "m6.quality-plan.v1",
+      "default": "m6.quality-plan.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "service_diagnostic",
+        "e2e_publication"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "reason_policies": {
+      "items": {
+        "$ref": "#/$defs/M6ReasonPolicy"
+      },
+      "maxItems": 256,
+      "title": "Reason Policies",
+      "type": "array"
+    },
+    "required_checks": {
+      "items": {
+        "enum": [
+          "source_identity",
+          "page_closure",
+          "block_conservation",
+          "table_segment_conservation",
+          "logical_table_conservation",
+          "retrieval_target_binding",
+          "repair_binding",
+          "finding_binding",
+          "reading_order_contiguity",
+          "heading_occurrence_closure",
+          "artifact_closure",
+          "independent_rebuild_match",
+          "public_units_hash_match"
+        ],
+        "type": "string"
+      },
+      "maxItems": 13,
+      "minItems": 1,
+      "title": "Required Checks",
+      "type": "array"
+    }
+  },
+  "required": [
+    "mode",
+    "required_checks",
+    "reason_policies"
+  ],
+  "title": "M6QualityPlan",
+  "type": "object"
+}
