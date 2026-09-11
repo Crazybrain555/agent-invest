@@ -92,4 +92,3 @@ def _remove_diagnostic_resources(
         if root_fd >= 0:
             os.close(root_fd)
         os.close(parent_fd)
-
