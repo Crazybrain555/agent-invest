@@ -19,6 +19,8 @@ class M6RunJsonSchemaTests(unittest.TestCase):
             "m6-document-qualification.v1.schema.json", "m6-source-history-fact.v1.schema.json",
             "m6-run-spec.v1.schema.json", "m6-producer-event.v1.schema.json",
             "m6-run-event.v1.schema.json", "m6-run-receipt.v1.schema.json",
+            "m6-owner-anchor.v1.schema.json", "m6-owner-request.v1.schema.json",
+            "m6-owner-status.v1.schema.json", "m6-owner-reply.v1.schema.json",
         })
         root = Path(__file__).resolve().parents[2] / "contracts" / "operational"
         all_schemas = operational_schema_documents()

@@ -9,6 +9,9 @@ from disclosure_anchor.application.contracts.m6_common import M6ClosedModel
 from disclosure_anchor.application.contracts.m6_document_qualification import (
     M6DocumentQualification, M6QualificationEvidence, M6QualityPlan,
 )
+from disclosure_anchor.application.contracts.m6_owner import (
+    M6OwnerAnchor, M6OwnerReply, M6OwnerRequest, M6OwnerStatus,
+)
 from disclosure_anchor.application.contracts.m6_run import M6RunReceipt, M6RunSpec, M6SourceHistoryFact
 from disclosure_anchor.application.contracts.m6_run_events import M6ProducerEvent, M6RunEvent
 
@@ -25,6 +28,10 @@ def operational_m6_schema_documents() -> dict[str, dict[str, Any]]:
         "m6-producer-event.v1.schema.json": M6ProducerEvent,
         "m6-run-event.v1.schema.json": M6RunEvent,
         "m6-run-receipt.v1.schema.json": M6RunReceipt,
+        "m6-owner-anchor.v1.schema.json": M6OwnerAnchor,
+        "m6-owner-request.v1.schema.json": M6OwnerRequest,
+        "m6-owner-status.v1.schema.json": M6OwnerStatus,
+        "m6-owner-reply.v1.schema.json": M6OwnerReply,
     }
     result: dict[str, dict[str, Any]] = {}
     for filename, model in models.items():

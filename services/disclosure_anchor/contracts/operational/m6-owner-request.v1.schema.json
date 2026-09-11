@@ -1,0 +1,1091 @@
+{
+  "$defs": {
+    "M6AdmissionClosedAck": {
+      "additionalProperties": false,
+      "description": "Sent only after every in-flight claim has returned and been accounted for.\n\nThe immutable receipt contains the exact claim set and any unclaimed H0s;\nthe owner compares the count/last sequence with its admitted observations.\nA nonzero unresolved count remains a permanent measurement incident.",
+      "properties": {
+        "admitted_attempt_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Admitted Attempt Count",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "admission_closed",
+          "default": "admission_closed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "last_producer_sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Last Producer Sequence",
+          "type": "integer"
+        },
+        "reconciliation_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Reconciliation Receipt Sha256",
+          "type": "string"
+        },
+        "runner_epoch_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Runner Epoch Sha256",
+          "type": "string"
+        },
+        "unresolved_claim_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Unresolved Claim Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "runner_epoch_sha256",
+        "last_producer_sequence",
+        "admitted_attempt_count",
+        "unresolved_claim_count",
+        "reconciliation_receipt_sha256"
+      ],
+      "title": "M6AdmissionClosedAck",
+      "type": "object"
+    },
+    "M6AdmissionControl": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "admission_opened",
+            "stop_admission_requested",
+            "stop_admission_effective"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "M6AdmissionControl",
+      "type": "object"
+    },
+    "M6AppendObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/M6ProducerEvent"
+        },
+        "kind": {
+          "const": "append",
+          "default": "append",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event"
+      ],
+      "title": "M6AppendObservation",
+      "type": "object"
+    },
+    "M6AttemptAdmitted": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "document_id": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Document Id"
+        },
+        "fence_identity": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Fence Identity",
+          "type": "string"
+        },
+        "kind": {
+          "const": "attempt_admitted",
+          "default": "attempt_admitted",
+          "title": "Kind",
+          "type": "string"
+        },
+        "process_profile_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Process Profile Sha256",
+          "type": "string"
+        },
+        "processing_run_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\x00-\\x20\\x7f]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Processing Run Id"
+        },
+        "source_byte_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Byte Count",
+          "type": "integer"
+        },
+        "source_page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Page Count",
+          "type": "integer"
+        },
+        "source_pdf_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Pdf Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "fence_identity",
+        "document_id",
+        "processing_run_id",
+        "source_pdf_sha256",
+        "source_byte_count",
+        "source_page_count",
+        "process_profile_sha256"
+      ],
+      "title": "M6AttemptAdmitted",
+      "type": "object"
+    },
+    "M6AttemptFinal": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "cleanup_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Cleanup Receipt Sha256",
+          "type": "string"
+        },
+        "kind": {
+          "const": "attempt_final",
+          "default": "attempt_final",
+          "title": "Kind",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "published",
+            "diagnostic_disposed",
+            "failed",
+            "superseded"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "remote_disposition": {
+          "enum": [
+            "not_submitted",
+            "consumed",
+            "absent"
+          ],
+          "title": "Remote Disposition",
+          "type": "string"
+        },
+        "remote_receipt_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Remote Receipt Sha256"
+        },
+        "remote_task_identity_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Remote Task Identity Sha256"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "outcome",
+        "remote_disposition",
+        "remote_receipt_sha256",
+        "remote_task_identity_sha256",
+        "cleanup_receipt_sha256"
+      ],
+      "title": "M6AttemptFinal",
+      "type": "object"
+    },
+    "M6BindOwner": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Anchor Sha256",
+          "type": "string"
+        },
+        "kind": {
+          "const": "bind",
+          "default": "bind",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "anchor_sha256"
+      ],
+      "title": "M6BindOwner",
+      "type": "object"
+    },
+    "M6ClockDomain": {
+      "additionalProperties": false,
+      "properties": {
+        "boot_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Boot Identity Sha256",
+          "type": "string"
+        },
+        "clock_domain_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Clock Domain Identity Sha256",
+          "type": "string"
+        },
+        "host_assignment_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Host Assignment Identity Sha256",
+          "type": "string"
+        },
+        "qpc_frequency_hz": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Qpc Frequency Hz",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host_assignment_identity_sha256",
+        "boot_identity_sha256",
+        "qpc_frequency_hz",
+        "clock_domain_identity_sha256"
+      ],
+      "title": "M6ClockDomain",
+      "type": "object"
+    },
+    "M6CloseOwner": {
+      "additionalProperties": false,
+      "properties": {
+        "children_exited": {
+          "title": "Children Exited",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "close",
+          "default": "close",
+          "title": "Kind",
+          "type": "string"
+        },
+        "ownership_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Ownership Receipt Sha256",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "deadline_drained",
+            "stop_requested",
+            "failed"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "residual_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Residual Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ownership_receipt_sha256",
+        "residual_count",
+        "children_exited",
+        "reason"
+      ],
+      "title": "M6CloseOwner",
+      "type": "object"
+    },
+    "M6DocumentQualified": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "document_qualified",
+          "default": "document_qualified",
+          "title": "Kind",
+          "type": "string"
+        },
+        "qualification_evidence_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Qualification Evidence Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "qualification_evidence_sha256"
+      ],
+      "title": "M6DocumentQualified",
+      "type": "object"
+    },
+    "M6MeasurementIncident": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Code",
+          "type": "string"
+        },
+        "evidence_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Evidence Sha256",
+          "type": "string"
+        },
+        "kind": {
+          "const": "measurement_incident",
+          "default": "measurement_incident",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "evidence_sha256"
+      ],
+      "title": "M6MeasurementIncident",
+      "type": "object"
+    },
+    "M6OwnerControl": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "status",
+            "lease",
+            "open",
+            "stop"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "M6OwnerControl",
+      "type": "object"
+    },
+    "M6OwnerResumed": {
+      "additionalProperties": false,
+      "properties": {
+        "clock": {
+          "$ref": "#/$defs/M6ClockDomain"
+        },
+        "deadline_ticks": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Deadline Ticks",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "owner_resumed",
+          "default": "owner_resumed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "previous_owner_epoch_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Previous Owner Epoch Sha256",
+          "type": "string"
+        },
+        "t0_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "T0 Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clock",
+        "t0_ticks",
+        "deadline_ticks",
+        "previous_owner_epoch_sha256"
+      ],
+      "title": "M6OwnerResumed",
+      "type": "object"
+    },
+    "M6ProducerEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "const": "m6.producer-event.v1",
+          "default": "m6.producer-event.v1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "payload": {
+          "discriminator": {
+            "mapping": {
+              "admission_opened": "#/$defs/M6AdmissionControl",
+              "attempt_admitted": "#/$defs/M6AttemptAdmitted",
+              "attempt_final": "#/$defs/M6AttemptFinal",
+              "document_qualified": "#/$defs/M6DocumentQualified",
+              "measurement_incident": "#/$defs/M6MeasurementIncident",
+              "owner_resumed": "#/$defs/M6OwnerResumed",
+              "public_confirmation": "#/$defs/M6PublicConfirmation",
+              "publication_committed": "#/$defs/M6PublicationCommitted",
+              "remote_accepted": "#/$defs/M6RemoteAccepted",
+              "resources_closed": "#/$defs/M6ResourcesClosed",
+              "run_closed": "#/$defs/M6RunClosed",
+              "run_started": "#/$defs/M6RunStarted",
+              "service_validated": "#/$defs/M6ServiceValidated",
+              "stop_admission_effective": "#/$defs/M6AdmissionControl",
+              "stop_admission_requested": "#/$defs/M6AdmissionControl",
+              "verifier_drained": "#/$defs/M6VerifierDrained"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/M6RunStarted"
+            },
+            {
+              "$ref": "#/$defs/M6OwnerResumed"
+            },
+            {
+              "$ref": "#/$defs/M6AdmissionControl"
+            },
+            {
+              "$ref": "#/$defs/M6AttemptAdmitted"
+            },
+            {
+              "$ref": "#/$defs/M6RemoteAccepted"
+            },
+            {
+              "$ref": "#/$defs/M6PublicationCommitted"
+            },
+            {
+              "$ref": "#/$defs/M6PublicConfirmation"
+            },
+            {
+              "$ref": "#/$defs/M6DocumentQualified"
+            },
+            {
+              "$ref": "#/$defs/M6ServiceValidated"
+            },
+            {
+              "$ref": "#/$defs/M6AttemptFinal"
+            },
+            {
+              "$ref": "#/$defs/M6VerifierDrained"
+            },
+            {
+              "$ref": "#/$defs/M6ResourcesClosed"
+            },
+            {
+              "$ref": "#/$defs/M6RunClosed"
+            },
+            {
+              "$ref": "#/$defs/M6MeasurementIncident"
+            }
+          ],
+          "title": "Payload"
+        },
+        "producer_epoch_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Producer Epoch Sha256",
+          "type": "string"
+        },
+        "producer_kind": {
+          "enum": [
+            "owner",
+            "e2e_runner",
+            "service_runner",
+            "public_verifier",
+            "quality_verifier"
+          ],
+          "title": "Producer Kind",
+          "type": "string"
+        },
+        "producer_sequence": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Producer Sequence",
+          "type": "integer"
+        },
+        "run_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Run Id",
+          "type": "string"
+        },
+        "spec_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Spec Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "spec_sha256",
+        "producer_kind",
+        "producer_epoch_sha256",
+        "producer_sequence",
+        "payload"
+      ],
+      "title": "M6ProducerEvent",
+      "type": "object"
+    },
+    "M6PublicConfirmation": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_closure_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Artifact Closure Sha256",
+          "type": "string"
+        },
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "consumer_check_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Consumer Check Receipt Sha256",
+          "type": "string"
+        },
+        "document_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Document Id",
+          "type": "string"
+        },
+        "durable_base_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Durable Base Sha256",
+          "type": "string"
+        },
+        "history_audit_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "History Audit Receipt Sha256",
+          "type": "string"
+        },
+        "kind": {
+          "const": "public_confirmation",
+          "default": "public_confirmation",
+          "title": "Kind",
+          "type": "string"
+        },
+        "ledger_seq": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Ledger Seq",
+          "type": "integer"
+        },
+        "processing_run_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Processing Run Id",
+          "type": "string"
+        },
+        "public_units_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Public Units Sha256",
+          "type": "string"
+        },
+        "source_page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Page Count",
+          "type": "integer"
+        },
+        "source_pdf_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Pdf Sha256",
+          "type": "string"
+        },
+        "verifier_identity": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Verifier Identity",
+          "type": "string"
+        },
+        "winner_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Winner Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "processing_run_id",
+        "document_id",
+        "source_pdf_sha256",
+        "source_page_count",
+        "ledger_seq",
+        "winner_sha256",
+        "durable_base_sha256",
+        "public_units_sha256",
+        "artifact_closure_sha256",
+        "consumer_check_receipt_sha256",
+        "history_audit_receipt_sha256",
+        "verifier_identity"
+      ],
+      "title": "M6PublicConfirmation",
+      "type": "object"
+    },
+    "M6PublicationCommitted": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "document_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Document Id",
+          "type": "string"
+        },
+        "durable_base_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Durable Base Sha256",
+          "type": "string"
+        },
+        "kind": {
+          "const": "publication_committed",
+          "default": "publication_committed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "ledger_seq": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Ledger Seq",
+          "type": "integer"
+        },
+        "processing_run_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Processing Run Id",
+          "type": "string"
+        },
+        "source_page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Source Page Count",
+          "type": "integer"
+        },
+        "source_pdf_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Pdf Sha256",
+          "type": "string"
+        },
+        "winner_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Winner Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "processing_run_id",
+        "document_id",
+        "source_pdf_sha256",
+        "source_page_count",
+        "ledger_seq",
+        "winner_sha256",
+        "durable_base_sha256"
+      ],
+      "title": "M6PublicationCommitted",
+      "type": "object"
+    },
+    "M6RemoteAccepted": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptance_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Acceptance Receipt Sha256",
+          "type": "string"
+        },
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "remote_accepted",
+          "default": "remote_accepted",
+          "title": "Kind",
+          "type": "string"
+        },
+        "remote_task_identity_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Remote Task Identity Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "remote_task_identity_sha256",
+        "acceptance_receipt_sha256"
+      ],
+      "title": "M6RemoteAccepted",
+      "type": "object"
+    },
+    "M6ResourcesClosed": {
+      "additionalProperties": false,
+      "properties": {
+        "children_exited": {
+          "title": "Children Exited",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "resources_closed",
+          "default": "resources_closed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "ownership_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Ownership Receipt Sha256",
+          "type": "string"
+        },
+        "residual_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Residual Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "residual_count",
+        "children_exited",
+        "ownership_receipt_sha256"
+      ],
+      "title": "M6ResourcesClosed",
+      "type": "object"
+    },
+    "M6RunClosed": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "run_closed",
+          "default": "run_closed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "deadline_drained",
+            "stop_requested",
+            "failed"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "tclose_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Tclose Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tclose_ticks",
+        "reason"
+      ],
+      "title": "M6RunClosed",
+      "type": "object"
+    },
+    "M6RunStarted": {
+      "additionalProperties": false,
+      "properties": {
+        "clock": {
+          "$ref": "#/$defs/M6ClockDomain"
+        },
+        "deadline_ticks": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Deadline Ticks",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "run_started",
+          "default": "run_started",
+          "title": "Kind",
+          "type": "string"
+        },
+        "t0_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "T0 Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clock",
+        "t0_ticks",
+        "deadline_ticks"
+      ],
+      "title": "M6RunStarted",
+      "type": "object"
+    },
+    "M6ServiceValidated": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "service_validated",
+          "default": "service_validated",
+          "title": "Kind",
+          "type": "string"
+        },
+        "provider_bundle_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Provider Bundle Sha256",
+          "type": "string"
+        },
+        "validation_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Validation Receipt Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "provider_bundle_sha256",
+        "validation_receipt_sha256"
+      ],
+      "title": "M6ServiceValidated",
+      "type": "object"
+    },
+    "M6VerifierDrained": {
+      "additionalProperties": false,
+      "properties": {
+        "drain_receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Drain Receipt Sha256",
+          "type": "string"
+        },
+        "kind": {
+          "const": "verifier_drained",
+          "default": "verifier_drained",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "drain_receipt_sha256"
+      ],
+      "title": "M6VerifierDrained",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-owner-request.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "command": {
+      "discriminator": {
+        "mapping": {
+          "admission_closed": "#/$defs/M6AdmissionClosedAck",
+          "append": "#/$defs/M6AppendObservation",
+          "bind": "#/$defs/M6BindOwner",
+          "close": "#/$defs/M6CloseOwner",
+          "lease": "#/$defs/M6OwnerControl",
+          "open": "#/$defs/M6OwnerControl",
+          "status": "#/$defs/M6OwnerControl",
+          "stop": "#/$defs/M6OwnerControl"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/M6BindOwner"
+        },
+        {
+          "$ref": "#/$defs/M6OwnerControl"
+        },
+        {
+          "$ref": "#/$defs/M6AppendObservation"
+        },
+        {
+          "$ref": "#/$defs/M6AdmissionClosedAck"
+        },
+        {
+          "$ref": "#/$defs/M6CloseOwner"
+        }
+      ],
+      "title": "Command"
+    },
+    "contract_version": {
+      "const": "m6.owner-request.v1",
+      "default": "m6.owner-request.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Request Id",
+      "type": "string"
+    },
+    "run_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "spec_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Spec Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "spec_sha256",
+    "request_id",
+    "command"
+  ],
+  "title": "M6OwnerRequest",
+  "type": "object"
+}

@@ -109,9 +109,10 @@ recorded owner record can be replayed by the reader; a *new* owner stamp after
 close, even for a producer retry, contradicts Tclose and makes the receipt invalid.
 `stop_admission_effective` and `resources_closed` are each one terminal fact per
 run. Producer retries must retain their original incarnation/sequence and bytes.
-Report residual resources as incidents until final closure; a terminal residual
-report leaves the measurement incomplete and cannot be replaced with a second
-`resources_closed` event claiming success.
+Ordinary pending drain waits for its final closure; it is not a recoverable
+measurement incident. Every `measurement_incident` permanently makes that run
+incomplete. A terminal residual report leaves the measurement incomplete and
+cannot be replaced with a second `resources_closed` event claiming success.
 
 ## Whole-document quality
 

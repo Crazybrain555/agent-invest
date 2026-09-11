@@ -1,0 +1,90 @@
+{
+  "$id": "urn:disclosure-anchor:operational:m6-owner-status.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "admission_valid_until_ticks": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Admission Valid Until Ticks"
+    },
+    "anchor_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Anchor Sha256",
+      "type": "string"
+    },
+    "contract_version": {
+      "const": "m6.owner-status.v1",
+      "default": "m6.owner-status.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "last_sequence": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Last Sequence",
+      "type": "integer"
+    },
+    "observed_qpc_ticks": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Observed Qpc Ticks",
+      "type": "integer"
+    },
+    "owner_process_epoch_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Owner Process Epoch Sha256",
+      "type": "string"
+    },
+    "run_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[^\\x00-\\x20\\x7f]+$",
+      "title": "Run Id",
+      "type": "string"
+    },
+    "spec_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Spec Sha256",
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "bound",
+        "open",
+        "stopping",
+        "draining",
+        "closed",
+        "failed"
+      ],
+      "title": "State",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "spec_sha256",
+    "anchor_sha256",
+    "owner_process_epoch_sha256",
+    "observed_qpc_ticks",
+    "state",
+    "last_sequence",
+    "admission_valid_until_ticks"
+  ],
+  "title": "M6OwnerStatus",
+  "type": "object"
+}
