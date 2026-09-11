@@ -26,6 +26,8 @@ import time
 from typing import Callable, Literal, cast
 import uuid
 
+from pydantic import ValidationError
+
 import disclosure_anchor.application.contracts.synchronized_telemetry as contract_module
 import disclosure_anchor.application.ports.synchronized_telemetry as port_module
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
@@ -185,6 +187,75 @@ def _capture_clock_pair(
             "wall/monotonic clock pair exceeded its sampling bound"
         )
     return best
+
+
+_RECEIPT_CLOCK_DIVERGENCE_ERROR = "wall and monotonic receipt clocks diverged"
+
+
+def _is_receipt_clock_divergence_validation_error(exc: ValidationError) -> bool:
+    """Match only the receipt validator's closed clock-divergence failure."""
+
+    for error in exc.errors(include_url=False, include_input=False):
+        if error.get("type") != "value_error":
+            continue
+        context = error.get("ctx")
+        if not isinstance(context, dict):
+            continue
+        if str(context.get("error")) == _RECEIPT_CLOCK_DIVERGENCE_ERROR:
+            return True
+    return False
+
+
+def _receipt_clock_diagnostic_note(
+    *,
+    receipt_model: type[SynchronizedTelemetryReceiptV2]
+    | type[SynchronizedTelemetryReceiptV3],
+    start_clock: _ClockPair,
+    finish_clock: _ClockPair,
+) -> str | None:
+    """Format only bounded clock facts using the selected receipt model limits."""
+
+    fixed_field = receipt_model.model_fields.get("maximum_clock_divergence_fixed_ns")
+    ppm_field = receipt_model.model_fields.get("maximum_clock_divergence_ppm")
+    if fixed_field is None or ppm_field is None:
+        return None
+    fixed_value = fixed_field.default
+    ppm_value = ppm_field.default
+    if (
+        isinstance(fixed_value, bool)
+        or not isinstance(fixed_value, int)
+        or isinstance(ppm_value, bool)
+        or not isinstance(ppm_value, int)
+    ):
+        return None
+    fixed_ns = cast(int, fixed_value)
+    ppm = cast(int, ppm_value)
+    wall_elapsed_ns = int(
+        (finish_clock.wall - start_clock.wall).total_seconds() * 1_000_000_000
+    )
+    monotonic_elapsed_ns = finish_clock.monotonic_ns - start_clock.monotonic_ns
+    clock_divergence_ns = abs(wall_elapsed_ns - monotonic_elapsed_ns)
+    maximum_clock_divergence_ns = (
+        fixed_ns + monotonic_elapsed_ns * ppm // 1_000_000
+    )
+    fields = (
+        ("receipt_model", receipt_model.__name__),
+        ("started_at_utc", start_clock.wall.isoformat()),
+        ("finished_at_utc", finish_clock.wall.isoformat()),
+        ("started_monotonic_ns", start_clock.monotonic_ns),
+        ("finished_monotonic_ns", finish_clock.monotonic_ns),
+        ("start_clock_bracket_ns", start_clock.bracket_ns),
+        ("finish_clock_bracket_ns", finish_clock.bracket_ns),
+        ("wall_elapsed_ns", wall_elapsed_ns),
+        ("monotonic_elapsed_ns", monotonic_elapsed_ns),
+        ("clock_divergence_ns", clock_divergence_ns),
+        ("maximum_clock_divergence_fixed_ns", fixed_ns),
+        ("maximum_clock_divergence_ppm", ppm),
+        ("maximum_clock_divergence_ns", maximum_clock_divergence_ns),
+    )
+    return "synchronized telemetry receipt clock diagnostics: " + "; ".join(
+        f"{name}={value}" for name, value in fields
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1125,7 +1196,18 @@ def run_synchronized_telemetry_observer(
         }
         if observer_identity is not None:
             receipt_payload["observer_identity"] = observer_identity
-        receipt = protocol.receipt_model.model_validate(receipt_payload)
+        try:
+            receipt = protocol.receipt_model.model_validate(receipt_payload)
+        except ValidationError as exc:
+            if _is_receipt_clock_divergence_validation_error(exc):
+                diagnostic_note = _receipt_clock_diagnostic_note(
+                    receipt_model=protocol.receipt_model,
+                    start_clock=start_clock,
+                    finish_clock=finish_clock,
+                )
+                if diagnostic_note is not None:
+                    exc.add_note(diagnostic_note)
+            raise
         validate_synchronized_telemetry_v2(frame_tuple, receipt=receipt)
         receipt_bytes = writer.write_receipt(receipt)
         replay_frames, replay_receipt = writer.replay_unsealed()

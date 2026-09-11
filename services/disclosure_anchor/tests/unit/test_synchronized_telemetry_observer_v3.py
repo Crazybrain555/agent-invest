@@ -8,10 +8,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     run_synchronized_telemetry_observer, verify_synchronized_telemetry_observer,
     validate_synchronized_telemetry_v2,
-    SynchronizedObserverResult, ObserverState,
+    SynchronizedObserverLimits, SynchronizedObserverResult,
+    SynchronizedTelemetryEvidenceError, ObserverState,
 )
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
     FrozenApiProcessProfile, TelemetryObserverIdentity,
@@ -22,7 +25,7 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
 from disclosure_anchor.adapters.runtime.full_host_hour_kpi import verified_coverage_from_observer_artifacts
 from tests.unit.test_resident_session_evidence import _mapping_fixture
 from tests.unit.test_synchronized_telemetry_observer import (
-    HASH_B, HASH_D, _collector_spec, _profile,
+    HASH_B, HASH_D, _MainThreadUtcNow, _collector_spec, _profile,
 )
 
 
@@ -81,6 +84,61 @@ class SynchronizedTelemetryObserverV3Tests(unittest.TestCase):
             payload["observer_identity"]["clock_domain_identity_sha256"] = HASH_B
             with self.assertRaisesRegex(ValueError, "observer clock domain"):
                 SynchronizedTelemetryReceiptV3.model_validate(payload)
+
+    def test_v3_clock_divergence_reports_selected_model_diagnostics(self) -> None:
+        clock = _MainThreadUtcNow(jump_after_call=3)
+        run_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "telemetry"
+            with self.assertRaisesRegex(
+                SynchronizedTelemetryEvidenceError,
+                "FAILED_EVIDENCE",
+            ) as raised:
+                run_synchronized_telemetry_observer(
+                    artifact_root=root,
+                    process_profile=_api_profile(),
+                    observer_identity=TelemetryObserverIdentity(
+                        process_epoch_sha256=OBSERVER_EPOCH,
+                        clock_domain_identity_sha256=HASH_D,
+                    ),
+                    gpu_collector=_collector_spec(lane="gpu"),
+                    host_collector=_collector_spec(lane="host"),
+                    duration_seconds=1,
+                    limits=SynchronizedObserverLimits(maximum_frame_records=2),
+                    run_id=run_id,
+                    process_cpu_ns=lambda: 0,
+                    utc_now=clock,
+                )
+            cause = raised.exception.__cause__
+            self.assertIsInstance(cause, ValidationError)
+            assert isinstance(cause, ValidationError)
+            self.assertIn("wall and monotonic receipt clocks diverged", str(cause))
+            notes = getattr(cause, "__notes__", ())
+            self.assertEqual(len(notes), 1)
+            prefix = "synchronized telemetry receipt clock diagnostics: "
+            self.assertTrue(notes[0].startswith(prefix))
+            diagnostics = dict(
+                item.split("=", 1)
+                for item in notes[0].removeprefix(prefix).split("; ")
+            )
+            self.assertEqual(
+                diagnostics["receipt_model"],
+                "SynchronizedTelemetryReceiptV3",
+            )
+            elapsed_ns = int(diagnostics["monotonic_elapsed_ns"])
+            fixed_ns = SynchronizedTelemetryReceiptV3.model_fields[
+                "maximum_clock_divergence_fixed_ns"
+            ].default
+            ppm = SynchronizedTelemetryReceiptV3.model_fields[
+                "maximum_clock_divergence_ppm"
+            ].default
+            maximum_ns = fixed_ns + elapsed_ns * ppm // 1_000_000
+            self.assertEqual(
+                int(diagnostics["maximum_clock_divergence_ns"]),
+                maximum_ns,
+            )
+            self.assertGreater(int(diagnostics["clock_divergence_ns"]), maximum_ns)
+            self.assertFalse((root / run_id / "seal.v3.json").exists())
 
     def test_mixed_legacy_profile_and_new_observer_never_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

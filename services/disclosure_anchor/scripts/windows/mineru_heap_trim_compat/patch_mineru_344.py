@@ -7,6 +7,7 @@ file must match the deployed 3.4.4 bytes before any write occurs.
 """
 
 from __future__ import annotations
+import re
 
 import hashlib
 import json
@@ -126,6 +127,262 @@ def _replace_exact_span(
     start = source.index(start_marker)
     end = source.index(end_marker, start)
     return source[:start] + replacement + source[end:]
+
+
+
+
+def _patch_registry_persistence_behavior(source: str) -> str:
+    """Finish P1 integration on the generated FastAPI source.
+
+    The production import groups the registry symbols on one line, while small
+    compatibility fixtures may omit individual endpoint/cleanup bodies.  Patch
+    only anchors that are actually present, but require the full source's
+    worker and ownership boundaries to be transformed.
+    """
+    counters = {"processor": 0, "http": 0, "cleanup": 0}
+
+    import_block = re.search(
+        r"from mineru\.cli\.agent_task_protocol_v2 import \(\n"
+        r"(?P<body>.*?)^\)\n",
+        source,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if import_block is None:
+        # Reduced unit fixtures intentionally omit the real module imports.
+        # They are not executable generated sources, so leave their legacy
+        # worker/endpoint snippets untouched.
+        return source
+    if "TaskRegistryPersistenceError" not in import_block.group("body"):
+        raise RuntimeError("registry persistence exception import is absent")
+
+    wait_failure_marker = (
+        "self.task_wait_failures: dict[str, TaskRegistryPersistenceError]"
+    )
+    if wait_failure_marker not in source:
+        source = _replace_exact(
+            source,
+            "        self.last_worker_error: Optional[str] = None\n",
+            "        self.last_worker_error: Optional[str] = None\n"
+            "        self.task_wait_failures: dict[str, TaskRegistryPersistenceError] = {}\n",
+            count=1,
+            label="FastAPI task-specific persistence wait state",
+        )
+        source = _replace_exact(
+            source,
+            "        self.last_worker_error = None\n"
+            "        self.manager_wakeup = asyncio.Event()\n",
+            "        self.last_worker_error = None\n"
+            "        self.task_wait_failures.clear()\n"
+            "        self.manager_wakeup = asyncio.Event()\n",
+            count=1,
+            label="FastAPI recovered waiter state reset",
+        )
+        source = _replace_exact(
+            source,
+            "    async def wait_for_terminal_state(self, task_id: str) -> AsyncParseTask:\n",
+            "    def _raise_task_wait_failure(self, task_id: str) -> None:\n"
+            "        failure = self.task_wait_failures.get(task_id)\n"
+            "        if failure is None:\n"
+            "            return\n"
+            "        status = self.task_protocol_v2.persistence_status()\n"
+            "        recovery_action = (\n"
+            '            status.get("recovery_action") or "restart task manager"\n'
+            "        )\n"
+            "        raise TaskWaitAbortedError(\n"
+            '            "Task registry persistence is unavailable while waiting; "\n'
+            '            f"outcome={failure.outcome}; recovery={recovery_action}"\n'
+            "        ) from failure\n\n"
+            "    async def wait_for_terminal_state(self, task_id: str) -> AsyncParseTask:\n",
+            count=1,
+            label="FastAPI task-specific persistence wait outcome",
+        )
+        source = _replace_exact(
+            source,
+            "        if is_task_terminal(task.status):\n"
+            "            return task\n\n"
+            "        task_event = self.task_events.get(task_id)\n",
+            "        if is_task_terminal(task.status):\n"
+            "            return task\n"
+            "        self._raise_task_wait_failure(task_id)\n\n"
+            "        task_event = self.task_events.get(task_id)\n",
+            count=1,
+            label="FastAPI later waiter persistence check",
+        )
+        source = _replace_exact(
+            source,
+            "        if is_task_terminal(task.status):\n"
+            "            return task\n"
+            "        if self.is_shutting_down:\n",
+            "        if is_task_terminal(task.status):\n"
+            "            return task\n"
+            "        self._raise_task_wait_failure(task_id)\n"
+            "        if self.is_shutting_down:\n",
+            count=1,
+            label="FastAPI awakened waiter persistence check",
+        )
+        source = _replace_exact(
+            source,
+            "        event_wait_task = asyncio.create_task(task_event.wait())\n"
+            "        manager_wait_task = asyncio.create_task(self.manager_wakeup.wait())\n"
+            "        done: set[asyncio.Task[Any]] = set()\n"
+            "        pending: set[asyncio.Task[Any]] = set()\n"
+            "        try:\n"
+            "            done, pending = await asyncio.wait(\n"
+            "                {event_wait_task, manager_wait_task},\n"
+            "                return_when=asyncio.FIRST_COMPLETED,\n"
+            "            )\n"
+            "        finally:\n"
+            "            for waiter in pending:\n"
+            "                waiter.cancel()\n"
+            "            if pending:\n"
+            "                await asyncio.gather(*pending, return_exceptions=True)\n"
+            "            for waiter in done:\n"
+            "                with suppress(asyncio.CancelledError):\n"
+            "                    waiter.result()\n",
+            "        event_wait_task = asyncio.create_task(task_event.wait())\n"
+            "        manager_wait_task = asyncio.create_task(self.manager_wakeup.wait())\n"
+            "        wait_helpers = (event_wait_task, manager_wait_task)\n"
+            "        done: set[asyncio.Task[Any]] = set()\n"
+            "        try:\n"
+            "            done, _ = await asyncio.wait(\n"
+            "                wait_helpers,\n"
+            "                return_when=asyncio.FIRST_COMPLETED,\n"
+            "            )\n"
+            "        finally:\n"
+            "            for waiter in wait_helpers:\n"
+            "                waiter.cancel()\n"
+            "            await asyncio.gather(*wait_helpers, return_exceptions=True)\n"
+            "        for waiter in done:\n"
+            "            with suppress(asyncio.CancelledError):\n"
+            "                waiter.result()\n",
+            count=1,
+            label="FastAPI cancellation-safe waiter helper cleanup",
+        )
+
+    processor_marker = "task status remains nonterminal"
+    if processor_marker not in source:
+        processor_pattern = re.compile(
+            r"(?m)^(?P<i>[ \t]*)except Exception as exc:\n"
+            r"(?P=i)    task\.status = TASK_FAILED"
+        )
+
+        def processor_replacement(match: re.Match[str]) -> str:
+            indent = match.group("i")
+            return (
+                f"{indent}except TaskRegistryPersistenceError as exc:\n"
+                f"{indent}    self.task_wait_failures[task_id] = exc\n"
+                f"{indent}    self._signal_task_event(task_id)\n"
+                f"{indent}    logger.exception("
+                '"Task registry persistence failed; task status remains nonterminal"'
+                ")\n"
+                f"{indent}    raise\n"
+                f"{indent}except Exception as exc:\n"
+                f"{indent}    task.status = TASK_FAILED"
+            )
+
+        source, counters["processor"] = processor_pattern.subn(
+            processor_replacement,
+            source,
+        )
+
+    cleanup_expected = (
+        "with suppress(TaskProtocolConflict):" in source
+        and "abandon_unbound" in source
+        and "cleanup_file(task_output_dir)" in source
+    )
+    conflict_handlers_present = "except TaskProtocolConflict as exc:" in source
+
+    lines = source.splitlines()
+    rewritten: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        indent = line[: len(line) - len(line.lstrip())]
+        if stripped == "except TaskProtocolConflict as exc:":
+            recent = "\n".join(rewritten[-5:])
+            if "except TaskRegistryPersistenceError as exc:" not in recent:
+                rewritten.extend(
+                    [
+                        f"{indent}except TaskRegistryPersistenceError as exc:",
+                        f"{indent}    raise HTTPException(",
+                        f"{indent}        status_code=503, detail=str(exc)",
+                        f"{indent}    ) from exc",
+                    ]
+                )
+                counters["http"] += 1
+        if stripped == "if protocol_record is not None:":
+            cursor = index + 1
+            while (
+                cursor < min(len(lines), index + 24)
+                and lines[cursor].strip() != "cleanup_file(task_output_dir)"
+            ):
+                cursor += 1
+            block = lines[index : cursor + 1] if cursor < len(lines) else []
+            joined = "\n".join(block)
+            if (
+                cursor < len(lines)
+                and "with suppress(TaskProtocolConflict):" in joined
+                and "abandon_unbound" in joined
+            ):
+                with_index = next(
+                    pos
+                    for pos in range(index + 1, cursor)
+                    if "with suppress(TaskProtocolConflict):" in lines[pos]
+                )
+                call_lines = lines[with_index + 1 : cursor]
+                rewritten.extend(
+                    [
+                        f"{indent}if protocol_record is None:",
+                        f"{indent}    cleanup_file(task_output_dir)",
+                        f"{indent}else:",
+                        f"{indent}    try:",
+                    ]
+                )
+                rewritten.extend(call_lines)
+                rewritten.extend(
+                    [
+                        f"{indent}    except TaskRegistryPersistenceError:",
+                        f"{indent}        raise",
+                        f"{indent}    except TaskProtocolConflict:",
+                        # A conflict means the registry may already own the
+                        # input.  Preserve it for exact reconciliation.
+                        f"{indent}        pass",
+                        f"{indent}    else:",
+                        f"{indent}        cleanup_file(task_output_dir)",
+                    ]
+                )
+                counters["cleanup"] += 1
+                index = cursor + 1
+                continue
+        rewritten.append(line)
+        index += 1
+    source = "\n".join(rewritten) + ("\n" if source.endswith("\n") else "")
+
+    if "async def _process_task" in source and processor_marker not in source:
+        raise RuntimeError(
+            f"registry persistence worker guard was not patched: {counters}"
+        )
+    if "async def wait_for_terminal_state" in source and (
+        wait_failure_marker not in source
+        or "self.task_wait_failures[task_id] = exc" not in source
+        or source.count("self._raise_task_wait_failure(task_id)") != 2
+        or "wait_helpers = (event_wait_task, manager_wait_task)" not in source
+        or "await asyncio.gather(*wait_helpers, return_exceptions=True)" not in source
+        or "done, pending = await asyncio.wait" in source
+    ):
+        raise RuntimeError(
+            f"registry persistence waiter guard was not patched: {counters}"
+        )
+    if cleanup_expected and counters["cleanup"] < 1:
+        raise RuntimeError(
+            f"bound task-tree cleanup guard was not patched: {counters}"
+        )
+    if conflict_handlers_present and "except TaskRegistryPersistenceError as exc:" not in source:
+        raise RuntimeError(
+            f"registry persistence HTTP guard was not patched: {counters}"
+        )
+    return source
 
 
 def patch_source(relative_path: str, source: str) -> str:
@@ -357,6 +614,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "from mineru.cli.api_request import ParseRequestOptions, parse_request_form\n"
             "from mineru.cli.agent_task_protocol_v2 import (\n"
             "    DurableTaskRegistry, SplitTaskExecutor, TaskProtocolConflict,\n"
+            "    TaskRegistryPersistenceError,\n"
             "    evict_consumed_routes, task_protocol_runtime_status,\n"
             ")\n",
             count=1,
@@ -1028,6 +1286,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             count=1,
             label="FastAPI task protocol cleanup ownership",
         )
+        source = _patch_registry_persistence_behavior(source)
         return source
 
     if relative_path == "mineru/utils/model_utils.py":

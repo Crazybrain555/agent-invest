@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
+from functools import wraps
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
@@ -30,6 +32,27 @@ _MAX_CLOCK_SKEW_SECONDS = 300
 
 class TaskProtocolConflict(RuntimeError):
     pass
+
+
+class TaskRegistryPersistenceError(OSError):
+    """A content-free registry persistence outcome with an explicit commit boundary."""
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        phase: str,
+        outcome: str,
+        committed: bool,
+    ) -> None:
+        self.operation = operation
+        self.phase = phase
+        self.outcome = outcome
+        self.committed = committed
+        super().__init__(
+            "task registry persistence "
+            f"{outcome} during {operation} at {phase}"
+        )
 
 
 @dataclass(slots=True)
@@ -192,8 +215,19 @@ class DurableTaskRegistry:
         finally:
             os.close(root_fd)
         self._lock = RLock()
+        self._active_operation = "initial_load"
+        self._last_persistence_event: dict[str, Any] | None = None
+        self._last_persistence_cause: BaseException | None = None
+        self._last_persistence_cleanup_cause: BaseException | None = None
+        self._uncertain_records: dict[str, DurableTaskRecord] | None = None
+        self._uncertain_watermark_bucket: int | None = None
+        self._uncertain_payload: bytes | None = None
+        self._persistence_generation = 0
         self._submission_watermark_bucket = -1
         self._records = self._load()
+        self._durable_payload = self._read_current_registry_bytes()
+        self._last_durable_records = self._clone_records(self._records)
+        self._last_durable_watermark_bucket = self._submission_watermark_bucket
 
     def reconcile_or_create(
         self,
@@ -243,18 +277,24 @@ class DurableTaskRegistry:
             self._commit_registry_transition(proposed_records, proposed_watermark)
             return record, True
 
+
     def get(self, idempotency_key: str) -> DurableTaskRecord | None:
         with self._lock:
-            return self._records.get(idempotency_key)
+            self.assert_observation_safe()
+            return copy.deepcopy(self._records.get(idempotency_key))
+
+
 
     def get_by_task_id(self, task_id: str) -> DurableTaskRecord | None:
         with self._lock:
+            self.assert_observation_safe()
             matches = [
                 record for record in self._records.values() if record.task_id == task_id
             ]
             if len(matches) > 1:
                 raise TaskProtocolConflict("task id is not unique")
-            return matches[0] if matches else None
+            return copy.deepcopy(matches[0]) if matches else None
+
 
     def bind_task_payload(
         self,
@@ -326,20 +366,30 @@ class DurableTaskRegistry:
             record.task_payload = normalized
             self._persist()
 
+
     def recoverable_payloads(self) -> tuple[dict[str, Any], ...]:
+        """Hydrate routes and durably prepare interrupted work for replay.
+
+        Live reader counts are process-local barriers.  A cold constructor may
+        clear persisted counts, but an in-process recovery must never discard a
+        handle that is still open.  Interrupted-state changes are committed
+        before any filesystem cleanup, so a cleanup failure remains retryable.
+        """
         with self._lock:
-            recoverable = []
-            abandoned = [
-                key
-                for key, record in self._records.items()
-                if record.state == "pending" and record.task_payload is None
-            ]
-            for key in abandoned:
-                del self._records[key]
-            for record in self._records.values():
+            if any(record.active_readers for record in self._records.values()):
+                raise TaskProtocolConflict(
+                    "live result readers prevent in-process task recovery"
+                )
+
+            proposed_records = self._clone_records(self._records)
+            changed = False
+            replay_keys: list[str] = []
+            for key, record in list(proposed_records.items()):
+                if record.state == "pending" and record.task_payload is None:
+                    del proposed_records[key]
+                    changed = True
+                    continue
                 if record.state in {"pending", "processing", "finalizing"}:
-                    # A partially allocated request without a bound upload/output
-                    # description cannot be safely replayed.
                     if record.task_payload is None:
                         raise TaskProtocolConflict(
                             "nonterminal task has no durable replay payload"
@@ -348,23 +398,60 @@ class DurableTaskRegistry:
                         record.state = "pending"
                         record.reserved_result_bytes = 0
                         record.recovery_generation += 1
-                        self._prepare_clean_replay(record)
-                if record.task_payload is not None and record.state != "consumed":
-                    recovered = dict(record.task_payload)
-                    recovered.pop("_agent_protocol", None)
-                    recovered["status"] = (
-                        "pending"
-                        if record.state in {"pending", "processing", "finalizing"}
-                        else record.state
-                    )
-                    recovered["result_artifact_path"] = record.result_path
-                    recovered["result_artifact_sha256"] = record.result_sha256
-                    recovered["result_artifact_bytes"] = record.result_bytes
-                    recovered["result_artifact_owner"] = record.result_owner
-                    recovered["error"] = record.error
-                    recoverable.append(recovered)
-            self._persist()
-            return tuple(recoverable)
+                        record.error = None
+                        changed = True
+                    ownership = record.task_payload.get("_agent_protocol")
+                    if (
+                        not isinstance(ownership, dict)
+                        or ownership.get("schema")
+                        != "mineru-task-payload-owner.v1"
+                    ):
+                        raise TaskProtocolConflict(
+                            "recoverable task payload ownership receipt is invalid"
+                        )
+                    if ownership.get("generation") != record.recovery_generation:
+                        ownership["generation"] = record.recovery_generation
+                        changed = True
+                    replay_keys.append(key)
+
+            if changed:
+                self._commit_registry_transition(
+                    proposed_records,
+                    self._submission_watermark_bucket,
+                )
+
+            # Filesystem replay cleanup is intentionally after the registry
+            # transition.  The durable pending state and ownership receipt then
+            # make a partial cleanup failure safe to retry on the next call.
+            for key in replay_keys:
+                current_record = self._records.get(key)
+                if (
+                    current_record is None
+                    or current_record.state != "pending"
+                    or current_record.task_payload is None
+                ):
+                    continue
+                self._prepare_clean_replay(copy.deepcopy(current_record))
+
+            hydrated: list[dict[str, Any]] = []
+            for record in self._records.values():
+                if record.task_payload is None or record.state == "consumed":
+                    continue
+                recovered = copy.deepcopy(record.task_payload)
+                recovered.pop("_agent_protocol", None)
+                recovered["status"] = (
+                    "pending"
+                    if record.state in {"pending", "processing", "finalizing"}
+                    else record.state
+                )
+                recovered["result_artifact_path"] = record.result_path
+                recovered["result_artifact_sha256"] = record.result_sha256
+                recovered["result_artifact_bytes"] = record.result_bytes
+                recovered["result_artifact_owner"] = record.result_owner
+                recovered["error"] = record.error
+                hydrated.append(recovered)
+            return tuple(hydrated)
+
 
     def _prepare_clean_replay(self, record: DurableTaskRecord) -> None:
         payload = record.task_payload or {}
@@ -488,6 +575,56 @@ class DurableTaskRegistry:
             raise
         return root_fd, task_fd
 
+    @staticmethod
+    def _fsync_namespace_directory(fd: int) -> None:
+        """Commit directory-entry changes before durable ownership is released."""
+        os.fsync(fd)
+
+    @staticmethod
+    def _close_namespace_descriptors(
+        descriptors: tuple[tuple[int, str], ...],
+        primary_error: BaseException | None,
+    ) -> None:
+        """Close every fd without replacing an earlier delete/fsync failure."""
+        close_error: BaseException | None = None
+        for descriptor, label in descriptors:
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        f"{label} close also failed: {type(exc).__name__}"
+                    )
+                elif close_error is None:
+                    close_error = exc
+                else:
+                    close_error.add_note(
+                        f"{label} close also failed: {type(exc).__name__}"
+                    )
+        if primary_error is None and close_error is not None:
+            raise close_error
+
+    @classmethod
+    def _sync_namespace_path(cls, directory: Path) -> None:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        primary_error: BaseException | None = None
+        try:
+            cls._fsync_namespace_directory(descriptor)
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            cls._close_namespace_descriptors(
+                ((descriptor, "cleanup namespace directory"),),
+                primary_error,
+            )
+
     @classmethod
     def _remove_at(cls, parent_fd: int, name: str) -> None:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -498,14 +635,23 @@ class DurableTaskRegistry:
                 name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd,
             )
+            primary_error: BaseException | None = None
             try:
                 for child in os.listdir(child_fd):
                     cls._remove_at(child_fd, child)
+                cls._fsync_namespace_directory(child_fd)
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
-                os.close(child_fd)
+                cls._close_namespace_descriptors(
+                    ((child_fd, "cleanup child directory"),),
+                    primary_error,
+                )
             os.rmdir(name, dir_fd=parent_fd)
         else:
             os.unlink(name, dir_fd=parent_fd)
+        cls._fsync_namespace_directory(parent_fd)
 
     def _validate_key_lifecycle(self, key: str) -> int | None:
         if not self._enforce_key_lifecycle:
@@ -528,7 +674,7 @@ class DurableTaskRegistry:
     def _records_without_expired_tombstones(
         self,
     ) -> dict[str, DurableTaskRecord]:
-        proposed = dict(self._records)
+        proposed = self._clone_records(self._records)
         if not self._enforce_key_lifecycle:
             return proposed
         cutoff = self._clock() - self._retention
@@ -674,17 +820,38 @@ class DurableTaskRegistry:
             record.reserved_result_bytes = byte_budget
             self._persist()
 
+
     @property
     def reserved_result_bytes(self) -> int:
-        return sum(record.reserved_result_bytes for record in self._records.values())
+        with self._lock:
+            durable = sum(
+                record.reserved_result_bytes for record in self._records.values()
+            )
+            if self._uncertain_records is None:
+                return durable
+            candidate = sum(
+                record.reserved_result_bytes
+                for record in self._uncertain_records.values()
+            )
+            return max(durable, candidate)
+
+
 
     @property
     def unacked_result_bytes(self) -> int:
-        return sum(
-            record.result_bytes or 0
-            for record in self._records.values()
-            if record.state in {"completed", "cleanup_pending", "consumed"} and record.result_path
-        )
+        def usage(records: dict[str, DurableTaskRecord]) -> int:
+            return sum(
+                record.result_bytes or 0
+                for record in records.values()
+                if record.state in {"completed", "cleanup_pending"}
+            )
+
+        with self._lock:
+            durable = usage(self._records)
+            if self._uncertain_records is None:
+                return durable
+            return max(durable, usage(self._uncertain_records))
+
 
     def lease(self, idempotency_key: str, *, seconds: float) -> float:
         if seconds <= 0:
@@ -702,7 +869,17 @@ class DurableTaskRegistry:
         path = self.acquire_result(idempotency_key)
         try:
             yield path
-        finally:
+        except BaseException as primary_error:
+            try:
+                self.release_result(idempotency_key)
+            except BaseException as release_error:
+                primary_error.add_note(
+                    "result reader release also failed: "
+                    f"{type(release_error).__name__}"
+                )
+                raise primary_error from release_error
+            raise
+        else:
             self.release_result(idempotency_key)
 
     def acquire_result(self, idempotency_key: str) -> Path:
@@ -719,9 +896,9 @@ class DurableTaskRegistry:
     def release_result(self, idempotency_key: str) -> None:
         with self._lock:
             current = self._required(idempotency_key)
-            current.active_readers -= 1
-            if current.active_readers < 0:
+            if current.active_readers < 1:
                 raise RuntimeError("result reader count underflowed")
+            current.active_readers -= 1
             self._persist()
 
     def acknowledge(self, idempotency_key: str) -> None:
@@ -804,13 +981,15 @@ class DurableTaskRegistry:
                 return
             if not self._enforce_key_lifecycle:
                 if record.result_path:
+                    result_path = Path(record.result_path)
                     if before_unlink is None:
-                        Path(record.result_path).unlink(missing_ok=True)
+                        result_path.unlink(missing_ok=True)
                     else:
                         try:
-                            before_unlink(Path(record.result_path))
+                            before_unlink(result_path)
                         except FileNotFoundError:
                             pass
+                    self._sync_namespace_path(result_path.parent)
                 return
             raise TaskProtocolConflict("cleanup task ownership receipt is absent")
         output = Path(output_value)
@@ -828,6 +1007,7 @@ class DurableTaskRegistry:
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
             )
+            primary_error: BaseException | None = None
             try:
                 root_meta = os.fstat(root_fd)
                 if (
@@ -854,29 +1034,70 @@ class DurableTaskRegistry:
                         raise TaskProtocolConflict(
                             "owned task directory was renamed during cleanup"
                         )
+                # A prior attempt may have removed the task entry before its
+                # output-parent fsync.  Syncing the still-pinned output root
+                # makes the observed absence durable before consuming intent.
+                self._fsync_namespace_directory(root_fd)
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
-                os.close(root_fd)
+                self._close_namespace_descriptors(
+                    ((root_fd, "cleanup output root"),),
+                    primary_error,
+                )
             return
+        cleanup_error: BaseException | None = None
         try:
             if self._directory_identity(os.fstat(task_fd)) != protocol.get(
                 "task_root_identity"
             ):
                 raise TaskProtocolConflict("cleanup task directory identity drifted")
-            upload_fd = os.open(
-                "uploads",
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=task_fd,
-            )
+            expected_upload_root = protocol.get("uploads_root_identity")
+            if not isinstance(expected_upload_root, dict):
+                raise TaskProtocolConflict("cleanup uploads identity is absent")
             try:
-                if self._directory_identity(os.fstat(upload_fd)) != protocol.get(
-                    "uploads_root_identity"
-                ):
+                upload_fd = os.open(
+                    "uploads",
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=task_fd,
+                )
+            except FileNotFoundError:
+                # A prior cleanup attempt may already have removed the owned
+                # uploads tree.  Reject a rename of that same inode, but allow
+                # exact intent replay to continue with the remaining children.
+                entries = os.listdir(task_fd)
+                if len(entries) > _MAX_RECORDS + _MAX_TOMBSTONES:
                     raise TaskProtocolConflict(
-                        "cleanup uploads directory identity drifted"
+                        "cleanup task-root scan exceeded bound"
                     )
-            finally:
-                os.close(upload_fd)
+                for entry in entries:
+                    metadata = os.stat(
+                        entry, dir_fd=task_fd, follow_symlinks=False
+                    )
+                    if (
+                        metadata.st_dev == expected_upload_root.get("device")
+                        and metadata.st_ino == expected_upload_root.get("inode")
+                    ):
+                        raise TaskProtocolConflict(
+                            "owned uploads directory was renamed during cleanup"
+                        )
+            else:
+                upload_error: BaseException | None = None
+                try:
+                    if self._directory_identity(os.fstat(upload_fd)) != expected_upload_root:
+                        raise TaskProtocolConflict(
+                            "cleanup uploads directory identity drifted"
+                        )
+                except BaseException as exc:
+                    upload_error = exc
+                    raise
+                finally:
+                    self._close_namespace_descriptors(
+                        ((upload_fd, "cleanup uploads directory"),),
+                        upload_error,
+                    )
             if record.cleanup_kind == "result":
                 result_metadata: os.stat_result | None
                 try:
@@ -894,13 +1115,26 @@ class DurableTaskRegistry:
                     before_unlink(result)
             for child in os.listdir(task_fd):
                 self._remove_at(task_fd, child)
-            os.close(task_fd)
+            self._fsync_namespace_directory(task_fd)
+            closing_task_fd = task_fd
             task_fd = -1
+            self._close_namespace_descriptors(
+                ((closing_task_fd, "cleanup task directory"),),
+                None,
+            )
             os.rmdir(record.task_id, dir_fd=root_fd)
+            self._fsync_namespace_directory(root_fd)
+        except BaseException as exc:
+            cleanup_error = exc
+            raise
         finally:
-            if task_fd >= 0:
-                os.close(task_fd)
-            os.close(root_fd)
+            self._close_namespace_descriptors(
+                (
+                    (task_fd, "cleanup task directory"),
+                    (root_fd, "cleanup output root"),
+                ),
+                cleanup_error,
+            )
 
     def _required(self, key: str) -> DurableTaskRecord:
         try:
@@ -1063,51 +1297,626 @@ class DurableTaskRegistry:
                     raise TaskProtocolConflict("retained result identity drifted")
         return loaded
 
-    def _persist(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            {
-                "schema": "mineru-task-registry.v2",
-                "output_root": {
-                    "path": str(self._output_root),
-                    "device": self._output_root_identity[0],
-                    "inode": self._output_root_identity[1],
-                    "uid": self._output_root_identity[2],
-                    "mode": self._output_root_identity[3],
-                },
-                "submission_watermark_bucket": self._submission_watermark_bucket,
-                "records": [
-                    asdict(record)
-                    for record in sorted(
-                        self._records.values(), key=lambda item: item.idempotency_key
-                    )
-                ],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        if len(payload) > _MAX_REGISTRY_BYTES:
-            raise TaskProtocolConflict("task registry exceeds the closed envelope")
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{self._path.name}-",
-            suffix=".tmp",
-            dir=self._path.parent,
+
+    @staticmethod
+    def _clone_records(
+        records: dict[str, DurableTaskRecord],
+    ) -> dict[str, DurableTaskRecord]:
+        return copy.deepcopy(records)
+
+    def _restore_last_durable_state(self) -> None:
+        self._records = self._clone_records(self._last_durable_records)
+        self._submission_watermark_bucket = (
+            self._last_durable_watermark_bucket
         )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as target:
-                os.fchmod(target.fileno(), 0o600)
-                target.write(payload)
-                target.flush()
-                os.fsync(target.fileno())
-            os.replace(temporary, self._path)
-            directory = os.open(self._path.parent, os.O_RDONLY)
+
+    def _current_state_differs_from_last_durable(self) -> bool:
+        return (
+            self._submission_watermark_bucket
+            != self._last_durable_watermark_bucket
+            or self._records != self._last_durable_records
+        )
+
+    def _record_persistence_event(
+        self,
+        *,
+        outcome: str,
+        phase: str,
+        committed: bool,
+        operation: str | None = None,
+        cause: BaseException | None = None,
+        cleanup_cause: BaseException | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "outcome": outcome,
+            "phase": phase,
+            "committed": committed,
+            "operation": operation or self._active_operation,
+        }
+        if cause is not None:
+            event["cause_type"] = type(cause).__name__
+        if cleanup_cause is not None:
+            event["cleanup_cause_type"] = type(cleanup_cause).__name__
+        self._last_persistence_event = event
+        self._last_persistence_cause = cause
+        self._last_persistence_cleanup_cause = cleanup_cause
+
+    def persistence_status(self) -> dict[str, Any]:
+        with self._lock:
+            if self._uncertain_records is not None:
+                state = "durability_uncertain"
+                event = self._last_persistence_event or {}
+                if event.get("operation") in {"acquire_result", "release_result"}:
+                    recovery_action = "restart_registry_process"
+                else:
+                    recovery_action = "call recover_persistence_uncertainty"
+            elif self._last_persistence_event is not None:
+                state = "degraded"
+                event = self._last_persistence_event
+                if bool(event.get("committed")):
+                    recovery_action = "do_not_retry_committed_operation"
+                else:
+                    recovery_action = "retry_idempotent_operation"
+            else:
+                state = "healthy"
+                recovery_action = None
+            return {
+                "state": state,
+                "last_event": copy.deepcopy(self._last_persistence_event),
+                "candidate_idempotency_keys": sorted(
+                    self._uncertain_records or {}
+                ),
+                "recovery_action": recovery_action,
+            }
+
+    def recover_persistence_uncertainty(self) -> dict[str, Any]:
+        """Durably reconcile an ambiguous replace without cold-decoding readers.
+
+        Exact saved snapshots are selected only after a successful parent fsync
+        and stable byte reread.  Reader-count mutations require a cold process
+        restart because a failed acquire may not have returned a handle and a
+        failed release may already have relinquished one.
+        """
+        with self._lock:
+            if self._uncertain_records is None:
+                return self.persistence_status()
+            event = self._last_persistence_event or {}
+            operation = str(event.get("operation", "unknown"))
+            original_cause = self._last_persistence_cause
+            original_cleanup_cause = self._last_persistence_cleanup_cause
+            if operation in {"acquire_result", "release_result"}:
+                error = TaskRegistryPersistenceError(
+                    operation=operation,
+                    phase="reader_mutation_requires_cold_restart",
+                    outcome="durability_uncertain",
+                    committed=False,
+                )
+                cause = original_cleanup_cause or original_cause
+                if cause is None:
+                    raise error
+                raise error from cause
+            candidate_payload = self._uncertain_payload
+            candidate_records = self._uncertain_records
+            candidate_watermark = self._uncertain_watermark_bucket
+            if candidate_payload is None or candidate_watermark is None:
+                raise TaskProtocolConflict(
+                    "task registry uncertainty snapshot is incomplete"
+                )
             try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+                visible = self._read_current_registry_bytes()
+                if visible not in {candidate_payload, self._durable_payload}:
+                    raise TaskProtocolConflict(
+                        "task registry bytes changed during explicit recovery"
+                    )
+                close_error = self._sync_parent_directory()
+                visible_after = self._read_current_registry_bytes()
+                if visible_after != visible:
+                    raise TaskProtocolConflict(
+                        "task registry bytes changed during explicit recovery"
+                    )
+            except BaseException as exc:
+                self._record_persistence_event(
+                    outcome="durability_uncertain",
+                    phase="explicit_parent_fsync",
+                    committed=False,
+                    operation=operation,
+                    cause=exc,
+                )
+                raise TaskRegistryPersistenceError(
+                    operation=operation,
+                    phase="explicit_parent_fsync",
+                    outcome="durability_uncertain",
+                    committed=False,
+                ) from exc
+
+            if visible == candidate_payload:
+                self._records = self._clone_records(candidate_records)
+                self._submission_watermark_bucket = candidate_watermark
+                if close_error is None:
+                    self._mark_durable_commit(
+                        candidate_payload,
+                        outcome="committed_after_explicit_recovery",
+                        phase="explicit_parent_fsync",
+                        operation=operation,
+                    )
+                else:
+                    self._mark_durable_commit(
+                        candidate_payload,
+                        outcome="committed_cleanup_failed",
+                        phase="explicit_parent_close",
+                        cause=original_cause,
+                        cleanup_cause=close_error,
+                        operation=operation,
+                    )
+            else:
+                self._restore_last_durable_state()
+                self._uncertain_records = None
+                self._uncertain_watermark_bucket = None
+                self._uncertain_payload = None
+                self._persistence_generation += 1
+                outcome = "not_committed_after_explicit_recovery"
+                phase = "explicit_parent_fsync"
+                if close_error is not None:
+                    outcome = "not_committed_cleanup_failed"
+                    phase = "explicit_parent_close"
+                self._record_persistence_event(
+                    outcome=outcome,
+                    phase=phase,
+                    committed=False,
+                    operation=operation,
+                    cause=original_cause,
+                    cleanup_cause=close_error or original_cleanup_cause,
+                )
+            return self.persistence_status()
+
+    def _raise_current_persistence_error(
+        self,
+        *,
+        operation: str,
+        phase: str,
+        outcome: str,
+        committed: bool,
+    ) -> None:
+        error = TaskRegistryPersistenceError(
+            operation=operation,
+            phase=phase,
+            outcome=outcome,
+            committed=committed,
+        )
+        cause = self._last_persistence_cleanup_cause or self._last_persistence_cause
+        if cause is None:
+            raise error
+        raise error from cause
+
+    def assert_observation_safe(self) -> None:
+        if self._uncertain_records is None:
+            return
+        event = self._last_persistence_event or {}
+        self._raise_current_persistence_error(
+            operation=str(event.get("operation", self._active_operation)),
+            phase=str(event.get("phase", "replace_reconciliation")),
+            outcome="durability_uncertain",
+            committed=False,
+        )
+
+    def assert_persistence_healthy(self) -> None:
+        with self._lock:
+            event = self._last_persistence_event
+            if event is None:
+                return
+            self._raise_current_persistence_error(
+                operation=str(event["operation"]),
+                phase=str(event["phase"]),
+                outcome=str(event["outcome"]),
+                committed=bool(event["committed"]),
+            )
+
+    def _ensure_mutation_allowed(self, operation: str) -> None:
+        if self._uncertain_records is None:
+            return
+        event = self._last_persistence_event or {}
+        self._raise_current_persistence_error(
+            operation=operation,
+            phase=str(event.get("phase", "replace_reconciliation")),
+            outcome="durability_uncertain",
+            committed=False,
+        )
+
+    def _read_current_registry_bytes(self) -> bytes | None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self._path, flags)
+        except FileNotFoundError:
+            return None
+        try:
+            before = os.fstat(fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or not 0 < before.st_size <= _MAX_REGISTRY_BYTES
+            ):
+                raise TaskProtocolConflict(
+                    "task registry file identity is unsafe"
+                )
+            chunks: list[bytes] = []
+            remaining = _MAX_REGISTRY_BYTES + 1
+            while remaining:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(fd)
+
+            def identity(value: os.stat_result) -> tuple[int, ...]:
+                return (
+                    value.st_dev,
+                    value.st_ino,
+                    value.st_mode,
+                    value.st_uid,
+                    value.st_nlink,
+                    value.st_size,
+                    value.st_mtime_ns,
+                    value.st_ctime_ns,
+                )
+
+            if len(raw) != before.st_size or identity(before) != identity(after):
+                raise TaskProtocolConflict(
+                    "task registry changed while reading"
+                )
+            return raw
         finally:
-            temporary.unlink(missing_ok=True)
+            os.close(fd)
+
+    @staticmethod
+    def _write_registry_stream(stream: Any, payload: bytes) -> None:
+        written = stream.write(payload)
+        if written != len(payload):
+            raise OSError("short task registry write")
+
+    @staticmethod
+    def _flush_registry_stream(stream: Any) -> None:
+        stream.flush()
+
+    @staticmethod
+    def _fsync_registry_file(fd: int) -> None:
+        os.fsync(fd)
+
+    @staticmethod
+    def _close_registry_stream(stream: Any) -> None:
+        stream.close()
+
+    @staticmethod
+    def _replace_registry_file(source: Path, destination: Path) -> None:
+        os.replace(source, destination)
+
+    @staticmethod
+    def _fsync_parent_descriptor(fd: int) -> None:
+        os.fsync(fd)
+
+    @staticmethod
+    def _close_parent_descriptor(fd: int) -> None:
+        os.close(fd)
+
+    @staticmethod
+    def _cleanup_temp_path(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _sync_parent_directory(self) -> BaseException | None:
+        directory_fd = os.open(
+            self._path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        fsync_error: BaseException | None = None
+        close_error: BaseException | None = None
+        try:
+            self._fsync_parent_descriptor(directory_fd)
+        except BaseException as exc:
+            fsync_error = exc
+        try:
+            self._close_parent_descriptor(directory_fd)
+        except BaseException as exc:
+            close_error = exc
+        if fsync_error is not None:
+            if close_error is not None:
+                fsync_error.add_note(
+                    "task registry parent close also failed: "
+                    f"{type(close_error).__name__}"
+                )
+            raise fsync_error
+        return close_error
+
+    def _mark_durable_commit(
+        self,
+        payload: bytes,
+        *,
+        outcome: str | None = None,
+        phase: str = "parent_fsync",
+        cause: BaseException | None = None,
+        cleanup_cause: BaseException | None = None,
+        operation: str | None = None,
+    ) -> None:
+        self._durable_payload = payload
+        self._last_durable_records = self._clone_records(self._records)
+        self._last_durable_watermark_bucket = (
+            self._submission_watermark_bucket
+        )
+        self._uncertain_records = None
+        self._uncertain_watermark_bucket = None
+        self._uncertain_payload = None
+        self._persistence_generation += 1
+        if outcome is None:
+            self._last_persistence_event = None
+            self._last_persistence_cause = None
+            self._last_persistence_cleanup_cause = None
+        else:
+            self._record_persistence_event(
+                outcome=outcome,
+                phase=phase,
+                committed=True,
+                operation=operation,
+                cause=cause,
+                cleanup_cause=cleanup_cause,
+            )
+
+    def _raise_persistence_failure(
+        self,
+        *,
+        outcome: str,
+        phase: str,
+        candidate_payload: bytes,
+        cause: BaseException | None = None,
+        cleanup_cause: BaseException | None = None,
+    ) -> None:
+        if outcome == "durability_uncertain":
+            self._uncertain_records = self._clone_records(self._records)
+            self._uncertain_watermark_bucket = (
+                self._submission_watermark_bucket
+            )
+            self._uncertain_payload = candidate_payload
+        self._record_persistence_event(
+            outcome=outcome,
+            phase=phase,
+            committed=False,
+            cause=cause,
+            cleanup_cause=cleanup_cause,
+        )
+        error = TaskRegistryPersistenceError(
+            operation=self._active_operation,
+            phase=phase,
+            outcome=outcome,
+            committed=False,
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
+    def _resolve_replace_outcome(
+        self,
+        *,
+        candidate_payload: bytes,
+        phase: str,
+        primary_error: BaseException,
+        cleanup_error: BaseException | None,
+    ) -> None:
+        try:
+            visible = self._read_current_registry_bytes()
+        except BaseException as exc:
+            self._raise_persistence_failure(
+                outcome="durability_uncertain",
+                phase=f"{phase}_readback",
+                candidate_payload=candidate_payload,
+                cause=exc,
+                cleanup_cause=cleanup_error,
+            )
+        previous_payload = self._durable_payload
+        if visible == candidate_payload:
+            visible_kind = "candidate"
+        elif visible == previous_payload:
+            visible_kind = "previous"
+        else:
+            self._raise_persistence_failure(
+                outcome="durability_uncertain",
+                phase=f"{phase}_ambiguous_bytes",
+                candidate_payload=candidate_payload,
+                cause=primary_error,
+                cleanup_cause=cleanup_error,
+            )
+            raise AssertionError("unreachable")
+        retry_phase = (
+            "parent_fsync_retry"
+            if phase == "parent_fsync"
+            else f"{phase}_parent_fsync_retry"
+        )
+        try:
+            close_error = self._sync_parent_directory()
+            visible_after = self._read_current_registry_bytes()
+        except BaseException as exc:
+            self._raise_persistence_failure(
+                outcome="durability_uncertain",
+                phase=retry_phase,
+                candidate_payload=candidate_payload,
+                cause=exc,
+                cleanup_cause=cleanup_error,
+            )
+            raise AssertionError("unreachable")
+        if visible_after != visible:
+            self._raise_persistence_failure(
+                outcome="durability_uncertain",
+                phase=f"{phase}_changed_during_reconciliation",
+                candidate_payload=candidate_payload,
+                cause=primary_error,
+                cleanup_cause=cleanup_error,
+            )
+        if visible_kind == "previous":
+            self._raise_persistence_failure(
+                outcome="not_committed",
+                phase=f"{phase}_previous_durable",
+                candidate_payload=candidate_payload,
+                cause=primary_error,
+                cleanup_cause=cleanup_error or close_error,
+            )
+        warning = cleanup_error or close_error
+        if warning is None:
+            self._mark_durable_commit(
+                candidate_payload,
+                outcome="committed_after_recovery",
+                phase=retry_phase,
+                cause=primary_error,
+            )
+            return
+        self._mark_durable_commit(
+            candidate_payload,
+            outcome="committed_cleanup_failed",
+            phase=f"{phase}_cleanup_after_recovery",
+            cause=primary_error,
+            cleanup_cause=warning,
+        )
+
+    def _persist_serialized_payload(self, payload: bytes) -> None:
+        temp_path: Path | None = None
+        stream: Any | None = None
+        raw_fd: int | None = None
+        phase = "temp_create"
+        replace_attempted = False
+        durability_established = False
+        primary_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        parent_close_error: BaseException | None = None
+        try:
+            raw_fd, temp_name = tempfile.mkstemp(
+                prefix=f".{self._path.name}.",
+                suffix=".tmp",
+                dir=self._path.parent,
+            )
+            temp_path = Path(temp_name)
+            stream = os.fdopen(raw_fd, "wb")
+            raw_fd = None
+            phase = "write"
+            self._write_registry_stream(stream, payload)
+            phase = "flush"
+            self._flush_registry_stream(stream)
+            phase = "file_fsync"
+            self._fsync_registry_file(stream.fileno())
+            phase = "file_close"
+            self._close_registry_stream(stream)
+            stream = None
+            phase = "replace"
+            replace_attempted = True
+            self._replace_registry_file(temp_path, self._path)
+            phase = "parent_fsync"
+            parent_close_error = self._sync_parent_directory()
+            durability_established = True
+        except BaseException as exc:
+            primary_error = exc
+        if stream is not None:
+            try:
+                self._close_registry_stream(stream)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if raw_fd is not None:
+            try:
+                os.close(raw_fd)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        if temp_path is not None:
+            try:
+                self._cleanup_temp_path(temp_path)
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+
+        if durability_established:
+            warning = cleanup_error or parent_close_error
+            if warning is None:
+                self._mark_durable_commit(payload)
+                return
+            self._mark_durable_commit(
+                payload,
+                outcome="committed_cleanup_failed",
+                phase="post_commit_cleanup",
+                cleanup_cause=warning,
+            )
+            return
+
+        if primary_error is None:
+            primary_error = cleanup_error or OSError(
+                "registry persistence did not commit"
+            )
+        if replace_attempted:
+            self._resolve_replace_outcome(
+                candidate_payload=payload,
+                phase=phase,
+                primary_error=primary_error,
+                cleanup_error=cleanup_error,
+            )
+            return
+        if cleanup_error is not None and cleanup_error is not primary_error:
+            primary_error.add_note(
+                "task registry temp cleanup also failed: "
+                f"{type(cleanup_error).__name__}"
+            )
+        # Before replace, the target name was never exchanged.
+        self._raise_persistence_failure(
+            outcome="not_committed",
+            phase=phase if cleanup_error is None else f"{phase}_temp_cleanup",
+            candidate_payload=payload,
+            cause=primary_error,
+            cleanup_cause=cleanup_error,
+        )
+
+    def _persist(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                {
+                    "schema": "mineru-task-registry.v2",
+                    "output_root": {
+                        "path": str(self._output_root),
+                        "device": self._output_root_identity[0],
+                        "inode": self._output_root_identity[1],
+                        "uid": self._output_root_identity[2],
+                        "mode": self._output_root_identity[3],
+                    },
+                    "submission_watermark_bucket": self._submission_watermark_bucket,
+                    "records": [
+                        asdict(record)
+                        for record in sorted(
+                            self._records.values(), key=lambda item: item.idempotency_key
+                        )
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            if len(payload) > _MAX_REGISTRY_BYTES:
+                raise TaskProtocolConflict(
+                    "task registry exceeds the closed envelope"
+                )
+        except TaskProtocolConflict:
+            raise
+        except BaseException as exc:
+            self._record_persistence_event(
+                outcome="not_committed",
+                phase="serialize_or_prepare",
+                committed=False,
+                cause=exc,
+            )
+            raise TaskRegistryPersistenceError(
+                operation=self._active_operation,
+                phase="serialize_or_prepare",
+                outcome="not_committed",
+                committed=False,
+            ) from exc
+        self._persist_serialized_payload(payload)
+
 
 
 def inspect_quiescent_output_root(
@@ -1232,6 +2041,75 @@ def inspect_quiescent_output_root(
             os.close(descriptor)
 
 
+_REGISTRY_MUTATOR_NAMES = (
+    "abandon_unbound",
+    "acknowledge",
+    "acknowledge_failed",
+    "acquire_result",
+    "bind_task_payload",
+    "cleanup_consumed",
+    "complete",
+    "fail",
+    "lease",
+    "reconcile_or_create",
+    "recoverable_payloads",
+    "release_result",
+    "reserve_finalizer",
+    "transition",
+)
+
+
+def _transactional_registry_mutator(method: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(method)
+    def wrapped(self: DurableTaskRegistry, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            operation = method.__name__
+            self._ensure_mutation_allowed(operation)
+            previous_operation = self._active_operation
+            starting_generation = self._persistence_generation
+            self._active_operation = operation
+            try:
+                result = method(self, *args, **kwargs)
+            except BaseException as exc:
+                changed_without_commit = (
+                    self._persistence_generation == starting_generation
+                    and self._current_state_differs_from_last_durable()
+                )
+                self._restore_last_durable_state()
+                if (
+                    changed_without_commit
+                    and not isinstance(
+                        exc,
+                        (TaskProtocolConflict, TaskRegistryPersistenceError),
+                    )
+                ):
+                    # Test/fault probes may replace _persist itself and thereby
+                    # bypass phase classification.  Roll back safely and retain
+                    # the original injected exception for compatibility.
+                    self._record_persistence_event(
+                        outcome="not_committed",
+                        phase="persist_call",
+                        committed=False,
+                        operation=operation,
+                    )
+                raise
+            finally:
+                self._active_operation = previous_operation
+            return copy.deepcopy(result)
+
+    return wrapped
+
+
+for _registry_mutator_name in _REGISTRY_MUTATOR_NAMES:
+    setattr(
+        DurableTaskRegistry,
+        _registry_mutator_name,
+        _transactional_registry_mutator(
+            getattr(DurableTaskRegistry, _registry_mutator_name)
+        ),
+    )
+
+
 class SplitTaskExecutor:
     """Separate parse and finalizer credits with explicit state transitions."""
 
@@ -1271,6 +2149,8 @@ class SplitTaskExecutor:
                 result_bytes=byte_count,
                 result_owner=owner,
             )
+        except TaskRegistryPersistenceError:
+            raise
         except BaseException as exc:
             record = registry.get(key)
             if record is not None and record.state in {"processing", "finalizing"}:
@@ -1300,6 +2180,7 @@ def task_protocol_runtime_status(
     }
     if any(type(value) is not int or value < 1 for value in limits.values()):
         raise TaskProtocolConflict("task protocol runtime limits are invalid")
+    registry.assert_persistence_healthy()
     return {"schema": "mineru-task-runtime.v1", "enabled": True, **limits}
 
 
@@ -1320,6 +2201,7 @@ def evict_consumed_routes(
 
 
 __all__ = [
+    "TaskRegistryPersistenceError",
     "DurableTaskRecord",
     "DurableTaskRegistry",
     "SplitTaskExecutor",

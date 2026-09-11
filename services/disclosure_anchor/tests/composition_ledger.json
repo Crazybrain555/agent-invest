@@ -454,6 +454,10 @@
    "private_imports": [],
    "tests": 37
   },
+  "tests/unit/test_mineru_task_registry_persistence.py": {
+   "private_imports": [],
+   "tests": 27
+  },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],
    "tests": 5
@@ -710,7 +714,7 @@
   },
   "tests/unit/test_synchronized_telemetry_observer_v3.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],
