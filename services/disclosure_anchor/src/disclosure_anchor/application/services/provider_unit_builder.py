@@ -1,9 +1,10 @@
-"""Build one thin Unit per coarse section from an admitted provider document."""
+"""Build thin Units with separate admitted and source-only entrypoints."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import re
 import string
 
 from disclosure_anchor.application.contracts.applicability_selector import (
@@ -28,6 +29,15 @@ from disclosure_anchor.application.contracts.provider_document import (
     ProviderDocument,
     ProviderPayload,
     provider_payload_field_contract,
+)
+from disclosure_anchor.application.contracts._provider_content import (
+    validate_provider_content,
+)
+from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
+from disclosure_anchor.application.contracts.provider_source_semantics import (
+    ProviderSourceSemantics,
+    SourceTextReconciliation,
+    SourceQualityFinding,
 )
 from disclosure_anchor.application.contracts.provider_document_admission import (
     AdmittedProviderDocument,
@@ -90,15 +100,156 @@ class ProviderUnitSearchRowAtom:
     row_text: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ProviderBuildInput:
+    """Validated semantic values for the shared build and replay kernel."""
+
+    document: ProviderDocument
+    provider_document_sha256: str
+    source_text_reconciliations: tuple[SourceTextReconciliation, ...]
+    source_quality_findings: tuple[SourceQualityFinding, ...]
+
+
+def _admitted_build_input(admitted: AdmittedProviderDocument) -> _ProviderBuildInput:
+    if type(admitted) is not AdmittedProviderDocument:
+        raise TypeError("provider Unit build/replay requires AdmittedProviderDocument")
+    return _ProviderBuildInput(
+        admitted.effective_provider_document,
+        admitted.provider_document_sha256,
+        admitted.source_text_reconciliations,
+        admitted.source_quality_findings,
+    )
+
+
+def _source_build_input(
+    semantics: ProviderSourceSemantics,
+    *,
+    semantic_record_sha256: str,
+    target_identity: ParserTargetIdentity,
+) -> _ProviderBuildInput:
+    if type(semantics) is not ProviderSourceSemantics:
+        raise TypeError("source-only Unit build/replay requires ProviderSourceSemantics")
+    if type(target_identity) is not ParserTargetIdentity:
+        raise TypeError("source-only Unit build/replay requires ParserTargetIdentity")
+    if not isinstance(semantic_record_sha256, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", semantic_record_sha256
+    ) is None:
+        raise ValueError("source semantic record hash must be canonical")
+    validate_provider_content(semantics.provider_document, target_identity)
+    return _ProviderBuildInput(
+        semantics.effective_provider_document,
+        semantic_record_sha256,
+        semantics.source_text_reconciliations,
+        semantics.source_quality_findings,
+    )
+
+
 def build_provider_units(
     admitted: AdmittedProviderDocument,
     *,
     level_hints: Iterable[HeadingLevelHint] = (),
     negative_hints: Iterable[HeadingNegativeHint] = (),
 ) -> ProviderUnitBuildResult:
-    """Build deterministic drafts; the capability cannot be bypassed with a DTO."""
+    """Build deterministic drafts only through the production capability."""
 
-    document = admitted.effective_provider_document
+    return _build_provider_units(
+        _admitted_build_input(admitted),
+        level_hints=level_hints, negative_hints=negative_hints,
+    )
+
+
+def build_source_provider_units(
+    semantics: ProviderSourceSemantics,
+    *,
+    semantic_record_sha256: str,
+    target_identity: ParserTargetIdentity,
+    level_hints: Iterable[HeadingLevelHint] = (),
+    negative_hints: Iterable[HeadingNegativeHint] = (),
+) -> ProviderUnitBuildResult:
+    """Build diagnostic drafts; the caller binds a separate semantic record.
+
+    This pure operation neither verifies that record's bytes nor admits any
+    production document. Runtime evidence must establish the actual file reads.
+    """
+
+    return _build_provider_units(
+        _source_build_input(
+            semantics, semantic_record_sha256=semantic_record_sha256,
+            target_identity=target_identity,
+        ),
+        level_hints=level_hints, negative_hints=negative_hints,
+    )
+
+
+def replay_provider_unit_search_binding(
+    admitted: AdmittedProviderDocument,
+    draft: ProviderUnitDraft,
+    binding: ProviderUnitSearchBinding,
+) -> tuple[str, ...]:
+    """Replay one flat binding through the production capability."""
+
+    return _replay_provider_unit_search_binding(
+        _admitted_build_input(admitted), draft, binding
+    )
+
+
+def replay_provider_unit_search_binding_source_text(
+    admitted: AdmittedProviderDocument,
+    draft: ProviderUnitDraft,
+    binding: ProviderUnitSearchBinding,
+) -> str:
+    """Replay the immutable scalar through the production capability."""
+
+    return _replay_provider_unit_search_binding_source_text(
+        _admitted_build_input(admitted), draft, binding
+    )
+
+
+def replay_source_provider_unit_search_binding(
+    semantics: ProviderSourceSemantics,
+    draft: ProviderUnitDraft,
+    binding: ProviderUnitSearchBinding,
+    *,
+    semantic_record_sha256: str,
+    target_identity: ParserTargetIdentity,
+) -> tuple[str, ...]:
+    """Replay a diagnostic binding in its source semantic record domain."""
+
+    return _replay_provider_unit_search_binding(
+        _source_build_input(
+            semantics, semantic_record_sha256=semantic_record_sha256,
+            target_identity=target_identity,
+        ), draft, binding,
+    )
+
+
+def replay_source_provider_unit_search_binding_source_text(
+    semantics: ProviderSourceSemantics,
+    draft: ProviderUnitDraft,
+    binding: ProviderUnitSearchBinding,
+    *,
+    semantic_record_sha256: str,
+    target_identity: ParserTargetIdentity,
+) -> str:
+    """Replay a diagnostic source scalar without production authority."""
+
+    return _replay_provider_unit_search_binding_source_text(
+        _source_build_input(
+            semantics, semantic_record_sha256=semantic_record_sha256,
+            target_identity=target_identity,
+        ), draft, binding,
+    )
+
+
+def _build_provider_units(
+    build_input: _ProviderBuildInput,
+    *,
+    level_hints: Iterable[HeadingLevelHint] = (),
+    negative_hints: Iterable[HeadingNegativeHint] = (),
+) -> ProviderUnitBuildResult:
+    """Build and validate drafts from already validated semantic inputs."""
+
+    document = build_input.document
     outline = build_document_outline(
         document,
         level_hints=level_hints,
@@ -107,7 +258,7 @@ def build_provider_units(
     tables = build_provider_table_projection(document)
     retrieval = build_retrieval_primary_projection(document, outline, tables)
     context = _BuildContext(
-        admitted=admitted,
+        build_input=build_input,
         document=document,
         outline=outline,
         tables=tables,
@@ -118,7 +269,7 @@ def build_provider_units(
         part for part in tables.unbound_parts if part.part.block_source_index is None
     )
     result = ProviderUnitBuildResult(
-        provider_document_sha256=admitted.provider_document_sha256,
+        provider_document_sha256=build_input.provider_document_sha256,
         units=drafts,
         unassigned_table_parts=unassigned,
     )
@@ -130,13 +281,13 @@ class _BuildContext:
     def __init__(
         self,
         *,
-        admitted: AdmittedProviderDocument,
+        build_input: _ProviderBuildInput,
         document: ProviderDocument,
         outline: DocumentOutline,
         tables: ProviderTableProjection,
         retrieval: RetrievalPrimaryProjection,
     ) -> None:
-        self.admitted = admitted
+        self.build_input = build_input
         self.document = document
         self.outline = outline
         self.tables = tables
@@ -344,7 +495,7 @@ class _BuildContext:
         )
 
         locator = ProviderUnitLocator(
-            provider_document_sha256=self.admitted.provider_document_sha256,
+            provider_document_sha256=self.build_input.provider_document_sha256,
             unit_index=unit.unit_index,
             heading_chain=heading_chain,
             parts=tuple(part.ref for part in parts),
@@ -360,7 +511,7 @@ class _BuildContext:
                     source_text_sha256=item.source_text_sha256,
                     source_kind=item.source_kind,
                 )
-                for item in self.admitted.source_text_reconciliations
+                for item in self.build_input.source_text_reconciliations
                 if item.source_index
                 in {
                     *unit_sources,
@@ -382,7 +533,7 @@ class _BuildContext:
                     reason=item.reason,
                     source_kind=item.source_kind,
                 )
-                for item in self.admitted.source_quality_findings
+                for item in self.build_input.source_quality_findings
                 if item.source_index in unit_sources
             ),
             search_targets=tuple(search_bindings),
@@ -430,7 +581,7 @@ class _BuildContext:
             structure_hash=hashes.structure_hash,
         )
         for binding in locator.search_targets:
-            replay_provider_unit_search_binding(self.admitted, draft, binding)
+            _replay_provider_unit_search_binding(self.build_input, draft, binding)
         return draft
 
     def _heading_chain(
@@ -665,20 +816,20 @@ def _has_suspected_truncated_markup_title(
     return not any("\u4e00" <= character <= "\u9fff" for character in visible)
 
 
-def replay_provider_unit_search_binding(
-    admitted: AdmittedProviderDocument,
+def _replay_provider_unit_search_binding(
+    build_input: _ProviderBuildInput,
     draft: ProviderUnitDraft,
     binding: ProviderUnitSearchBinding,
 ) -> tuple[str, ...]:
     """Replay one flat binding and reject any Unit or source drift."""
 
-    if draft.locator.provider_document_sha256 != admitted.provider_document_sha256:
+    if draft.locator.provider_document_sha256 != build_input.provider_document_sha256:
         raise ValueError("provider Unit locator belongs to a different document")
     if binding not in draft.locator.search_targets:
         raise ValueError("search binding does not belong to the provider Unit")
     _validate_binding_owner(locator=draft.locator, binding=binding)
     return _replay_binding(
-        document=admitted.effective_provider_document,
+        document=build_input.document,
         payload=draft.payload,
         payload_kind=draft.payload_kind,
         title=draft.title,
@@ -686,20 +837,20 @@ def replay_provider_unit_search_binding(
     )
 
 
-def replay_provider_unit_search_binding_source_text(
-    admitted: AdmittedProviderDocument,
+def _replay_provider_unit_search_binding_source_text(
+    build_input: _ProviderBuildInput,
     draft: ProviderUnitDraft,
     binding: ProviderUnitSearchBinding,
 ) -> str:
     """Replay the immutable scalar before its retrieval transform."""
 
-    if draft.locator.provider_document_sha256 != admitted.provider_document_sha256:
+    if draft.locator.provider_document_sha256 != build_input.provider_document_sha256:
         raise ValueError("provider Unit locator belongs to a different document")
     if binding not in draft.locator.search_targets:
         raise ValueError("search binding does not belong to the provider Unit")
     _validate_binding_owner(locator=draft.locator, binding=binding)
     source_text = _source_payload_text(
-        admitted.effective_provider_document,
+        build_input.document,
         binding.source,
     )
     if binding.destination.kind == "unit_title_fragment":
@@ -1107,7 +1258,7 @@ def _validate_build(
         }
         expected_reconciliations = tuple(
             (item.source_index, item.payload_ordinal)
-            for item in context.admitted.source_text_reconciliations
+            for item in context.build_input.source_text_reconciliations
             if item.source_index in dependency_sources
         )
         if actual_reconciliations != expected_reconciliations:
@@ -1121,7 +1272,7 @@ def _validate_build(
         )
         expected_quality_findings = tuple(
             (item.source_index, item.payload_ordinal)
-            for item in context.admitted.source_quality_findings
+            for item in context.build_input.source_quality_findings
             if item.source_index in unit.block_source_indices
         )
         if actual_quality_findings != expected_quality_findings:
@@ -1152,18 +1303,21 @@ def _validate_build(
         raise ValueError("provider Unit build must own every logical table in order")
     if covered_reconciliations != {
         (item.source_index, item.payload_ordinal)
-        for item in context.admitted.source_text_reconciliations
+        for item in context.build_input.source_text_reconciliations
     }:
         raise ValueError("provider Unit build must bind every source repair")
     if covered_quality_findings != {
         (item.source_index, item.payload_ordinal)
-        for item in context.admitted.source_quality_findings
+        for item in context.build_input.source_quality_findings
     }:
         raise ValueError("provider Unit build must bind every source quality finding")
 
 
 __all__ = [
     "build_provider_units",
+    "build_source_provider_units",
+    "replay_source_provider_unit_search_binding",
+    "replay_source_provider_unit_search_binding_source_text",
     "provider_unit_search_text_values",
     "replay_provider_unit_search_binding",
     "replay_provider_unit_search_binding_source_text",

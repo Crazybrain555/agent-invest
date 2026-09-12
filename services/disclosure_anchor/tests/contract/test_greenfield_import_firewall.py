@@ -9,6 +9,7 @@ import unittest
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
 _GREENFIELD_CORE_FILES = (
+    _SOURCE_ROOT / "application" / "contracts" / "_provider_content.py",
     _SOURCE_ROOT / "application" / "contracts" / "applicability_selector.py",
     _SOURCE_ROOT / "application" / "contracts" / "document_outline.py",
     _SOURCE_ROOT / "application" / "contracts" / "html_visible_text.py",
@@ -16,6 +17,7 @@ _GREENFIELD_CORE_FILES = (
     _SOURCE_ROOT / "application" / "contracts" / "provider_document.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_document_admission.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_document_envelope.py",
+    _SOURCE_ROOT / "application" / "contracts" / "provider_source_semantics.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_table_projection.py",
     _SOURCE_ROOT / "application" / "contracts" / "provider_unit.py",
     _SOURCE_ROOT / "application" / "contracts" / "retrieval_primary.py",
@@ -23,6 +25,7 @@ _GREENFIELD_CORE_FILES = (
     _SOURCE_ROOT / "application" / "contracts" / "strict_json.py",
     _SOURCE_ROOT / "application" / "services" / "document_outline.py",
     _SOURCE_ROOT / "application" / "services" / "provider_document_admission.py",
+    _SOURCE_ROOT / "application" / "services" / "provider_source_semantics.py",
     _SOURCE_ROOT / "application" / "services" / "provider_table_projection.py",
     _SOURCE_ROOT / "application" / "services" / "provider_unit_builder.py",
     _SOURCE_ROOT / "application" / "services" / "retrieval_primary.py",
@@ -42,6 +45,7 @@ _HISTORICAL_EVIDENCE_CONTRACT = (
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.adapters.parsers.mineru_medium",
+    "disclosure_anchor.application.contracts._provider_content",
     "disclosure_anchor.application.contracts.applicability_selector",
     "disclosure_anchor.application.contracts.document_outline",
     "disclosure_anchor.application.contracts.html_visible_text",
@@ -50,6 +54,7 @@ _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.application.contracts.provider_document",
     "disclosure_anchor.application.contracts.provider_document_admission",
     "disclosure_anchor.application.contracts.provider_document_envelope",
+    "disclosure_anchor.application.contracts.provider_source_semantics",
     "disclosure_anchor.application.contracts.provider_table_projection",
     "disclosure_anchor.application.contracts.provider_unit",
     "disclosure_anchor.application.contracts.retrieval_primary",
@@ -57,6 +62,7 @@ _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.application.contracts.strict_json",
     "disclosure_anchor.application.services.document_outline",
     "disclosure_anchor.application.services.provider_document_admission",
+    "disclosure_anchor.application.services.provider_source_semantics",
     "disclosure_anchor.application.services.provider_table_projection",
     "disclosure_anchor.application.services.provider_unit_builder",
     "disclosure_anchor.application.services.retrieval_primary",

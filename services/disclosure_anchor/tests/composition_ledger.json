@@ -556,6 +556,24 @@
    "private_imports": [],
    "tests": 19
   },
+  "tests/unit/test_provider_source_build.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_provider_source_compatibility.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_provider_source_content.py": {
+   "private_imports": [
+    "_provider_content"
+   ],
+   "tests": 5
+  },
+  "tests/unit/test_provider_source_semantics.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_provider_table_projection.py": {
    "private_imports": [],
    "tests": 11
