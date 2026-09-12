@@ -19,6 +19,9 @@ from disclosure_anchor.adapters.runtime.mineru_diagnostic_resources import (
     _relative, validate_resource_identity,
 )
 from disclosure_anchor.adapters.runtime.mineru_diagnostic_store import _canonical, _digest
+from disclosure_anchor.adapters.runtime.mineru_diagnostic_quality_phases import (
+    QUALITY_CREATION_STEPS, owned_quality_configuration, validate_quality_creation,
+)
 from disclosure_anchor.application.contracts.mineru_api_health import MINERU_API_RESULT_RESERVATION_BYTES
 
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -95,6 +98,10 @@ class DiagnosticPhases:
 
     def __init__(self, journal: DiagnosticJournal, binding: dict[str, Any]) -> None:
         self.journal, self.binding = journal, binding
+        self.owned_quality = owned_quality_configuration(journal, binding)
+        split = _STEPS.index("validated")
+        self._steps = (_STEPS if self.owned_quality is None
+                       else _STEPS[:split] + QUALITY_CREATION_STEPS + _STEPS[split:])
         self.latest: dict[str, DiagnosticJournalRecord] = {}
         self.history: list[DiagnosticJournalRecord] = []
         for record in journal.records:
@@ -160,15 +167,19 @@ class DiagnosticPhases:
         return items
 
     def _validate(self, step: str, value: dict[str, Any]) -> None:
-        if step not in _STEPS or self.has("disposed"):
+        if step not in self._steps or self.has("disposed"):
             raise DiagnosticJournalError("unknown or closed diagnostic phase")
+        if self.owned_quality is not None and step in _STEPS[_STEPS.index("validated"):]:
+            raise DiagnosticJournalError("owned quality validation/disposal requires the complete owned runtime")
         repeated = step in {"lookup_intent", "lookup_reply", "ack_exchange_intent", "ack_reply", "ack_lookup"}
         exchanges = ({"lookup_intent", "lookup_reply"}, {"ack_exchange_intent", "ack_reply", "ack_lookup"})
         ack_exchange = self.history and any(step in group and self.history[-1].step in group for group in exchanges)
         if (self.has(step) and not repeated or repeated and sum(r.step == step for r in self.history) >= (5 if step == "ack_reply" else 4)
-                or self.history and not ack_exchange and _STEPS.index(step) < _STEPS.index(self.history[-1].step)):
+                or self.history and not ack_exchange and self._steps.index(step) < self._steps.index(self.history[-1].step)):
             raise DiagnosticJournalError("diagnostic duplicate, regressed or exhausted phase")
-        if step == "binding":
+        if step in QUALITY_CREATION_STEPS:
+            validate_quality_creation(self, step, value)
+        elif step == "binding":
             if value != self.binding:
                 raise DiagnosticJournalError("diagnostic bound configuration changed")
         elif step in _BASES:

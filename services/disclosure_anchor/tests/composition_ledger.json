@@ -458,6 +458,10 @@
    "private_imports": [],
    "tests": 20
   },
+  "tests/unit/test_mineru_diagnostic_quality_creation_phases.py": {
+   "private_imports": [],
+   "tests": 19
+  },
   "tests/unit/test_mineru_diagnostic_quality_input.py": {
    "private_imports": [],
    "tests": 21
@@ -469,6 +473,10 @@
   "tests/unit/test_mineru_diagnostic_quality_ownership_failures.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_mineru_diagnostic_quality_store.py": {
+   "private_imports": [],
+   "tests": 27
   },
   "tests/unit/test_mineru_diagnostic_wire.py": {
    "private_imports": [],

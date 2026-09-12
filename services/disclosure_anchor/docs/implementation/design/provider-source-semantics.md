@@ -171,3 +171,19 @@ the original E1 record envelope. A per-role request references one complete,
 nonempty retained input slot and has no command, environment or producer-result
 field. These data values check shape and internal consistency; actual phase,
 path, hash, deadline and process ownership checks remain mandatory at runtime.
+
+The retained quality store derives its sibling directory and fixed sixteen
+files from the original v3 binding. It appends directory and file creation
+identities to the same journal before exposing any payload writer. Every write
+reserves the whole bounded chunk against both original byte allowances; only
+positive, valid syscall returns count as confirmed retained bytes. Interrupted
+or impossible write results remain unresolved, with the original error and
+known prefix preserved. Seals reread the held original file, are immutable
+within the owner, and cannot be upgraded by editing a returned data value.
+
+Creation receipts preserve original source/output references and the complete
+binding hash. Their v3 replay is separate from the unchanged v2 lifecycle.
+The current storage seam accepts only its four creation/input phases: semantic
+child phases, v3 validation/disposal and all store reopening remain unavailable
+until the complete owned runtime and final-evidence recovery are implemented.
+No retained file is automatically removed, adopted, overwritten or truncated.
