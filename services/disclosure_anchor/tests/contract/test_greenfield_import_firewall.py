@@ -8,7 +8,21 @@ import unittest
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
+_EXISTING_M6_SCHEMA_FILES = (
+    _SOURCE_ROOT / "application" / "contracts" / "m6_document_qualification.py",
+    _SOURCE_ROOT / "application" / "contracts" / "m6_campaign.py",
+    _SOURCE_ROOT / "application" / "contracts" / "m6_common.py",
+    _SOURCE_ROOT / "application" / "contracts" / "synchronized_telemetry.py",
+    _SOURCE_ROOT / "application" / "contracts" / "capacity.py",
+    _SOURCE_ROOT / "application" / "contracts" / "m6_owner.py",
+    _SOURCE_ROOT / "application" / "contracts" / "m6_run.py",
+    _SOURCE_ROOT / "application" / "contracts" / "m6_run_events.py",
+)
 _GREENFIELD_CORE_FILES = (
+    _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_config.py",
+    _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_input.py",
+    *_EXISTING_M6_SCHEMA_FILES,
+    _SOURCE_ROOT / "application" / "contracts" / "m6_schemas.py",
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality.py",
     _SOURCE_ROOT / "application" / "services" / "source_semantic_record.py",
     _SOURCE_ROOT / "application" / "services" / "source_semantic_comparison.py",
@@ -51,6 +65,17 @@ _HISTORICAL_EVIDENCE_CONTRACT = (
     / "normalized_ir_v4_evidence.py"
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
+    "disclosure_anchor.application.contracts.mineru_diagnostic_quality_config",
+    "disclosure_anchor.application.contracts.mineru_diagnostic_quality_input",
+    "disclosure_anchor.application.contracts.m6_document_qualification",
+    "disclosure_anchor.application.contracts.m6_campaign",
+    "disclosure_anchor.application.contracts.m6_common",
+    "disclosure_anchor.application.contracts.synchronized_telemetry",
+    "disclosure_anchor.application.contracts.capacity",
+    "disclosure_anchor.application.contracts.m6_owner",
+    "disclosure_anchor.application.contracts.m6_run",
+    "disclosure_anchor.application.contracts.m6_run_events",
+    "disclosure_anchor.application.contracts.m6_schemas",
     "disclosure_anchor.application.contracts.mineru_diagnostic_quality",
     "disclosure_anchor.application.services.source_semantic_record",
     "disclosure_anchor.application.services.source_semantic_comparison",
@@ -146,6 +171,10 @@ class GreenfieldImportFirewallTest(unittest.TestCase):
                 for name in names:
                     root = name.split(".", 1)[0]
                     if root in sys.stdlib_module_names or root == "__future__":
+                        continue
+                    # These existing closed schemas already use Pydantic. Keep
+                    # this exception tied to their exact files and module name.
+                    if path in _EXISTING_M6_SCHEMA_FILES and name == "pydantic":
                         continue
                     if any(
                         name == allowed or name.startswith(f"{allowed}.")

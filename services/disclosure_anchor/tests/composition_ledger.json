@@ -454,6 +454,14 @@
    "private_imports": [],
    "tests": 18
   },
+  "tests/unit/test_mineru_diagnostic_quality_config.py": {
+   "private_imports": [],
+   "tests": 20
+  },
+  "tests/unit/test_mineru_diagnostic_quality_input.py": {
+   "private_imports": [],
+   "tests": 21
+  },
   "tests/unit/test_mineru_diagnostic_quality_inputs.py": {
    "private_imports": [],
    "tests": 20

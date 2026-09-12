@@ -153,3 +153,21 @@ capacity and do not waive append's per-record enforcement. Pending or poisoned
 state cannot create new headroom for quality work. Every clock checkpoint
 revalidates ownership after the clock returns, and resource directory traversal
 checks the original deadline before and after each descent.
+
+The private owned-quality configuration carries the original service-diagnostic
+`M6QualityPlan`, six byte budgets and declared program/interpreter/dependency
+inventories. Its codec checks one shared projection budget before expanding any
+nested value; only the existing M6 plan and reason-policy models receive a narrow
+projection bridge. Their canonical bytes and semantic validation remain owned by
+the existing M6 contracts. Program lists have finite per-list and aggregate
+limits, checked before expansion even for altered frozen values. Actual source
+coverage and loaded-module origins still require the runtime owner.
+
+The input manifest preserves original journal/configuration/clock references,
+source facts, target and the complete ordered output inventory. Its inventory
+hash uses that original array order; root and parent directory closure are
+required without imposing a new sort order. The inventory and target must fit
+the original E1 record envelope. A per-role request references one complete,
+nonempty retained input slot and has no command, environment or producer-result
+field. These data values check shape and internal consistency; actual phase,
+path, hash, deadline and process ownership checks remain mandatory at runtime.
