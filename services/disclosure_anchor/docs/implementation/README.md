@@ -21,6 +21,8 @@
   vector credits、配置生命周期、Auto 与吞吐验收的当前实施契约；旧 fixed-arm/7GiB 约束不再适用。
 - `design/capacity-observation.md`：旁路、只读、可重放的 MinerU/GPU Observation v1；不含 Advisor/selector/actuator。
 - `design/synchronized-capacity-telemetry.md`：250–500ms/1s 同步遥测、clock-domain、向量信用与 durable-page 进度契约；默认禁用。
+- `design/m6-owner-control.md`：M6 原生测量 owner、控制协议与资源退出边界。
+- `design/mineru-diagnostic-lifecycle.md`：单次 v2 diagnostic 执行、原身份恢复、独立质量证据与清理/ACK；不授予发布或 M6 吞吐验收资格。
 - `design/retrieval-and-semantic-keys.md`：检索投影当前契约及其历史演变。
 - `design/semantic-adjudication-runtime.md`：Luna/Sonnet 可配置 provider 链、availability-only
   failover、v2 cache/receipt、终态与修复纪律。

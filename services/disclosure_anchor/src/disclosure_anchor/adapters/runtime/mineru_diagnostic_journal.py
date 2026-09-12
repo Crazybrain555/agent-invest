@@ -156,11 +156,13 @@ class DiagnosticJournal:
             names = sorted(os.listdir(self._root_fd))
             if _PENDING in names:
                 raise DiagnosticJournalError("diagnostic append outcome is uncertain; retain pending evidence")
-            if "resources" in names:
+            for resource_name in ("resources", "resources-reclaim"):
                 # Presence grants no cleanup authority. The lifecycle checks
                 # the original creation receipt and phase before touching it.
-                _directory_identity(os.stat("resources", dir_fd=self._root_fd, follow_symlinks=False))
-            names = [name for name in names if name not in {_HEADER, "owner.lock", "resources"}]
+                # The reserved root rename is only for an already empty tree.
+                if resource_name in names:
+                    _directory_identity(os.stat(resource_name, dir_fd=self._root_fd, follow_symlinks=False))
+            names = [name for name in names if name not in {_HEADER, "owner.lock", "resources", "resources-reclaim"}]
             if len(names) > _MAX_RECORDS:
                 raise DiagnosticJournalError("diagnostic journal record count exceeded")
             for sequence, name in enumerate(names, 1):

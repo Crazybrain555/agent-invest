@@ -414,6 +414,26 @@
    "private_imports": [],
    "tests": 20
   },
+  "tests/unit/test_mineru_diagnostic_lifecycle.py": {
+   "private_imports": [],
+   "tests": 17
+  },
+  "tests/unit/test_mineru_diagnostic_lifecycle_exchange_limits.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_mineru_diagnostic_lifecycle_quality.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_mineru_diagnostic_lifecycle_recovery.py": {
+   "private_imports": [],
+   "tests": 21
+  },
+  "tests/unit/test_mineru_diagnostic_lifecycle_source.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_mineru_diagnostic_wire.py": {
    "private_imports": [],
    "tests": 7
