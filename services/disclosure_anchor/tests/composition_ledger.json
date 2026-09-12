@@ -442,6 +442,10 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_mineru_diagnostic_quality.py": {
+   "private_imports": [],
+   "tests": 18
+  },
   "tests/unit/test_mineru_diagnostic_wire.py": {
    "private_imports": [],
    "tests": 7
@@ -529,6 +533,10 @@
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_pdf_text_observation_stream.py": {
+   "private_imports": [],
+   "tests": 14
   },
   "tests/unit/test_pending_download_predicate.py": {
    "private_imports": [

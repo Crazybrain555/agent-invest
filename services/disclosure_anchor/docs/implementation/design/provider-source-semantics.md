@@ -101,3 +101,29 @@ or candidate data remains a visible error. `artifact_closure` and
 `independent_rebuild_match` are always `unverified` here. No pure result grants
 scorable pages, publication, cleanup or ACK; producer/verifier process ownership
 and actual file-read closure remain separate runtime work.
+
+## Held source and owned-quality wire primitives
+
+`pdf_text_observation.py` exposes a separate
+`observe_pdf_text_rectangles_from_open_file` entrypoint. It rewinds the caller's
+held binary stream under the existing PDFium lock and shares the path entrypoint's
+exact extraction and handle-closing loop. PDFium leaves the caller stream open.
+The caller remains responsible for the original file identity, content seal and
+exclusive stream use; the helper does not reopen a pathname or certify those facts.
+
+`application/contracts/mineru_diagnostic_quality.py` defines immutable private
+budget, frame, stream, bounded-error and retained-file values. A thirteen-byte
+`M6Q1` header carries a fixed frame kind and an unsigned 64-bit payload declaration.
+Declarations are distinct from actual observed bytes. Stream totals remain unknown
+until EOF; retained and discarded bytes must exactly sum to observed bytes. A
+partial or discarded frame cannot claim a complete retained payload hash. Error
+records explicitly distinguish retained UTF-8 text from truncation.
+
+Six budget fields map to sixteen fixed retained slots. Requests and raw control
+streams have separate per-file control limits and both consume the total budget;
+source, build, evidence and stderr have their own limits. The sum of slot ceilings
+need not equal the aggregate allowance. Primitive codecs apply projection checks
+before materialization and use the shared bounded canonical JSON implementation.
+These values carry no process or filesystem authority. Actual byte charging,
+create-only file ownership, frame sequencing, child closure, qualification and
+versioned lifecycle integration must be enforced by the runtime owner.

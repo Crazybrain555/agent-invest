@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import BinaryIO
 
 import pypdfium2 as pdfium
 
@@ -29,6 +30,30 @@ def observe_pdf_text_rectangles(
 ) -> tuple[SourcePdfTextObservation, ...]:
     """Read native text only within exact MinerU text-block rectangles."""
 
+    return _observe_pdf_text_rectangles(path, document=document)
+
+
+def observe_pdf_text_rectangles_from_open_file(
+    source: BinaryIO,
+    *,
+    document: ProviderDocument,
+) -> tuple[SourcePdfTextObservation, ...]:
+    """Read the caller's held source; leave its stream open and reusable.
+
+    PDFium's default autoclose=False preserves caller ownership. Its document,
+    page and text handles still close before this function returns or raises.
+    The caller owns source identity verification and exclusive use of the stream.
+    """
+    with PDFIUM_LOCK:
+        source.seek(0)
+        return _observe_pdf_text_rectangles(source, document=document)
+
+
+def _observe_pdf_text_rectangles(
+    path: Path | BinaryIO,
+    *,
+    document: ProviderDocument,
+) -> tuple[SourcePdfTextObservation, ...]:
     result: list[SourcePdfTextObservation] = []
     with PDFIUM_LOCK:
         pdf = pdfium.PdfDocument(path)
@@ -147,4 +172,7 @@ def _bbox_coverage(left: ProviderBBox, right: ProviderBBox) -> float:
     return intersection / min(left_area, right_area)
 
 
-__all__ = ["observe_pdf_text_rectangles"]
+__all__ = [
+    "observe_pdf_text_rectangles",
+    "observe_pdf_text_rectangles_from_open_file",
+]

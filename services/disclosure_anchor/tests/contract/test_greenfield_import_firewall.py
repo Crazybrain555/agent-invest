@@ -9,6 +9,7 @@ import unittest
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
 _GREENFIELD_CORE_FILES = (
+    _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality.py",
     _SOURCE_ROOT / "application" / "services" / "source_semantic_record.py",
     _SOURCE_ROOT / "application" / "services" / "source_semantic_comparison.py",
     _SOURCE_ROOT / "application" / "services" / "source_semantic_build.py",
@@ -50,6 +51,7 @@ _HISTORICAL_EVIDENCE_CONTRACT = (
     / "normalized_ir_v4_evidence.py"
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
+    "disclosure_anchor.application.contracts.mineru_diagnostic_quality",
     "disclosure_anchor.application.services.source_semantic_record",
     "disclosure_anchor.application.services.source_semantic_comparison",
     "disclosure_anchor.application.services.source_semantic_build",
