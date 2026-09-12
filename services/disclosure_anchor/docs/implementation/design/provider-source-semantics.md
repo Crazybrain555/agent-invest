@@ -187,3 +187,13 @@ The current storage seam accepts only its four creation/input phases: semantic
 child phases, v3 validation/disposal and all store reopening remain unavailable
 until the complete owned runtime and final-evidence recovery are implemented.
 No retained file is automatically removed, adopted, overwritten or truncated.
+
+The diagnostic continuous-clock accessor reads the actual Mac boot-session UUID
+around acquisition of the existing Mach continuous clock and timebase. Its
+bounded canonical descriptor binds that boot and exact tick conversion, so
+separate processes in the same clock domain can independently obtain the same
+hash. It adds no deadline or start time; original journal and worker checks
+retain responsibility for expiry and regression. Native acquisition failures
+remain visible. The new descriptor accessor currently supports Mac only; the
+existing Mac and Linux sleep-inclusive callable remains unchanged. This
+accessor alone does not enable owned lifecycle routing or qualify child closure.

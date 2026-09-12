@@ -422,6 +422,10 @@
    "private_imports": [],
    "tests": 10
   },
+  "tests/unit/test_mineru_diagnostic_clock.py": {
+   "private_imports": [],
+   "tests": 16
+  },
   "tests/unit/test_mineru_diagnostic_journal.py": {
    "private_imports": [],
    "tests": 20
