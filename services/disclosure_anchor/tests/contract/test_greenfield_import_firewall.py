@@ -9,6 +9,12 @@ import unittest
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
 _GREENFIELD_CORE_FILES = (
+    _SOURCE_ROOT / "application" / "services" / "source_semantic_record.py",
+    _SOURCE_ROOT / "application" / "services" / "source_semantic_comparison.py",
+    _SOURCE_ROOT / "application" / "services" / "source_semantic_build.py",
+    _SOURCE_ROOT / "application" / "services" / "provider_quality.py",
+    _SOURCE_ROOT / "application" / "contracts" / "provider_quality.py",
+    _SOURCE_ROOT / "application" / "contracts" / "diagnostic_json.py",
     _SOURCE_ROOT / "application" / "contracts" / "_provider_content.py",
     _SOURCE_ROOT / "application" / "contracts" / "applicability_selector.py",
     _SOURCE_ROOT / "application" / "contracts" / "document_outline.py",
@@ -44,6 +50,12 @@ _HISTORICAL_EVIDENCE_CONTRACT = (
     / "normalized_ir_v4_evidence.py"
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
+    "disclosure_anchor.application.services.source_semantic_record",
+    "disclosure_anchor.application.services.source_semantic_comparison",
+    "disclosure_anchor.application.services.source_semantic_build",
+    "disclosure_anchor.application.services.provider_quality",
+    "disclosure_anchor.application.contracts.provider_quality",
+    "disclosure_anchor.application.contracts.diagnostic_json",
     "disclosure_anchor.adapters.parsers.mineru_medium",
     "disclosure_anchor.application.contracts._provider_content",
     "disclosure_anchor.application.contracts.applicability_selector",

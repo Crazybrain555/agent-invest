@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import re
-import string
 
 from disclosure_anchor.application.contracts.applicability_selector import (
     applicability_selector_pairs,
@@ -80,6 +79,7 @@ from disclosure_anchor.application.services.retrieval_primary import (
     build_retrieval_primary_projection,
     replay_retrieval_target,
 )
+from disclosure_anchor.application.services.provider_quality import assess_provider_unit_quality
 from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
 
 
@@ -539,17 +539,10 @@ class _BuildContext:
             search_targets=tuple(search_bindings),
         )
         heading_path = () if heading is None else heading.headpath
-        quality_status = (
-            "needs_review"
-            if bound_unbound
-            or locator.source_quality_findings
-            or _has_suspected_truncated_markup_title(heading)
-            or any(
-                _has_suspected_encoded_text(self.blocks[source_index])
-                for source_index in unit_sources
-            )
-            else "ok"
-        )
+        quality_status = assess_provider_unit_quality(
+            document=self.document, unit_sources=frozenset(unit_sources),
+            heading=heading, locator=locator,
+        ).quality_status
         applicability = _unit_applicability(
             heading=heading,
             parts=parts,
@@ -780,40 +773,6 @@ def _part_visible_text(payload: dict[str, object]) -> str:
                 for item in value
             )
     return "\n".join(values)
-
-
-def _has_suspected_encoded_text(block: ProviderBlock) -> bool:
-    """Flag improbable ASCII-glyph maps without replacing their source text."""
-
-    for payload in block.payloads:
-        if payload.field not in {"text", "content"}:
-            continue
-        visible = "".join(html_visible_text(payload.text).split())
-        if len(visible) < 24 or any("\u4e00" <= char <= "\u9fff" for char in visible):
-            continue
-        punctuation = [char for char in visible if char in string.punctuation]
-        if len(punctuation) / len(visible) >= 0.45 and len(set(punctuation)) >= 12:
-            return True
-    return False
-
-
-def _has_suspected_truncated_markup_title(
-    heading: ResolvedHeading | None,
-) -> bool:
-    """Flag a provider title reduced to inline markup and non-CJK residue.
-
-    MinerU can preserve a superscript trademark while dropping the adjacent
-    Chinese drug name.  The source scalar remains untouched; this only makes
-    the unresolved provider damage visible to downstream review.
-    """
-
-    if heading is None:
-        return False
-    folded = heading.text.casefold()
-    if "<sup" not in folded and "<sub" not in folded:
-        return False
-    visible = html_visible_text(heading.text)
-    return not any("\u4e00" <= character <= "\u9fff" for character in visible)
 
 
 def _replay_provider_unit_search_binding(

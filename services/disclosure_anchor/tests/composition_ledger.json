@@ -251,6 +251,14 @@
    ],
    "tests": 7
   },
+  "tests/unit/test_diagnostic_json.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/unit/test_diagnostic_projection_budget.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_disclosure_source_port.py": {
    "private_imports": [],
    "tests": 5
@@ -548,6 +556,10 @@
    "private_imports": [],
    "tests": 10
   },
+  "tests/unit/test_provider_quality.py": {
+   "private_imports": [],
+   "tests": 10
+  },
   "tests/unit/test_provider_secret_envelope_v4.py": {
    "private_imports": [],
    "tests": 32
@@ -711,6 +723,18 @@
   "tests/unit/test_settings.py": {
    "private_imports": [],
    "tests": 9
+  },
+  "tests/unit/test_source_semantic_build.py": {
+   "private_imports": [],
+   "tests": 9
+  },
+  "tests/unit/test_source_semantic_comparison.py": {
+   "private_imports": [],
+   "tests": 12
+  },
+  "tests/unit/test_source_semantic_record.py": {
+   "private_imports": [],
+   "tests": 10
   },
   "tests/unit/test_staged_admission_observation.py": {
    "private_imports": [],
