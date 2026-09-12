@@ -80,7 +80,10 @@ def _stream(fd: int, mode: str) -> Iterator[BinaryIO]:
     """Keep FD ownership outside the wrapper, including failed construction."""
     stream: BinaryIO | None = None
     errors: list[BaseException] = []
+    original: tuple[int, int] | None = None
     try:
+        info = os.fstat(fd)
+        original = (info.st_dev, info.st_ino)
         stream = cast(BinaryIO, os.fdopen(fd, mode, closefd=False))
         yield stream
     except BaseException as primary:
@@ -92,6 +95,10 @@ def _stream(fd: int, mode: str) -> Iterator[BinaryIO]:
             except BaseException as cleanup:
                 errors.append(cleanup)
         try:
+            if original is not None:
+                current = os.fstat(fd)
+                if (current.st_dev, current.st_ino) != original:
+                    raise DiagnosticJournalError("diagnostic stream descriptor was recycled; replacement left open")
             os.close(fd)
         except BaseException as cleanup:
             errors.append(cleanup)
@@ -166,6 +173,7 @@ class DiagnosticResources:
         fd = os.dup(self._fd)
         try:
             for index, part in enumerate(parts[:-1], 1):
+                self.checkpoint()
                 expected = self._directories.get("/".join(parts[:index]))
                 if expected is None:
                     raise DiagnosticJournalError("diagnostic parent has no original ownership receipt")
@@ -179,6 +187,8 @@ class DiagnosticResources:
                     raise
                 prior, fd = fd, child
                 os.close(prior)
+                self.checkpoint()
+            self.checkpoint()
             yield fd, parts[-1]
         finally:
             os.close(fd)

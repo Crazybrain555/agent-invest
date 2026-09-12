@@ -127,3 +127,29 @@ before materialization and use the shared bounded canonical JSON implementation.
 These values carry no process or filesystem authority. Actual byte charging,
 create-only file ownership, frame sequencing, child closure, qualification and
 versioned lifecycle integration must be enforced by the runtime owner.
+
+`PinnedArtifactTree` accepts an optional checkpoint and a root-inclusive entry
+limit. The bounded scan enumerates entries incrementally and checks the original
+owner between reads. File reads stay within the initially pinned byte count plus
+one growth-detection byte; a later stat cannot increase that grant.
+`verify_contents_unchanged` rehashes every admitted file as well as checking the
+complete topology. These checks cooperate between filesystem operations; they do
+not preempt a blocked kernel call or native parser work.
+
+`hold_quality_inputs` binds the same live journal, resource owner and phase
+configuration. It derives source and output seals by replaying the actual journal,
+then holds the original source stream, a separate output directory descriptor and
+the complete bounded artifact tree. Every original directory and file remains in
+the comparison, including empty directories and files outside the parser subroot.
+Reverification reads original source bytes and rehashes the output tree. Closing
+the lease releases all its handles while leaving the borrowed journal and
+resources open. Known descriptor reuse fails visibly and leaves the replacement
+open. The lease grants no child launch, cleanup, ACK or qualification authority.
+
+The journal's original identity accessor rereads the accepted header bytes without
+changing its start or deadline. Capacity checks use complete actual header and
+record bytes against the existing 96-record/16 MiB envelope. They consume no
+capacity and do not waive append's per-record enforcement. Pending or poisoned
+state cannot create new headroom for quality work. Every clock checkpoint
+revalidates ownership after the clock returns, and resource directory traversal
+checks the original deadline before and after each descent.

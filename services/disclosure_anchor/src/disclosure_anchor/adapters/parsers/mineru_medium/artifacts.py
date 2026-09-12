@@ -166,6 +166,8 @@ class PinnedArtifactTree:
         max_bytes: int = _MAX_TREE_BYTES,
         require_private_modes: bool = False,
         allow_empty_directories: bool = False,
+        checkpoint: Callable[[], object] | None = None,
+        max_entries: int | None = None,
     ) -> None:
         _require_dirfd_flags()
         if type(max_files) is not int or max_files < 1:
@@ -178,14 +180,20 @@ class PinnedArtifactTree:
             raise ParserOutputContractError(
                 "MinerU artifact empty-directory policy is invalid"
             )
+        _validate_scan_options(checkpoint, max_entries)
+        if checkpoint is not None:
+            checkpoint()
         self._display_root = display_root.absolute()
         self._root_fd = os.dup(root_fd)
         self._max_files = max_files
         self._max_bytes = max_bytes
         self._require_private_modes = require_private_modes
         self._allow_empty_directories = allow_empty_directories
+        self._checkpoint_callback = checkpoint
+        self._max_entries = max_entries
         self._closed = False
         try:
+            self._checkpoint()
             observed = os.fstat(self._root_fd)
             self._root_identity = _directory_identity(
                 observed,
@@ -202,9 +210,12 @@ class PinnedArtifactTree:
             self._directory_entries: dict[PurePosixPath, tuple[str, ...]] = {}
             self._files: dict[PurePosixPath, PinnedArtifactFile] = {}
             self._scan_initial()
-        except BaseException:
-            os.close(self._root_fd)
-            self._closed = True
+            self._checkpoint()
+        except BaseException as primary:
+            try:
+                self.close()
+            except BaseException as cleanup:
+                raise BaseExceptionGroup("MinerU tree initialization and closure failed", [primary, cleanup]) from None
             raise
 
     @classmethod
@@ -216,8 +227,13 @@ class PinnedArtifactTree:
         max_bytes: int = _MAX_TREE_BYTES,
         require_private_modes: bool = False,
         allow_empty_directories: bool = False,
+        checkpoint: Callable[[], object] | None = None,
+        max_entries: int | None = None,
     ) -> PinnedArtifactTree:
         _require_dirfd_flags()
+        _validate_scan_options(checkpoint, max_entries)
+        if checkpoint is not None:
+            checkpoint()
         flags = (
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
         )
@@ -228,16 +244,31 @@ class PinnedArtifactTree:
                 f"cannot open pinned MinerU output root: {root}"
             ) from exc
         try:
-            return cls(
+            tree = cls(
                 display_root=root,
                 root_fd=fd,
                 max_files=max_files,
                 max_bytes=max_bytes,
                 require_private_modes=require_private_modes,
                 allow_empty_directories=allow_empty_directories,
+                checkpoint=checkpoint,
+                max_entries=max_entries,
             )
-        finally:
+        except BaseException as primary:
+            try:
+                os.close(fd)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup("MinerU path tree initialization and closure failed", [primary, cleanup]) from None
+            raise
+        try:
             os.close(fd)
+        except BaseException as primary:
+            try:
+                tree.close()
+            except BaseException as cleanup:
+                raise BaseExceptionGroup("MinerU path and returned tree closure failed", [primary, cleanup]) from None
+            raise
+        return tree
 
     @classmethod
     def from_root_fd(
@@ -249,6 +280,8 @@ class PinnedArtifactTree:
         max_bytes: int = _MAX_TREE_BYTES,
         require_private_modes: bool = False,
         allow_empty_directories: bool = False,
+        checkpoint: Callable[[], object] | None = None,
+        max_entries: int | None = None,
     ) -> PinnedArtifactTree:
         return cls(
             display_root=display_root,
@@ -257,6 +290,8 @@ class PinnedArtifactTree:
             max_bytes=max_bytes,
             require_private_modes=require_private_modes,
             allow_empty_directories=allow_empty_directories,
+            checkpoint=checkpoint,
+            max_entries=max_entries,
         )
 
     def __enter__(self) -> PinnedArtifactTree:
@@ -268,8 +303,15 @@ class PinnedArtifactTree:
 
     def close(self) -> None:
         if not self._closed:
-            os.close(self._root_fd)
             self._closed = True
+            fd, self._root_fd = self._root_fd, -1
+            os.close(fd)
+
+    def _checkpoint(self) -> None:
+        self._require_open()
+        if self._checkpoint_callback is not None:
+            self._checkpoint_callback()
+        self._require_open()
 
     @property
     def display_root(self) -> Path:
@@ -319,6 +361,7 @@ class PinnedArtifactTree:
         receipt = self.require_file(relative_path)
         if receipt.size_bytes > max_bytes:
             raise ParserOutputContractError("MinerU pinned file exceeds its limit")
+        self._checkpoint()
         fd = self._open_regular(receipt.relative_path)
         try:
             before = _FileIdentity.from_stat(os.fstat(fd))
@@ -329,14 +372,20 @@ class PinnedArtifactTree:
             digest = hashlib.sha256()
             byte_count = 0
             chunks: list[bytes] = []
-            while chunk := os.read(fd, min(1024 * 1024, max_bytes + 1)):
+            while True:
+                self._checkpoint()
+                chunk = os.read(fd, min(1024 * 1024, receipt.size_bytes - byte_count + 1))
+                self._checkpoint()
+                if not chunk:
+                    break
                 byte_count += len(chunk)
-                if byte_count > max_bytes:
+                if byte_count > receipt.size_bytes:
                     raise ParserOutputContractError(
                         "MinerU pinned file exceeded its limit while reading"
                     )
                 digest.update(chunk)
                 chunks.append(chunk)
+            self._checkpoint()
             if (
                 _FileIdentity.from_stat(os.fstat(fd)) != before
                 or byte_count != receipt.size_bytes
@@ -345,6 +394,7 @@ class PinnedArtifactTree:
                 raise ParserOutputContractError(
                     "MinerU pinned file changed while reading"
                 )
+            self._checkpoint()
             return b"".join(chunks)
         finally:
             os.close(fd)
@@ -359,6 +409,22 @@ class PinnedArtifactTree:
         receipt = self.require_file(relative_path)
         if receipt.size_bytes > max_bytes:
             raise ParserOutputContractError(f"MinerU {label} JSON exceeds its limit")
+        if self._checkpoint_callback is not None:
+            raw = self.read_bytes(relative_path, max_bytes=max_bytes)
+            self._checkpoint()
+            try:
+                value = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise ParserOutputContractError(f"invalid MinerU {label} JSON") from exc
+            self._checkpoint()
+            fd = self._open_regular(receipt.relative_path)
+            try:
+                if _FileIdentity.from_stat(os.fstat(fd)) != receipt.identity:
+                    raise ParserOutputContractError(f"MinerU {label} JSON changed during parsing")
+            finally:
+                os.close(fd)
+            self._checkpoint()
+            return value
         fd = self._open_regular(receipt.relative_path)
         try:
             before = _FileIdentity.from_stat(os.fstat(fd))
@@ -389,35 +455,69 @@ class PinnedArtifactTree:
 
     def validate_utf8(self, relative_path: PurePosixPath, *, label: str) -> None:
         receipt = self.require_file(relative_path)
+        self._checkpoint()
         fd = self._open_regular(receipt.relative_path)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         try:
             before = _FileIdentity.from_stat(os.fstat(fd))
+            if before != receipt.identity:
+                raise ParserOutputContractError(f"MinerU artifact role={label} changed before UTF-8 validation")
             digest = hashlib.sha256()
-            while chunk := os.read(fd, 1024 * 1024):
-                decoder.decode(chunk, final=False)
+            size = 0
+            while True:
+                self._checkpoint()
+                chunk = os.read(fd, min(1024 * 1024, receipt.size_bytes - size + 1))
+                self._checkpoint()
+                size += len(chunk)
+                if size > receipt.size_bytes:
+                    raise ParserOutputContractError(f"MinerU artifact role={label} grew during UTF-8 validation")
+                try:
+                    decoder.decode(chunk, final=not chunk)
+                except UnicodeDecodeError as exc:
+                    raise ParserOutputContractError(f"cannot read MinerU artifact role={label}") from exc
+                if not chunk:
+                    break
                 digest.update(chunk)
-            decoder.decode(b"", final=True)
+            self._checkpoint()
             if (
-                before != receipt.identity
+                size != receipt.size_bytes
                 or _FileIdentity.from_stat(os.fstat(fd)) != before
                 or "sha256:" + digest.hexdigest() != receipt.sha256
             ):
                 raise ParserOutputContractError(
                     f"MinerU artifact role={label} changed during UTF-8 validation"
                 )
-        except UnicodeDecodeError as exc:
-            raise ParserOutputContractError(
-                f"cannot read MinerU artifact role={label}"
-            ) from exc
+            self._checkpoint()
         finally:
             os.close(fd)
 
     def verify_unchanged(self) -> None:
-        self._require_open()
+        self._checkpoint()
         self._assert_display_path()
         self.verify_pinned_topology_unchanged()
         self._assert_display_path()
+        self._checkpoint()
+
+    def verify_contents_unchanged(self) -> None:
+        """Rehash every original file without materializing its payload."""
+        self.verify_unchanged()
+        for receipt in self.files:
+            self._checkpoint()
+            fd = self._open_regular(receipt.relative_path)
+            try:
+                before = _FileIdentity.from_stat(os.fstat(fd))
+                if before != receipt.identity:
+                    raise ParserOutputContractError("MinerU file identity changed before content verification")
+                digest, size, _leading = _stream_digest(
+                    fd, checkpoint=self._checkpoint, maximum_bytes=receipt.size_bytes,
+                )
+                if (_FileIdentity.from_stat(os.fstat(fd)) != before
+                        or size != receipt.size_bytes or digest != receipt.sha256):
+                    raise ParserOutputContractError("MinerU file contents changed during verification")
+                self._checkpoint()
+            finally:
+                os.close(fd)
+        self.verify_unchanged()
 
     def verify_pinned_topology_unchanged(
         self, *, allow_root_rename_ctime: bool = False
@@ -430,7 +530,7 @@ class PinnedArtifactTree:
         must still match before the adapter may act on the renamed tree.
         """
 
-        self._require_open()
+        self._checkpoint()
         if type(allow_root_rename_ctime) is not bool:
             raise ParserOutputContractError(
                 "MinerU pinned topology verification mode is invalid"
@@ -473,6 +573,7 @@ class PinnedArtifactTree:
             raise ParserOutputContractError(
                 "MinerU artifact tree changed during pinned admission"
             )
+        self._checkpoint()
 
     def remove_exact_admitted_contents(
         self,
@@ -764,6 +865,7 @@ class PinnedArtifactTree:
             depth=0,
             file_count=file_count,
             total_bytes=total_bytes,
+            entry_count=[1],
         )
 
     def _scan_hashing(
@@ -774,8 +876,10 @@ class PinnedArtifactTree:
         depth: int,
         file_count: list[int],
         total_bytes: list[int],
+        entry_count: list[int],
     ) -> None:
         try:
+            self._checkpoint()
             if depth > _MAX_TREE_DEPTH:
                 raise ParserOutputContractError("MinerU artifact tree is too deep")
             before = _directory_identity(
@@ -788,7 +892,11 @@ class PinnedArtifactTree:
                 is_directory=True,
                 label=f"MinerU artifact directory {relative.as_posix()}",
             )
-            names = _directory_names(directory_fd, relative=relative)
+            names = _directory_names(
+                directory_fd, relative=relative, checkpoint=self._checkpoint if self._checkpoint_callback is not None else None,
+                maximum_names=None if self._max_entries is None else self._max_entries - entry_count[0],
+            )
+            entry_count[0] += len(names)
             if (
                 relative != PurePosixPath(".")
                 and not names
@@ -800,6 +908,7 @@ class PinnedArtifactTree:
             self._directories[relative] = before
             self._directory_entries[relative] = names
             for name in names:
+                self._checkpoint()
                 child = _child_relative(relative, name)
                 observed = _lstat_at(directory_fd, name, relative=child)
                 if stat.S_ISDIR(observed.st_mode):
@@ -816,6 +925,7 @@ class PinnedArtifactTree:
                         depth=depth + 1,
                         file_count=file_count,
                         total_bytes=total_bytes,
+                        entry_count=entry_count,
                     )
                     continue
                 expected_file = _regular_identity(
@@ -844,7 +954,15 @@ class PinnedArtifactTree:
                 )
                 try:
                     identity = _FileIdentity.from_stat(os.fstat(fd))
-                    sha256, size_bytes, leading = _stream_digest(fd)
+                    if identity != expected_file:
+                        raise ParserOutputContractError(
+                            f"MinerU artifact changed before hashing: {child.as_posix()}"
+                        )
+                    sha256, size_bytes, leading = _stream_digest(
+                        fd, checkpoint=self._checkpoint if self._checkpoint_callback is not None else None,
+                        maximum_bytes=expected_file.byte_count,
+                    )
+                    self._checkpoint()
                     if _FileIdentity.from_stat(os.fstat(fd)) != identity:
                         raise ParserOutputContractError(
                             f"MinerU artifact changed while hashing: {child.as_posix()}"
@@ -861,7 +979,10 @@ class PinnedArtifactTree:
                     leading_bytes=leading,
                 )
             if (
-                _directory_names(directory_fd, relative=relative) != names
+                _directory_names(
+                    directory_fd, relative=relative, checkpoint=self._checkpoint if self._checkpoint_callback is not None else None,
+                    maximum_names=len(names) if self._max_entries is not None else None,
+                ) != names
                 or _directory_identity(
                     os.fstat(directory_fd),
                     root_device=self._root_identity.device,
@@ -872,6 +993,7 @@ class PinnedArtifactTree:
                 raise ParserOutputContractError(
                     f"MinerU artifact directory changed during scan: {relative.as_posix()}"
                 )
+            self._checkpoint()
         finally:
             os.close(directory_fd)
 
@@ -885,8 +1007,12 @@ class PinnedArtifactTree:
         entries: dict[PurePosixPath, tuple[str, ...]],
         files: dict[PurePosixPath, _FileIdentity],
         allow_empty_directories: bool = False,
+        entry_count: list[int] | None = None,
     ) -> None:
         try:
+            self._checkpoint()
+            if entry_count is None:
+                entry_count = [1]
             if depth > _MAX_TREE_DEPTH:
                 raise ParserOutputContractError("MinerU artifact tree is too deep")
             before = _directory_identity(
@@ -899,7 +1025,11 @@ class PinnedArtifactTree:
                 is_directory=True,
                 label=f"MinerU artifact directory {relative.as_posix()}",
             )
-            names = _directory_names(directory_fd, relative=relative)
+            names = _directory_names(
+                directory_fd, relative=relative, checkpoint=self._checkpoint if self._checkpoint_callback is not None else None,
+                maximum_names=None if self._max_entries is None else self._max_entries - entry_count[0],
+            )
+            entry_count[0] += len(names)
             if (
                 relative != PurePosixPath(".")
                 and not names
@@ -911,6 +1041,7 @@ class PinnedArtifactTree:
             directories[relative] = before
             entries[relative] = names
             for name in names:
+                self._checkpoint()
                 child = _child_relative(relative, name)
                 observed = _lstat_at(directory_fd, name, relative=child)
                 if stat.S_ISDIR(observed.st_mode):
@@ -929,6 +1060,7 @@ class PinnedArtifactTree:
                         entries=entries,
                         files=files,
                         allow_empty_directories=allow_empty_directories,
+                        entry_count=entry_count,
                     )
                     continue
                 fd = _open_regular_at(
@@ -949,7 +1081,10 @@ class PinnedArtifactTree:
                 finally:
                     os.close(fd)
             if (
-                _directory_names(directory_fd, relative=relative) != names
+                _directory_names(
+                    directory_fd, relative=relative, checkpoint=self._checkpoint if self._checkpoint_callback is not None else None,
+                    maximum_names=len(names) if self._max_entries is not None else None,
+                ) != names
                 or _directory_identity(
                     os.fstat(directory_fd),
                     root_device=self._root_identity.device,
@@ -960,6 +1095,7 @@ class PinnedArtifactTree:
                 raise ParserOutputContractError(
                     f"MinerU artifact directory changed during verification: {relative.as_posix()}"
                 )
+            self._checkpoint()
         finally:
             os.close(directory_fd)
 
@@ -969,26 +1105,41 @@ class PinnedArtifactTree:
             self._root_fd,
             relative.parts[:-1],
             root_device=self._root_identity.device,
+            checkpoint=self._checkpoint if self._checkpoint_callback is not None else None,
         )
         try:
-            expected = os.stat(
-                relative.name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            return _open_regular_at(
-                parent_fd,
-                relative.name,
-                expected=expected,
-                root_device=self._root_identity.device,
-                relative=relative,
-            )
-        except OSError as exc:
-            raise ParserOutputContractError(
-                f"cannot reopen MinerU artifact: {relative.as_posix()}"
-            ) from exc
-        finally:
+            try:
+                expected = os.stat(
+                    relative.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                fd = _open_regular_at(
+                    parent_fd,
+                    relative.name,
+                    expected=expected,
+                    root_device=self._root_identity.device,
+                    relative=relative,
+                )
+            except OSError as exc:
+                raise ParserOutputContractError(
+                    f"cannot reopen MinerU artifact: {relative.as_posix()}"
+                ) from exc
+        except BaseException as primary:
+            try:
+                os.close(parent_fd)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup("MinerU file opening and parent closure failed", [primary, cleanup]) from None
+            raise
+        try:
             os.close(parent_fd)
+        except BaseException as primary:
+            try:
+                os.close(fd)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup("MinerU parent and opened file closure failed", [primary, cleanup]) from None
+            raise
+        return fd
 
     def _assert_display_path(self) -> None:
         try:
@@ -1016,6 +1167,13 @@ class PinnedArtifactTree:
     def _require_open(self) -> None:
         if self._closed:
             raise ParserOutputContractError("pinned MinerU artifact tree is closed")
+
+
+def _validate_scan_options(checkpoint: Callable[[], object] | None, max_entries: int | None) -> None:
+    if checkpoint is not None and not callable(checkpoint):
+        raise ParserOutputContractError("MinerU artifact checkpoint is invalid")
+    if max_entries is not None and (type(max_entries) is not int or max_entries < 1):
+        raise ParserOutputContractError("MinerU artifact entry limit is invalid")
 
 
 def _require_dirfd_flags() -> None:
@@ -1097,14 +1255,13 @@ def _directory_names(
     directory_fd: int,
     *,
     relative: PurePosixPath,
+    checkpoint: Callable[[], object] | None = None,
+    maximum_names: int | None = None,
 ) -> tuple[str, ...]:
-    try:
-        names = os.listdir(directory_fd)
-    except OSError as exc:
-        raise ParserOutputContractError(
-            f"cannot list MinerU artifact directory: {relative.as_posix()}"
-        ) from exc
-    for name in names:
+    if maximum_names is not None and (type(maximum_names) is not int or maximum_names < 0):
+        raise ParserOutputContractError("MinerU artifact directory entry limit is invalid")
+
+    def validate_name(name: str) -> None:
         if not isinstance(name, str) or not name or name in {".", ".."}:
             raise ParserOutputContractError(
                 f"MinerU artifact directory contains an unsafe name: {relative.as_posix()}"
@@ -1113,6 +1270,48 @@ def _directory_names(
             raise ParserOutputContractError(
                 f"MinerU artifact directory contains an unsafe name: {relative.as_posix()}"
             )
+
+    if checkpoint is None and maximum_names is None:
+        try:
+            names = os.listdir(directory_fd)
+        except OSError as exc:
+            raise ParserOutputContractError(
+                f"cannot list MinerU artifact directory: {relative.as_posix()}"
+            ) from exc
+        for name in names:
+            validate_name(name)
+    else:
+        if checkpoint is not None:
+            checkpoint()
+        try:
+            entries = os.scandir(directory_fd)
+        except OSError as exc:
+            raise ParserOutputContractError(
+                f"cannot list MinerU artifact directory: {relative.as_posix()}"
+            ) from exc
+        names = []
+        with entries:
+            while True:
+                if checkpoint is not None:
+                    checkpoint()
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    entry = None
+                except OSError as exc:
+                    raise ParserOutputContractError(
+                        f"cannot list MinerU artifact directory: {relative.as_posix()}"
+                    ) from exc
+                if checkpoint is not None:
+                    checkpoint()
+                if entry is None:
+                    break
+                validate_name(entry.name)
+                if maximum_names is not None and len(names) >= maximum_names:
+                    raise ParserOutputContractError("MinerU artifact tree exceeds its entry limit")
+                names.append(entry.name)
+        if checkpoint is not None:
+            checkpoint()
     return tuple(sorted(names))
 
 
@@ -1216,11 +1415,16 @@ def _open_parent_directory(
     components: Sequence[str],
     *,
     root_device: int,
+    checkpoint: Callable[[], object] | None = None,
 ) -> int:
+    if checkpoint is not None:
+        checkpoint()
     current_fd = os.dup(root_fd)
     current = PurePosixPath(".")
     try:
         for component in components:
+            if checkpoint is not None:
+                checkpoint()
             relative = _child_relative(current, component)
             expected = _lstat_at(current_fd, component, relative=relative)
             if not stat.S_ISDIR(expected.st_mode):
@@ -1234,29 +1438,60 @@ def _open_parent_directory(
                 root_device=root_device,
                 relative=relative,
             )
-            os.close(current_fd)
-            current_fd = next_fd
+            prior_fd, current_fd = current_fd, next_fd
+            os.close(prior_fd)
+            if checkpoint is not None:
+                checkpoint()
             current = relative
+        if checkpoint is not None:
+            checkpoint()
         return current_fd
-    except BaseException:
-        os.close(current_fd)
+    except BaseException as primary:
+        try:
+            os.close(current_fd)
+        except BaseException as cleanup:
+            raise BaseExceptionGroup("MinerU parent traversal and closure failed", [primary, cleanup]) from None
         raise
 
 
-def _stream_digest(fd: int) -> tuple[str, int, bytes]:
+def _stream_digest(
+    fd: int, *, checkpoint: Callable[[], object] | None = None,
+    maximum_bytes: int | None = None,
+) -> tuple[str, int, bytes]:
+    if maximum_bytes is not None and (type(maximum_bytes) is not int or maximum_bytes < 0):
+        raise ParserOutputContractError("MinerU artifact digest byte limit is invalid")
+    if checkpoint is not None:
+        checkpoint()
     try:
         os.lseek(fd, 0, os.SEEK_SET)
-        digest = hashlib.sha256()
-        size_bytes = 0
-        leading_bytes = b""
-        while chunk := os.read(fd, 1024 * 1024):
-            if not leading_bytes:
-                leading_bytes = chunk[:16]
-            digest.update(chunk)
-            size_bytes += len(chunk)
-        return "sha256:" + digest.hexdigest(), size_bytes, leading_bytes
     except OSError as exc:
         raise ParserOutputContractError("cannot stream MinerU artifact") from exc
+    digest = hashlib.sha256()
+    size_bytes = 0
+    leading_bytes = b""
+    while True:
+        if checkpoint is not None:
+            checkpoint()
+        request = 1024 * 1024 if maximum_bytes is None else min(1024 * 1024, maximum_bytes - size_bytes + 1)
+        try:
+            chunk = os.read(fd, request)
+        except OSError as exc:
+            raise ParserOutputContractError("cannot stream MinerU artifact") from exc
+        if checkpoint is not None:
+            checkpoint()
+        if not chunk:
+            break
+        size_bytes += len(chunk)
+        if maximum_bytes is not None and size_bytes > maximum_bytes:
+            raise ParserOutputContractError("MinerU artifact grew beyond its pinned byte count")
+        if not leading_bytes:
+            leading_bytes = chunk[:16]
+        digest.update(chunk)
+    if maximum_bytes is not None and size_bytes != maximum_bytes:
+        raise ParserOutputContractError("MinerU artifact ended before its pinned byte count")
+    if checkpoint is not None:
+        checkpoint()
+    return "sha256:" + digest.hexdigest(), size_bytes, leading_bytes
 
 
 def _relative_parts(relative: PurePosixPath) -> tuple[str, ...]:

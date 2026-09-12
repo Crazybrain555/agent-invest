@@ -173,6 +173,10 @@
    "private_imports": [],
    "tests": 18
   },
+  "tests/unit/test_bounded_pinned_artifact_tree.py": {
+   "private_imports": [],
+   "tests": 30
+  },
   "tests/unit/test_build_mineru_validation_receipt.py": {
    "private_imports": [],
    "tests": 5
@@ -422,6 +426,10 @@
    "private_imports": [],
    "tests": 20
   },
+  "tests/unit/test_mineru_diagnostic_journal_accessors.py": {
+   "private_imports": [],
+   "tests": 17
+  },
   "tests/unit/test_mineru_diagnostic_lifecycle.py": {
    "private_imports": [],
    "tests": 17
@@ -445,6 +453,14 @@
   "tests/unit/test_mineru_diagnostic_quality.py": {
    "private_imports": [],
    "tests": 18
+  },
+  "tests/unit/test_mineru_diagnostic_quality_inputs.py": {
+   "private_imports": [],
+   "tests": 20
+  },
+  "tests/unit/test_mineru_diagnostic_quality_ownership_failures.py": {
+   "private_imports": [],
+   "tests": 11
   },
   "tests/unit/test_mineru_diagnostic_wire.py": {
    "private_imports": [],

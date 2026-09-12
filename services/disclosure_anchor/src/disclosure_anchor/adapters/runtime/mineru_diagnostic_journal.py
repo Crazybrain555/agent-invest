@@ -45,6 +45,19 @@ class DiagnosticJournalRecord:
     observed_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class DiagnosticJournalIdentity:
+    """Detached original header facts, never an ownership capability."""
+
+    attempt_id: str
+    configuration_sha256: str
+    clock_identity_sha256: str
+    started_ns: int
+    deadline_ns: int
+    root_identity: tuple[int, int, int, int]
+    header_sha256: str
+
+
 def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -152,6 +165,14 @@ class DiagnosticJournal:
                 raise DiagnosticJournalError("diagnostic original identity, root, clock or deadline changed")
             self._last_clock = started
             self._tail_sha = _digest(raw)
+            self._header_raw = raw
+            self._original_identity = DiagnosticJournalIdentity(
+                attempt_id=attempt_id, configuration_sha256=configuration_sha256,
+                clock_identity_sha256=clock_identity_sha256, started_ns=started,
+                deadline_ns=deadline_ns,
+                root_identity=(self._identity[0], self._identity[1], self._identity[2], self._identity[3]),
+                header_sha256=self._tail_sha,
+            )
             self._bytes = len(raw)
             names = sorted(os.listdir(self._root_fd))
             if _PENDING in names:
@@ -199,6 +220,35 @@ class DiagnosticJournal:
         return tuple(DiagnosticJournalRecord(r.sequence, r.step, _decode(_canonical(r.value)), r.sha256, r.observed_ns)
                      for r in self._records)
 
+    def _require_certain_owner(self) -> None:
+        self._assert_root()
+        if self._poisoned:
+            raise DiagnosticJournalError("diagnostic journal is poisoned after uncertain IO")
+        try:
+            os.stat(_PENDING, dir_fd=self._root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise DiagnosticJournalError("diagnostic append outcome is uncertain; retain pending evidence")
+
+    @property
+    def original_identity(self) -> DiagnosticJournalIdentity:
+        self._require_certain_owner()
+        if self._read(_HEADER) != self._header_raw:
+            raise DiagnosticJournalError("diagnostic original header bytes changed")
+        self._require_certain_owner()
+        return self._original_identity
+
+    def require_capacity(self, *, additional_records: int, additional_bytes: int) -> None:
+        """Check actual complete-envelope capacity without reserving new work."""
+        if (type(additional_records) is not int or additional_records < 0
+                or type(additional_bytes) is not int or additional_bytes < 0):
+            raise DiagnosticJournalError("diagnostic capacity demand must use nonnegative exact integers")
+        self._require_certain_owner()
+        self.remaining_seconds()
+        self._require_certain_owner()
+        if len(self._records) + additional_records > _MAX_RECORDS or self._bytes + additional_bytes > _MAX_TOTAL:
+            raise DiagnosticJournalError("diagnostic capacity demand exceeds original record/byte envelope")
+
     def _assert_root(self) -> None:
         if self._closed or self._root_fd < 0:
             raise DiagnosticJournalError("diagnostic journal is closed")
@@ -221,7 +271,7 @@ class DiagnosticJournal:
         return info
 
     def _read(self, name: str) -> bytes:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._root_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self._root_fd)
         with os.fdopen(fd, "rb") as source:
             info = self._owned_file(source.fileno())
             if not 0 < info.st_size <= _MAX_RECORD:
@@ -258,6 +308,9 @@ class DiagnosticJournal:
             raise DiagnosticJournalError("diagnostic journal is poisoned after uncertain IO")
         if now >= self._deadline:
             raise TimeoutError("original diagnostic deadline expired; preserve exact attempt")
+        # The injected clock can revoke ownership or expose an uncertain append.
+        # A successful checkpoint must still own the same journal after it runs.
+        self._require_certain_owner()
         return min(30.0, (self._deadline - now) / 1_000_000_000)
 
     def append(self, step: str, value: dict[str, Any]) -> DiagnosticJournalRecord:
