@@ -4,13 +4,13 @@
 
 ## Claude-specific continuity
 
-- Use `/context` to verify instruction loading. Descendant `CLAUDE.md` adapters load on demand; after compact or
-  resume, re-read the applicable leaf before editing there.
+- Use `/context` when instruction loading is uncertain. Descendant `CLAUDE.md` adapters load on demand;
+  read the applicable leaf before its first edit if it has not already been loaded.
 - Durable product/task state belongs in tracked docs or the applicable HANDOFF, not Auto Memory. Never store
   credentials, acceptance criteria, runtime claims, or volatile service state in memory.
-- After compact or resume, reconcile the current request with HANDOFF, Git/worktree truth, and any narrow
-  read-only external observation required by the next action. Preserve `Completed / do not repeat` separately
-  from pending work.
+- Recover after compact or resume only when history is incomplete, unclear or conflicts with current state,
+  following `docs/agent-workflow.md`. With intact context, continue without repeating completed reads or checks.
+  Preserve `Completed / do not repeat` separately from pending work.
 - When compacting, keep verbatim: the user's authorizations and their limits, open HANDOFF obligations, the
   exact commands run with their results (credentials and raw datasets redacted), touched files, open blockers,
   and the `Completed / do not repeat` list.
