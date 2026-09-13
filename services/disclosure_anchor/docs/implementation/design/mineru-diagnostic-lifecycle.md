@@ -6,7 +6,9 @@ artifact validation, local disposal, provider ACK and verified remote absence.
 It returns a private `mineru-diagnostic-disposal.v2` receipt. It does not publish,
 write a database, construct a production completion witness, or qualify M6 pages.
 The existing v1 `run_diagnostic_pdf` and opt-in smoke CLI retain their interfaces
-and behavior. A multi-input M6 controller and its CLI are separate work.
+and behavior. The bounded functional multi-input entry is described in
+[m6-service-batch.md](m6-service-batch.md); formal M6 owner/quality metrology
+remains separate from that entry.
 
 The caller supplies the original attempt/fence/epoch, PDF SHA-256/byte count/page
 count, API and upstream URLs, complete parser/runtime options, clock identity,
@@ -27,6 +29,13 @@ Termination has a separate bounded one-second reap allowance; this never grants
 new observation time. Failure retains the exact child object in the propagated
 unresolved error for caller reconciliation, rather than claiming that it exited.
 Supplying a plausible page count alone cannot authorize a POST.
+
+An optional `before_submit` guard runs after durable submit intent and opening
+the original snapshot, immediately before the fresh task POST. It rechecks
+current admission after potentially lengthy preparation. Guard rejection keeps
+the original intent/resources unresolved; it does not manufacture no-submission
+or disposal proof. Original-key lookup and accepted/disposed recovery do not
+request fresh admission.
 
 ## Evidence and recovery
 
@@ -57,6 +66,13 @@ reconciliation. A failed provider terminal may clean and ACK its own obligation,
 with `outcome: failed`, no result artifact and no invented successful quality.
 
 ## Local resources and closure
+
+`require_disposed=True` is an explicit read-only recovery guard and requires
+`resume=True`. It opens the original journal, validates the complete phase chain
+and requires its final disposed record. Both resource names must remain absent
+after the final original-clock and owner checks. Unfinished phases fail before
+wire-client creation, source observation, journal append or cleanup. A batch
+disposal reference alone cannot establish this proof.
 
 `mineru_diagnostic_resources.py` registers the actual FD-derived identity before
 payload writes. Original inodes, type, owner, private modes, link count and sealed

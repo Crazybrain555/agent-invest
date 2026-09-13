@@ -25,6 +25,7 @@ from disclosure_anchor.application.contracts.m6_owner import (
 from disclosure_anchor.application.contracts.m6_schemas import operational_m6_schema_documents
 
 from tests import m6_support as m6
+from tests import _m6_service_quality_fixture as service_quality
 
 import jsonschema
 
@@ -35,6 +36,9 @@ EXPECTED_FILES = {
     "m6-quality-plan.v1.schema.json": "m6.quality-plan.v1",
     "m6-qualification-evidence.v1.schema.json": "m6.qualification-evidence.v1",
     "m6-document-qualification.v1.schema.json": "m6.document-qualification.v1",
+    "m6-service-quality-plan.v1.schema.json": "m6.service-quality-plan.v1",
+    "m6-service-qualification-evidence.v1.schema.json": "m6.service-qualification-evidence.v1",
+    "m6-service-document-qualification.v1.schema.json": "m6.service-document-qualification.v1",
     "m6-source-history-fact.v1.schema.json": None,
     "m6-run-spec.v1.schema.json": "m6.run-spec.v1",
     "m6-producer-event.v1.schema.json": "m6.producer-event.v1",
@@ -74,7 +78,7 @@ class ClosedSchemaExportTests(unittest.TestCase):
         self.documents = operational_m6_schema_documents()
 
     def test_closed_schemas_are_valid_exact_exports_and_in_complete_registry(self) -> None:
-        self.assertEqual(set(self.documents), set(EXPECTED_FILES), "the private registry is exactly these fourteen")
+        self.assertEqual(set(self.documents), set(EXPECTED_FILES), "the private registry is exactly the declared set")
         for filename, document in self.documents.items():
             self.assertEqual(document["$schema"], DRAFT, filename)
             self.assertEqual(document["$id"], ID_PREFIX + filename, filename)
@@ -170,12 +174,25 @@ class SchemaAcceptanceTests(unittest.TestCase):
         reply = M6OwnerReply(request_sha256=request.canonical_sha256(), outcome="ok", status=status,
                              record=record, error_code=None)
         history = m6.history_fact(self.fixture.entries["a"], attempt_id="att-a", ledger_seq=1)
+        # Independent service-only wire instances; no new qualifier generates
+        # the expected verdict or its evidence/plan digests for this oracle.
+        service_plan = service_quality.plan_payload()
+        service_evidence = service_quality.evidence_payload()
+        service_qualification = {
+            "contract_version": "m6.service-document-qualification.v1",
+            "evidence_sha256": service_quality.sha(service_quality.canonical(service_evidence)),
+            "plan_sha256": service_quality.sha(service_quality.canonical(service_plan)),
+            "verdict": "scorable", "reasons": [], "scorable_page_count": 2,
+        }
         instances = {
             "m6-campaign-scope.v1.schema.json": scope,
             "m6-corpus-manifest.v1.schema.json": corpus,
             "m6-quality-plan.v1.schema.json": plan,
             "m6-qualification-evidence.v1.schema.json": proof,
             "m6-document-qualification.v1.schema.json": qualification,
+            "m6-service-quality-plan.v1.schema.json": service_plan,
+            "m6-service-qualification-evidence.v1.schema.json": service_evidence,
+            "m6-service-document-qualification.v1.schema.json": service_qualification,
             "m6-source-history-fact.v1.schema.json": history,
             "m6-run-spec.v1.schema.json": spec,
             "m6-producer-event.v1.schema.json": record.event,
@@ -188,7 +205,7 @@ class SchemaAcceptanceTests(unittest.TestCase):
         }
         self.assertEqual(set(instances), set(self.documents))
         for filename, model in instances.items():
-            wire = json.loads(model.canonical_bytes())
+            wire = model if isinstance(model, dict) else json.loads(model.canonical_bytes())
             self.assert_accepts(filename, wire)
             self.assert_rejects(filename, {**wire, "unexpected": 1}, "an unknown top-level field")
             required_key = next(key for key in wire if key not in {"contract_version", "kind"})
@@ -238,6 +255,16 @@ class SchemaAcceptanceTests(unittest.TestCase):
         self.assert_rejects("m6-owner-request.v1.schema.json", {**request_wire, "command": {"kind": "status", "token": "x"}},
                             "credentials inside a durable control model")
         self.assert_accepts("m6-owner-request.v1.schema.json", {**request_wire, "command": {"kind": "status"}})
+
+        self.assert_rejects("m6-service-quality-plan.v1.schema.json", {
+            **service_plan, "required_checks": ["artifact_closure", *service_plan["required_checks"][1:]],
+        }, "a legacy Unit-level check in the service-only family")
+        self.assert_rejects("m6-service-qualification-evidence.v1.schema.json", {
+            **service_evidence, "observation": {**service_evidence["observation"], "unit_count": 3},
+        }, "a Unit count inside the source/provider-only observation")
+        self.assert_rejects("m6-service-document-qualification.v1.schema.json", {
+            **service_qualification, "scorable_page_count": True,
+        }, "a boolean page count")
 
         # Service-mode instances are accepted by the same schemas (mode is a closed enum, not a separate document).
         service = m6.make_fixture("service_diagnostic", {"s": (2, "fresh")})

@@ -150,6 +150,8 @@ class M6DocumentQualification(M6ClosedModel):
 def qualify_document(
     evidence: M6QualificationEvidence, plan: M6QualityPlan,
 ) -> M6DocumentQualification:
+    if type(evidence) is not M6QualificationEvidence or type(plan) is not M6QualityPlan:
+        raise ValueError("whole-document qualification requires its exact evidence and plan family")
     observation = evidence.observation
     if observation.mode != plan.mode:
         raise ValueError("qualification plan mode mismatch")

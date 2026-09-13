@@ -14,6 +14,9 @@ from disclosure_anchor.application.contracts.m6_owner import (
 )
 from disclosure_anchor.application.contracts.m6_run import M6RunReceipt, M6RunSpec, M6SourceHistoryFact
 from disclosure_anchor.application.contracts.m6_run_events import M6ProducerEvent, M6RunEvent
+from disclosure_anchor.application.contracts.m6_service_quality import (
+    M6ServiceDocumentQualification, M6ServiceQualificationEvidence, M6ServiceQualityPlan,
+)
 
 
 def operational_m6_schema_documents() -> dict[str, dict[str, Any]]:
@@ -23,6 +26,9 @@ def operational_m6_schema_documents() -> dict[str, dict[str, Any]]:
         "m6-quality-plan.v1.schema.json": M6QualityPlan,
         "m6-qualification-evidence.v1.schema.json": M6QualificationEvidence,
         "m6-document-qualification.v1.schema.json": M6DocumentQualification,
+        "m6-service-quality-plan.v1.schema.json": M6ServiceQualityPlan,
+        "m6-service-qualification-evidence.v1.schema.json": M6ServiceQualificationEvidence,
+        "m6-service-document-qualification.v1.schema.json": M6ServiceDocumentQualification,
         "m6-source-history-fact.v1.schema.json": M6SourceHistoryFact,
         "m6-run-spec.v1.schema.json": M6RunSpec,
         "m6-producer-event.v1.schema.json": M6ProducerEvent,

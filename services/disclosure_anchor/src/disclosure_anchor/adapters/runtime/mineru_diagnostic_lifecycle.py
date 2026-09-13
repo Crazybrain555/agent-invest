@@ -120,7 +120,8 @@ class _Attempt:
         self.phases.append("snapshot_sealed", resources.seal_payload(
             "source.pdf", identity=self.phases.value("snapshot_created")["identity"]))
 
-    def submit(self, resources: DiagnosticResources) -> None:
+    def submit(self, resources: DiagnosticResources,
+               before_submit: Callable[[], None] | None = None) -> None:
         if self.phases.has("accepted"):
             return
         if not self.phases.has("submit_intent"):
@@ -139,6 +140,12 @@ class _Attempt:
             receipt = self.phases.value("snapshot_sealed")
             resources.verify_payload("source.pdf", receipt)
             with resources.open_payload("source.pdf", identity=receipt["identity"]) as source:
+                # Snapshot/source observation can outlive the caller's admission
+                # grant. Check at the actual POST boundary, not just at dispatch.
+                # A rejected guard leaves original intent/resources unresolved;
+                # it grants neither a new-key retry nor fictitious disposal.
+                if before_submit is not None:
+                    before_submit()
                 with self.wire.client.stream(
                     "POST", self.binding["api_url"].rstrip("/") + "/tasks", data=data,
                     files={"files": ("sha256_" + self.binding["source_pdf_sha256"][7:] + ".pdf",
@@ -300,9 +307,17 @@ def run_diagnostic_attempt_v2(
     reader: MinerUMediumArtifactReader | None = None, unix_time: Callable[[], float] = time.time,
     pause: Callable[[float], None] = time.sleep, quality_verifier: QualityVerifier | None = None,
     quality_verifier_sha256: str | None = None,
+    before_submit: Callable[[], None] | None = None,
+    require_disposed: bool = False,
 ) -> dict[str, Any]:
-    """Run or explicitly reconcile one diagnostic; no new-key retry on resume."""
-    if (type(resume) is not bool or type(source_byte_count) is not int or not 0 < source_byte_count <= _MAX_INPUT_BYTES
+    """Run or explicitly reconcile one diagnostic; no new-key retry on resume.
+
+    ``require_disposed`` is read-only reconciliation of an already sealed final
+    proof. It requires resume and refuses every unfinished phase before issuing
+    requests, appending records or changing resources.
+    """
+    if (type(resume) is not bool or type(require_disposed) is not bool or require_disposed and not resume
+            or type(source_byte_count) is not int or not 0 < source_byte_count <= _MAX_INPUT_BYTES
             or type(source_page_count) is not int or not 0 < source_page_count <= 2**31 - 1
             or (quality_verifier is None) != (quality_verifier_sha256 is None)
             or quality_verifier_sha256 is not None and (type(quality_verifier_sha256) is not str
@@ -319,6 +334,18 @@ def run_diagnostic_attempt_v2(
     with DiagnosticJournal(journal_root, create=not resume, attempt_id=attempt_identity,
                            configuration_sha256=_digest(_canonical(binding)), clock_identity_sha256=clock_identity_sha256,
                            deadline_ns=deadline_ns, continuous_ns=continuous_ns) as journal:
+        if require_disposed:
+            phases = DiagnosticPhases(journal, binding)
+            if not phases.has("disposed"):
+                raise DiagnosticUnresolved("expected final diagnostic proof is not durably disposed")
+            names = (journal.root / "resources", journal.root / "resources-reclaim")
+            if any(path.exists() or path.is_symlink() for path in names):
+                raise DiagnosticJournalError("resource names reappeared after sealed local closure")
+            journal.remaining_seconds()
+            journal.original_identity
+            if any(path.exists() or path.is_symlink() for path in names):
+                raise DiagnosticJournalError("resource names reappeared during final disposal observation")
+            return phases.final_proof()
         with DiagnosticWireClient(checkpoint=journal.remaining_seconds, transport=transport) as wire:
             attempt = _Attempt(journal, binding, resume=resume, wire=wire, options=options, unix_time=unix_time, pause=pause)
             if not attempt.phases.has("binding"):
@@ -345,7 +372,7 @@ def run_diagnostic_attempt_v2(
                             "response_hex": raw.hex(), "response_sha256": _digest(raw)})
                         attempt.refresh()
                         resources.verify_payload("source.pdf", attempt.phases.value("snapshot_sealed"))
-                    attempt.submit(resources)
+                    attempt.submit(resources, before_submit)
                     attempt.terminal()
                     if attempt.phases.terminal().status == "completed":
                         attempt.artifacts(resources)

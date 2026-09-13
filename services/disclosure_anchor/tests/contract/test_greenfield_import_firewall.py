@@ -8,7 +8,8 @@ import unittest
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
-_EXISTING_M6_SCHEMA_FILES = (
+_M6_SCHEMA_FILES = (
+    _SOURCE_ROOT / "application" / "contracts" / "m6_service_quality.py",
     _SOURCE_ROOT / "application" / "contracts" / "m6_document_qualification.py",
     _SOURCE_ROOT / "application" / "contracts" / "m6_campaign.py",
     _SOURCE_ROOT / "application" / "contracts" / "m6_common.py",
@@ -21,7 +22,7 @@ _EXISTING_M6_SCHEMA_FILES = (
 _GREENFIELD_CORE_FILES = (
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_config.py",
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_input.py",
-    *_EXISTING_M6_SCHEMA_FILES,
+    *_M6_SCHEMA_FILES,
     _SOURCE_ROOT / "application" / "contracts" / "m6_schemas.py",
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality.py",
     _SOURCE_ROOT / "application" / "services" / "source_semantic_record.py",
@@ -65,6 +66,7 @@ _HISTORICAL_EVIDENCE_CONTRACT = (
     / "normalized_ir_v4_evidence.py"
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
+    "disclosure_anchor.application.contracts.m6_service_quality",
     "disclosure_anchor.application.contracts.mineru_diagnostic_quality_config",
     "disclosure_anchor.application.contracts.mineru_diagnostic_quality_input",
     "disclosure_anchor.application.contracts.m6_document_qualification",
@@ -172,9 +174,9 @@ class GreenfieldImportFirewallTest(unittest.TestCase):
                     root = name.split(".", 1)[0]
                     if root in sys.stdlib_module_names or root == "__future__":
                         continue
-                    # These existing closed schemas already use Pydantic. Keep
+                    # These closed M6 schemas use Pydantic. Keep
                     # this exception tied to their exact files and module name.
-                    if path in _EXISTING_M6_SCHEMA_FILES and name == "pydantic":
+                    if path in _M6_SCHEMA_FILES and name == "pydantic":
                         continue
                     if any(
                         name == allowed or name.startswith(f"{allowed}.")

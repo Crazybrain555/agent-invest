@@ -133,6 +133,24 @@ change the business publication policy or add L2 semantic repair.
 
 ## Validation and implementation boundaries
 
+The additional `m6.service-quality-plan.v1`,
+`m6.service-qualification-evidence.v1` and
+`m6.service-document-qualification.v1` family defines a narrower source/provider
+integrity scope. It freezes exactly four checks: provider artifact closure,
+provider content integrity, provider page closure and source identity. Its plan
+binds the parser target, applicable previously accepted parser evidence and the
+actual verifier. Missing/failed/unverified checks and page-count mismatch exclude
+all pages; reason/review dispositions retain their existing meaning. It carries
+no invented Unit counts or public hashes. The old whole-document v1 family and
+`reduce_m6_run` retain their meaning and reject cross-family values.
+
+The pure new qualification function cannot attest external baseline evidence or
+actual validation. The functional [service batch](m6-service-batch.md) currently
+uses E1's explicit `quality=unverified`. It does not emit a new formal service
+receipt or substitute narrower checks into the old service numerator. A bound
+actual verifier and a separately versioned service accounting projection are
+required before claiming qualified throughput under the new scope.
+
 Deterministic tests cover closed membership, canonical bytes, source/page/winner
 conflicts, global history, late qualification, carry-in/replay, owner/producer
 sequences, original-deadline resume, boot changes and failed closure. Operational

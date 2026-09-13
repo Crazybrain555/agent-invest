@@ -1,0 +1,101 @@
+{
+  "$defs": {
+    "M6ReasonPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "enum": [
+            "score_hard_fail",
+            "review_required",
+            "accepted_noncritical"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "disposition"
+      ],
+      "title": "M6ReasonPolicy",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-service-quality-plan.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "m6.service-quality-plan.v1",
+      "default": "m6.service-quality-plan.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "mode": {
+      "const": "service_diagnostic",
+      "title": "Mode",
+      "type": "string"
+    },
+    "parser_baseline_evidence_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Parser Baseline Evidence Sha256",
+      "type": "string"
+    },
+    "parser_target_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Parser Target Sha256",
+      "type": "string"
+    },
+    "quality_verifier_sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Quality Verifier Sha256",
+      "type": "string"
+    },
+    "reason_policies": {
+      "items": {
+        "$ref": "#/$defs/M6ReasonPolicy"
+      },
+      "maxItems": 256,
+      "title": "Reason Policies",
+      "type": "array"
+    },
+    "required_checks": {
+      "items": {
+        "enum": [
+          "provider_artifact_closure",
+          "provider_content_integrity",
+          "provider_page_closure",
+          "source_identity"
+        ],
+        "type": "string"
+      },
+      "maxItems": 4,
+      "minItems": 4,
+      "title": "Required Checks",
+      "type": "array"
+    }
+  },
+  "required": [
+    "mode",
+    "parser_target_sha256",
+    "parser_baseline_evidence_sha256",
+    "quality_verifier_sha256",
+    "required_checks",
+    "reason_policies"
+  ],
+  "title": "M6ServiceQualityPlan",
+  "type": "object"
+}

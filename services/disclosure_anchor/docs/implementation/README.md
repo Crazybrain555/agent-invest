@@ -22,6 +22,7 @@
 - `design/capacity-observation.md`：旁路、只读、可重放的 MinerU/GPU Observation v1；不含 Advisor/selector/actuator。
 - `design/synchronized-capacity-telemetry.md`：250–500ms/1s 同步遥测、clock-domain、向量信用与 durable-page 进度契约；默认禁用。
 - `design/m6-owner-control.md`：M6 原生测量 owner、控制协议与资源退出边界。
+- `design/m6-service-batch.md`：有界多 PDF 自动供给、原身份恢复和 functional CLI；与正式 M6 计分分开。
 - `design/mineru-diagnostic-lifecycle.md`：单次 v2 diagnostic 执行、原身份恢复、独立质量证据与清理/ACK；不授予发布或 M6 吞吐验收资格。
 - `design/provider-source-semantics.md`：生产 admission 与诊断共享内容校验、源文本语义及 Unit 构建/replay，保留各自权限边界。
 - `design/retrieval-and-semantic-keys.md`：检索投影当前契约及其历史演变。
