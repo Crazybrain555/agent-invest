@@ -462,6 +462,10 @@
    "private_imports": [],
    "tests": 17
   },
+  "tests/unit/test_mineru_cpu_thread_policy.py": {
+   "private_imports": [],
+   "tests": 11
+  },
   "tests/unit/test_mineru_deployment_gate.py": {
    "private_imports": [],
    "tests": 11

@@ -116,7 +116,7 @@ class FreezeMineruServiceEpochTests(unittest.TestCase):
 
     def test_freeze_rejects_unknown_runtime_manifest_contract(self) -> None:
         with self.assertRaisesRegex(SystemExit, "runtime manifest identity is invalid"):
-            self._run_freeze("mineru-runtime-bundle.v10")
+            self._run_freeze("mineru-runtime-bundle.v11")
 
 if __name__ == "__main__":
     unittest.main()

@@ -299,11 +299,21 @@ parse-capable worker/pipeline/admin 会在连 DB 前重算并核验当前 PASS �
 ### Staged-v4 resource cutover (default-off)
 
 当前 serial process profile 的 `cpu_worker_threads=3` 指 `MINERU_PDF_RENDER_THREADS` 的
-PDF 渲染 worker 配置上限，不是整个进程的 OS 线程数；`omp_thread_count=1` 对应显式
-OMP/MKL/OpenBLAS 单线程策略。Compose、collector 的闭合环境清单和 attester 同步核验，
+PDF 渲染 worker 配置上限，不是整个进程的 OS 线程数。默认 v9 的 `omp_thread_count=1`
+对应显式 OMP/MKL/OpenBLAS 单线程策略。受控 CPU 对比可以显式选择 attester 的
+`--expected-api-cpu-threads 2`：仅在实际 API 环境 OMP/MKL 都为 2、OpenBLAS 为 1、
+PDF render 为 3 时生成 `mineru-runtime-bundle.v10`。其闭合 `cpu_thread_policy`
+记录这四项配置；原 v8/v9 不接受新增字段，默认 attester 仍要求单线程并生成 v9。
+staged profile 的 `omp_thread_count` 必须与已验证 manifest 一致，不能只改 profile 的数值或 SHA。
+这项配置证明不代表框架实际执行宽度，也不代表吞吐验收通过。
+Compose、collector 的闭合环境清单和 attester 同步核验，
 不能把新 probe 进程的默认值或某时刻 `/proc` 线程人口当作这个配置。容器内存上限从实际
 Docker/cgroup 读取；v1 要求有限正数，`max`/未设置不能编造为机器总内存或测试 fixture。
 现场资源 cap 写私有 compose 并经原安装器在 quiescent 状态应用，重采集后才建新 profile。
+线程对比同样要求排空、保留原配置、新 runtime/epoch/held-out 证据；不得重贴旧运行身份。
+负载开始前必须确认 GPU/VRAM、CPU/RAM、API 与推理队列监测就绪并覆盖整个运行，
+跨主机时间对齐保留运行前后校准及误差范围。以完整任务/源页吞吐及等待阶段定位收益，
+保留空闲、采样缺口、OOM、重启和失败证据；单纯增加线程或通过功能检查不构成性能通过。
 
 staged-v4 的默认关闭 source candidate 另有 [V4 资源生命周期与离线切换步骤](../design/v4-resource-lifetime.md)：
 0060→全历史 spec 回填→0061 验证；实际旧 writer 退出是前置，不可用 PG lease 代替。

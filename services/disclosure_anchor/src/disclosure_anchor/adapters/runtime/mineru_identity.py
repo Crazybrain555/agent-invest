@@ -19,6 +19,7 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
 
 RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v8"
 STAGED_RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v9"
+CPU_THREAD_RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v10"
 MINERU_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_PROTOCOL_VERSION = 2
 MINERU_API_DEFAULT_TASK_SLOTS = 1
@@ -96,6 +97,9 @@ _STAGED_ORCHESTRATOR_MANIFEST_FIELDS = _ORCHESTRATOR_MANIFEST_FIELDS | {
     "task_registry_max_records",
     "task_result_reservation_bytes",
     "max_unacked_result_bytes",
+}
+_CPU_THREAD_ORCHESTRATOR_MANIFEST_FIELDS = _STAGED_ORCHESTRATOR_MANIFEST_FIELDS | {
+    "cpu_thread_policy",
 }
 _INFERENCE_SERVER_MANIFEST_FIELDS = {
     "container_image_digest",
@@ -296,10 +300,9 @@ def verify_runtime_manifest_payload(
     if contract_version not in {
         RUNTIME_MANIFEST_CONTRACT,
         STAGED_RUNTIME_MANIFEST_CONTRACT,
+        CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
     }:
-        raise ValueError(
-            "runtime manifest contract is unsupported"
-        )
+        raise ValueError("runtime manifest contract is unsupported")
     if set(manifest) != _MANIFEST_FIELDS:
         raise ValueError("runtime manifest fields are not closed")
     manifest_identity = canonical_payload_sha256(manifest)
@@ -327,7 +330,9 @@ def verify_runtime_manifest_payload(
     if set(local) != _CLIENT_MANIFEST_FIELDS:
         raise ValueError("runtime manifest client fields are not closed")
     expected_orchestrator_fields = (
-        _STAGED_ORCHESTRATOR_MANIFEST_FIELDS
+        _CPU_THREAD_ORCHESTRATOR_MANIFEST_FIELDS
+        if contract_version == CPU_THREAD_RUNTIME_MANIFEST_CONTRACT
+        else _STAGED_ORCHESTRATOR_MANIFEST_FIELDS
         if contract_version == STAGED_RUNTIME_MANIFEST_CONTRACT
         else _ORCHESTRATOR_MANIFEST_FIELDS
     )
@@ -368,6 +373,52 @@ def verify_runtime_manifest_payload(
         max_concurrent_requests=int(orchestrator["max_concurrent_requests"]),
         max_pending_tasks=int(orchestrator["max_pending_tasks_effective"]),
     )
+
+
+def verified_cpu_thread_policy(manifest: object) -> int:
+    """Check this version's closed CPU configuration, not a framework getter.
+
+    The caller still verifies overall identity and all other runtime semantics.
+    V8/v9 keep one thread. V10 is the explicit two-thread CPU trial.
+    """
+    if type(manifest) is not dict:
+        raise ValueError("CPU thread policy requires a runtime manifest")
+    version = manifest.get("contract_version")
+    fields = {
+        RUNTIME_MANIFEST_CONTRACT: _ORCHESTRATOR_MANIFEST_FIELDS,
+        STAGED_RUNTIME_MANIFEST_CONTRACT: _STAGED_ORCHESTRATOR_MANIFEST_FIELDS,
+        CPU_THREAD_RUNTIME_MANIFEST_CONTRACT: _CPU_THREAD_ORCHESTRATOR_MANIFEST_FIELDS,
+    }
+    orchestrator = manifest.get("orchestrator")
+    if (
+        type(version) is not str
+        or version not in fields
+        or type(orchestrator) is not dict
+        or set(orchestrator) != fields[version]
+    ):
+        raise ValueError(
+            "runtime manifest CPU policy version or fields are unsupported"
+        )
+    if version != CPU_THREAD_RUNTIME_MANIFEST_CONTRACT:
+        return 1
+    value = orchestrator.get("cpu_thread_policy")
+    expected = {
+        "omp_num_threads": 2,
+        "mkl_num_threads": 2,
+        "openblas_num_threads": 1,
+        "pdf_render_threads": 3,
+    }
+    if (
+        type(value) is not dict
+        or set(value) != {"contract_version", *expected}
+        or value.get("contract_version") != "mineru.cpu-thread-policy.v1"
+        or any(
+            type(value.get(key)) is not int or value[key] != count
+            for key, count in expected.items()
+        )
+    ):
+        raise ValueError("runtime manifest CPU thread policy is unsupported")
+    return 2
 
 
 def _verify_orchestrator_manifest(
@@ -447,7 +498,14 @@ def _verify_orchestrator_manifest(
         )
     if orchestrator.get("output_root_policy") != MINERU_API_OUTPUT_ROOT_POLICY:
         raise ValueError("runtime manifest orchestrator output-root policy drifted")
-    if contract_version == STAGED_RUNTIME_MANIFEST_CONTRACT:
+    if contract_version == CPU_THREAD_RUNTIME_MANIFEST_CONTRACT:
+        verified_cpu_thread_policy(
+            {"contract_version": contract_version, "orchestrator": orchestrator}
+        )
+    if contract_version in {
+        STAGED_RUNTIME_MANIFEST_CONTRACT,
+        CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+    }:
         staged_capacity = {
             "task_registry_max_records": MINERU_API_TASK_REGISTRY_MAX_RECORDS,
             "task_result_reservation_bytes": MINERU_API_RESULT_RESERVATION_BYTES,
@@ -648,6 +706,8 @@ __all__ = [
     "MINERU_WINDOWS_COMPOSE_PATH",
     "RUNTIME_MANIFEST_CONTRACT",
     "STAGED_RUNTIME_MANIFEST_CONTRACT",
+    "CPU_THREAD_RUNTIME_MANIFEST_CONTRACT",
+    "verified_cpu_thread_policy",
     "MinerUClientIdentity",
     "VerifiedMinerURuntimeManifest",
     "canonical_payload_sha256",

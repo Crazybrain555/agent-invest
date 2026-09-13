@@ -477,12 +477,17 @@ class MinerUDeploymentGateTests(unittest.TestCase):
                 {"max_unacked_result_bytes": 1024 * 1024 * 1024},
             ):
                 with self.subTest(update=update):
+                    expected_error = (
+                        "identity differs.*omp_thread_count"
+                        if update == {"omp_thread_count": 2}
+                        else "serial runtime contract"
+                    )
                     client_patch, code_patch = self._identity_patches(client)
                     with (
                         client_patch,
                         code_patch,
                         self.assertRaisesRegex(
-                            MinerUDeploymentGateError, "serial runtime contract"
+                            MinerUDeploymentGateError, expected_error
                         ),
                     ):
                         require_mineru_deployment_gate(

@@ -22,7 +22,9 @@ from disclosure_anchor.adapters.runtime.mineru_canary import (
     model_id_sha256,
     probe_mineru_served_model,
 )
-from disclosure_anchor.adapters.runtime.mineru_diagnostic import validate_diagnostic_disposal
+from disclosure_anchor.adapters.runtime.mineru_diagnostic import (
+    validate_diagnostic_disposal,
+)
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
     MINERU_API_MAX_UNACKED_RESULT_BYTES,
@@ -33,6 +35,8 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_SMOKE_INPUT_NAME,
     MINERU_SMOKE_INPUT_SHA256,
     STAGED_RUNTIME_MANIFEST_CONTRACT,
+    CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+    verified_cpu_thread_policy,
     canonical_payload_sha256,
     client_bundle_identity,
     verify_runtime_manifest_payload,
@@ -335,7 +339,6 @@ def _verify_configured_capacity(
         ),
         "processing_window_size": settings.mineru_processing_window_size,
         "cpu_worker_threads": 3,
-        "omp_thread_count": 1,
         "requested_hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
         "effective_hybrid_batch_ratio": MINERU_HYBRID_BATCH_RATIO,
         "hybrid_ocr_override": False,
@@ -360,6 +363,8 @@ def _verify_configured_capacity(
         for name, value in expected.items()
         if getattr(process_profile, name) != value
     )
+    if process_profile.omp_thread_count not in {1, 2}:
+        drifted += ("omp_thread_count",)
     if drifted:
         raise MinerUDeploymentGateError(
             "staged V4 process profile exceeds the current serial runtime "
@@ -371,10 +376,17 @@ def _verify_staged_profile_manifest(
     profile: MineruProcessProfile,
     manifest: dict[str, Any],
 ) -> None:
-    if manifest.get("contract_version") != STAGED_RUNTIME_MANIFEST_CONTRACT:
+    if manifest.get("contract_version") not in {
+        STAGED_RUNTIME_MANIFEST_CONTRACT,
+        CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+    }:
         raise MinerUDeploymentGateError(
-            "staged V4 requires the independently measured v9 runtime manifest"
+            "staged V4 requires the independently measured v9 or v10 runtime manifest"
         )
+    try:
+        cpu_threads = verified_cpu_thread_policy(manifest)
+    except ValueError as exc:
+        raise MinerUDeploymentGateError(str(exc)) from exc
     orchestrator = manifest.get("orchestrator")
     inference = manifest.get("inference_server")
     topology = manifest.get("topology")
@@ -401,6 +413,7 @@ def _verify_staged_profile_manifest(
         else None
     )
     expected = {
+        "omp_thread_count": cpu_threads,
         "orchestrator_image_identity_sha256": orchestrator.get(
             "container_image_digest"
         ),
@@ -409,12 +422,8 @@ def _verify_staged_profile_manifest(
         "host_runtime_identity_sha256": topology.get("windows_node_identity_sha256"),
         "vllm_engine_args_sha256": vllm_args_identity,
         "registry_terminal_cap": expected_registry_terminal,
-        "result_reservation_bytes": orchestrator.get(
-            "task_result_reservation_bytes"
-        ),
-        "max_unacked_result_bytes": orchestrator.get(
-            "max_unacked_result_bytes"
-        ),
+        "result_reservation_bytes": orchestrator.get("task_result_reservation_bytes"),
+        "max_unacked_result_bytes": orchestrator.get("max_unacked_result_bytes"),
     }
     drifted = tuple(
         name for name, value in expected.items() if getattr(profile, name) != value
@@ -440,14 +449,20 @@ def verify_mineru_deployment_gate(
     """Prove exact runtime, fixed smoke, held-out PDFs, and live boundaries."""
 
     return _verify_mineru_deployment_evidence(
-        settings, parse_enabled=parse_enabled, process_profile=process_profile, now=now,
+        settings,
+        parse_enabled=parse_enabled,
+        process_profile=process_profile,
+        now=now,
         historical_writer_digest=None,
     )
 
 
 def _verify_mineru_deployment_evidence(
-    settings: Settings, *, parse_enabled: bool | None,
-    process_profile: MineruProcessProfile | None, now: datetime | None,
+    settings: Settings,
+    *,
+    parse_enabled: bool | None,
+    process_profile: MineruProcessProfile | None,
+    now: datetime | None,
     historical_writer_digest: str | None,
 ) -> VerifiedMinerUDeployment | None:
     """Shared evidence parser; historical digest is restricted to the recovery gate.
@@ -941,12 +956,16 @@ def _verify_smoke_receipt(
         raise MinerUDeploymentGateError(f"{label} did not preserve all source pages")
     try:
         validate_diagnostic_disposal(
-            receipt.get("diagnostic_disposal"), source_pdf_sha256=str(source_identity),
-            runtime_identity=runtime_identity, source_page_count=provider_pages,
+            receipt.get("diagnostic_disposal"),
+            source_pdf_sha256=str(source_identity),
+            runtime_identity=runtime_identity,
+            source_page_count=provider_pages,
             provider_bundle_sha256=receipt["provider"]["provider_bundle_sha256"],
         )
     except (TypeError, ValueError) as exc:
-        raise MinerUDeploymentGateError(f"{label} diagnostic disposal was not proved: {exc}") from exc
+        raise MinerUDeploymentGateError(
+            f"{label} diagnostic disposal was not proved: {exc}"
+        ) from exc
     _verify_smoke_orchestrator(
         receipt.get("orchestrator"),
         task_retention_seconds=task_retention_seconds,

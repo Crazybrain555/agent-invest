@@ -35,6 +35,8 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_WINDOWS_COLLECTOR_PATH,
     MINERU_WINDOWS_COMPOSE_PATH,
     STAGED_RUNTIME_MANIFEST_CONTRACT,
+    CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+    verified_cpu_thread_policy,
     canonical_payload_sha256,
     client_bundle_identity,
     verify_runtime_manifest_payload,
@@ -85,7 +87,10 @@ COMPAT_LABEL_KEYS = {
 API_ENV_KEYS = {
     "MINERU_MODEL_SOURCE",
     "MINERU_MALLOC_TRIM",
-    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MINERU_PDF_RENDER_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MINERU_PDF_RENDER_THREADS",
     "MINERU_PHASE_TRACE",
     "MINERU_API_MAX_CONCURRENT_REQUESTS",
     "MINERU_API_MAX_PENDING_TASKS",
@@ -151,10 +156,7 @@ def _canonical_remote_collector_path(value: object) -> str:
         raise ValueError("remote collector path must not contain an ADS")
     parts = path[3:].split("\\")
     if any(
-        not part
-        or part in {".", ".."}
-        or part.endswith((" ", "."))
-        for part in parts
+        not part or part in {".", ".."} or part.endswith((" ", ".")) for part in parts
     ):
         raise ValueError("remote collector path contains an ambiguous segment")
     if path.casefold() != EXPECTED_COLLECTOR_PATH.casefold():
@@ -234,9 +236,12 @@ def _expected_serial_runtime(environment: dict[str, str]) -> dict[str, Any]:
         "vllm_max_num_seqs": 128,
         "window_size": configured_window_size,
     }
-    profile_sha256 = "sha256:" + hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    profile_sha256 = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
     return {
         "configured_window_size": configured_window_size,
         "mode": "serial",
@@ -276,7 +281,8 @@ def _verify_api_compatibility(
     labels = value.get("image_labels")
     if (
         not isinstance(marker, dict)
-        or set(marker) != {
+        or set(marker)
+        != {
             "schema",
             "policy",
             "capacity_policy",
@@ -305,7 +311,8 @@ def _verify_api_compatibility(
         or not isinstance(patched, dict)
         or set(patched) != set(EXPECTED_COMPAT_PREIMAGES)
         or actual != patched
-        or value.get("task_protocol_v2_actual_sha256") != expected_task_protocol_v2_sha256
+        or value.get("task_protocol_v2_actual_sha256")
+        != expected_task_protocol_v2_sha256
         or any(SHA256_RE.fullmatch(str(item)) is None for item in patched.values())
         or not isinstance(value.get("capacity_runtime"), dict)
         or value.get("heap_trim_enabled") is not True
@@ -317,8 +324,7 @@ def _verify_api_compatibility(
         != MINERU_API_TASK_REGISTRY_MAX_RECORDS
         or value.get("task_result_reservation_bytes")
         != MINERU_API_RESULT_RESERVATION_BYTES
-        or value.get("max_unacked_result_bytes")
-        != MINERU_API_MAX_UNACKED_RESULT_BYTES
+        or value.get("max_unacked_result_bytes") != MINERU_API_MAX_UNACKED_RESULT_BYTES
     ):
         raise ValueError("remote API heap-return marker or source bytes drifted")
     if labels != {
@@ -353,7 +359,13 @@ def build_manifest(
     expected_compat_dockerfile_sha256: str,
     expected_task_protocol_v2_sha256: str,
     expected_collector_path: str = EXPECTED_COLLECTOR_PATH,
+    expected_api_cpu_threads: int = 1,
 ) -> dict[str, Any]:
+    if type(expected_api_cpu_threads) is not int or expected_api_cpu_threads not in {
+        1,
+        2,
+    }:
+        raise ValueError("expected API CPU thread budget must be exactly 1 or 2")
     if observation.get("schema") != "mineru-windows-runtime-observation.v5":
         raise ValueError("remote runtime observation contract drifted")
     api = observation.get("api")
@@ -506,8 +518,12 @@ def build_manifest(
     quiescence = output_root.get("quiescence")
     if (
         not isinstance(quiescence, dict)
-        or set(quiescence) != {
-            "schema", "root_identity", "registry_sha256", "record_count",
+        or set(quiescence)
+        != {
+            "schema",
+            "root_identity",
+            "registry_sha256",
+            "record_count",
             "submission_watermark_bucket",
         }
         or quiescence.get("schema") != "mineru-output-quiescence.v1"
@@ -524,10 +540,14 @@ def build_manifest(
         not isinstance(root_identity, dict)
         or set(root_identity) != {"path", "device", "inode", "uid", "mode"}
         or root_identity.get("path") != "/var/lib/mineru-api-output"
-        or any(type(root_identity.get(key)) is not int
-               for key in ("device", "inode", "uid", "mode"))
-        or root_identity["device"] < 0 or root_identity["inode"] < 1
-        or root_identity["uid"] != 0 or not stat.S_ISDIR(root_identity["mode"])
+        or any(
+            type(root_identity.get(key)) is not int
+            for key in ("device", "inode", "uid", "mode")
+        )
+        or root_identity["device"] < 0
+        or root_identity["inode"] < 1
+        or root_identity["uid"] != 0
+        or not stat.S_ISDIR(root_identity["mode"])
     ):
         raise ValueError("remote MinerU output root identity is invalid")
     expected_model_id = (
@@ -560,8 +580,12 @@ def build_manifest(
         raise ValueError("remote API pending depth compatibility drifted")
     if api_environment.get("MINERU_MALLOC_TRIM") != "1":
         raise ValueError("remote API heap-return switch is not enabled")
-    for field, expected in {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
-                            "OPENBLAS_NUM_THREADS": "1", "MINERU_PDF_RENDER_THREADS": "3"}.items():
+    for field, expected in {
+        "OMP_NUM_THREADS": str(expected_api_cpu_threads),
+        "MKL_NUM_THREADS": str(expected_api_cpu_threads),
+        "OPENBLAS_NUM_THREADS": "1",
+        "MINERU_PDF_RENDER_THREADS": "3",
+    }.items():
         if api_environment.get(field) != expected:
             raise ValueError(f"remote API thread policy drifted: {field}")
     if api_environment.get("MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS") != "1":
@@ -607,15 +631,11 @@ def build_manifest(
             "max_pending_tasks_effective": pending_effective,
             "vllm_max_num_seqs": 128,
             "vllm_version": served_model.get("vllm_version"),
-            "task_registry_max_records": compatibility.get(
-                "task_registry_max_records"
-            ),
+            "task_registry_max_records": compatibility.get("task_registry_max_records"),
             "task_result_reservation_bytes": compatibility.get(
                 "task_result_reservation_bytes"
             ),
-            "max_unacked_result_bytes": compatibility.get(
-                "max_unacked_result_bytes"
-            ),
+            "max_unacked_result_bytes": compatibility.get("max_unacked_result_bytes"),
         }
     )
     if (
@@ -630,7 +650,7 @@ def build_manifest(
     ):
         raise ValueError("remote API proxy policy drifted")
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "contract_version": STAGED_RUNTIME_MANIFEST_CONTRACT,
         "client": {
             "package_set_sha256": client.package_set_sha256,
@@ -662,9 +682,7 @@ def build_manifest(
                     "proxy_port": proxy.get("port"),
                 }
             ),
-            "heap_return_compatibility_sha256": canonical_payload_sha256(
-                compatibility
-            ),
+            "heap_return_compatibility_sha256": canonical_payload_sha256(compatibility),
             "heap_return_policy": MINERU_HEAP_RETURN_POLICY,
             "mineru_version": "3.4.4",
             "api_protocol_version": MINERU_API_PROTOCOL_VERSION,
@@ -677,15 +695,11 @@ def build_manifest(
             "processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
             "task_retention_seconds": MINERU_API_TASK_RETENTION_SECONDS,
             "task_cleanup_interval_seconds": MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
-            "task_registry_max_records": compatibility.get(
-                "task_registry_max_records"
-            ),
+            "task_registry_max_records": compatibility.get("task_registry_max_records"),
             "task_result_reservation_bytes": compatibility.get(
                 "task_result_reservation_bytes"
             ),
-            "max_unacked_result_bytes": compatibility.get(
-                "max_unacked_result_bytes"
-            ),
+            "max_unacked_result_bytes": compatibility.get("max_unacked_result_bytes"),
             "output_root_policy": MINERU_API_OUTPUT_ROOT_POLICY,
             "command": api_command,
             "capacity_runtime_compatibility_sha256": (
@@ -733,6 +747,17 @@ def build_manifest(
             "windows_collector_sha256": expected_collector_sha256,
         },
     }
+    if expected_api_cpu_threads == 2:
+        manifest["contract_version"] = CPU_THREAD_RUNTIME_MANIFEST_CONTRACT
+        cpu_policy = {
+            "contract_version": "mineru.cpu-thread-policy.v1",
+            "omp_num_threads": int(api_environment["OMP_NUM_THREADS"]),
+            "mkl_num_threads": int(api_environment["MKL_NUM_THREADS"]),
+            "openblas_num_threads": int(api_environment["OPENBLAS_NUM_THREADS"]),
+            "pdf_render_threads": int(api_environment["MINERU_PDF_RENDER_THREADS"]),
+        }
+        manifest["orchestrator"]["cpu_thread_policy"] = cpu_policy
+        verified_cpu_thread_policy(manifest)
     identity = canonical_payload_sha256(manifest)
     payload = {"identity_sha256": identity, "manifest": manifest}
     verify_runtime_manifest_payload(
@@ -848,6 +873,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ssh-host", required=True)
     parser.add_argument("--ssh-user", required=True)
     parser.add_argument("--ssh-port", type=int, default=22)
+    parser.add_argument(
+        "--expected-api-cpu-threads", type=int, choices=(1, 2), default=1
+    )
     parser.add_argument("--identity-file", type=Path, required=True)
     parser.add_argument("--known-hosts-file", type=Path, required=True)
     parser.add_argument("--api-url", default="http://127.0.0.1:30002")
@@ -901,9 +929,7 @@ def main(argv: list[str] | None = None) -> int:
         / "agent_task_protocol_v2.py",
     )
     args = parser.parse_args(argv)
-    remote_collector_path = _canonical_remote_collector_path(
-        args.remote_collector_path
-    )
+    remote_collector_path = _canonical_remote_collector_path(args.remote_collector_path)
     _private_regular_file(args.identity_file, label="SSH identity")
     host_key_sha256 = _known_host_key_sha256(
         args.known_hosts_file, expected_host=args.ssh_host
@@ -932,15 +958,11 @@ def main(argv: list[str] | None = None) -> int:
         command,
         remote_path=EXPECTED_COMPOSE_PATH,
         allowed_remote_path=EXPECTED_COMPOSE_PATH,
-    ) != (
-        expected_compose_bytes
-    ) or _read_remote_file(
+    ) != (expected_compose_bytes) or _read_remote_file(
         command,
         remote_path=remote_collector_path,
         allowed_remote_path=remote_collector_path,
-    ) != (
-        expected_collector_bytes
-    ):
+    ) != (expected_collector_bytes):
         raise SystemExit("[abort] remote compose or collector bytes drifted")
     collector_command = [
         *command,
@@ -981,6 +1003,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_compat_dockerfile_sha256=expected_compat_dockerfile_sha256,
         expected_task_protocol_v2_sha256=expected_task_protocol_v2_sha256,
         expected_collector_path=remote_collector_path,
+        expected_api_cpu_threads=args.expected_api_cpu_threads,
     )
     _new_private_json(args.observation_out, observation)
     _new_private_json(args.manifest_out, payload)
