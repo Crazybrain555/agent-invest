@@ -474,6 +474,10 @@
    "private_imports": [],
    "tests": 17
   },
+  "tests/unit/test_mineru_consumed_lookup.py": {
+   "private_imports": [],
+   "tests": 0
+  },
   "tests/unit/test_mineru_cpu_thread_policy.py": {
    "private_imports": [],
    "tests": 11
@@ -584,6 +588,10 @@
    "private_imports": [],
    "tests": 26
   },
+  "tests/unit/test_mineru_native_owned_drain.py": {
+   "private_imports": [],
+   "tests": 0
+  },
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
    "tests": 8
@@ -609,6 +617,22 @@
     "_RecoveryOnlyAdmission"
    ],
    "tests": 8
+  },
+  "tests/unit/test_mineru_result_reservation_executor.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_mineru_result_reservation_fastapi.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_mineru_result_reservation_registry.py": {
+   "private_imports": [],
+   "tests": 21
+  },
+  "tests/unit/test_mineru_retained_owned_drain.py": {
+   "private_imports": [],
+   "tests": 0
   },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],

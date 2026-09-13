@@ -38,6 +38,22 @@ class TaskAdmissionFull(TaskProtocolConflict):
     """A new key was rejected before it acquired ingress responsibility."""
 
 
+class TaskResultCapacityFull(TaskProtocolConflict):
+    """Accepted work must wait for result responsibility to be released."""
+
+
+class TaskResultCapacityRecoveryRequired(TaskProtocolConflict):
+    """Existing result responsibility must be reconciled before more parsing."""
+
+
+class TaskExecutionStopped(TaskProtocolConflict):
+    """Parsing did not start; the accepted pending responsibility is retained."""
+
+    def __init__(self, message: str, *, capacity_wait: bool = False) -> None:
+        super().__init__(message)
+        self.capacity_wait = capacity_wait
+
+
 class TaskRegistryPersistenceError(OSError):
     """A content-free registry persistence outcome with an explicit commit boundary."""
 
@@ -221,7 +237,7 @@ class DurableTaskRegistry:
         enforce_key_lifecycle: bool = False,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if max_unacked_result_bytes < 1:
+        if type(max_unacked_result_bytes) is not int or max_unacked_result_bytes < 1:
             raise ValueError("unacked result byte limit must be positive")
         if not 3600 <= tombstone_retention_seconds <= 30 * 86400:
             raise ValueError("tombstone retention must be between one hour and 30 days")
@@ -255,6 +271,11 @@ class DurableTaskRegistry:
         self._persistence_generation = 0
         self._submission_watermark_bucket = -1
         self._records = self._load()
+        self._replay_required_keys = {
+            key for key, record in self._records.items()
+            if record.state in {"pending", "processing", "finalizing"}
+            and record.task_payload is not None
+        }
         self._durable_payload = self._read_current_registry_bytes()
         self._last_durable_records = self._clone_records(self._records)
         self._last_durable_watermark_bucket = self._submission_watermark_bucket
@@ -584,7 +605,6 @@ class DurableTaskRegistry:
                         )
                     if record.state in {"processing", "finalizing"}:
                         record.state = "pending"
-                        record.reserved_result_bytes = 0
                         record.recovery_generation += 1
                         record.error = None
                         changed = True
@@ -602,6 +622,9 @@ class DurableTaskRegistry:
                         changed = True
                     replay_keys.append(key)
 
+            # Reconciliation may later select the pending snapshot after an uncertain
+            # commit. Keep the physical replay barrier before attempting that commit.
+            self._replay_required_keys.update(replay_keys)
             if changed:
                 self._commit_registry_transition(
                     proposed_records,
@@ -620,6 +643,7 @@ class DurableTaskRegistry:
                 ):
                     continue
                 self._prepare_clean_replay(copy.deepcopy(current_record))
+                self._replay_required_keys.discard(key)
 
             hydrated: list[dict[str, Any]] = []
             for record in self._records.values():
@@ -691,6 +715,9 @@ class DurableTaskRegistry:
                 if child == "uploads":
                     continue
                 self._remove_at(task_fd, child)
+            # A prior attempt may have unlinked the last child before its fsync failed.
+            # Successful replay must close that namespace boundary even on an empty retry.
+            os.fsync(task_fd)
             protocol["generation"] = record.recovery_generation
         finally:
             os.close(task_fd)
@@ -914,7 +941,6 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict("terminal task cannot fail again")
             record.state = "failed"
             record.error = error
-            record.reserved_result_bytes = 0
             self._persist()
 
     def acknowledge_failed(self, idempotency_key: str) -> None:
@@ -952,8 +978,6 @@ class DurableTaskRegistry:
                     f"invalid task transition {record.state}->{target}"
                 )
             record.state = target
-            if target == "failed":
-                record.reserved_result_bytes = 0
             self._persist()
 
     def complete(
@@ -991,6 +1015,48 @@ class DurableTaskRegistry:
             record.reserved_result_bytes = 0
             self._persist()
 
+    def reserve_result_for_parse(self, idempotency_key: str, *, byte_budget: int) -> None:
+        """Acquire one durable result budget before invoking the parser."""
+        if type(byte_budget) is not int or not 1 <= byte_budget <= self._limit:
+            raise ValueError("result reservation must be positive and within its limit")
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state not in {"pending", "processing", "finalizing"}:
+                raise TaskProtocolConflict("result reservation state is invalid")
+            if any(
+                key in self._records and self._records[key].state != "consumed"
+                for key in self._replay_required_keys
+            ):
+                raise TaskResultCapacityRecoveryRequired(
+                    "cold task responsibility requires successful replay cleanup"
+                )
+            if any(
+                item.reserved_result_bytes == 0
+                and (
+                    item.state in {"processing", "finalizing", "failed"}
+                    or item.state == "cleanup_pending" and item.cleanup_kind == "task_tree"
+                )
+                for item in self._records.values()
+            ):
+                raise TaskResultCapacityRecoveryRequired(
+                    "legacy task responsibility requires owned cleanup before new parse"
+                )
+            used = self.unacked_result_bytes + self.reserved_result_bytes
+            if used > self._limit:
+                raise TaskResultCapacityRecoveryRequired(
+                    "existing result responsibility exceeds the configured limit"
+                )
+            if record.reserved_result_bytes:
+                if record.reserved_result_bytes != byte_budget:
+                    raise TaskProtocolConflict("held result reservation differs from requested budget")
+                return
+            if record.state != "pending":
+                raise TaskResultCapacityRecoveryRequired("legacy active parse requires replay cleanup")
+            if used + byte_budget > self._limit:
+                raise TaskResultCapacityFull("result byte capacity is awaiting owned cleanup")
+            record.reserved_result_bytes = byte_budget
+            self._persist()
+
     def reserve_finalizer(self, idempotency_key: str, *, byte_budget: int) -> None:
         if (
             isinstance(byte_budget, bool)
@@ -1000,8 +1066,12 @@ class DurableTaskRegistry:
             raise ValueError("finalizer byte reservation must be a positive integer")
         with self._lock:
             record = self._required(idempotency_key)
-            if record.state != "finalizing" or record.reserved_result_bytes:
+            if record.state != "finalizing":
                 raise TaskProtocolConflict("finalizer reservation state is invalid")
+            if record.reserved_result_bytes:
+                if record.reserved_result_bytes != byte_budget:
+                    raise TaskProtocolConflict("finalizer budget differs from held result reservation")
+                return
             if (
                 self.unacked_result_bytes + self.reserved_result_bytes + byte_budget
                 > self._limit
@@ -2259,6 +2329,7 @@ _REGISTRY_MUTATOR_NAMES = (
     "recoverable_payloads",
     "release_result",
     "reserve_finalizer",
+    "reserve_result_for_parse",
     "transition",
 )
 
@@ -2324,11 +2395,33 @@ class SplitTaskExecutor:
         finalizer_slots: int,
         result_reservation_bytes: int = 268435456,
     ) -> None:
-        if parse_slots < 1 or finalizer_slots < 1:
+        if any(type(value) is not int or value < 1 for value in (parse_slots, finalizer_slots)):
             raise ValueError("executor slots must be positive")
+        if type(result_reservation_bytes) is not int or result_reservation_bytes < 1:
+            raise ValueError("result reservation must be a positive integer")
         self._parse = asyncio.Semaphore(parse_slots)
         self._finalize = asyncio.Semaphore(finalizer_slots)
         self._result_reservation_bytes = result_reservation_bytes
+        self._capacity_changed = asyncio.Event()
+        self._stopping = False
+        self._abort_pending = False
+
+    @property
+    def result_reservation_bytes(self) -> int:
+        return self._result_reservation_bytes
+
+    def start(self) -> None:
+        self._stopping = False
+        self._abort_pending = False
+        self._capacity_changed.set()
+
+    def notify_result_capacity_changed(self) -> None:
+        self._capacity_changed.set()
+
+    def begin_shutdown(self, *, abort_pending: bool = False) -> None:
+        self._stopping = True
+        self._abort_pending = self._abort_pending or abort_pending
+        self._capacity_changed.set()
 
     async def run(
         self,
@@ -2338,12 +2431,31 @@ class SplitTaskExecutor:
         parse: Callable[[], Awaitable[None]],
         finalize: Callable[[], Awaitable[tuple[Path, str, int, str]]],
     ) -> None:
-        registry.transition(key, "processing")
+        record = registry.get(key)
+        if record is None or record.state != "pending":
+            raise TaskProtocolConflict("only pending work may enter the parser")
+        while True:
+            if self._abort_pending:
+                raise TaskExecutionStopped("result capacity wait stopped with pending responsibility")
+            self._capacity_changed.clear()
+            try:
+                registry.reserve_result_for_parse(key, byte_budget=self._result_reservation_bytes)
+            except TaskResultCapacityFull:
+                if self._stopping:
+                    raise TaskExecutionStopped(
+                        "result capacity unavailable during accepted-work drain",
+                        capacity_wait=True,
+                    ) from None
+                await self._capacity_changed.wait()
+            else:
+                break
         try:
             async with self._parse:
+                if self._abort_pending:
+                    raise TaskExecutionStopped("parse slot wait stopped with pending responsibility")
+                registry.transition(key, "processing")
                 await parse()
             registry.transition(key, "finalizing")
-            registry.reserve_finalizer(key, byte_budget=self._result_reservation_bytes)
             async with self._finalize:
                 path, digest, byte_count, owner = await finalize()
             registry.complete(
@@ -2353,6 +2465,7 @@ class SplitTaskExecutor:
                 result_bytes=byte_count,
                 result_owner=owner,
             )
+            self.notify_result_capacity_changed()
         except TaskRegistryPersistenceError:
             raise
         except BaseException as exc:

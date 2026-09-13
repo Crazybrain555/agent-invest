@@ -32,50 +32,15 @@ from scripts.windows.mineru_heap_trim_compat.patch_mineru_344 import (
 )
 
 
-_VLM_GUARDS = '''@contextmanager
-def predictor_execution_guard(predictor: MinerUClient):
-    lock = getattr(predictor, "_mineru_execution_lock", None)
-    if lock is None:
-        yield
-        return
-    with lock:
-        yield
-
-
-@asynccontextmanager
-async def aio_predictor_execution_guard(predictor: MinerUClient):
-    lock = getattr(predictor, "_mineru_execution_lock", None)
-    if lock is None:
-        yield
-        return
-    await asyncio.to_thread(lock.acquire)
-    try:
-        yield
-    finally:
-        lock.release()
-'''
-
-
 _RUNTIME_COMPATIBILITY_SHA256 = "sha256:" + "9" * 64
 
-_HYBRID_COORDINATOR_FIXTURE = '''def _apply_medium_table_orientation_labels():
-    try:
-        rotate_labels = table_orientation_cls_model.batch_predict(
-            table_inputs,
-            det_batch_size=max(1, batch_ratio * OCR_DET_BASE_BATCH_SIZE),
-            tqdm_enable=True,
-        )
-    except Exception:
-        return None
 
-
-def get_batch_ratio(device):
-    return 1
-
-
-def _close_images(images_list):
-    return None
-'''
+def _pinned_preimage(relative_path: str, expected_sha256: str) -> str:
+    fixture_root = Path(__file__).parents[1] / "fixtures" / "mineru_344_preimages"
+    raw = (fixture_root / relative_path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise AssertionError(f"fixed upstream preimage changed: {relative_path}")
+    return raw.decode("utf-8")
 
 
 def _http_client_fixture() -> str:
@@ -315,200 +280,6 @@ def _retained_fast_api_fixture() -> str:
         "        return_original_file=task.return_original_file,\n"
         "        zip_filename=f\"{task.task_id}.zip\",\n"
         "    )\n"
-    )
-def _vlm_document_fixture(*, asynchronous: bool) -> str:
-    render = (
-        "                images_list = await aio_load_images_from_pdf_bytes_range(\n"
-        "                    pdf_bytes,\n"
-        "                    start_page_id=window_start,\n"
-        "                    end_page_id=window_end,\n"
-        "                    image_type=ImageType.PIL,\n"
-        "                )\n"
-        if asynchronous
-        else
-        "                images_list = load_images_from_pdf_doc(\n"
-        "                    pdf_doc,\n"
-        "                    start_page_id=window_start,\n"
-        "                    end_page_id=window_end,\n"
-        "                    image_type=ImageType.PIL,\n"
-        "                    pdf_bytes=pdf_bytes,\n"
-        "                )\n"
-    )
-    finalize = (
-        "        if not client_side_output_generation:\n"
-        "            await asyncio.to_thread(finalize_middle_json, middle_json[\"pdf_info\"])\n"
-        if asynchronous
-        else
-        "        if not client_side_output_generation:\n"
-        "            finalize_middle_json(middle_json[\"pdf_info\"])\n"
-    )
-    guard = (
-        "                    async with aio_predictor_execution_guard(predictor):\n"
-        "                        pass\n"
-        if asynchronous
-        else
-        "                    with predictor_execution_guard(predictor):\n"
-        "                        pass\n"
-    )
-    return (
-        "    results = []\n    doc_closed = False\n    try:\n"
-        "        configured_window_size = get_processing_window_size(default=64)\n"
-        "        logger.info(\n"
-        "            f'VLM processing-window run. page_count={page_count}, '\n"
-        "            f'window_size={configured_window_size}, total_windows={total_windows}'\n"
-        "        )\n\n"
-        "        infer_start = time.time()\n"
-        "            for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):\n"
-        "                window_end = min(page_count - 1, window_start + effective_window_size - 1)\n"
-        + render
-        + "                try:\n"
-        + guard
-        + "                    append_page_blocks_to_middle_json(\n"
-        "                        middle_json,\n"
-        "                        progress_bar=progress_bar,\n"
-        "                    )\n"
-        "                    last_append_end_time = time.time()\n"
-        "                finally:\n"
-        "                    _close_images(images_list)\n"
-        + finalize
-        + "        close_pdfium_document(pdf_doc)\n"
-        "        doc_closed = True\n        return middle_json, results\n"
-        "    finally:\n"
-        "        if not doc_closed:\n"
-        "            close_pdfium_document(pdf_doc)\n"
-    )
-
-
-def _hybrid_document_fixture(*, asynchronous: bool) -> str:
-    render = (
-        "                images_list = await aio_load_images_from_pdf_bytes_range(\n"
-        "                    pdf_bytes,\n"
-        "                    start_page_id=window_start,\n"
-        "                    end_page_id=window_end,\n"
-        "                    image_type=ImageType.PIL,\n"
-        "                )\n"
-        if asynchronous
-        else
-        "                images_list = load_images_from_pdf_doc(\n"
-        "                    pdf_doc,\n"
-        "                    start_page_id=window_start,\n"
-        "                    end_page_id=window_end,\n"
-        "                    image_type=ImageType.PIL,\n"
-        "                    pdf_bytes=pdf_bytes,\n"
-        "                )\n"
-    )
-    layout = (
-        "                    images_layout_res, hybrid_pipeline_model = await asyncio.to_thread(\n"
-        if asynchronous
-        else
-        "                    images_layout_res, hybrid_pipeline_model = _predict_layout_for_window(\n"
-    )
-    finalize = (
-        "        if client_side_output_generation:\n"
-        "            await asyncio.to_thread(\n"
-        if asynchronous
-        else
-        "        if client_side_output_generation:\n"
-        "            apply_server_side_postprocess(\n"
-    )
-    work = (
-        "                    if effort == \"medium\":\n"
-        "                        async with aio_predictor_execution_guard(predictor):\n"
-        "                            pass\n"
-        "                        optimize_hybrid_formula_number_blocks(window_model_list)\n"
-        "                        if _ocr_enable:\n"
-        "                            await asyncio.to_thread(\n"
-        "                                _apply_vlm_ocr_det_sidecars_for_window,\n"
-        "                            )\n"
-        "                        else:\n"
-        "                            window_model_list = await asyncio.to_thread(\n"
-        "                                _process_ocr_and_formulas,\n"
-        "                            )\n"
-        "                    elif effort == \"high\":\n"
-        "                        if _ocr_enable:\n"
-        "                            async with aio_predictor_execution_guard(predictor):\n"
-        "                                pass\n"
-        "                            await asyncio.to_thread(\n"
-        "                                _apply_vlm_ocr_det_sidecars_for_window,\n"
-        "                            )\n"
-        "                        else:\n"
-        "                            async with aio_predictor_execution_guard(predictor):\n"
-        "                                pass\n"
-        "                            window_model_list = await asyncio.to_thread(\n"
-        "                                _process_ocr_and_formulas,\n"
-        "                            )\n"
-        "                    await asyncio.to_thread(\n"
-        "                        _apply_layout_title_split,\n"
-        "                        window_model_list,\n"
-        "                        images_layout_res,\n"
-        "                        page_sizes,\n"
-        "                    )\n"
-        "                    model_list.extend(window_model_list)\n"
-        if asynchronous
-        else
-        "                    if effort == \"medium\":\n"
-        "                        with predictor_execution_guard(predictor):\n"
-        "                            pass\n"
-        "                        optimize_hybrid_formula_number_blocks(window_model_list)\n"
-        "                        if _ocr_enable:\n"
-        "                            _apply_vlm_ocr_det_sidecars_for_window(\n"
-        "                            )\n"
-        "                        else:\n"
-        "                            window_model_list = _process_ocr_and_formulas(\n"
-        "                            )\n"
-        "                    elif effort == \"high\":\n"
-        "                        if _ocr_enable:\n"
-        "                            with predictor_execution_guard(predictor):\n"
-        "                                pass\n"
-        "                            _apply_vlm_ocr_det_sidecars_for_window(\n"
-        "                            )\n"
-        "                        else:\n"
-        "                            with predictor_execution_guard(predictor):\n"
-        "                                pass\n"
-        "                            window_model_list = _process_ocr_and_formulas(\n"
-        "                            )\n"
-        "                    _apply_layout_title_split(\n"
-        "                        window_model_list,\n"
-        "                        images_layout_res,\n"
-        "                        page_sizes,\n"
-        "                    )\n"
-        "                    model_list.extend(window_model_list)\n"
-    )
-    return (
-        "    model_list = []\n"
-        "    doc_closed = False\n"
-        "    hybrid_pipeline_model = None\n"
-        "        configured_window_size = get_processing_window_size(default=64)\n"
-        "        effective_window_size = min(page_count, configured_window_size) if page_count else 0\n"
-        "        logger.info(\n"
-        "            f'Hybrid processing-window run. page_count={page_count}, '\n"
-        "            f'window_size={configured_window_size}, total_windows={total_windows}'\n"
-        "        )\n\n"
-        "        batch_ratio = get_batch_ratio(device) if not _ocr_enable else 1\n\n"
-        "        infer_start = time.time()\n"
-        "            for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):\n"
-        "                window_end = min(page_count - 1, window_start + effective_window_size - 1)\n"
-        + render
-        + "                try:\n"
-        + layout
-        + "                        _ocr_enable,\n"
-        "                    )\n"
-        + work
-        + "                    append_page_model_list_to_middle_json(\n"
-        "                        middle_json,\n"
-        "                        progress_bar=progress_bar,\n"
-        "                    )\n"
-        "                    last_append_end_time = time.time()\n"
-        "                finally:\n"
-        "                    _close_images(images_list)\n"
-        + finalize
-        + "        close_pdfium_document(pdf_doc)\n"
-        "        doc_closed = True\n"
-        "        clean_memory(device)\n"
-        "        return middle_json, model_list\n"
-        "    finally:\n"
-        "        if not doc_closed:\n"
-        "            close_pdfium_document(pdf_doc)\n"
     )
 
 
@@ -786,12 +557,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             namespace["_apply_merge_results"]([], [object()], [])
 
     def test_hybrid_batch_ratio_is_strict_and_orientation_uses_model_gate(self) -> None:
-        source = (
-            "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n"
-            + _HYBRID_COORDINATOR_FIXTURE
-            + _hybrid_document_fixture(asynchronous=False)
-            + "async def aio_doc_analyze(\n"
-            + _hybrid_document_fixture(asynchronous=True)
+        source = _pinned_preimage(
+            "mineru/backend/hybrid/hybrid_analyze.py",
+            "404ce6552e9d7374b96de798d2d0f7d72927eef9485668e79c82c5002b36adb0",
         )
         patched = patch_source("mineru/backend/hybrid/hybrid_analyze.py", source)
         self.assertIn("MINERU_HYBRID_BATCH_RATIO must be explicitly configured", patched)
@@ -958,11 +726,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             first.write_bytes(b"first")
             (root / "a" / "a_middle.json").write_bytes(b"middle")
             (root / "b" / "b.md").write_bytes(b"only")
-            with patch.dict(
-                os.environ,
-                {"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "10485760"},
-            ):
-                _budget, observations = observe(AsyncParseTask(directory))
+            _budget, observations = observe(
+                AsyncParseTask(directory), byte_budget=10 * 1024 * 1024
+            )
             self.assertEqual(len(observations), 3)
             # Matching regular and symlink members added after the closed
             # receipt are never candidates. The regular is removed after the
@@ -1082,13 +848,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             O_RDONLY = os.O_RDONLY
             O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
             path = os.path
-            environ = {"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "268435456"}
 
             def __init__(self) -> None:
                 self.closed = 0
-
-            def getenv(self, key, default=None):
-                return self.environ.get(key, default)
 
             @staticmethod
             def open(_path, _flags):
@@ -1115,7 +877,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         }
         exec(compile(patched[start:end], "retained-cap.py", "exec"), namespace)
         with self.assertRaisesRegex(RuntimeError, "member/FD"):
-            namespace["_retained_result_sources"](AsyncParseTask())
+            namespace["_retained_result_sources"](
+                AsyncParseTask(), byte_budget=268435456
+            )
         self.assertEqual(fake_os.closed, 0)
 
     def test_preimages_match_the_reproduced_deployed_344_sources(self) -> None:
@@ -1228,19 +992,13 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             self.assertEqual(strict(), 16)
 
     def test_vlm_and_hybrid_trim_every_window_and_document(self) -> None:
-        vlm = (
-            "from ...utils.config_reader import get_device, get_processing_window_size\n\n"
-            "from ...utils.enum_class import ImageType\n"
-            + _VLM_GUARDS
-            + _vlm_document_fixture(asynchronous=False)
-            + _vlm_document_fixture(asynchronous=True)
+        vlm = _pinned_preimage(
+            "mineru/backend/vlm/vlm_analyze.py",
+            "0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390",
         )
-        hybrid = (
-            "from mineru.utils.model_utils import clean_memory, crop_img, get_vram\n"
-            + _HYBRID_COORDINATOR_FIXTURE
-            + _hybrid_document_fixture(asynchronous=False)
-            + "async def aio_doc_analyze(\n"
-            + _hybrid_document_fixture(asynchronous=True)
+        hybrid = _pinned_preimage(
+            "mineru/backend/hybrid/hybrid_analyze.py",
+            "404ce6552e9d7374b96de798d2d0f7d72927eef9485668e79c82c5002b36adb0",
         )
 
         patched_vlm = patch_source("mineru/backend/vlm/vlm_analyze.py", vlm)
@@ -1358,11 +1116,6 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                     window_size=16,
                     total_windows=1,
                 )
-
-
-
-
-
 
 
     def test_async_owned_factory_is_not_created_while_waiting_for_owner(self) -> None:

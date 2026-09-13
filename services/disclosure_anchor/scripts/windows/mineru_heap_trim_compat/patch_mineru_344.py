@@ -94,6 +94,29 @@ def _replace_exact_fixture_optional(
     return _replace_exact(source, old, new, count=count, label=label)
 
 
+def _patch_owned_render_await(source: str) -> str:
+    return _replace_exact(
+        source,
+        "                images_list = await aio_load_images_from_pdf_bytes_range(\n"
+        "                    pdf_bytes,\n"
+        "                    start_page_id=window_start,\n"
+        "                    end_page_id=window_end,\n"
+        "                    image_type=ImageType.PIL,\n"
+        "                )\n",
+        "                images_list = await drain_owned_awaitable(\n"
+        "                    aio_load_images_from_pdf_bytes_range(\n"
+        "                        pdf_bytes,\n"
+        "                        start_page_id=window_start,\n"
+        "                        end_page_id=window_end,\n"
+        "                        image_type=ImageType.PIL,\n"
+        "                    ),\n"
+        "                    on_cancel_result=_close_images,\n"
+        "                )\n",
+        count=1,
+        label="async render result ownership on cancellation",
+    )
+
+
 def _replace_exact_occurrence(
     source: str,
     old: str,
@@ -658,9 +681,150 @@ def _patch_admission_responsibility(source: str) -> str:
     source = _replace_exact(
         source,
         "    task = None if record is None else task_manager.get(record.task_id)\n",
-        "    task = None if record is None else task_manager.reconcile_submission(record)\n",
+        '    task = None if record is None or record.state == "consumed" else task_manager.reconcile_submission(record)\n',
         count=1, label="FastAPI ingress-aware keyed lookup",
     )
+    return source
+
+
+def _patch_result_capacity_before_parse(source: str) -> str:
+    if "async def create_async_parse_task(" not in source:
+        return source
+    replacements = (
+        (
+            "        protocol_root = get_output_root() / \".agent-task-protocol-v2\"\n",
+            "        protocol_root = get_output_root() / \".agent-task-protocol-v2\"\n"
+            "        result_limit = int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES\", \"2147483648\"))\n"
+            "        result_budget = int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES\", \"268435456\"))\n"
+            "        if not 0 < result_budget <= result_limit:\n"
+            "            raise ValueError(\"result reservation must be positive and within its limit\")\n",
+        ),
+        (
+            "            max_unacked_result_bytes=int(\n"
+            "                os.getenv(\"MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES\", \"2147483648\")\n"
+            "            ),\n",
+            "            max_unacked_result_bytes=result_limit,\n",
+        ),
+        (
+            "            result_reservation_bytes=int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES\", \"268435456\")),\n",
+            "            result_reservation_bytes=result_budget,\n",
+        ),
+        (
+            "DurableTaskRegistry, SplitTaskExecutor, TaskProtocolConflict, TaskAdmissionFull,",
+            "DurableTaskRegistry, SplitTaskExecutor, TaskProtocolConflict, TaskAdmissionFull,\n"
+            "    TaskResultCapacityRecoveryRequired, TaskExecutionStopped,",
+        ),
+        (
+            "self.task_wait_failures: dict[str, TaskRegistryPersistenceError] = {}",
+            "self.task_wait_failures: dict[str, TaskRegistryPersistenceError | TaskResultCapacityRecoveryRequired] = {}",
+        ),
+        (
+            "        self.task_wait_failures.clear()\n",
+            "        self.task_wait_failures.clear()\n"
+            "        self._stopped_pending_task_ids.clear()\n"
+            "        self.task_protocol_executor.start()\n",
+        ),
+        (
+            "        self._scheduled_task_ids: set[str] = set()\n",
+            "        self._scheduled_task_ids: set[str] = set()\n"
+            "        self._stopped_pending_task_ids: set[str] = set()\n",
+        ),
+        (
+            "            if task.status == TASK_PENDING and task.task_id not in self._scheduled_task_ids:\n",
+            "            if (task.status == TASK_PENDING\n"
+            "                    and task.task_id not in self._scheduled_task_ids\n"
+            "                    and task.task_id not in self._stopped_pending_task_ids):\n",
+        ),
+        (
+            "    def _wake_waiters(self) -> None:\n",
+            "    def _wake_waiters(self) -> None:\n"
+            "        if self.is_shutting_down or self.last_worker_error is not None:\n"
+            "            self.task_protocol_executor.begin_shutdown(\n"
+            "                abort_pending=self.last_worker_error is not None\n"
+            "            )\n"
+            "        else:\n"
+            "            self.task_protocol_executor.notify_result_capacity_changed()\n",
+        ),
+        (
+            "            logger.error(f\"Async task processor crashed: {exception}\")\n"
+            "            self.last_worker_error = str(exception)\n",
+            "            logger.error(f\"Async task processor crashed: {exception}\")\n"
+            "            self.last_worker_error = str(exception)\n"
+            "            self._wake_waiters()\n",
+        ),
+        (
+            "            self.last_worker_error = \"Task processor was cancelled with retained responsibility\"\n",
+            "            self.last_worker_error = \"Task processor was cancelled with retained responsibility\"\n"
+            "            self._wake_waiters()\n",
+        ),
+        (
+            "            logger.exception(\"Async task cleanup loop crashed\")\n",
+            "            self._wake_waiters()\n"
+            "            logger.exception(\"Async task cleanup loop crashed\")\n",
+        ),
+        (
+            "                await build_retained_task_result(task)\n",
+            "                await build_retained_task_result(\n"
+            "                    task, byte_budget=self.task_protocol_executor.result_reservation_bytes\n"
+            "                )\n",
+        ),
+        (
+            "        except asyncio.CancelledError:\n"
+            "            task.status = TASK_FAILED\n",
+            "        except TaskExecutionStopped as exc:\n"
+            "            if (exc.capacity_wait and self.is_shutting_down\n"
+            "                    and self.last_worker_error is None):\n"
+            "                self._stopped_pending_task_ids.add(task_id)\n"
+            "                self._signal_task_event(task_id)\n"
+            "                return\n"
+            "            self._signal_task_event(task_id)\n"
+            "            raise\n"
+            "        except asyncio.CancelledError:\n"
+            "            if task.status == TASK_PENDING:\n"
+            "                self._signal_task_event(task_id)\n"
+            "                raise\n"
+            "            task.status = TASK_FAILED\n",
+        ),
+        (
+            "        except TaskRegistryPersistenceError as exc:\n"
+            "            self.task_wait_failures[task_id] = exc\n",
+            "        except (TaskRegistryPersistenceError, TaskResultCapacityRecoveryRequired) as exc:\n"
+            "            self.task_wait_failures[task_id] = exc\n",
+        ),
+        (
+            "        failure = self.task_wait_failures.get(task_id)\n"
+            "        if failure is not None:\n",
+            "        failure = self.task_wait_failures.get(task_id)\n"
+            "        if isinstance(failure, TaskResultCapacityRecoveryRequired):\n"
+            "            raise HTTPException(status_code=503, detail={\n"
+            "                \"code\": \"result_capacity_recovery_required\",\n"
+            "                \"task_id\": task_id, \"accepted\": True,\n"
+            "            }) from failure\n"
+            "        if failure is not None:\n",
+        ),
+        (
+            "        if failure is None:\n            return\n"
+            "        status = self.task_protocol_v2.persistence_status()\n",
+            "        if failure is None:\n            return\n"
+            "        if isinstance(failure, TaskResultCapacityRecoveryRequired):\n"
+            "            raise TaskWaitAbortedError(\n"
+            "                \"Result capacity recovery requires owned cleanup and manager restart\"\n"
+            "            ) from failure\n"
+            "        status = self.task_protocol_v2.persistence_status()\n",
+        ),
+        (
+            "        cleaned = self.task_protocol_v2.cleanup_consumed()\n",
+            "        cleaned = self.task_protocol_v2.cleanup_consumed()\n"
+            "        self.task_protocol_executor.notify_result_capacity_changed()\n",
+        ),
+        (
+            "        task_manager.task_protocol_v2.cleanup_consumed()\n",
+            "        task_manager.task_protocol_v2.cleanup_consumed()\n"
+            "        task_manager.task_protocol_executor.notify_result_capacity_changed()\n",
+        ),
+    )
+    for number, (old, new) in enumerate(replacements):
+        source = _replace_exact(source, old, new, count=1, label=f"result capacity wiring {number}")
     return source
 
 
@@ -956,8 +1120,10 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "            digest.update(chunk)\n"
             "            total += len(chunk)\n"
             "    return digest.hexdigest(), total\n\n\n"
-            "def _retained_result_sources(task: AsyncParseTask):\n"
-            "    budget = int(os.getenv(\"MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES\", \"268435456\"))\n"
+            "def _retained_result_sources(task: AsyncParseTask, *, byte_budget: int):\n"
+            "    if type(byte_budget) is not int or byte_budget < 1:\n"
+            "        raise ValueError(\"result byte budget must be a positive integer\")\n"
+            "    budget = byte_budget\n"
             "    candidates = []\n"
             "    for pdf_name in task.file_names:\n"
             "        parse_dir = get_parse_dir(task.output_dir, pdf_name, task.backend, task.parse_method)\n"
@@ -991,6 +1157,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "    try:\n"
             "        for path, arcname in sorted(candidates, key=lambda item: item[1]):\n"
             "            descriptor = os.open(path, os.O_RDONLY | getattr(os, \"O_NOFOLLOW\", 0))\n"
+            "            descriptor_error = None\n"
             "            try:\n"
             "                metadata = os.fstat(descriptor)\n"
             "                identity = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)\n"
@@ -999,19 +1166,32 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "                source_bytes += metadata.st_size\n"
             "                observations.append((path, arcname, descriptor, identity))\n"
             "                descriptor = -1\n"
+            "            except BaseException as exc:\n"
+            "                descriptor_error = exc\n"
+            "                raise\n"
             "            finally:\n"
             "                if descriptor >= 0:\n"
-            "                    os.close(descriptor)\n"
+            "                    try:\n"
+            "                        os.close(descriptor)\n"
+            "                    except BaseException as close_error:\n"
+            "                        if descriptor_error is None:\n"
+            "                            raise\n"
+            "                        descriptor_error.add_note(f\"result source cleanup failed: {close_error!r}\")\n"
             "        if source_bytes * 2 + len(observations) * 65536 + 1048576 > budget:\n"
             "            raise RuntimeError(\"result source tree exceeds reserved ZIP envelope\")\n"
             "        return budget, observations\n"
-            "    except BaseException:\n"
+            "    except BaseException as primary_error:\n"
             "        for _path, _arcname, descriptor, _identity in observations:\n"
-            "            os.close(descriptor)\n"
+            "            try:\n"
+            "                os.close(descriptor)\n"
+            "            except BaseException as close_error:\n"
+            "                primary_error.add_note(f\"result source cleanup failed: {close_error!r}\")\n"
             "        raise\n\n\n"
             "def _verify_and_close_result_sources(observations) -> None:\n"
+            "    closing_observations = tuple(observations)\n"
+            "    observations.clear()\n"
             "    failure = None\n"
-            "    for path, _arcname, descriptor, expected in observations:\n"
+            "    for path, _arcname, descriptor, expected in closing_observations:\n"
             "        try:\n"
             "            current = os.fstat(descriptor)\n"
             "            by_path = os.stat(path, follow_symlinks=False)\n"
@@ -1054,14 +1234,18 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        os.fsync(descriptor)\n"
             "    finally:\n"
             "        os.close(descriptor)\n\n\n"
-            "async def build_retained_task_result(task: AsyncParseTask) -> None:\n"
+            "async def build_retained_task_result(task: AsyncParseTask, *, byte_budget: int) -> None:\n"
             "    source_observations = []\n"
+            "    primary_error = None\n"
             '    retained = os.path.join(task.output_dir, ".retained-result.zip")\n'
             '    retained_part = retained + ".part"\n'
             "    try:\n"
-            "        budget, source_observations = await asyncio.to_thread(_retained_result_sources, task)\n"
-            "        await asyncio.to_thread(_write_retained_zip_from_fds, source_observations, retained_part, budget)\n"
-            "        await asyncio.to_thread(_verify_and_close_result_sources, source_observations)\n"
+            "        budget, source_observations = await to_thread_owned(\n"
+            "            _retained_result_sources, task, byte_budget=byte_budget,\n"
+            "            on_cancel_result=lambda result: _verify_and_close_result_sources(result[1]),\n"
+            "        )\n"
+            "        await to_thread_owned(_write_retained_zip_from_fds, source_observations, retained_part, budget)\n"
+            "        await to_thread_owned(_verify_and_close_result_sources, source_observations)\n"
             "        source_observations = []\n"
             "        os.replace(retained_part, retained)\n"
             "        directory_fd = os.open(task.output_dir, os.O_RDONLY)\n"
@@ -1069,7 +1253,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "            os.fsync(directory_fd)\n"
             "        finally:\n"
             "            os.close(directory_fd)\n"
-            "        artifact_sha256, artifact_bytes = await asyncio.to_thread(\n"
+            "        artifact_sha256, artifact_bytes = await to_thread_owned(\n"
             "            _hash_file, retained\n"
             "        )\n"
             "        if artifact_bytes <= 0:\n"
@@ -1080,13 +1264,27 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        task.result_artifact_owner = hashlib.sha256(\n"
             '            f"{task.task_id}\\0{artifact_sha256}\\0{artifact_bytes}".encode()\n'
             "        ).hexdigest()\n"
-            "    except BaseException:\n"
+            "    except BaseException as exc:\n"
+            "        primary_error = exc\n"
             "        cleanup_file(retained)\n"
             "        raise\n"
             "    finally:\n"
-            "        for _path, _arcname, descriptor, _identity in source_observations:\n"
-            "            os.close(descriptor)\n"
-            "        cleanup_file(retained_part)\n\n\n"
+            "        closing_observations = tuple(source_observations)\n"
+            "        source_observations.clear()\n"
+            "        close_failure = None\n"
+            "        for _path, _arcname, descriptor, _identity in closing_observations:\n"
+            "            try:\n"
+            "                os.close(descriptor)\n"
+            "            except BaseException as close_error:\n"
+            "                if primary_error is not None:\n"
+            "                    primary_error.add_note(f\"result source cleanup failed: {close_error!r}\")\n"
+            "                elif close_failure is None:\n"
+            "                    close_failure = close_error\n"
+            "                else:\n"
+            "                    close_failure.add_note(f\"additional source cleanup failed: {close_error!r}\")\n"
+            "        cleanup_file(retained_part)\n"
+            "        if close_failure is not None:\n"
+            "            raise close_failure\n\n\n"
             "def _cleanup_generated_zip_task",
             count=1,
             label="FastAPI retained result builder",
@@ -1100,7 +1298,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "from mineru.utils.config_reader import (\n"
             "    get_max_concurrent_requests as read_max_concurrent_requests,\n"
             ")\n"
-            "from mineru.utils.model_utils import strict_processing_window_size\n",
+            "from mineru.utils.model_utils import strict_processing_window_size, to_thread_owned\n",
             count=1,
             label="FastAPI strict processing window import",
         )
@@ -1567,7 +1765,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         )
         source = _patch_registry_persistence_behavior(source)
         source = _patch_admission_responsibility(source)
-        return source
+        return _patch_result_capacity_before_parse(source)
 
     if relative_path == "mineru/utils/model_utils.py":
         source = _replace_exact(
@@ -2104,6 +2302,14 @@ async def drain_owned_awaitable(awaitable, *, on_cancel_result=None):
     )
 
 
+async def to_thread_owned(function, /, *args, on_cancel_result=None, **kwargs):
+    """Drain a started native call before its caller releases owned resources."""
+    return await drain_owned_awaitable(
+        asyncio.to_thread(function, *args, **kwargs),
+        on_cancel_result=on_cancel_result,
+    )
+
+
 async def run_native_owned(
     native_owner,
     function,
@@ -2206,6 +2412,7 @@ def trim_process_heap() -> bool:
             "from ...utils.config_reader import get_device, get_processing_window_size\n"
             "from ...utils.model_utils import (\n"
             "    drain_owned_awaitable,\n"
+            "    to_thread_owned,\n"
             "    serial_execution_profile,\n"
             "    strict_processing_window_size,\n"
             "    new_phase_trace,\n"
@@ -2502,7 +2709,7 @@ def trim_process_heap() -> bool:
             count=2,
             label="VLM document completion",
         )
-        return _replace_exact(
+        source = _replace_exact(
             source,
             "    finally:\n"
             "        if not doc_closed:\n"
@@ -2514,6 +2721,14 @@ def trim_process_heap() -> bool:
             "            close_pdfium_document(pdf_doc)\n",
             count=2,
             label="VLM document failure",
+        )
+        source = _patch_owned_render_await(source)
+        return _replace_exact(
+            source,
+            "await asyncio.to_thread(",
+            "await to_thread_owned(",
+            count=2,
+            label="VLM native model initialization and finalization drain",
         )
 
     if relative_path == "mineru/backend/hybrid/hybrid_analyze.py":
@@ -2530,6 +2745,7 @@ def trim_process_heap() -> bool:
             "    run_async_owned,\n"
             "    run_native_owned,\n"
             "    drain_owned_awaitable,\n"
+            "    to_thread_owned,\n"
             "    trim_process_heap,\n"
             ")\n",
             count=1,
@@ -2950,7 +3166,7 @@ def trim_process_heap() -> bool:
             count=2,
             label="Hybrid document completion",
         )
-        return _replace_exact(
+        source = _replace_exact(
             source,
             "    finally:\n"
             "        if not doc_closed:\n"
@@ -2962,6 +3178,14 @@ def trim_process_heap() -> bool:
             "            close_pdfium_document(pdf_doc)\n",
             count=2,
             label="Hybrid document failure",
+        )
+        source = _patch_owned_render_await(source)
+        return _replace_exact(
+            source,
+            "await asyncio.to_thread(",
+            "await to_thread_owned(",
+            count=9,
+            label="Hybrid native layout and postprocess resource drain",
         )
 
     raise ValueError(f"unapproved MinerU compatibility target: {relative_path}")

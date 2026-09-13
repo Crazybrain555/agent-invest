@@ -2,7 +2,6 @@
 
 import asyncio
 import errno
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -382,44 +381,6 @@ class AdmissionResponsibilityTests(unittest.IsolatedAsyncioTestCase):
         task = await self.fx.create(self.fx.options("reservation-write-refused"))
         self.assertIs(self.fx.manager.get(task.task_id), task)
         self.assertEqual(self.fx.manager.queue.qsize(), 1)
-
-    async def test_result_credit_refusal_becomes_failed_terminal_and_requires_ack(self):
-        registry = self.fx.manager.task_protocol_v2
-        previous = self.fx.seed_legacy_pending("reserved")
-        registry.transition(previous.agent_idempotency_key, "processing")
-        registry.transition(previous.agent_idempotency_key, "finalizing")
-        registry.reserve_finalizer(previous.agent_idempotency_key, byte_budget=1024)
-        self.assertEqual(registry.reserved_result_bytes, 1024)
-        # Old accepted second responsibility demonstrates downstream refusal,
-        # without broadening current new-key admission or changing pool capacity.
-        target = self.fx.seed_legacy_pending("result-refused")
-        parsed = []
-
-        async def parse_boundary(**kwargs):
-            parsed.append(kwargs["request_options"].task_id)
-
-        async def finalize_forbidden(task):
-            self.fail("no output builder may run without retained-result credit")
-
-        self.fx.module.run_parse_job = parse_boundary
-        self.fx.module.build_retained_task_result = finalize_forbidden
-        await self.fx.manager.submit(target)
-        self.assertEqual(self.fx.manager.queue.get_nowait(), target.task_id)
-        await self.fx.manager._process_task(target.task_id)
-        record = registry.get(target.agent_idempotency_key)
-        self.assertEqual(parsed, [target.task_id])
-        self.assertEqual(record.state, "failed")
-        self.assertEqual(json.loads(record.error)["code"], "parse_or_finalize_failed")
-        self.assertEqual(registry.reserved_result_bytes, 1024)
-        self.assertEqual(record.reserved_result_bytes, 0)
-        self.assertTrue(Path(target.uploads[0]).exists())
-        registry.acknowledge_failed(target.agent_idempotency_key)
-        registry.cleanup_consumed()
-        self.assertFalse(Path(target.output_dir).exists())
-        self.assertTrue(Path(previous.output_dir).exists())
-        self.assertEqual(
-            registry.get(previous.agent_idempotency_key).state, "finalizing"
-        )
 
     async def test_open_task_directory_first_fstat_failure_closes_the_acquired_root_fd(
         self,

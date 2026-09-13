@@ -101,9 +101,56 @@ rejected while a reader is active. The `open_result()` context keeps a primary
 download exception as the raised exception if reader release also fails; the
 release exception is chained and noted instead of masking the primary error.
 
-Reservations remain charged through finalization. Completed and
-`cleanup_pending` result bytes remain charged until durable cleanup reaches
-`consumed`; uncertainty never releases the larger possible charge early.
+Each accepted pending task obtains its durable result-byte reservation before
+entering the parse semaphore. `reserve_result_for_parse` atomically checks the
+actual retained bytes plus existing reservations and the requested budget.
+The same key and same budget are idempotent; a different budget conflicts.
+A capacity-full task remains accepted pending, waits outside parse/finalizer
+slots, and rechecks after the existing same-loop capacity event. It is not a
+new 429 rejection and has not performed expensive parsing. The manager reads
+and validates one positive per-task budget against the positive global limit
+at construction; the finalizer receives that same budget explicitly.
+
+Reservations stay charged through pending, processing, finalizing, failure,
+and owned task-tree cleanup. Completion atomically replaces the reservation
+with the actual result bytes, which cannot exceed its held budget. Successful
+completion and completed ACK/cleanup notify waiting processors; notification
+is only a reason to retry the atomic reservation, not a grant of capacity.
+Writing cleanup intent, warning-only partial-ZIP deletion, observing a missing
+file, or a failed registry commit cannot return credit. Only successful owned
+namespace cleanup followed by durable `consumed` releases the responsibility.
+
+Cold replay retains the original reservation. Its physical-cleanup barrier is
+installed before attempting the pending transition, so later reconciliation
+of an uncertain registry write cannot skip physical cleanup. Even an empty
+retry syncs the held task directory before the barrier is removed. Legacy
+zero-reservation active/failed tree responsibility and a loaded total above
+the configured limit block new parsing until explicit recovery or owned
+cleanup. Existing readers, leases, result downloads and ACK remain available.
+Recovery-required responses retain their distinct cause and do not invent
+persistence phase/outcome fields.
+
+Normal shutdown closes new admission and wakes result-capacity waiters. Already
+accepted work, including owned ingress and cold backlog, still drains when it
+holds or can obtain its result reservation. If capacity is full during shutdown,
+the waiter retains its pending key and shutdown reports incomplete responsibility
+instead of waiting indefinitely for an external ACK. Worker failure also wakes
+waiters and prevents work that has not entered parsing from starting; the same
+pending key and any held reservation remain recoverable. Already running native
+work drains by its existing ownership boundary. Ordinary capacity wait while
+the manager is running does not create a worker-failure condition.
+
+A capacity waiter stopped by normal shutdown is excluded from further scheduling
+in that manager run. This preserves its pending responsibility without converting
+the normal stop into a worker error that would abort already reserved peers.
+Shutdown waits for those peers to drain before reporting any remaining pending
+responsibility; starting the manager again clears only this process-local exclusion.
+
+During persistence uncertainty no new mutation can allocate or return credit.
+The separate retained/reserved accessors are conservative component bounds;
+their sum is not necessarily the exact charge in one durable snapshot. These
+result-ZIP reservations do not account for all uploaded files, parser
+intermediates, RAM, VRAM or whole-disk capacity.
 
 ## Recovery hydration and cleanup intent
 
@@ -148,7 +195,8 @@ The synchronous wait path checks that map both before sleeping and after an
 event wake. A caller already waiting and a caller arriving after the processor
 failure therefore receive a prompt `TaskWaitAbortedError` chained from the
 original `TaskRegistryPersistenceError`, including its persistence outcome and
-the registry's recovery action. Unrelated task events are not signalled.
+the registry's recovery action. A processor failure additionally marks the worker
+unavailable and wakes all waiters; the original cause remains task-specific.
 
 Each synchronous wait retains both created `Event.wait` helper tasks from the
 moment they are started. Its `finally` path cancels both helpers and awaits both
@@ -158,8 +206,9 @@ cannot bypass helper cleanup merely because its result assignment did not
 complete. A normal event or shutdown wake uses the same cleanup path, and any
 completed helper result keeps the prior fail-visible inspection behavior.
 
-Ordinary parser errors and cancellation retain their established terminal task
-behavior, while shutdown continues to wake waiters through the manager signal.
+Ordinary errors and cancellation after entering parse retain their terminal task
+behavior. Cancellation while still pending for result capacity or a parse slot
+retains that pending responsibility. Shutdown wakes waiters through the manager signal.
 Startup clears only this process-local map before durable cleanup/recovery
 reconstructs routes.
 
@@ -241,6 +290,42 @@ legacy-v1 branch for old service inspection; the new runtime collector and new
 installation qualification require v2 admission evidence. Overcommitted
 recovery remains diagnostically visible and fails normal qualification.
 
-These changes do not qualify parser cancellation at the native CPU boundary,
-advance all output reservations before parse, increase concurrency parameters,
-or establish real GPU throughput. Those remain separate Pro-plan steps.
+The R1 admission changes by themselves do not qualify native cancellation,
+result capacity, increased concurrency or real GPU throughput. The result
+reservation boundary above and the native lifetime boundary below are separate
+changes; neither establishes full M6 acceptance.
+
+
+## Owned asynchronous native lifetimes
+
+Hybrid and VLM CPU/model/finalization thread awaits use the existing
+`drain_owned_awaitable` through a thin `to_thread_owned` adapter. Cancellation
+waits for the submitted function to settle before caller-owned images/PDFs or
+result-source file descriptors are closed. Repeated cancellation preserves the
+first cancellation and retains a later native failure as its cause. The two
+render callers also return images produced after cancellation through their
+existing image-close callback. No new global model lock or parser algorithm
+is introduced by these adapters.
+
+The retained-result builder drains acquisition, writing, verification/closure
+and hashing. Cancelled acquisition closes the descriptors it actually returns;
+verification transfers the source list only when its callee starts. Each
+acquired descriptor receives one close attempt; a consumed and recycled integer
+is not retried. Cleanup attempts the remaining descriptors and retains the
+primary IO error. Acquisition and builder cleanup record secondary close errors
+as notes; verification retains its first verification or close failure.
+Hashing must finish before the caller unlinks the retained ZIP.
+
+This boundary covers the selected hybrid/VLM callers and retained-result
+builder. It does not certify forcible process-pool termination, every inference
+client cancellation, the separate pipeline backend or legacy response builders.
+Cooperative drain does not create a new production timeout or prove a native
+thread can be forcibly cancelled. Real service/GPU and publication acceptance
+remain separate from these deterministic lifetime checks.
+
+
+After successful ACK, both task-ID GET and idempotency-key GET return the
+original 404 `Task not found` absence response. The retained consumed tombstone
+still prevents a repeated POST from treating that key as fresh work. The GET
+lookup must not reuse the repeated-submission 410 response for a consumed key;
+otherwise the original diagnostic disposal cannot confirm absence.

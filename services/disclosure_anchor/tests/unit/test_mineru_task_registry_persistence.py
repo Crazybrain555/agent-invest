@@ -1006,73 +1006,130 @@ class ExecutorTests(_RegistryCase):
         async def parse_ok() -> None:
             return None
 
-        async def parse_broken() -> None:
-            raise RuntimeError("synthetic parse failure")
-
         with self.subTest(failure="first_transition"):
             lab = self.lab()
             registry = lab.open()
             drive(lab, registry, "bound")
 
+            parsed: list[str] = []
+            finalized: list[str] = []
+            marker = SyntheticStorageFault("processing transition write failed")
+            original_write = DurableTaskRegistry._write_registry_stream
+
+            def fail_processing_write(stream: object, payload: bytes) -> None:
+                records = json.loads(payload)["records"]
+                record = next(item for item in records if item["idempotency_key"] == KEY)
+                if record["state"] == "processing":
+                    raise marker
+                original_write(stream, payload)
+
+            async def parse_first() -> None:
+                parsed.append("parse")
+
             async def finalize() -> tuple[Path, str, int, str]:
+                finalized.append("finalize")
                 return lab.make_result(TASK)
 
-            with pre_commit_fault(registry, "write"), self.assertRaises(
+            with instance_hook(registry, "_write_registry_stream", fail_processing_write), self.assertRaises(
                 TaskRegistryPersistenceError
-            ):
+            ) as raised:
                 asyncio.run(
                     self.executor().run(
-                        registry=registry, key=KEY, parse=parse_ok, finalize=finalize
+                        registry=registry, key=KEY, parse=parse_first, finalize=finalize
                     )
                 )
+            self.assert_outcome(raised.exception, outcome="not_committed", committed=False,
+                                phase_prefix="write")
+            self.assertEqual(raised.exception.operation, "transition")
+            self.assertIs(raised.exception.__cause__, marker)
+            self.assertEqual((parsed, finalized), ([], []))
             record = registry.get(KEY)
             self.assertEqual((record.state, record.error), ("pending", None))
+            self.assertEqual(record.reserved_result_bytes, FINALIZER_BUDGET)
 
         with self.subTest(failure="after_parse_before_finalizing"):
             lab = self.lab()
             registry = lab.open()
             drive(lab, registry, "bound")
             original_write = DurableTaskRegistry._write_registry_stream
-            calls: list[int] = []
+            parsed = []
+            finalized = []
+            after_parse_disk: list[bytes | None] = []
+            marker = SyntheticStorageFault("finalizing transition write failed after parse")
 
-            def fail_second_write(stream: object, payload: bytes) -> None:
-                calls.append(1)
-                if len(calls) == 2:
-                    raise SyntheticStorageFault("second persist failed")
+            def fail_finalizing_write(stream: object, payload: bytes) -> None:
+                records = json.loads(payload)["records"]
+                record = next(item for item in records if item["idempotency_key"] == KEY)
+                if record["state"] == "finalizing":
+                    self.assertEqual(parsed, ["parse"])
+                    raise marker
                 original_write(stream, payload)
 
+            async def parse_second() -> None:
+                self.assertEqual(registry.get(KEY).state, "processing")
+                self.assertEqual(registry.reserved_result_bytes, FINALIZER_BUDGET)
+                parsed.append("parse")
+                after_parse_disk.append(lab.disk_bytes())
+
             async def finalize_two() -> tuple[Path, str, int, str]:
+                finalized.append("finalize")
                 return lab.make_result(TASK)
 
-            with instance_hook(registry, "_write_registry_stream", fail_second_write), self.assertRaises(
+            with instance_hook(registry, "_write_registry_stream", fail_finalizing_write), self.assertRaises(
                 TaskRegistryPersistenceError
-            ):
+            ) as raised:
                 asyncio.run(
                     self.executor().run(
-                        registry=registry, key=KEY, parse=parse_ok, finalize=finalize_two
+                        registry=registry, key=KEY, parse=parse_second, finalize=finalize_two
                     )
                 )
+            self.assert_outcome(raised.exception, outcome="not_committed", committed=False,
+                                phase_prefix="write")
+            self.assertEqual(raised.exception.operation, "transition")
+            self.assertIs(raised.exception.__cause__, marker)
+            self.assertEqual((parsed, finalized), (["parse"], []))
+            self.assertEqual(after_parse_disk, [lab.disk_bytes()])
             record = registry.get(KEY)
             self.assertEqual((record.state, record.error), ("processing", None))
+            self.assertEqual(record.reserved_result_bytes, FINALIZER_BUDGET)
 
         with self.subTest(failure="ordinary_parse_error"):
             lab = self.lab()
             registry = lab.open()
             drive(lab, registry, "bound")
+            partial_path = lab.task_dir(TASK) / "partial-parser-output"
+            marker = RuntimeError("synthetic parse failure")
+            finalized = []
+
+            async def parse_broken() -> None:
+                partial_path.write_bytes(b"synthetic owned partial output")
+                raise marker
 
             async def finalize_three() -> tuple[Path, str, int, str]:
+                finalized.append("finalize")
                 return lab.make_result(TASK)
 
-            with self.assertRaisesRegex(RuntimeError, "synthetic parse failure"):
+            with self.assertRaisesRegex(RuntimeError, "synthetic parse failure") as raised:
                 asyncio.run(
                     self.executor().run(
                         registry=registry, key=KEY, parse=parse_broken, finalize=finalize_three
                     )
                 )
+            self.assertIs(raised.exception, marker)
+            self.assertEqual(finalized, [])
             record = registry.get(KEY)
             self.assertEqual(record.state, "failed")
             self.assertEqual(json.loads(record.error)["code"], "parse_or_finalize_failed")
-            self.assertEqual(record.reserved_result_bytes, 0)
+            self.assertEqual(record.reserved_result_bytes, FINALIZER_BUDGET)
+            self.assertEqual(registry.reserved_result_bytes, FINALIZER_BUDGET)
+            self.assertEqual(partial_path.read_bytes(), b"synthetic owned partial output")
+            cold = lab.open()
+            self.assertEqual(cold.get(KEY).state, "failed")
+            self.assertEqual(cold.reserved_result_bytes, FINALIZER_BUDGET)
+            cold.acknowledge_failed(KEY)
+            self.assertFalse(lab.task_dir(TASK).exists())
+            self.assertEqual((cold.get(KEY).state, cold.reserved_result_bytes), ("consumed", 0))
+            self.assertEqual(lab.disk_records()[KEY]["reserved_result_bytes"], 0)
 
         with self.subTest(failure="none"):
             lab = self.lab()
@@ -1336,9 +1393,20 @@ class RealPreimageTests(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.ImportFrom) and node.module == "mineru.cli.agent_task_protocol_v2"
         )
-        self.assertIn("TaskRegistryPersistenceError", {alias.name for alias in import_block.names})
+        self.assertTrue({"TaskRegistryPersistenceError", "TaskResultCapacityRecoveryRequired"}
+                        <= {alias.name for alias in import_block.names})
         self.assertEqual(generated.count("self._raise_task_wait_failure(task_id)"), 2)
-        self.assertIn("self.task_wait_failures: dict[str, TaskRegistryPersistenceError] = {}", generated)
+        failure_maps = [node for node in ast.walk(tree)
+                        if isinstance(node, ast.AnnAssign)
+                        and isinstance(node.target, ast.Attribute)
+                        and isinstance(node.target.value, ast.Name)
+                        and node.target.value.id == "self" and node.target.attr == "task_wait_failures"]
+        self.assertEqual(len(failure_maps), 1)
+        expected_annotation = ast.parse(
+            "dict[str, TaskRegistryPersistenceError | TaskResultCapacityRecoveryRequired]", mode="eval"
+        ).body
+        self.assertEqual(ast.dump(failure_maps[0].annotation), ast.dump(expected_annotation))
+        self.assertEqual(ast.dump(failure_maps[0].value), ast.dump(ast.Dict(keys=[], values=[])))
         self.assertIn("self.task_wait_failures.clear()", generated)
         self.assertIn("self.task_wait_failures[task_id] = exc", generated)
         self.assertIn("task status remains nonterminal", generated)
@@ -1358,9 +1426,15 @@ class RealPreimageTests(unittest.TestCase):
             if isinstance(node, ast.Try)
             for handler in node.handlers
         ]
-        names = [ast.unparse(handler.type) if handler.type is not None else None for handler in handlers]
-        self.assertIn("TaskRegistryPersistenceError", names)
-        self.assertLess(names.index("TaskRegistryPersistenceError"), names.index("Exception"))
+        type_names = [{node.id for node in ast.walk(handler.type) if isinstance(node, ast.Name)}
+                      if handler.type is not None else set() for handler in handlers]
+        persistence_positions = [index for index, names in enumerate(type_names)
+                                 if "TaskRegistryPersistenceError" in names]
+        self.assertEqual(len(persistence_positions), 1)
+        position = persistence_positions[0]
+        self.assertEqual(type_names[position],
+                         {"TaskRegistryPersistenceError", "TaskResultCapacityRecoveryRequired"})
+        self.assertLess(position, type_names.index({"Exception"}))
 
         conflict_handlers = 0
         for node in ast.walk(tree):

@@ -934,7 +934,7 @@ class MinerUTaskProtocolV2Tests(unittest.TestCase):
 
     def test_executor_failure_is_content_free_and_survives_restart(self) -> None:
         async def exercise(root: Path, registry: DurableTaskRegistry) -> None:
-            executor = SplitTaskExecutor(parse_slots=1, finalizer_slots=1)
+            executor = SplitTaskExecutor(parse_slots=1, finalizer_slots=1, result_reservation_bytes=2)
 
             async def parse() -> None:
                 raise ValueError("private document text")

@@ -1,4 +1,6 @@
-"""Independent admission fixture: real generated code and real registry, no parser.
+"""R6 fixture derived from independently authored R1 admission fixture.
+
+Actual generated manager, ACK, ZIP and owned-thread helpers execute; no parser/model.
 
 The upload bytes are deliberately synthetic. The fixture proves local ownership
 and scheduling behavior only; it neither parses PDFs nor qualifies content.
@@ -12,6 +14,7 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 import sys
 import time
 import types
@@ -26,6 +29,7 @@ from scripts.windows.mineru_heap_trim_compat import agent_task_protocol_v2 as pr
 from scripts.windows.mineru_heap_trim_compat.patch_mineru_344 import patch_source
 
 PREIMAGE_SHA256 = "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
+MODEL_PREIMAGE_SHA256 = "7662656c5c406ab704065b8a3a6e662b662b0bb877b76b08c7d8a8a7eaf9c109"
 UPLOAD_BYTES = b"synthetic-unparsed-admission-ownership-fixture\n"
 
 
@@ -63,11 +67,12 @@ class Upload:
         self.closed = True
 
 
-class AdmissionFixture:
+class ResultCapacityApiFixture:
     """AST allowlist excludes module startup, routing, imports, and model code."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, budget=2097152, limit=6291456, pending=1):
         self.root = root
+        self.limit = limit
         self.epoch = int(time.time())
         self.environment = patch.dict(
             os.environ,
@@ -75,8 +80,8 @@ class AdmissionFixture:
                 "MINERU_API_OUTPUT_ROOT": str(root),
                 "MINERU_API_MAX_PENDING_TASKS": "1",
                 "MINERU_API_TASK_RETENTION_SECONDS": "0",
-                "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES": "1024",
-                "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "512",
+                "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES": str(limit),
+                "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": str(budget),
             },
         )
         self.environment.start()
@@ -106,6 +111,10 @@ class AdmissionFixture:
             "save_upload_files",
             "create_task_output_dir",
             "create_async_parse_task",
+            "ack_async_task_result",
+            "_hash_file", "_retained_result_sources", "_verify_and_close_result_sources",
+            "_write_retained_zip_from_fds", "build_retained_task_result",
+            "get_parse_dir", "get_images_dir_image_paths", "build_zip_arcname",
         }
         constants = {
             "TASK_PENDING",
@@ -129,6 +138,8 @@ class AdmissionFixture:
                 isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name in selected
             ):
+                if node.name == "ack_async_task_result":
+                    node.decorator_list = []
                 body.append(node)
                 found.add(node.name)
             elif isinstance(node, ast.Assign) and all(
@@ -146,6 +157,12 @@ class AdmissionFixture:
                 "asyncio": asyncio,
                 "os": os,
                 "shutil": shutil,
+                "stat": stat,
+                "hashlib": hashlib,
+                # Only external directory resolution is a literal fixture boundary.
+                # ZIP enumeration/writing/ownership checks below are actual generated code.
+                "resolve_parse_dir": lambda output, name, backend, method, **kw: Path(output) / name / method,
+                "RESULT_IMAGE_SUFFIXES": {"png", "jpg", "jpeg"},
                 "uuid": uuid,
                 "Path": Path,
                 "datetime": datetime,
@@ -180,9 +197,40 @@ class AdmissionFixture:
             ),
             namespace,
         )
-        self.manager = module.AsyncTaskManager(
-            types.SimpleNamespace(state=types.SimpleNamespace(config={}))
-        )
+        model_preimage = service / "tests/fixtures/mineru_344_preimages/mineru/utils/model_utils.py"
+        model_raw = model_preimage.read_bytes()
+        if hashlib.sha256(model_raw).hexdigest() != MODEL_PREIMAGE_SHA256:
+            raise AssertionError("official model_utils preimage changed")
+        self.generated_model = patch_source("mineru/utils/model_utils.py", model_raw.decode())
+        helper_names = {"OwnedOperation", "drain_owned_awaitable", "to_thread_owned"}
+        helper_nodes = [node for node in ast.parse(self.generated_model).body
+                        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                        and node.name in helper_names]
+        if {node.name for node in helper_nodes} != helper_names:
+            raise AssertionError("actual generated owned-thread helpers changed")
+        exec(compile(ast.fix_missing_locations(ast.Module(body=helper_nodes, type_ignores=[])),
+                     "<actual-generated-owned-operation>", "exec"), namespace)
+        evidence = os.environ.get("R6_GENERATED_OUT")
+        if evidence:
+            for name, content in (("fast_api.py", self.generated), ("model_utils.py", self.generated_model)):
+                target = Path(evidence) / name
+                if target.exists():
+                    if target.read_text() != content:
+                        raise AssertionError("generated source changed within one verification")
+                else:
+                    target.write_text(content)
+        if pending != 1:
+            # One explicit algorithm-only multi-processor callback family.
+            # Current deployment remains serial1; this does not qualify P=2 config.
+            namespace["get_max_pending_tasks"] = lambda: pending
+        try:
+            self.manager = module.AsyncTaskManager(
+                types.SimpleNamespace(state=types.SimpleNamespace(config={}))
+            )
+        except BaseException:
+            sys.modules.pop(module.__name__, None)
+            self.environment.stop()
+            raise
         namespace["get_task_manager"] = lambda: self.manager
 
     def options(self, name: str, *, upload=None, fence="fence-original"):
@@ -217,7 +265,7 @@ class AdmissionFixture:
     def cold_registry(self):
         return protocol.DurableTaskRegistry(
             self.root / ".agent-task-protocol-v2/registry.json",
-            max_unacked_result_bytes=1024,
+            max_unacked_result_bytes=self.limit,
             output_root=self.root,
             enforce_key_lifecycle=True,
         )
