@@ -25,9 +25,12 @@ from disclosure_anchor.adapters.runtime.mineru_diagnostic_lifecycle import (
     _MAX_INPUT_BYTES, run_diagnostic_attempt_v2,
 )
 from disclosure_anchor.adapters.runtime.mineru_diagnostic_store import _canonical, _digest
+from disclosure_anchor.adapters.runtime.m6_service_quality_verifier import (
+    ServiceQualityVerifier, service_quality_verifier_identity_sha256,
+)
 from disclosure_anchor.application.contracts.mineru_api_health import MINERU_API_RESULT_RESERVATION_BYTES
 from disclosure_anchor.application.contracts.staged_resource_credit import ResourceCreditVector
-from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.parser import ParserIdentity, ParserOptions
 from disclosure_anchor.application.services.m6_service_controller import (
     ServiceCompletion, ServiceControllerFailure, ServiceControllerResult, ServiceWork, run_service_controller,
 )
@@ -104,6 +107,7 @@ def run_service_batch(
     max_in_flight: int, credits_limit: ResourceCreditVector,
     stop_requested: Callable[[], bool], before_submit: Callable[[], None],
     resume: bool = False,
+    service_quality_verifier: ServiceQualityVerifier | None = None,
 ) -> ServiceBatchResult:
     """Supply a frozen finite batch; POST authority is checked again per attempt.
 
@@ -121,6 +125,16 @@ def run_service_batch(
             or type(credits_limit) is not ResourceCreditVector
             or credits_limit.temp_disk_bytes < _MAX_TOTAL):
         raise ValueError("service batch identity, input set or resource envelope is invalid")
+    scope = "functional_lifecycle_only_quality_unverified"
+    verifier_arguments: dict[str, Any] = {}
+    if service_quality_verifier is not None:
+        if (type(service_quality_verifier) is not ServiceQualityVerifier
+                or service_quality_verifier.identity_sha256 != service_quality_verifier_identity_sha256()
+                or service_quality_verifier.plan.parser_target_sha256 != _digest(_canonical(
+                    options.target_identity(ParserIdentity("MinerU", "3.4.4")).to_payload()))):
+            raise ValueError("service batch fixed verifier type, source or parser target differs")
+        verifier_arguments["service_quality_verifier"] = service_quality_verifier
+        scope = "service_provider_integrity_only"
     effective_limit = replace(credits_limit, temp_disk_bytes=credits_limit.temp_disk_bytes - _MAX_TOTAL)
     by_id = {item.attempt_id: item for item in inputs}
     work = tuple(service_work_reservation(item) for item in inputs)
@@ -148,8 +162,10 @@ def run_service_batch(
         "options": asdict(options), "max_in_flight": max_in_flight,
         "credits_limit": asdict(credits_limit),
         "attempt_journals": {identity: str(path) for identity, path in paths.items()},
-        "qualification_scope": "functional_lifecycle_only_quality_unverified",
+        "qualification_scope": scope,
     }
+    if service_quality_verifier is not None:
+        binding["service_quality"] = service_quality_verifier.binding_payload()
     binding_sha = _digest(_canonical(binding))
     with DiagnosticJournal(
         journal_root, create=not resume, attempt_id=batch_id,
@@ -226,6 +242,7 @@ def run_service_batch(
                 clock_identity_sha256=clock_identity_sha256, deadline_ns=deadline_ns,
                 continuous_ns=continuous_ns, resume=resume, before_submit=guard,
                 require_disposed=require_disposed,
+                **verifier_arguments,
             )
             return ServiceCompletion(source.attempt_id, proof["outcome"], _digest(_canonical(proof)))
 
@@ -272,6 +289,7 @@ def run_service_batch(
                     retained_or_unresolved_credits=remaining_credits(),
                     unreconciled=tuple(item.attempt_id for item in inputs
                                        if item.attempt_id in dispatched and item.attempt_id not in disposed),
+                    qualification_scope=scope,
                 )) from exc
         return ServiceBatchResult(
             controller=result, previously_disposed=previous,
@@ -279,4 +297,5 @@ def run_service_batch(
             retained_or_unresolved_credits=remaining_credits(),
             unreconciled=tuple(item.attempt_id for item in inputs
                                if item.attempt_id in dispatched and item.attempt_id not in disposed),
+            qualification_scope=scope,
         )

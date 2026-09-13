@@ -145,10 +145,11 @@ no invented Unit counts or public hashes. The old whole-document v1 family and
 `reduce_m6_run` retain their meaning and reject cross-family values.
 
 The pure new qualification function cannot attest external baseline evidence or
-actual validation. The functional [service batch](m6-service-batch.md) currently
-uses E1's explicit `quality=unverified`. It does not emit a new formal service
-receipt or substitute narrower checks into the old service numerator. A bound
-actual verifier and a separately versioned service accounting projection are
+actual validation. The functional [service batch](m6-service-batch.md) defaults
+to E1's explicit `quality=unverified`; its optional fixed source/provider
+verifier binds the actual held inputs and sealed per-document qualification.
+It does not emit a new formal service receipt or substitute narrower checks
+into the old service numerator. A separately versioned service accounting projection is
 required before claiming qualified throughput under the new scope.
 
 Deterministic tests cover closed membership, canonical bytes, source/page/winner

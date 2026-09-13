@@ -408,6 +408,10 @@
    "private_imports": [],
    "tests": 18
   },
+  "tests/unit/test_m6_service_batch_quality.py": {
+   "private_imports": [],
+   "tests": 8
+  },
   "tests/unit/test_m6_service_controller.py": {
    "private_imports": [],
    "tests": 19
@@ -419,6 +423,18 @@
   "tests/unit/test_m6_service_quality_compatibility.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_m6_service_quality_report.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_m6_service_quality_verifier_config.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_m6_service_quality_verifier_lifecycle.py": {
+   "private_imports": [],
+   "tests": 12
   },
   "tests/unit/test_mac_observer_identity.py": {
    "private_imports": [

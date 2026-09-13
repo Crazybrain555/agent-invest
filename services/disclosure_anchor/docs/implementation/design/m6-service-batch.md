@@ -85,14 +85,47 @@ blocked decoder/OS calls, physical Windows ownership or bounded native stop.
 
 ## Acceptance boundary
 
-Current results explicitly say
+Default results explicitly say
 `functional_lifecycle_only_quality_unverified`. Real source/provider artifact
 validation and disposal are necessary functional facts, but do not imply full
 Unit semantic qualification, public publication, formal G2, or hourly throughput.
 The new source/provider qualification family in [m6-run-contract.md](m6-run-contract.md)
-is separately versioned; its actual verifier/accounting connection remains a
-distinct implementation step. Existing parser acceptance is reused where its
+is separately versioned. Existing parser acceptance is reused where its
 identity applies, without inventing passed checks.
+
+Python composition may supply the fixed `service_quality_verifier` returned by
+`m6_service_quality_verifier.load_service_quality_verifier`. Its canonical plan
+and frozen deployment expectations enter both batch and original E1 bindings;
+the implementation identity and parser target are checked before dispatch.
+This branch returns `service_provider_integrity_only`. Each original E1 proof
+retains its own qualification; the batch's completion count remains a lifecycle
+count and does not become qualified throughput. The v1 CLI request remains the
+default unverified interface; it cannot load a Python callback or verifier module.
+
+The loader reads original owner-only plan and held-out validation files. It
+checks the baseline's exact byte hash and uses the existing held-out validator
+with expectations from actual runtime preflight, never copied from the receipt
+being checked. Every baseline target must equal the frozen plan's full parser
+target. The verifier identity binds the existing writer digest and the additional
+source files enumerated in `_EXTRA_SOURCE_PATHS`; it is not an assertion about
+every native or dynamically loaded dependency.
+
+For completed attempts, the fixed path holds the same source and complete
+output inventory owned by E1, reads the provider tree once, and applies existing
+provider content/profile and complete physical-page contracts. Four check
+references point to the original source-observed and output-sealed records.
+It performs no additional Unit build or native PDF parse. A changed source,
+output, record or incomplete check raises visibly and retains the original
+resources; it cannot gain cleanup or ACK authority from a callback's `pass`.
+
+The sealed `validated` report is closed evidence plus its recomputed scoped
+qualification. Replay binds source/output record hashes, attempt, target,
+provider and status/reason. Already-validated or disposed recovery does not
+read removed artifacts, renew baseline acceptance time or extend the original
+deadline. Changed plan, policy or expectations cannot resume the old journal.
+Legacy quality callbacks and caller readers are mutually exclusive with this
+fixed path. Formal owner/reducer accounting remains a separate implementation
+boundary; source/provider integrity alone does not prove public Unit semantics.
 
 Before live load, verify the actual original WSL GPU and inference execution,
 not merely API metadata health. Reconcile current driver/WSL boot/container

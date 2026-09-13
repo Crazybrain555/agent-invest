@@ -34,6 +34,9 @@ from disclosure_anchor.adapters.runtime.mineru_diagnostic_resources import Diagn
 from disclosure_anchor.adapters.runtime.mineru_diagnostic_store import _canonical, _digest
 from disclosure_anchor.adapters.runtime.mineru_diagnostic_source import observe_diagnostic_source
 from disclosure_anchor.adapters.runtime.mineru_diagnostic_wire import DiagnosticWireClient
+from disclosure_anchor.adapters.runtime.m6_service_quality_verifier import (
+    ServiceQualityVerifier, service_quality_verifier_identity_sha256,
+)
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.ports.parser import ParserIdentity, ParserOptions
 
@@ -221,7 +224,8 @@ class _Attempt:
         resources.verify_inventory(self.phases.value("output_sealed")["inventory"], prefix="output", partial=False)
 
     def validate(self, resources: DiagnosticResources, reader: MinerUMediumArtifactReader,
-                 quality_verifier: QualityVerifier | None) -> None:
+                 quality_verifier: QualityVerifier | None,
+                 service_quality_verifier: ServiceQualityVerifier | None = None) -> None:
         resources.verify_inventory(self.phases.inventory(), partial=False)
         if self.phases.has("validated"):
             return
@@ -230,15 +234,20 @@ class _Attempt:
         quality: dict[str, Any] = {"status": "not_applicable", "reason": "provider terminal failed",
                                    "verifier_sha256": None, "report": {}}
         if terminal.status == "completed":
-            document = reader.read_with_location(resources.path / "output",
-                                                source_pdf_sha256=self.binding["source_pdf_sha256"]).document
+            if service_quality_verifier is not None:
+                verified = service_quality_verifier.verify_result(resources=resources, phases=self.phases)
+                document = verified.document
+                quality = dict(verified.quality_payload())
+            else:
+                document = reader.read_with_location(resources.path / "output",
+                                                    source_pdf_sha256=self.binding["source_pdf_sha256"]).document
+                quality = {"status": "unverified", "reason": "independent semantic verifier not supplied", "report": {}}
             if (document.parser_version != "3.4.4" or document.backend != "hybrid"
                     or document.effort != "medium" or len(document.pages) != self.binding["source_page_count"]):
                 raise DiagnosticJournalError("diagnostic source page/profile closure differs")
             resources.verify_inventory(self.phases.inventory(), partial=False)
             provider = {"target_identity": self.binding["target_identity"], "provider_bundle_sha256": document.bundle_sha256,
                         "page_count": len(document.pages), "block_count": len(document.blocks), "artifact_count": len(document.artifacts)}
-            quality = {"status": "unverified", "reason": "independent semantic verifier not supplied", "report": {}}
             if quality_verifier is not None:
                 quality = quality_verifier(resources.path / "source.pdf", resources.path / "output", document)
                 if (type(quality) is not dict or set(quality) != {"status", "reason", "report"}
@@ -307,6 +316,7 @@ def run_diagnostic_attempt_v2(
     reader: MinerUMediumArtifactReader | None = None, unix_time: Callable[[], float] = time.time,
     pause: Callable[[float], None] = time.sleep, quality_verifier: QualityVerifier | None = None,
     quality_verifier_sha256: str | None = None,
+    service_quality_verifier: ServiceQualityVerifier | None = None,
     before_submit: Callable[[], None] | None = None,
     require_disposed: bool = False,
 ) -> dict[str, Any]:
@@ -316,6 +326,11 @@ def run_diagnostic_attempt_v2(
     proof. It requires resume and refuses every unfinished phase before issuing
     requests, appending records or changing resources.
     """
+    if service_quality_verifier is not None and (
+        type(service_quality_verifier) is not ServiceQualityVerifier or quality_verifier is not None
+        or quality_verifier_sha256 is not None or reader is not None
+    ):
+        raise DiagnosticJournalError("fixed service verifier excludes caller reader and legacy verifier overrides")
     if (type(resume) is not bool or type(require_disposed) is not bool or require_disposed and not resume
             or type(source_byte_count) is not int or not 0 < source_byte_count <= _MAX_INPUT_BYTES
             or type(source_page_count) is not int or not 0 < source_page_count <= 2**31 - 1
@@ -323,6 +338,10 @@ def run_diagnostic_attempt_v2(
             or quality_verifier_sha256 is not None and (type(quality_verifier_sha256) is not str
                                                         or not _HASH.fullmatch(quality_verifier_sha256))):
         raise DiagnosticJournalError("diagnostic source bounds or explicit verifier binding differ")
+    if service_quality_verifier is not None:
+        quality_verifier_sha256 = service_quality_verifier.identity_sha256
+        if quality_verifier_sha256 != service_quality_verifier_identity_sha256():
+            raise DiagnosticJournalError("fixed service verifier source changed after preparation")
     prepared = prepare_submission_identity_v2(
         api_url=api_url, server_url=server_url, options=options, source_pdf_sha256=source_pdf_sha256,
         attempt_identity=attempt_identity, fence_identity=fence_identity, submission_epoch_unix=submission_epoch_unix)
@@ -331,6 +350,8 @@ def run_diagnostic_attempt_v2(
                "source_pdf_sha256": source_pdf_sha256, "source_byte_count": source_byte_count,
                "source_page_count": source_page_count, "quality_verifier_sha256": quality_verifier_sha256,
                "target_identity": options.target_identity(ParserIdentity("MinerU", "3.4.4")).to_payload()}
+    if service_quality_verifier is not None:
+        binding["service_quality"] = service_quality_verifier.binding_payload()
     with DiagnosticJournal(journal_root, create=not resume, attempt_id=attempt_identity,
                            configuration_sha256=_digest(_canonical(binding)), clock_identity_sha256=clock_identity_sha256,
                            deadline_ns=deadline_ns, continuous_ns=continuous_ns) as journal:
@@ -376,7 +397,8 @@ def run_diagnostic_attempt_v2(
                     attempt.terminal()
                     if attempt.phases.terminal().status == "completed":
                         attempt.artifacts(resources)
-                    attempt.validate(resources, reader or MinerUMediumArtifactReader(), quality_verifier)
+                    attempt.validate(resources, reader or MinerUMediumArtifactReader(), quality_verifier,
+                                     service_quality_verifier)
                     attempt.phases.intent("cleanup_intent")
             attempt.cleanup()
             return attempt.ack()

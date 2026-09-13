@@ -11,6 +11,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
+from disclosure_anchor.application.contracts.diagnostic_json import bounded_json_bytes
 from disclosure_anchor.application.contracts.m6_common import (
     M6ClosedModel, M6Hash, M6Id, M6PositiveInt, M6Reason,
 )
@@ -158,3 +159,23 @@ def qualify_service_document(
         verdict=verdict, reasons=tuple(sorted(failures | pending)),
         scorable_page_count=observation.source_page_count if verdict == "scorable" else None,
     )
+
+
+def verify_service_quality_report(
+    report: object, *, plan: M6ServiceQualityPlan,
+) -> tuple[M6ServiceQualificationEvidence, M6ServiceDocumentQualification]:
+    """Replay a sealed scoped projection; this does not perform artifact IO."""
+    maximum = 2 * 1024 * 1024 + 8192
+    if type(report) is not dict or set(report) != {"evidence", "qualification"}:
+        raise ValueError("service quality report fields are not closed")
+    bounded_json_bytes(report, maximum_bytes=maximum)
+    evidence = M6ServiceQualificationEvidence.from_canonical_bytes(
+        bounded_json_bytes(report["evidence"], maximum_bytes=maximum), maximum_bytes=maximum,
+    )
+    qualification = M6ServiceDocumentQualification.from_canonical_bytes(
+        bounded_json_bytes(report["qualification"], maximum_bytes=maximum), maximum_bytes=maximum,
+    )
+    expected = qualify_service_document(evidence, plan)
+    if qualification.canonical_bytes() != expected.canonical_bytes():
+        raise ValueError("service quality report differs from its exact evidence projection")
+    return evidence, qualification

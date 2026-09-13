@@ -22,6 +22,7 @@ from disclosure_anchor.adapters.runtime.mineru_diagnostic_store import _canonica
 from disclosure_anchor.adapters.runtime.mineru_diagnostic_quality_phases import (
     QUALITY_CREATION_STEPS, owned_quality_configuration, validate_quality_creation,
 )
+from disclosure_anchor.adapters.runtime.m6_service_quality_phases import service_quality_plan, validate_service_quality_report
 from disclosure_anchor.application.contracts.mineru_api_health import MINERU_API_RESULT_RESERVATION_BYTES
 
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -99,6 +100,7 @@ class DiagnosticPhases:
     def __init__(self, journal: DiagnosticJournal, binding: dict[str, Any]) -> None:
         self.journal, self.binding = journal, binding
         self.owned_quality = owned_quality_configuration(journal, binding)
+        self.service_quality = service_quality_plan(journal, binding)
         split = _STEPS.index("validated")
         self._steps = (_STEPS if self.owned_quality is None
                        else _STEPS[:split] + QUALITY_CREATION_STEPS + _STEPS[split:])
@@ -280,6 +282,7 @@ class DiagnosticPhases:
                 raise DiagnosticJournalError("diagnostic quality lacks explicit verifier identity")
             if terminal.status == "completed" and quality["verifier_sha256"] != self.binding["quality_verifier_sha256"]:
                 raise DiagnosticJournalError("diagnostic quality verifier differs from bound configuration")
+            validate_service_quality_report(self, value)
         elif step == "local_removed":
             _closed(value, {"cleanup_intent_sha256", "resources_identity"})
             self.value("cleanup_intent")
