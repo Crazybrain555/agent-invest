@@ -436,6 +436,18 @@
    "private_imports": [],
    "tests": 12
   },
+  "tests/unit/test_m6_service_run_accounting.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/unit/test_m6_service_run_compatibility.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_m6_service_run_contract.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/unit/test_mac_observer_identity.py": {
    "private_imports": [
     "_ProcBsdInfo"

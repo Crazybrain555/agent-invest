@@ -18,6 +18,8 @@ from disclosure_anchor.application.contracts.m6_service_quality import (
     M6ServiceDocumentQualification, M6ServiceQualificationEvidence, M6ServiceQualityPlan,
 )
 
+from disclosure_anchor.application.contracts.m6_service_run import M6ServiceRunReceipt
+
 
 def operational_m6_schema_documents() -> dict[str, dict[str, Any]]:
     models: dict[str, type[M6ClosedModel]] = {
@@ -34,6 +36,7 @@ def operational_m6_schema_documents() -> dict[str, dict[str, Any]]:
         "m6-producer-event.v1.schema.json": M6ProducerEvent,
         "m6-run-event.v1.schema.json": M6RunEvent,
         "m6-run-receipt.v1.schema.json": M6RunReceipt,
+        "m6-service-run-receipt.v1.schema.json": M6ServiceRunReceipt,
         "m6-owner-anchor.v1.schema.json": M6OwnerAnchor,
         "m6-owner-request.v1.schema.json": M6OwnerRequest,
         "m6-owner-status.v1.schema.json": M6OwnerStatus,

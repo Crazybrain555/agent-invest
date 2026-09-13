@@ -425,30 +425,9 @@ def _source_outcome(
     return line()
 
 
-def reduce_m6_run(
-    *, spec: M6RunSpec, manifest: M6CorpusManifest, quality_plan: M6QualityPlan,
-    journal_lines: Iterable[bytes], history: tuple[M6SourceHistoryFact, ...],
-    qualifications: tuple[M6QualificationEvidence, ...],
-) -> M6RunReceipt:
-    """Replay LF-terminated canonical records in physical append order.
-
-    The source adapter must use bounded readline(max_record_bytes + 2). The
-    reducer additionally limits records, bytes, identities, and attempt state.
-    Partial/malformed evidence is retained as an incomplete/invalid receipt;
-    programmer, iterator and IO exceptions propagate rather than look complete.
-    """
-    if (spec.manifest_sha256 != manifest.canonical_sha256()
-            or spec.campaign_id != manifest.campaign_id or spec.mode != manifest.mode
-            or spec.quality_plan_sha256 != quality_plan.canonical_sha256() or spec.mode != quality_plan.mode):
-        raise ValueError("run inputs differ from frozen spec")
-    if spec.mode == "e2e_publication" and spec.scope_sha256 != M6CampaignScope.from_manifest(manifest).canonical_sha256():
-        raise ValueError("run campaign scope differs from manifest")
-    if len(history) > len(manifest.entries) or len(qualifications) > spec.resources.max_attempts:
-        raise ValueError("run evidence exceeds declared bounded scope")
-    history_by_source = {item.source_pdf_sha256: item for item in history}
-    evidence_by_sha = {item.canonical_sha256(): item for item in qualifications}
-    if len(history_by_source) != len(history) or len(evidence_by_sha) != len(qualifications):
-        raise ValueError("duplicate evidence identity")
+def _replay_journal(
+    spec: M6RunSpec, manifest: M6CorpusManifest, journal_lines: Iterable[bytes],
+) -> tuple[_Replay, str, int, int]:
     replay = _Replay(spec, manifest)
     digest = hashlib.sha256()
     count = consumed_bytes = 0
@@ -471,8 +450,12 @@ def reduce_m6_run(
             continue
         replay.consume(record)
     replay.finish()
-    lines = tuple(_source_outcome(replay, attempt, quality_plan, history_by_source, evidence_by_sha)
-                  for _, attempt in sorted(replay.attempts.items()))
+    return replay, "sha256:" + digest.hexdigest(), consumed_bytes, count
+
+
+def _eligible_sources(
+    lines: tuple[M6SourceOutcome, ...],
+) -> tuple[dict[str, M6SourceOutcome], dict[str, int]]:
     # Deduplicate eligible full sources, not attempts, profiles or document aliases.
     eligible: dict[str, M6SourceOutcome] = {}
     carry_in: dict[str, int] = {}
@@ -483,6 +466,40 @@ def reduce_m6_run(
             previous = eligible.get(line.source_pdf_sha256)
             if previous is None or (line.ready_received_ticks or 0) < (previous.ready_received_ticks or 0):
                 eligible[line.source_pdf_sha256] = line
+    return eligible, carry_in
+
+
+def reduce_m6_run(
+    *, spec: M6RunSpec, manifest: M6CorpusManifest, quality_plan: M6QualityPlan,
+    journal_lines: Iterable[bytes], history: tuple[M6SourceHistoryFact, ...],
+    qualifications: tuple[M6QualificationEvidence, ...],
+) -> M6RunReceipt:
+    """Replay LF-terminated canonical records in physical append order.
+
+    The source adapter must use bounded readline(max_record_bytes + 2). The
+    reducer additionally limits records, bytes, identities, and attempt state.
+    Partial/malformed evidence is retained as an incomplete/invalid receipt;
+    programmer, iterator and IO exceptions propagate rather than look complete.
+    """
+    if (type(quality_plan) is not M6QualityPlan or type(qualifications) is not tuple
+            or any(type(item) is not M6QualificationEvidence for item in qualifications)):
+        raise ValueError("run qualification requires its exact evidence and plan family")
+    if (spec.manifest_sha256 != manifest.canonical_sha256()
+            or spec.campaign_id != manifest.campaign_id or spec.mode != manifest.mode
+            or spec.quality_plan_sha256 != quality_plan.canonical_sha256() or spec.mode != quality_plan.mode):
+        raise ValueError("run inputs differ from frozen spec")
+    if spec.mode == "e2e_publication" and spec.scope_sha256 != M6CampaignScope.from_manifest(manifest).canonical_sha256():
+        raise ValueError("run campaign scope differs from manifest")
+    if len(history) > len(manifest.entries) or len(qualifications) > spec.resources.max_attempts:
+        raise ValueError("run evidence exceeds declared bounded scope")
+    history_by_source = {item.source_pdf_sha256: item for item in history}
+    evidence_by_sha = {item.canonical_sha256(): item for item in qualifications}
+    if len(history_by_source) != len(history) or len(evidence_by_sha) != len(qualifications):
+        raise ValueError("duplicate evidence identity")
+    replay, prefix_sha, consumed_bytes, count = _replay_journal(spec, manifest, journal_lines)
+    lines = tuple(_source_outcome(replay, attempt, quality_plan, history_by_source, evidence_by_sha)
+                  for _, attempt in sorted(replay.attempts.items()))
+    eligible, carry_in = _eligible_sources(lines)
     window = sum(line.page_count for line in eligible.values() if line.outcome == "credited_window")
     whole = sum(line.page_count for line in eligible.values())
     status: Literal["complete", "incomplete", "invalid"] = (
@@ -497,7 +514,7 @@ def reduce_m6_run(
     elapsed = None if replay.cross_boot or replay.closed is None or replay.closed < spec.t0_ticks else replay.closed - spec.t0_ticks
     return M6RunReceipt(
         run_id=spec.run_id, spec_sha256=spec.canonical_sha256(),
-        journal_prefix_sha256="sha256:" + digest.hexdigest(), journal_bytes_consumed=consumed_bytes,
+        journal_prefix_sha256=prefix_sha, journal_bytes_consumed=consumed_bytes,
         mode=spec.mode, phase=spec.phase, status=status,
         incomplete_reasons=tuple(sorted(replay.incomplete)), invalid_reasons=tuple(sorted(replay.invalid)),
         t0_ticks=spec.t0_ticks, deadline_ticks=spec.deadline_ticks, tclose_ticks=replay.closed,

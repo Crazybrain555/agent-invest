@@ -26,6 +26,7 @@ from disclosure_anchor.application.contracts.m6_schemas import operational_m6_sc
 
 from tests import m6_support as m6
 from tests import _m6_service_quality_fixture as service_quality
+from tests._m6_service_run_fixture import receipt_payload
 
 import jsonschema
 
@@ -44,6 +45,7 @@ EXPECTED_FILES = {
     "m6-producer-event.v1.schema.json": "m6.producer-event.v1",
     "m6-run-event.v1.schema.json": "m6.run-event.v1",
     "m6-run-receipt.v1.schema.json": "m6.run-receipt.v1",
+    "m6-service-run-receipt.v1.schema.json": "m6.service-run-receipt.v1",
     "m6-owner-anchor.v1.schema.json": "m6.owner-anchor.v1",
     "m6-owner-request.v1.schema.json": "m6.owner-request.v1",
     "m6-owner-status.v1.schema.json": "m6.owner-status.v1",
@@ -198,6 +200,7 @@ class SchemaAcceptanceTests(unittest.TestCase):
             "m6-producer-event.v1.schema.json": record.event,
             "m6-run-event.v1.schema.json": record,
             "m6-run-receipt.v1.schema.json": self.receipt,
+            "m6-service-run-receipt.v1.schema.json": receipt_payload(),
             "m6-owner-anchor.v1.schema.json": anchor,
             "m6-owner-request.v1.schema.json": request,
             "m6-owner-status.v1.schema.json": status,
@@ -238,6 +241,14 @@ class SchemaAcceptanceTests(unittest.TestCase):
         self.assert_rejects("m6-run-receipt.v1.schema.json", {**receipt_wire, "metrics": {"kind": "pages_per_hour", "value": 1}},
                             "an unregistered metrics kind")
         self.assert_rejects("m6-run-receipt.v1.schema.json", {**receipt_wire, "events_total": -1}, "negative count")
+        service_run = receipt_payload()
+        self.assert_rejects("m6-service-run-receipt.v1.schema.json", {
+            **service_run, "mode": "e2e_publication"}, "a publication mode in the service family")
+        self.assert_rejects("m6-service-run-receipt.v1.schema.json", {
+            **service_run, "metrics": {**service_run["metrics"], "kind": "service_validated_source_pages"}},
+            "the unchanged old service metric kind")
+        self.assert_rejects("m6-service-run-receipt.v1.schema.json", {
+            **service_run, "metrics": {**service_run["metrics"], "whole_run_pages": True}}, "boolean page count")
         event_wire = json.loads(record.event.canonical_bytes())
         self.assert_rejects("m6-producer-event.v1.schema.json", {**event_wire, "payload": {"kind": "run_started"}},
                             "a payload missing its fields")

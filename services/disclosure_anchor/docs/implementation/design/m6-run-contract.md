@@ -148,9 +148,26 @@ The pure new qualification function cannot attest external baseline evidence or
 actual validation. The functional [service batch](m6-service-batch.md) defaults
 to E1's explicit `quality=unverified`; its optional fixed source/provider
 verifier binds the actual held inputs and sealed per-document qualification.
-It does not emit a new formal service receipt or substitute narrower checks
-into the old service numerator. A separately versioned service accounting projection is
-required before claiming qualified throughput under the new scope.
+The batch does not emit physical-owner run events or a formal run receipt.
+
+`reduce_m6_service_run` consumes the new evidence family explicitly and returns
+`m6.service-run-receipt.v1`, with metric kind
+`service_provider_integrity_source_pages`. It shares the original bounded journal
+replay and full-source deduplication. The `service_validated` and
+`document_qualified` events must reference the same evidence's complete canonical
+SHA; a phase record hash or report hash is not interchangeable. Existing facts
+are checked for attempt/source/target/verifier/bundle conflicts before failed
+terminal or non-scorable shortcuts. Missing referenced bytes remain incomplete.
+The credit time is the later actual owner receipt tick of those two facts; ACK,
+cleanup and all child/resource closure remain whole-run completion requirements.
+Carry-in is separate, replay is a labeled subset, and the original half-open
+deadline, whole-run tail and cross-boot rules remain in force. No public or Unit
+credit is produced. Both reducer entries reject the other qualification family
+before consuming the journal; valid old v1 bytes and schemas retain their meaning.
+
+This pure projection cannot prove physical execution. Connecting the fixed E1
+facts to their authenticated producer roles and actual Windows owner receipt
+clock remains necessary before a service batch can produce a formal run result.
 
 Deterministic tests cover closed membership, canonical bytes, source/page/winner
 conflicts, global history, late qualification, carry-in/replay, owner/producer

@@ -9,6 +9,7 @@ import unittest
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _SERVICE_ROOT / "src" / "disclosure_anchor"
 _M6_SCHEMA_FILES = (
+    _SOURCE_ROOT / "application" / "contracts" / "m6_service_run.py",
     _SOURCE_ROOT / "application" / "contracts" / "m6_service_quality.py",
     _SOURCE_ROOT / "application" / "contracts" / "m6_document_qualification.py",
     _SOURCE_ROOT / "application" / "contracts" / "m6_campaign.py",
@@ -20,6 +21,8 @@ _M6_SCHEMA_FILES = (
     _SOURCE_ROOT / "application" / "contracts" / "m6_run_events.py",
 )
 _GREENFIELD_CORE_FILES = (
+    _SOURCE_ROOT / "application" / "services" / "m6_service_run_accounting.py",
+    _SOURCE_ROOT / "application" / "services" / "m6_run_accounting.py",
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_config.py",
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_input.py",
     *_M6_SCHEMA_FILES,
@@ -66,6 +69,9 @@ _HISTORICAL_EVIDENCE_CONTRACT = (
     / "normalized_ir_v4_evidence.py"
 )
 _ALLOWED_DISCLOSURE_IMPORTS = (
+    "disclosure_anchor.application.contracts.m6_service_run",
+    "disclosure_anchor.application.services.m6_service_run_accounting",
+    "disclosure_anchor.application.services.m6_run_accounting",
     "disclosure_anchor.application.contracts.m6_service_quality",
     "disclosure_anchor.application.contracts.mineru_diagnostic_quality_config",
     "disclosure_anchor.application.contracts.mineru_diagnostic_quality_input",
