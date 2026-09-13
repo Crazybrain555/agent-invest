@@ -23,7 +23,7 @@ import httpx
 from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import MinerUMediumArtifactReader
 from disclosure_anchor.adapters.parsers.mineru_medium.http_staged import prepare_submission_identity_v2
 from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
-    decode_closed_json_v2, parse_result_lease_v2, result_lease_url_v2,
+    TaskProtocolV2Observation, decode_closed_json_v2, parse_result_lease_v2, result_lease_url_v2,
     submission_form_v2, task_ack_url_v2, task_lookup_url_v2,
 )
 from disclosure_anchor.adapters.runtime.mineru_diagnostic_journal import DiagnosticJournal, DiagnosticJournalError
@@ -318,6 +318,7 @@ def run_diagnostic_attempt_v2(
     quality_verifier_sha256: str | None = None,
     service_quality_verifier: ServiceQualityVerifier | None = None,
     before_submit: Callable[[], None] | None = None,
+    on_terminal: Callable[[TaskProtocolV2Observation], None] | None = None,
     require_disposed: bool = False,
 ) -> dict[str, Any]:
     """Run or explicitly reconcile one diagnostic; no new-key retry on resume.
@@ -325,6 +326,10 @@ def run_diagnostic_attempt_v2(
     ``require_disposed`` is read-only reconciliation of an already sealed final
     proof. It requires resume and refuses every unfinished phase before issuing
     requests, appending records or changing resources.
+
+    ``on_terminal`` observes a durably sealed remote terminal before local result
+    retrieval. It grants no ACK or result-disposal authority. A resumed unfinished
+    attempt may notify again; callers must make their notification idempotent.
     """
     if service_quality_verifier is not None and (
         type(service_quality_verifier) is not ServiceQualityVerifier or quality_verifier is not None
@@ -395,6 +400,8 @@ def run_diagnostic_attempt_v2(
                         resources.verify_payload("source.pdf", attempt.phases.value("snapshot_sealed"))
                     attempt.submit(resources, before_submit)
                     attempt.terminal()
+                    if on_terminal is not None:
+                        on_terminal(attempt.phases.terminal())
                     if attempt.phases.terminal().status == "completed":
                         attempt.artifacts(resources)
                     attempt.validate(resources, reader or MinerUMediumArtifactReader(), quality_verifier,

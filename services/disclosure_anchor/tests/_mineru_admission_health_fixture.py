@@ -184,6 +184,7 @@ class CollectorIO:
 
         modules = {
             "hashlib": hashlib, "json": json,
+            "sys": types.SimpleNamespace(argv=[]),
             "os": types.SimpleNamespace(environ={
                 "MINERU_PROCESSING_WINDOW_SIZE": "16", "MINERU_HYBRID_BATCH_RATIO": "1",
                 "MINERU_API_MAX_PENDING_TASKS": "1",

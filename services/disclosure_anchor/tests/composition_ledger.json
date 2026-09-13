@@ -474,6 +474,58 @@
    "private_imports": [],
    "tests": 17
   },
+  "tests/unit/test_mineru_capacity_bootstrap.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_mineru_capacity_cli_consumers.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_mineru_capacity_collector.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_mineru_capacity_config.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_mineru_capacity_consumers.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_mineru_capacity_file.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_mineru_capacity_health.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_mineru_capacity_http_owner.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_mineru_capacity_lifecycle.py": {
+   "private_imports": [],
+   "tests": 0
+  },
+  "tests/unit/test_mineru_capacity_orchestrator.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_mineru_capacity_process_observation.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_mineru_capacity_readiness.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_mineru_capacity_v11.py": {
+   "private_imports": [],
+   "tests": 9
+  },
   "tests/unit/test_mineru_consumed_lookup.py": {
    "private_imports": [],
    "tests": 0
@@ -557,6 +609,10 @@
   "tests/unit/test_mineru_diagnostic_wire.py": {
    "private_imports": [],
    "tests": 7
+  },
+  "tests/unit/test_mineru_executor_stage_counters.py": {
+   "private_imports": [],
+   "tests": 1
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],

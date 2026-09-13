@@ -18,6 +18,8 @@ from disclosure_anchor.application.contracts.capacity import (
 from disclosure_anchor.application.contracts.mineru_api_health import (
     parse_mineru_api_health,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
     nvidia_smi_sample_age_seconds,
 )
@@ -156,13 +158,30 @@ def _alias(
     return ()
 
 
-def _api_values(payload: bytes, *, expected_task_slots: int) -> ApiSampleValues:
-    decoded = parse_mineru_api_health(
-        payload, expected_task_slots=expected_task_slots
-    )
+def _api_values(
+    payload: bytes, *, expected_task_slots: int | None = None,
+    expected_capacity: MineruCapacityConfig | None = None,
+) -> ApiSampleValues:
+    if expected_capacity is None:
+        decoded = parse_mineru_api_health(
+            payload, expected_task_slots=expected_task_slots,
+        )
+        active = decoded["processing_tasks"]
+    else:
+        if expected_task_slots is not None:
+            raise ValueError("explicit capacity cannot also use legacy task slots")
+        health = parse_mineru_capacity_wire_health(payload, expected_capacity=expected_capacity)
+        control = health["capacity_observation"]["owner_control"]
+        if (any(control[field] for field in (
+                "foreign_loop_observed", "soft_drain_requested", "soft_drain_applied"))
+                or health["task_admission"]["blocked_reason"] not in (None, "capacity_full")):
+            raise ValueError("MinerU capacity owner is draining or admission is closed")
+        # The wire aggregate includes finalizers, which do not occupy N.
+        active = health["capacity_observation"]["stage_counters"]["parse_active"]
+        decoded = health
     return ApiSampleValues(
         queued_tasks=decoded["queued_tasks"],
-        processing_tasks=decoded["processing_tasks"],
+        processing_tasks=active,
         completed_tasks_gauge=decoded["completed_tasks"],
         failed_tasks_gauge=decoded["failed_tasks"],
         task_slots=decoded["max_concurrent_requests"],
@@ -294,10 +313,16 @@ class MineruApiCapacitySampler:
     source = "api"
     cadence_seconds = 1.0
 
-    def __init__(self, *, url: str, timeout_seconds: float, task_slots: int) -> None:
+    def __init__(
+        self, *, url: str, timeout_seconds: float, task_slots: int | None = None,
+        expected_capacity: MineruCapacityConfig | None = None,
+    ) -> None:
+        if expected_capacity is not None and task_slots is not None:
+            raise ValueError("explicit capacity cannot also use legacy task slots")
         self._url = _service_root(url) + "/health"
         self._timeout = timeout_seconds
         self._task_slots = task_slots
+        self._expected_capacity = expected_capacity
 
     def sample(self) -> ApiSampleValues:
         payload = _fetch_payload(
@@ -306,7 +331,9 @@ class MineruApiCapacitySampler:
             accepted_content_types=frozenset({"application/json"}),
             maximum_bytes=MAX_API_HEALTH_BYTES,
         )
-        return _api_values(payload, expected_task_slots=self._task_slots)
+        return _api_values(
+            payload, expected_task_slots=self._task_slots, expected_capacity=self._expected_capacity,
+        )
 
 
 class VllmCapacitySampler:

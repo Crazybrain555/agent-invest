@@ -16,10 +16,19 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
     MINERU_API_RESULT_RESERVATION_BYTES,
     MINERU_API_MAX_UNACKED_RESULT_BYTES,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruCapacityConfig,
+    encode_mineru_capacity_config,
+)
 
 RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v8"
 STAGED_RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v9"
 CPU_THREAD_RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v10"
+EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v11"
+CAPACITY_SOURCE_PATHS = frozenset(
+    f"mineru/cli/agent_capacity_{name}.py"
+    for name in ("config", "file", "bootstrap", "observation")
+)
 MINERU_PROCESSING_WINDOW_SIZE = 16
 MINERU_API_PROTOCOL_VERSION = 2
 MINERU_API_DEFAULT_TASK_SLOTS = 1
@@ -101,6 +110,9 @@ _STAGED_ORCHESTRATOR_MANIFEST_FIELDS = _ORCHESTRATOR_MANIFEST_FIELDS | {
 _CPU_THREAD_ORCHESTRATOR_MANIFEST_FIELDS = _STAGED_ORCHESTRATOR_MANIFEST_FIELDS | {
     "cpu_thread_policy",
 }
+_CAPACITY_ORCHESTRATOR_MANIFEST_FIELDS = _STAGED_ORCHESTRATOR_MANIFEST_FIELDS | {
+    "capacity_config", "capacity_config_sha256", "capacity_source_sha256",
+}
 _INFERENCE_SERVER_MANIFEST_FIELDS = {
     "container_image_digest",
     "content_environment_sha256",
@@ -153,6 +165,10 @@ _WRITER_CODE_RELPATHS = (
     "src/disclosure_anchor/application/ports/staged_provider_parser.py",
     "src/disclosure_anchor/adapters/runtime/mineru_identity.py",
     "src/disclosure_anchor/adapters/runtime/mineru_orchestrator.py",
+    "src/disclosure_anchor/adapters/runtime/mineru_capacity_config.py",
+    "src/disclosure_anchor/adapters/runtime/mineru_capacity_file.py",
+    "src/disclosure_anchor/application/contracts/mineru_capacity_config.py",
+    "src/disclosure_anchor/application/contracts/mineru_capacity_health.py",
     "src/disclosure_anchor/adapters/runtime/mineru_process_isolation.py",
     "src/disclosure_anchor/adapters/storage/provider_document_source.py",
     "src/disclosure_anchor/application/ports/parser.py",
@@ -290,6 +306,7 @@ def verify_runtime_manifest_payload(
     local_client_identity: MinerUClientIdentity,
     local_processing_window_size: int,
     local_writer_code_digest: str,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> VerifiedMinerURuntimeManifest:
     if not isinstance(payload, dict):
         raise ValueError("runtime attestation root must be an object")
@@ -301,6 +318,7 @@ def verify_runtime_manifest_payload(
         RUNTIME_MANIFEST_CONTRACT,
         STAGED_RUNTIME_MANIFEST_CONTRACT,
         CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+        EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT,
     }:
         raise ValueError("runtime manifest contract is unsupported")
     if set(manifest) != _MANIFEST_FIELDS:
@@ -313,6 +331,12 @@ def verify_runtime_manifest_payload(
             "runtime manifest identity does not match "
             "DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256"
         )
+    if (contract_version == EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT) != (
+        expected_capacity is not None
+    ):
+        raise ValueError("runtime explicit capacity selection disagrees with version")
+    if expected_capacity is not None:
+        encode_mineru_capacity_config(expected_capacity)
     local = manifest.get("client")
     orchestrator = manifest.get("orchestrator")
     inference_server = manifest.get("inference_server")
@@ -330,7 +354,9 @@ def verify_runtime_manifest_payload(
     if set(local) != _CLIENT_MANIFEST_FIELDS:
         raise ValueError("runtime manifest client fields are not closed")
     expected_orchestrator_fields = (
-        _CPU_THREAD_ORCHESTRATOR_MANIFEST_FIELDS
+        _CAPACITY_ORCHESTRATOR_MANIFEST_FIELDS
+        if contract_version == EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT
+        else _CPU_THREAD_ORCHESTRATOR_MANIFEST_FIELDS
         if contract_version == CPU_THREAD_RUNTIME_MANIFEST_CONTRACT
         else _STAGED_ORCHESTRATOR_MANIFEST_FIELDS
         if contract_version == STAGED_RUNTIME_MANIFEST_CONTRACT
@@ -359,6 +385,7 @@ def verify_runtime_manifest_payload(
         orchestrator,
         expected_processing_window_size=local_processing_window_size,
         contract_version=contract_version,
+        expected_capacity=expected_capacity,
     )
     _verify_inference_server_manifest(inference_server)
     _verify_topology_manifest(topology)
@@ -426,6 +453,7 @@ def _verify_orchestrator_manifest(
     *,
     expected_processing_window_size: int,
     contract_version: str,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> None:
     _require_sha256(
         orchestrator.get("container_image_digest"),
@@ -455,13 +483,19 @@ def _verify_orchestrator_manifest(
     ):
         raise ValueError("runtime manifest orchestrator MinerU version drifted")
     task_slots = orchestrator.get("max_concurrent_requests")
+    expected_slots = 1 if expected_capacity is None else expected_capacity.parse_active_limit
+    expected_pending = (
+        1 if expected_capacity is None else expected_capacity.total_nonterminal_limit
+    )
     if (
         isinstance(task_slots, bool)
         or not isinstance(task_slots, int)
-        or task_slots != 1
+        or task_slots != expected_slots
     ):
         raise ValueError(
             "runtime manifest orchestrator max_concurrent_requests must be 1"
+            if expected_capacity is None
+            else "runtime manifest orchestrator max_concurrent_requests drifted"
         )
     pending_requested = orchestrator.get("max_pending_tasks_requested")
     pending_effective = orchestrator.get("max_pending_tasks_effective")
@@ -470,8 +504,8 @@ def _verify_orchestrator_manifest(
         or not isinstance(pending_requested, int)
         or isinstance(pending_effective, bool)
         or not isinstance(pending_effective, int)
-        or pending_requested != 1
-        or pending_effective != 1
+        or pending_requested != expected_pending
+        or pending_effective != expected_pending
     ):
         raise ValueError("runtime manifest orchestrator pending task depth drifted")
     fixed_values = {
@@ -482,9 +516,25 @@ def _verify_orchestrator_manifest(
         "task_retention_seconds": MINERU_API_TASK_RETENTION_SECONDS,
         "task_cleanup_interval_seconds": MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS,
     }
+    if expected_capacity is not None:
+        fixed_values.update({
+            "inference_max_concurrency": expected_capacity.final_http_limit_per_loop,
+            "hybrid_batch_ratio": expected_capacity.hybrid_batch_ratio_requested,
+            "processing_window_size": expected_capacity.processing_window_size,
+        })
+        if (
+            type(orchestrator.get("capacity_config")) is not dict
+            or canonical_payload_sha256(orchestrator["capacity_config"])
+            != expected_capacity.sha256
+            or orchestrator.get("capacity_config_sha256") != expected_capacity.sha256
+        ):
+            raise ValueError("runtime manifest capacity config differs from external input")
+        validate_capacity_source_sha256(orchestrator.get("capacity_source_sha256"))
     for field, expected in fixed_values.items():
         value = orchestrator.get(field)
-        if isinstance(value, bool) or value != expected:
+        if isinstance(value, bool) or value != expected or (
+            expected_capacity is not None and type(value) is not int
+        ):
             raise ValueError(
                 f"runtime manifest orchestrator {field} must be {expected}"
             )
@@ -492,7 +542,7 @@ def _verify_orchestrator_manifest(
         raise ValueError(
             "runtime manifest orchestrator pipeline_inference_locks must be True"
         )
-    if expected_processing_window_size != MINERU_PROCESSING_WINDOW_SIZE:
+    if expected_processing_window_size != fixed_values["processing_window_size"]:
         raise ValueError(
             "local expected MinerU processing window drifted from the v3 contract"
         )
@@ -505,15 +555,23 @@ def _verify_orchestrator_manifest(
     if contract_version in {
         STAGED_RUNTIME_MANIFEST_CONTRACT,
         CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+        EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT,
     }:
         staged_capacity = {
             "task_registry_max_records": MINERU_API_TASK_REGISTRY_MAX_RECORDS,
             "task_result_reservation_bytes": MINERU_API_RESULT_RESERVATION_BYTES,
             "max_unacked_result_bytes": MINERU_API_MAX_UNACKED_RESULT_BYTES,
         }
+        if expected_capacity is not None:
+            staged_capacity.update({
+                "task_result_reservation_bytes": expected_capacity.result_reservation_bytes,
+                "max_unacked_result_bytes": expected_capacity.max_unacked_result_bytes,
+            })
         for field, expected in staged_capacity.items():
             value = orchestrator.get(field)
-            if isinstance(value, bool) or value != expected:
+            if isinstance(value, bool) or value != expected or (
+                expected_capacity is not None and type(value) is not int
+            ):
                 raise ValueError(
                     f"runtime manifest orchestrator {field} must be {expected}"
                 )
@@ -527,8 +585,18 @@ def _verify_orchestrator_manifest(
         command,
         "--max-concurrency",
         component="orchestrator",
-    ) != str(MINERU_API_INFERENCE_MAX_CONCURRENCY):
-        raise ValueError("runtime manifest orchestrator must pin max_concurrency=7")
+    ) != str(fixed_values["inference_max_concurrency"]):
+        raise ValueError("runtime manifest orchestrator max_concurrency drifted")
+
+
+def validate_capacity_source_sha256(value: object) -> dict[str, str]:
+    """Require the four distinct added image sources, outside legacy preimages."""
+    if type(value) is not dict or set(value) != CAPACITY_SOURCE_PATHS:
+        raise ValueError("capacity source hash map is not closed")
+    return {
+        key: _require_sha256(value[key], label=f"capacity source {key}")
+        for key in sorted(CAPACITY_SOURCE_PATHS)
+    }
 
 
 def _verify_inference_server_manifest(inference_server: dict[str, Any]) -> None:
@@ -707,6 +775,9 @@ __all__ = [
     "RUNTIME_MANIFEST_CONTRACT",
     "STAGED_RUNTIME_MANIFEST_CONTRACT",
     "CPU_THREAD_RUNTIME_MANIFEST_CONTRACT",
+    "EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT",
+    "CAPACITY_SOURCE_PATHS",
+    "validate_capacity_source_sha256",
     "verified_cpu_thread_policy",
     "MinerUClientIdentity",
     "VerifiedMinerURuntimeManifest",

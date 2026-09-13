@@ -472,6 +472,13 @@ resident 代码在 installer/worker/settings 的 activation caller closure 下�
 及其 fallback 已从执行面删除；任何 process-startup 参数变化都要求先完全 quiesce，产生新的 exact
 runtime/profile identity，并重新通过 multimodal canary、epoch、OOM/restart 和 drain 门。
 
+显式容量试验使用独立的 canonical `mineru.capacity-config.v1` 配置及 SHA，安装器明确选择
+`explicit-capacity` Docker target；省略配置仍选 `legacy-runtime`。它支持单进程/单事件循环下
+分别配置 N/P/F/H，并保留原解析语义、真实责任与 rollback 门。完整17字段 health、collector v6、
+runtime v11 与外部配置逐层对应；不得把 v11 降格投影成旧串行 manifest。
+具体参数意义、安装和 no-DB 验证边界见 [显式容量合同](../design/mineru-explicit-capacity.md)。
+该试验入口不自动启用 Settings/staged worker/PG 发布，也不单凭功能通过授予 M6 吞吐验收。
+
 新的受控容量搜索必须满足：
 
 - 使用独立 held-out 完整真实 PDF，覆盖 regular/heavy/huge、OCR、表格/公式、跨页结构和

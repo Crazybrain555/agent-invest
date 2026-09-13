@@ -16,6 +16,14 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
     parse_mineru_api_health,
     validate_mineru_api_health,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruCapacityConfig,
+    encode_mineru_capacity_config,
+)
+from disclosure_anchor.application.contracts.mineru_capacity_health import (
+    parse_mineru_capacity_wire_health,
+    validate_mineru_capacity_wire_health,
+)
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_PROCESSING_WINDOW_SIZE,
 )
@@ -63,7 +71,9 @@ class MinerUOrchestratorHealthClient:
         expected_cleanup_interval_seconds: int | None = (
             MINERU_API_CLEANUP_INTERVAL_SECONDS
         ),
+        expected_capacity: MineruCapacityConfig | None = None,
     ) -> "MinerUOrchestratorHealth":
+        _check_capacity_selection(expected_capacity, expected_task_slots)
         try:
             status, payload = self._transport.get_bytes(
                 "/health",
@@ -92,6 +102,7 @@ class MinerUOrchestratorHealthClient:
             expected_task_slots=expected_task_slots,
             expected_task_retention_seconds=expected_task_retention_seconds,
             expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+            expected_capacity=expected_capacity,
         )
 
     def close(self) -> None:
@@ -102,6 +113,15 @@ class MinerUOrchestratorHealthClient:
 class MinerUOrchestratorIncidentState:
     generation: int
     drains_in_progress: int
+
+
+def _check_capacity_selection(
+    capacity: MineruCapacityConfig | None, task_slots: int | None,
+) -> None:
+    if capacity is not None:
+        encode_mineru_capacity_config(capacity)
+        if task_slots is not None:
+            raise ValueError("explicit capacity requires expected_task_slots=None")
 
 
 def mark_mineru_orchestrator_incident() -> int:
@@ -167,6 +187,27 @@ class MinerUOrchestratorHealth:
     def as_dict(self) -> dict[str, Any]:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
 
+    def require_accepting(self) -> None:
+        """Legacy health has no serving admission-control observation."""
+
+
+@dataclass(frozen=True)
+class MinerUCapacityOrchestratorHealth(MinerUOrchestratorHealth):
+    """The full new wire observation; no projection back into legacy serial health."""
+
+    task_protocol_schema: str
+    task_protocol_runtime: dict[str, Any]
+    task_admission: dict[str, Any]
+    capacity_observation: dict[str, Any]
+
+    def require_accepting(self) -> None:
+        """A valid drain observation is not permission to start more work."""
+        control = self.capacity_observation["owner_control"]
+        if (control["foreign_loop_observed"] or control["soft_drain_requested"]
+                or control["soft_drain_applied"]
+                or self.task_admission["blocked_reason"] not in (None, "capacity_full")):
+            raise MinerUOrchestratorError("MinerU API serving admission is stopped or draining")
+
 
 def fetch_mineru_orchestrator_health(
     api_url: str,
@@ -175,6 +216,7 @@ def fetch_mineru_orchestrator_health(
     expected_task_slots: int | None = MINERU_API_DEFAULT_TASK_SLOTS,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> MinerUOrchestratorHealth:
     """Fetch one bounded strict `/health` sample without proxy inheritance."""
     client = MinerUOrchestratorHealthClient(api_url)
@@ -184,6 +226,7 @@ def fetch_mineru_orchestrator_health(
             expected_task_slots=expected_task_slots,
             expected_task_retention_seconds=expected_task_retention_seconds,
             expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+            **({"expected_capacity": expected_capacity} if expected_capacity is not None else {}),
         )
     finally:
         client.close()
@@ -195,8 +238,20 @@ def _decode_mineru_orchestrator_health(
     expected_task_slots: int | None,
     expected_task_retention_seconds: int | None,
     expected_cleanup_interval_seconds: int | None,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> MinerUOrchestratorHealth:
+    _check_capacity_selection(expected_capacity, expected_task_slots)
     try:
+        if expected_capacity is not None:
+            if (type(expected_task_retention_seconds) is not int
+                    or type(expected_cleanup_interval_seconds) is not int):
+                raise ValueError("explicit capacity requires explicit retention and cleanup limits")
+            capacity_health = parse_mineru_capacity_wire_health(
+                payload, expected_capacity=expected_capacity,
+                expected_task_retention_seconds=expected_task_retention_seconds,
+                expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+            )
+            return MinerUCapacityOrchestratorHealth(**capacity_health)
         decoded = parse_mineru_api_health(
             payload,
             expected_task_slots=expected_task_slots,
@@ -214,10 +269,22 @@ def parse_mineru_orchestrator_health_payload(
     expected_task_slots: int | None = MINERU_API_DEFAULT_TASK_SLOTS,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> MinerUOrchestratorHealth:
     """Validate one already-decoded API health object under the shared contract."""
 
+    _check_capacity_selection(expected_capacity, expected_task_slots)
     try:
+        if expected_capacity is not None:
+            if (type(expected_task_retention_seconds) is not int
+                    or type(expected_cleanup_interval_seconds) is not int):
+                raise ValueError("explicit capacity requires explicit retention and cleanup limits")
+            capacity_health = validate_mineru_capacity_wire_health(
+                decoded, expected_capacity=expected_capacity,
+                expected_task_retention_seconds=expected_task_retention_seconds,
+                expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
+            )
+            return MinerUCapacityOrchestratorHealth(**capacity_health)
         health = validate_mineru_api_health(
             decoded,
             expected_task_slots=expected_task_slots,
@@ -237,6 +304,7 @@ def wait_for_mineru_orchestrator_idle(
     expected_task_slots: int | None = MINERU_API_DEFAULT_TASK_SLOTS,
     expected_task_retention_seconds: int | None = MINERU_API_TASK_RETENTION_SECONDS,
     expected_cleanup_interval_seconds: int | None = MINERU_API_CLEANUP_INTERVAL_SECONDS,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> tuple[MinerUOrchestratorHealth, float]:
     """Wait for natural drain; this is deliberately not called cancellation."""
 
@@ -262,6 +330,7 @@ def wait_for_mineru_orchestrator_idle(
                     expected_cleanup_interval_seconds=(
                         expected_cleanup_interval_seconds
                     ),
+                    **({"expected_capacity": expected_capacity} if expected_capacity is not None else {}),
                 )
             except MinerUOrchestratorUnavailableError as exc:
                 remaining = deadline - time.monotonic()
@@ -293,6 +362,7 @@ __all__ = [
     "MINERU_API_VERSION",
     "MinerUOrchestratorError",
     "MinerUOrchestratorHealth",
+    "MinerUCapacityOrchestratorHealth",
     "MinerUOrchestratorHealthClient",
     "MinerUOrchestratorIncidentState",
     "MinerUOrchestratorUnavailableError",

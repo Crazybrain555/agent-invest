@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from disclosure_anchor.adapters.runtime.mineru_diagnostic import run_diagnostic_pdf
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import load_mineru_capacity_config
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     run_mineru_multimodal_canary,
@@ -149,6 +151,8 @@ def _smoke_orchestrator_evidence(
     before: MinerUOrchestratorHealth,
     after: MinerUOrchestratorHealth,
 ) -> dict[str, object]:
+    before.require_accepting()
+    after.require_accepting()
     if before.active_tasks != 0:
         raise ValueError("MinerU API must be idle before smoke")
     if after.active_tasks != 0:
@@ -169,6 +173,7 @@ def _runtime_manifest(
     local_client_identity: MinerUClientIdentity,
     local_processing_window_size: int,
     local_writer_code_digest: str,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     payload = strict_json_loads(path.read_bytes())
     verified = verify_runtime_manifest_payload(
@@ -177,6 +182,7 @@ def _runtime_manifest(
         local_client_identity=local_client_identity,
         local_processing_window_size=local_processing_window_size,
         local_writer_code_digest=local_writer_code_digest,
+        **({"expected_capacity": expected_capacity} if expected_capacity is not None else {}),
     )
     return (
         verified.manifest,
@@ -373,7 +379,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work-root", type=Path)
     parser.add_argument("--canary-attempts", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--capacity-config", type=Path)
+    parser.add_argument("--capacity-config-sha256")
     args = parser.parse_args(argv)
+    if (args.capacity_config is None) != (args.capacity_config_sha256 is None):
+        parser.error("--capacity-config and --capacity-config-sha256 must be supplied together")
+    expected_capacity = None
+    if args.capacity_config is not None:
+        try:
+            expected_capacity = load_mineru_capacity_config(
+                args.capacity_config, expected_sha256=args.capacity_config_sha256,
+                expected_owner_uid=os.getuid(),
+            ).config
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"[abort] invalid explicit capacity: {exc}") from exc
+    processing_window = (
+        MINERU_PROCESSING_WINDOW_SIZE if expected_capacity is None else expected_capacity.processing_window_size
+    )
+    capacity_kwargs: dict[str, Any] = {"expected_capacity": expected_capacity} if expected_capacity is not None else {}
 
     mineru_bin = args.mineru_bin or (
         Path(value) if (value := os.environ.get("DISCLOSURE_MINERU_BIN")) else None
@@ -425,10 +448,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("[abort] smoke input SHA-256 does not match the frozen value")
 
     processing_window_raw = os.environ.get("MINERU_PROCESSING_WINDOW_SIZE")
-    if processing_window_raw != str(MINERU_PROCESSING_WINDOW_SIZE):
+    if processing_window_raw != str(processing_window):
         raise SystemExit(
             "[abort] MINERU_PROCESSING_WINDOW_SIZE must be pinned to "
-            f"{MINERU_PROCESSING_WINDOW_SIZE}"
+            f"{processing_window}"
         )
     try:
         before_processes = process_snapshot()
@@ -457,8 +480,9 @@ def main(argv: list[str] | None = None) -> int:
             args.runtime_manifest,
             configured_identity=runtime_identity,
             local_client_identity=local_client_identity,
-            local_processing_window_size=MINERU_PROCESSING_WINDOW_SIZE,
+            local_processing_window_size=processing_window,
             local_writer_code_digest=code_digest,
+            **({"expected_capacity": expected_capacity} if expected_capacity is not None else {}),
         )
         canary = run_mineru_multimodal_canary(
             observability_url,
@@ -474,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
 
     api_before = fetch_mineru_orchestrator_health(
         api_url,
-        expected_task_slots=int(
+        expected_task_slots=None if expected_capacity is not None else int(
             runtime_manifest["orchestrator"]["max_concurrent_requests"]
         ),
         expected_task_retention_seconds=int(
@@ -483,7 +507,9 @@ def main(argv: list[str] | None = None) -> int:
         expected_cleanup_interval_seconds=int(
             runtime_manifest["orchestrator"]["task_cleanup_interval_seconds"]
         ),
+        **capacity_kwargs,
     )
+    api_before.require_accepting()
     if api_before.active_tasks != 0:
         raise SystemExit("[abort] MinerU API must be idle before smoke")
 
@@ -539,9 +565,10 @@ def main(argv: list[str] | None = None) -> int:
 
     api_after = fetch_mineru_orchestrator_health(
         api_url,
-        expected_task_slots=api_before.max_concurrent_requests,
+        expected_task_slots=None if expected_capacity is not None else api_before.max_concurrent_requests,
         expected_task_retention_seconds=api_before.task_retention_seconds,
         expected_cleanup_interval_seconds=api_before.task_cleanup_interval_seconds,
+        **capacity_kwargs,
     )
     try:
         orchestrator_evidence = _smoke_orchestrator_evidence(api_before, api_after)
@@ -576,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
             "local_content_package_versions": dict(
                 local_client_identity.content_package_versions
             ),
-            "local_processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
+            "local_processing_window_size": processing_window,
             "local_writer_code_sha256": code_digest,
             "runtime_manifest_identity_sha256": runtime_identity,
             "orchestrator_runtime_identity_sha256": orchestrator_identity,

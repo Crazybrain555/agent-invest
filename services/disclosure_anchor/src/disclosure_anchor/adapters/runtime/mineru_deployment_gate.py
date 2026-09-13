@@ -45,6 +45,7 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
 from disclosure_anchor.application.contracts.mineru_process_profile import (
     MineruProcessProfile,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
     MinerUOrchestratorUnavailableError,
@@ -100,6 +101,11 @@ class VerifiedMinerUDeployment:
     task_retention_seconds: int
     task_cleanup_interval_seconds: int
     task_slots: int
+    expected_capacity: MineruCapacityConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.expected_capacity is not None and self.task_slots != self.expected_capacity.parse_active_limit:
+            raise MinerUDeploymentGateError("deployment task slots differ from explicit capacity")
 
     def assert_fresh(self, *, now: datetime | None = None) -> None:
         current = (now or datetime.now(UTC)).astimezone(UTC)
@@ -123,13 +129,18 @@ class VerifiedMinerUDeployment:
             ) from exc
 
     def probe_orchestrator(self, *, require_idle: bool) -> None:
+        capacity_kwargs: dict[str, Any] = (
+            {"expected_capacity": self.expected_capacity} if self.expected_capacity is not None else {}
+        )
         try:
             health = fetch_mineru_orchestrator_health(
                 self.api_url,
-                expected_task_slots=self.task_slots,
+                expected_task_slots=None if self.expected_capacity is not None else self.task_slots,
                 expected_task_retention_seconds=self.task_retention_seconds,
                 expected_cleanup_interval_seconds=self.task_cleanup_interval_seconds,
+                **capacity_kwargs,
             )
+            health.require_accepting()
         except MinerUOrchestratorUnavailableError as exc:
             raise MinerUDeploymentUnavailableError(
                 f"MinerU API live health probe unavailable: {exc}"
@@ -1004,7 +1015,10 @@ def _verify_smoke_orchestrator(
     task_retention_seconds: int,
     cleanup_interval_seconds: int,
     task_slots: int,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> None:
+    if expected_capacity is not None and task_slots != expected_capacity.parse_active_limit:
+        raise MinerUDeploymentGateError("smoke task slots differ from explicit capacity")
     required_fields = {
         "task_registry_semantics",
         "before",
@@ -1022,19 +1036,23 @@ def _verify_smoke_orchestrator(
         health_samples = tuple(
             parse_mineru_orchestrator_health_payload(
                 sample,
-                expected_task_slots=task_slots,
+                expected_task_slots=None if expected_capacity is not None else task_slots,
                 expected_task_retention_seconds=task_retention_seconds,
                 expected_cleanup_interval_seconds=cleanup_interval_seconds,
+                **({"expected_capacity": expected_capacity} if expected_capacity is not None else {}),
             )
             for sample in (before, after)
         )
+        for sample in health_samples:
+            sample.require_accepting()
     except MinerUOrchestratorError as exc:
         raise MinerUDeploymentGateError(
             f"MinerU smoke API health drifted: {exc}"
         ) from exc
+    pending_limit = task_slots if expected_capacity is None else expected_capacity.total_nonterminal_limit
     if any(
-        sample.max_pending_tasks_requested != task_slots
-        or sample.max_pending_tasks_effective != task_slots
+        sample.max_pending_tasks_requested != pending_limit
+        or sample.max_pending_tasks_effective != pending_limit
         for sample in health_samples
     ):
         raise MinerUDeploymentGateError("MinerU smoke API pending capacity drifted")

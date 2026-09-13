@@ -8,11 +8,13 @@ param(
     [string]$TraceUntilUtc = "",
     [ValidateSet("serial")][string]$ExpectedExecutionMode = "serial",
     [string]$ExpectedProfileSha256 = "",
+    [ValidatePattern('^(|sha256:[a-f0-9]{64})$')][string]$ExpectedCapacityConfigSha256 = "",
     [ValidateRange(1, 200000)][int]$MaxTraceLines = 100000,
     [ValidateRange(1024, 268435456)][int]$MaxTraceBytes = 67108864
 )
 
 $ErrorActionPreference = "Stop"
+$ExplicitCapacity = -not [string]::IsNullOrEmpty($ExpectedCapacityConfigSha256)
 $ProgressPreference = "SilentlyContinue"
 $DockerCommand = (
     Get-Command docker.exe -CommandType Application -ErrorAction Stop |
@@ -594,6 +596,25 @@ $apiAllowedEnvironment = @(
     "MINERU_MODEL_SOURCE", "MINERU_PHASE_TRACE", "MINERU_PROCESSING_WINDOW_SIZE"
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
+if ($ExplicitCapacity) {
+    $apiAllowedEnvironment += @(
+        "MINERU_API_FINALIZER_SLOTS", "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
+        "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES"
+    )
+    $anchorExpected = @{
+        MINERU_CAPACITY_CONFIG_PATH = "/usr/local/etc/mineru/capacity.json"
+        MINERU_CAPACITY_CONFIG_SHA256 = $ExpectedCapacityConfigSha256
+    }
+    $imageEnv = Convert-EnvironmentToMap -Values $apiImageEnvironment
+    $actualEnv = Convert-EnvironmentToMap -Values @($api.Config.Env)
+    foreach ($name in $anchorExpected.Keys) {
+        if ($null -ne $configObject.services."mineru-api".environment.PSObject.Properties[$name] -or
+            [string]$imageEnv[$name] -cne [string]$anchorExpected[$name] -or
+            [string]$actualEnv[$name] -cne [string]$anchorExpected[$name]) {
+            throw "explicit capacity image anchor drifted or compose overrides it: $name"
+        }
+    }
+}
 $apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
     -ImageValues $apiImageEnvironment `
     -ResolvedValues $configObject.services."mineru-api".environment -AllowedNames $apiAllowedEnvironment
@@ -609,6 +630,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -638,14 +660,49 @@ with opener.open("http://127.0.0.1:8000/health", timeout=10) as response:
     health_bytes = response.read(65537)
 if len(health_bytes) > 65536:
     raise RuntimeError("serving API health exceeds bounded envelope")
-serving_health = json.loads(health_bytes)
+expected_capacity_sha = sys.argv[1] if len(sys.argv) == 2 else None
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate health JSON field")
+        result[key] = value
+    return result
+def reject_constant(value):
+    raise ValueError("non-finite health JSON value")
+if expected_capacity_sha is None:
+    serving_health = json.loads(health_bytes)
+    capacity = None
+else:
+    from mineru.cli.agent_capacity_bootstrap import get_process_capacity
+    from mineru.cli.agent_capacity_file import read_mineru_capacity_file
+    capacity = get_process_capacity()
+    if capacity is None or capacity.sha256 != expected_capacity_sha:
+        raise RuntimeError("capacity file and caller anchor drifted")
+    capacity_raw = read_mineru_capacity_file(
+        Path("/usr/local/etc/mineru/capacity.json"),
+        expected_sha256=expected_capacity_sha, expected_owner_uid=0,
+    )
+    if capacity_raw != capacity.exact_bytes:
+        raise RuntimeError("capacity file changed during collection")
+    serving_health = json.loads(health_bytes, object_pairs_hook=unique_object,
+                               parse_constant=reject_constant)
 runtime = serving_health["task_protocol_runtime"]
+runtime_fields = {"schema", "enabled", "task_registry_max_records",
+                  "task_result_reservation_bytes", "max_unacked_result_bytes",
+                  "registry_schema", "admission_scope"}
+if capacity is not None:
+    runtime_fields.add("capacity_config_sha256")
+    if (runtime.get("capacity_config_sha256") != capacity.sha256
+            or serving_health.get("capacity_observation", {}).get("capacity_config_sha256") != capacity.sha256
+            or runtime.get("task_result_reservation_bytes") != capacity.result_reservation_bytes
+            or runtime.get("max_unacked_result_bytes") != capacity.max_unacked_result_bytes):
+        raise RuntimeError("serving capacity config identity drifted")
 if (
     serving_health.get("task_protocol_schema") != "mineru-task-protocol.v2"
-    or set(runtime) != {"schema", "enabled", "task_registry_max_records",
-                        "task_result_reservation_bytes", "max_unacked_result_bytes",
-                        "registry_schema", "admission_scope"}
-    or runtime["schema"] != "mineru-task-runtime.v2" or runtime["enabled"] is not True
+    or set(runtime) != runtime_fields
+    or runtime["schema"] != ("mineru-task-runtime.v2" if capacity is None else "mineru-task-runtime.v3")
+    or runtime["enabled"] is not True
     or runtime["registry_schema"] != "mineru-task-registry.v3"
     or runtime["admission_scope"] != "post_form_owned_upload"
     or any(type(runtime[name]) is not int or runtime[name] < 1 for name in (
@@ -664,7 +721,7 @@ marker = json.loads(
     Path("/opt/agent-invest/mineru-serial-v1/compatibility.json")
     .read_text(encoding="utf-8")
 )
-print(json.dumps({
+probe = {
     "marker": marker,
     "task_protocol_v2_actual_sha256": "sha256:" + hashlib.sha256(protocol_source.read_bytes()).hexdigest(),
     "actual_source_sha256": {
@@ -672,9 +729,6 @@ print(json.dumps({
         for path in paths
     },
     "heap_trim_enabled": is_heap_trim_enabled(),
-    "capacity_runtime": serial_runtime_status(
-        int(os.environ["MINERU_PROCESSING_WINDOW_SIZE"])
-    ),
     "phase_trace_enabled": is_phase_trace_enabled(),
     "hybrid_batch_ratio_requested": int(os.environ["MINERU_HYBRID_BATCH_RATIO"]),
     "max_pending_tasks_requested": int(os.environ["MINERU_API_MAX_PENDING_TASKS"]),
@@ -686,11 +740,29 @@ print(json.dumps({
     "max_unacked_result_bytes": runtime["max_unacked_result_bytes"],
     "mineru_version": importlib.metadata.version("mineru"),
     "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),
-}, sort_keys=True, separators=(",", ":")))
+}
+if capacity is None:
+    probe["capacity_runtime"] = serial_runtime_status(int(os.environ["MINERU_PROCESSING_WINDOW_SIZE"]))
+else:
+    source_paths = tuple("mineru/cli/agent_capacity_" + name + ".py"
+                         for name in ("config", "file", "bootstrap", "observation"))
+    def source_sha(path):
+        with (root / path).open("rb") as source:
+            raw = source.read(1048577)
+        if len(raw) > 1048576:
+            raise RuntimeError("capacity source exceeds bounded envelope")
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+    probe["capacity_sources_actual_sha256"] = {path: source_sha(path) for path in source_paths}
+    probe["capacity_config_file"] = {"path": "/usr/local/etc/mineru/capacity.json",
+                                     "sha256": capacity.sha256, "byte_count": len(capacity_raw)}
+    probe["serving_health"] = serving_health
+print(json.dumps(probe, sort_keys=True, separators=(",", ":"), allow_nan=False))
 '@
-$compatProbeResult = Invoke-DockerProcess -Arguments @(
+$compatProbeArguments = @(
     "exec", "-i", "mineru-api", "/usr/bin/python3.12", "-I", "-"
-) -StandardInput $compatProbeCode
+)
+if ($ExplicitCapacity) { $compatProbeArguments += $ExpectedCapacityConfigSha256 }
+$compatProbeResult = Invoke-DockerProcess -Arguments $compatProbeArguments -StandardInput $compatProbeCode
 $compatProbeOutput = @(
     ConvertFrom-NativeProcessText -Value $compatProbeResult.StandardOutput
 )
@@ -713,6 +785,11 @@ $compatLabelNames = @(
     "io.agent-invest.mineru.task-protocol-v2-sha256"
 )
 $compatLabels = [ordered]@{}
+if ($ExplicitCapacity) {
+    $compatLabelNames += @(
+        "io.agent-invest.mineru.capacity-config-sha256", "io.agent-invest.mineru.capacity-sources-sha256"
+    )
+}
 foreach ($name in $compatLabelNames) {
     $value = $apiImageInspect[0].Config.Labels.$name
     if ([string]::IsNullOrWhiteSpace([string]$value)) {
@@ -722,6 +799,14 @@ foreach ($name in $compatLabelNames) {
 }
 
 $health = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
+if ($ExplicitCapacity) {
+    if ([string]$health.capacity_observation.capacity_config_sha256 -cne $ExpectedCapacityConfigSha256 -or
+        [string]$health.task_protocol_runtime.capacity_config_sha256 -cne $ExpectedCapacityConfigSha256) {
+        throw "proxy health static capacity identity drifted"
+    }
+    # All volatile compatibility projections refer to this one original serving sample.
+    $health = $compatProbe.serving_health
+}
 $models = Invoke-RestMethod -Uri "http://127.0.0.1:30001/v1/models" -TimeoutSec 30
 if ($models.data.Count -ne 1) { throw "vLLM model list is not singular" }
 $modelId = [string]$models.data[0].id
@@ -877,4 +962,10 @@ $result = [ordered]@{
     }
 }
 
+if ($ExplicitCapacity) {
+    $result.schema = "mineru-windows-runtime-observation.v6"
+    $result.api_compatibility.Remove("capacity_runtime")
+    $result.api_compatibility["capacity_sources_actual_sha256"] = $compatProbe.capacity_sources_actual_sha256
+    $result.api_compatibility["capacity_config_file"] = $compatProbe.capacity_config_file
+}
 $result | ConvertTo-Json -Depth 100 -Compress

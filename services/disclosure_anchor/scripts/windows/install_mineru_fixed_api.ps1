@@ -14,7 +14,9 @@ param(
     [switch]$ApiOnlyCompatibilityUpgrade,
     [string]$CampaignApiCompatImageId = "",
     [ValidateSet(1)][int]$ExpectedApiTaskSlots = 1,
-    [ValidateSet(1)][int]$ExpectedApiMaxPendingTasks = 1
+    [ValidateSet(1)][int]$ExpectedApiMaxPendingTasks = 1,
+    [string]$CapacityConfigSource = "",
+    [ValidatePattern('\A(|sha256:[a-f0-9]{64})\z')][string]$ExpectedCapacityConfigSha256 = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +24,15 @@ if ($ReuseCurrentPublishedImage -and $ApiOnlyCompatibilityUpgrade) {
     throw "API compatibility upgrade and published-image reuse are mutually exclusive"
 }
 $ApiOnlyOperation = $ReuseCurrentPublishedImage -or $ApiOnlyCompatibilityUpgrade
+$ExplicitCapacity = -not [string]::IsNullOrEmpty($CapacityConfigSource)
+if ($ExplicitCapacity -ne (-not [string]::IsNullOrEmpty($ExpectedCapacityConfigSha256))) {
+    throw "capacity config source and expected SHA must be supplied together"
+}
+if ($ExplicitCapacity -and ($PSBoundParameters.ContainsKey("ExpectedApiTaskSlots") -or
+        $PSBoundParameters.ContainsKey("ExpectedApiMaxPendingTasks"))) {
+    throw "explicit capacity cannot also select legacy task or pending limits"
+}
+$CapacityInputs = $null
 $ProgressPreference = "SilentlyContinue"
 if ($ExpectedApiTaskSlots -ne 1 -or $ExpectedApiMaxPendingTasks -ne 1) {
     throw "serial MinerU requires task slots and pending depth to both equal 1"
@@ -199,7 +210,7 @@ $ProjectName = "mineru-tailnet"
 $ApiCompatImage = "agent-invest/mineru-api:3.4.4-serial-v1"
 $ApiCompatBuildTag = "agent-invest/mineru-api:build-$([Guid]::NewGuid().ToString('N'))"
 $HeapReturnPolicy = "glibc-malloc-trim-per-window.v1"
-$CapacityPolicy = "single-owner-serial-mineru.v1"
+$CapacityPolicy = if ($ExplicitCapacity) { "single-process-explicit-capacity.v1" } else { "single-owner-serial-mineru.v1" }
 $RequiredComposeTarget = "C:\ProgramData\compose.tailnet.yaml"
 $RequiredCollectorTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1"
 $RequiredReceiptTarget = "C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json"
@@ -327,11 +338,150 @@ function Assert-StableServiceEpochs {
     }
 }
 
+function Get-CanonicalObjectJson {
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $parts = @($Value.Keys | Sort-Object | ForEach-Object {
+            ($_ | ConvertTo-Json -Compress) + ":" + (Get-CanonicalObjectJson $Value[$_])
+        })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $parts = @($Value | ForEach-Object { Get-CanonicalObjectJson $_ })
+        return "[" + ($parts -join ",") + "]"
+    }
+    if ($Value.GetType().FullName -ceq "System.Management.Automation.PSCustomObject") {
+        $parts = @($Value.PSObject.Properties.Name | Sort-Object | ForEach-Object {
+            ($_ | ConvertTo-Json -Compress) + ":" + (Get-CanonicalObjectJson $Value.$_)
+        })
+        return "{" + ($parts -join ",") + "}"
+    }
+    return ($Value | ConvertTo-Json -Compress)
+}
+
+function Get-ExplicitCapacityInputs {
+    if (-not $ExplicitCapacity) { return $null }
+    $context = Split-Path -Parent ([IO.Path]::GetFullPath($CompatDockerfileSource))
+    $path = [IO.Path]::GetFullPath($CapacityConfigSource)
+    if ($path -ine (Join-Path $context "capacity-config.json")) {
+        throw "capacity config must be the explicit build context capacity-config.json"
+    }
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -eq 0 -or $stream.Length -gt 65536) { throw "capacity config byte bound exceeded" }
+        $buffer = New-Object byte[] 65537
+        $count = 0
+        do {
+            $read = $stream.Read($buffer, $count, $buffer.Length - $count)
+            $count += $read
+        } while ($read -gt 0 -and $count -lt $buffer.Length)
+        if ($count -eq 0 -or $count -gt 65536 -or $count -ne $stream.Length) { throw "capacity config changed or exceeds bound" }
+        $raw = New-Object byte[] $count
+        [Array]::Copy($buffer, $raw, $count)
+    } finally { $stream.Dispose() }
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    $text = $utf8.GetString($raw)
+    if ((Get-Sha256Text $text) -cne $ExpectedCapacityConfigSha256) { throw "capacity config SHA differs" }
+    $config = $text | ConvertFrom-Json
+    $limits = @{
+        parse_active_limit=128; total_nonterminal_limit=128; finalizer_active_limit=128;
+        final_http_limit_per_loop=128; api_process_limit=1; api_event_loop_limit=1;
+        processing_window_size=1024; omp_num_threads=256; mkl_num_threads=256;
+        openblas_num_threads=256; pdf_render_processes_requested=256;
+        result_reservation_bytes=[long]::MaxValue; max_unacked_result_bytes=[long]::MaxValue
+    }
+    $names = @($limits.Keys) + @("contract_version", "hybrid_batch_ratio_requested", "pipeline_inference_locks")
+    if ((@($config.PSObject.Properties.Name | Sort-Object) -join ",") -cne
+            (@($names | Sort-Object) -join ",") -or
+        $config.contract_version -isnot [string] -or $config.contract_version -cne "mineru.capacity-config.v1" -or
+        $config.pipeline_inference_locks -isnot [bool] -or -not $config.pipeline_inference_locks -or
+        ($config.hybrid_batch_ratio_requested -isnot [int] -and $config.hybrid_batch_ratio_requested -isnot [long]) -or
+        $config.hybrid_batch_ratio_requested -notin @(1,2,4,8)) { throw "capacity config fields or policy differ" }
+    foreach ($name in $limits.Keys) {
+        $value = $config.$name
+        if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt 1 -or $value -gt $limits[$name]) {
+            throw "capacity config integer outside supported envelope: $name"
+        }
+    }
+    if ($config.parse_active_limit -gt $config.total_nonterminal_limit -or
+        $config.finalizer_active_limit -gt $config.total_nonterminal_limit -or
+        $config.result_reservation_bytes -gt $config.max_unacked_result_bytes -or
+        (Get-CanonicalObjectJson $config) -cne $text) { throw "capacity config is not canonical or internally consistent" }
+    $mapping = @{
+        MINERU_API_MAX_CONCURRENT_REQUESTS="parse_active_limit"; MINERU_API_MAX_PENDING_TASKS="total_nonterminal_limit";
+        MINERU_API_FINALIZER_SLOTS="finalizer_active_limit"; MINERU_PROCESSING_WINDOW_SIZE="processing_window_size";
+        OMP_NUM_THREADS="omp_num_threads"; MKL_NUM_THREADS="mkl_num_threads"; OPENBLAS_NUM_THREADS="openblas_num_threads";
+        MINERU_PDF_RENDER_THREADS="pdf_render_processes_requested"; MINERU_HYBRID_BATCH_RATIO="hybrid_batch_ratio_requested";
+        MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES="result_reservation_bytes";
+        MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES="max_unacked_result_bytes"
+    }
+    $environment = [ordered]@{}
+    foreach ($name in ($mapping.Keys | Sort-Object)) { $environment[$name] = [string]$config.($mapping[$name]) }
+    $environment["MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS"] = "1"
+    $sources = [ordered]@{}
+    foreach ($name in @("bootstrap", "config", "file", "observation")) {
+        $source = Join-Path $context "agent_capacity_$name.py"
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "capacity source missing: $source" }
+        $sources["mineru/cli/agent_capacity_$name.py"] = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant())"
+    }
+    return [ordered]@{
+        config=$config; config_sha256=$ExpectedCapacityConfigSha256; config_bytes=$raw;
+        source_sha256=$sources; sources_sha256=(Get-Sha256Text (Get-CanonicalObjectJson $sources));
+        environment=$environment; build_target="explicit-capacity"; context=$context
+    }
+}
+
+function Get-ResolvedCompose {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $raw = Invoke-Docker -Arguments @("compose", "--project-name", $ProjectName, "--file", $Path, "config", "--format", "json")
+    return (($raw -join "`n") | ConvertFrom-Json)
+}
+
+function Assert-CapacityCompose {
+    param([Parameter(Mandatory=$true)][object]$Compose)
+    $api = $Compose.services."mineru-api"
+    foreach ($name in $CapacityInputs.environment.Keys) {
+        if ([string]$api.environment.$name -cne $CapacityInputs.environment[$name]) {
+            throw "compose capacity projection differs: $name"
+        }
+    }
+    foreach ($name in @("MINERU_CAPACITY_CONFIG_PATH", "MINERU_CAPACITY_CONFIG_SHA256")) {
+        if ($null -ne $api.environment.PSObject.Properties[$name]) { throw "compose overrides baked capacity anchor" }
+    }
+    $expected = @("--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client", "--max-concurrency",
+        [string]$CapacityInputs.config.final_http_limit_per_loop)
+    if ((Get-CanonicalObjectJson @($api.command)) -cne (Get-CanonicalObjectJson $expected)) {
+        throw "compose API command differs from configured shared HTTP limit"
+    }
+}
+
 function Assert-ApiOnlyUpgradeInputs {
     if (-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
         throw "API-only compatibility upgrade requires a complete existing deployment"
     }
-    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeSource).Hash -ne
+    if ($ExplicitCapacity) {
+        $next = Get-ResolvedCompose $ComposeSource
+        $previous = Get-ResolvedCompose $ComposeTarget
+        Assert-CapacityCompose $next
+        # Only the selected API capacity fields may differ. Inference/proxy,
+        # networks, mounts, image name and every other setting remain exact.
+        foreach ($item in @($next, $previous)) {
+            foreach ($name in $CapacityInputs.environment.Keys) {
+                $item.services."mineru-api".environment.PSObject.Properties.Remove($name)
+            }
+            $command = @($item.services."mineru-api".command)
+            if ($command.Count -ne 7 -or ($command[0..5] -join ",") -cne
+                    "--host,0.0.0.0,--port,8000,--allow-public-http-client,--max-concurrency") {
+                throw "API-only capacity upgrade requires the original command shape"
+            }
+            $item.services."mineru-api".command = @($command[0..5]) + @("capacity-value")
+        }
+        if ((Get-CanonicalObjectJson $next) -cne (Get-CanonicalObjectJson $previous)) {
+            throw "API-only capacity upgrade changed configuration outside API capacity fields"
+        }
+    }
+    elseif ((Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeSource).Hash -ne
             (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash) {
         throw "API-only compatibility upgrade requires unchanged compose bytes"
     }
@@ -406,11 +556,191 @@ function Assert-RequiredProperties {
     }
 }
 
+function Assert-ClosedProperties {
+    param([object]$Value, [string[]]$Names, [string]$Label)
+    if ($null -eq $Value -or $Value.GetType().FullName -cne "System.Management.Automation.PSCustomObject" -or (@($Value.PSObject.Properties.Name | Sort-Object) -join ",") -cne
+            (@($Names | Sort-Object) -join ",")) { throw "$Label fields are not closed" }
+}
+
+function Assert-CapacityIdleHealth {
+    param([object]$Health, [AllowNull()][object]$ExpectedCapacity, [string]$Label)
+    Assert-ClosedProperties $Health @("status", "version", "protocol_version", "max_concurrent_requests",
+        "max_pending_tasks_requested", "max_pending_tasks_effective", "processing_window_size",
+        "task_retention_seconds", "task_cleanup_interval_seconds", "task_protocol_schema", "queued_tasks",
+        "processing_tasks", "completed_tasks", "failed_tasks", "task_protocol_runtime", "task_admission",
+        "capacity_observation") $Label
+    foreach ($name in @("protocol_version", "max_concurrent_requests", "max_pending_tasks_requested",
+        "max_pending_tasks_effective", "processing_window_size", "task_retention_seconds",
+        "task_cleanup_interval_seconds", "queued_tasks", "processing_tasks", "completed_tasks", "failed_tasks")) {
+        if (($Health.$name -isnot [int] -and $Health.$name -isnot [long]) -or $Health.$name -lt 0) {
+            throw "$Label noninteger health counter: $name"
+        }
+    }
+    if ($Health.status -isnot [string] -or $Health.version -isnot [string] -or
+        $Health.task_protocol_schema -isnot [string] -or
+        $Health.status -cne "healthy" -or $Health.version -cne "3.4.4" -or $Health.protocol_version -ne 2 -or
+        $Health.task_protocol_schema -cne "mineru-task-protocol.v2" -or $Health.queued_tasks -ne 0 -or
+        $Health.processing_tasks -ne 0 -or $Health.task_retention_seconds -ne 600 -or
+        $Health.task_cleanup_interval_seconds -ne 30) { throw "$Label capacity API is not healthy and idle" }
+    $runtime = $Health.task_protocol_runtime
+    Assert-ClosedProperties $runtime @("schema", "enabled", "task_registry_max_records", "task_result_reservation_bytes",
+        "max_unacked_result_bytes", "registry_schema", "admission_scope", "capacity_config_sha256") "$Label runtime"
+    if ($runtime.schema -isnot [string] -or $runtime.registry_schema -isnot [string] -or
+        $runtime.admission_scope -isnot [string] -or $runtime.capacity_config_sha256 -isnot [string] -or
+        $runtime.schema -cne "mineru-task-runtime.v3" -or $runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
+        $runtime.registry_schema -cne "mineru-task-registry.v3" -or $runtime.admission_scope -cne "post_form_owned_upload" -or
+        $runtime.capacity_config_sha256 -cnotmatch '\Asha256:[a-f0-9]{64}\z') { throw "$Label runtime identity differs" }
+    foreach ($name in @("task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes")) {
+        if (($runtime.$name -isnot [int] -and $runtime.$name -isnot [long]) -or $runtime.$name -lt 1) {
+            throw "$Label runtime limit is invalid: $name"
+        }
+    }
+    if ($runtime.task_registry_max_records -ne 128 -or $runtime.task_result_reservation_bytes -gt $runtime.max_unacked_result_bytes) {
+        throw "$Label runtime capacity is inconsistent"
+    }
+    $observation = $Health.capacity_observation
+    Assert-ClosedProperties $observation @("schema", "capacity_config_sha256", "owner", "resolved_limits",
+        "http_limiter_state", "stage_counters", "http_counters", "owner_control", "framework_limits", "observed_at") "$Label observation"
+    if ($observation.schema -isnot [string] -or $observation.capacity_config_sha256 -isnot [string] -or
+        $observation.http_limiter_state -isnot [string] -or
+        $observation.schema -cne "mineru.capacity-observation.v1" -or
+        $observation.capacity_config_sha256 -cne $runtime.capacity_config_sha256) { throw "$Label config identity differs" }
+    $limits = $observation.resolved_limits
+    Assert-ClosedProperties $limits @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit",
+        "result_reservation_bytes", "max_unacked_result_bytes", "final_http_limit_per_loop") "$Label resolved limits"
+    foreach ($name in @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit", "result_reservation_bytes", "max_unacked_result_bytes")) {
+        if (($limits.$name -isnot [int] -and $limits.$name -isnot [long]) -or $limits.$name -lt 1) {
+            throw "$Label resolved limit is invalid: $name"
+        }
+        if ($null -ne $ExpectedCapacity -and $limits.$name -ne $ExpectedCapacity.$name) {
+            throw "$Label resolved limit differs from external config: $name"
+        }
+    }
+    if ($limits.parse_active_limit -ne $Health.max_concurrent_requests -or
+        $limits.total_nonterminal_limit -ne $Health.max_pending_tasks_requested -or
+        $limits.total_nonterminal_limit -ne $Health.max_pending_tasks_effective -or
+        $limits.total_nonterminal_limit -gt 128 -or $limits.parse_active_limit -gt $limits.total_nonterminal_limit -or
+        $limits.finalizer_active_limit -gt $limits.total_nonterminal_limit -or
+        $limits.result_reservation_bytes -ne $runtime.task_result_reservation_bytes -or
+        $limits.max_unacked_result_bytes -ne $runtime.max_unacked_result_bytes) { throw "$Label resolved owners disagree" }
+    if ($null -ne $ExpectedCapacity -and
+        ((Get-Sha256Text (Get-CanonicalObjectJson $ExpectedCapacity)) -cne $runtime.capacity_config_sha256 -or
+        $Health.processing_window_size -ne $ExpectedCapacity.processing_window_size)) { throw "$Label expected config differs" }
+    if ($observation.http_limiter_state -ceq "not_initialized") {
+        if ($null -ne $limits.final_http_limit_per_loop) { throw "$Label lazy HTTP limiter fabricated capacity" }
+    } elseif ($observation.http_limiter_state -ceq "initialized") {
+        if (($limits.final_http_limit_per_loop -isnot [int] -and $limits.final_http_limit_per_loop -isnot [long]) -or
+            $limits.final_http_limit_per_loop -lt 1 -or $limits.final_http_limit_per_loop -gt 128 -or
+            ($null -ne $ExpectedCapacity -and $limits.final_http_limit_per_loop -ne $ExpectedCapacity.final_http_limit_per_loop)) {
+            throw "$Label shared HTTP limit differs"
+        }
+    } else { throw "$Label unknown HTTP limiter state" }
+    Assert-ClosedProperties $observation.owner_control @("foreign_loop_observed", "soft_drain_requested", "soft_drain_applied", "trigger") "$Label owner control"
+    foreach ($name in @("foreign_loop_observed", "soft_drain_requested", "soft_drain_applied")) {
+        if ($observation.owner_control.$name -isnot [bool] -or $observation.owner_control.$name) { throw "$Label owner is draining" }
+    }
+    if ($null -ne $observation.owner_control.trigger) { throw "$Label owner trigger is active" }
+    $stages = @("result_capacity_waiting", "parse_waiting", "parse_active", "finalizer_waiting", "finalizer_active")
+    $http = @("active_requests", "pending_requests")
+    Assert-ClosedProperties $observation.stage_counters $stages "$Label stages"
+    Assert-ClosedProperties $observation.http_counters $http "$Label HTTP"
+    foreach ($pair in @(@($observation.stage_counters, $stages), @($observation.http_counters, $http))) {
+        foreach ($name in $pair[1]) {
+            if (($pair[0].$name -isnot [int] -and $pair[0].$name -isnot [long]) -or $pair[0].$name -ne 0) {
+                throw "$Label has active stage or HTTP responsibility: $name"
+            }
+        }
+    }
+    $admission = $Health.task_admission
+    $counters = @("ingress_tasks", "accepted_pending_tasks", "accepted_processing_tasks", "accepted_finalizing_tasks",
+        "durable_nonterminal_tasks", "routeless_accepted_tasks", "ingress_cleanup_tasks", "unowned_ingress_tasks",
+        "scheduled_tasks", "queue_depth", "active_processors")
+    Assert-ClosedProperties $admission (@("schema", "registry_schema", "nonterminal_limit", "recovery_overcommitted", "admission_open", "blocked_reason") + $counters) "$Label admission"
+    if ($admission.schema -isnot [string] -or $admission.registry_schema -isnot [string] -or
+        $admission.schema -cne "mineru-task-admission.v1" -or $admission.registry_schema -cne "mineru-task-registry.v3" -or
+        ($admission.nonterminal_limit -isnot [int] -and $admission.nonterminal_limit -isnot [long]) -or
+        $admission.nonterminal_limit -ne $limits.total_nonterminal_limit -or $admission.recovery_overcommitted -isnot [bool] -or
+        $admission.recovery_overcommitted -or $admission.admission_open -isnot [bool] -or -not $admission.admission_open -or
+        $null -ne $admission.blocked_reason) { throw "$Label admission is not open and idle" }
+    foreach ($name in $counters) {
+        if (($admission.$name -isnot [int] -and $admission.$name -isnot [long]) -or $admission.$name -ne 0) {
+            throw "$Label retains task responsibility: $name"
+        }
+    }
+    Assert-ClosedProperties $observation.owner @("process_id", "process_start_ticks", "boot_id", "loop_epoch") "$Label owner"
+    foreach ($name in @("process_id", "process_start_ticks")) {
+        if (($observation.owner.$name -isnot [int] -and $observation.owner.$name -isnot [long]) -or $observation.owner.$name -lt 1) {
+            throw "$Label invalid serving process identity"
+        }
+    }
+    foreach ($name in @("boot_id", "loop_epoch")) {
+        $guid = [Guid]::Empty
+        if ($observation.owner.$name -isnot [string] -or -not [Guid]::TryParseExact($observation.owner.$name, "D", [ref]$guid) -or
+            $guid.ToString("D") -cne $observation.owner.$name) { throw "$Label invalid serving epoch" }
+    }
+    Assert-ClosedProperties $observation.observed_at @("clock", "implementation", "started_ns", "completed_ns") "$Label clock"
+    $clock = $observation.observed_at
+    if ($clock.clock -isnot [string] -or $clock.clock -cne "python.monotonic_ns" -or $clock.implementation -isnot [string] -or
+        $clock.implementation.Length -lt 1 -or $clock.implementation.Length -gt 128) { throw "$Label invalid observation clock" }
+    foreach ($name in @("started_ns", "completed_ns")) {
+        if (($clock.$name -isnot [int] -and $clock.$name -isnot [long]) -or $clock.$name -lt 0) { throw "$Label invalid clock sample" }
+    }
+    if ($clock.completed_ns -lt $clock.started_ns) { throw "$Label reversed clock sample" }
+    $framework = $observation.framework_limits
+    $reasons = @{
+        torch_intraop_threads=@("serving_getter_not_loaded");
+        pdf_render_pool_max_workers=@("serving_pool_not_initialized", "serving_pool_lock_busy");
+        mkl_threads=@("no_serving_getter"); openblas_threads=@("no_serving_getter")
+    }
+    Assert-ClosedProperties $framework @($reasons.Keys) "$Label framework"
+    foreach ($name in $reasons.Keys) {
+        $item = $framework.$name
+        Assert-ClosedProperties $item @("state", "value", "reason") "$Label framework $name"
+        if ($item.state -isnot [string]) { throw "$Label framework state is not a scalar string" }
+        if ($item.state -ceq "available") {
+            if ($name -in @("mkl_threads", "openblas_threads") -or $null -ne $item.reason -or
+                ($item.value -isnot [int] -and $item.value -isnot [long]) -or $item.value -lt 1) { throw "$Label unsupported framework getter" }
+        } elseif ($item.state -ceq "unavailable") {
+            if ($null -ne $item.value -or $item.reason -isnot [string] -or $item.reason -cnotin $reasons[$name]) { throw "$Label framework unknown is not explicit" }
+        } else { throw "$Label unknown framework state" }
+    }
+}
+
+function Assert-CapacityFiles {
+    param([Parameter(Mandatory=$true)][string]$ContainerId)
+    $code = @'
+import hashlib,json,sys
+from pathlib import Path
+from mineru.cli.agent_capacity_file import read_mineru_capacity_file
+from mineru.cli.agent_capacity_config import decode_mineru_capacity_config
+raw=read_mineru_capacity_file(Path('/usr/local/etc/mineru/capacity.json'),expected_sha256=sys.argv[1],expected_owner_uid=0)
+config=decode_mineru_capacity_config(raw)
+sources={}
+for name in ('bootstrap','config','file','observation'):
+    relative='mineru/cli/agent_capacity_'+name+'.py'
+    with open('/usr/local/lib/python3.12/dist-packages/'+relative,'rb') as stream:
+        source=stream.read(1024*1024+1)
+    if len(source)>1024*1024: raise RuntimeError('capacity source exceeds byte bound')
+    sources[relative]='sha256:'+hashlib.sha256(source).hexdigest()
+print(json.dumps({'config_sha256':config.sha256,'byte_count':len(raw),'source_sha256':sources},sort_keys=True,separators=(',',':')))
+'@
+    $result = Invoke-DockerProcess -Arguments @("exec", "-i", $ContainerId, "/usr/bin/python3.12", "-I", "-", $ExpectedCapacityConfigSha256) -StandardInput $code
+    $actual = $result.StandardOutput | ConvertFrom-Json
+    Assert-ClosedProperties $actual @("config_sha256", "byte_count", "source_sha256") "installed capacity files"
+    if ($actual.config_sha256 -isnot [string] -or $actual.config_sha256 -cne $CapacityInputs.config_sha256 -or
+        ($actual.byte_count -isnot [int] -and $actual.byte_count -isnot [long]) -or
+        $actual.byte_count -ne $CapacityInputs.config_bytes.Length -or
+        (Get-CanonicalObjectJson $actual.source_sha256) -cne (Get-CanonicalObjectJson $CapacityInputs.source_sha256)) {
+        throw "installed capacity source/config bytes differ from reviewed inputs"
+    }
+}
+
 function Assert-IdleHealth {
     param(
         [Parameter(Mandatory = $true)][object]$Health,
         [Parameter(Mandatory = $true)][string]$Label,
-        [switch]$RequireAdmissionV2
+        [switch]$RequireAdmissionV2,
+        [AllowNull()][object]$ExpectedCapacity = $null
     )
     Assert-RequiredProperties -Value $Health -Names @(
         "status", "queued_tasks", "processing_tasks"
@@ -425,6 +755,12 @@ function Assert-IdleHealth {
         throw "$Label is not healthy and idle"
     }
     $runtime = $Health.task_protocol_runtime
+    $isV3 = $null -ne $runtime -and $runtime.schema -eq "mineru-task-runtime.v3"
+    if ($isV3) {
+        Assert-CapacityIdleHealth -Health $Health -ExpectedCapacity $ExpectedCapacity -Label $Label
+        return
+    }
+    if ($null -ne $ExpectedCapacity) { throw "$Label has no explicit capacity evidence" }
     $isV2 = $null -ne $runtime -and $runtime.schema -eq "mineru-task-runtime.v2"
     if ($RequireAdmissionV2 -and -not $isV2) {
         throw "$Label has no durable admission evidence"
@@ -759,10 +1095,20 @@ function Get-ValidatedRuntime {
     }
     Assert-SinglePort -Container $proxy -ContainerPort "8000/tcp" -HostPort "30003"
     Assert-SinglePort -Container $inference -ContainerPort "30000/tcp" -HostPort "30001"
+    $httpLimit = if ($ExplicitCapacity) { [string]$CapacityInputs.config.final_http_limit_per_loop } else { "7" }
     Assert-ExactCommand -Container $api -Expected @(
         "mineru-api", "--host", "0.0.0.0", "--port", "8000",
-        "--allow-public-http-client", "--max-concurrency", "7"
+        "--allow-public-http-client", "--max-concurrency", $httpLimit
     )
+    if ($ExplicitCapacity) {
+        foreach ($name in $CapacityInputs.environment.Keys) {
+            $actual = @($api.Config.Env | Where-Object { $_ -clike "$name=*" })
+            if ($actual.Count -ne 1 -or $actual[0] -cne "$name=$($CapacityInputs.environment[$name])") {
+                throw "actual API capacity environment differs: $name"
+            }
+        }
+        Assert-CapacityFiles -ContainerId ([string]$api.Id)
+    }
     Assert-ExactCommand -Container $inference -Expected @(
         "mineru-openai-server", "--host", "0.0.0.0", "--port", "30000",
         "--max-num-seqs", "128", "--mm-processor-cache-gb", "0"
@@ -831,8 +1177,9 @@ function Get-ValidatedRuntime {
         "task_cleanup_interval_seconds", "task_protocol_schema",
         "queued_tasks", "processing_tasks"
     ) -Label "new MinerU API health"
-    Assert-IdleHealth -Health $health -Label "new MinerU API health" -RequireAdmissionV2
-    if (
+    $expectedCapacity = if ($ExplicitCapacity) { $CapacityInputs.config } else { $null }
+    Assert-IdleHealth -Health $health -Label "new MinerU API health" -RequireAdmissionV2 -ExpectedCapacity $expectedCapacity
+    if (-not $ExplicitCapacity -and (
         [string]$health.version -ne "3.4.4" -or
         [int]$health.protocol_version -ne 2 -or
         [string]$health.task_protocol_schema -ne "mineru-task-protocol.v2" -or
@@ -843,7 +1190,7 @@ function Get-ValidatedRuntime {
         [int]$health.processing_window_size -ne 16 -or
         [int]$health.task_retention_seconds -ne 600 -or
         [int]$health.task_cleanup_interval_seconds -ne 30
-    ) {
+    )) {
         throw "MinerU API health contract drifted or API is not idle"
     }
     if (@($models.data).Count -ne 1) { throw "served model is not singular" }
@@ -905,14 +1252,24 @@ function Get-ApiCompatBuildIdentity {
     $patcherSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $patcher).Hash.ToLowerInvariant())"
     $dockerfileSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $dockerfile).Hash.ToLowerInvariant())"
     $taskProtocolSha256 = "sha256:$((Get-FileHash -Algorithm SHA256 -LiteralPath $taskProtocol).Hash.ToLowerInvariant())"
-    return [ordered]@{
+    $result = [ordered]@{
         dockerfile = $dockerfile
         patcher = $patcher
         context = $context
         patcher_sha256 = $patcherSha256
         dockerfile_sha256 = $dockerfileSha256
         task_protocol_v2_sha256 = $taskProtocolSha256
+        build_target = "legacy-runtime"
     }
+    if ($ExplicitCapacity) {
+        $result["capacity"] = Get-ExplicitCapacityInputs
+        $result["build_target"] = "explicit-capacity"
+        if ($null -ne $CapacityInputs -and
+            (Get-CanonicalObjectJson $result.capacity.source_sha256) -cne (Get-CanonicalObjectJson $CapacityInputs.source_sha256)) {
+            throw "capacity source bytes changed after preflight"
+        }
+    }
+    return $result
 }
 
 function Get-ValidatedApiCompatImage {
@@ -952,6 +1309,22 @@ function Get-ValidatedApiCompatImage {
     ) {
         throw "MinerU API compatibility image labels or environment drifted"
     }
+    if ($ExplicitCapacity) {
+        foreach ($item in @(
+            @("capacity-config-sha256", $BuildIdentity.capacity.config_sha256),
+            @("capacity-sources-sha256", $BuildIdentity.capacity.sources_sha256)
+        )) {
+            $name = "io.agent-invest.mineru.$($item[0])"
+            if ([string]$image.Config.Labels.$name -cne [string]$item[1]) { throw "capacity image label differs: $name" }
+        }
+        foreach ($item in @(
+            @("MINERU_CAPACITY_CONFIG_PATH", "/usr/local/etc/mineru/capacity.json"),
+            @("MINERU_CAPACITY_CONFIG_SHA256", $BuildIdentity.capacity.config_sha256)
+        )) {
+            $values = @($image.Config.Env | Where-Object { $_ -clike "$($item[0])=*" })
+            if ($values.Count -ne 1 -or $values[0] -cne "$($item[0])=$($item[1])") { throw "capacity image anchor differs" }
+        }
+    }
     return [ordered]@{
         image = $ApiCompatImage
         image_id = $RequiredImageId
@@ -965,15 +1338,24 @@ function Get-ValidatedApiCompatImage {
 
 function Build-ValidatedApiCompatImage {
     $identity = Get-ApiCompatBuildIdentity
-    Invoke-Docker -Arguments @(
-        "build", "--pull=false", "--provenance=false", "--file",
+    $arguments = @(
+        "build", "--pull=false", "--provenance=false", "--target", [string]$identity.build_target, "--file",
         [string]$identity.dockerfile,
         "--tag", $ApiCompatBuildTag,
         "--build-arg", "COMPAT_PATCHER_SHA256=$($identity.patcher_sha256)",
         "--build-arg", "COMPAT_DOCKERFILE_SHA256=$($identity.dockerfile_sha256)",
-        "--build-arg", "TASK_PROTOCOL_V2_SHA256=$($identity.task_protocol_v2_sha256)",
-        [string]$identity.context
-    ) | Out-Null
+        "--build-arg", "TASK_PROTOCOL_V2_SHA256=$($identity.task_protocol_v2_sha256)"
+    )
+    if ($ExplicitCapacity) {
+        foreach ($name in @("config", "file", "bootstrap", "observation")) {
+            $pin = $identity.capacity.source_sha256["mineru/cli/agent_capacity_$name.py"]
+            $arguments += @("--build-arg", "CAPACITY_$($name.ToUpperInvariant())_SOURCE_SHA256=$pin")
+        }
+        $arguments += @("--build-arg", "CAPACITY_SOURCES_SHA256=$($identity.capacity.sources_sha256)",
+            "--build-arg", "CAPACITY_CONFIG_SHA256=$($identity.capacity.config_sha256)")
+    }
+    $arguments += [string]$identity.context
+    Invoke-Docker -Arguments $arguments | Out-Null
     $script:CompatBuildTagCreated = $true
     $script:ExpectedApiCompatImageId = Get-OptionalImageId -Reference $ApiCompatBuildTag
     if ($ExpectedApiCompatImageId -notmatch '^sha256:[a-f0-9]{64}$') {
@@ -1178,6 +1560,8 @@ function Restore-PreviousDeployment {
 }
 
 try {
+    $CapacityInputs = Get-ExplicitCapacityInputs
+    if ($ExplicitCapacity) { Assert-CapacityCompose (Get-ResolvedCompose $ComposeSource) }
     foreach ($source in @(
         $ComposeSource, $CollectorSource, $CompatDockerfileSource,
         $CompatPatcherSource
@@ -1294,14 +1678,15 @@ try {
             throw "campaign image tag drifted during API-only deployment"
         }
     }
-    $collectorOutput = @(
-        & $CollectorTarget -ComposePath $ComposeTarget -OutputRoot $OutputRoot
-    )
+    $collectorArguments = @{ ComposePath=$ComposeTarget; OutputRoot=$OutputRoot }
+    if ($ExplicitCapacity) { $collectorArguments["ExpectedCapacityConfigSha256"] = $ExpectedCapacityConfigSha256 }
+    $collectorOutput = @(& $CollectorTarget @collectorArguments)
     if ($collectorOutput.Count -ne 1) {
         throw "formal runtime collector did not return one observation"
     }
     $collectorObservation = ([string]$collectorOutput[0]) | ConvertFrom-Json
-    if ([string]$collectorObservation.schema -ne "mineru-windows-runtime-observation.v5") {
+    $expectedCollectorSchema = if ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } else { "mineru-windows-runtime-observation.v5" }
+    if ($collectorObservation.schema -isnot [string] -or $collectorObservation.schema -cne $expectedCollectorSchema) {
         throw "formal runtime collector contract drifted"
     }
     Remove-CompatBuildTag

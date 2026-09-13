@@ -33,6 +33,8 @@ foreach ($name in $Allow) {
     if ($nodes.Count -ne 1) { throw "expected one function $name" }
     . ([ScriptBlock]::Create($nodes[0].Extent.Text))
 }
+$ExplicitCapacity = $false
+$CapacityInputs = $null
 $script:Calls = New-Object Collections.ArrayList
 $script:Results = New-Object Collections.ArrayList
 $script:Image = 'sha256:' + ('a' * 64)

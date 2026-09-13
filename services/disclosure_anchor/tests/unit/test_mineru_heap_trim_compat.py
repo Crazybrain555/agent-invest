@@ -1464,7 +1464,13 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertNotIn("versioned v4 evidence paths", installer)
         self.assertIn('schema = "mineru-windows-runtime-observation.v5"', collector)
         self.assertIn(
-            'collectorObservation.schema -ne "mineru-windows-runtime-observation.v5"',
+            '$expectedCollectorSchema = if ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } '
+            'else { "mineru-windows-runtime-observation.v5" }',
+            installer,
+        )
+        self.assertIn(
+            '$collectorObservation.schema -isnot [string] -or '
+            '$collectorObservation.schema -cne $expectedCollectorSchema',
             installer,
         )
         self.assertNotIn("mineru-windows-runtime-observation.v3", installer)

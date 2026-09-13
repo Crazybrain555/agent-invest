@@ -16,6 +16,15 @@ from typing import Any
 from disclosure_anchor.application.contracts.mineru_api_health import (
     validate_mineru_api_wire_health,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruCapacityConfig, encode_mineru_capacity_config,
+)
+from disclosure_anchor.application.contracts.mineru_capacity_health import (
+    validate_mineru_capacity_wire_health,
+)
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import (
+    load_mineru_capacity_config,
+)
 from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_API_EGRESS_POLICY,
     MINERU_API_EXPOSURE_POLICY,
@@ -36,6 +45,9 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     MINERU_WINDOWS_COMPOSE_PATH,
     STAGED_RUNTIME_MANIFEST_CONTRACT,
     CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+    EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT,
+    CAPACITY_SOURCE_PATHS,
+    validate_capacity_source_sha256,
     verified_cpu_thread_policy,
     canonical_payload_sha256,
     client_bundle_identity,
@@ -53,6 +65,17 @@ EXPECTED_IMAGE_ID = (
 EXPECTED_API_COMPAT_IMAGE = "agent-invest/mineru-api:3.4.4-serial-v1"
 EXPECTED_COMPAT_MARKER_SCHEMA = "mineru-runtime-compatibility.v5"
 EXPECTED_CAPACITY_POLICY = "single-owner-serial-mineru.v1"
+EXPLICIT_CAPACITY_POLICY = "single-process-explicit-capacity.v1"
+CAPACITY_CONFIG_PATH = "/usr/local/etc/mineru/capacity.json"
+CAPACITY_LABEL_KEYS = {
+    "io.agent-invest.mineru.capacity-config-sha256",
+    "io.agent-invest.mineru.capacity-sources-sha256",
+}
+CAPACITY_ENV_KEYS = {
+    "MINERU_API_FINALIZER_SLOTS",
+    "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
+    "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES",
+}
 EXPECTED_COMPAT_PREIMAGES = {
     "mineru/cli/api_request.py": (
         "sha256:16e16ee7fe9d3b1872f6fb43e1f7b2e7d314d2f726311e821813abece0334e77"
@@ -257,8 +280,10 @@ def _verify_api_compatibility(
     expected_patcher_sha256: str,
     expected_dockerfile_sha256: str,
     expected_task_protocol_v2_sha256: str,
+    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity_source_sha256: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {
+    fields = {
         "marker",
         "actual_source_sha256",
         "task_protocol_v2_actual_sha256",
@@ -274,7 +299,16 @@ def _verify_api_compatibility(
         "task_result_reservation_bytes",
         "max_unacked_result_bytes",
         "image_labels",
-    }:
+    }
+    if expected_capacity is not None:
+        encode_mineru_capacity_config(expected_capacity)
+        sources = validate_capacity_source_sha256(expected_capacity_source_sha256)
+        fields = (fields - {"capacity_runtime"}) | {
+            "capacity_sources_actual_sha256", "capacity_config_file",
+        }
+    elif expected_capacity_source_sha256 is not None:
+        raise ValueError("capacity sources require an explicit capacity config")
+    if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("remote API compatibility evidence fields drifted")
     marker = value.get("marker")
     actual = value.get("actual_source_sha256")
@@ -295,14 +329,18 @@ def _verify_api_compatibility(
         }
         or not isinstance(actual, dict)
         or not isinstance(labels, dict)
-        or set(labels) != COMPAT_LABEL_KEYS
+        or set(labels) != COMPAT_LABEL_KEYS | (
+            CAPACITY_LABEL_KEYS if expected_capacity is not None else set()
+        )
     ):
         raise ValueError("remote API compatibility marker or labels drifted")
     patched = marker.get("patched_source_sha256")
     if (
         marker.get("schema") != EXPECTED_COMPAT_MARKER_SCHEMA
         or marker.get("policy") != MINERU_HEAP_RETURN_POLICY
-        or marker.get("capacity_policy") != EXPECTED_CAPACITY_POLICY
+        or marker.get("capacity_policy") != (
+            EXPECTED_CAPACITY_POLICY if expected_capacity is None else EXPLICIT_CAPACITY_POLICY
+        )
         or marker.get("mineru_version") != "3.4.4"
         or marker.get("mineru_vl_utils_version") != "1.0.5"
         or marker.get("base_image_digest") != EXPECTED_IMAGE_ID
@@ -314,7 +352,7 @@ def _verify_api_compatibility(
         or value.get("task_protocol_v2_actual_sha256")
         != expected_task_protocol_v2_sha256
         or any(SHA256_RE.fullmatch(str(item)) is None for item in patched.values())
-        or not isinstance(value.get("capacity_runtime"), dict)
+        or (expected_capacity is None and not isinstance(value.get("capacity_runtime"), dict))
         or value.get("heap_trim_enabled") is not True
         or not isinstance(value.get("phase_trace_enabled"), bool)
         or value.get("hybrid_batch_ratio_requested") not in {1, 2, 4, 8}
@@ -323,13 +361,18 @@ def _verify_api_compatibility(
         or value.get("task_registry_max_records")
         != MINERU_API_TASK_REGISTRY_MAX_RECORDS
         or value.get("task_result_reservation_bytes")
-        != MINERU_API_RESULT_RESERVATION_BYTES
-        or value.get("max_unacked_result_bytes") != MINERU_API_MAX_UNACKED_RESULT_BYTES
+        != (MINERU_API_RESULT_RESERVATION_BYTES if expected_capacity is None
+            else expected_capacity.result_reservation_bytes)
+        or value.get("max_unacked_result_bytes") != (
+            MINERU_API_MAX_UNACKED_RESULT_BYTES if expected_capacity is None
+            else expected_capacity.max_unacked_result_bytes)
     ):
         raise ValueError("remote API heap-return marker or source bytes drifted")
-    if labels != {
+    expected_labels = {
         "io.agent-invest.mineru.base-image-digest": EXPECTED_IMAGE_ID,
-        "io.agent-invest.mineru.capacity-policy": EXPECTED_CAPACITY_POLICY,
+        "io.agent-invest.mineru.capacity-policy": (
+            EXPECTED_CAPACITY_POLICY if expected_capacity is None else EXPLICIT_CAPACITY_POLICY
+        ),
         "io.agent-invest.mineru.compatibility-policy": MINERU_HEAP_RETURN_POLICY,
         "io.agent-invest.mineru.compatibility-patcher-sha256": (
             expected_patcher_sha256
@@ -340,7 +383,36 @@ def _verify_api_compatibility(
         "io.agent-invest.mineru.task-protocol-v2-sha256": (
             expected_task_protocol_v2_sha256
         ),
-    }:
+    }
+    if expected_capacity is not None:
+        expected_labels.update({
+            "io.agent-invest.mineru.capacity-config-sha256": expected_capacity.sha256,
+            "io.agent-invest.mineru.capacity-sources-sha256": canonical_payload_sha256(sources),
+        })
+        config_file = value.get("capacity_config_file")
+        if (
+            type(config_file) is not dict
+            or set(config_file) != {"path", "sha256", "byte_count"}
+            or type(config_file.get("byte_count")) is not int
+            or type(config_file.get("path")) is not str
+            or type(config_file.get("sha256")) is not str
+        ):
+            raise ValueError("remote capacity file evidence has invalid fields or types")
+        if (
+            validate_capacity_source_sha256(value.get("capacity_sources_actual_sha256"))
+            != sources
+            or config_file != {
+                "path": CAPACITY_CONFIG_PATH, "sha256": expected_capacity.sha256,
+                "byte_count": len(expected_capacity.exact_bytes),
+            }
+            or any(type(value.get(key)) is not int for key in (
+                "hybrid_batch_ratio_requested", "max_pending_tasks_requested",
+                "max_pending_tasks_effective", "task_registry_max_records",
+                "task_result_reservation_bytes", "max_unacked_result_bytes",
+            ))
+        ):
+            raise ValueError("remote API explicit capacity source or config evidence drifted")
+    if labels != expected_labels:
         raise ValueError("remote API compatibility image labels drifted")
     return dict(value)
 
@@ -359,14 +431,28 @@ def build_manifest(
     expected_compat_dockerfile_sha256: str,
     expected_task_protocol_v2_sha256: str,
     expected_collector_path: str = EXPECTED_COLLECTOR_PATH,
-    expected_api_cpu_threads: int = 1,
+    expected_api_cpu_threads: int | None = None,
+    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity_source_sha256: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if expected_capacity is not None:
+        encode_mineru_capacity_config(expected_capacity)
+        validate_capacity_source_sha256(expected_capacity_source_sha256)
+        if expected_api_cpu_threads is not None:
+            raise ValueError("explicit capacity and legacy CPU policy are mutually exclusive")
+    elif expected_capacity_source_sha256 is not None:
+        raise ValueError("capacity sources require an explicit capacity config")
+    if expected_api_cpu_threads is None:
+        expected_api_cpu_threads = 1
     if type(expected_api_cpu_threads) is not int or expected_api_cpu_threads not in {
         1,
         2,
     }:
         raise ValueError("expected API CPU thread budget must be exactly 1 or 2")
-    if observation.get("schema") != "mineru-windows-runtime-observation.v5":
+    if observation.get("schema") != (
+        "mineru-windows-runtime-observation.v5" if expected_capacity is None
+        else "mineru-windows-runtime-observation.v6"
+    ):
         raise ValueError("remote runtime observation contract drifted")
     api = observation.get("api")
     proxy = observation.get("proxy")
@@ -382,7 +468,22 @@ def build_manifest(
     assert isinstance(inference, dict)
     assert isinstance(health, dict)
     assert isinstance(served_model, dict)
-    validate_mineru_api_wire_health(health, expected_task_slots=1)
+    if expected_capacity is None:
+        validate_mineru_api_wire_health(health, expected_task_slots=1)
+    else:
+        checked = validate_mineru_capacity_wire_health(health, expected_capacity=expected_capacity)
+        admission = checked["task_admission"]
+        serving = checked["capacity_observation"]
+        if (
+            admission["durable_nonterminal_tasks"] != 0 or admission["blocked_reason"] is not None
+            or admission["admission_open"] is not True
+            or any(serving["stage_counters"].values())
+            or any(serving["http_counters"].values())
+            or any(serving["owner_control"][key] for key in (
+                "foreign_loop_observed", "soft_drain_requested", "soft_drain_applied",
+            ))
+        ):
+            raise ValueError("remote explicit capacity owner is not idle and open")
     if (
         observation.get("compose_sha256") != expected_compose_sha256
         or observation.get("collector_sha256") != expected_collector_sha256
@@ -406,6 +507,8 @@ def build_manifest(
         expected_patcher_sha256=expected_compat_patcher_sha256,
         expected_dockerfile_sha256=expected_compat_dockerfile_sha256,
         expected_task_protocol_v2_sha256=expected_task_protocol_v2_sha256,
+        expected_capacity=expected_capacity,
+        expected_capacity_source_sha256=expected_capacity_source_sha256,
     )
     task_slots = health.get("max_concurrent_requests")
     pending_requested = health.get("max_pending_tasks_requested")
@@ -416,15 +519,16 @@ def build_manifest(
         or health.get("protocol_version") != MINERU_API_PROTOCOL_VERSION
         or isinstance(task_slots, bool)
         or not isinstance(task_slots, int)
-        or task_slots != 1
+        or task_slots != (1 if expected_capacity is None else expected_capacity.parse_active_limit)
         or isinstance(pending_requested, bool)
         or not isinstance(pending_requested, int)
         or isinstance(pending_effective, bool)
         or not isinstance(pending_effective, int)
         or pending_requested != pending_effective
-        or pending_requested != 1
-        or pending_effective != 1
-        or health.get("processing_window_size") != MINERU_PROCESSING_WINDOW_SIZE
+        or pending_requested != (1 if expected_capacity is None else expected_capacity.total_nonterminal_limit)
+        or health.get("processing_window_size") != (
+            MINERU_PROCESSING_WINDOW_SIZE if expected_capacity is None
+            else expected_capacity.processing_window_size)
         or health.get("task_retention_seconds") != MINERU_API_TASK_RETENTION_SECONDS
         or health.get("task_cleanup_interval_seconds")
         != MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS
@@ -480,7 +584,9 @@ def build_manifest(
         raise ValueError("remote MinerU container health is not healthy")
     if api.get("external_tcp_egress_blocked") is not True:
         raise ValueError("remote MinerU API external egress was not disproved")
-    api_environment = _environment(api.get("environment"), allowlist=API_ENV_KEYS)
+    api_environment = _environment(api.get("environment"), allowlist=API_ENV_KEYS | (
+        CAPACITY_ENV_KEYS if expected_capacity is not None else set()
+    ))
     mounts = api.get("mounts")
     if not isinstance(mounts, list):
         raise ValueError("remote MinerU mount policy drifted")
@@ -569,9 +675,9 @@ def build_manifest(
     )
     if _environment(proxy.get("environment"), allowlist=set()) != {}:
         raise ValueError("remote API proxy environment drifted")
-    if api_environment.get("MINERU_API_MAX_CONCURRENT_REQUESTS") != "1":
+    if api_environment.get("MINERU_API_MAX_CONCURRENT_REQUESTS") != str(task_slots):
         raise ValueError("remote API environment and health task slots drifted")
-    if api_environment.get("MINERU_API_MAX_PENDING_TASKS") != "1":
+    if api_environment.get("MINERU_API_MAX_PENDING_TASKS") != str(pending_requested):
         raise ValueError("remote API environment and health pending depth drifted")
     if (
         compatibility.get("max_pending_tasks_requested") != pending_requested
@@ -580,12 +686,25 @@ def build_manifest(
         raise ValueError("remote API pending depth compatibility drifted")
     if api_environment.get("MINERU_MALLOC_TRIM") != "1":
         raise ValueError("remote API heap-return switch is not enabled")
-    for field, expected in {
+    expected_cpu_environment = {
         "OMP_NUM_THREADS": str(expected_api_cpu_threads),
         "MKL_NUM_THREADS": str(expected_api_cpu_threads),
         "OPENBLAS_NUM_THREADS": "1",
         "MINERU_PDF_RENDER_THREADS": "3",
-    }.items():
+    }
+    if expected_capacity is not None:
+        expected_cpu_environment = {
+            "OMP_NUM_THREADS": str(expected_capacity.omp_num_threads),
+            "MKL_NUM_THREADS": str(expected_capacity.mkl_num_threads),
+            "OPENBLAS_NUM_THREADS": str(expected_capacity.openblas_num_threads),
+            "MINERU_PDF_RENDER_THREADS": str(expected_capacity.pdf_render_processes_requested),
+            "MINERU_API_FINALIZER_SLOTS": str(expected_capacity.finalizer_active_limit),
+            "MINERU_PROCESSING_WINDOW_SIZE": str(expected_capacity.processing_window_size),
+            "MINERU_HYBRID_BATCH_RATIO": str(expected_capacity.hybrid_batch_ratio_requested),
+            "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": str(expected_capacity.result_reservation_bytes),
+            "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES": str(expected_capacity.max_unacked_result_bytes),
+        }
+    for field, expected in expected_cpu_environment.items():
         if api_environment.get(field) != expected:
             raise ValueError(f"remote API thread policy drifted: {field}")
     if api_environment.get("MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS") != "1":
@@ -595,9 +714,10 @@ def build_manifest(
         raise ValueError("remote API hybrid batch ratio is not closed")
     if compatibility.get("hybrid_batch_ratio_requested") != int(ratio_raw):
         raise ValueError("remote API hybrid batch ratio observation drifted")
-    expected_serial_runtime = _expected_serial_runtime(api_environment)
-    if compatibility.get("capacity_runtime") != expected_serial_runtime:
-        raise ValueError("remote API serial observation and environment drifted")
+    if expected_capacity is None:
+        expected_serial_runtime = _expected_serial_runtime(api_environment)
+        if compatibility.get("capacity_runtime") != expected_serial_runtime:
+            raise ValueError("remote API serial observation and environment drifted")
     phase_trace_value = api_environment.get("MINERU_PHASE_TRACE")
     if phase_trace_value not in {"0", "1"}:
         raise ValueError("remote API phase-trace switch is not closed")
@@ -608,13 +728,15 @@ def build_manifest(
     api_command = _command(api)
     proxy_command = _command(proxy)
     inference_command = _command(inference)
+    expected_api_command = list(EXPECTED_API_COMMAND)
+    if expected_capacity is not None:
+        expected_api_command[-1] = str(expected_capacity.final_http_limit_per_loop)
     if (
-        api_command != EXPECTED_API_COMMAND
+        api_command != expected_api_command
         or inference_command != EXPECTED_INFERENCE_COMMAND
     ):
         raise ValueError("remote MinerU command drifted")
-    capacity_runtime_compatibility_sha256 = canonical_payload_sha256(
-        {
+    capacity_projection = {
             "api_command": api_command,
             "api_image_id": api.get("image_id"),
             "base_image_id": EXPECTED_IMAGE_ID,
@@ -637,7 +759,15 @@ def build_manifest(
             ),
             "max_unacked_result_bytes": compatibility.get("max_unacked_result_bytes"),
         }
-    )
+    if expected_capacity is not None:
+        capacity_projection.update({
+            "inference_concurrency": expected_capacity.final_http_limit_per_loop,
+            "processing_window_size": expected_capacity.processing_window_size,
+            "hybrid_batch_ratio": expected_capacity.hybrid_batch_ratio_requested,
+            "capacity_config_sha256": expected_capacity.sha256,
+            "capacity_source_sha256": expected_capacity_source_sha256,
+        })
+    capacity_runtime_compatibility_sha256 = canonical_payload_sha256(capacity_projection)
     if (
         len(proxy_command) != 4
         or proxy_command[:3] != ["/usr/bin/python3.12", "-I", "-c"]
@@ -747,7 +877,17 @@ def build_manifest(
             "windows_collector_sha256": expected_collector_sha256,
         },
     }
-    if expected_api_cpu_threads == 2:
+    if expected_capacity is not None:
+        manifest["contract_version"] = EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT
+        manifest["orchestrator"].update({
+            "capacity_config": json.loads(expected_capacity.exact_bytes),
+            "capacity_config_sha256": expected_capacity.sha256,
+            "capacity_source_sha256": dict(expected_capacity_source_sha256 or {}),
+            "inference_max_concurrency": expected_capacity.final_http_limit_per_loop,
+            "hybrid_batch_ratio": expected_capacity.hybrid_batch_ratio_requested,
+            "processing_window_size": expected_capacity.processing_window_size,
+        })
+    elif expected_api_cpu_threads == 2:
         manifest["contract_version"] = CPU_THREAD_RUNTIME_MANIFEST_CONTRACT
         cpu_policy = {
             "contract_version": "mineru.cpu-thread-policy.v1",
@@ -764,8 +904,10 @@ def build_manifest(
         payload,
         configured_identity=identity,
         local_client_identity=client,
-        local_processing_window_size=MINERU_PROCESSING_WINDOW_SIZE,
+        local_processing_window_size=(MINERU_PROCESSING_WINDOW_SIZE if expected_capacity is None
+                                      else expected_capacity.processing_window_size),
         local_writer_code_digest=code_digest,
+        expected_capacity=expected_capacity,
     )
     return payload
 
@@ -874,8 +1016,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ssh-user", required=True)
     parser.add_argument("--ssh-port", type=int, default=22)
     parser.add_argument(
-        "--expected-api-cpu-threads", type=int, choices=(1, 2), default=1
+        "--expected-api-cpu-threads", type=int, choices=(1, 2)
     )
+    parser.add_argument("--capacity-config", type=Path)
+    parser.add_argument("--expected-capacity-config-sha256")
+    for name in ("config", "file", "bootstrap", "observation"):
+        parser.add_argument(f"--capacity-{name}-source", type=Path)
     parser.add_argument("--identity-file", type=Path, required=True)
     parser.add_argument("--known-hosts-file", type=Path, required=True)
     parser.add_argument("--api-url", default="http://127.0.0.1:30002")
@@ -929,6 +1075,34 @@ def main(argv: list[str] | None = None) -> int:
         / "agent_task_protocol_v2.py",
     )
     args = parser.parse_args(argv)
+    expected_capacity = None
+    capacity_sources = None
+    if (args.capacity_config is None) != (args.expected_capacity_config_sha256 is None):
+        parser.error("capacity config path and expected SHA must be supplied together")
+    if args.capacity_config is not None:
+        if args.expected_api_cpu_threads is not None:
+            parser.error("capacity config and legacy CPU thread policy are mutually exclusive")
+        expected_capacity = load_mineru_capacity_config(
+            args.capacity_config, expected_sha256=args.expected_capacity_config_sha256,
+            expected_owner_uid=os.geteuid(),
+        ).config
+        service_root = Path(__file__).resolve().parents[1]
+        source_defaults = {
+            "config": service_root / "src/disclosure_anchor/application/contracts/mineru_capacity_config.py",
+            "file": service_root / "src/disclosure_anchor/adapters/runtime/mineru_capacity_file.py",
+            "bootstrap": service_root / "scripts/windows/mineru_heap_trim_compat/agent_capacity_bootstrap.py",
+            "observation": service_root / "scripts/windows/mineru_heap_trim_compat/agent_capacity_observation.py",
+        }
+        capacity_sources = {
+            f"mineru/cli/agent_capacity_{name}.py": "sha256:" + hashlib.sha256(
+                (getattr(args, f"capacity_{name}_source") or default).read_bytes()
+            ).hexdigest() for name, default in source_defaults.items()
+        }
+        if set(capacity_sources) != CAPACITY_SOURCE_PATHS:
+            raise ValueError("local capacity source selection is not closed")
+    elif any(getattr(args, f"capacity_{name}_source") is not None
+             for name in ("config", "file", "bootstrap", "observation")):
+        parser.error("capacity source selection requires explicit capacity config")
     remote_collector_path = _canonical_remote_collector_path(args.remote_collector_path)
     _private_regular_file(args.identity_file, label="SSH identity")
     host_key_sha256 = _known_host_key_sha256(
@@ -974,6 +1148,8 @@ def main(argv: list[str] | None = None) -> int:
         "-File",
         remote_collector_path,
     ]
+    if expected_capacity is not None:
+        collector_command.extend(["-ExpectedCapacityConfigSha256", expected_capacity.sha256])
     completed = subprocess.run(
         collector_command,
         check=True,
@@ -1003,7 +1179,9 @@ def main(argv: list[str] | None = None) -> int:
         expected_compat_dockerfile_sha256=expected_compat_dockerfile_sha256,
         expected_task_protocol_v2_sha256=expected_task_protocol_v2_sha256,
         expected_collector_path=remote_collector_path,
-        expected_api_cpu_threads=args.expected_api_cpu_threads,
+        expected_api_cpu_threads=(args.expected_api_cpu_threads or 1) if expected_capacity is None else None,
+        expected_capacity=expected_capacity,
+        expected_capacity_source_sha256=capacity_sources,
     )
     _new_private_json(args.observation_out, observation)
     _new_private_json(args.manifest_out, payload)

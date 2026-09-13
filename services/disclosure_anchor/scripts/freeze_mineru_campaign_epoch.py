@@ -16,12 +16,17 @@ from disclosure_anchor.adapters.runtime.mineru_host_capacity_observer import (
     project_host_service_epoch,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
+    EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT,
     RUNTIME_MANIFEST_CONTRACT,
     CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
     verified_cpu_thread_policy,
     STAGED_RUNTIME_MANIFEST_CONTRACT,
     canonical_payload_sha256,
+    client_bundle_identity,
+    verify_runtime_manifest_payload,
+    writer_code_digest,
 )
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import load_mineru_capacity_config
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
@@ -32,6 +37,7 @@ _ACCEPTED_RUNTIME_MANIFEST_CONTRACTS = frozenset(
         RUNTIME_MANIFEST_CONTRACT,
         STAGED_RUNTIME_MANIFEST_CONTRACT,
         CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+        EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT,
     }
 )
 
@@ -113,12 +119,27 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ssh-port", type=int, default=22)
     parser.add_argument("--ssh-identity", type=Path, required=True)
     parser.add_argument("--ssh-known-hosts", type=Path, required=True)
-    return parser.parse_args(argv)
+    parser.add_argument("--capacity-config", type=Path)
+    parser.add_argument("--capacity-config-sha256")
+    parser.add_argument("--mineru-bin", type=Path)
+    parser.add_argument("--runtime-bundle-identity")
+    args = parser.parse_args(argv)
+    if (args.capacity_config is None) != (args.capacity_config_sha256 is None):
+        parser.error("--capacity-config and --capacity-config-sha256 must be supplied together")
+    if args.capacity_config is not None and (args.mineru_bin is None or args.runtime_bundle_identity is None):
+        parser.error("explicit capacity requires --mineru-bin and --runtime-bundle-identity")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _args(argv)
     try:
+        expected_capacity = None
+        if args.capacity_config is not None:
+            expected_capacity = load_mineru_capacity_config(
+                args.capacity_config, expected_sha256=args.capacity_config_sha256,
+                expected_owner_uid=os.getuid(),
+            ).config
         wrapper = _read_private_json(args.runtime_manifest)
         manifest = wrapper.get("manifest")
         runtime_identity = wrapper.get("identity_sha256")
@@ -129,6 +150,15 @@ def main(argv: list[str] | None = None) -> int:
             or runtime_identity != canonical_payload_sha256(manifest)
         ):
             raise ValueError("runtime manifest identity is invalid")
+        if (manifest.get("contract_version") == EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT) != (expected_capacity is not None):
+            raise ValueError("runtime manifest and explicit capacity selection differ")
+        if expected_capacity is not None:
+            verify_runtime_manifest_payload(
+                wrapper, configured_identity=args.runtime_bundle_identity,
+                local_client_identity=client_bundle_identity(args.mineru_bin),
+                local_processing_window_size=expected_capacity.processing_window_size,
+                local_writer_code_digest=writer_code_digest(), expected_capacity=expected_capacity,
+            )
         if manifest.get("contract_version") == CPU_THREAD_RUNTIME_MANIFEST_CONTRACT:
             verified_cpu_thread_policy(manifest)
         topology = manifest.get("topology")

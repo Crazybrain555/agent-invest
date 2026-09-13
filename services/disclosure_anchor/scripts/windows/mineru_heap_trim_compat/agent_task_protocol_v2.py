@@ -10,8 +10,8 @@ import os
 import stat
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, fields
 from functools import wraps
 from pathlib import Path
@@ -2401,6 +2401,15 @@ class SplitTaskExecutor:
             raise ValueError("result reservation must be a positive integer")
         self._parse = asyncio.Semaphore(parse_slots)
         self._finalize = asyncio.Semaphore(finalizer_slots)
+        self._parse_slots = parse_slots
+        self._finalizer_slots = finalizer_slots
+        self._stage_counts = {
+            "result_capacity_waiting": 0,
+            "parse_waiting": 0,
+            "parse_active": 0,
+            "finalizer_waiting": 0,
+            "finalizer_active": 0,
+        }
         self._result_reservation_bytes = result_reservation_bytes
         self._capacity_changed = asyncio.Event()
         self._stopping = False
@@ -2409,6 +2418,34 @@ class SplitTaskExecutor:
     @property
     def result_reservation_bytes(self) -> int:
         return self._result_reservation_bytes
+
+    @property
+    def parse_slots(self) -> int:
+        return self._parse_slots
+
+    @property
+    def finalizer_slots(self) -> int:
+        return self._finalizer_slots
+
+    def stage_snapshot(self) -> dict[str, int]:
+        """Actual acquire/wait ownership, read on the executor's serving loop."""
+        return dict(self._stage_counts)
+
+    @asynccontextmanager
+    async def _stage_slot(self, semaphore: asyncio.Semaphore, stage: str) -> AsyncIterator[None]:
+        waiting = stage + "_waiting"
+        active = stage + "_active"
+        self._stage_counts[waiting] += 1
+        try:
+            await semaphore.acquire()
+        finally:
+            self._stage_counts[waiting] -= 1
+        self._stage_counts[active] += 1
+        try:
+            yield
+        finally:
+            self._stage_counts[active] -= 1
+            semaphore.release()
 
     def start(self) -> None:
         self._stopping = False
@@ -2446,17 +2483,21 @@ class SplitTaskExecutor:
                         "result capacity unavailable during accepted-work drain",
                         capacity_wait=True,
                     ) from None
-                await self._capacity_changed.wait()
+                self._stage_counts["result_capacity_waiting"] += 1
+                try:
+                    await self._capacity_changed.wait()
+                finally:
+                    self._stage_counts["result_capacity_waiting"] -= 1
             else:
                 break
         try:
-            async with self._parse:
+            async with self._stage_slot(self._parse, "parse"):
                 if self._abort_pending:
                     raise TaskExecutionStopped("parse slot wait stopped with pending responsibility")
                 registry.transition(key, "processing")
                 await parse()
             registry.transition(key, "finalizing")
-            async with self._finalize:
+            async with self._stage_slot(self._finalize, "finalizer"):
                 path, digest, byte_count, owner = await finalize()
             registry.complete(
                 key,
@@ -2545,7 +2586,8 @@ def validate_mineru_task_admission(
 
 
 def task_protocol_runtime_status(
-    registry: DurableTaskRegistry, executor: SplitTaskExecutor
+    registry: DurableTaskRegistry, executor: SplitTaskExecutor,
+    *, capacity_config_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Content-free facts from the serving process's initialized objects."""
     if not isinstance(registry, DurableTaskRegistry) or not isinstance(executor, SplitTaskExecutor):
@@ -2558,11 +2600,20 @@ def task_protocol_runtime_status(
     if any(type(value) is not int or value < 1 for value in limits.values()):
         raise TaskProtocolConflict("task protocol runtime limits are invalid")
     registry.assert_persistence_healthy()
-    return {
+    result = {
         "schema": "mineru-task-runtime.v2", "enabled": True, **limits,
         "registry_schema": "mineru-task-registry.v3",
         "admission_scope": "post_form_owned_upload",
     }
+    if capacity_config_sha256 is not None:
+        if (type(capacity_config_sha256) is not str
+                or len(capacity_config_sha256) != 71
+                or not capacity_config_sha256.startswith("sha256:")
+                or any(ch not in "0123456789abcdef" for ch in capacity_config_sha256[7:])):
+            raise TaskProtocolConflict("task runtime capacity config SHA is invalid")
+        result["schema"] = "mineru-task-runtime.v3"
+        result["capacity_config_sha256"] = capacity_config_sha256
+    return result
 
 
 def evict_consumed_routes(

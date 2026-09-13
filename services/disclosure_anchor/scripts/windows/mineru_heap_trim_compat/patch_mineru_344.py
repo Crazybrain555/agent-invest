@@ -828,6 +828,109 @@ def _patch_result_capacity_before_parse(source: str) -> str:
     return source
 
 
+def _patch_explicit_capacity(source: str) -> str:
+    """Wire the new explicit profile; preserve the unselected legacy branch."""
+    if "async def create_async_parse_task(" not in source:
+        return source
+    replacements = (
+        (
+            "import os\n",
+            "import os\n"
+            "if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ\n"
+            "        or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):\n"
+            "    from mineru.cli.agent_capacity_bootstrap import get_process_capacity\n"
+            "    get_process_capacity()  # Validate startup before model imports.\n",
+        ),
+        (
+            "def get_max_concurrent_requests() -> int:\n",
+            "def get_max_concurrent_requests() -> int:\n"
+            "    if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ\n"
+            "            or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):\n"
+            "        from mineru.cli.agent_capacity_bootstrap import get_process_capacity\n"
+            "        config = get_process_capacity()\n"
+            "        if (type(_configured_max_concurrent_requests) is not int\n"
+            "                or _configured_max_concurrent_requests != config.parse_active_limit):\n"
+            "            raise RuntimeError('MinerU API parse capacity differs from its config')\n"
+            "        return config.parse_active_limit\n",
+        ),
+        (
+            "def get_max_pending_tasks() -> int:\n",
+            "def get_max_pending_tasks() -> int:\n"
+            "    if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ\n"
+            "            or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):\n"
+            "        from mineru.cli.agent_capacity_bootstrap import get_process_capacity\n"
+            "        return get_process_capacity().total_nonterminal_limit\n",
+        ),
+        (
+            "        self.max_nonterminal_tasks = get_max_pending_tasks()\n",
+            "        self.capacity_config = None\n"
+            "        self.capacity_observer = None\n"
+            "        if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ\n"
+            "                or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):\n"
+            "            from mineru.cli.agent_capacity_bootstrap import get_process_capacity\n"
+            "            self.capacity_config = get_process_capacity()\n"
+            "        self.max_nonterminal_tasks = get_max_pending_tasks()\n",
+        ),
+        (
+            "            parse_slots=get_max_concurrent_requests(), finalizer_slots=1,\n",
+            "            parse_slots=get_max_concurrent_requests(),\n"
+            "            finalizer_slots=(1 if self.capacity_config is None\n"
+            "                             else self.capacity_config.finalizer_active_limit),\n",
+        ),
+        (
+            "    async def start(self) -> None:\n",
+            "    async def start(self) -> None:\n"
+            "        if self.capacity_config is not None:\n"
+            "            from mineru.cli.agent_capacity_bootstrap import verify_http_capacity\n"
+            "            from mineru.cli.agent_capacity_observation import CapacityServingObservation\n"
+            "            from mineru_vl_utils.vlm_client.http_client import _bind_capacity_owner\n"
+            "            verify_http_capacity(\n"
+            "                self.capacity_config, self.app.state.config.get('max_concurrency')\n"
+            "            )\n"
+            "            observer = CapacityServingObservation(self.capacity_config, self)\n"
+            "            _bind_capacity_owner(self.capacity_config.sha256,\n"
+            "                                 self.capacity_config.final_http_limit_per_loop,\n"
+            "                                 self.begin_soft_drain)\n"
+            "            self.capacity_observer = observer\n",
+        ),
+        (
+            "    async def shutdown(self) -> None:\n"
+            "        self.is_shutting_down = True\n"
+            "        self._wake_waiters()\n",
+            "    def begin_soft_drain(self) -> None:\n"
+            "        self.is_shutting_down = True\n"
+            "        self._wake_waiters()\n\n"
+            "    async def shutdown(self) -> None:\n"
+            "        self.begin_soft_drain()\n",
+        ),
+        (
+            "    admission = task_manager.admission_snapshot()\n",
+            "    admission = task_manager.admission_snapshot()\n"
+            "    capacity_extra = {}\n"
+            "    if getattr(task_manager, 'capacity_config', None) is None:\n"
+            "        protocol_runtime = task_protocol_runtime_status(\n"
+            "            task_manager.task_protocol_v2, task_manager.task_protocol_executor\n"
+            "        )\n"
+            "    else:\n"
+            "        protocol_runtime = task_protocol_runtime_status(\n"
+            "            task_manager.task_protocol_v2, task_manager.task_protocol_executor,\n"
+            "            capacity_config_sha256=task_manager.capacity_config.sha256,\n"
+            "        )\n"
+            "        capacity_extra['capacity_observation'] = task_manager.capacity_observer.snapshot()\n",
+        ),
+        (
+            '        "task_protocol_runtime": task_protocol_runtime_status(\n'
+            "            task_manager.task_protocol_v2, task_manager.task_protocol_executor\n"
+            "        ),\n",
+            '        "task_protocol_runtime": protocol_runtime,\n'
+            "        **capacity_extra,\n",
+        ),
+    )
+    for number, (old, new) in enumerate(replacements):
+        source = _replace_exact(source, old, new, count=1, label=f"explicit capacity wiring {number}")
+    return source
+
+
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
 
@@ -922,6 +1025,71 @@ import threading as _agent_request_threading
 _PROCESS_ASYNC_REQUEST_STATS_LOCK = _agent_request_threading.Lock()
 _PROCESS_ASYNC_REQUEST_STATS = {"active": 0, "pending": 0}
 _PROCESS_ASYNC_REQUEST_LIMITERS = {}
+_CAPACITY_OWNER = None
+
+
+def _bind_capacity_owner(config_sha256, capacity, request_soft_drain):
+    """Bind the real manager before any final POST, without creating a limiter."""
+    global _CAPACITY_OWNER
+    import uuid
+    loop = asyncio.get_running_loop()
+    if type(capacity) is not int or not 1 <= capacity <= 128 or not callable(request_soft_drain):
+        raise RuntimeError("capacity owner binding is invalid")
+    with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+        if _CAPACITY_OWNER is None:
+            if _PROCESS_ASYNC_REQUEST_LIMITERS:
+                raise RuntimeError("HTTP limiter preceded capacity owner startup")
+            _CAPACITY_OWNER = {
+                "loop": loop, "process_id": _agent_request_os.getpid(),
+                "loop_epoch": str(uuid.uuid4()), "config_sha256": config_sha256,
+                "capacity": capacity, "request_soft_drain": request_soft_drain,
+                "foreign_loop_observed": False, "soft_drain_requested": False,
+                "soft_drain_applied": False,
+            }
+        elif (
+            _CAPACITY_OWNER["loop"] is not loop
+            or _CAPACITY_OWNER["process_id"] != _agent_request_os.getpid()
+            or _CAPACITY_OWNER["config_sha256"] != config_sha256
+            or _CAPACITY_OWNER["capacity"] != capacity
+            or _CAPACITY_OWNER["request_soft_drain"] != request_soft_drain
+            or _CAPACITY_OWNER["soft_drain_requested"]
+        ):
+            raise RuntimeError("capacity owner cannot be rebound within one process")
+
+
+def _apply_capacity_soft_drain(owner):
+    if asyncio.get_running_loop() is not owner["loop"]:
+        raise RuntimeError("capacity drain callback is outside the serving loop")
+    owner["request_soft_drain"]()
+    with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+        owner["soft_drain_applied"] = True
+
+
+def _capacity_http_snapshot(config_sha256):
+    """Read initialized owner facts on its loop; health never creates credits."""
+    loop = asyncio.get_running_loop()
+    with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
+        owner = _CAPACITY_OWNER
+        if (owner is None or owner["loop"] is not loop
+                or owner["process_id"] != _agent_request_os.getpid()
+                or owner["config_sha256"] != config_sha256):
+            raise RuntimeError("capacity HTTP observation has no matching serving owner")
+        limiter = _PROCESS_ASYNC_REQUEST_LIMITERS.get(loop)
+        return {
+            "process_id": owner["process_id"], "loop_epoch": owner["loop_epoch"],
+            "final_http_limit_per_loop": None if limiter is None else limiter.capacity,
+            "http_limiter_state": "not_initialized" if limiter is None else "initialized",
+            "http_counters": {
+                "active_requests": _PROCESS_ASYNC_REQUEST_STATS["active"],
+                "pending_requests": _PROCESS_ASYNC_REQUEST_STATS["pending"],
+            },
+            "owner_control": {
+                "foreign_loop_observed": owner["foreign_loop_observed"],
+                "soft_drain_requested": owner["soft_drain_requested"],
+                "soft_drain_applied": owner["soft_drain_applied"],
+                "trigger": "foreign_event_loop" if owner["foreign_loop_observed"] else None,
+            },
+        }
 
 
 def _process_async_request_snapshot() -> dict:
@@ -937,13 +1105,37 @@ def _process_async_request_snapshot() -> dict:
 
 def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter:
     loop = asyncio.get_running_loop()
+    notify_owner = None
+    foreign_loop = False
     with _PROCESS_ASYNC_REQUEST_STATS_LOCK:
-        limiter = _PROCESS_ASYNC_REQUEST_LIMITERS.get(loop)
-        if limiter is None:
-            limiter = _ProcessAsyncRequestLimiter(capacity)
-            _PROCESS_ASYNC_REQUEST_LIMITERS[loop] = limiter
-        elif limiter.capacity != capacity:
-            raise RuntimeError("global VLM request concurrency drifted within one process")
+        owner = _CAPACITY_OWNER
+        if owner is None and (
+            "MINERU_CAPACITY_CONFIG_PATH" in _agent_request_os.environ
+            or "MINERU_CAPACITY_CONFIG_SHA256" in _agent_request_os.environ
+        ):
+            raise RuntimeError("capacity serving owner is not initialized")
+        if owner is not None:
+            if owner["process_id"] != _agent_request_os.getpid():
+                raise RuntimeError("capacity owner process changed")
+            foreign_loop = owner["loop"] is not loop
+            if foreign_loop:
+                owner["foreign_loop_observed"] = True
+                if not owner["soft_drain_requested"]:
+                    owner["soft_drain_requested"] = True
+                    notify_owner = owner
+            elif type(capacity) is not int or capacity != owner["capacity"]:
+                raise RuntimeError("HTTP request capacity differs from the serving config")
+        if not foreign_loop:
+            limiter = _PROCESS_ASYNC_REQUEST_LIMITERS.get(loop)
+            if limiter is None:
+                limiter = _ProcessAsyncRequestLimiter(capacity)
+                _PROCESS_ASYNC_REQUEST_LIMITERS[loop] = limiter
+            elif limiter.capacity != capacity:
+                raise RuntimeError("global VLM request concurrency drifted within one process")
+    if foreign_loop:
+        if notify_owner is not None:
+            notify_owner["loop"].call_soon_threadsafe(_apply_capacity_soft_drain, notify_owner)
+        raise RuntimeError("final POST rejected outside the capacity serving loop")
     return limiter
 '''
         source = _replace_exact(
@@ -957,8 +1149,8 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             source,
             "        client = await self._aio_client()\n"
             "        response = await client.post(self.chat_url, json=request_body)\n",
-            "        client = await self._aio_client()\n"
             "        limiter = _process_async_request_limiter(self.max_concurrency)\n"
+            "        client = await self._aio_client()\n"
             "        async with limiter:\n"
             "            response = await client.post(self.chat_url, json=request_body)\n",
             count=1,
@@ -1765,7 +1957,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         )
         source = _patch_registry_persistence_behavior(source)
         source = _patch_admission_responsibility(source)
-        return _patch_result_capacity_before_parse(source)
+        return _patch_explicit_capacity(_patch_result_capacity_before_parse(source))
 
     if relative_path == "mineru/utils/model_utils.py":
         source = _replace_exact(
@@ -1784,7 +1976,11 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "import threading\n"
             "import time\n"
             "import uuid\n"
-            "import gc\n",
+            "import gc\n"
+            "if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ\n"
+            "        or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):\n"
+            "    from mineru.cli.agent_capacity_bootstrap import get_process_capacity\n"
+            "    get_process_capacity()  # Validate startup before torch/model imports.\n",
             count=1,
             label="model-utils imports",
         )
@@ -1822,7 +2018,11 @@ def is_phase_trace_enabled() -> bool:
 
 
 def strict_processing_window_size() -> int:
-    """Require the versioned serial window without an implicit fallback."""
+    """Require the selected explicit window without an implicit fallback."""
+    if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ
+            or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):
+        from mineru.cli.agent_capacity_bootstrap import get_process_capacity
+        return get_process_capacity().processing_window_size
     raw = os.getenv("MINERU_PROCESSING_WINDOW_SIZE")
     if raw is None or not raw.isdigit() or str(int(raw)) != raw:
         raise RuntimeError(
@@ -1919,6 +2119,19 @@ def serial_execution_profile(configured_window_size: int) -> SerialExecutionProf
         "vllm_max_num_seqs": 128,
         "window_size": configured_window_size,
     }
+    if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ
+            or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):
+        from mineru.cli.agent_capacity_bootstrap import get_process_capacity
+        config = get_process_capacity()
+        if configured_window_size != config.processing_window_size:
+            raise RuntimeError("document window differs from the capacity config")
+        payload.update(
+            schema="mineru-native-document-profile.v1",
+            capacity_config_sha256=config.sha256,
+            owner_task_slots=config.parse_active_limit,
+            inner_inference_concurrency=config.final_http_limit_per_loop,
+            profile_id=f"native-w{configured_window_size}",
+        )
     return SerialExecutionProfile(
         profile_id=payload["profile_id"],
         profile_sha256=_serial_profile_hash(payload),
@@ -1926,13 +2139,24 @@ def serial_execution_profile(configured_window_size: int) -> SerialExecutionProf
         pipeline_depth=0,
         window_size=configured_window_size,
         max_resident_pages=configured_window_size,
-        inner_inference_concurrency=7,
+        inner_inference_concurrency=payload["inner_inference_concurrency"],
         vllm_max_num_seqs=128,
     )
 
 
 def serial_runtime_status(configured_window_size: int) -> dict:
     profile = serial_execution_profile(configured_window_size)
+    if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ
+            or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):
+        from mineru.cli.agent_capacity_bootstrap import get_process_capacity
+        config = get_process_capacity()
+        return {
+            "configured_window_size": profile.window_size,
+            "mode": "serial", "owner_task_slots": config.parse_active_limit,
+            "profile_sha256": profile.profile_sha256,
+            "schema": "mineru-native-runtime.v1",
+            "capacity_config_sha256": config.sha256,
+        }
     return {
         "configured_window_size": profile.window_size,
         "mode": "serial",
