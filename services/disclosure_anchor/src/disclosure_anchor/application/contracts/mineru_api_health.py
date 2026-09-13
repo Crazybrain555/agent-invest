@@ -150,15 +150,78 @@ def validate_mineru_task_runtime(decoded: object) -> None:
         "task_result_reservation_bytes": MINERU_API_RESULT_RESERVATION_BYTES,
         "max_unacked_result_bytes": MINERU_API_MAX_UNACKED_RESULT_BYTES,
     }
+    v2 = isinstance(decoded, dict) and decoded.get("schema") == "mineru-task-runtime.v2"
+    extra = {"registry_schema", "admission_scope"} if v2 else set()
     if (
         not isinstance(decoded, dict)
-        or set(decoded) != {"schema", "enabled", *limits}
-        or decoded.get("schema") != "mineru-task-runtime.v1"
+        or set(decoded) != {"schema", "enabled", *limits, *extra}
+        or decoded.get("schema") not in {"mineru-task-runtime.v1", "mineru-task-runtime.v2"}
+        or (v2 and (decoded.get("registry_schema") != "mineru-task-registry.v3"
+                    or decoded.get("admission_scope") != "post_form_owned_upload"))
         or decoded.get("enabled") is not True
         or any(type(decoded.get(key)) is not int or decoded[key] != value
                for key, value in limits.items())
     ):
         raise ValueError("MinerU serving task runtime identity or limits drifted")
+
+
+def validate_mineru_task_admission(
+    decoded: object, *, queued_tasks: int, processing_tasks: int, nonterminal_limit: int,
+) -> None:
+    """Validate durable responsibilities before projecting the legacy load gauges.
+
+    queued_tasks covers ingress and accepted pending, not physical queue depth.
+    A cold backlog remains readable on the wire but is not qualified healthy.
+    """
+    counters = {
+        "nonterminal_limit", "ingress_tasks", "accepted_pending_tasks",
+        "accepted_processing_tasks", "accepted_finalizing_tasks", "durable_nonterminal_tasks",
+        "routeless_accepted_tasks", "ingress_cleanup_tasks", "unowned_ingress_tasks",
+        "scheduled_tasks", "queue_depth", "active_processors",
+    }
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != counters | {
+            "schema", "registry_schema", "recovery_overcommitted", "admission_open", "blocked_reason",
+        }
+        or decoded.get("schema") != "mineru-task-admission.v1"
+        or decoded.get("registry_schema") != "mineru-task-registry.v3"
+        or any(type(decoded.get(key)) is not int or not 0 <= decoded[key] <= 128 for key in counters)
+        or type(decoded.get("recovery_overcommitted")) is not bool
+        or type(decoded.get("admission_open")) is not bool
+        or decoded["nonterminal_limit"] != nonterminal_limit
+        or nonterminal_limit < 1
+    ):
+        raise ValueError("MinerU admission evidence fields or types drifted")
+    ingress = decoded["ingress_tasks"]
+    accepted = sum(decoded[key] for key in (
+        "accepted_pending_tasks", "accepted_processing_tasks", "accepted_finalizing_tasks",
+    ))
+    total = ingress + accepted
+    if (
+        total != decoded["durable_nonterminal_tasks"]
+        or queued_tasks != ingress + decoded["accepted_pending_tasks"]
+        or processing_tasks != decoded["accepted_processing_tasks"] + decoded["accepted_finalizing_tasks"]
+        or decoded["routeless_accepted_tasks"] > accepted
+        or max(decoded["ingress_cleanup_tasks"], decoded["unowned_ingress_tasks"]) > ingress
+        or decoded["queue_depth"] + decoded["active_processors"] > decoded["scheduled_tasks"]
+        or decoded["scheduled_tasks"] > nonterminal_limit
+        or decoded["recovery_overcommitted"] != (total > nonterminal_limit)
+    ):
+        raise ValueError("MinerU admission responsibility counters disagree")
+    reason = decoded["blocked_reason"]
+    expected_reason = (
+        "ingress_recovery_required" if decoded["unowned_ingress_tasks"] or decoded["ingress_cleanup_tasks"]
+        else "accepted_recovery_required" if decoded["routeless_accepted_tasks"]
+        else "recovery_overcommitted" if total > nonterminal_limit
+        else "capacity_full" if total == nonterminal_limit
+        else None
+    )
+    if (
+        reason not in ("shutting_down", "worker_unavailable", expected_reason)
+        or decoded["admission_open"] != (reason is None)
+    ):
+        raise ValueError("MinerU admission availability contradicts its responsibilities")
 
 
 def validate_mineru_api_wire_health(
@@ -173,15 +236,24 @@ def validate_mineru_api_wire_health(
     validate_mineru_api_health remains the closed normalized receipt contract;
     no wire caller may silently drop unknown fields or accept that projection.
     """
+    runtime = decoded.get("task_protocol_runtime") if isinstance(decoded, dict) else None
+    v2 = isinstance(runtime, dict) and runtime.get("schema") == "mineru-task-runtime.v2"
+    extra = {"task_admission"} if v2 else set()
     if (
         not isinstance(decoded, dict)
         or set(decoded) != MINERU_API_HEALTH_FIELDS | {
-            "task_protocol_schema", "task_protocol_runtime"
+            "task_protocol_schema", "task_protocol_runtime", *extra,
         }
         or decoded.get("task_protocol_schema") != "mineru-task-protocol.v2"
     ):
         raise ValueError("MinerU API wire health fields are not closed")
     validate_mineru_task_runtime(decoded["task_protocol_runtime"])
+    if v2:
+        validate_mineru_task_admission(
+            decoded["task_admission"], queued_tasks=decoded["queued_tasks"],
+            processing_tasks=decoded["processing_tasks"],
+            nonterminal_limit=decoded["max_pending_tasks_effective"],
+        )
     return validate_mineru_api_health(
         {name: decoded[name] for name in MINERU_API_HEALTH_FIELDS},
         expected_task_slots=expected_task_slots,
@@ -196,4 +268,5 @@ __all__ = [
     "validate_mineru_api_health",
     "validate_mineru_api_wire_health",
     "validate_mineru_task_runtime",
+    "validate_mineru_task_admission",
 ]

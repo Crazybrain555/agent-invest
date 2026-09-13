@@ -1057,9 +1057,11 @@ class MinerUOutputQuiescenceTests(unittest.TestCase):
             with patch.object(DurableTaskRegistry, "__init__", side_effect=AssertionError("constructor")):
                 proof = _MODULE.task_protocol_runtime_status(registry, executor)
             self.assertEqual(proof, {
-                "schema": "mineru-task-runtime.v1", "enabled": True,
+                "schema": "mineru-task-runtime.v2", "enabled": True,
                 "task_registry_max_records": 128, "task_result_reservation_bytes": 257,
                 "max_unacked_result_bytes": 1024,
+                "registry_schema": "mineru-task-registry.v3",
+                "admission_scope": "post_form_owned_upload",
             })
             self.assertEqual(path.read_bytes(), before)
             for left, right in ((None, executor), (registry, None), (object(), object())):

@@ -228,6 +228,7 @@ if (
 }
 $MutationStarted = $false
 $DeploymentAttempted = $false
+$PreDeploymentOutputState = $null
 $ComposeBackupCreated = $false
 $CollectorBackupCreated = $false
 $ReceiptBackupCreated = $false
@@ -408,17 +409,86 @@ function Assert-RequiredProperties {
 function Assert-IdleHealth {
     param(
         [Parameter(Mandatory = $true)][object]$Health,
-        [Parameter(Mandatory = $true)][string]$Label
+        [Parameter(Mandatory = $true)][string]$Label,
+        [switch]$RequireAdmissionV2
     )
     Assert-RequiredProperties -Value $Health -Names @(
         "status", "queued_tasks", "processing_tasks"
     ) -Label $Label
     if (
         [string]$Health.status -ne "healthy" -or
+        ($Health.queued_tasks -isnot [int] -and $Health.queued_tasks -isnot [long]) -or
+        ($Health.processing_tasks -isnot [int] -and $Health.processing_tasks -isnot [long]) -or
         [int]$Health.queued_tasks -ne 0 -or
         [int]$Health.processing_tasks -ne 0
     ) {
         throw "$Label is not healthy and idle"
+    }
+    $runtime = $Health.task_protocol_runtime
+    $isV2 = $null -ne $runtime -and $runtime.schema -eq "mineru-task-runtime.v2"
+    if ($RequireAdmissionV2 -and -not $isV2) {
+        throw "$Label has no durable admission evidence"
+    }
+    if ($isV2) {
+        $runtimeNames = @("schema", "enabled", "task_registry_max_records",
+            "task_result_reservation_bytes", "max_unacked_result_bytes", "registry_schema", "admission_scope")
+        if (@($runtime.PSObject.Properties.Name).Count -ne $runtimeNames.Count) {
+            throw "$Label runtime evidence is not closed"
+        }
+        Assert-RequiredProperties -Value $runtime -Names $runtimeNames -Label $Label
+        if ($runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
+            $runtime.registry_schema -ne "mineru-task-registry.v3" -or
+            $runtime.admission_scope -ne "post_form_owned_upload") {
+            throw "$Label runtime admission identity drifted"
+        }
+        $limits = @{ task_registry_max_records = 128; task_result_reservation_bytes = 268435456;
+            max_unacked_result_bytes = 2147483648 }
+        foreach ($key in $limits.Keys) {
+            if (($runtime.$key -isnot [int] -and $runtime.$key -isnot [long]) -or
+                $runtime.$key -ne $limits[$key]) { throw "$Label runtime limit drifted: $key" }
+        }
+        $admission = $Health.task_admission
+        $zeroCounters = @("ingress_tasks", "accepted_pending_tasks", "accepted_processing_tasks",
+            "accepted_finalizing_tasks", "durable_nonterminal_tasks", "routeless_accepted_tasks",
+            "ingress_cleanup_tasks", "unowned_ingress_tasks", "scheduled_tasks", "queue_depth", "active_processors")
+        $fields = @("schema", "registry_schema", "nonterminal_limit", "recovery_overcommitted",
+            "admission_open", "blocked_reason") + $zeroCounters
+        if ($null -eq $admission -or @($admission.PSObject.Properties.Name).Count -ne $fields.Count) {
+            throw "$Label admission evidence is not closed"
+        }
+        foreach ($key in $fields) {
+            if ($admission.PSObject.Properties.Name -notcontains $key) {
+                throw "$Label admission evidence is missing $key"
+            }
+        }
+        if ($admission.schema -ne "mineru-task-admission.v1" -or
+            $admission.registry_schema -ne "mineru-task-registry.v3" -or
+            ($admission.nonterminal_limit -isnot [int] -and $admission.nonterminal_limit -isnot [long]) -or
+            $admission.nonterminal_limit -ne $Health.max_pending_tasks_effective -or
+            $admission.nonterminal_limit -lt 1 -or $admission.nonterminal_limit -gt 128 -or
+            $admission.recovery_overcommitted -isnot [bool] -or $admission.recovery_overcommitted -or
+            $admission.admission_open -isnot [bool] -or -not $admission.admission_open -or
+            $null -ne $admission.blocked_reason) {
+            throw "$Label admission is not open and idle"
+        }
+        foreach ($key in $zeroCounters) {
+            if (($admission.$key -isnot [int] -and $admission.$key -isnot [long]) -or $admission.$key -ne 0) {
+                throw "$Label retains task responsibility: $key"
+            }
+        }
+    } elseif ($null -ne $runtime -and $runtime.schema -ne "mineru-task-runtime.v1") {
+        throw "$Label runtime version is unsupported"
+    } elseif ($null -ne $runtime) {
+        $legacyNames = @("schema", "enabled", "task_registry_max_records",
+            "task_result_reservation_bytes", "max_unacked_result_bytes")
+        if ($Health.PSObject.Properties.Name -contains "task_admission" -or
+            @($runtime.PSObject.Properties.Name).Count -ne $legacyNames.Count) {
+            throw "$Label mixes legacy runtime and admission evidence"
+        }
+        Assert-RequiredProperties -Value $runtime -Names $legacyNames -Label $Label
+        if ($runtime.enabled -isnot [bool] -or -not $runtime.enabled) {
+            throw "$Label legacy runtime is disabled"
+        }
     }
 }
 
@@ -761,7 +831,7 @@ function Get-ValidatedRuntime {
         "task_cleanup_interval_seconds", "task_protocol_schema",
         "queued_tasks", "processing_tasks"
     ) -Label "new MinerU API health"
-    Assert-IdleHealth -Health $health -Label "new MinerU API health"
+    Assert-IdleHealth -Health $health -Label "new MinerU API health" -RequireAdmissionV2
     if (
         [string]$health.version -ne "3.4.4" -or
         [int]$health.protocol_version -ne 2 -or
@@ -942,7 +1012,82 @@ function Restore-ApiCompatTag {
     $script:CompatTagSwitched = $false
 }
 
+function Get-RollbackRegistryWitness {
+    param([AllowNull()][object]$State)
+    # Both observations come from the same pinned, read-only inspector. Keep a
+    # closed, typed canonical witness so missing values cannot compare as zero.
+    $proof = $State.quiescence
+    $root = $proof.root_identity
+    foreach ($shape in @(
+        @($State, "file_count,quiescence,total_bytes"),
+        @($proof, "record_count,registry_sha256,root_identity,schema,submission_watermark_bucket"),
+        @($root, "device,inode,mode,path,uid")
+    )) {
+        if ($null -eq $shape[0] -or $shape[0] -isnot [pscustomobject]) {
+            throw "output witness must contain typed objects"
+        }
+        $keys = @($shape[0].PSObject.Properties.Name | Sort-Object) -join ","
+        if ($keys -cne $shape[1]) { throw "output witness fields drifted" }
+    }
+    if ($proof.schema -isnot [string] -or $root.path -isnot [string] -or
+        $proof.schema -cne "mineru-output-quiescence.v1" -or
+        $root.path -cne "/var/lib/mineru-api-output") {
+        throw "output witness schema or root path drifted"
+    }
+    foreach ($value in @(
+        $State.file_count, $State.total_bytes, $proof.record_count,
+        $root.device, $root.inode, $root.uid, $root.mode
+    )) {
+        if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt 0) {
+            throw "output witness counters and identity must be nonnegative integers"
+        }
+    }
+    if ($null -eq $proof.registry_sha256) {
+        if ($State.file_count -ne 0 -or $State.total_bytes -ne 0 -or
+            $proof.record_count -ne 0 -or $null -ne $proof.submission_watermark_bucket) {
+            throw "absent registry requires an empty physical witness"
+        }
+    }
+    else {
+        $watermark = $proof.submission_watermark_bucket
+        if ($proof.registry_sha256 -isnot [string] -or
+            $proof.registry_sha256 -cnotmatch '\Asha256:[a-f0-9]{64}\z' -or
+            $State.file_count -ne 1 -or $State.total_bytes -le 0 -or
+            ($watermark -isnot [int] -and $watermark -isnot [long]) -or $watermark -lt -1) {
+            throw "present registry witness is invalid"
+        }
+    }
+    return ([ordered]@{
+        file_count = $State.file_count; total_bytes = $State.total_bytes
+        schema = $proof.schema
+        path = $root.path; device = $root.device; inode = $root.inode
+        uid = $root.uid; mode = $root.mode
+        registry_sha256 = $proof.registry_sha256
+        record_count = $proof.record_count
+        submission_watermark_bucket = $proof.submission_watermark_bucket
+    } | ConvertTo-Json -Depth 4 -Compress)
+}
+
+function Assert-RollbackRegistryUnchanged {
+    # Operator writer exclusion must span preflight through this decision,
+    # including requests already in Form parsing. Health is not a writer lock.
+    try {
+        $before = Get-RollbackRegistryWitness -State $PreDeploymentOutputState
+        $current = Get-QuiescentOutputState -CandidateSource
+        $after = Get-RollbackRegistryWitness -State $current
+    }
+    catch {
+        throw "rollback_blocked_registry_unverified: $($_.Exception.Message)"
+    }
+    if (-not [string]::Equals($before, $after, [StringComparison]::Ordinal)) {
+        throw "rollback_blocked_registry_changed: retained responsibilities or root identity changed"
+    }
+}
+
 function Restore-PreviousDeployment {
+    if ($DeploymentAttempted -and ($OldProjectContainers -contains "mineru-api")) {
+        Assert-RollbackRegistryUnchanged
+    }
     if ($ComposeExisted -and $ComposeBackupCreated) {
         Copy-Item -LiteralPath $ComposeBackup -Destination $ComposeTarget -Force
     }
@@ -1069,7 +1214,8 @@ try {
         Assert-TargetWritable -Path $target
     }
     if ($OldProjectContainers -contains "mineru-api") {
-        Get-QuiescentOutputState -CandidateSource | Out-Null
+        $PreDeploymentOutputState = Get-QuiescentOutputState -CandidateSource
+        Get-RollbackRegistryWitness -State $PreDeploymentOutputState | Out-Null
     }
     elseif (@(Get-ChildItem -LiteralPath $OutputRoot -Force).Count -ne 0) {
         throw "first installation requires a genuinely empty output root"

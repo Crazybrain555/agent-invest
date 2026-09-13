@@ -1382,8 +1382,23 @@ class RealPreimageTests(unittest.TestCase):
         )
         allocation_source = ast.get_source_segment(generated, allocation) or ""
         self.assertNotIn("with suppress(TaskProtocolConflict):", allocation_source)
-        self.assertGreaterEqual(allocation_source.count("if protocol_record is None:"), 2)
-        self.assertGreaterEqual(allocation_source.count("except TaskRegistryPersistenceError:"), 2)
+        calls = {
+            name: [node.lineno for node in ast.walk(allocation)
+                   if isinstance(node, ast.Call)
+                   and ((isinstance(node.func, ast.Name) and node.func.id == name)
+                        or (isinstance(node.func, ast.Attribute) and node.func.attr == name))]
+            for name in ("begin_submission", "create_task_output_dir", "save_upload_files",
+                         "bind_task_payload", "submit", "abort_ingress")
+        }
+        for name, lines in calls.items():
+            self.assertEqual(len(lines), 1, name)
+        ordered = ("begin_submission", "create_task_output_dir", "save_upload_files",
+                   "bind_task_payload", "submit")
+        for earlier, later in zip(ordered, ordered[1:]):
+            self.assertLess(calls[earlier][0], calls[later][0])
+        self.assertNotIn("cleanup_file(task_output_dir)", allocation_source)
+        self.assertIn("isinstance(exc, TaskRegistryPersistenceError)", allocation_source)
+        self.assertIn("status_code=503", allocation_source)
 
 
 if __name__ == "__main__":

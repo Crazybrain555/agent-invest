@@ -385,6 +385,285 @@ def _patch_registry_persistence_behavior(source: str) -> str:
     return source
 
 
+def _patch_admission_responsibility(source: str) -> str:
+    """Use durable ingress as the acceptance authority in the real API module."""
+    if "from mineru.cli.agent_task_protocol_v2 import (" not in source:
+        return source  # Reduced compatibility fixtures are not serving modules.
+    if "async def create_async_parse_task(" not in source:
+        # Same reduced-fixture boundary as _replace_exact_fixture_optional;
+        # the installer checks the whole official preimage before patching.
+        return source
+    source = _replace_exact(
+        source, "    DurableTaskRegistry, SplitTaskExecutor, TaskProtocolConflict,\n",
+        "    DurableTaskRegistry, SplitTaskExecutor, TaskProtocolConflict, TaskAdmissionFull,\n",
+        count=1, label="FastAPI admission exception import",
+    )
+    start = source.index("async def create_async_parse_task(\n")
+    end = source.index("\n\nclass AsyncTaskManager:\n", start)
+    original = source[start:end]
+    upload_start = original.index("        uploads = await save_upload_files(")
+    upload_end = original.index("        return task\n", upload_start) + len("        return task\n")
+    upload_body = original[upload_start:upload_end]
+    creation = '''async def create_async_parse_task(
+    request_options: ParseRequestOptions,
+) -> AsyncParseTask:
+    task_manager = get_task_manager()
+    identities = (request_options.agent_idempotency_key, request_options.agent_attempt_identity, request_options.agent_fence_identity)
+    if not all(isinstance(item, str) and item for item in identities):
+        raise HTTPException(status_code=400, detail="Task protocol v2 identities are required")
+    try:
+        record, created = task_manager.begin_submission(request_options)
+    except TaskAdmissionFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except TaskRegistryPersistenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TaskProtocolConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not created:
+        return task_manager.reconcile_submission(record)
+    task_id = record.task_id
+    try:
+        task_output_dir = create_task_output_dir(task_id)
+        uploads_dir = os.path.join(task_output_dir, "uploads")
+        os.mkdir(uploads_dir)
+        task_manager.task_protocol_v2.bind_ingress_root(record.idempotency_key)
+''' + upload_body + '''    except BaseException as exc:
+        try:
+            current = task_manager.task_protocol_v2.get(record.idempotency_key)
+            if current is not None and current.state in {"ingress", "ingress_cleanup"}:
+                task_manager.task_protocol_v2.abort_ingress(record.idempotency_key)
+        except BaseException as cleanup_exc:
+            raise cleanup_exc from exc
+        if isinstance(exc, TaskRegistryPersistenceError):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if isinstance(exc, TaskProtocolConflict):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
+    finally:
+        task_manager.finish_submission(task_id)
+'''
+    source = source[:start] + creation + source[end:]
+    source = _replace_exact(
+        source, "        self._next_submit_order = 1\n",
+        "        self._next_submit_order = 1\n"
+        "        self._scheduled_task_ids: set[str] = set()\n"
+        "        self._ingress_in_flight: set[str] = set()\n"
+        "        self._ingress_drained = asyncio.Event()\n"
+        "        self._ingress_drained.set()\n"
+        "        self._schedule_changed = asyncio.Event()\n",
+        count=1, label="FastAPI live scheduling and upload ownership",
+    )
+    source = _replace_exact(
+        source,
+        "            if task.status not in TASK_TERMINAL_STATES:\n"
+        "                task.status = TASK_PENDING\n"
+        "                self.queue.put_nowait(task.task_id)\n",
+        "        self._refill_pending_queue()\n",
+        count=1, label="FastAPI bounded recovery refill",
+    )
+    start = source.index("    async def shutdown(self) -> None:\n", source.index("class AsyncTaskManager:"))
+    end = source.index("    def get_queued_ahead(", start)
+    source = source[:start] + '''    def begin_submission(self, options):
+        key = options.agent_idempotency_key
+        existing = self.task_protocol_v2.get(key)
+        if existing is None and self.is_shutting_down:
+            raise HTTPException(status_code=503, detail="Task manager is shutting down")
+        if existing is None:
+            reason = self.admission_snapshot()["blocked_reason"]
+            if reason not in {None, "capacity_full"}:
+                raise HTTPException(status_code=503, detail=reason)
+        record, created = self.task_protocol_v2.reconcile_or_create(
+            idempotency_key=key, task_id=str(uuid.uuid4()),
+            attempt_identity=options.agent_attempt_identity,
+            fence_identity=options.agent_fence_identity,
+            max_nonterminal_tasks=self.max_nonterminal_tasks,
+        )
+        if created:
+            self._ingress_in_flight.add(record.task_id)
+            self._ingress_drained.clear()
+        return record, created
+
+    def finish_submission(self, task_id: str) -> None:
+        self._ingress_in_flight.discard(task_id)
+        if not self._ingress_in_flight:
+            self._ingress_drained.set()
+
+    def reconcile_submission(self, record):
+        if record.state in {"ingress", "ingress_cleanup"}:
+            raise HTTPException(status_code=503, detail={
+                "code": ("task_ingress_in_progress" if record.task_id in self._ingress_in_flight
+                         else "ingress_recovery_required"), "task_id": record.task_id,
+                "accepted": False,
+            })
+        task = self.get(record.task_id)
+        if task is None:
+            raise HTTPException(status_code=410 if record.state == "consumed" else 503,
+                                detail="Task responsibility requires reconciliation")
+        return task
+
+    def _refill_pending_queue(self) -> None:
+        if self.last_worker_error is not None:
+            return
+        for task in sorted(self.tasks.values(), key=lambda item: (item.submit_order, item.created_at, item.task_id)):
+            if len(self._scheduled_task_ids) >= self.max_nonterminal_tasks or self.queue.full():
+                break
+            if task.status == TASK_PENDING and task.task_id not in self._scheduled_task_ids:
+                self.queue.put_nowait(task.task_id)
+                self._scheduled_task_ids.add(task.task_id)
+
+    def _finish_scheduled_task(self, task_id, processor) -> None:
+        self._on_processor_done(processor)
+        if processor.cancelled():
+            self.last_worker_error = "Task processor was cancelled with retained responsibility"
+        self._scheduled_task_ids.discard(task_id)
+        try:
+            self._refill_pending_queue()
+        except Exception as exc:
+            self.last_worker_error = str(exc)
+            self._wake_waiters()
+            raise
+        finally:
+            self._schedule_changed.set()
+
+    async def shutdown(self) -> None:
+        self.is_shutting_down = True
+        self._wake_waiters()
+        await self._ingress_drained.wait()
+        self._refill_pending_queue()
+        while self._scheduled_task_ids:
+            if self.last_worker_error is not None:
+                raise RuntimeError("Task shutdown is incomplete: " + self.last_worker_error)
+            if self.dispatcher_task is None or self.dispatcher_task.done():
+                raise RuntimeError("Task dispatcher stopped with retained responsibility")
+            self._schedule_changed.clear()
+            await self._schedule_changed.wait()
+        status = self.task_protocol_v2.admission_status(set(self.tasks))
+        if status["durable_nonterminal_tasks"]:
+            raise RuntimeError("durable task responsibilities remain during shutdown")
+        if self.dispatcher_task is not None:
+            self.dispatcher_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.dispatcher_task
+            self.dispatcher_task = None
+        if self.cleanup_task is not None:
+            self.cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.cleanup_task
+            self.cleanup_task = None
+        self.active_tasks.clear()
+        self.task_protocol_v2.cleanup_consumed()
+
+    async def submit(self, task: AsyncParseTask) -> None:
+        record = self.task_protocol_v2.get(task.agent_idempotency_key)
+        if record is None or record.task_id != task.task_id or record.task_payload is None:
+            raise TaskProtocolConflict("Task was not durably accepted")
+        if task.task_id not in self.tasks:
+            task.submit_order = self._next_submit_order
+            self._next_submit_order += 1
+            self.tasks[task.task_id] = task
+            self.task_events[task.task_id] = asyncio.Event()
+        # Existing accepted responsibility may complete ingress after stop.
+        # The registry already reserved capacity; queue fullness is not rejection.
+        self._refill_pending_queue()
+
+    def get(self, task_id: str) -> Optional[AsyncParseTask]:
+        record = self.task_protocol_v2.get_by_task_id(task_id)
+        if record is None or record.state in {"ingress", "ingress_cleanup", "consumed"}:
+            return None
+        failure = self.task_wait_failures.get(task_id)
+        if failure is not None:
+            raise HTTPException(status_code=503, detail={
+                "code": "accepted_recovery_required", "task_id": task_id, "accepted": True,
+                "phase": failure.phase, "outcome": failure.outcome, "committed": failure.committed,
+            }) from failure
+        if record.state in {"processing", "finalizing"} and task_id not in self._scheduled_task_ids:
+            raise HTTPException(status_code=503, detail={
+                "code": "accepted_recovery_required", "task_id": task_id, "accepted": True,
+            }) from self.task_wait_failures.get(task_id)
+        payload = self.task_protocol_v2.task_payload_for_route(record.idempotency_key)
+        if payload is None:
+            return None
+        task = self.tasks.get(task_id)
+        if task is None:
+            task = AsyncParseTask(**payload)
+            self.tasks[task_id] = task
+            self.task_events.setdefault(task_id, asyncio.Event())
+        else:
+            for name in ("status", "error", "result_artifact_path", "result_artifact_sha256",
+                         "result_artifact_bytes", "result_artifact_owner"):
+                setattr(task, name, payload[name])
+        self._refill_pending_queue()
+        return task
+
+    def admission_snapshot(self):
+        snapshot = self.task_protocol_v2.admission_status(set(self.tasks), self._ingress_in_flight)
+        count = snapshot["durable_nonterminal_tasks"]
+        reason = None
+        if self.is_shutting_down:
+            reason = "shutting_down"
+        elif self.last_worker_error is not None:
+            reason = "worker_unavailable"
+        elif snapshot["unowned_ingress_tasks"] or snapshot["ingress_cleanup_tasks"]:
+            reason = "ingress_recovery_required"
+        elif snapshot["routeless_accepted_tasks"]:
+            reason = "accepted_recovery_required"
+        elif count > self.max_nonterminal_tasks:
+            reason = "recovery_overcommitted"
+        elif count == self.max_nonterminal_tasks:
+            reason = "capacity_full"
+        snapshot.update(
+            nonterminal_limit=self.max_nonterminal_tasks,
+            scheduled_tasks=len(self._scheduled_task_ids), queue_depth=self.queue.qsize(),
+            active_processors=sum(not task.done() for task in self.active_tasks),
+            recovery_overcommitted=count > self.max_nonterminal_tasks,
+            admission_open=reason is None, blocked_reason=reason,
+        )
+        return snapshot
+
+''' + source[end:]
+    source = _replace_exact(
+        source, "    task_output_dir.mkdir(parents=True, exist_ok=True)\n",
+        "    task_output_dir.mkdir(exist_ok=False)\n",
+        count=1, label="FastAPI new-only task output directory",
+    )
+    source = _replace_exact(
+        source, "    def _wake_waiters(self) -> None:\n",
+        "    def _wake_waiters(self) -> None:\n        self._schedule_changed.set()\n",
+        count=1, label="FastAPI shutdown failure wakeup",
+    )
+    source = _replace_exact(
+        source, "    stats = task_manager.get_stats()\n",
+        "    stats = task_manager.get_stats()\n    admission = task_manager.admission_snapshot()\n",
+        count=1, label="FastAPI durable admission health snapshot",
+    )
+    source = _replace_exact(
+        source, '        "queued_tasks": stats[TASK_PENDING],\n'
+        '        "processing_tasks": stats[TASK_PROCESSING],\n',
+        '        "task_admission": admission,\n'
+        '        "queued_tasks": admission["ingress_tasks"] + admission["accepted_pending_tasks"],\n'
+        '        "processing_tasks": admission["accepted_processing_tasks"] + admission["accepted_finalizing_tasks"],\n',
+        count=1, label="FastAPI health includes upload and finalizer responsibility",
+    )
+    source = _replace_exact(
+        source, '        "status": "healthy",\n',
+        '        "status": "recovering" if admission["recovery_overcommitted"] else "healthy",\n',
+        count=1, label="FastAPI overcommitted recovery is not qualified healthy",
+    )
+    source = _replace_exact(
+        source, "                processor.add_done_callback(self._on_processor_done)\n",
+        "                processor.add_done_callback(\n"
+        "                    lambda done, key=task_id: self._finish_scheduled_task(key, done)\n"
+        "                )\n", count=1, label="FastAPI refill on actual task completion",
+    )
+    source = _replace_exact(
+        source,
+        "    task = None if record is None else task_manager.get(record.task_id)\n",
+        "    task = None if record is None else task_manager.reconcile_submission(record)\n",
+        count=1, label="FastAPI ingress-aware keyed lookup",
+    )
+    return source
+
+
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
 
@@ -1287,6 +1566,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             label="FastAPI task protocol cleanup ownership",
         )
         source = _patch_registry_persistence_behavior(source)
+        source = _patch_admission_responsibility(source)
         return source
 
     if relative_path == "mineru/utils/model_utils.py":

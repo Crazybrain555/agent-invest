@@ -518,39 +518,82 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             MINERU_API_HEALTH_FIELDS, parse_mineru_api_health, validate_mineru_api_health,
         )
         from scripts.windows.mineru_heap_trim_compat.agent_task_protocol_v2 import (
-            DurableTaskRegistry, SplitTaskExecutor, task_protocol_runtime_status,
+            task_protocol_runtime_status,
         )
+        from tests._mineru_admission_fixture import AdmissionFixture, Upload
 
-        patched = patch_source("mineru/cli/fast_api.py", _fast_api_fixture())
-        function = next(node for node in ast.parse(patched).body
-                        if isinstance(node, ast.FunctionDef) and node.name == "health_payload")
-        namespace = {
-            "get_max_concurrent_requests": lambda: 1, "get_max_pending_tasks": lambda: 1,
-            "strict_processing_window_size": lambda: 16,
-            "task_protocol_runtime_status": task_protocol_runtime_status,
-        }
-        exec(compile(ast.Module(body=[function], type_ignores=[]), "patched-health", "exec"), namespace)
+        async def exercise(root: Path) -> None:
+            fx = AdmissionFixture(root)
+            # The independently owned fixture defaults to tiny IO-test budgets.
+            # Reconstruct an actual, still empty manager under explicit serving
+            # values; neither manager has started or accepted work at this point.
+            try:
+                with patch.dict(os.environ, {
+                    "MINERU_API_TASK_RETENTION_SECONDS": "600",
+                    "MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS": "30",
+                    "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES": "2147483648",
+                    "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "268435456",
+                }):
+                    fx.manager = fx.module.AsyncTaskManager(fx.manager.app)
+                    namespace = fx.module.__dict__
+                    namespace.update({
+                        "app": SimpleNamespace(state=SimpleNamespace(task_manager=fx.manager)),
+                        "__version__": "3.4.4", "API_PROTOCOL_VERSION": 2,
+                        "strict_processing_window_size": lambda: 16,
+                        "task_protocol_runtime_status": task_protocol_runtime_status,
+                    })
+                    # Full hash-pinned upstream FastAPI preimage, not the old
+                    # toy health_payload fragment. Only its real endpoint runs.
+                    endpoint = next(node for node in ast.parse(fx.generated).body
+                                    if isinstance(node, ast.AsyncFunctionDef)
+                                    and node.name == "health_check")
+                    endpoint.decorator_list = []
+                    exec(compile(ast.Module(body=[endpoint], type_ignores=[]),
+                                 "<actual-generated-health-check>", "exec"), namespace)
+                    await fx.manager.start()
+                    try:
+                        before = {str(path.relative_to(root)): path.read_bytes()
+                                  for path in root.rglob("*") if path.is_file()}
+                        payload = await namespace["health_check"]()
+                        normalized = parse_mineru_api_health(json.dumps(payload).encode(),
+                                                             expected_task_slots=1)
+                        self.assertEqual(set(normalized), MINERU_API_HEALTH_FIELDS)
+                        self.assertEqual(validate_mineru_api_health(normalized,
+                                                                   expected_task_slots=1), normalized)
+                        self.assertEqual(payload["task_protocol_runtime"]["schema"],
+                                         "mineru-task-runtime.v2")
+                        self.assertEqual(payload["task_admission"]["durable_nonterminal_tasks"], 0)
+                        self.assertEqual(before, {str(path.relative_to(root)): path.read_bytes()
+                                                  for path in root.rglob("*") if path.is_file()})
+                        with self.assertRaisesRegex(ValueError, "wire health"):
+                            parse_mineru_api_health(json.dumps(normalized).encode(),
+                                                   expected_task_slots=1)
+                        entered, release = asyncio.Event(), asyncio.Event()
+                        pending = asyncio.create_task(fx.create(fx.options("health-upload", upload=Upload(
+                            entered=entered, release=release,
+                            failure=RuntimeError("independent upload observation boundary"),
+                        ))))
+                        try:
+                            await asyncio.wait_for(entered.wait(), 1)
+                            uploading = await namespace["health_check"]()
+                            observed = parse_mineru_api_health(json.dumps(uploading).encode(),
+                                                              expected_task_slots=1)
+                            self.assertEqual((observed["queued_tasks"], observed["processing_tasks"]), (1, 0))
+                            self.assertEqual(uploading["task_admission"]["ingress_tasks"], 1)
+                            self.assertEqual(uploading["task_admission"]["blocked_reason"], "capacity_full")
+                            self.assertEqual(uploading["task_admission"]["queue_depth"], 0)
+                        finally:
+                            release.set()
+                            result = await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 2)
+                        self.assertIsInstance(result[0], BaseException)
+                    finally:
+                        await asyncio.wait_for(fx.manager.shutdown(), 2)
+            finally:
+                await fx.dispose_test_tasks()
+                fx.close()
+
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            manager = SimpleNamespace(
-                task_protocol_v2=DurableTaskRegistry(
-                    root / "registry.json", output_root=root, max_unacked_result_bytes=2147483648,
-                ),
-                task_protocol_executor=SplitTaskExecutor(parse_slots=1, finalizer_slots=1),
-                max_nonterminal_tasks=1,
-            )
-            payload = {
-                "status": "healthy", "version": "3.4.4", "protocol_version": 2,
-                "queued_tasks": 0, "processing_tasks": 0, "completed_tasks": 0,
-                "failed_tasks": 0, "task_retention_seconds": 600,
-                "task_cleanup_interval_seconds": 30, **namespace["health_payload"](manager),
-            }
-            normalized = parse_mineru_api_health(json.dumps(payload).encode(), expected_task_slots=1)
-            self.assertEqual(set(normalized), MINERU_API_HEALTH_FIELDS)
-            self.assertEqual(validate_mineru_api_health(normalized, expected_task_slots=1), normalized)
-            with self.assertRaisesRegex(ValueError, "wire health"):
-                parse_mineru_api_health(json.dumps(normalized).encode(), expected_task_slots=1)
-            self.assertEqual(list(root.iterdir()), [])
+            asyncio.run(asyncio.wait_for(exercise(Path(directory).resolve()), 8))
         collector = (Path(__file__).resolve().parents[2] / "scripts/windows/collect_mineru_runtime.ps1").read_text()
         self.assertNotIn("get_task_manager", collector)
         self.assertNotIn("from mineru.cli.fast_api", collector)

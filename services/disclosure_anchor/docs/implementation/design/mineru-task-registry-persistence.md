@@ -163,11 +163,84 @@ behavior, while shutdown continues to wake waiters through the manager signal.
 Startup clears only this process-local map before durable cleanup/recovery
 reconstructs routes.
 
-HTTP conflict boundaries return 503 for persistence failures. Failed request
-setup deletes the task tree only after durable `abandon_unbound`; persistence
-ambiguity preserves the input for exact retry.
+HTTP conflict boundaries return 503 for persistence failures. Accepted input
+survives a routing, submission, or persistence-response failure. Incomplete
+ingress uses the owned cleanup sequence below; persistence ambiguity preserves
+the input and its responsibility for reconciliation.
 
 Health remains closed: a degraded or uncertain persistence status raises the
 structured persistence error rather than reporting a healthy runtime. This is
 an operational signal for P1 recovery, not proof of complete M6 service
 qualification.
+
+## Ingress and acceptance (M6 admission responsibility R1)
+
+The registry writer uses `mineru-task-registry.v3`; the decoder explicitly
+accepts the original closed v2 shape and the new closed v3 shape. The new
+private `ingress_owner` field is absent from v2. An older executable cannot
+read v3; restoring its image alone is not a registry rollback. Deployment
+still requires an independently inspected quiescent output root and retained
+backups. Never delete retained responsibilities to make a rollback pass.
+Before automatic rollback can restart an existing older API, the installer
+requires the complete predeployment physical witness to remain identical:
+root identity, registry bytes or absence, counts and submission watermark.
+Changed evidence blocks rollback; missing, unreadable or malformed evidence
+blocks it as unverified. This check precedes restoring any old deployment
+files or tag. Operator writer exclusion must span the entire operation,
+including already-issued requests still in multipart/Form processing.
+
+After FastAPI has parsed the Form, but before creating an API-owned directory
+or awaiting upload copies, new keyed ingress reserves durable nonterminal
+capacity atomically. Existing keys reconcile their original task/attempt/fence
+before capacity is charged. A fresh over-capacity request gets 429 without an
+owned directory or executable payload. This boundary does not claim that the
+framework avoided reading or spooling the multipart body.
+
+The nonterminal count is `ingress + ingress_cleanup + pending + processing +
+finalizing`, with each durable record counted once. A new-only task directory
+and uploads directory are pinned by actual device/inode/uid/mode receipts.
+Complete upload files and their containing namespaces are synced before one
+durable transition binds the payload and changes ingress to pending. That
+transition is executable acceptance; queue insertion is a derived operation
+and cannot subsequently reject the accepted task as fresh 429 work.
+
+An upload failure first persists `ingress_cleanup`. Only identity-checked
+owned deletion and namespace sync, followed by registry persistence, release
+the preparation credit. A crash between directory creation and owner-receipt
+persistence is not an atomic filesystem transaction: an existing directory
+without its receipt remains charged and requires recovery. Neither cold
+recovery nor legacy `abandon_unbound` may delete such a record by guessing
+ownership from its task ID.
+
+Same-key retries during live ingress report the original task ID with
+`accepted=false`; abandoned ingress reports recovery required. Accepted
+pending tasks missing an online route hydrate the existing payload without
+changing generation or invoking cold replay. Processing/finalizing tasks
+without a scheduled owner report recovery required. Any accepted task with a
+known persistence failure, including a pending task whose processing transition
+failed, reports 503 with the original phase/outcome/committed diagnostics and
+exception cause. Wire status remains pending/processing/completed/failed;
+finalizing projects as processing and cleanup intent projects its original
+completed/failed terminal, while the protocol state keeps the actual phase.
+
+Stopping closes fresh admission and waits for already-owned uploads to accept
+or clean up. Completion callbacks drive bounded pending refill and shutdown;
+an already-completed queue join is not a reason to spin on the event loop.
+Cold accepted backlog can exceed the current admission limit, remains durable,
+and refills only available scheduling capacity. It is reported as recovering,
+not as a qualified idle runtime.
+
+New health uses `mineru-task-runtime.v2` with registry schema v3 and scope
+`post_form_owned_upload`, plus closed `mineru-task-admission.v1` evidence.
+The normalized 13-field observation remains: queued counts ingress plus
+accepted pending responsibility, processing includes finalizing. Physical queue
+depth, live processors, scheduled IDs, route-less accepted tasks and unowned
+ingress are separate gauges. Thus upload responsibility cannot disappear from
+idle checks or sampled nonterminal load. Observers retain an explicit closed
+legacy-v1 branch for old service inspection; the new runtime collector and new
+installation qualification require v2 admission evidence. Overcommitted
+recovery remains diagnostically visible and fails normal qualification.
+
+These changes do not qualify parser cancellation at the native CPU boundary,
+advance all output reservations before parse, increase concurrency parameters,
+or establish real GPU throughput. Those remain separate Pro-plan steps.

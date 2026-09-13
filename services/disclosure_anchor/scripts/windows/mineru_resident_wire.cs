@@ -760,22 +760,34 @@ public sealed class MineruQueueTelemetry {
     public string Observe(string healthJson,string httpJson,string metricsText) {
         if(Thread.CurrentThread.ManagedThreadId!=owner) throw new InvalidOperationException("queue crossed owner thread");
         MineruJsonValue health=MineruResidentWire.Parse(healthJson,8192);
-        health.Keys("status","version","protocol_version","queued_tasks","processing_tasks","completed_tasks","failed_tasks",
+        MineruJsonValue runtime=health.Get("task_protocol_runtime");
+        bool admissionV2=runtime.Get("schema").String()=="mineru-task-runtime.v2";
+        List<string> healthKeys=new List<string>(new string[] {
+            "status","version","protocol_version","queued_tasks","processing_tasks","completed_tasks","failed_tasks",
             "max_concurrent_requests","max_pending_tasks_requested","max_pending_tasks_effective","processing_window_size",
-            "task_retention_seconds","task_cleanup_interval_seconds","task_protocol_schema","task_protocol_runtime");
+            "task_retention_seconds","task_cleanup_interval_seconds","task_protocol_schema","task_protocol_runtime"});
+        if(admissionV2) healthKeys.Add("task_admission");
+        health.Keys(healthKeys.ToArray());
         if(health.Get("status").String()!="healthy" || health.Get("version").String()!="3.4.4" ||
            health.Get("task_protocol_schema").String()!="mineru-task-protocol.v2") throw new FormatException("API identity drift");
         Expect(health,"protocol_version",2); Expect(health,"max_concurrent_requests",1);
         Expect(health,"max_pending_tasks_requested",1); Expect(health,"max_pending_tasks_effective",1);
         Expect(health,"processing_window_size",16); Expect(health,"task_retention_seconds",600);
         Expect(health,"task_cleanup_interval_seconds",30);
-        MineruJsonValue runtime=health.Get("task_protocol_runtime");
-        runtime.Keys("schema","enabled","task_registry_max_records","task_result_reservation_bytes","max_unacked_result_bytes");
-        if(runtime.Get("schema").String()!="mineru-task-runtime.v1" || runtime.Get("enabled").Raw!="true")
+        if(admissionV2) {
+            runtime.Keys("schema","enabled","task_registry_max_records","task_result_reservation_bytes",
+                "max_unacked_result_bytes","registry_schema","admission_scope");
+            if(runtime.Get("registry_schema").String()!="mineru-task-registry.v3" ||
+               runtime.Get("admission_scope").String()!="post_form_owned_upload")
+                throw new FormatException("task runtime admission identity drift");
+        } else runtime.Keys("schema","enabled","task_registry_max_records","task_result_reservation_bytes","max_unacked_result_bytes");
+        if((!admissionV2 && runtime.Get("schema").String()!="mineru-task-runtime.v1") || runtime.Get("enabled").Raw!="true")
             throw new FormatException("task runtime disabled/drift");
         Expect(runtime,"task_registry_max_records",128); Expect(runtime,"task_result_reservation_bytes",268435456);
         Expect(runtime,"max_unacked_result_bytes",2147483648);
         long queued=health.Get("queued_tasks").Integer(),processing=health.Get("processing_tasks").Integer();
+        if(admissionV2) ValidateAdmission(health.Get("task_admission"),queued,processing,
+            health.Get("max_pending_tasks_effective").Integer());
         // Health terminal counts are registry gauges, not monotonic counters.
         health.Get("completed_tasks").Integer(); health.Get("failed_tasks").Integer();
         if(queued>1 || processing>1 || queued+processing>1) throw new FormatException("API task capacity overflow");
@@ -799,5 +811,38 @@ public sealed class MineruQueueTelemetry {
             "vllm_kv_cache_usage_ratio",ratio,"vllm_preemptions_total",MineruResidentWire.Integer(currentPreemptions));
         preemptions=currentPreemptions;
         return MineruResidentWire.Object("reason","null","status","\"supported\"","values",values);
+    }
+
+    static void ValidateAdmission(MineruJsonValue value,long queued,long processing,long limit) {
+        string[] counters={"nonterminal_limit","ingress_tasks","accepted_pending_tasks","accepted_processing_tasks",
+            "accepted_finalizing_tasks","durable_nonterminal_tasks","routeless_accepted_tasks","ingress_cleanup_tasks",
+            "unowned_ingress_tasks","scheduled_tasks","queue_depth","active_processors"};
+        List<string> keys=new List<string>(counters);
+        keys.AddRange(new string[]{"schema","registry_schema","recovery_overcommitted","admission_open","blocked_reason"});
+        value.Keys(keys.ToArray());
+        if(value.Get("schema").String()!="mineru-task-admission.v1" ||
+           value.Get("registry_schema").String()!="mineru-task-registry.v3") throw new FormatException("admission identity drift");
+        Dictionary<string,long> counts=new Dictionary<string,long>();
+        foreach(string key in counters) {
+            long count=value.Get(key).Integer();
+            if(count>128) throw new FormatException("admission counter exceeds envelope");
+            counts.Add(key,count);
+        }
+        long ingress=counts["ingress_tasks"],accepted=counts["accepted_pending_tasks"]+
+            counts["accepted_processing_tasks"]+counts["accepted_finalizing_tasks"],total=ingress+accepted;
+        if(limit<1 || counts["nonterminal_limit"]!=limit || total!=counts["durable_nonterminal_tasks"] ||
+           queued!=ingress+counts["accepted_pending_tasks"] ||
+           processing!=counts["accepted_processing_tasks"]+counts["accepted_finalizing_tasks"] ||
+           counts["routeless_accepted_tasks"]>accepted || counts["ingress_cleanup_tasks"]>ingress ||
+           counts["unowned_ingress_tasks"]>ingress || counts["queue_depth"]+counts["active_processors"]>counts["scheduled_tasks"] ||
+           counts["scheduled_tasks"]>limit || value.Get("recovery_overcommitted").Raw!=(total>limit ? "true":"false"))
+            throw new FormatException("admission responsibility counters disagree");
+        string expected=counts["unowned_ingress_tasks"]>0 || counts["ingress_cleanup_tasks"]>0 ? "ingress_recovery_required" :
+            counts["routeless_accepted_tasks"]>0 ? "accepted_recovery_required" : total>limit ? "recovery_overcommitted" :
+            total==limit ? "capacity_full" : null;
+        string reason=value.Get("blocked_reason").Raw=="null" ? null : value.Get("blocked_reason").String();
+        if((reason!="shutting_down" && reason!="worker_unavailable" && reason!=expected) ||
+           value.Get("admission_open").Raw!=(reason==null ? "true":"false"))
+            throw new FormatException("admission availability contradicts responsibilities");
     }
 }

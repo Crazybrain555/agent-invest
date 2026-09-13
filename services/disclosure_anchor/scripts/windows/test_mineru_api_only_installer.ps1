@@ -26,7 +26,8 @@ $ast = [Management.Automation.Language.Parser]::ParseFile([IO.Path]::GetFullPath
 if (@($parseErrors).Count) { throw ($parseErrors | Out-String) }
 $Allow = @('ConvertFrom-NativeProcessText', 'Get-OptionalImageId', 'Get-StableServiceEpochs', 'Assert-StableServiceEpochs',
     'Assert-ApiOnlyUpgradeInputs', 'Invoke-ApiOnlyRecreate', 'Get-ApiCompatBuildIdentity', 'Get-ValidatedApiCompatImage',
-    'Get-ValidatedPublishedApiCompatImage', 'Remove-CompatBuildTag', 'Restore-ApiCompatTag', 'Restore-PreviousDeployment')
+    'Get-ValidatedPublishedApiCompatImage', 'Remove-CompatBuildTag', 'Restore-ApiCompatTag',
+    'Get-RollbackRegistryWitness', 'Assert-RollbackRegistryUnchanged', 'Restore-PreviousDeployment')
 foreach ($name in $Allow) {
     $nodes = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true))
     if ($nodes.Count -ne 1) { throw "expected one function $name" }
@@ -64,6 +65,25 @@ function Invoke-Docker {
     if (($Arguments -join '|') -eq ('tag|' + $OldApiCompatImageId + '|' + $ApiCompatImage)) { $script:PublishedApiImage = $OldApiCompatImageId; return '' }
     if (($Arguments -join '|') -eq ('image|rm|' + $ApiCompatBuildTag)) { return '' }
     throw ('SAFETY: unexpected Docker command rejected by mock: ' + ($Arguments -join '|'))
+}
+# Existing rollback cases model a deployed old API before any submission. The
+# exact absent-registry witness is fresh IO data; the real guard is AST-loaded.
+$DeploymentAttempted = $true
+$OldProjectContainers = @('mineru-api','mineru-api-proxy','mineru-openai-server')
+$PreDeploymentOutputState = [pscustomobject]@{
+    file_count = 0; total_bytes = 0
+    quiescence = [pscustomobject]@{
+        schema = 'mineru-output-quiescence.v1'
+        root_identity = [pscustomobject]@{ path='/var/lib/mineru-api-output'; device=41; inode=9001; uid=0; mode=16832 }
+        registry_sha256 = $null; record_count = 0; submission_watermark_bucket = $null
+    }
+}
+$script:RollbackProbeCount = 0
+function Get-QuiescentOutputState {
+    param([switch]$CandidateSource)
+    if (-not $CandidateSource) { throw 'independent rollback requires actual candidate inspector selection' }
+    $script:RollbackProbeCount++
+    return (($PreDeploymentOutputState | ConvertTo-Json -Depth 8 -Compress) | ConvertFrom-Json)
 }
 function Wait-Healthy { $script:WaitCount++; return 'mock-healthy' }
 function Get-ValidatedRuntime { $script:RuntimeCount++; return 'mock-runtime' }
@@ -184,8 +204,9 @@ Case 'optional image absence is distinguished from daemon or malformed errors' {
     Reject { Get-OptionalImageId 'test:missing' } 'invalid image ID'
     $script:NativeReply = $null
 }
+Check ($script:RollbackProbeCount -eq 5) 'real guard must freshly probe every existing Restore invocation'
 $failed = @($script:Results | Where-Object { $_.status -ne 'pass' }).Count
-$evidence = [ordered]@{ contract_version = 'm6.independent-installer-tests.v1'; installer_sha256 = ('sha256:' + (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()); script_sha256 = ('sha256:' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()); loaded_functions = $Allow; top_level_executed = $false; native_or_docker_executed = $false; output_root = $OutputRoot; failed = $failed; results = @($script:Results.ToArray()) }
+$evidence = [ordered]@{ contract_version = 'm6.independent-installer-tests.v1'; installer_sha256 = ('sha256:' + (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()); script_sha256 = ('sha256:' + (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()); loaded_functions = $Allow; rollback_candidate_probe_count = $script:RollbackProbeCount; top_level_executed = $false; native_or_docker_executed = $false; output_root = $OutputRoot; failed = $failed; results = @($script:Results.ToArray()) }
 [IO.File]::WriteAllText((Join-Path $OutputRoot 'installer-evidence.json'), ($evidence | ConvertTo-Json -Depth 20), $utf8)
 if ($failed) { exit 1 }
 Write-Host 'PASS independent installer functions-only mocked boundaries; no deployment executed.'

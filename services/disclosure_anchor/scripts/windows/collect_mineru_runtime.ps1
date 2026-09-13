@@ -643,14 +643,23 @@ runtime = serving_health["task_protocol_runtime"]
 if (
     serving_health.get("task_protocol_schema") != "mineru-task-protocol.v2"
     or set(runtime) != {"schema", "enabled", "task_registry_max_records",
-                        "task_result_reservation_bytes", "max_unacked_result_bytes"}
-    or runtime["schema"] != "mineru-task-runtime.v1" or runtime["enabled"] is not True
+                        "task_result_reservation_bytes", "max_unacked_result_bytes",
+                        "registry_schema", "admission_scope"}
+    or runtime["schema"] != "mineru-task-runtime.v2" or runtime["enabled"] is not True
+    or runtime["registry_schema"] != "mineru-task-registry.v3"
+    or runtime["admission_scope"] != "post_form_owned_upload"
     or any(type(runtime[name]) is not int or runtime[name] < 1 for name in (
         "task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes"
     ))
     or type(serving_health.get("max_pending_tasks_effective")) is not int
 ):
     raise RuntimeError("serving API task runtime evidence is invalid")
+agent_task_protocol_v2.validate_mineru_task_admission(
+    serving_health.get("task_admission"),
+    queued_tasks=serving_health["queued_tasks"],
+    processing_tasks=serving_health["processing_tasks"],
+    nonterminal_limit=serving_health["max_pending_tasks_effective"],
+)
 marker = json.loads(
     Path("/opt/agent-invest/mineru-serial-v1/compatibility.json")
     .read_text(encoding="utf-8")

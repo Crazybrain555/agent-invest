@@ -189,8 +189,12 @@ held-out 验收后，应删除这个兼容层而不是永久形成私有 fork。
 并以 `--pull=false` 构建和验证唯一临时 tag；完成 target writable/output-root 预检并保存旧
 stable tag→image ID 后，才把固定发布 tag 原子指向新 image。随后只写固定 compose 以及
 `C:\ProgramData\agent-invest\mineru-runtime-v6\` 下的 collector/receipt。任何部署后 identity、
-health、网络、egress、空 output-root 或 formal collector 校验失败都会恢复旧 tag 映射、旧 compose、
-旧 collector、旧 receipt 和旧容器运行态，并删除临时 tag。不要手工把 v6 reader 改回兼容任意历史路径，也不要在同一次处置中
+health、网络、egress、output-root 或 formal collector 校验失败时，若已尝试启动候选 API 且存在
+旧 API，必须先证明输出根与部署前完整 witness 一致，才恢复旧 tag、compose、collector、receipt
+和容器运行态。根身份、registry 哈希或物理缺失状态、计数、水位变化时返回
+`rollback_blocked_registry_changed`；无法读取或验证证据时返回
+`rollback_blocked_registry_unverified`。被阻断时保留现场、旧备份及原始失败，不自动启动旧 reader，
+也不覆盖 registry。不要手工把 v6 reader 改回兼容任意历史路径，也不要在同一次处置中
 重启 Docker Desktop、Windows、Tailscale 或 v2rayN。
 安装器与 collector 在 Windows PowerShell 5.1 中通过同一 `System.Diagnostics.Process` 调用层取得
 显式 `ExitCode/stdout/stderr`，并并行排空双流、以 UTF-8 字节写入 `docker exec -i`；不得改回依赖
@@ -200,8 +204,8 @@ health、网络、egress、空 output-root 或 formal collector 校验失败都�
 `-ApiOnlyCompatibilityUpgrade`。此模式要求完整旧部署和与 live target **完全相同**的
 compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurrentPublishedImage` 同用。
 它仍从审核后的源码构建新镜像、备份旧文件及 tag；部署和失败回滚均只执行
-`up --detach --no-build --no-deps --force-recreate mineru-api`。回滚先恢复旧 tag 与文件，
-再重建 API、验证旧 API image、健康状态以及推理服务/代理的原 ID、image、started_at。
+`up --detach --no-build --no-deps --force-recreate mineru-api`。回滚通过上述 witness 检查后才恢复
+旧 tag 与文件，再重建 API、验证旧 API image、健康状态以及推理服务/代理的原 ID、image、started_at。
 机器断线或监督进程超时仍须核对 daemon 状态；不能把客户端退出当作完成回滚。
 完整项目安装模式保留给明确授权的初装或拓扑变更，不能借 dry-run 代替此 API 单独升级边界。
 `scripts/windows/test_mineru_api_only_installer.ps1 -InstallerPath <reviewed-installer.ps1>`
@@ -212,16 +216,21 @@ compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurren
 protocol-v2 启动后的输出根并非物理零文件：唯一控制树
 `.agent-task-protocol-v2/registry.json` 保存提交水位与已消费 tombstone，不能删除来通过安装门。
 runtime observation v5 保留真实 `file_count/total_bytes`，另附 `mineru-output-quiescence.v1`：
-在 Linux bind-mount 命名空间固定根/目录/文件身份、读取有界稳定 canonical registry-v2 字节，
+在 Linux bind-mount 命名空间固定根/目录/文件身份、读取有界稳定 canonical registry-v2/v3 字节，
 只接受空登记或已完全清理的 consumed 记录；未知目录（包括空目录）、链接、临时文件和任何
 仍持有资源的记录均拒绝。首次旧 API 安装前才允许真正空根；新 API commissioning 必须有登记。
 安装器与 collector 调用同一已绑定源码的只读检查，前后核对 API idle；这不代替停用 producer
-和实际 writer drain，也不把瞬时快照当成防止新提交的锁。旧 v4 observation 不能用于新 attestation。
+和实际 writer drain，也不把瞬时快照当成防止新提交的锁。排除写入的窗口必须从 preflight 持续到
+部署或回滚结论，覆盖所有调用方已经发出的 submit/ACK/lease/GC 请求，包括尚在 Form 解析、未计入
+ingress 的请求。v3 writer 可以读取旧 v2，但旧 reader 不能读取 v3；即使只有 consumed 记录，也不能
+用旧 registry 备份覆盖新的 tombstone 或水位。旧 v4 observation 不能用于新 attestation。
 
 collector 的独立 Python 进程只检查安装字节/package/marker，不能读取服务进程的
 `get_task_manager()`。真实对象容量由正在服务的 `/health` 返回闭合
-`task_protocol_runtime`（`mineru-task-runtime.v1`）；包含实际 registry/executor 的容量，
-effective pending 也取自同一 HTTP 证据。collector 有界读取并复核 API container/start epoch。
+`task_protocol_runtime`（新部署为 `mineru-task-runtime.v2`）以及
+`mineru-task-admission.v1`；包含实际 registry/executor 容量及 durable/ingress/排队/执行责任，
+effective pending 也取自同一 HTTP 证据。新 collector 与部署资格检查要求 v2 admission；明确的
+旧 v1 分支仅用于观察旧服务。collector 有界读取并复核 API container/start epoch。
 所有 wire health 消费者先严格验证 protocol-v2 标记与 runtime 子证明，再显式投影为原有
 13 字段 receipt/observer 形状；旧规范化 receipt 可继续读取，但不能冒充 live wire health。
 

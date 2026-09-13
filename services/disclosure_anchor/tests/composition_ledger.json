@@ -458,6 +458,18 @@
    "private_imports": [],
    "tests": 35
   },
+  "tests/unit/test_mineru_admission_health.py": {
+   "private_imports": [],
+   "tests": 12
+  },
+  "tests/unit/test_mineru_admission_pending_failure.py": {
+   "private_imports": [],
+   "tests": 0
+  },
+  "tests/unit/test_mineru_admission_responsibility.py": {
+   "private_imports": [],
+   "tests": 0
+  },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
    "tests": 17

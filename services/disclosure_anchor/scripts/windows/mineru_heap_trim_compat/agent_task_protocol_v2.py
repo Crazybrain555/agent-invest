@@ -19,7 +19,7 @@ from threading import RLock
 from typing import Any, Literal
 
 TaskState = Literal[
-    "pending", "processing", "finalizing", "completed", "failed",
+    "ingress", "ingress_cleanup", "pending", "processing", "finalizing", "completed", "failed",
     "cleanup_pending", "consumed"
 ]
 CleanupKind = Literal["result", "task_tree"]
@@ -32,6 +32,10 @@ _MAX_CLOCK_SKEW_SECONDS = 300
 
 class TaskProtocolConflict(RuntimeError):
     pass
+
+
+class TaskAdmissionFull(TaskProtocolConflict):
+    """A new key was rejected before it acquired ingress responsibility."""
 
 
 class TaskRegistryPersistenceError(OSError):
@@ -74,6 +78,7 @@ class DurableTaskRecord:
     recovery_generation: int = 1
     consumed_at_unix: float | None = None
     cleanup_kind: CleanupKind | None = None
+    ingress_owner: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for value in (
@@ -130,6 +135,31 @@ class DurableTaskRecord:
             raise TaskProtocolConflict("task registry error is invalid")
         if self.task_payload is not None and not isinstance(self.task_payload, dict):
             raise TaskProtocolConflict("task registry payload is invalid")
+        if self.ingress_owner is not None and not isinstance(self.ingress_owner, dict):
+            raise TaskProtocolConflict("task ingress owner is invalid")
+        if self.ingress_owner is not None:
+            owner = self.ingress_owner
+            if (
+                set(owner) != {"schema", "task_root", "task_root_identity", "uploads_root_identity"}
+                or owner.get("schema") != "mineru-task-ingress-owner.v1"
+                or not isinstance(owner.get("task_root"), str)
+                or not Path(owner["task_root"]).is_absolute()
+                or Path(owner["task_root"]).name != self.task_id
+            ):
+                raise TaskProtocolConflict("task ingress owner fields are not closed")
+            for name in ("task_root_identity", "uploads_root_identity"):
+                identity = owner[name]
+                if (
+                    not isinstance(identity, dict)
+                    or set(identity) != {"device", "inode", "uid", "mode"}
+                    or any(type(value) is not int or value < 0 for value in identity.values())
+                    or not stat.S_ISDIR(identity["mode"])
+                ):
+                    raise TaskProtocolConflict("task ingress directory identity is invalid")
+        if self.state in {"ingress", "ingress_cleanup"} and self.task_payload is not None:
+            raise TaskProtocolConflict("unaccepted ingress contains an executable payload")
+        if self.state not in {"ingress", "ingress_cleanup"} and self.ingress_owner is not None:
+            raise TaskProtocolConflict("ingress ownership escaped its preparation state")
         identities = (self.result_sha256, self.result_owner)
         if any(value is not None for value in identities) and not all(
             isinstance(value, str)
@@ -236,6 +266,7 @@ class DurableTaskRegistry:
         task_id: str,
         attempt_identity: str,
         fence_identity: str,
+        max_nonterminal_tasks: int | None = None,
     ) -> tuple[DurableTaskRecord, bool]:
         values = (idempotency_key, task_id, attempt_identity, fence_identity)
         if not all(value.strip() for value in values):
@@ -263,6 +294,14 @@ class DurableTaskRegistry:
                         proposed_records, proposed_watermark
                     )
                 return existing, False
+            if max_nonterminal_tasks is not None:
+                if type(max_nonterminal_tasks) is not int or not 1 <= max_nonterminal_tasks <= _MAX_RECORDS:
+                    raise ValueError("task admission limit is invalid")
+                if sum(
+                    record.state in {"ingress", "ingress_cleanup", "pending", "processing", "finalizing"}
+                    for record in proposed_records.values()
+                ) >= max_nonterminal_tasks:
+                    raise TaskAdmissionFull("Task admission capacity exhausted")
             if sum(record.state != "consumed" for record in proposed_records.values()) >= _MAX_RECORDS:
                 raise TaskProtocolConflict("active task registry capacity exhausted")
             if sum(record.state == "consumed" for record in proposed_records.values()) >= _MAX_TOMBSTONES:
@@ -272,6 +311,7 @@ class DurableTaskRegistry:
                 task_id=task_id,
                 attempt_identity=attempt_identity,
                 fence_identity=fence_identity,
+                state="pending" if max_nonterminal_tasks is None else "ingress",
             )
             proposed_records[idempotency_key] = record
             self._commit_registry_transition(proposed_records, proposed_watermark)
@@ -296,6 +336,135 @@ class DurableTaskRegistry:
             return copy.deepcopy(matches[0]) if matches else None
 
 
+    def bind_ingress_root(self, idempotency_key: str) -> None:
+        """Pin empty owned directories before any asynchronous upload writes."""
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state != "ingress" or record.ingress_owner is not None:
+                raise TaskProtocolConflict("ingress directory ownership already resolved")
+            root_fd, task_fd = self._open_task_dir(record.task_id)
+            upload_fd = -1
+            primary_error: BaseException | None = None
+            try:
+                if set(os.listdir(task_fd)) != {"uploads"}:
+                    raise TaskProtocolConflict("ingress task directory is not empty")
+                upload_fd = os.open(
+                    "uploads", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0), dir_fd=task_fd,
+                )
+                if os.listdir(upload_fd):
+                    raise TaskProtocolConflict("ingress upload directory is not empty")
+                for descriptor in (task_fd, upload_fd):
+                    if os.fstat(descriptor).st_uid != os.getuid():
+                        raise TaskProtocolConflict("ingress directory owner drifted")
+                owner = {
+                    "schema": "mineru-task-ingress-owner.v1",
+                    "task_root": str(self._output_root / record.task_id),
+                    "task_root_identity": self._directory_identity(os.fstat(task_fd)),
+                    "uploads_root_identity": self._directory_identity(os.fstat(upload_fd)),
+                }
+                for descriptor in (upload_fd, task_fd, root_fd):
+                    self._fsync_namespace_directory(descriptor)
+                record.ingress_owner = owner
+                self._persist()
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                self._close_namespace_descriptors(
+                    ((upload_fd, "ingress uploads"), (task_fd, "ingress task"),
+                     (root_fd, "ingress output root")), primary_error,
+                )
+
+    def _confirm_unowned_task_absent(self, record: DurableTaskRecord) -> None:
+        """A crash before the owner receipt must never authorize path-only deletion."""
+        root_fd = os.open(
+            self._output_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        primary_error: BaseException | None = None
+        try:
+            metadata = os.fstat(root_fd)
+            if (metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_mode) != self._output_root_identity:
+                raise TaskProtocolConflict("configured output root identity drifted")
+            try:
+                os.stat(record.task_id, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                self._fsync_namespace_directory(root_fd)
+            else:
+                raise TaskProtocolConflict("unaccepted task directory requires ownership recovery")
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            self._close_namespace_descriptors(((root_fd, "ingress output root"),), primary_error)
+
+    def abort_ingress(self, idempotency_key: str) -> None:
+        """Persist non-executable cleanup intent; release credit only after durable absence."""
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state not in {"ingress", "ingress_cleanup"}:
+                raise TaskProtocolConflict("accepted task cannot be abandoned as ingress")
+            if record.state == "ingress":
+                record.state = "ingress_cleanup"
+                self._persist()
+            if record.ingress_owner is None:
+                self._confirm_unowned_task_absent(record)
+            else:
+                self._unlink_owned_result(record, before_unlink=None)
+            del self._records[idempotency_key]
+            self._persist()
+
+    def task_payload_for_route(self, idempotency_key: str) -> dict[str, Any] | None:
+        """Project one accepted task without replay, cleanup or generation changes."""
+        with self._lock:
+            self.assert_observation_safe()
+            record = self._required(idempotency_key)
+            if record.task_payload is None or record.state == "consumed":
+                return None
+            result = copy.deepcopy(record.task_payload)
+            result.pop("_agent_protocol", None)
+            wire_state = record.state
+            if wire_state == "finalizing":
+                wire_state = "processing"
+            elif wire_state == "cleanup_pending":
+                wire_state = "completed" if record.cleanup_kind == "result" else "failed"
+            result.update(
+                status=wire_state,
+                result_artifact_path=record.result_path,
+                result_artifact_sha256=record.result_sha256,
+                result_artifact_bytes=record.result_bytes,
+                result_artifact_owner=record.result_owner,
+                error=record.error,
+            )
+            return result
+
+    def admission_status(
+        self, route_task_ids: set[str], live_ingress_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Count durable responsibilities independently of the derived route index."""
+        with self._lock:
+            self.assert_observation_safe()
+            records = tuple(self._records.values())
+            ingress = sum(r.state in {"ingress", "ingress_cleanup"} for r in records)
+            accepted = [r for r in records if r.state in {"pending", "processing", "finalizing"}]
+            live_ingress_ids = live_ingress_ids or set()
+            return {
+                "schema": "mineru-task-admission.v1",
+                "registry_schema": "mineru-task-registry.v3",
+                "ingress_tasks": ingress,
+                "accepted_pending_tasks": sum(r.state == "pending" for r in accepted),
+                "accepted_processing_tasks": sum(r.state == "processing" for r in accepted),
+                "accepted_finalizing_tasks": sum(r.state == "finalizing" for r in accepted),
+                "durable_nonterminal_tasks": ingress + len(accepted),
+                "routeless_accepted_tasks": sum(r.task_id not in route_task_ids for r in accepted),
+                "ingress_cleanup_tasks": sum(r.state == "ingress_cleanup" for r in records),
+                "unowned_ingress_tasks": sum(
+                    r.state in {"ingress", "ingress_cleanup"} and r.task_id not in live_ingress_ids
+                    for r in records
+                ),
+            }
+
     def bind_task_payload(
         self,
         idempotency_key: str,
@@ -307,6 +476,10 @@ class DurableTaskRegistry:
             raise TypeError("task payload must be one JSON object")
         with self._lock:
             record = self._required(idempotency_key)
+            if record.state not in {"ingress", "pending"}:
+                raise TaskProtocolConflict("task payload cannot bind in this state")
+            if record.state == "ingress" and record.ingress_owner is None:
+                raise TaskProtocolConflict("ingress directory ownership is absent")
             if normalized.get("task_id") != record.task_id:
                 raise TaskProtocolConflict("task payload identity drifted")
             output_value = normalized.get("output_dir")
@@ -340,10 +513,13 @@ class DurableTaskRegistry:
                     upload_meta = os.fstat(upload_fd)
                     upload_identities = [
                         self._stable_file_identity_at(
-                            upload_fd, Path(value), expected_parent=upload_root
+                            upload_fd, Path(value), expected_parent=upload_root,
+                            sync_source=True,
                         )
                         for value in uploads_value if isinstance(value, str)
                     ]
+                    for descriptor in (upload_fd, task_fd, root_fd):
+                        self._fsync_namespace_directory(descriptor)
                 finally:
                     os.close(upload_fd)
             finally:
@@ -359,11 +535,20 @@ class DurableTaskRegistry:
                 "generation": record.recovery_generation,
                 "uploads": upload_identities,
             }
+            if record.state == "ingress":
+                ingress_owner = record.ingress_owner
+                if ingress_owner is None or any(
+                    normalized["_agent_protocol"][name] != ingress_owner.get(name)
+                    for name in ("task_root", "task_root_identity", "uploads_root_identity")
+                ):
+                    raise TaskProtocolConflict("ingress directory identity drifted before acceptance")
             if len(json.dumps(normalized, sort_keys=True).encode()) > _MAX_TASK_PAYLOAD_BYTES:
                 raise TaskProtocolConflict("task payload exceeds the closed envelope")
             if record.task_payload is not None and record.task_payload != normalized:
                 raise TaskProtocolConflict("task payload drifted after allocation")
             record.task_payload = normalized
+            record.state = "pending"
+            record.ingress_owner = None
             self._persist()
 
 
@@ -380,12 +565,15 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict(
                     "live result readers prevent in-process task recovery"
                 )
-
+            for key, record in tuple(self._records.items()):
+                if record.state in {"ingress", "ingress_cleanup"}:
+                    self.abort_ingress(key)
             proposed_records = self._clone_records(self._records)
             changed = False
             replay_keys: list[str] = []
             for key, record in list(proposed_records.items()):
                 if record.state == "pending" and record.task_payload is None:
+                    self._confirm_unowned_task_absent(record)
                     del proposed_records[key]
                     changed = True
                     continue
@@ -519,7 +707,7 @@ class DurableTaskRegistry:
 
     @staticmethod
     def _stable_file_identity_at(
-        parent_fd: int, path: Path, *, expected_parent: Path
+        parent_fd: int, path: Path, *, expected_parent: Path, sync_source: bool = False
     ) -> dict[str, Any]:
         if path.parent.resolve() != expected_parent.resolve() or path.name in {"", ".", ".."}:
             raise TaskProtocolConflict("task upload escaped configured task root")
@@ -540,6 +728,8 @@ class DurableTaskRegistry:
             while chunk := os.read(descriptor, 1024 * 1024):
                 digest.update(chunk)
                 total += len(chunk)
+            if sync_source:
+                os.fsync(descriptor)
             after = os.fstat(descriptor)
             def identity(value: os.stat_result) -> tuple[int, ...]:
                 return (
@@ -558,20 +748,19 @@ class DurableTaskRegistry:
             self._output_root,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
-        root_meta = os.fstat(root_fd)
-        if (
-            root_meta.st_dev, root_meta.st_ino, root_meta.st_uid, root_meta.st_mode
-        ) != self._output_root_identity:
-            os.close(root_fd)
-            raise TaskProtocolConflict("configured output root identity drifted")
         try:
+            root_meta = os.fstat(root_fd)
+            if (
+                root_meta.st_dev, root_meta.st_ino, root_meta.st_uid, root_meta.st_mode
+            ) != self._output_root_identity:
+                raise TaskProtocolConflict("configured output root identity drifted")
             task_fd = os.open(
                 task_id,
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                 | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd,
             )
-        except BaseException:
-            os.close(root_fd)
+        except BaseException as exc:
+            self._close_namespace_descriptors(((root_fd, "output root"),), exc)
             raise
         return root_fd, task_fd
 
@@ -712,6 +901,7 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict(
                     "only an unbound pending task may be abandoned"
                 )
+            self._confirm_unowned_task_absent(record)
             del self._records[idempotency_key]
             self._persist()
 
@@ -974,6 +1164,11 @@ class DurableTaskRegistry:
         before_unlink: Callable[[Path], None] | None,
     ) -> None:
         payload = record.task_payload or {}
+        if record.state == "ingress_cleanup" and record.ingress_owner is not None:
+            payload = {
+                "output_dir": str(self._output_root / record.task_id),
+                "_agent_protocol": record.ingress_owner,
+            }
         protocol = payload.get("_agent_protocol")
         output_value = payload.get("output_dir")
         if not isinstance(protocol, dict) or not isinstance(output_value, str):
@@ -1206,7 +1401,7 @@ class DurableTaskRegistry:
         if (
             not isinstance(payload, dict)
             or set(payload) != {"schema", "output_root", "submission_watermark_bucket", "records"}
-            or payload.get("schema") != "mineru-task-registry.v2"
+            or payload.get("schema") not in {"mineru-task-registry.v2", "mineru-task-registry.v3"}
         ):
             raise TaskProtocolConflict("task registry schema is invalid")
         expected_root = {
@@ -1233,12 +1428,17 @@ class DurableTaskRegistry:
         if not isinstance(records, list) or len(records) > _MAX_RECORDS + _MAX_TOMBSTONES:
             raise TaskProtocolConflict("task registry records are invalid")
         expected = {item.name for item in fields(DurableTaskRecord)}
+        legacy = payload["schema"] == "mineru-task-registry.v2"
+        if legacy:
+            expected -= {"ingress_owner"}
         if any(not isinstance(item, dict) or set(item) != expected for item in records):
             raise TaskProtocolConflict("task registry record fields are not closed")
         loaded = {}
         task_ids = set()
         for item in records:
             record = DurableTaskRecord(**item)
+            if legacy and record.state in {"ingress", "ingress_cleanup"}:
+                raise TaskProtocolConflict("v2 registry cannot contain ingress states")
             if require_quiescent and (
                 record.state != "consumed"
                 or record.active_readers != 0
@@ -1254,6 +1454,8 @@ class DurableTaskRegistry:
             if record.idempotency_key in loaded or record.task_id in task_ids:
                 raise TaskProtocolConflict("task registry identities are not unique")
             if record.state not in {
+                "ingress",
+                "ingress_cleanup",
                 "pending",
                 "processing",
                 "finalizing",
@@ -1877,7 +2079,7 @@ class DurableTaskRegistry:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(
                 {
-                    "schema": "mineru-task-registry.v2",
+                    "schema": "mineru-task-registry.v3",
                     "output_root": {
                         "path": str(self._output_root),
                         "device": self._output_root_identity[0],
@@ -2042,11 +2244,13 @@ def inspect_quiescent_output_root(
 
 
 _REGISTRY_MUTATOR_NAMES = (
+    "abort_ingress",
     "abandon_unbound",
     "acknowledge",
     "acknowledge_failed",
     "acquire_result",
     "bind_task_payload",
+    "bind_ingress_root",
     "cleanup_consumed",
     "complete",
     "fail",
@@ -2167,6 +2371,66 @@ class SplitTaskExecutor:
             raise
 
 
+# The host observer validates the same closed envelope independently.
+def validate_mineru_task_admission(
+    decoded: object, *, queued_tasks: int, processing_tasks: int, nonterminal_limit: int,
+) -> None:
+    """Validate durable responsibilities before projecting the legacy load gauges.
+
+    queued_tasks covers ingress and accepted pending, not physical queue depth.
+    A cold backlog remains readable on the wire but is not qualified healthy.
+    """
+    counters = {
+        "nonterminal_limit", "ingress_tasks", "accepted_pending_tasks",
+        "accepted_processing_tasks", "accepted_finalizing_tasks", "durable_nonterminal_tasks",
+        "routeless_accepted_tasks", "ingress_cleanup_tasks", "unowned_ingress_tasks",
+        "scheduled_tasks", "queue_depth", "active_processors",
+    }
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != counters | {
+            "schema", "registry_schema", "recovery_overcommitted", "admission_open", "blocked_reason",
+        }
+        or decoded.get("schema") != "mineru-task-admission.v1"
+        or decoded.get("registry_schema") != "mineru-task-registry.v3"
+        or any(type(decoded.get(key)) is not int or not 0 <= decoded[key] <= 128 for key in counters)
+        or type(decoded.get("recovery_overcommitted")) is not bool
+        or type(decoded.get("admission_open")) is not bool
+        or decoded["nonterminal_limit"] != nonterminal_limit
+        or nonterminal_limit < 1
+    ):
+        raise ValueError("MinerU admission evidence fields or types drifted")
+    ingress = decoded["ingress_tasks"]
+    accepted = sum(decoded[key] for key in (
+        "accepted_pending_tasks", "accepted_processing_tasks", "accepted_finalizing_tasks",
+    ))
+    total = ingress + accepted
+    if (
+        total != decoded["durable_nonterminal_tasks"]
+        or queued_tasks != ingress + decoded["accepted_pending_tasks"]
+        or processing_tasks != decoded["accepted_processing_tasks"] + decoded["accepted_finalizing_tasks"]
+        or decoded["routeless_accepted_tasks"] > accepted
+        or max(decoded["ingress_cleanup_tasks"], decoded["unowned_ingress_tasks"]) > ingress
+        or decoded["queue_depth"] + decoded["active_processors"] > decoded["scheduled_tasks"]
+        or decoded["scheduled_tasks"] > nonterminal_limit
+        or decoded["recovery_overcommitted"] != (total > nonterminal_limit)
+    ):
+        raise ValueError("MinerU admission responsibility counters disagree")
+    reason = decoded["blocked_reason"]
+    expected_reason = (
+        "ingress_recovery_required" if decoded["unowned_ingress_tasks"] or decoded["ingress_cleanup_tasks"]
+        else "accepted_recovery_required" if decoded["routeless_accepted_tasks"]
+        else "recovery_overcommitted" if total > nonterminal_limit
+        else "capacity_full" if total == nonterminal_limit
+        else None
+    )
+    if (
+        reason not in ("shutting_down", "worker_unavailable", expected_reason)
+        or decoded["admission_open"] != (reason is None)
+    ):
+        raise ValueError("MinerU admission availability contradicts its responsibilities")
+
+
 def task_protocol_runtime_status(
     registry: DurableTaskRegistry, executor: SplitTaskExecutor
 ) -> dict[str, Any]:
@@ -2181,7 +2445,11 @@ def task_protocol_runtime_status(
     if any(type(value) is not int or value < 1 for value in limits.values()):
         raise TaskProtocolConflict("task protocol runtime limits are invalid")
     registry.assert_persistence_healthy()
-    return {"schema": "mineru-task-runtime.v1", "enabled": True, **limits}
+    return {
+        "schema": "mineru-task-runtime.v2", "enabled": True, **limits,
+        "registry_schema": "mineru-task-registry.v3",
+        "admission_scope": "post_form_owned_upload",
+    }
 
 
 def evict_consumed_routes(
@@ -2201,6 +2469,7 @@ def evict_consumed_routes(
 
 
 __all__ = [
+    "TaskAdmissionFull",
     "TaskRegistryPersistenceError",
     "DurableTaskRecord",
     "DurableTaskRegistry",
