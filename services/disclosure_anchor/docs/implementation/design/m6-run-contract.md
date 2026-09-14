@@ -136,6 +136,67 @@ Independent public pagination/artifact confirmation, qualification and finite
 owner assembly remain separate boundaries. No public schema or reader privilege
 is broadened by this adapter.
 
+## Independent public consumption
+
+`M6PublicConsumerVerifier` accepts the persisted private publication/history
+audit bytes through a trusted input boundary and holds only a reader engine.
+The owner assembly must authenticate those inputs and run the consumer in its
+separate process; matching hashes alone do not authenticate their producer.
+Each confirmation uses one actual reader-principal `READ ONLY / REPEATABLE READ`
+snapshot of public documents/runs, all Unit pages, and every source reference.
+It fixes document/run identity, requires an active unsuperseded publication,
+and reads through the empty terminal page. No private SQL or current-run fallback
+is part of public consumption.
+
+Expected Unit fields come from the immutable request/readiness/winner chain.
+Only the existing public route-array projection maps expected private `NULL`
+to `[]`; actual public rows remain unchanged. `public_units_sha256` hashes the
+complete ordered 39-column public-v1 row array, with UTC timestamps and ISO dates.
+It is distinct from the winner's private final-Unit digest. The receipt preserves
+the complete rows, source references, pagination hashes and snapshot identity.
+
+The consumer reuses the read-only artifact-readiness verifier for the exact parser
+tree and three derived resources, reads the provider envelope through the API
+path, rereads original source bytes/hash, and resolves every public evidence
+reference with the existing API integrity checks. It cannot prepare/promote
+publication artifacts. Source page count remains bound to the admitted envelope;
+this reader does not render/reparse the PDF or replace independent
+whole-document qualification.
+
+Evidence resolution is document-scoped, not cached. One confirmation binds one
+`ProviderEvidenceOwner`: admitted document/run, sealed provider and
+provider-document identity, sealed envelope hash and admitted source hash. The
+API helper reads that owner's envelope once from the owner-derived path, requires
+the sealed hash, byte count and relpath, and verifies the envelope identity.
+Every public Unit's published owner projection must equal this owner exactly;
+every reference must be declared by that Unit's own provider locator bound to the
+same record hash; every artifact's bytes are read and hash/size/media verified
+for each reference. A verified envelope authorizes nothing for another run,
+document, source, record hash, or a non-provider locator, and the same digest is
+never served from another path or owner. The public route is unchanged: without
+a caller-supplied verified envelope it reads the envelope per request.
+
+The verification window is fixed by explicit reads, not a filesystem snapshot:
+the readiness verifier and the API-path read establish the envelope before the
+public snapshot opens, and after the last page the immutable store must reread
+the identical sealed envelope bytes or the confirmation fails. Artifact and
+source reads verify their own identities at read time. Before each file read the
+consumer reserves the sealed expected payload bytes and file count: manifest,
+preparation, whole parser tree, three derived resources, the API-path envelope,
+the source PDF, each referenced artifact, and the closing envelope reread. Read
+cost is linear in referenced artifact bytes rather than references x envelope.
+The per-confirmation default limits are 2 GiB and 200,000 file payload reads and
+can be set by the finite owner assembly. These are declared immutable-input
+budgets, not measurements or hard limits on a concurrently growing file read by
+the existing API handler. Receipt-byte limits fail explicitly; output-byte limits
+are not a peak-memory guarantee. The finite owner assembly supplies the process
+deadline and admission/backlog limits around this synchronous check.
+
+The sink persists canonical receipt bytes before a confirmation is returned.
+Private, public and history snapshots are distinct and recorded as such.
+Incomplete source history is preserved for the reducer, never converted to fresh
+credit. No owner event, quality verdict or formal M6 success is issued here.
+
 ## Whole-document quality
 
 `M6QualityPlan` cannot omit source identity, full-page closure, block/table/logical

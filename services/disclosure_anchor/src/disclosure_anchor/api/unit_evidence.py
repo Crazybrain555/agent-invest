@@ -19,6 +19,7 @@ from disclosure_anchor.application.contracts.normalized_ir_v4_evidence import (
     resolve_historical_normalized_ir_v4_evidence,
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
+    ProviderDocumentEnvelope,
     ProviderDocumentEnvelopeError,
     provider_document_envelope_from_bytes,
 )
@@ -55,6 +56,40 @@ class VerifiedUnitEvidence:
     content: bytes
     sha256: str
     media_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderEvidenceOwner:
+    """The exact published owner identity that authorizes one provider envelope.
+
+    Every field comes from the unit's own published row/run projection. Two
+    units may share an owner only when all of these values are identical; a
+    different run, document, provider record hash or source hash is another
+    owner and never reuses a verified envelope.
+    """
+
+    document_id: str
+    artifact_owner_processing_run_id: str
+    provider: str
+    security_code: str
+    provider_document_id: str
+    provider_document_sha256: str
+    source_pdf_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedProviderEnvelope:
+    """One provider envelope read through the API path and bound to its owner.
+
+    It authorizes nothing by itself: each unit still has to reference the
+    requested digest in its own locator, and the artifact bytes are read and
+    hash/size/media verified for every request that uses this envelope.
+    """
+
+    owner: ProviderEvidenceOwner
+    record_relpath: Path
+    byte_count: int
+    envelope: ProviderDocumentEnvelope
 
 
 def normalize_evidence_digest(value: str) -> str | None:
@@ -99,36 +134,13 @@ def unit_evidence_refs(
     return refs
 
 
-def read_unit_evidence(
-    *,
-    row: Mapping[str, Any],
-    digest: str,
-    paths: FileStorePathBuilder,
-) -> VerifiedUnitEvidence | None:
-    """Resolve and verify one unit-authorized evidence artifact.
+def unit_evidence_owner(row: Mapping[str, Any]) -> ProviderEvidenceOwner:
+    """Bind the published owner identity that may authorize a unit's evidence.
 
-    ``None`` means the syntactically valid digest is not referenced by this
-    unit. Every published-state or filesystem inconsistency fails explicitly
-    as ``EVIDENCE_INTEGRITY_ERROR``.
+    This is the same published-state check the evidence route performs before
+    any file is opened. It does not read storage and fails explicitly as
+    ``EVIDENCE_INTEGRITY_ERROR`` on any owner/hash inconsistency.
     """
-
-    requested_sha256 = f"sha256:{digest}"
-    artifact_locator = _optional_mapping(
-        row.get("artifact_locator"),
-        field="artifact_locator",
-    )
-    descriptors = _unit_evidence_descriptors(
-        payload_kind=_required_text(row, "payload_kind"),
-        payload=_optional_mapping(row.get("payload"), field="payload"),
-        artifact_locator=artifact_locator,
-    )
-    matching = tuple(
-        descriptor
-        for descriptor in descriptors
-        if descriptor.sha256 == requested_sha256
-    )
-    if not matching:
-        return None
 
     document_id = _required_text(row, "document_id")
     _required_text(row, "processing_run_id")
@@ -172,6 +184,126 @@ def read_unit_evidence(
         or owner_source_sha256 != source_pdf_sha256
     ):
         evidence_integrity_error("artifact_owner_source_hash_mismatch")
+    return ProviderEvidenceOwner(
+        document_id=document_id,
+        artifact_owner_processing_run_id=artifact_owner_id,
+        provider=provider,
+        security_code=security_code,
+        provider_document_id=provider_document_id,
+        provider_document_sha256=expected_ir_hash,
+        source_pdf_sha256=source_pdf_sha256,
+    )
+
+
+def read_provider_envelope(
+    *,
+    owner: ProviderEvidenceOwner,
+    paths: FileStorePathBuilder,
+    expected_byte_count: int | None = None,
+) -> VerifiedProviderEnvelope:
+    """Read and verify the owner's provider envelope exactly as the API does.
+
+    The record path is derived only from the owner identity; its bytes must
+    hash to the owner's published record hash and decode to an envelope whose
+    document/run/provider/source identities equal that owner. The result may
+    be reused for further units of the very same owner within one caller's
+    fixed verification window; it is never a cache keyed by path or digest.
+
+    ``expected_byte_count`` lets a caller that holds the sealed envelope size
+    refuse a differently sized file before reading it; a hash check still
+    follows, so the failure reason stays ``provider_document_hash_mismatch``.
+    """
+
+    if type(owner) is not ProviderEvidenceOwner:
+        evidence_integrity_error("artifact_owner_invalid")
+    if expected_byte_count is not None and (
+        type(expected_byte_count) is not int or expected_byte_count < 1
+    ):
+        raise ValueError("expected provider envelope byte count is invalid")
+    try:
+        record_relpath = paths.provider_document_relpath(
+            provider=owner.provider,
+            security_code=owner.security_code,
+            provider_document_id=owner.provider_document_id,
+            artifact_owner_processing_run_id=owner.artifact_owner_processing_run_id,
+        )
+        record_content = _read_data_bytes(
+            paths,
+            record_relpath,
+            expected_size=expected_byte_count,
+            size_mismatch_reason="provider_document_hash_mismatch",
+            missing_reason="provider_document_missing",
+            unreadable_reason="provider_document_unreadable",
+            path_invalid_reason="provider_document_path_invalid",
+        )
+    except PathSafetyError:
+        evidence_integrity_error("provider_document_path_invalid")
+    if _sha256(record_content) != owner.provider_document_sha256:
+        evidence_integrity_error("provider_document_hash_mismatch")
+    try:
+        envelope = provider_document_envelope_from_bytes(record_content)
+    except (ProviderDocumentEnvelopeError, ValueError):
+        evidence_integrity_error("provider_document_contract_invalid")
+    source_parts = Path(envelope.source_pdf_relpath).parts
+    if (
+        envelope.document_id != owner.document_id
+        or envelope.artifact_owner_processing_run_id
+        != owner.artifact_owner_processing_run_id
+        or envelope.provider != owner.provider
+        or envelope.provider_document_id != owner.provider_document_id
+        or envelope.input_raw_file_hash != owner.source_pdf_sha256
+        or len(source_parts) < 3
+        or source_parts[2] != owner.security_code
+    ):
+        evidence_integrity_error("provider_document_identity_mismatch")
+    return VerifiedProviderEnvelope(
+        owner=owner,
+        record_relpath=record_relpath,
+        byte_count=len(record_content),
+        envelope=envelope,
+    )
+
+
+def read_unit_evidence(
+    *,
+    row: Mapping[str, Any],
+    digest: str,
+    paths: FileStorePathBuilder,
+    envelope: VerifiedProviderEnvelope | None = None,
+) -> VerifiedUnitEvidence | None:
+    """Resolve and verify one unit-authorized evidence artifact.
+
+    ``None`` means the syntactically valid digest is not referenced by this
+    unit. Every published-state or filesystem inconsistency fails explicitly
+    as ``EVIDENCE_INTEGRITY_ERROR``.
+
+    Without ``envelope`` (the public route) the owner's provider envelope is
+    read and verified for this request. With ``envelope`` the caller has
+    already verified that exact owner's envelope through
+    :func:`read_provider_envelope`; the unit's published owner must equal the
+    envelope's owner, the locator must be a provider locator bound to that
+    record hash, and the artifact bytes are still read and verified here.
+    """
+
+    requested_sha256 = f"sha256:{digest}"
+    artifact_locator = _optional_mapping(
+        row.get("artifact_locator"),
+        field="artifact_locator",
+    )
+    descriptors = _unit_evidence_descriptors(
+        payload_kind=_required_text(row, "payload_kind"),
+        payload=_optional_mapping(row.get("payload"), field="payload"),
+        artifact_locator=artifact_locator,
+    )
+    matching = tuple(
+        descriptor
+        for descriptor in descriptors
+        if descriptor.sha256 == requested_sha256
+    )
+    if not matching:
+        return None
+
+    owner = unit_evidence_owner(row)
     locator_version = (
         None if artifact_locator is None else artifact_locator.get("contract_version")
     )
@@ -186,20 +318,19 @@ def read_unit_evidence(
             artifact_locator=artifact_locator,
             matching=matching,
             requested_sha256=requested_sha256,
-            document_id=document_id,
-            artifact_owner_id=artifact_owner_id,
-            expected_record_hash=expected_ir_hash,
-            source_pdf_sha256=source_pdf_sha256,
-            provider=provider,
-            security_code=security_code,
-            provider_document_id=provider_document_id,
+            owner=owner,
+            envelope=envelope,
         )
+    if envelope is not None:
+        # A verified envelope authorizes only provider-locator units of its
+        # owner; it never widens resolution to another evidence lineage.
+        evidence_integrity_error("unit_evidence_locator_invalid")
     try:
         ir_relpath = paths.normalized_ir_run_relpath(
-            provider=provider,
-            security_code=security_code,
-            provider_document_id=provider_document_id,
-            processing_run_id=artifact_owner_id,
+            provider=owner.provider,
+            security_code=owner.security_code,
+            provider_document_id=owner.provider_document_id,
+            processing_run_id=owner.artifact_owner_processing_run_id,
         )
         ir_content = _read_data_bytes(
             paths,
@@ -212,14 +343,14 @@ def read_unit_evidence(
         evidence_integrity_error("normalized_ir_path_invalid")
 
     actual_ir_hash = _sha256(ir_content)
-    if actual_ir_hash != expected_ir_hash:
+    if actual_ir_hash != owner.provider_document_sha256:
         evidence_integrity_error("normalized_ir_hash_mismatch")
     try:
         artifact = resolve_historical_normalized_ir_v4_evidence(
             ir_content,
             ir_relpath=ir_relpath,
-            expected_document_id=document_id,
-            expected_source_pdf_sha256=source_pdf_sha256,
+            expected_document_id=owner.document_id,
+            expected_source_pdf_sha256=owner.source_pdf_sha256,
             claims=tuple(
                 HistoricalEvidenceClaim(
                     artifact_role=cast(str, descriptor.artifact_role),
@@ -262,57 +393,25 @@ def _read_provider_unit_evidence(
     artifact_locator: Mapping[str, Any],
     matching: tuple[EvidenceArtifactDescriptor, ...],
     requested_sha256: str,
-    document_id: str,
-    artifact_owner_id: str,
-    expected_record_hash: str,
-    source_pdf_sha256: str,
-    provider: str,
-    security_code: str,
-    provider_document_id: str,
+    owner: ProviderEvidenceOwner,
+    envelope: VerifiedProviderEnvelope | None,
 ) -> VerifiedUnitEvidence:
     try:
         locator = provider_unit_locator_from_payload(artifact_locator)
     except ValueError:
         evidence_integrity_error("unit_evidence_locator_invalid")
-    if locator.provider_document_sha256 != expected_record_hash:
+    if locator.provider_document_sha256 != owner.provider_document_sha256:
         evidence_integrity_error("provider_document_hash_mismatch")
-    try:
-        record_relpath = paths.provider_document_relpath(
-            provider=provider,
-            security_code=security_code,
-            provider_document_id=provider_document_id,
-            artifact_owner_processing_run_id=artifact_owner_id,
-        )
-        record_content = _read_data_bytes(
-            paths,
-            record_relpath,
-            missing_reason="provider_document_missing",
-            unreadable_reason="provider_document_unreadable",
-            path_invalid_reason="provider_document_path_invalid",
-        )
-    except PathSafetyError:
-        evidence_integrity_error("provider_document_path_invalid")
-    if _sha256(record_content) != expected_record_hash:
-        evidence_integrity_error("provider_document_hash_mismatch")
-    try:
-        envelope = provider_document_envelope_from_bytes(record_content)
-    except (ProviderDocumentEnvelopeError, ValueError):
-        evidence_integrity_error("provider_document_contract_invalid")
-    source_parts = Path(envelope.source_pdf_relpath).parts
-    if (
-        envelope.document_id != document_id
-        or envelope.artifact_owner_processing_run_id != artifact_owner_id
-        or envelope.provider != provider
-        or envelope.provider_document_id != provider_document_id
-        or envelope.input_raw_file_hash != source_pdf_sha256
-        or len(source_parts) < 3
-        or source_parts[2] != security_code
-    ):
+    if envelope is None:
+        envelope = read_provider_envelope(owner=owner, paths=paths)
+    elif type(envelope) is not VerifiedProviderEnvelope or envelope.owner != owner:
+        # The supplied envelope was verified for another owner identity; this
+        # unit's owner gets no authority from it.
         evidence_integrity_error("provider_document_identity_mismatch")
     descriptor = matching[0]
     candidates = tuple(
         artifact
-        for artifact in envelope.provider_document.artifacts
+        for artifact in envelope.envelope.provider_document.artifacts
         if artifact.sha256 == descriptor.sha256
         and artifact.size_bytes == descriptor.size_bytes
         and artifact.media_type == descriptor.media_type
@@ -323,7 +422,7 @@ def _read_provider_unit_evidence(
     try:
         artifact_content = _read_data_bytes(
             paths,
-            Path(envelope.parser_artifact_root_relpath) / artifact.relative_path,
+            Path(envelope.envelope.parser_artifact_root_relpath) / artifact.relative_path,
             expected_size=artifact.size_bytes,
             missing_reason="evidence_artifact_missing",
             unreadable_reason="evidence_artifact_unreadable",
@@ -484,6 +583,7 @@ def _read_data_bytes(
     unreadable_reason: str,
     path_invalid_reason: str,
     expected_size: int | None = None,
+    size_mismatch_reason: str = "evidence_artifact_size_mismatch",
 ) -> bytes:
     configured_path = paths.data_path(relpath)
     try:
@@ -493,7 +593,7 @@ def _read_data_bytes(
         if not resolved.is_file():
             evidence_integrity_error(unreadable_reason)
         if expected_size is not None and resolved.stat().st_size != expected_size:
-            evidence_integrity_error("evidence_artifact_size_mismatch")
+            evidence_integrity_error(size_mismatch_reason)
         return resolved.read_bytes()
     except FileNotFoundError:
         evidence_integrity_error(missing_reason)

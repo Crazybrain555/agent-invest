@@ -48,6 +48,14 @@
    "private_imports": [],
    "tests": 11
   },
+  "tests/integration/test_m6_public_consumer.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/integration/test_m6_public_evidence_budget.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
    "tests": 28
@@ -407,6 +415,10 @@
   "tests/unit/test_m6_private_publication.py": {
    "private_imports": [],
    "tests": 6
+  },
+  "tests/unit/test_m6_public_consumer.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_m6_run_accounting.py": {
    "private_imports": [],
@@ -823,6 +835,10 @@
   "tests/unit/test_provider_document_envelope.py": {
    "private_imports": [],
    "tests": 10
+  },
+  "tests/unit/test_provider_evidence_envelope_scope.py": {
+   "private_imports": [],
+   "tests": 6
   },
   "tests/unit/test_provider_quality.py": {
    "private_imports": [],
