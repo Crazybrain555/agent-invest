@@ -25,6 +25,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
     SemanticAdjudicatorIdentity,
+    SemanticExecutionGuard,
     SemanticProviderResult,
     SemanticRouteAdjudicatorError,
 )
@@ -174,15 +175,18 @@ def _stop_process_group(
     *,
     grace_seconds: float = _GRACEFUL_STOP_SECONDS,
 ) -> None:
-    if process.poll() is not None:
-        return
+    # A reaped leader can leave descendants holding stdout/stderr open.
+    # The process was spawned in its own session; stop that group and drain
+    # both pipes before releasing this call's ownership registration.
     _signal_process_group(process, signal.SIGTERM)
     try:
-        process.wait(timeout=max(0.0, grace_seconds))
-        return
+        process.communicate(timeout=max(0.0, grace_seconds))
     except subprocess.TimeoutExpired:
         _signal_process_group(process, signal.SIGKILL)
-    process.wait()
+        process.communicate()
+    else:
+        # Pipe closure does not prove that every group member exited.
+        _signal_process_group(process, signal.SIGKILL)
 
 
 def terminate_active_semantic_processes(
@@ -241,7 +245,11 @@ def _run_process(
     prompt: str,
     env: dict[str, str],
     timeout_seconds: int,
+    stage_guard: SemanticExecutionGuard | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if stage_guard is not None:
+        stage_guard.checkpoint()
+    provider_deadline = time.monotonic() + timeout_seconds
     process = subprocess.Popen(
         args,
         stdin=subprocess.PIPE,
@@ -254,11 +262,29 @@ def _run_process(
     _register_process(process)
     try:
         try:
-            stdout, stderr = process.communicate(
-                input=prompt,
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired:
+            if stage_guard is None:
+                stdout, stderr = process.communicate(input=prompt, timeout=timeout_seconds)
+            else:
+                pending_input: str | None = prompt
+                while True:
+                    remaining = stage_guard.remaining_seconds()
+                    if _SEMANTIC_SHUTDOWN_REQUESTED.is_set():
+                        raise _SemanticProcessCancelled
+                    provider_remaining = provider_deadline - time.monotonic()
+                    if provider_remaining <= 0:
+                        raise subprocess.TimeoutExpired(args, timeout_seconds)
+                    try:
+                        stdout, stderr = process.communicate(
+                            input=pending_input,
+                            timeout=min(0.1, remaining, provider_remaining),
+                        )
+                        stage_guard.checkpoint()
+                        break
+                    except subprocess.TimeoutExpired:
+                        # communicate retains buffered output and pending stdin.
+                        # Resupplying input on a retry is invalid.
+                        pending_input = None
+        except BaseException:  # stop and reap our child, then preserve the original failure
             _stop_process_group(process)
             raise
     finally:
@@ -641,8 +667,13 @@ class CodexCliSemanticAdjudicator:
     def adjudicate_with_result(
         self,
         batch: SemanticAdjudicationBatch,
+        *, stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticProviderResult:
+        if stage_guard is not None:
+            stage_guard.checkpoint()
         while not self._slot.acquire(timeout=0.1):
+            if stage_guard is not None:
+                stage_guard.checkpoint()
             if _SEMANTIC_SHUTDOWN_REQUESTED.is_set():
                 raise SemanticRouteAdjudicatorError(
                     "Codex semantic adjudication was cancelled before admission",
@@ -650,19 +681,25 @@ class CodexCliSemanticAdjudicator:
                     retryable=True,
                 )
         try:
+            if stage_guard is not None:
+                stage_guard.checkpoint()
             if _SEMANTIC_SHUTDOWN_REQUESTED.is_set():
                 raise SemanticRouteAdjudicatorError(
                     "Codex semantic adjudication was cancelled before admission",
                     reason_code="cancelled",
                     retryable=True,
                 )
-            return self._adjudicate_serial(batch)
+            result = self._adjudicate_serial(batch, stage_guard=stage_guard)
+            if stage_guard is not None:
+                stage_guard.checkpoint()
+            return result
         finally:
             self._slot.release()
 
     def _adjudicate_serial(
         self,
         batch: SemanticAdjudicationBatch,
+        *, stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticProviderResult:
         self._runtime_tmp_root.mkdir(parents=True, exist_ok=True)
         prompt = _prompt(batch)
@@ -730,7 +767,10 @@ class CodexCliSemanticAdjudicator:
                     prompt=prompt,
                     env=_safe_subprocess_environment(),
                     timeout_seconds=self._timeout_seconds,
+                    **({} if stage_guard is None else {"stage_guard": stage_guard}),
                 )
+                if stage_guard is not None:
+                    stage_guard.checkpoint()
                 if completed.returncode != 0:
                     raise _command_error(completed)
                 _validate_event_stream(completed.stdout, completed.stderr)

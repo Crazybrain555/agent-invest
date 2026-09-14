@@ -79,6 +79,7 @@ def staged_v4_coordinator_limits(
         cleanup_workers=mac_finalize_workers,
         ack_workers=mac_finalize_workers,
         admission_probe_seconds=worker_profile.admission_probe_milliseconds / 1000,
+        commit_stage_seconds=worker_profile.commit_stage_seconds,
     )
 
 

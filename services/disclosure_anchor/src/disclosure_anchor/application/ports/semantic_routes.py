@@ -110,12 +110,21 @@ class SemanticRouteAdjudicatorPort(Protocol):
     ) -> tuple[SemanticAdjudicationDecision, ...]: ...
 
 
+class SemanticExecutionGuard(Protocol):
+    """Live execution permission checked while waiting and around external IO."""
+
+    def checkpoint(self) -> None: ...
+
+    def remaining_seconds(self) -> float: ...
+
+
 class SemanticAdjudicatorAdapterPort(SemanticRouteAdjudicatorPort, Protocol):
     @property
     def provider_identity(self) -> SemanticProviderIdentity: ...
 
     def adjudicate_with_result(
-        self, batch: SemanticAdjudicationBatch
+        self, batch: SemanticAdjudicationBatch, *,
+        stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticProviderResult: ...
 
 
@@ -134,6 +143,7 @@ class SemanticAdjudicationExecutorPort(Protocol):
         batch: SemanticAdjudicationBatch,
         *,
         group_hash: str,
+        stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticAdjudicationOutcome: ...
 
 
@@ -164,6 +174,7 @@ class SemanticRouteReceiptStorePort(Protocol):
 
 
 __all__ = [
+    "SemanticExecutionGuard",
     "SemanticAdjudicationBatch",
     "SemanticAdjudicationCacheEntry",
     "SemanticAdjudicationExecutorPort",

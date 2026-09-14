@@ -742,9 +742,10 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
 的页数/主机小时；CPU/GPU 利用率用于解释空档，不能替代完整性或吞吐验证。
 
 - Windows `MineruProcessProfile` 只描述远端进程及资源上限。本机
-  `staged-worker-composition.v1` 另行绑定它的 SHA，以及 preflight/finalize 并发上限、
-  provider 状态轮询与 admission 探测间隔；七条 lane、物化信用和 DB primary/nested
+  `staged-worker-composition.v2` 另行绑定它的 SHA，以及 preflight/finalize 并发上限、
+  provider 状态轮询、admission 探测间隔与 commit 总预算；七条 lane、物化信用和 DB primary/nested
   checkout 均从这两个 exact profile 投影。运行时可在上限内按实时信用派工，不固定占满槽数。
+  历史 v1 的规范字节和 SHA 保持不变，解码仍接受其封闭字段集；v2 才包含 commit 预算。
 - `v4-prepared-execution-spec.v2` 将两份 exact profile 与 request/source/runtime 关联，
   由 H0 的 spec SHA/byte count 绑定。未发布的旧 spec v1 不做默默兼容。恢复时所有阶段，
   包括 publish、cleanup、ACK，在副作用前验证当前本机 profile；不同则明确失败。
@@ -760,6 +761,16 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   `DISCLOSURE_V4_ADMISSION_PROBE_MILLISECONDS` 默认均为 `1000`，范围 `1..60000`。
   它们不复用调度器 `0.1s` wake tick；archive member count 的配置/执行合同统一为
   `1..100000`，不能把字节信用当成文件数量来静默截断。
+- `DISCLOSURE_V4_COMMIT_STAGE_SECONDS` 是单文档 commit 的总安全预算，默认 `3600`、
+  范围 `60..86400` 秒，纳入本机 v2 profile 身份；它包含语义单飞锁、provider 名额等待、
+  所有模型组和发布准备。它不是按页数推算的完成承诺；各 provider 自身超时仍独立生效。
+  其他阶段保留原 `60s` 上限。commit 使用不可延长的总期限与可续新的 claim 期限两重保护，
+  后者扣除续租余量；只有核实成功的续租（含响应丢失后的同 claim 重读）才可向前更新。
+  任一期限过期或权限撤销后均不得复活，即使续租响应随后到达。
+  live guard 贯穿 builder、router、provider executor 和两种 CLI adapter；等待锁/名额及
+  子进程通信至多每 `0.1s` 检查一次。失去权限不进入下一组、备用 provider 或缓存写入，
+  保留原始阶段失权异常；已启动子进程按自有进程组停止并排空管道、实际 reap 后才退出。
+  不支持 live guard 的历史 adjudicator 分支不能用于受保护的模型执行，旧无 guard 调用不变。
 - 单例数据库连接只由协调线程探测；执行线程提交后的 claim 重读使用独立 UoW 与阶段 guard。
   staged 单例探测失败立即抛出，协调器先撤销全部在途阶段许可、等待实际退出，再由 resident
   外层清理进程；不得先等待进程终止而让其他阶段在已知失锁期间继续启动副作用。

@@ -400,6 +400,7 @@ class CoordinatorLimits:
     claim_lease_seconds: int = 120
     claim_renew_margin_seconds: float = 30.0
     max_stage_step_seconds: float = 60.0
+    commit_stage_seconds: float | None = None
     retry_initial_backoff_seconds: float = 0.25
     retry_max_backoff_seconds: float = 30.0
     retry_consecutive_threshold: int = 3
@@ -446,6 +447,13 @@ class CoordinatorLimits:
                 raise ValueError(f"{label} must be finite and positive")
         if not 0 < self.claim_renew_margin_seconds < self.claim_lease_seconds:
             raise ValueError("claim renewal margin must be inside the lease")
+        if self.commit_stage_seconds is not None and (
+            isinstance(self.commit_stage_seconds, bool)
+            or not isinstance(self.commit_stage_seconds, (int, float))
+            or not isfinite(self.commit_stage_seconds)
+            or self.commit_stage_seconds < self.max_stage_step_seconds
+        ):
+            raise ValueError("commit stage budget must be finite and cover the bounded stage step")
         if (
             self.max_stage_step_seconds <= 0
             or self.max_stage_step_seconds + self.claim_renew_margin_seconds
@@ -1131,10 +1139,39 @@ class StagedParseCoordinator:
 
         def guard_in_flight(now: float) -> None:
             nonlocal circuit_open, admission_open, blocked_reason
+
+            def refresh_guard_claim(
+                guard: StageLeaseGuard, renewed_work: CoordinatorWork,
+            ) -> bool:
+                nonlocal circuit_open, admission_open, blocked_reason
+                if guard.claim_deadline_monotonic is None:
+                    return True
+                try:
+                    if renewed_work.lease_expires_monotonic is None:
+                        raise StageLeaseLost("renewal has no verified claim deadline")
+                    guard.refresh_claim_deadline(
+                        renewed_work.lease_expires_monotonic
+                        - self._limits.claim_renew_margin_seconds
+                    )
+                except (StageLeaseLost, ValueError) as exc:
+                    circuit_open = True
+                    admission_open = False
+                    blocked_reason = "in_flight_claim_lost"
+                    errors.append(
+                        f"{renewed_work.attempt_id}:{lane.value}:claim-guard:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    in_flight_failures.add(future)
+                    guard.revoke()
+                    return False
+                return True
+
             for future, (lane, work, stage_guard, _grant) in tuple(in_flight.items()):
                 if future.done():
                     continue
-                if now >= stage_guard.deadline_monotonic:
+                try:
+                    stage_guard.checkpoint()
+                except StageLeaseLost:
                     if future not in in_flight_failures:
                         circuit_open = True
                         admission_open = False
@@ -1184,9 +1221,14 @@ class StagedParseCoordinator:
                         and durable.lease_expires_monotonic
                         > work.lease_expires_monotonic
                         and durable.lease_expires_monotonic
-                        > stage_guard.deadline_monotonic
+                        > min(
+                            stage_guard.deadline_monotonic,
+                            self._monotonic() + self._limits.max_stage_step_seconds,
+                        )
                         + self._limits.claim_renew_margin_seconds
                     ):
+                        if not refresh_guard_claim(stage_guard, durable):
+                            continue
                         known[work.attempt_id] = durable
                         ledger.replace(
                             durable,
@@ -1217,6 +1259,8 @@ class StagedParseCoordinator:
                         in_flight_failures.add(future)
                         stage_guard.revoke()
                 else:
+                    if not refresh_guard_claim(stage_guard, renewed):
+                        continue
                     in_flight[future] = (lane, renewed, stage_guard, _grant)
 
         try:
@@ -1634,10 +1678,23 @@ class StagedParseCoordinator:
                             break
                         stage_guard = StageLeaseGuard(
                             deadline_monotonic=(
-                                self._monotonic() + self._limits.max_stage_step_seconds
+                                self._monotonic() + (
+                                    self._limits.commit_stage_seconds
+                                    if lane == CoordinatorLane.COMMIT
+                                    and self._limits.commit_stage_seconds is not None
+                                    else self._limits.max_stage_step_seconds
+                                )
                             ),
                             _revoked=Event(),
                             _monotonic=self._monotonic,
+                            claim_deadline_monotonic=(
+                                work.lease_expires_monotonic
+                                - self._limits.claim_renew_margin_seconds
+                                if lane == CoordinatorLane.COMMIT
+                                and self._limits.commit_stage_seconds is not None
+                                and work.lease_expires_monotonic is not None
+                                else None
+                            ),
                         )
                         if lane == CoordinatorLane.PREFLIGHT:
                             future = pools[lane].submit(

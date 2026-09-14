@@ -123,6 +123,12 @@ class StagedV4Settings(BaseSettings):
             "DISCLOSURE_V4_ADMISSION_PROBE_MILLISECONDS", "admission_probe_milliseconds",
         ),
     )
+    commit_stage_seconds: int = Field(
+        default=3600, ge=60, le=86400,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_COMMIT_STAGE_SECONDS", "commit_stage_seconds",
+        ),
+    )
 
     def worker_profile(
         self, *, process_profile_sha256: str,
@@ -132,6 +138,8 @@ class StagedV4Settings(BaseSettings):
             StagedWorkerProfileV4,
         )
         return StagedWorkerProfileV4(
+            contract_version="staged-worker-composition.v2",
+            commit_stage_seconds=self.commit_stage_seconds,
             process_profile_sha256=process_profile_sha256,
             mac_preflight_workers=mac_preflight_workers,
             mac_finalize_workers=mac_finalize_workers,

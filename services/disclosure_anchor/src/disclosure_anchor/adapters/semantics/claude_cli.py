@@ -21,6 +21,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
     SemanticAdjudicatorIdentity,
+    SemanticExecutionGuard,
     SemanticProviderResult,
     SemanticRouteAdjudicatorError,
 )
@@ -160,20 +161,31 @@ class ClaudeCliSemanticAdjudicator:
     def adjudicate_with_result(
         self,
         batch: SemanticAdjudicationBatch,
+        *, stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticProviderResult:
+        if stage_guard is not None:
+            stage_guard.checkpoint()
         while not self._slot.acquire(timeout=0.1):
+            if stage_guard is not None:
+                stage_guard.checkpoint()
             if codex_cli._SEMANTIC_SHUTDOWN_REQUESTED.is_set():
                 raise _cancelled("before admission")
         try:
+            if stage_guard is not None:
+                stage_guard.checkpoint()
             if codex_cli._SEMANTIC_SHUTDOWN_REQUESTED.is_set():
                 raise _cancelled("before admission")
-            return self._adjudicate_serial(batch)
+            result = self._adjudicate_serial(batch, stage_guard=stage_guard)
+            if stage_guard is not None:
+                stage_guard.checkpoint()
+            return result
         finally:
             self._slot.release()
 
     def _adjudicate_serial(
         self,
         batch: SemanticAdjudicationBatch,
+        *, stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticProviderResult:
         schema = _output_schema(batch)
         args = [
@@ -205,7 +217,10 @@ class ClaudeCliSemanticAdjudicator:
                 prompt=codex_cli._prompt(batch),
                 env=codex_cli._safe_subprocess_environment(),
                 timeout_seconds=self._timeout_seconds,
+                **({} if stage_guard is None else {"stage_guard": stage_guard}),
             )
+            if stage_guard is not None:
+                stage_guard.checkpoint()
         except subprocess.TimeoutExpired as exc:
             raise SemanticRouteAdjudicatorError(
                 "Claude semantic adjudication timed out",

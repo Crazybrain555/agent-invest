@@ -162,6 +162,7 @@ class ProductionAtomicPublicationRequestBuilderV4:
             admitted=admitted,
             document=semantic_document_context(context.document),
             drafts=base_build.units,
+            stage_guard=stage_guard,
         )
         stage_guard.checkpoint()
 

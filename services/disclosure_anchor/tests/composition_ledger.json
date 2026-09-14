@@ -966,6 +966,10 @@
    "private_imports": [],
    "tests": 14
   },
+  "tests/unit/test_semantic_execution_guard.py": {
+   "private_imports": [],
+   "tests": 16
+  },
   "tests/unit/test_semantic_route_receipt_v3.py": {
    "private_imports": [],
    "tests": 6
@@ -1025,6 +1029,10 @@
   "tests/unit/test_staged_commission_pressure.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_staged_commit_budget.py": {
+   "private_imports": [],
+   "tests": 13
   },
   "tests/unit/test_staged_coordinator_backend_v4.py": {
    "private_imports": [],

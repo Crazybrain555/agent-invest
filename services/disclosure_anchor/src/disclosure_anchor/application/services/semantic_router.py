@@ -42,6 +42,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
     SemanticAdjudicationExecutorPort,
+    SemanticExecutionGuard,
     SemanticAdjudicationOutcome,
     SemanticRouteAdjudicatorPort,
     SemanticRouteAdjudicatorError,
@@ -290,9 +291,12 @@ class SemanticRouter:
         admitted: AdmittedProviderDocument,
         document: SemanticDocumentContext,
         drafts: Sequence[ProviderUnitDraft],
+        stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticRouteBatchResult:
         """Create new receipts, consulting the model only for uncached ambiguity."""
 
+        if stage_guard is not None:
+            stage_guard.checkpoint()
         inputs = tuple(
             self._prepare_input(admitted=admitted, document=document, draft=draft)
             for draft in drafts
@@ -324,8 +328,11 @@ class SemanticRouter:
             model_inputs,
             batch_size=self.batch_size,
         ):
+            if stage_guard is not None:
+                stage_guard.checkpoint()
             group_hash = _semantic_adjudication_group_hash(requested)
             if self.executor is not None:
+                guard_arguments = {} if stage_guard is None else {"stage_guard": stage_guard}
                 outcome = self.executor.adjudicate(
                     SemanticAdjudicationBatch(
                         document=document,
@@ -333,7 +340,10 @@ class SemanticRouter:
                         units=requested,
                     ),
                     group_hash=group_hash,
+                    **guard_arguments,
                 )
+                if stage_guard is not None:
+                    stage_guard.checkpoint()
                 outcomes.append(outcome)
                 if outcome.group_hash != group_hash:
                     raise SemanticRouteContractError(
@@ -385,6 +395,10 @@ class SemanticRouter:
                         outcome=outcome,
                     )
                 continue
+            if stage_guard is not None:
+                raise SemanticRouteContractError(
+                    "guarded semantic model execution requires the provider executor"
+                )
             assert self.cache is not None
             group_cache_keys = {
                 unit_input.unit_index: self._cache_key(
@@ -485,6 +499,8 @@ class SemanticRouter:
                 strict=True,
             )
         )
+        if stage_guard is not None:
+            stage_guard.checkpoint()
         return SemanticRouteBatchResult(
             units=routed,
             receipts=ordered_receipts,

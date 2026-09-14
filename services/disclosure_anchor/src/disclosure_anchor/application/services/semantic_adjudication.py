@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import json
 import threading
@@ -21,6 +23,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationGroupCachePort,
     SemanticAdjudicationOutcome,
     SemanticAdjudicatorAdapterPort,
+    SemanticExecutionGuard,
     SemanticRouteAdjudicatorError,
     SemanticRouteCacheError,
 )
@@ -77,9 +80,12 @@ class OrderedSemanticAdjudicationExecutor:
         batch: SemanticAdjudicationBatch,
         *,
         group_hash: str,
+        stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticAdjudicationOutcome:
         attempts: list[SemanticProviderAttempt] = []
         for ordinal, configured in enumerate(self._providers, start=1):
+            if stage_guard is not None:
+                stage_guard.checkpoint()
             identity = configured.adapter.provider_identity
             cache_key = semantic_group_cache_key(
                 identity=identity,
@@ -87,8 +93,10 @@ class OrderedSemanticAdjudicationExecutor:
                 group_hash=group_hash,
             )
             lock = _single_flight_lock(cache_key)
-            with lock:
+            with _guarded_single_flight(lock, stage_guard):
                 cached = configured.cache.get(cache_key)
+                if stage_guard is not None:
+                    stage_guard.checkpoint()
                 if cached is not None:
                     _validate_cache_entry(
                         cached,
@@ -112,8 +120,14 @@ class OrderedSemanticAdjudicationExecutor:
                         response_sha256=cached.response_sha256,
                     )
                 try:
-                    result = configured.adapter.adjudicate_with_result(batch)
+                    result = (
+                        configured.adapter.adjudicate_with_result(batch)
+                        if stage_guard is None
+                        else configured.adapter.adjudicate_with_result(batch, stage_guard=stage_guard)
+                    )
                 except SemanticRouteAdjudicatorError as exc:
+                    if stage_guard is not None:
+                        stage_guard.checkpoint()
                     if exc.reason_code == _CANCELLED_REASON_CODE:
                         cancelled = SemanticProviderAttempt(
                             ordinal=ordinal,
@@ -164,12 +178,16 @@ class OrderedSemanticAdjudicationExecutor:
                     "succeeded", "succeeded_cache_write_failed"
                 ] = "succeeded"
                 try:
+                    if stage_guard is not None:
+                        stage_guard.checkpoint()
                     configured.cache.put(entry)
                 except SemanticRouteCacheError:
                     # The exact validated result and this failure are frozen in
                     # receipt v2 before DB success.  Receipt failure still
                     # fails the build closed.
                     outcome = "succeeded_cache_write_failed"
+                if stage_guard is not None:
+                    stage_guard.checkpoint()
                 attempt = SemanticProviderAttempt(
                     ordinal=ordinal,
                     provider=identity,
@@ -185,6 +203,8 @@ class OrderedSemanticAdjudicationExecutor:
                     identity=identity,
                     response_sha256=result.response_sha256,
                 )
+        if stage_guard is not None:
+            stage_guard.checkpoint()
         return SemanticAdjudicationOutcome(
             policy_version=self._policy_version,
             group_hash=group_hash,
@@ -195,6 +215,25 @@ class OrderedSemanticAdjudicationExecutor:
             group_response_sha256=None,
             degraded_unavailable=True,
         )
+
+
+@contextmanager
+def _guarded_single_flight(
+    lock: threading.Lock, stage_guard: SemanticExecutionGuard | None,
+) -> Iterator[None]:
+    if stage_guard is None:
+        with lock:
+            yield
+        return
+    while True:
+        remaining = stage_guard.remaining_seconds()
+        if lock.acquire(timeout=min(0.1, remaining)):
+            break
+    try:
+        stage_guard.checkpoint()
+        yield
+    finally:
+        lock.release()
 
 
 def semantic_group_cache_key(
