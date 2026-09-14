@@ -101,8 +101,12 @@ class StagedCommissionTests(unittest.TestCase):
                 runtime.worker_profile_sha256 = "sha256:"+"f"*64
                 runtime.coordinator.run.return_value = CoordinatorResult(
                     CoordinatorTerminal.QUIESCENT, True, 1, 1, (), (), ResourceCreditVector())
-                result = run_commissioning(SimpleNamespace(worker_parse_execution_mode="staged-v4"),
-                                          document_ids=("chosen",), max_seconds=5)
+                result = run_commissioning(SimpleNamespace(
+                    worker_parse_execution_mode="staged-v4",
+                    disclosure_mineru_stream_pressure_config=None,
+                    disclosure_mineru_stream_pressure_config_sha256=None,
+                    disclosure_mineru_runtime_bundle_identity_sha256=None,
+                ), document_ids=("chosen",), max_seconds=5)
                 self.assertEqual(result["result"], expected)
                 self.assertEqual(build.call_args.kwargs["admission_document_ids"], ("chosen",))
                 runtime.verify_startup.assert_called_once_with()

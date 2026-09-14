@@ -21,6 +21,7 @@ from disclosure_anchor.adapters.db.postgres.connection import (
     require_runtime_app_connection, require_runtime_app_engine,
 )
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import MinerUDeploymentChecker
+from disclosure_anchor.adapters.runtime.mineru_stream_worker import owned_mineru_stream_control
 from disclosure_anchor.adapters.runtime.staged_worker_v4 import build_staged_worker_v4_runtime
 from disclosure_anchor.application.ports.staged_new_work_v4 import validate_admission_document_ids
 from disclosure_anchor.application.services.staged_parse_coordinator import CoordinatorTerminal
@@ -118,43 +119,46 @@ def run_commissioning(
                 def admission_guard() -> None:
                     _assert_worker_admission(lock_conn, mineru_checker=checker, singleton_guard=ownership_guard)
 
-                runtime = build_staged_worker_v4_runtime(
-                    settings=settings, engine=engine, ownership_guard=ownership_guard,
-                    admission_guard=admission_guard,
-                    process_scope_classes=_process_scope_classes(settings),
-                    admission_document_ids=document_ids, progress=lambda _snapshot: None,
-                    expected_capacity=checker.expected_capacity,
-                )
-                try:
-                    runtime.verify_startup()
-                    deadline = time.monotonic() + max_seconds
-                    result = runtime.coordinator.run(
-                        stop_requested=lambda: stop_requested() or time.monotonic() >= deadline,
+                with owned_mineru_stream_control(
+                    settings, expected_capacity=checker.expected_capacity, wakeup=lambda: None,
+                ) as stream_control:
+                    runtime = build_staged_worker_v4_runtime(
+                        settings=settings, engine=engine, ownership_guard=ownership_guard,
+                        admission_guard=admission_guard,
+                        process_scope_classes=_process_scope_classes(settings),
+                        admission_document_ids=document_ids, progress=lambda _snapshot: None,
+                        expected_capacity=checker.expected_capacity, stream_control=stream_control,
                     )
-                    after = _documents(engine, document_ids)
-                    outcomes = _outcomes(document_ids, before, after)
-                    clean = (
-                        result.terminal is CoordinatorTerminal.QUIESCENT
-                        and result.recovery_complete and not result.errors
-                        and not result.credits_in_use.nonzero()
-                    )
-                    passed = clean and all(item["outcome"] == "published" for item in outcomes)
-                    return {
-                        "contract_version": "staged-v4-commissioning.v1",
-                        "observed_at": datetime.now(UTC).isoformat(),
-                        "owner_identity": runtime.owner_identity,
-                        "worker_profile_sha256": runtime.worker_profile_sha256,
-                        "process_profile_sha256": loaded.profile.sha256,
-                        "runtime_bundle_identity_sha256": loaded.profile.runtime_bundle_identity_sha256,
-                        "max_seconds": max_seconds, "result": "PASS" if passed else "NOT_PASS",
-                        "terminal": result.terminal.value, "clean": clean,
-                        "recovery_complete": result.recovery_complete,
-                        "admitted": result.admitted, "completed": result.completed,
-                        "errors": list(result.errors),
-                        "credits_in_use": result.credits_in_use.nonzero(), "documents": outcomes,
-                    }
-                finally:
-                    runtime.close()
+                    try:
+                        runtime.verify_startup()
+                        deadline = time.monotonic() + max_seconds
+                        result = runtime.coordinator.run(
+                            stop_requested=lambda: stop_requested() or time.monotonic() >= deadline,
+                        )
+                        after = _documents(engine, document_ids)
+                        outcomes = _outcomes(document_ids, before, after)
+                        clean = (
+                            result.terminal is CoordinatorTerminal.QUIESCENT
+                            and result.recovery_complete and not result.errors
+                            and not result.credits_in_use.nonzero()
+                        )
+                        passed = clean and all(item["outcome"] == "published" for item in outcomes)
+                        return {
+                            "contract_version": "staged-v4-commissioning.v1",
+                            "observed_at": datetime.now(UTC).isoformat(),
+                            "owner_identity": runtime.owner_identity,
+                            "worker_profile_sha256": runtime.worker_profile_sha256,
+                            "process_profile_sha256": loaded.profile.sha256,
+                            "runtime_bundle_identity_sha256": loaded.profile.runtime_bundle_identity_sha256,
+                            "max_seconds": max_seconds, "result": "PASS" if passed else "NOT_PASS",
+                            "terminal": result.terminal.value, "clean": clean,
+                            "recovery_complete": result.recovery_complete,
+                            "admitted": result.admitted, "completed": result.completed,
+                            "errors": list(result.errors),
+                            "credits_in_use": result.credits_in_use.nonzero(), "documents": outcomes,
+                        }
+                    finally:
+                        runtime.close()
             finally:
                 engine.dispose()
     finally:

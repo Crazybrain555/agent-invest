@@ -74,6 +74,11 @@ corpus 过滤，既有 carry-in 不得被计入本轮新增合格产出。
 `build_staged_worker_v4_campaign_runtime` 是显式 scoped 构造入口，不能用未限定的
 ordinary resident CLI 冒充有限 campaign。
 
+既有 `staged_commission` 小批量入口也接入同一 owned pressure context，并将同一个
+control 交给真实 staged runtime；未配置时保持关闭。它仍只接受显式的 1–8 个文档，
+保留原部署检查、全局恢复边界与运行收尾，用于真实入库功能检查。此入口不生成正式
+M6 owner 事件或公开消费者资格。
+
 正式 M6 还需要有限运行入口把真实 PG attempt/commit 事实、完整原 owner 证据和
 独立公开消费者检查接通。诊断 runner 的完整 PDF/ACK 结果、内存数据库 SQL shim、
 单元测试和动态 target 曲线都不能替代这项验收。已有公开视图与解析合同不改变；
