@@ -3354,6 +3354,15 @@ def trim_process_heap() -> bool:
             count=2,
             label="Hybrid append and window completion",
         )
+        source = _replace_exact_occurrence(
+            source,
+            "                    append_page_model_list_to_middle_json(\n",
+            "                    await to_thread_owned(\n"
+            "                        append_page_model_list_to_middle_json,\n",
+            count=2,
+            occurrence=1,
+            label="Hybrid asynchronous append resource drain",
+        )
         source = _replace_exact(
             source,
             "        if client_side_output_generation:\n"

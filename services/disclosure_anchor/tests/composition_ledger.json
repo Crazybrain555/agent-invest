@@ -470,6 +470,10 @@
    "private_imports": [],
    "tests": 0
   },
+  "tests/unit/test_mineru_async_append.py": {
+   "private_imports": [],
+   "tests": 1
+  },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
    "tests": 17
