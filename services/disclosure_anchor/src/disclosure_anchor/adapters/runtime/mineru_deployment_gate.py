@@ -26,6 +26,7 @@ from disclosure_anchor.adapters.runtime.mineru_diagnostic import (
     validate_diagnostic_disposal,
 )
 from disclosure_anchor.adapters.runtime.mineru_identity import (
+    EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT,
     MINERU_API_INFERENCE_MAX_CONCURRENCY,
     MINERU_API_MAX_UNACKED_RESULT_BYTES,
     MINERU_API_RESULT_RESERVATION_BYTES,
@@ -43,8 +44,10 @@ from disclosure_anchor.adapters.runtime.mineru_identity import (
     writer_code_digest,
 )
 from disclosure_anchor.application.contracts.mineru_process_profile import (
+    EXPLICIT_PROCESS_PROFILE_CONTRACT,
     MineruProcessProfile,
 )
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured_mineru_capacity
 from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
@@ -176,15 +179,18 @@ class MinerUDeploymentChecker:
         *,
         parse_enabled: bool | None = None,
         process_profile: MineruProcessProfile | None = None,
+        expected_capacity: MineruCapacityConfig | None = None,
         wall_clock: Callable[[], datetime] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self._monotonic_clock = monotonic_clock or time.monotonic
+        self.expected_capacity = configured_mineru_capacity(settings, expected_capacity)
         self._evidence = verify_mineru_deployment_gate(
             settings,
             parse_enabled=parse_enabled,
             process_profile=process_profile,
+            expected_capacity=self.expected_capacity,
             now=self._wall_clock(),
         )
         self._probe_interval_seconds = (
@@ -308,7 +314,12 @@ def _verify_configured_capacity(
     settings: Settings,
     *,
     process_profile: MineruProcessProfile | None,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> None:
+    expected_capacity = configured_mineru_capacity(settings, expected_capacity)
+    if expected_capacity is not None:
+        _verify_explicit_profile_configuration(settings, process_profile, expected_capacity)
+        return
     if (
         "mineru_processing_window_size" not in settings.model_fields_set
         or settings.mineru_processing_window_size != MINERU_PROCESSING_WINDOW_SIZE
@@ -383,19 +394,64 @@ def _verify_configured_capacity(
         )
 
 
+def _verify_explicit_profile_configuration(
+    settings: Settings, profile: MineruProcessProfile | None, capacity: MineruCapacityConfig,
+) -> None:
+    if type(profile) is not MineruProcessProfile or profile.contract_version != EXPLICIT_PROCESS_PROFILE_CONTRACT:
+        raise MinerUDeploymentGateError("explicit capacity requires the v2 staged process profile")
+    scalar = {
+        "disclosure_mineru_api_task_slots": capacity.parse_active_limit,
+        "disclosure_mineru_api_inference_concurrency": capacity.final_http_limit_per_loop,
+        "mineru_processing_window_size": capacity.processing_window_size,
+        "worker_gpu_request_budget": capacity.final_http_limit_per_loop,
+    }
+    drift = [name for name, value in scalar.items() if getattr(settings, name) != value]
+    expected = {
+        "runtime_bundle_identity_sha256": settings.disclosure_mineru_runtime_bundle_identity_sha256,
+        "api_task_slots": capacity.parse_active_limit,
+        "api_max_pending_tasks": capacity.total_nonterminal_limit,
+        "registry_nonterminal_cap": capacity.total_nonterminal_limit,
+        "registry_terminal_cap": MINERU_API_TASK_REGISTRY_MAX_RECORDS - capacity.total_nonterminal_limit,
+        "processing_window_size": capacity.processing_window_size,
+        "cpu_worker_threads": capacity.pdf_render_processes_requested,
+        "omp_thread_count": capacity.omp_num_threads,
+        "requested_hybrid_batch_ratio": capacity.hybrid_batch_ratio_requested,
+        "effective_hybrid_batch_ratio": capacity.hybrid_batch_ratio_requested,
+        "hybrid_ocr_override": False,
+        "inference_concurrency": capacity.final_http_limit_per_loop,
+        "gpu_request_slots": capacity.final_http_limit_per_loop,
+        "pipeline_inference_locks": capacity.pipeline_inference_locks,
+        "finalizer_slots": capacity.finalizer_active_limit,
+        "result_reservation_bytes": capacity.result_reservation_bytes,
+        "max_unacked_result_bytes": capacity.max_unacked_result_bytes,
+        "vllm_max_num_seqs": settings.worker_gpu_max_sequences,
+        "task_retention_seconds": settings.disclosure_mineru_api_task_retention_seconds,
+        "task_cleanup_interval_seconds": settings.disclosure_mineru_api_cleanup_interval_seconds,
+    }
+    drift.extend(name for name, value in expected.items() if getattr(profile, name) != value)
+    if drift:
+        raise MinerUDeploymentGateError("explicit capacity/profile/configuration drift: " + ", ".join(drift))
+
+
 def _verify_staged_profile_manifest(
     profile: MineruProcessProfile,
     manifest: dict[str, Any],
+    *,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> None:
     if manifest.get("contract_version") not in {
         STAGED_RUNTIME_MANIFEST_CONTRACT,
         CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
+        *({EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT} if expected_capacity is not None else set()),
     }:
         raise MinerUDeploymentGateError(
             "staged V4 requires the independently measured v9 or v10 runtime manifest"
         )
     try:
-        cpu_threads = verified_cpu_thread_policy(manifest)
+        cpu_threads = (
+            expected_capacity.omp_num_threads
+            if expected_capacity is not None else verified_cpu_thread_policy(manifest)
+        )
     except ValueError as exc:
         raise MinerUDeploymentGateError(str(exc)) from exc
     orchestrator = manifest.get("orchestrator")
@@ -410,6 +466,25 @@ def _verify_staged_profile_manifest(
     assert isinstance(orchestrator, dict)
     assert isinstance(inference, dict)
     assert isinstance(topology, dict)
+    if profile.contract_version == EXPLICIT_PROCESS_PROFILE_CONTRACT:
+        # The current manifest binds the actual engine command, not a resolved
+        # framework getter. Absent an explicit value, this field stays unknown.
+        command = inference.get("command")
+        if type(command) is not list or any(type(arg) is not str for arg in command):
+            raise MinerUDeploymentGateError("engine command evidence is unavailable")
+        values = []
+        for index, argument in enumerate(command):
+            if argument == "--max-num-batched-tokens":
+                if index + 1 >= len(command):
+                    raise MinerUDeploymentGateError("engine token argument is incomplete")
+                values.append(command[index + 1])
+            elif argument.startswith("--max-num-batched-tokens="):
+                values.append(argument.split("=", 1)[1])
+        if len(values) > 1 or any(not value.isascii() or not value.isdecimal() or int(value) <= 0 for value in values):
+            raise MinerUDeploymentGateError("engine token argument is ambiguous")
+        expected_tokens = int(values[0]) if values else None
+        if profile.vllm_max_num_batched_tokens != expected_tokens:
+            raise MinerUDeploymentGateError("profile token limit lacks matching engine command evidence")
     model_identity = canonical_payload_sha256(
         {
             "model_repository": inference.get("model_repository"),
@@ -455,6 +530,7 @@ def verify_mineru_deployment_gate(
     *,
     parse_enabled: bool | None = None,
     process_profile: MineruProcessProfile | None = None,
+    expected_capacity: MineruCapacityConfig | None = None,
     now: datetime | None = None,
 ) -> VerifiedMinerUDeployment | None:
     """Prove exact runtime, fixed smoke, held-out PDFs, and live boundaries."""
@@ -465,6 +541,7 @@ def verify_mineru_deployment_gate(
         process_profile=process_profile,
         now=now,
         historical_writer_digest=None,
+        expected_capacity=expected_capacity,
     )
 
 
@@ -475,6 +552,7 @@ def _verify_mineru_deployment_evidence(
     process_profile: MineruProcessProfile | None,
     now: datetime | None,
     historical_writer_digest: str | None,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> VerifiedMinerUDeployment | None:
     """Shared evidence parser; historical digest is restricted to the recovery gate.
 
@@ -488,7 +566,8 @@ def _verify_mineru_deployment_evidence(
     )
     if not enabled:
         return None
-    _verify_configured_capacity(settings, process_profile=process_profile)
+    expected_capacity = configured_mineru_capacity(settings, expected_capacity)
+    _verify_configured_capacity(settings, process_profile=process_profile, expected_capacity=expected_capacity)
     api_url = settings.disclosure_mineru_api_url
     observability_url = settings.disclosure_mineru_observability_url
     inference_upstream_url = settings.disclosure_mineru_inference_upstream_url
@@ -544,15 +623,16 @@ def _verify_mineru_deployment_evidence(
             },
             configured_identity=runtime_identity,
             local_client_identity=local_client,
-            local_processing_window_size=MINERU_PROCESSING_WINDOW_SIZE,
+            local_processing_window_size=settings.mineru_processing_window_size,
             local_writer_code_digest=local_code_digest,
+            expected_capacity=expected_capacity,
         )
     except (OSError, ValueError) as exc:
         raise MinerUDeploymentGateError(
             f"MinerU exact runtime identity cannot be verified: {exc}"
         ) from exc
     if process_profile is not None:
-        _verify_staged_profile_manifest(process_profile, manifest.manifest)
+        _verify_staged_profile_manifest(process_profile, manifest.manifest, expected_capacity=expected_capacity)
     expected_task_slots = (
         settings.disclosure_mineru_api_task_slots
         if process_profile is None
@@ -575,7 +655,7 @@ def _verify_mineru_deployment_evidence(
     expected_identity: dict[str, object] = {
         "local_client_identity_sha256": local_client.package_set_sha256,
         "local_content_package_versions": dict(local_client.content_package_versions),
-        "local_processing_window_size": MINERU_PROCESSING_WINDOW_SIZE,
+        "local_processing_window_size": settings.mineru_processing_window_size,
         "local_writer_code_sha256": local_code_digest,
         "runtime_manifest_identity_sha256": runtime_identity,
         "orchestrator_runtime_identity_sha256": (manifest.orchestrator_identity_sha256),
@@ -605,6 +685,7 @@ def _verify_mineru_deployment_evidence(
         "observability_url": observability_url,
         "max_age_seconds": settings.disclosure_mineru_canary_max_age_seconds,
         "current": current,
+        "expected_capacity": expected_capacity,
     }
     _verify_smoke_receipt(
         smoke,
@@ -628,6 +709,7 @@ def _verify_mineru_deployment_evidence(
         task_retention_seconds=expected_retention_seconds,
         task_cleanup_interval_seconds=expected_cleanup_seconds,
         task_slots=expected_task_slots,
+        expected_capacity=expected_capacity,
     )
     evidence.assert_fresh(now=current)
     return evidence
@@ -636,10 +718,12 @@ def _verify_mineru_deployment_evidence(
 def verify_staged_process_profile_configuration(
     settings: Settings,
     process_profile: MineruProcessProfile,
+    *,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> None:
     """Reject a staged profile outside the currently attested runtime version."""
 
-    _verify_configured_capacity(settings, process_profile=process_profile)
+    _verify_configured_capacity(settings, process_profile=process_profile, expected_capacity=expected_capacity)
 
 
 def verify_mineru_heldout_validation(
@@ -884,6 +968,7 @@ def _verify_smoke_receipt(
     current: datetime,
     expected_cache: dict[str, Any] | None,
     require_multi_page: bool = False,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> tuple[str, datetime, datetime]:
     required_receipt_fields = {
         "schema",
@@ -982,6 +1067,7 @@ def _verify_smoke_receipt(
         task_retention_seconds=task_retention_seconds,
         cleanup_interval_seconds=cleanup_interval_seconds,
         task_slots=task_slots,
+        expected_capacity=expected_capacity,
     )
     if receipt.get("cleanup") != _EXPECTED_CLEANUP:
         raise MinerUDeploymentGateError(f"{label} cleanup was not proved")

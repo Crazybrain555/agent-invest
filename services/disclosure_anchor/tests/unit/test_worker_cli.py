@@ -890,7 +890,11 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             return_value=runtime,
         ):
             worker_cli._run_staged_v4_resident(
-                mock.MagicMock(worker_loop_interval_seconds=900),
+                mock.MagicMock(
+                    worker_loop_interval_seconds=900,
+                    disclosure_mineru_stream_pressure_config=None,
+                    disclosure_mineru_stream_pressure_config_sha256=None,
+                ),
                 engine=mock.MagicMock(),
                 deps=deps,
                 should_stop=should_stop,

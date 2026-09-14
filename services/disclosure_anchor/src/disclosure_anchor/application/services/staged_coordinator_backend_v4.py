@@ -7,6 +7,8 @@ effect through an existing port, and append/reconcile exactly one successor.
 
 from __future__ import annotations
 
+from disclosure_anchor.application.ports.mineru_stream_pressure import StreamSubmissionDeferred
+
 from collections.abc import Callable
 from dataclasses import fields
 from math import isfinite
@@ -87,6 +89,7 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     RetryStage,
     StageLeaseGuard,
     StageWaiting,
+    StageAdmissionDeferred,
 )
 from disclosure_anchor.application.use_cases.prepare_and_publish_whole_document_v4 import (
     PrepareAndPublishWholeDocumentV4,
@@ -771,6 +774,12 @@ class DurableStagedCoordinatorBackendV4:
         )
         try:
             accepted = self._remote.reconcile_or_submit(command)
+        except StreamSubmissionDeferred as exc:
+            waiting = StageAdmissionDeferred if exc.unsafe else StageWaiting
+            raise waiting(
+                "provider submission paused by stream pressure: " + str(exc),
+                retry_after_seconds=self._poll_seconds,
+            ) from exc
         except (RemoteProviderUnavailableV4, RemoteSubmissionAmbiguousV4) as exc:
             raise RetryStage(
                 "provider submission episode was unavailable",

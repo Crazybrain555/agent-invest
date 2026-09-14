@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+
 
 import argparse
 import hashlib
@@ -619,6 +621,7 @@ def _run_loop(
                 work_available=work_available,
                 prune_tracker=prune_tracker,
                 progress_output=progress_output,
+                expected_capacity=None if mineru_checker is None else mineru_checker.expected_capacity,
             )
         else:
             run_resident_parse(
@@ -666,6 +669,7 @@ def _run_staged_v4_resident(
     work_available: threading.Event,
     prune_tracker: _ProjectionPruneTracker,
     progress_output: str,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> None:
     """Run only the V4 parse/finalize path until process shutdown."""
 
@@ -678,6 +682,8 @@ def _run_staged_v4_resident(
         CoordinatorSnapshot,
         CoordinatorTerminal,
     )
+
+    from disclosure_anchor.adapters.runtime.mineru_stream_worker import owned_mineru_stream_control
 
     last_snapshot: list[CoordinatorSnapshot | None] = [None]
 
@@ -700,6 +706,10 @@ def _run_staged_v4_resident(
             "completed": snapshot.completed,
             "blocked_reason": snapshot.blocked_reason,
             "credit_blocked_by_lane": dict(snapshot.credit_blocked_by_lane),
+            "stream_target": snapshot.stream_target,
+            "stream_actual": snapshot.stream_actual,
+            "stream_reason": snapshot.stream_reason,
+            "stream_evidence_sha256": snapshot.stream_evidence_sha256,
         }
         if progress_output == "jsonl":
             import json
@@ -717,42 +727,45 @@ def _run_staged_v4_resident(
                 flush=True,
             )
 
-    runtime = build_staged_worker_v4_runtime(
-        settings=settings,
-        engine=engine,
-        ownership_guard=ownership_guard,
-        admission_guard=admission_guard,
-        process_scope_classes=(
-            deps.config.process_scope_classes
-            if isinstance(deps.config.process_scope_classes, tuple)
-            else None
-        ),
-        progress=progress,
-        publication_committed=lambda replaced: prune_tracker.mark(1 if replaced else 0),
-    )
-    try:
-        runtime.verify_startup()
-        while not should_stop():
-            # Clear only before the authoritative DB scan. Any acquisition
-            # signal that races with or follows that scan remains set and
-            # forces an immediate next pass; clearing after QUIESCENT would
-            # lose that wakeup and unnecessarily idle for a full poll period.
-            work_available.clear()
-            # Each run performs an exhaustive V4 recovery barrier before it
-            # can admit from ordinary pending_parse. A quiescent return is an
-            # idle observation, not a resident-process exit.
-            result = runtime.coordinator.run(stop_requested=should_stop)
-            if result.terminal is not CoordinatorTerminal.QUIESCENT:
-                raise RuntimeError(
-                    "staged V4 coordinator opened its circuit: "
-                    + "; ".join(result.errors or ("unknown staged failure",))
-                )
-            if should_stop():
-                return
-            last_snapshot[0] = None
-            work_available.wait(timeout=settings.worker_loop_interval_seconds)
-    finally:
-        runtime.close()
+    with owned_mineru_stream_control(settings, expected_capacity=expected_capacity, wakeup=work_available.set) as stream_control:
+        runtime = build_staged_worker_v4_runtime(
+            settings=settings,
+            engine=engine,
+            ownership_guard=ownership_guard,
+            admission_guard=admission_guard,
+            process_scope_classes=(
+                deps.config.process_scope_classes
+                if isinstance(deps.config.process_scope_classes, tuple)
+                else None
+            ),
+            progress=progress,
+            publication_committed=lambda replaced: prune_tracker.mark(1 if replaced else 0),
+            expected_capacity=expected_capacity,
+            stream_control=stream_control,
+        )
+        try:
+            runtime.verify_startup()
+            while not should_stop():
+                # Clear only before the authoritative DB scan. Any acquisition
+                # signal that races with or follows that scan remains set and
+                # forces an immediate next pass; clearing after QUIESCENT would
+                # lose that wakeup and unnecessarily idle for a full poll period.
+                work_available.clear()
+                # Each run performs an exhaustive V4 recovery barrier before it
+                # can admit from ordinary pending_parse. A quiescent return is an
+                # idle observation, not a resident-process exit.
+                result = runtime.coordinator.run(stop_requested=should_stop)
+                if result.terminal is not CoordinatorTerminal.QUIESCENT:
+                    raise RuntimeError(
+                        "staged V4 coordinator opened its circuit: "
+                        + "; ".join(result.errors or ("unknown staged failure",))
+                    )
+                if should_stop():
+                    return
+                last_snapshot[0] = None
+                work_available.wait(timeout=settings.worker_loop_interval_seconds)
+        finally:
+            runtime.close()
 
 
 class _ProjectionPruneTracker:
@@ -1518,8 +1531,8 @@ def _print_version_banner(settings: Settings) -> None:
         f"builder_rules={PROVIDER_UNIT_BUILDER_VERSION} "
         f"parse_workers={settings.worker_parse_concurrency} "
         f"api_outstanding={settings.worker_mineru_client_outstanding_window} "
-        f"gpu_request_cap={settings.disclosure_mineru_api_task_slots}x"
-        f"{settings.mineru_http_request_concurrency}="
+        f"gpu_request_scope={'shared-H' if settings.disclosure_mineru_capacity_config else 'legacy-NxH'} "
+        f"gpu_request_cap="
         f"{settings.mineru_effective_inference_request_upper_bound}"
         f"<={settings.worker_gpu_max_sequences} "
         f"parse_runaway={settings.disclosure_parse_runaway_timeout_seconds}s "

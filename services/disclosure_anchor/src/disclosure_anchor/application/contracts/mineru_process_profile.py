@@ -11,6 +11,7 @@ from disclosure_anchor.application.contracts.strict_json import strict_json_load
 
 
 PROCESS_PROFILE_CONTRACT = "mineru.process-profile.v1"
+EXPLICIT_PROCESS_PROFILE_CONTRACT = "mineru.process-profile.v2"
 _FIELDS = frozenset(
     {
         "contract_version",
@@ -106,7 +107,7 @@ class MineruProcessProfile:
     inference_concurrency: int
     vllm_max_num_seqs: int
     vllm_max_model_len: int
-    vllm_max_num_batched_tokens: int
+    vllm_max_num_batched_tokens: int | None
     vllm_gpu_memory_utilization_millionths: int
     vllm_tensor_parallel_size: int
     vllm_pipeline_parallel_size: int
@@ -135,7 +136,7 @@ class MineruProcessProfile:
     task_cleanup_interval_seconds: int
 
     def __post_init__(self) -> None:
-        if self.contract_version != PROCESS_PROFILE_CONTRACT:
+        if self.contract_version not in {PROCESS_PROFILE_CONTRACT, EXPLICIT_PROCESS_PROFILE_CONTRACT}:
             raise ValueError("MinerU process profile contract is unsupported")
         for name in (
             "runtime_bundle_identity_sha256",
@@ -163,7 +164,6 @@ class MineruProcessProfile:
             "inference_concurrency",
             "vllm_max_num_seqs",
             "vllm_max_model_len",
-            "vllm_max_num_batched_tokens",
             "vllm_gpu_memory_utilization_millionths",
             "vllm_tensor_parallel_size",
             "vllm_pipeline_parallel_size",
@@ -175,6 +175,13 @@ class MineruProcessProfile:
             "task_cleanup_interval_seconds",
         ):
             _validate_positive_bounded_int(name, getattr(self, name), _MAX_INT32)
+        if not (
+            self.contract_version == EXPLICIT_PROCESS_PROFILE_CONTRACT
+            and self.vllm_max_num_batched_tokens is None
+        ):
+            _validate_positive_bounded_int(
+                "vllm_max_num_batched_tokens", self.vllm_max_num_batched_tokens, _MAX_INT32
+            )
         for name in (
             "result_reservation_bytes",
             "max_unacked_result_bytes",
@@ -316,6 +323,7 @@ def _is_sha256(value: object) -> bool:
 __all__ = [
     "MineruProcessProfile",
     "PROCESS_PROFILE_CONTRACT",
+    "EXPLICIT_PROCESS_PROFILE_CONTRACT",
     "decode_mineru_process_profile",
     "encode_mineru_process_profile",
 ]

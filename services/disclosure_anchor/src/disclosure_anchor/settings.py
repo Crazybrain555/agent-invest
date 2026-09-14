@@ -193,8 +193,8 @@ class Settings(BaseSettings):
     # Literal, which would reject the valid `MINERU_PROCESSING_WINDOW_SIZE=16`.
     mineru_processing_window_size: int = Field(
         default=16,
-        ge=16,
-        le=16,
+        ge=1,
+        le=512,
         validation_alias=AliasChoices(
             "MINERU_PROCESSING_WINDOW_SIZE",
             "mineru_processing_window_size",
@@ -282,15 +282,39 @@ class Settings(BaseSettings):
             "disclosure_mineru_inference_upstream_url",
         ),
     )
-    # These are service-side limits of the attested Windows orchestrator.
-    # They are not CLI fan-out controls: MinerU ignores the CLI's unknown
-    # --max-concurrency option when --api-url selects an existing API.  The
-    # The current serial contract has one and only one owner. A future scheduler
-    # requires a new versioned runtime contract rather than widening this field.
+    # Explicit capacity is an externally pinned startup authority. Scalar
+    # projections below must also match it at the deployment gate; health is
+    # never used to choose an expected capacity.
+    disclosure_mineru_capacity_config: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_CAPACITY_CONFIG", "disclosure_mineru_capacity_config"
+        ),
+    )
+    disclosure_mineru_capacity_config_sha256: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_CAPACITY_CONFIG_SHA256",
+            "disclosure_mineru_capacity_config_sha256",
+        ),
+    )
+    disclosure_mineru_stream_pressure_config: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_STREAM_PRESSURE_CONFIG", "disclosure_mineru_stream_pressure_config"
+        ),
+    )
+    disclosure_mineru_stream_pressure_config_sha256: str | None = Field(
+        default=None, pattern=r"^sha256:[a-f0-9]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_MINERU_STREAM_PRESSURE_CONFIG_SHA256", "disclosure_mineru_stream_pressure_config_sha256"
+        ),
+    )
     disclosure_mineru_api_task_slots: int = Field(
         default=1,
         ge=1,
-        le=1,
+        le=128,
         validation_alias=AliasChoices(
             "DISCLOSURE_MINERU_API_TASK_SLOTS",
             "disclosure_mineru_api_task_slots",
@@ -298,8 +322,8 @@ class Settings(BaseSettings):
     )
     disclosure_mineru_api_inference_concurrency: int = Field(
         default=7,
-        ge=7,
-        le=7,
+        ge=1,
+        le=128,
         validation_alias=AliasChoices(
             "DISCLOSURE_MINERU_API_INFERENCE_CONCURRENCY",
             "disclosure_mineru_api_inference_concurrency",
@@ -942,6 +966,32 @@ class Settings(BaseSettings):
                 "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS must be greater "
                 "than or equal to DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS"
             )
+        capacity_path = self.disclosure_mineru_capacity_config
+        capacity_hash = self.disclosure_mineru_capacity_config_sha256
+        if (capacity_path is None) != (capacity_hash is None):
+            raise ValueError("MinerU explicit capacity path and SHA256 must be paired")
+        if capacity_path is not None:
+            if not capacity_path.is_absolute() or ".." in capacity_path.parts:
+                raise ValueError("MinerU explicit capacity path must be absolute")
+            if self.worker_parse_execution_mode != "staged-v4":
+                raise ValueError("MinerU explicit capacity requires staged-v4 worker mode")
+        elif (
+            self.disclosure_mineru_api_task_slots != 1
+            or self.disclosure_mineru_api_inference_concurrency != 7
+            or self.mineru_processing_window_size != 16
+        ):
+            raise ValueError("Legacy MinerU capacity remains N1/H7/W16")
+        stream_path = self.disclosure_mineru_stream_pressure_config
+        stream_hash = self.disclosure_mineru_stream_pressure_config_sha256
+        if (stream_path is None) != (stream_hash is None):
+            raise ValueError("MinerU stream pressure path and SHA256 must be paired")
+        if stream_path is not None:
+            if not stream_path.is_absolute() or ".." in stream_path.parts:
+                raise ValueError("MinerU stream pressure path must be absolute")
+            if capacity_path is None or self.worker_parse_execution_mode != "staged-v4":
+                raise ValueError("MinerU stream pressure requires explicit capacity and staged-v4")
+            if self.disclosure_gpu_metrics_url is None or self.disclosure_mineru_api_url is None:
+                raise ValueError("MinerU stream pressure requires both API and GPU sources")
         if self.worker_gpu_request_budget > self.worker_gpu_max_sequences:
             raise ValueError(
                 "WORKER_GPU_REQUEST_BUDGET must not exceed WORKER_GPU_MAX_SEQUENCES"
@@ -952,7 +1002,7 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "WORKER_GPU_REQUEST_BUDGET must equal the attested "
-                "MinerU API task-slots x inference-concurrency envelope"
+                "MinerU request envelope (shared H for explicit capacity)"
             )
         if (
             self.worker_mineru_client_outstanding_window
@@ -1005,8 +1055,10 @@ class Settings(BaseSettings):
 
     @property
     def mineru_effective_inference_request_upper_bound(self) -> int:
-        """Conservative active request envelope; submitted documents may queue."""
+        """Explicit capacity has one shared H, independent of document N."""
 
+        if self.disclosure_mineru_capacity_config is not None:
+            return self.disclosure_mineru_api_inference_concurrency
         return (
             self.disclosure_mineru_api_task_slots
             * self.disclosure_mineru_api_inference_concurrency

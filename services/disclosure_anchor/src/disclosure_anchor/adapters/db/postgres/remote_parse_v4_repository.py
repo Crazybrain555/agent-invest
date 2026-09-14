@@ -11,6 +11,9 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import models
+from disclosure_anchor.application.contracts.staged_campaign_v4 import (
+    V4CampaignAdmissionScope, require_v4_campaign_scope,
+)
 from disclosure_anchor.application.contracts.v4_prepared_execution_spec import (
     V4PreparedExecutionSpec, decode_v4_prepared_execution_spec,
 )
@@ -429,6 +432,7 @@ class RemoteParseV4Repository:
         *,
         after_attempt_id: str | None,
         limit: int,
+        campaign_scope: V4CampaignAdmissionScope | None = None,
     ) -> tuple[RecoveryCandidate, ...]:
         if (
             isinstance(limit, bool)
@@ -451,6 +455,9 @@ class RemoteParseV4Repository:
             table.c.claim_owner_identity.is_(None),
             table.c.claim_lease_until.is_(None),
         ]
+        if campaign_scope is not None:
+            scope = require_v4_campaign_scope(campaign_scope)
+            predicates.append(table.c.document_id.in_(scope.document_ids))
         if after_attempt_id is not None:
             predicates.append(ordered_attempt_id > after_attempt_id)
         statement = (

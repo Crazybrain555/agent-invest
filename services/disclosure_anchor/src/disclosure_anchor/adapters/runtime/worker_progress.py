@@ -35,6 +35,9 @@ from disclosure_anchor.application.worker.queries import (
     worker_progress_database_snapshot,
 )
 from disclosure_anchor.settings import Settings
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured_mineru_capacity
 
 
 WORKER_PROGRESS_CONTRACT_VERSION = "worker_progress.v2"
@@ -297,11 +300,16 @@ def mineru_api_health_snapshot(
     payload: bytes,
     *,
     expected_task_slots: int | None = None,
+    expected_capacity: MineruCapacityConfig | None = None,
 ) -> dict[str, Any]:
     """Parse the exact MinerU 3.4.4 orchestration health contract."""
 
-    decoded = parse_mineru_api_health(
-        payload, expected_task_slots=expected_task_slots
+    if expected_capacity is not None and expected_task_slots is not None:
+        raise ValueError("explicit capacity cannot use a legacy task-slot projection")
+    decoded = (
+        parse_mineru_capacity_wire_health(payload, expected_capacity=expected_capacity)
+        if expected_capacity is not None
+        else parse_mineru_api_health(payload, expected_task_slots=expected_task_slots)
     )
     nonnegative_fields = (
         "queued_tasks",
@@ -324,6 +332,7 @@ def mineru_api_health_snapshot(
         "health_status": decoded["status"],
         "version": decoded["version"],
         "protocol_version": decoded["protocol_version"],
+        **({"capacity_observation": cast(dict[str, Any], decoded)["capacity_observation"], "task_admission": cast(dict[str, Any], decoded)["task_admission"]} if expected_capacity is not None else {}),
         **{
             name: health_values[name]
             for name in (*nonnegative_fields, *positive_fields)
@@ -544,7 +553,7 @@ def collect_worker_progress(
             url=api_health_url,
             parser=lambda payload: mineru_api_health_snapshot(
                 payload,
-                expected_task_slots=settings.disclosure_mineru_api_task_slots,
+                **({"expected_capacity": capacity} if (capacity := configured_mineru_capacity(settings)) is not None else {"expected_task_slots": settings.disclosure_mineru_api_task_slots}),
             ),
             timeout_seconds=settings.worker_progress_metrics_timeout_seconds,
             source="mineru_api_health",

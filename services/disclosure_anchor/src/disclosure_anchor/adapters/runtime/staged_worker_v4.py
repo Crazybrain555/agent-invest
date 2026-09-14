@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured_mineru_capacity
+
 from collections.abc import Callable
 from dataclasses import dataclass
 import os
@@ -17,6 +20,7 @@ from disclosure_anchor.adapters.db.postgres.atomic_document_publisher_v4 import 
 from disclosure_anchor.adapters.db.postgres.staged_new_work_v4 import (
     PostgresV4OrdinaryParseCandidateSource,
     require_commissioning_recovery_scope,
+    require_campaign_recovery_scope,
 )
 from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
 from disclosure_anchor.adapters.parsers.mineru_medium.http_remote_v4 import (
@@ -60,7 +64,10 @@ from disclosure_anchor.adapters.storage.provider_document_source import (
 )
 from disclosure_anchor.adapters.storage.v4_source_observation import BoundedV4SourcePdfObserver
 from disclosure_anchor.application.ports.parser import ParserIdentity, ParserOptions
-from disclosure_anchor.application.ports.staged_new_work_v4 import validate_admission_document_ids
+from disclosure_anchor.application.ports.staged_new_work_v4 import validate_v4_admission_scope
+from disclosure_anchor.application.contracts.staged_campaign_v4 import (
+    V4CampaignAdmissionScope, require_v4_campaign_scope,
+)
 from disclosure_anchor.application.services.atomic_publication_request_builder_v4 import (
     ProductionAtomicPublicationRequestBuilderV4,
 )
@@ -88,6 +95,7 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     CoordinatorSnapshot,
     StagedParseCoordinator,
 )
+from disclosure_anchor.application.services.mineru_stream_policy import StreamAdmissionControl
 from disclosure_anchor.application.contracts.staged_resource_credit import ResourceCreditVector
 from disclosure_anchor.application.services.staged_v4_capacity import (
     staged_v4_coordinator_limits,
@@ -136,12 +144,15 @@ def build_staged_worker_v4_runtime(
     owner_identity: str | None = None,
     admission_document_ids: tuple[str, ...] | None = None,
     recovery_only: bool = False,
+    expected_capacity: MineruCapacityConfig | None = None,
+    stream_control: StreamAdmissionControl | None = None,
+    campaign_scope: V4CampaignAdmissionScope | None = None,
 ) -> StagedWorkerV4Runtime:
     """Compose exactly one seven-lane runtime after explicit mode selection."""
 
     if settings.worker_parse_execution_mode != "staged-v4":
         raise ValueError("staged V4 composition requires explicit staged-v4 mode")
-    validate_admission_document_ids(admission_document_ids)
+    validate_v4_admission_scope(admission_document_ids=admission_document_ids, campaign_scope=campaign_scope)
     if type(recovery_only) is not bool or (recovery_only and admission_document_ids is None):
         raise ValueError("recovery-only composition requires explicit bounded document scope")
     if (
@@ -163,13 +174,33 @@ def build_staged_worker_v4_runtime(
         # Before profile/keyring/scratch construction and before any recovery
         # write. The same guard also checks each controller effect boundary.
         ownership_guard()
+    if campaign_scope is not None:
+        prior_ownership_guard = ownership_guard
+        prior_admission_guard = admission_guard
+        selected_campaign = campaign_scope
+
+        def campaign_ownership_guard() -> None:
+            prior_ownership_guard()
+            require_campaign_recovery_scope(engine, selected_campaign)
+
+        def campaign_admission_guard() -> None:
+            prior_admission_guard()
+            campaign_ownership_guard()
+
+        ownership_guard = campaign_ownership_guard
+        admission_guard = campaign_admission_guard
+        ownership_guard()
     staged = load_staged_v4_settings()
     loaded = load_mineru_process_profile(
         staged.process_profile_file,
         expected_sha256=staged.process_profile_sha256,
         expected_owner_uid=os.getuid(),
     )
-    verify_staged_process_profile_configuration(settings, loaded.profile)
+    expected_capacity = configured_mineru_capacity(settings, expected_capacity)
+    verify_staged_process_profile_configuration(
+        settings, loaded.profile,
+        **({"expected_capacity": expected_capacity} if expected_capacity is not None else {}),
+    )
     runtime_identity = settings.disclosure_mineru_runtime_bundle_identity_sha256
     if (
         runtime_identity is None
@@ -188,6 +219,12 @@ def build_staged_worker_v4_runtime(
         mac_finalize_workers=settings.worker_finalize_concurrency,
     )
     limits = staged_v4_coordinator_limits(loaded.profile, worker_profile=worker_profile)
+    if stream_control is not None and (
+        expected_capacity is None
+        or stream_control.policy.config.runtime_identity_sha256 != runtime_identity
+        or stream_control.policy.config.qualified_max > limits.credits.remote_waits
+    ):
+        raise ValueError("stream policy requires matching explicit staged capacity")
     exact_owner = owner_identity or _new_owner_identity()
     paths = FileStorePathBuilder(settings)
     uow_factory = unit_of_work_factory(engine)
@@ -201,11 +238,13 @@ def build_staged_worker_v4_runtime(
         limits=limits,
         owner_identity=exact_owner,
         process_guard=ownership_guard,
+        campaign_scope=campaign_scope,
     )
     claim_guard = DurableV4ClaimGuard(uow_factory=uow_factory)
     remote = MinerUHttpRemoteV4(
         request_timeout_seconds=limits.max_stage_step_seconds,
         allow_task_submission=not recovery_only,
+        submission_guard=stream_control,
     )
     try:
         materialization = MinerUHttpStagedV4(
@@ -285,6 +324,7 @@ def build_staged_worker_v4_runtime(
                 max_retries=settings.disclosure_max_parse_retries,
                 scope_classes=process_scope_classes,
                 admission_document_ids=admission_document_ids,
+                campaign_scope=campaign_scope,
             ),
             ingress_factory=ingress_factory,
             ingress=ingress,
@@ -292,6 +332,7 @@ def build_staged_worker_v4_runtime(
             admission_guard=admission_guard,
             process_guard=ownership_guard,
             admission_document_ids=admission_document_ids,
+            campaign_scope=campaign_scope,
         )
         backend = DurableStagedCoordinatorBackendV4(
             persistence=persistence,
@@ -314,6 +355,7 @@ def build_staged_worker_v4_runtime(
                 progress=progress,
                 process_guard=ownership_guard,
                 admission_observer=None if recovery_only else new_work,
+                stream_control=stream_control,
             ),
             remote=remote,
             owner_identity=exact_owner,
@@ -328,8 +370,31 @@ def build_staged_worker_v4_runtime(
         raise
 
 
+def build_staged_worker_v4_campaign_runtime(
+    *, settings: Settings, engine: Engine, ownership_guard: Callable[[], None],
+    admission_guard: Callable[[], None], process_scope_classes: tuple[str, ...] | None,
+    progress: Callable[[CoordinatorSnapshot], None],
+    campaign_scope: V4CampaignAdmissionScope,
+    expected_capacity: MineruCapacityConfig,
+    stream_control: StreamAdmissionControl,
+    publication_committed: Callable[[bool], None] = lambda _replaced: None,
+    owner_identity: str | None = None,
+) -> StagedWorkerV4Runtime:
+    """Explicit finite campaign; missing authority never falls back to all work."""
+    campaign_scope = require_v4_campaign_scope(campaign_scope)
+    if type(expected_capacity) is not MineruCapacityConfig or type(stream_control) is not StreamAdmissionControl:
+        raise ValueError("campaign requires explicit capacity and stream control")
+    return build_staged_worker_v4_runtime(
+        settings=settings, engine=engine, ownership_guard=ownership_guard,
+        admission_guard=admission_guard, process_scope_classes=process_scope_classes,
+        progress=progress, publication_committed=publication_committed,
+        owner_identity=owner_identity, expected_capacity=expected_capacity,
+        stream_control=stream_control, campaign_scope=campaign_scope,
+    )
+
+
 def _new_owner_identity() -> str:
     return f"staged-v4-{os.getpid()}-{secrets.token_hex(16)}"
 
 
-__all__ = ["StagedWorkerV4Runtime", "build_staged_worker_v4_runtime"]
+__all__ = ["StagedWorkerV4Runtime", "build_staged_worker_v4_runtime", "build_staged_worker_v4_campaign_runtime"]

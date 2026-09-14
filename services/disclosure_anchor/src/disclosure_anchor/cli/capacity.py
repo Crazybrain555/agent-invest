@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured_mineru_capacity
+
 import argparse
 import json
 from pathlib import Path
@@ -79,11 +81,13 @@ def _observe(args: argparse.Namespace, settings: Settings) -> int:
         expected_host_key_sha256=topology.ssh_host_key_sha256,
     )
     timeout = settings.worker_progress_metrics_timeout_seconds
+    capacity = configured_mineru_capacity(settings)
     samplers = (
         MineruApiCapacitySampler(
             url=settings.disclosure_mineru_api_url,
             timeout_seconds=timeout,
-            task_slots=settings.disclosure_mineru_api_task_slots,
+            task_slots=None if capacity is not None else settings.disclosure_mineru_api_task_slots,
+            **({"expected_capacity": capacity} if capacity is not None else {}),
         ),
         VllmCapacitySampler(
             url=settings.disclosure_mineru_observability_url,

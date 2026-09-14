@@ -6,6 +6,9 @@ from collections.abc import Callable
 from dataclasses import fields
 from typing import Protocol
 
+from disclosure_anchor.application.contracts.staged_campaign_v4 import (
+    V4CampaignAdmissionScope, V4CampaignScopeViolation,
+)
 from disclosure_anchor.application.contracts.provider_document_admission import SourcePdfObservation
 from disclosure_anchor.application.contracts.staged_resource_credit import ResourceCreditVector
 from disclosure_anchor.application.ports.new_work_admission import NewWorkAdmissionUnavailable
@@ -20,7 +23,7 @@ from disclosure_anchor.application.ports.staged_new_work_v4 import (
     V4InitialIngressCapacityBlocked, V4OrdinaryParseCandidate,
     V4OrdinaryParseCandidateSourcePort,
     V4RejectedSourcePdf, V4SourcePdfOverLimit,
-    validate_admission_document_ids,
+    validate_v4_admission_scope,
 )
 from disclosure_anchor.application.ports.remote_parse_v4_source_rejection import V4SourceRejectionCommit
 from disclosure_anchor.application.ports.staged_provider_parser import V4StageGuard
@@ -50,6 +53,9 @@ class V4InitialIngressFactoryPort(Protocol):
 
 
 class V4PreparedClaimPort(Protocol):
+    @property
+    def campaign_scope_sha256(self) -> str | None: ...
+
     def admit_new(
         self, *, limit: int, available_credits: ResourceCreditVector,
     ) -> AdmissionOutcome: ...
@@ -74,6 +80,7 @@ class StagedV4NewWorkAdmitter:
         admission_guard: Callable[[], None] = lambda: None,
         process_guard: Callable[[], None] = lambda: None,
         admission_document_ids: tuple[str, ...] | None = None,
+        campaign_scope: V4CampaignAdmissionScope | None = None,
     ) -> None:
         if (
             not callable(getattr(prepared_claims, "admit_new", None))
@@ -94,7 +101,15 @@ class StagedV4NewWorkAdmitter:
         self._candidate_page_size = candidate_page_size
         self._admission_guard = admission_guard
         self._process_guard = process_guard
-        validate_admission_document_ids(admission_document_ids)
+        validate_v4_admission_scope(
+            admission_document_ids=admission_document_ids, campaign_scope=campaign_scope,
+        )
+        if campaign_scope is not None and any(
+            getattr(component, "campaign_scope_sha256", None) != campaign_scope.scope_sha256
+            for component in (prepared_claims, ordinary_candidates)
+        ):
+            raise V4CampaignScopeViolation("V4 campaign admission dependencies have different scopes")
+        self._campaign_scope = campaign_scope
         self._admission_document_ids = admission_document_ids
         self._after_document_id: str | None = None
         self._scan_blocked_at: dict[str, int] = {}
@@ -115,6 +130,10 @@ class StagedV4NewWorkAdmitter:
         return self._ingress_factory.observe(request, stage_guard=stage_guard)
 
     def _require_candidate_scope(self, candidate: V4OrdinaryParseCandidate) -> None:
+        if self._campaign_scope is not None:
+            self._campaign_scope.require_ordinary_document_source(
+                candidate.document_id, candidate.raw_file_hash,
+            )
         if (self._admission_document_ids is not None
                 and candidate.document_id not in self._admission_document_ids):
             raise ValueError("V4 ordinary candidate is outside commissioning scope")
@@ -177,6 +196,8 @@ class StagedV4NewWorkAdmitter:
                 elif isinstance(ready.source, V4RejectedSourcePdf):
                     self._process_guard()
                     rejection = self._ingress_factory.source_rejection(candidate, ready.source)
+                    if self._campaign_scope is not None:
+                        self._require_candidate_scope(rejection.candidate)
                     try:
                         self._ingress.reject_source(rejection, write_guard=self._process_guard)
                     except V4InitialIngressNotEligible:
@@ -190,6 +211,10 @@ class StagedV4NewWorkAdmitter:
                     except V4InitialIngressCapacityBlocked as exc:
                         self._record_blocked(exc, remaining)
                     else:
+                        if self._campaign_scope is not None:
+                            self._campaign_scope.require_ordinary_document_source(
+                                command.proposal.document_id, command.expected_raw_file_hash,
+                            )
                         try:
                             authority = self._ingress.execute(command, write_guard=self._admission_guard)
                         except V4InitialIngressNotEligible:
@@ -280,6 +305,10 @@ class StagedV4NewWorkAdmitter:
         if (type(authority) is not RemoteParseV4Authority or authority.state != "prepared"
                 or authority.lifecycle_version != 0 or authority.claim_owner_identity is not None):
             raise ValueError("V4 ingress did not return one unclaimed H0")
+        if self._campaign_scope is not None:
+            self._campaign_scope.require_ordinary_document_source(
+                authority.checkpoint.document_id, authority.checkpoint.source_pdf_sha256,
+            )
         return self._prepared_claims.claim_recovery(RecoveryCandidate(
             attempt_id=authority.attempt_id, state=authority.state,
             lifecycle_version=authority.lifecycle_version, claim_generation=authority.claim_generation,

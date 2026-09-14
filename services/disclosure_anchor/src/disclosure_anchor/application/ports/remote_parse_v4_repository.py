@@ -12,6 +12,7 @@ from datetime import datetime
 from math import isfinite
 from typing import Protocol
 
+from disclosure_anchor.application.contracts.staged_campaign_v4 import V4CampaignAdmissionScope
 from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import (
     SealedProviderSecretV4,
     bind_provider_secret_v4,
@@ -837,6 +838,7 @@ class RemoteParseV4Repository(Protocol):
         *,
         after_attempt_id: str | None,
         limit: int,
+        campaign_scope: V4CampaignAdmissionScope | None = None,
     ) -> tuple[RecoveryCandidate, ...]:
         """Return one byte-ordered page of runtime-admissible V4 heads.
 
@@ -845,6 +847,8 @@ class RemoteParseV4Repository(Protocol):
         ``LIMIT`` so live or expired claimed rows cannot starve a newly
         activated generation-zero superseder.  The returned rows are hints;
         admission still reloads and claims the exact durable head.
+        A campaign's complete document membership is filtered before keyset and
+        LIMIT. Global recovery remains unfiltered and must reject scope escape.
         """
 
     def load(self, attempt_id: str) -> RemoteParseV4Authority: ...

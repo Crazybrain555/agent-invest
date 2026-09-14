@@ -9,6 +9,18 @@ NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS = 30.0
 NVIDIA_SMI_MAX_FUTURE_SKEW_SECONDS = 1.0
 
 
+class GpuTelemetryUnavailable(ValueError):
+    """A valid exporter response lacks a current successful observation."""
+
+
+class GpuSampleStaleError(GpuTelemetryUnavailable):
+    """The last successful observation is too old for a strict sampler."""
+
+
+class GpuCollectionUnavailableError(GpuTelemetryUnavailable):
+    """The exporter reports that its latest collection did not succeed."""
+
+
 def nvidia_smi_sample_age_seconds(
     *,
     now_timestamp: float,
@@ -22,5 +34,5 @@ def nvidia_smi_sample_age_seconds(
     if sample_age < -NVIDIA_SMI_MAX_FUTURE_SKEW_SECONDS:
         raise ValueError("nvidia-smi exporter timestamp is too far in the future")
     if sample_age > NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS:
-        raise ValueError("nvidia-smi exporter sample is stale")
+        raise GpuSampleStaleError("nvidia-smi exporter sample is stale")
     return max(0.0, sample_age)

@@ -106,6 +106,10 @@
    "private_imports": [],
    "tests": 14
   },
+  "tests/integration/test_staged_campaign_scope_v4.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/integration/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
    "tests": 14
@@ -339,6 +343,10 @@
   "tests/unit/test_generate_current_source_replay.py": {
    "private_imports": [],
    "tests": 7
+  },
+  "tests/unit/test_gpu_pressure_unavailable.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_health.py": {
    "private_imports": [],
@@ -644,6 +652,10 @@
    ],
    "tests": 65
   },
+  "tests/unit/test_mineru_http_stream_admission.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
    "tests": 15
@@ -664,9 +676,33 @@
    "private_imports": [],
    "tests": 16
   },
+  "tests/unit/test_mineru_package_a_builder.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_mineru_package_a_deployment.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_mineru_package_a_settings.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/unit/test_mineru_pressure_fatal_drain.py": {
+   "private_imports": [],
+   "tests": 9
+  },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
    "tests": 13
+  },
+  "tests/unit/test_mineru_process_pressure_consumer.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/unit/test_mineru_process_pressure_producer.py": {
+   "private_imports": [],
+   "tests": 8
   },
   "tests/unit/test_mineru_process_profile.py": {
    "private_imports": [],
@@ -709,6 +745,26 @@
   "tests/unit/test_mineru_ssh_tunnel.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_mineru_stream_activation_loading.py": {
+   "private_imports": [],
+   "tests": 30
+  },
+  "tests/unit/test_mineru_stream_backend_deferred.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_mineru_stream_policy.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_mineru_stream_pressure_adapter.py": {
+   "private_imports": [],
+   "tests": 11
+  },
+  "tests/unit/test_mineru_stream_worker_lifecycle.py": {
+   "private_imports": [],
+   "tests": 7
   },
   "tests/unit/test_mineru_task_protocol_v2.py": {
    "private_imports": [],
@@ -948,6 +1004,18 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_staged_campaign_admission_v4.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/unit/test_staged_campaign_builder_v4.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_staged_campaign_sql_v4.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/unit/test_staged_commission.py": {
    "private_imports": [
     "_outcomes"
@@ -973,6 +1041,10 @@
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
    "tests": 76
+  },
+  "tests/unit/test_staged_parse_stream_admission.py": {
+   "private_imports": [],
+   "tests": 4
   },
   "tests/unit/test_staged_provider_parser_v4.py": {
    "private_imports": [],

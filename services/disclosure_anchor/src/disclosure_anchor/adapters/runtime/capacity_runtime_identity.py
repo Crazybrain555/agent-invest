@@ -8,12 +8,12 @@ import json
 from pathlib import Path
 
 from disclosure_anchor.adapters.runtime.mineru_identity import (
-    MINERU_PROCESSING_WINDOW_SIZE,
     client_bundle_identity,
     verify_runtime_manifest_payload,
     writer_code_digest,
 )
 from disclosure_anchor.settings import Settings
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured_mineru_capacity
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +46,9 @@ def verify_capacity_runtime_topology(
         payload,
         configured_identity=configured_identity,
         local_client_identity=client_bundle_identity(settings.disclosure_mineru_bin),
-        local_processing_window_size=MINERU_PROCESSING_WINDOW_SIZE,
+        local_processing_window_size=settings.mineru_processing_window_size,
         local_writer_code_digest=writer_code_digest(),
+        **({"expected_capacity": capacity} if (capacity := configured_mineru_capacity(settings)) is not None else {}),
     )
     if verified.max_concurrent_requests != settings.disclosure_mineru_api_task_slots:
         raise ValueError("runtime manifest task slots drifted from worker configuration")

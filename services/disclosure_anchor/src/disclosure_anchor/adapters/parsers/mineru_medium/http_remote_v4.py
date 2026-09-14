@@ -59,6 +59,7 @@ from disclosure_anchor.application.ports.remote_provider_v4 import (
     RemoteSubmissionAmbiguousV4,
     RemoteSubmissionCommandV4,
 )
+from disclosure_anchor.application.ports.mineru_stream_pressure import StreamSubmissionGuard
 from disclosure_anchor.application.ports.staged_provider_parser import (
     PrivateProviderCapabilityV4,
     ProviderAckCommandV4,
@@ -113,6 +114,7 @@ class MinerUHttpRemoteV4:
         wall_clock: Callable[[], float] = time.time,
         request_timeout_seconds: float,
         allow_task_submission: bool = True,
+        submission_guard: StreamSubmissionGuard | None = None,
     ) -> None:
         if (
             type(allow_task_submission) is not bool
@@ -128,6 +130,7 @@ class MinerUHttpRemoteV4:
         self._wall_clock = wall_clock
         self._request_timeout_seconds = float(request_timeout_seconds)
         self._allow_task_submission = allow_task_submission
+        self._submission_guard = submission_guard
         self._client = httpx.Client(
             timeout=httpx.Timeout(self._request_timeout_seconds),
             follow_redirects=False,
@@ -235,6 +238,12 @@ class MinerUHttpRemoteV4:
                 }
                 def mark_post_started() -> None:
                     nonlocal post_started
+                    if self._submission_guard is not None:
+                        self._submission_guard.assert_submission_allowed(
+                            runtime_identity_sha256=cast(
+                                str, command.parser_options.runtime_bundle_identity_sha256
+                            ),
+                        )
                     post_started = True
 
                 try:

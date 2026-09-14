@@ -5,10 +5,14 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from disclosure_anchor.application.contracts.staged_campaign_v4 import (
+    V4CampaignAdmissionScope, V4CampaignScopeViolation, require_v4_campaign_scope,
+)
 from disclosure_anchor.application.ports.staged_new_work_v4 import (
     V4OrdinaryParseCandidate,
     V4OrdinaryParseCandidatePage,
     validate_admission_document_ids,
+    validate_v4_admission_scope,
 )
 from disclosure_anchor.application.worker.queries import pending_parse
 from disclosure_anchor.application.contracts.staged_resource_credit import (
@@ -36,6 +40,35 @@ def require_commissioning_recovery_scope(
         raise RuntimeError("unresolved V4 owner is outside commissioning scope")
 
 
+def require_campaign_recovery_scope(
+    engine: Engine, campaign_scope: V4CampaignAdmissionScope,
+) -> None:
+    """Reject unowned membership/source drift without hiding durable obligations.
+
+    The campaign builder includes this in its existing singleton process guard.
+    The global recovery scan remains complete; this query does not claim, cancel,
+    finalize, or remove a reservation belonging to any other responsibility.
+    """
+    scope = require_v4_campaign_scope(campaign_scope)
+    with engine.connect() as connection:
+        outside = connection.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM disclosure_ops.remote_parse_attempt AS a "
+                "WHERE a.is_current AND a.checkpoint_contract_version=4 "
+                "AND a.state=ANY(:resource_states) AND NOT EXISTS ("
+                "SELECT 1 FROM unnest(CAST(:document_ids AS text[]), "
+                "CAST(:source_hashes AS text[])) AS s(document_id, source_pdf_sha256) "
+                "WHERE s.document_id=a.document_id "
+                "AND s.source_pdf_sha256=a.source_pdf_sha256))"
+            ),
+            {"resource_states": list(STAGED_RESOURCE_STATE_TRANSITIONS),
+             "document_ids": list(scope.document_ids),
+             "source_hashes": list(scope.source_hashes)},
+        ).scalar_one()
+    if outside:
+        raise V4CampaignScopeViolation("unresolved V4 owner is outside frozen campaign source scope")
+
+
 class PostgresV4OrdinaryParseCandidateSource:
     def __init__(
         self,
@@ -44,6 +77,7 @@ class PostgresV4OrdinaryParseCandidateSource:
         max_retries: int,
         scope_classes: tuple[str, ...] | None,
         admission_document_ids: tuple[str, ...] | None = None,
+        campaign_scope: V4CampaignAdmissionScope | None = None,
     ) -> None:
         if not isinstance(engine, Engine):
             raise ValueError("V4 candidate source requires a SQLAlchemy engine")
@@ -52,8 +86,18 @@ class PostgresV4OrdinaryParseCandidateSource:
         self._engine = engine
         self._max_retries = max_retries
         self._scope_classes = scope_classes
-        validate_admission_document_ids(admission_document_ids)
-        self._admission_document_ids = admission_document_ids
+        validate_v4_admission_scope(
+            admission_document_ids=admission_document_ids, campaign_scope=campaign_scope,
+        )
+        self._campaign_scope = campaign_scope
+        self._admission_document_ids = (
+            admission_document_ids if campaign_scope is None
+            else campaign_scope.ordinary_document_ids
+        )
+
+    @property
+    def campaign_scope_sha256(self) -> str | None:
+        return None if self._campaign_scope is None else self._campaign_scope.scope_sha256
 
     def list_candidates(
         self,
@@ -100,6 +144,10 @@ class PostgresV4OrdinaryParseCandidateSource:
                 raise ValueError(
                     f"V4 candidate {document_id} lost document/security authority"
                 )
+            if self._campaign_scope is not None:
+                self._campaign_scope.require_ordinary_document_source(
+                    document_id, exact["raw_file_hash"],
+                )
             candidates.append(
                 V4OrdinaryParseCandidate(
                     document_id=document_id,
@@ -118,4 +166,7 @@ class PostgresV4OrdinaryParseCandidateSource:
         )
 
 
-__all__ = ["PostgresV4OrdinaryParseCandidateSource", "require_commissioning_recovery_scope"]
+__all__ = [
+    "PostgresV4OrdinaryParseCandidateSource", "require_commissioning_recovery_scope",
+    "require_campaign_recovery_scope",
+]

@@ -21,6 +21,8 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
 from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
+    GpuCollectionUnavailableError,
+    GpuSampleStaleError,
     nvidia_smi_sample_age_seconds,
 )
 
@@ -266,12 +268,8 @@ def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues
     values = {
         name: _alias(samples, aliases) for name, aliases in _NVIDIA_ALIASES.items()
     }
-    if values["success"] != (1.0,) or len(values["timestamp"]) != 1:
-        raise ValueError("nvidia-smi exporter collection is unsuccessful")
-    nvidia_smi_sample_age_seconds(
-        now_timestamp=time.time(),
-        success_timestamp=values["timestamp"][0],
-    )
+    if values["success"] not in ((0.0,), (1.0,)) or len(values["timestamp"]) != 1:
+        raise ValueError("nvidia-smi exporter collection status is invalid")
     utilization = values["utilization"]
     used = values["used_bytes"]
     free = values["free_bytes"]
@@ -296,6 +294,18 @@ def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues
         or not -50 <= temperature[0] <= 150
     ):
         raise ValueError("nvidia-smi GPU measurements are invalid")
+    # Missing evidence cannot hide a separate identity, format, measurement or
+    # future-clock violation. Validate those before classifying a failed/stale
+    # collection as transient. Legacy samplers still reject either condition.
+    try:
+        nvidia_smi_sample_age_seconds(
+            now_timestamp=time.time(), success_timestamp=values["timestamp"][0],
+        )
+    except GpuSampleStaleError:
+        if values["success"] == (1.0,):
+            raise
+    if values["success"] == (0.0,):
+        raise GpuCollectionUnavailableError("nvidia-smi exporter collection is unsuccessful")
     return GpuSampleValues(
         exporter_family="nvidia_smi",
         device_count=1,

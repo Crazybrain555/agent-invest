@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured_mineru_capacity
+
 import hashlib
 import json
 import os
@@ -158,9 +160,11 @@ def mineru_orchestrator_check(settings: Settings) -> CheckResult:
     if api_url is None:
         return _warn("MinerU orchestration", "API URL is not configured")
     try:
+        capacity = configured_mineru_capacity(settings)
         health = fetch_mineru_orchestrator_health(
             api_url,
-            expected_task_slots=settings.disclosure_mineru_api_task_slots,
+            expected_task_slots=None if capacity is not None else settings.disclosure_mineru_api_task_slots,
+            expected_capacity=capacity,
             expected_task_retention_seconds=(
                 settings.disclosure_mineru_api_task_retention_seconds
             ),

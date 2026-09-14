@@ -37,6 +37,7 @@ from disclosure_anchor.application.ports.staged_new_work_v4 import (
 )
 from disclosure_anchor.application.services.staged_admission_observation import StagedAdmissionObservation
 from disclosure_anchor.application.services.staged_execution_guard import StageLeaseGuard, StageLeaseLost
+from disclosure_anchor.application.services.mineru_stream_policy import StreamAdmissionControl, StreamAdmissionDecision
 
 
 class CoordinatorLane(str, Enum):
@@ -265,6 +266,14 @@ class StageWaiting(RuntimeError):
         self.retry_after_seconds = float(retry_after_seconds)
 
 
+class StageAdmissionDeferred(StageWaiting):
+    """An unsafe reader closed a submission proved absent before POST.
+
+    Keep its durable reservation for a later recovery, without polling this
+    unaccepted submission forever while already accepted work drains.
+    """
+
+
 class StagedCoordinatorBackend(Protocol):
     """Bounded staged operations owned by the durable coordinator.
 
@@ -469,6 +478,10 @@ class CoordinatorSnapshot:
     completed: int
     blocked_reason: str | None
     credit_blocked_by_lane: tuple[tuple[str, tuple[str, ...]], ...]
+    stream_target: int | None = None
+    stream_actual: int | None = None
+    stream_reason: str | None = None
+    stream_evidence_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -594,6 +607,7 @@ class StagedParseCoordinator:
         monotonic: Callable[[], float] = time.monotonic,
         process_guard: Callable[[], None] = lambda: None,
         admission_observer: V4AdmissionObservationPort | None = None,
+        stream_control: StreamAdmissionControl | None = None,
     ) -> None:
         self._backend = backend
         self._limits = limits
@@ -601,6 +615,9 @@ class StagedParseCoordinator:
         self._monotonic = monotonic
         self._process_guard = process_guard
         self._admission_observer = admission_observer
+        self._stream_control = stream_control
+        if stream_control is not None and stream_control.policy.config.qualified_max > limits.credits.remote_waits:
+            raise ValueError("stream qualified capacity exceeds hard remote credits")
 
     def run(
         self,
@@ -633,6 +650,9 @@ class StagedParseCoordinator:
         circuit_open = False
         blocked_reason: str | None = "recovery_barrier"
         last_progress = self._monotonic()
+        stream_decision: StreamAdmissionDecision | None = None
+        stream_failure: str | None = None
+        stream_parked: dict[str, CoordinatorWork] = {}
         waiting_renewal_floor = float("inf")
         lane_limits = {
             CoordinatorLane.PREFLIGHT: self._limits.preflight_workers,
@@ -671,6 +691,10 @@ class StagedParseCoordinator:
         def emit() -> None:
             self._progress(
                 CoordinatorSnapshot(
+                    stream_target=None if stream_decision is None else stream_decision.target,
+                    stream_actual=None if stream_decision is None else ledger.in_use.remote_waits + provisional_local_total.remote_waits,
+                    stream_reason=None if stream_decision is None else stream_decision.reason,
+                    stream_evidence_sha256=None if stream_decision is None else stream_decision.evidence_sha256,
                     admission_open=admission_open,
                     recovery_complete=recovery_complete,
                     circuit_open=circuit_open,
@@ -1014,6 +1038,14 @@ class StagedParseCoordinator:
                     work = renewed
                 assert work.lease_expires_monotonic is not None
                 next_floor = min(next_floor, work.lease_expires_monotonic)
+            for attempt_id, work in tuple(stream_parked.items()):
+                if needs_renewal(work, now):
+                    renewed = renew_waiting(work, CoordinatorLane.REMOTE)
+                    if renewed is None:
+                        return
+                    stream_parked[attempt_id] = work = renewed
+                assert work.lease_expires_monotonic is not None
+                next_floor = min(next_floor, work.lease_expires_monotonic)
             waiting_renewal_floor = next_floor
 
         def bounded_defer_delay(
@@ -1265,6 +1297,13 @@ class StagedParseCoordinator:
                     admission_probe_at = 0.0
                     last_progress = self._monotonic()
                 now = self._monotonic()
+                if self._stream_control is not None:
+                    stream_decision = self._stream_control.current()
+                    if stream_decision.unsafe and stream_failure is None:
+                        stream_failure = stream_decision.reason
+                        errors.append("stream pressure closed new submissions: " + stream_failure)
+                    if stream_failure is not None:
+                        observation.cancel()
                 if stop_requested():
                     admission_open = False
                     blocked_reason = "draining"
@@ -1306,7 +1345,7 @@ class StagedParseCoordinator:
                     and not stop_requested()
                 ):
                     admission_open = not admission_deferred or now >= admission_probe_at
-                    if blocked_reason == "recovery_barrier":
+                    if blocked_reason == "recovery_barrier" or (blocked_reason is not None and blocked_reason.startswith("stream_pause:")):
                         blocked_reason = None
                 elif (
                     not recovery_complete
@@ -1327,6 +1366,10 @@ class StagedParseCoordinator:
                         queues[lane].append(work)
 
                 active_ids = set(known)
+                if stream_failure is not None or (stream_decision is not None and stream_decision.target == 0):
+                    admission_open = False
+                    if not circuit_open and not stop_requested():
+                        blocked_reason = "stream_pause:" + (stream_failure or (stream_decision.reason if stream_decision is not None else "unknown"))
                 if admission_open and not circuit_open and not observation.pending:
                     committed_and_transient = ledger.in_use + provisional_local_total
                     if oversubscribed_recovery or not committed_and_transient.fits(ledger.limit):
@@ -1500,6 +1543,7 @@ class StagedParseCoordinator:
                 guard_waiting(self._monotonic())
                 self._process_guard()
                 credit_blocked_by_lane = {lane: set() for lane in CoordinatorLane}
+                stream_deferred = False
                 for lane in _LANE_PRIORITY:
                     if circuit_open:
                         break
@@ -1529,6 +1573,20 @@ class StagedParseCoordinator:
                         for position, index in enumerate(ordered_indices):
                             queued_work = queue[index]
                             candidate_hold = transition_hold(queued_work)
+                            if stream_failure is not None and (
+                                lane == CoordinatorLane.PREFLIGHT or candidate_hold.remote_waits > 0
+                            ):
+                                stream_deferred = True
+                                continue
+                            if (
+                                stream_decision is not None
+                                and candidate_hold.remote_waits > 0
+                                and ledger.in_use.remote_waits + provisional_local_total.remote_waits + candidate_hold.remote_waits > stream_decision.target
+                            ):
+                                # This is a new remote permit. Existing durable
+                                # remote_waits and every tail lane keep running.
+                                stream_deferred = True
+                                continue
                             if position > 0 and any(
                                 getattr(candidate_hold, name) > 0
                                 for name in first_shortages
@@ -1644,6 +1702,7 @@ class StagedParseCoordinator:
                 if (
                     observation.pending and not observation.active_slots
                     and not circuit_open and not stop_requested()
+                    and stream_failure is None
                     and preflight_active < lane_limits[CoordinatorLane.PREFLIGHT]
                 ):
                     observation.dispatch(
@@ -1656,11 +1715,33 @@ class StagedParseCoordinator:
 
                 if not in_flight:
                     if (
+                        stream_failure is not None and not observation.pending
+                        and not retry_at and not deferred_claims
+                        and all(
+                            lane == CoordinatorLane.PREFLIGHT or transition_hold(work).remote_waits > 0
+                            for lane, queue in queues.items() for work in queue
+                        )
+                    ):
+                        # Every accepted/runnable tail has drained. Parked
+                        # intents and pre-submit queues stay durable and keep
+                        # their reservations; no completion/ACK is invented.
+                        circuit_open = True
+                        admission_open = False
+                        blocked_reason = "stream_pressure_closed"
+                        emit()
+                        return CoordinatorResult(
+                            terminal=CoordinatorTerminal.STUCK_OPEN_CIRCUIT,
+                            recovery_complete=recovery_complete, admitted=admitted,
+                            completed=completed, final_states=tuple(sorted(final.items())),
+                            errors=tuple(errors), credits_in_use=ledger.in_use,
+                        )
+                    if (
                         any(queues.values())
                         and not circuit_open
                         and not retry_at
                         and not deferred_claims
                         and not observation.pending
+                        and not stream_deferred
                     ):
                         circuit_open = True
                         admission_open = False
@@ -1738,6 +1819,16 @@ class StagedParseCoordinator:
                             updated = reconciled_results.pop(future)
                         else:
                             updated = future.result()
+                    except StageAdmissionDeferred as exc:
+                        # Only the HTTP effect boundary can prove absence;
+                        # the backend has made no durable successor/effect.
+                        stream_parked[work.attempt_id] = work
+                        track_waiting_lease(work)
+                        if stream_failure is None:
+                            stream_failure = str(exc)
+                            errors.append("stream pressure closed new submissions: " + stream_failure)
+                        admission_open = False
+                        observation.cancel()
                     except StageWaiting as exc:
                         wait_now = self._monotonic()
                         retry_at[work.attempt_id] = (

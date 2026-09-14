@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
 
+from disclosure_anchor.application.contracts.staged_campaign_v4 import (
+    V4CampaignAdmissionScope, require_v4_campaign_scope,
+)
 from disclosure_anchor.application.contracts.provider_document_admission import SourcePdfObservation
 from disclosure_anchor.application.contracts.staged_resource_credit import ResourceCreditVector
 from disclosure_anchor.application.ports.staged_provider_parser import V4StageGuard
@@ -23,6 +26,17 @@ def validate_admission_document_ids(value: tuple[str, ...] | None) -> None:
         or len(set(value)) != len(value)
     ):
         raise ValueError("commissioning requires 1..8 unique nonempty document IDs")
+
+
+def validate_v4_admission_scope(
+    *, admission_document_ids: tuple[str, ...] | None,
+    campaign_scope: V4CampaignAdmissionScope | None,
+) -> None:
+    validate_admission_document_ids(admission_document_ids)
+    if campaign_scope is not None:
+        require_v4_campaign_scope(campaign_scope)
+        if admission_document_ids is not None:
+            raise ValueError("V4 commissioning and campaign scopes are mutually exclusive")
 
 
 class V4InitialIngressCapacityBlocked(RuntimeError):
@@ -98,6 +112,9 @@ class V4OrdinaryParseCandidatePage:
 
 
 class V4OrdinaryParseCandidateSourcePort(Protocol):
+    @property
+    def campaign_scope_sha256(self) -> str | None: ...
+
     def list_candidates(
         self,
         *,
@@ -202,6 +219,7 @@ class V4SourcePdfObserverPort(Protocol):
 
 
 __all__ = [
+    "validate_v4_admission_scope",
     "V4InitialIngressCapacityBlocked",
     "V4OrdinaryParseCandidate",
     "V4OrdinaryParseCandidatePage",

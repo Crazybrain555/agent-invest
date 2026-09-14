@@ -15,6 +15,9 @@ from datetime import UTC, datetime
 from math import isfinite
 import time
 
+from disclosure_anchor.application.contracts.staged_campaign_v4 import (
+    V4CampaignAdmissionScope, require_v4_campaign_scope,
+)
 from disclosure_anchor.application.contracts.staged_credit import (
     conservative_monotonic_deadline,
 )
@@ -134,6 +137,7 @@ class DurableStagedCoordinatorPersistenceV4:
         monotonic: Callable[[], float] = time.monotonic,
         utc_now: Callable[[], datetime] | None = None,
         outbox_event_id_factory: Callable[[], str] = ids.new_outbox_event_id,
+        campaign_scope: V4CampaignAdmissionScope | None = None,
     ) -> None:
         if type(limits) is not CoordinatorLimits:
             raise ValueError("staged persistence requires exact coordinator limits")
@@ -158,9 +162,16 @@ class DurableStagedCoordinatorPersistenceV4:
         self._monotonic = monotonic
         self._utc_now = utc_now or (lambda: datetime.now(UTC))
         self._outbox_event_id_factory = outbox_event_id_factory
+        self._campaign_scope = (
+            None if campaign_scope is None else require_v4_campaign_scope(campaign_scope)
+        )
         self._prepared_cursor: str | None = None
         self._prepared_blocked_at: dict[str, int] = {}
         self._prepared_ineligible: set[str] = set()
+
+    @property
+    def campaign_scope_sha256(self) -> str | None:
+        return None if self._campaign_scope is None else self._campaign_scope.scope_sha256
 
     def list_recoverable(
         self,
@@ -506,6 +517,12 @@ class DurableStagedCoordinatorPersistenceV4:
         limit: int | None = None,
     ) -> tuple[RecoveryCandidate, ...]:
         with self._uow_factory() as uow:
+            if self._campaign_scope is not None:
+                return uow.remote_parse_v4.list_unclaimed_prepared_heads(
+                    after_attempt_id=after_attempt_id,
+                    limit=self._limits.recovery_page_size if limit is None else limit,
+                    campaign_scope=self._campaign_scope,
+                )
             return uow.remote_parse_v4.list_unclaimed_prepared_heads(
                 after_attempt_id=after_attempt_id,
                 limit=self._limits.recovery_page_size if limit is None else limit,
@@ -517,11 +534,18 @@ class DurableStagedCoordinatorPersistenceV4:
             authority = uow.remote_parse_v4.load(attempt_id)
         after = self._now()
         self._require_monotonic_bracket(before, after)
+        self._require_campaign_authority(authority)
         return _ObservedAuthority(
             authority=authority,
             monotonic_before=before,
             monotonic_after=after,
         )
+
+    def _require_campaign_authority(self, authority: RemoteParseV4Authority) -> None:
+        if self._campaign_scope is not None:
+            self._campaign_scope.require_document_source(
+                authority.checkpoint.document_id, authority.checkpoint.source_pdf_sha256,
+            )
 
     def _claim_transaction(
         self,
@@ -632,6 +656,7 @@ class DurableStagedCoordinatorPersistenceV4:
         last_unknown: _MutationOutcomeUnknown | None = None
         for write_number in range(2):
             authority = observed.authority
+            self._require_campaign_authority(authority)
             if _is_final(authority):
                 return self._project_final(authority)
             if self._is_foreign_live(authority):
@@ -688,6 +713,7 @@ class DurableStagedCoordinatorPersistenceV4:
 
     def _project_owned(self, observed: _ObservedAuthority) -> CoordinatorWork:
         authority = observed.authority
+        self._require_campaign_authority(authority)
         if _is_final(authority):
             return self._project_final(authority)
         if not self._is_owned_live(authority):

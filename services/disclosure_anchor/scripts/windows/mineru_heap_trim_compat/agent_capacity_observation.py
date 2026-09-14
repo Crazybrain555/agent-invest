@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any
@@ -50,6 +53,81 @@ def _framework_limits() -> dict:
     }
 
 
+def _kernel_text(path: Path, maximum: int = 65536) -> str:
+    with path.open("rb") as stream:
+        raw = stream.read(maximum + 1)
+    if not raw or len(raw) > maximum:
+        raise RuntimeError("pressure kernel input exceeds its byte bound")
+    return raw.decode("ascii")
+
+
+def _linux_pressure_memory() -> dict:
+    """Read this container's cgroup and the VM, without claiming hidden ancestors.
+
+    The supported deployment has a private cgroup namespace mounted at its
+    root. Other topologies need their own qualified mapping, never path guesses.
+    These are pressure signals, not an allocation or reservation guarantee.
+    """
+    membership = _kernel_text(Path("/proc/self/cgroup"), 4096)
+    if membership != "0::/\n":
+        raise RuntimeError("pressure requires the qualified private cgroup root")
+    def mounted_root() -> str:
+        matches = []
+        for line in _kernel_text(Path("/proc/self/mountinfo")).splitlines():
+            left, separator, right = line.partition(" - ")
+            filesystem = right.split()
+            if separator and filesystem and filesystem[0] == "cgroup2":
+                fields = left.split()
+                if len(fields) >= 6 and fields[3:5] == ["/", "/sys/fs/cgroup"]:
+                    matches.append(line)
+        if len(matches) != 1:
+            raise RuntimeError("pressure cgroup mount does not identify one namespace root")
+        return matches[0]
+    mount = mounted_root()
+    root = Path("/sys/fs/cgroup")
+    birth = root.stat()
+    namespace = os.readlink("/proc/self/ns/cgroup")
+    if re.fullmatch(r"cgroup:\[[0-9]+\]", namespace) is None:
+        raise RuntimeError("pressure cgroup namespace identity is invalid")
+    identity = {"membership": membership, "mount": mount, "namespace": namespace,
+                "device": birth.st_dev, "inode": birth.st_ino}
+    identity_sha = "sha256:" + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    def number(path: Path, *, unlimited: bool = False) -> int | None:
+        value = _kernel_text(path, 128).strip()
+        if unlimited and value == "max":
+            return None
+        if re.fullmatch(r"[0-9]+", value) is None:
+            raise RuntimeError("pressure kernel counter is malformed")
+        return int(value)
+    current = number(root / "memory.current")
+    maximum = number(root / "memory.max", unlimited=True)
+    events = {}
+    for line in _kernel_text(root / "memory.events", 4096).splitlines():
+        pieces = line.split()
+        if len(pieces) != 2 or re.fullmatch(r"[a-z_]+", pieces[0]) is None or re.fullmatch(r"[0-9]+", pieces[1]) is None or pieces[0] in events:
+            raise RuntimeError("pressure memory event is malformed")
+        events[pieces[0]] = int(pieces[1])
+    if not {"low", "high", "max", "oom", "oom_kill"} <= events.keys():
+        raise RuntimeError("pressure memory event counters are incomplete")
+    meminfo = {}
+    for line in _kernel_text(Path("/proc/meminfo")).splitlines():
+        name, _, tail = line.partition(":")
+        if name in {"MemTotal", "MemAvailable"}:
+            if name in meminfo or re.fullmatch(r"\s*[0-9]+ kB", tail) is None:
+                raise RuntimeError("pressure VM memory field is malformed")
+            meminfo[name] = int(tail.split()[0]) * 1024
+    if set(meminfo) != {"MemTotal", "MemAvailable"} or not 0 <= meminfo["MemAvailable"] <= meminfo["MemTotal"] or meminfo["MemTotal"] <= 0:
+        raise RuntimeError("pressure VM memory fields are incomplete or invalid")
+    after = root.stat()
+    if (birth.st_dev, birth.st_ino) != (after.st_dev, after.st_ino) or os.readlink("/proc/self/ns/cgroup") != namespace or _kernel_text(Path("/proc/self/cgroup"), 4096) != membership or mounted_root() != mount:
+        raise RuntimeError("pressure cgroup identity changed during read")
+    return {"scope": "self_cgroup_and_vm", "ancestor_visibility": "not_observed",
+            "cgroup_identity_sha256": identity_sha,
+            "cgroup_current_bytes": current, "cgroup_max_bytes": maximum,
+            "memory_events": events, "vm_total_bytes": meminfo["MemTotal"],
+            "vm_available_bytes": meminfo["MemAvailable"]}
+
+
 class CapacityServingObservation:
     """Process birth is sampled at manager startup; stages remain live samples."""
 
@@ -62,6 +140,21 @@ class CapacityServingObservation:
         self.boot_id = str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
         if self.process_start_ticks <= 0:
             raise RuntimeError("serving process birth is invalid")
+        self._pressure_cgroup_identity = None
+
+    def pressure_snapshot(self) -> dict:
+        started = time.monotonic_ns()
+        observation = self.snapshot()
+        memory = _linux_pressure_memory()
+        identity = memory["cgroup_identity_sha256"]
+        if self._pressure_cgroup_identity is not None and self._pressure_cgroup_identity != identity:
+            raise RuntimeError("pressure cgroup identity changed during serving lifetime")
+        self._pressure_cgroup_identity = identity
+        return {"schema": "mineru.process-pressure.v1",
+                "capacity_config_sha256": self.config.sha256,
+                "owner": observation["owner"], "memory": memory,
+                "observed_at": {"clock": "python.monotonic_ns", "started_ns": started,
+                                "completed_ns": time.monotonic_ns()}}
 
     def snapshot(self) -> dict:
         from mineru.cli.agent_capacity_bootstrap import get_process_capacity

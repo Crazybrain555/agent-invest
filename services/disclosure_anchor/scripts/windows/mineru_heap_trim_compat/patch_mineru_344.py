@@ -1742,6 +1742,14 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        content=_process_async_request_snapshot(),\n"
             '        headers={"Cache-Control": "no-store"},\n'
             "    )\n\n\n"
+            '@app.get(path="/agent/telemetry/pressure/v1", include_in_schema=False)\n'
+            "async def agent_process_pressure_telemetry():\n"
+            "    manager = get_task_manager()\n"
+            "    observer = getattr(manager, 'capacity_observer', None)\n"
+            "    if observer is None:\n"
+            "        raise HTTPException(status_code=503, detail='explicit capacity pressure unavailable')\n"
+            "    return JSONResponse(content=observer.pressure_snapshot(),\n"
+            '                        headers={"Cache-Control": "no-store"})\n\n\n'
             '@app.get(path="/health")\n',
             count=1,
             label="FastAPI same-process outgoing HTTP telemetry",

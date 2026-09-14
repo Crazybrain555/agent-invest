@@ -123,6 +123,7 @@ def run_commissioning(
                     admission_guard=admission_guard,
                     process_scope_classes=_process_scope_classes(settings),
                     admission_document_ids=document_ids, progress=lambda _snapshot: None,
+                    expected_capacity=checker.expected_capacity,
                 )
                 try:
                     runtime.verify_startup()
