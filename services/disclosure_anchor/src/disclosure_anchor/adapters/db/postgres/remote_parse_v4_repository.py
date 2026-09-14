@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NoReturn, cast
 
@@ -175,9 +176,72 @@ _V4_DEFERRED_CONSTRAINTS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationSnapshotV4:
+    """Read-only publication evidence, never a claim or execution authority."""
+
+    checkpoint: RemoteParseCheckpointV4
+    winner: AtomicPublicationWinnerV4 | None
+    materialization_intent: MaterializationIntentV4 | None
+
+
 class RemoteParseV4Repository:
     def __init__(self, session: Session) -> None:
         self._session = session
+
+    def read_publication_snapshot(self, attempt_id: str) -> PublicationSnapshotV4:
+        """Reuse canonical decoders in one read-only repeatable snapshot.
+
+        No row/advisory locks or provider secrets are read. This narrower
+        projection cannot be used to claim, resume, cancel or ACK an attempt.
+        """
+        _identity(attempt_id, "attempt")
+        settings = self._session.execute(sa.text(
+            "SELECT current_setting('transaction_read_only'), "
+            "current_setting('transaction_isolation')"
+        )).one()
+        if tuple(settings) != ("on", "repeatable read"):
+            raise ValueError("publication snapshot requires READ ONLY REPEATABLE READ")
+        table = models.RemoteParseAttempt.__table__
+        head = self._session.execute(sa.select(table).where(
+            table.c.attempt_id == attempt_id,
+        )).mappings().one_or_none()
+        if head is None:
+            raise V4HeadNotFound("publication attempt is absent")
+        if head["checkpoint_contract_version"] != 4:
+            raise RemoteParseV4AuthorityViolation("publication attempt is not V4")
+        table = models.RemoteParseV4Checkpoint.__table__
+        rows = self._session.execute(sa.select(table).where(
+            table.c.attempt_id == attempt_id,
+        ).order_by(table.c.lifecycle_version)).mappings().all()
+        history = tuple(self._decode_checkpoint_row(row)[0] for row in rows)
+        if not history or history[0].lifecycle_version != 0:
+            raise RemoteParseV4AuthorityViolation("publication checkpoint prefix is absent")
+        for previous, current in zip(history, history[1:]):
+            validate_remote_parse_checkpoint_successor_v4(previous, current)
+        self._validate_head_projection(head, history[-1])
+        winner = self._load_winner(
+            attempt_id=attempt_id, expected_sha256=history[-1].publication_winner_sha256,
+        )
+        if winner is None:
+            return PublicationSnapshotV4(history[-1], None, None)
+        self._validate_winner_authority(head=head, history=history, winner=winner)
+        table = models.RemoteParseV4Evidence.__table__
+        row = self._session.execute(sa.select(table).where(
+            table.c.attempt_id == attempt_id,
+            table.c.evidence_kind == "materialization_intent",
+        )).mappings().one_or_none()
+        if row is None:
+            raise RemoteParseV4AuthorityViolation("publication materialization intent is absent")
+        evidence = self._decode_evidence_row(row)
+        if (type(evidence.value) is not MaterializationIntentV4
+                or evidence.sha256 != history[-1].materialization_intent_sha256):
+            raise RemoteParseV4AuthorityViolation("publication materialization intent drifted")
+        for name in ("attempt_id", "fence_identity", "document_id", "processing_run_id",
+                     "source_pdf_sha256", "source_page_count"):
+            if getattr(evidence.value, name) != getattr(history[-1], name):
+                raise RemoteParseV4AuthorityViolation("publication materialization identity drifted")
+        return PublicationSnapshotV4(history[-1], winner, evidence.value)
 
     def list_historical_local_resources(
         self, *, after_attempt_id: str | None, limit: int,

@@ -325,6 +325,16 @@ class PostgresAtomicWholeDocumentPublisherV4:
             )
             return winner
 
+    @staticmethod
+    def verify_publication_snapshot(
+        session: Session, *, winner: AtomicPublicationWinnerV4,
+        context: ProviderEnvelopeContextV4,
+    ) -> None:
+        """Verify stored publication in the caller's existing read snapshot."""
+        PostgresAtomicWholeDocumentPublisherV4._require_committed_closure(
+            session, winner=winner, request=None, context=context,
+        )
+
     def reload_commit_winner_by_processing_run_id(
         self,
         *,

@@ -114,6 +114,28 @@ measurement incident. Every `measurement_incident` permanently makes that run
 incomplete. A terminal residual report leaves the measurement incomplete and
 cannot be replaced with a second `resources_closed` event claiming success.
 
+## Private publication fact adapter
+
+`PostgresM6PublishVerifier` reads each private audit in a fresh app-principal
+`READ ONLY / REPEATABLE READ` transaction. Its publication read reuses canonical
+checkpoint/winner decoding and the original stored Unit/outbox/base/projection
+closure checks in that same snapshot. It obtains `ledger_seq` from the actual
+durable base, not the publication callback or outbox sequence. This read takes no
+claim, row/advisory lock or provider secret and cannot submit, resume or ACK work.
+
+Source history spans every document/run and time for each requested source SHA.
+Published/current/Unit/outbox witnesses missing a base, conflicting provenance,
+and unattributable historical publications keep `scan_complete=False`. A missing
+base never proves a source is fresh. The injected receipt sink must persist the
+exact canonical audit bytes before either method returns their digest; write or
+query failures propagate. History row and serialized receipt-byte bounds fail
+explicitly.
+
+These private facts neither authenticate a public reader nor emit owner events.
+Independent public pagination/artifact confirmation, qualification and finite
+owner assembly remain separate boundaries. No public schema or reader privilege
+is broadened by this adapter.
+
 ## Whole-document quality
 
 `M6QualityPlan` cannot omit source identity, full-page closure, block/table/logical
