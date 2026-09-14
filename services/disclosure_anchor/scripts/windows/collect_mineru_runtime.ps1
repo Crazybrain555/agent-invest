@@ -319,6 +319,64 @@ function Convert-EnvironmentToMap {
     return $result
 }
 
+# BEGIN MINERU API DEVICE PROFILE V1
+function Get-ApiDeviceProfile {
+    param([Parameter(Mandatory=$true)][object]$Api)
+    $entry = $Api.environment.PSObject.Properties['MINERU_DEVICE_MODE']
+    $mode = 'cpu'
+    if ($null -ne $entry) { $mode = $entry.Value }
+    if ($mode -isnot [string] -or $mode -cnotin @('cpu','cuda:0')) {
+        throw 'API device mode must be cpu or cuda:0'
+    }
+    $devices = @($Api.deploy.resources.reservations.devices | Where-Object { $null -ne $_ })
+    if ($mode -ceq 'cpu') {
+        if ($devices.Count -ne 0) { throw 'CPU API must not reserve GPU devices' }
+        return 'cpu'
+    }
+    if ($devices.Count -ne 1) { throw 'CUDA API requires one exact GPU reservation' }
+    $d = $devices[0]
+    $keys = @($d.PSObject.Properties.Name | Sort-Object) -join ','
+    if ($keys -cnotin @('capabilities,device_ids,driver','capabilities,device_ids,driver,options') -or
+        $d.driver -cne 'nvidia' -or $d.device_ids -isnot [array] -or @($d.device_ids).Count -ne 1 -or
+        $d.device_ids[0] -isnot [string] -or $d.device_ids[0] -cne '0' -or
+        $d.capabilities -isnot [array] -or @($d.capabilities).Count -ne 1 -or $d.capabilities[0] -cne 'gpu' -or
+        ($null -ne $d.options -and @($d.options.PSObject.Properties).Count -ne 0)) {
+        throw 'CUDA API reservation must select only NVIDIA GPU0 with gpu capability'
+    }
+    return 'cuda0'
+}
+
+function Assert-ApiDeviceRuntime {
+    param([Parameter(Mandatory=$true)][object]$Container,
+          [Parameter(Mandatory=$true)][ValidateSet('cpu','cuda0')][string]$Profile)
+    if ($Container.HostConfig.Privileged -isnot [bool] -or $Container.HostConfig.Privileged -or
+        @($Container.HostConfig.Devices | Where-Object { $null -ne $_ }).Count -ne 0 -or
+        @($Container.HostConfig.CapAdd | Where-Object { $null -ne $_ }).Count -ne 0) {
+        throw 'API GPU profile forbids privileged mode, direct devices and added capabilities'
+    }
+    $modes = @($Container.Config.Env | Where-Object { $_ -clike 'MINERU_DEVICE_MODE=*' })
+    $devices = @($Container.HostConfig.DeviceRequests | Where-Object { $null -ne $_ })
+    if ($Profile -ceq 'cpu') {
+        if ($modes.Count -gt 1 -or ($modes.Count -eq 1 -and $modes[0] -cne 'MINERU_DEVICE_MODE=cpu') -or
+            $devices.Count -ne 0) { throw 'actual CPU API device profile drifted' }
+        return
+    }
+    if ($modes.Count -ne 1 -or $modes[0] -cne 'MINERU_DEVICE_MODE=cuda:0' -or $devices.Count -ne 1) {
+        throw 'actual CUDA API device mode or request count drifted'
+    }
+    $d = $devices[0]
+    if ((@($d.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'Capabilities,Count,DeviceIDs,Driver,Options' -or
+        $d.Driver -cne 'nvidia' -or ($d.Count -isnot [int] -and $d.Count -isnot [long]) -or $d.Count -ne 0 -or
+        $d.DeviceIDs -isnot [array] -or @($d.DeviceIDs).Count -ne 1 -or $d.DeviceIDs[0] -isnot [string] -or $d.DeviceIDs[0] -cne '0' -or
+        $d.Capabilities -isnot [array] -or @($d.Capabilities).Count -ne 1 -or
+        $d.Capabilities[0] -isnot [array] -or @($d.Capabilities[0]).Count -ne 1 -or
+        $d.Capabilities[0][0] -cne 'gpu' -or
+        ($null -ne $d.Options -and @($d.Options.PSObject.Properties).Count -ne 0)) {
+        throw 'actual CUDA API must expose only the exact NVIDIA GPU0 request'
+    }
+}
+# END MINERU API DEVICE PROFILE V1
+
 function Select-ExactEnvironment {
     param(
         [Parameter(Mandatory = $true)][object[]]$ActualValues,
@@ -614,6 +672,12 @@ if ($ExplicitCapacity) {
             throw "explicit capacity image anchor drifted or compose overrides it: $name"
         }
     }
+}
+$apiDeviceProfile = Get-ApiDeviceProfile -Api $configObject.services."mineru-api"
+Assert-ApiDeviceRuntime -Container $api -Profile $apiDeviceProfile
+if ($null -ne $configObject.services."mineru-api".environment.PSObject.Properties['MINERU_DEVICE_MODE']) {
+    if (-not $ExplicitCapacity) { throw 'API device selection requires explicit capacity' }
+    $apiAllowedEnvironment += 'MINERU_DEVICE_MODE'
 }
 $apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
     -ImageValues $apiImageEnvironment `

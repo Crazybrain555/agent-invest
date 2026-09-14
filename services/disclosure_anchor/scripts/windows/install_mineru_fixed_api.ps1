@@ -12,6 +12,7 @@ param(
     [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [switch]$ReuseCurrentPublishedImage,
     [switch]$ApiOnlyCompatibilityUpgrade,
+    [ValidateSet("", "cpu", "cuda0")][string]$ApiDeviceProfile = "",
     [string]$CampaignApiCompatImageId = "",
     [ValidateSet(1)][int]$ExpectedApiTaskSlots = 1,
     [ValidateSet(1)][int]$ExpectedApiMaxPendingTasks = 1,
@@ -32,6 +33,10 @@ if ($ExplicitCapacity -and ($PSBoundParameters.ContainsKey("ExpectedApiTaskSlots
         $PSBoundParameters.ContainsKey("ExpectedApiMaxPendingTasks"))) {
     throw "explicit capacity cannot also select legacy task or pending limits"
 }
+if ($ApiDeviceProfile -ne "" -and (-not $ApiOnlyCompatibilityUpgrade -or -not $ExplicitCapacity)) {
+    throw "API device selection requires explicit-capacity API-only compatibility upgrade"
+}
+$PreviousApiDeviceProfile = $null
 $CapacityInputs = $null
 $ProgressPreference = "SilentlyContinue"
 if ($ExpectedApiTaskSlots -ne 1 -or $ExpectedApiMaxPendingTasks -ne 1) {
@@ -456,6 +461,102 @@ function Assert-CapacityCompose {
     }
 }
 
+# BEGIN MINERU API DEVICE PROFILE V1
+function Get-ApiDeviceProfile {
+    param([Parameter(Mandatory=$true)][object]$Api)
+    $entry = $Api.environment.PSObject.Properties['MINERU_DEVICE_MODE']
+    $mode = 'cpu'
+    if ($null -ne $entry) { $mode = $entry.Value }
+    if ($mode -isnot [string] -or $mode -cnotin @('cpu','cuda:0')) {
+        throw 'API device mode must be cpu or cuda:0'
+    }
+    $devices = @($Api.deploy.resources.reservations.devices | Where-Object { $null -ne $_ })
+    if ($mode -ceq 'cpu') {
+        if ($devices.Count -ne 0) { throw 'CPU API must not reserve GPU devices' }
+        return 'cpu'
+    }
+    if ($devices.Count -ne 1) { throw 'CUDA API requires one exact GPU reservation' }
+    $d = $devices[0]
+    $keys = @($d.PSObject.Properties.Name | Sort-Object) -join ','
+    if ($keys -cnotin @('capabilities,device_ids,driver','capabilities,device_ids,driver,options') -or
+        $d.driver -cne 'nvidia' -or $d.device_ids -isnot [array] -or @($d.device_ids).Count -ne 1 -or
+        $d.device_ids[0] -isnot [string] -or $d.device_ids[0] -cne '0' -or
+        $d.capabilities -isnot [array] -or @($d.capabilities).Count -ne 1 -or $d.capabilities[0] -cne 'gpu' -or
+        ($null -ne $d.options -and @($d.options.PSObject.Properties).Count -ne 0)) {
+        throw 'CUDA API reservation must select only NVIDIA GPU0 with gpu capability'
+    }
+    return 'cuda0'
+}
+
+function Assert-ApiDeviceRuntime {
+    param([Parameter(Mandatory=$true)][object]$Container,
+          [Parameter(Mandatory=$true)][ValidateSet('cpu','cuda0')][string]$Profile)
+    if ($Container.HostConfig.Privileged -isnot [bool] -or $Container.HostConfig.Privileged -or
+        @($Container.HostConfig.Devices | Where-Object { $null -ne $_ }).Count -ne 0 -or
+        @($Container.HostConfig.CapAdd | Where-Object { $null -ne $_ }).Count -ne 0) {
+        throw 'API GPU profile forbids privileged mode, direct devices and added capabilities'
+    }
+    $modes = @($Container.Config.Env | Where-Object { $_ -clike 'MINERU_DEVICE_MODE=*' })
+    $devices = @($Container.HostConfig.DeviceRequests | Where-Object { $null -ne $_ })
+    if ($Profile -ceq 'cpu') {
+        if ($modes.Count -gt 1 -or ($modes.Count -eq 1 -and $modes[0] -cne 'MINERU_DEVICE_MODE=cpu') -or
+            $devices.Count -ne 0) { throw 'actual CPU API device profile drifted' }
+        return
+    }
+    if ($modes.Count -ne 1 -or $modes[0] -cne 'MINERU_DEVICE_MODE=cuda:0' -or $devices.Count -ne 1) {
+        throw 'actual CUDA API device mode or request count drifted'
+    }
+    $d = $devices[0]
+    if ((@($d.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'Capabilities,Count,DeviceIDs,Driver,Options' -or
+        $d.Driver -cne 'nvidia' -or ($d.Count -isnot [int] -and $d.Count -isnot [long]) -or $d.Count -ne 0 -or
+        $d.DeviceIDs -isnot [array] -or @($d.DeviceIDs).Count -ne 1 -or $d.DeviceIDs[0] -isnot [string] -or $d.DeviceIDs[0] -cne '0' -or
+        $d.Capabilities -isnot [array] -or @($d.Capabilities).Count -ne 1 -or
+        $d.Capabilities[0] -isnot [array] -or @($d.Capabilities[0]).Count -ne 1 -or
+        $d.Capabilities[0][0] -cne 'gpu' -or
+        ($null -ne $d.Options -and @($d.Options.PSObject.Properties).Count -ne 0)) {
+        throw 'actual CUDA API must expose only the exact NVIDIA GPU0 request'
+    }
+}
+# END MINERU API DEVICE PROFILE V1
+
+function Assert-ApiDeviceTransition {
+    param([Parameter(Mandatory=$true)][object]$Next,
+          [Parameter(Mandatory=$true)][object]$Previous,
+          [Parameter(Mandatory=$true)][ValidateSet('cpu','cuda0')][string]$Profile)
+    if ((Get-ApiDeviceProfile -Api $Next.services.'mineru-api') -cne $Profile) {
+        throw 'candidate API device profile differs from explicit selection'
+    }
+    Get-ApiDeviceProfile -Api $Previous.services.'mineru-api' | Out-Null
+    # Clone before normalization; do not erase caller evidence. No capacity or
+    # command fields are masked in a device-only comparison.
+    $normalized = @($Next, $Previous | ForEach-Object { $_ | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json })
+    foreach ($item in $normalized) {
+        $api = $item.services.'mineru-api'
+        $api.environment.PSObject.Properties.Remove('MINERU_DEVICE_MODE')
+        if ($null -ne $api.deploy.resources.reservations) {
+            $api.deploy.resources.reservations.PSObject.Properties.Remove('devices')
+            if (@($api.deploy.resources.reservations.PSObject.Properties).Count -eq 0) {
+                $api.deploy.resources.PSObject.Properties.Remove('reservations')
+            }
+        }
+        if ($null -ne $api.deploy.resources -and @($api.deploy.resources.PSObject.Properties).Count -eq 0) {
+            $api.deploy.PSObject.Properties.Remove('resources')
+        }
+        # Compose renders an empty placement object when deploy is introduced.
+        # Remove only that empty object; preserve any actual placement policy.
+        if ($api.deploy.placement -is [PSCustomObject] -and
+            @($api.deploy.placement.PSObject.Properties).Count -eq 0) {
+            $api.deploy.PSObject.Properties.Remove('placement')
+        }
+        if ($null -ne $api.deploy -and @($api.deploy.PSObject.Properties).Count -eq 0) {
+            $api.PSObject.Properties.Remove('deploy')
+        }
+    }
+    if ((Get-CanonicalObjectJson $normalized[0]) -cne (Get-CanonicalObjectJson $normalized[1])) {
+        throw 'API device transition changed configuration outside GPU0 and device mode'
+    }
+}
+
 function Assert-ApiOnlyUpgradeInputs {
     if (-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
         throw "API-only compatibility upgrade requires a complete existing deployment"
@@ -464,6 +565,11 @@ function Assert-ApiOnlyUpgradeInputs {
         $next = Get-ResolvedCompose $ComposeSource
         $previous = Get-ResolvedCompose $ComposeTarget
         Assert-CapacityCompose $next
+        if ($ApiDeviceProfile -ne "") {
+            Assert-ApiDeviceTransition -Next $next -Previous $previous -Profile $ApiDeviceProfile
+            $script:PreviousApiDeviceProfile = Get-ApiDeviceProfile -Api $previous.services."mineru-api"
+            return
+        }
         # Only the selected API capacity fields may differ. Inference/proxy,
         # networks, mounts, image name and every other setting remain exact.
         foreach ($item in @($next, $previous)) {
@@ -1047,6 +1153,7 @@ function Get-ValidatedRuntime {
         throw "MinerU container names were not unique"
     }
     $api = $api[0]
+    if ($ApiDeviceProfile -ne "") { Assert-ApiDeviceRuntime -Container $api -Profile $ApiDeviceProfile }
     $proxy = $proxy[0]
     $inference = $inference[0]
 
@@ -1515,6 +1622,9 @@ function Restore-PreviousDeployment {
         $restored = (Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json
         if (@($restored).Count -ne 1 -or [string]$restored[0].Image -ne $OldApiCompatImageId) {
             throw "API-only rollback did not restore the previous API image"
+        }
+        if ($ApiDeviceProfile -ne "") {
+            Assert-ApiDeviceRuntime -Container $restored[0] -Profile $PreviousApiDeviceProfile
         }
         Remove-CompatBuildTag
         return

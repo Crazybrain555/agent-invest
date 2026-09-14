@@ -208,6 +208,10 @@ compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurren
 旧 tag 与文件，再重建 API、验证旧 API image、健康状态以及推理服务/代理的原 ID、image、started_at。
 机器断线或监督进程超时仍须核对 daemon 状态；不能把客户端退出当作完成回滚。
 完整项目安装模式保留给明确授权的初装或拓扑变更，不能借 dry-run 代替此 API 单独升级边界。
+以上 compose 字节不变要求描述默认兼容层升级。已显式选择容量配置时，容量参数变化以及
+`-ApiDeviceProfile cpu|cuda0` 的设备变化分别遵循
+[显式容量部署约束](../design/mineru-explicit-capacity.md#installation-and-observation)：
+每次只放行选定轴，保留其他配置和推理服务/代理进程。设备配置通过不代表解析质量已通过。
 `scripts/windows/test_mineru_api_only_installer.ps1 -InstallerPath <reviewed-installer.ps1>`
 在 Windows PowerShell 5.1 中抽取并执行真实安装器函数，使用独立临时文件和模拟 Docker
 验证配置保护、旧 tag/文件恢复顺序以及健康/镜像不符的失败路径；不调用真实 Docker。

@@ -105,6 +105,7 @@ function Reset-Fixture {
     $script:ApiCompatImage = 'fixture-api:published'; $script:OldApiCompatImageId = 'sha256:' + ('a' * 64)
     $script:CampaignApiCompatImageId = 'sha256:' + ('b' * 64)
     $script:PublishedImage = $script:CampaignApiCompatImageId; $script:RunningImage = $script:CampaignApiCompatImageId
+    $script:ApiDeviceProfile = ''
     $script:ReuseCurrentPublishedImage = $false; $script:ApiOnlyCompatibilityUpgrade = $true
     $script:StableServiceEpochs = 'independent-original-epochs'
 }

@@ -10,13 +10,22 @@ Requires Windows PowerShell 5.1. No native compilation, service, policy or runti
 param(
     [Parameter(Mandatory=$true)][string]$InstallerPath,
     [Parameter(Mandatory=$true)][string]$CollectorPath,
-    [Parameter(Mandatory=$true)][string]$InputPath,
-    [Parameter(Mandatory=$true)][string]$SourceContext,
+    [string]$InputPath = '',
+    [string]$SourceContext = '',
     [Parameter(Mandatory=$true)][string]$TestOutput
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2
+# Original cases select no device transition; device-specific tests are separate.
+$ApiDeviceProfile=''
 if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Windows PowerShell 5.1 required' }
+# Resolve defaults after Windows PowerShell has initialized script identity.
+if([string]::IsNullOrEmpty($InputPath)){
+    if([string]::IsNullOrEmpty($PSCommandPath) -or -not [IO.Path]::IsPathRooted($PSCommandPath)){throw 'cannot resolve default fixture without an absolute script path'}
+    $TestScriptRoot=Split-Path -Parent $PSCommandPath
+    $InputPath=[IO.Path]::GetFullPath((Join-Path $TestScriptRoot '..\..\tests\fixtures\mineru_explicit_capacity_deployment\inputs.json'))
+}
+if(-not (Test-Path -LiteralPath $InputPath -PathType Leaf)){throw 'capacity input fixture must be an existing file'}
 $TestOutput=[IO.Path]::GetFullPath($TestOutput)
 foreach($protected in @('C:\ProgramData','C:\Program Files',[Environment]::SystemDirectory)) {
     if($TestOutput.StartsWith($protected,[StringComparison]::OrdinalIgnoreCase)){throw 'requires disposable test output'}
@@ -44,7 +53,7 @@ foreach($name in $Allow){
     if($nodes.Count-ne 1){throw "expected exactly one actual installer function $name"}
     . ([ScriptBlock]::Create($nodes[0].Extent.Text))
 }
-foreach($name in @('Convert-EnvironmentToMap','Select-ExactEnvironment')){
+foreach($name in @('Convert-EnvironmentToMap','Select-ExactEnvironment','Get-ApiDeviceProfile','Assert-ApiDeviceRuntime')){
     $nodes=@($CollectorAst.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))
     if($nodes.Count-ne 1){throw "expected exactly one collector function $name"}
     . ([ScriptBlock]::Create($nodes[0].Extent.Text))
@@ -137,8 +146,22 @@ function Get-QuiescentOutputState {param([switch]$CandidateSource)
     return $script:QuiescentState
 }
 $Context=Join-Path $TestOutput 'context';[void](New-Item -ItemType Directory -Path $Context)
+# A clean checkout uses its current actual source bytes. The four capacity
+# source expectations remain independent literals in inputs.json. An explicit
+# SourceContext still supports an already-pinned isolated test package.
+$ServiceRoot=Split-Path -Parent (Split-Path -Parent (Split-Path -Parent ([IO.Path]::GetFullPath($InstallerPath))))
+$ContextSources=@{
+    'Dockerfile'='scripts/windows/mineru_heap_trim_compat/Dockerfile';
+    'patch_mineru_344.py'='scripts/windows/mineru_heap_trim_compat/patch_mineru_344.py';
+    'agent_task_protocol_v2.py'='scripts/windows/mineru_heap_trim_compat/agent_task_protocol_v2.py';
+    'agent_capacity_config.py'='src/disclosure_anchor/application/contracts/mineru_capacity_config.py';
+    'agent_capacity_file.py'='src/disclosure_anchor/adapters/runtime/mineru_capacity_file.py';
+    'agent_capacity_bootstrap.py'='scripts/windows/mineru_heap_trim_compat/agent_capacity_bootstrap.py';
+    'agent_capacity_observation.py'='scripts/windows/mineru_heap_trim_compat/agent_capacity_observation.py'
+}
 foreach($name in @('Dockerfile','patch_mineru_344.py','agent_task_protocol_v2.py','agent_capacity_config.py','agent_capacity_file.py','agent_capacity_bootstrap.py','agent_capacity_observation.py')){
-    Copy-Item -LiteralPath (Join-Path $SourceContext $name) -Destination (Join-Path $Context $name)
+    $source=if([string]::IsNullOrEmpty($SourceContext)){Join-Path $ServiceRoot $ContextSources[$name]}else{Join-Path $SourceContext $name}
+    Copy-Item -LiteralPath $source -Destination (Join-Path $Context $name)
 }
 $CompatDockerfileSource=Join-Path $Context 'Dockerfile';$CompatPatcherSource=Join-Path $Context 'patch_mineru_344.py'
 $CapacityConfigSource=Join-Path $Context 'capacity-config.json';$ProjectName='independent-no-real-project'
@@ -152,6 +175,7 @@ $ExpectedApiTaskSlots=1;$ExpectedApiMaxPendingTasks=1
 foreach($path in @($ComposeSource,$ComposeTarget,$CollectorTarget,$ReceiptTarget)){[IO.File]::WriteAllText($path,'untouched-fixture',$Utf8)}
 function Reset-Profile {param([int]$Index=0)
     $script:Profile=Clone $Inputs.profiles[$Index]
+    $script:ApiDeviceProfile=''
     $script:ExplicitCapacity=$true;$script:CapacityInputs=$null
     $script:ExpectedCapacityConfigSha256=$script:Profile.config_sha256
     [IO.File]::WriteAllText($CapacityConfigSource,$script:Profile.config_text,$Utf8)
@@ -159,6 +183,11 @@ function Reset-Profile {param([int]$Index=0)
     $script:CapacityPolicy='single-process-explicit-capacity.v1'
     $script:Health=Clone $script:Profile.raw.api_health;$script:ProxyHealth=Clone $script:Health
     $script:Models=Clone $script:Profile.models;$script:Inspect=Clone $script:Profile.inspect
+    # Literal baseline inspect fields omitted by the original CPU-only fixture.
+    $script:Inspect[0].HostConfig|Add-Member -NotePropertyName Privileged -NotePropertyValue $false -Force
+    $script:Inspect[0].HostConfig|Add-Member -NotePropertyName Devices -NotePropertyValue @() -Force
+    $script:Inspect[0].HostConfig|Add-Member -NotePropertyName CapAdd -NotePropertyValue $null -Force
+    $script:Inspect[0].HostConfig|Add-Member -NotePropertyName DeviceRequests -NotePropertyValue @() -Force
     $script:Inspect[0].Mounts[0].Source=$OutputRoot
     $script:ExpectedApiCompatImageId=$script:Profile.raw.api.image_id
     $script:CampaignApiCompatImageId=$script:ExpectedApiCompatImageId;$script:OptionalImage=$script:ExpectedApiCompatImageId

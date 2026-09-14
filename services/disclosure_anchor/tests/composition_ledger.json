@@ -470,6 +470,10 @@
    "private_imports": [],
    "tests": 0
   },
+  "tests/unit/test_mineru_api_device_attestation.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_mineru_async_append.py": {
    "private_imports": [],
    "tests": 1
@@ -655,6 +659,10 @@
   "tests/unit/test_mineru_orchestrator.py": {
    "private_imports": [],
    "tests": 8
+  },
+  "tests/unit/test_mineru_orientation_observation.py": {
+   "private_imports": [],
+   "tests": 16
   },
   "tests/unit/test_mineru_process.py": {
    "private_imports": [],
@@ -915,6 +923,10 @@
     "_normalize_title"
    ],
    "tests": 169
+  },
+  "tests/unit/test_serving_model_identity.py": {
+   "private_imports": [],
+   "tests": 14
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],

@@ -1976,6 +1976,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "import threading\n"
             "import time\n"
             "import uuid\n"
+            "import weakref\n"
             "import gc\n"
             "if ('MINERU_CAPACITY_CONFIG_PATH' in os.environ\n"
             "        or 'MINERU_CAPACITY_CONFIG_SHA256' in os.environ):\n"
@@ -2620,6 +2621,89 @@ def trim_process_heap() -> bool:
 
 
 '''
+        helper += '''_MODEL_DEVICE_OUTPUT_PREFIX = "MINERU_MODEL_DEVICE "
+_MODEL_DEVICE_LOCK = threading.Lock()
+_MODEL_DEVICE_SEEN = weakref.WeakKeyDictionary()
+
+
+def _model_device_metadata(module, weight_path):
+    """Read metadata from the serving tensors, without inference or transfers."""
+    groups = {}
+    if module is not None:
+        for kind in ("parameters", "buffers"):
+            getter = getattr(module, kind, None)
+            if getter is None:
+                continue
+            for tensor in getter():
+                key = (kind, str(tensor.device), str(tensor.dtype))
+                group = groups.setdefault(key, {"kind": kind, "device": key[1],
+                                               "dtype": key[2], "tensors": 0, "elements": 0})
+                group["tensors"] += 1
+                group["elements"] += tensor.numel()
+    path = str(weight_path) if isinstance(weight_path, (str, os.PathLike)) and str(weight_path) else None
+    return {"state": "available" if groups and path is not None else "unavailable",
+            "weight_path": path, "tensor_groups": [groups[key] for key in sorted(groups)]}
+
+
+def record_hybrid_model_devices(model, *, role="hybrid"):
+    """Once per actual serving instance/role; initialization evidence, not a probe."""
+    if not is_phase_trace_enabled():
+        return None
+    if role not in {"hybrid", "orientation"}:
+        raise ValueError("unknown Hybrid model identity role")
+    # Capacity validation is authoritative, including after a successful record.
+    # Keep it outside the recoverable observation-IO boundary.
+    capacity = None
+    if "MINERU_CAPACITY_CONFIG_PATH" in os.environ or "MINERU_CAPACITY_CONFIG_SHA256" in os.environ:
+        from mineru.cli.agent_capacity_bootstrap import get_process_capacity
+        capacity = get_process_capacity()
+    with _MODEL_DEVICE_LOCK:
+        seen = _MODEL_DEVICE_SEEN.setdefault(model, set())
+        if role in seen:
+            return None
+        try:
+            event = _hybrid_model_device_event(model, role, capacity)
+            with _PHASE_TRACE_OUTPUT_LOCK:
+                print(_MODEL_DEVICE_OUTPUT_PREFIX + json.dumps(event, sort_keys=True), file=sys.stderr, flush=True)
+        except OSError as exc:
+            # A failed diagnostic read/write must not replace model inference.
+            # Do not mark this instance as successfully recorded; a later call
+            # may collect the evidence once the IO failure has recovered.
+            logger.warning(
+                f"Hybrid model device evidence unavailable for {role}: {type(exc).__name__}: {exc}"
+            )
+            return {"state": "unavailable", "role": role, "error_type": type(exc).__name__}
+        seen.add(role)
+        return event
+
+
+def _hybrid_model_device_event(model, role, capacity):
+    models = {}
+    if role == "hybrid":
+        layout = getattr(model, "layout_model", None)
+        models["layout"] = _model_device_metadata(
+            getattr(layout, "model", None), getattr(layout, "model_dir", None))
+        mfr = getattr(getattr(model, "mfr_model", None), "model", None)
+        models["mfr"] = _model_device_metadata(
+            mfr, getattr(getattr(mfr, "config", None), "_name_or_path", None))
+        ocr = getattr(model, "ocr_model", None)
+    else:
+        ocr = getattr(model, "ocr_engine", None)
+    for name, attribute in (("ocr_detector", "text_detector"), ("ocr_recognizer", "text_recognizer")):
+        wrapper = getattr(ocr, attribute, None)
+        models[name] = _model_device_metadata(
+            getattr(wrapper, "net", None), getattr(wrapper, "weights_path", None))
+    with open("/proc/self/stat", encoding="utf-8") as stream:
+        stat_fields = stream.read().rsplit(")", 1)[1].split()
+    return {"schema": "mineru-hybrid-model-device.v1", "role": role,
+            "process_id": os.getpid(), "process_start_ticks": int(stat_fields[19]),
+            "process_epoch": _PHASE_TRACE_PROCESS_EPOCH,
+            "capacity_config_sha256": None if capacity is None else capacity.sha256,
+            "instance_id": id(model), "models": models,
+            "observation": "serving_instance_initialization"}
+
+
+'''
         return _replace_exact(
             source,
             "def clean_memory(device='cuda'):\n",
@@ -2963,6 +3047,7 @@ def trim_process_heap() -> bool:
             "    clean_memory,\n"
             "    crop_img,\n"
             "    get_vram,\n"
+            "    record_hybrid_model_devices,\n"
             "    serial_execution_profile,\n"
             "    strict_processing_window_size,\n"
             "    new_phase_trace,\n"
@@ -2974,6 +3059,14 @@ def trim_process_heap() -> bool:
             ")\n",
             count=1,
             label="Hybrid import",
+        )
+        source = _replace_exact(
+            source,
+            "    images_layout_res = _predict_layout_for_title_split(\n",
+            "    record_hybrid_model_devices(hybrid_pipeline_model)\n"
+            "    images_layout_res = _predict_layout_for_title_split(\n",
+            count=1,
+            label="Hybrid serving model device identity",
         )
         source = _replace_exact_span(
             source,
@@ -3000,6 +3093,13 @@ def trim_process_heap() -> bool:
             "            det_batch_size=max(1, batch_ratio * OCR_DET_BASE_BATCH_SIZE),\n"
             "            tqdm_enable=True,\n"
             "        )\n",
+            "    except Exception as exc:\n"
+            "        logger.warning(\n"
+            "            f\"Hybrid medium effort table orientation classification failed: {exc}, using original table images\"\n"
+            "        )\n"
+            "        return\n\n"
+            "    record_hybrid_model_devices(table_orientation_cls_model, role='orientation')\n"
+            "    try:\n"
             "        rotate_labels = run_ocr_inference(\n"
             "            table_orientation_cls_model.batch_predict,\n"
             "            table_inputs,\n"

@@ -46,6 +46,27 @@ proxy/inference service epochs. It uses the existing API-only recreation and
 fresh output/registry rollback witness. A failed or changed witness still blocks
 rollback over newly acquired task responsibility.
 
+The optional `-ApiDeviceProfile cpu|cuda0` selects a separate device-change axis
+and requires an explicit-capacity API-only upgrade. The supplied candidate
+Compose must select that profile: CPU has no GPU reservation; `cuda0` uses
+`MINERU_DEVICE_MODE=cuda:0` and the exact NVIDIA device `0` reservation. The
+installer compares all non-device configuration, including capacity, unchanged.
+To change H or another capacity setting while retaining CUDA, omit
+`-ApiDeviceProfile` and use the capacity-upgrade path above; existing device
+configuration remains part of its strict comparison. Neither option grants
+permission to operate a shared runtime. Collector checks the actual API device
+requests, environment and unprivileged container boundary; rollback restores and
+verifies the previous profile while preserving inference/proxy epochs.
+
+With phase tracing enabled, `MINERU_MODEL_DEVICE` records parameters and buffers
+from the actual serving Hybrid and orientation instances, including device,
+dtype, model path, PID/start ticks and capacity identity. Configuration alone is
+not proof that model tensors use CUDA. Unavailable observations remain unknown;
+recoverable observation IO failures warn and permit a later collection attempt.
+Capacity-validation and unexpected errors still propagate. Device selection may
+also change MinerU's native floating-point dtype, so throughput qualification
+requires retained-output comparison before claiming equivalent parsing quality.
+
 The v11 runtime manifest binds the externally supplied canonical config and four
 helper sources. Collector v6 preserves a complete seventeen-field serving health
 sample, including runtime v3, admission and capacity observation. Volatile owner,

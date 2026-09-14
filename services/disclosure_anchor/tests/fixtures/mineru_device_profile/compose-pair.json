@@ -1,0 +1,45 @@
+{
+  "previous": {
+    "name": "independent-device-fixture",
+    "services": {
+      "mineru-api": {
+        "image": "fixture/api:exact",
+        "command": ["--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client", "--max-concurrency", "7"],
+        "environment": {
+          "MINERU_API_MAX_CONCURRENT_REQUESTS": "5",
+          "MINERU_API_MAX_PENDING_TASKS": "6",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "mineru-openai-server": {"image": "fixture/engine:exact"},
+      "mineru-api-proxy": {"image": "fixture/proxy:exact", "read_only": true}
+    },
+    "networks": {"inference": {"internal": true}}
+  },
+  "next": {
+    "name": "independent-device-fixture",
+    "services": {
+      "mineru-api": {
+        "image": "fixture/api:exact",
+        "command": ["--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client", "--max-concurrency", "7"],
+        "environment": {
+          "MINERU_API_MAX_CONCURRENT_REQUESTS": "5",
+          "MINERU_API_MAX_PENDING_TASKS": "6",
+          "OMP_NUM_THREADS": "4",
+          "MINERU_DEVICE_MODE": "cuda:0"
+        },
+        "deploy": {
+          "resources": {
+            "reservations": {
+              "devices": [{"driver": "nvidia", "device_ids": ["0"], "capabilities": ["gpu"]}]
+            }
+          },
+          "placement": {}
+        }
+      },
+      "mineru-openai-server": {"image": "fixture/engine:exact"},
+      "mineru-api-proxy": {"image": "fixture/proxy:exact", "read_only": true}
+    },
+    "networks": {"inference": {"internal": true}}
+  }
+}

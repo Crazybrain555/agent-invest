@@ -584,7 +584,14 @@ def build_manifest(
         raise ValueError("remote MinerU container health is not healthy")
     if api.get("external_tcp_egress_blocked") is not True:
         raise ValueError("remote MinerU API external egress was not disproved")
-    api_environment = _environment(api.get("environment"), allowlist=API_ENV_KEYS | (
+    device_keys: set[str] = set()
+    raw_api_environment = api.get("environment")
+    if isinstance(raw_api_environment, dict) and "MINERU_DEVICE_MODE" in raw_api_environment:
+        device_mode = raw_api_environment["MINERU_DEVICE_MODE"]
+        if expected_capacity is None or not isinstance(device_mode, str) or device_mode not in {"cpu", "cuda:0"}:
+            raise ValueError("remote MinerU API device selection is not explicit CPU/CUDA0 capacity")
+        device_keys.add("MINERU_DEVICE_MODE")
+    api_environment = _environment(raw_api_environment, allowlist=API_ENV_KEYS | device_keys | (
         CAPACITY_ENV_KEYS if expected_capacity is not None else set()
     ))
     mounts = api.get("mounts")
