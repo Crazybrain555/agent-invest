@@ -35,6 +35,7 @@ from disclosure_anchor.application.ports.staged_new_work_v4 import (
     V4AdmissionObservationPort,
     V4AdmissionObservationRequest,
 )
+from disclosure_anchor.application.ports.staged_execution import StageObserverPort
 from disclosure_anchor.application.services.staged_admission_observation import StagedAdmissionObservation
 from disclosure_anchor.application.services.staged_execution_guard import StageLeaseGuard, StageLeaseLost
 from disclosure_anchor.application.services.mineru_stream_policy import StreamAdmissionControl, StreamAdmissionDecision
@@ -616,6 +617,7 @@ class StagedParseCoordinator:
         process_guard: Callable[[], None] = lambda: None,
         admission_observer: V4AdmissionObservationPort | None = None,
         stream_control: StreamAdmissionControl | None = None,
+        stage_observer: StageObserverPort | None = None,
     ) -> None:
         self._backend = backend
         self._limits = limits
@@ -624,6 +626,8 @@ class StagedParseCoordinator:
         self._process_guard = process_guard
         self._admission_observer = admission_observer
         self._stream_control = stream_control
+        # Measurement only: each stage guard carries attempt/lane for the notes.
+        self._stage_observer = stage_observer
         if stream_control is not None and stream_control.policy.config.qualified_max > limits.credits.remote_waits:
             raise ValueError("stream qualified capacity exceeds hard remote credits")
 
@@ -1695,6 +1699,9 @@ class StagedParseCoordinator:
                                 and work.lease_expires_monotonic is not None
                                 else None
                             ),
+                            attempt_id=work.attempt_id,
+                            lane=lane.value,
+                            observer=self._stage_observer,
                         )
                         if lane == CoordinatorLane.PREFLIGHT:
                             future = pools[lane].submit(
@@ -1767,6 +1774,7 @@ class StagedParseCoordinator:
                         stage_guard=StageLeaseGuard(
                             deadline_monotonic=self._monotonic() + self._limits.max_stage_step_seconds,
                             _revoked=Event(), _monotonic=self._monotonic,
+                            lane="preflight_observation", observer=self._stage_observer,
                         ),
                     )
 

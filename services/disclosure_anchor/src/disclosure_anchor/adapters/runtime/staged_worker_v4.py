@@ -64,6 +64,7 @@ from disclosure_anchor.adapters.storage.provider_document_source import (
 )
 from disclosure_anchor.adapters.storage.v4_source_observation import BoundedV4SourcePdfObserver
 from disclosure_anchor.application.ports.parser import ParserIdentity, ParserOptions
+from disclosure_anchor.application.ports.staged_execution import StageObserverPort
 from disclosure_anchor.application.ports.staged_new_work_v4 import validate_v4_admission_scope
 from disclosure_anchor.application.contracts.staged_campaign_v4 import (
     V4CampaignAdmissionScope, require_v4_campaign_scope,
@@ -147,6 +148,7 @@ def build_staged_worker_v4_runtime(
     expected_capacity: MineruCapacityConfig | None = None,
     stream_control: StreamAdmissionControl | None = None,
     campaign_scope: V4CampaignAdmissionScope | None = None,
+    stage_observer: StageObserverPort | None = None,
 ) -> StagedWorkerV4Runtime:
     """Compose exactly one seven-lane runtime after explicit mode selection."""
 
@@ -356,6 +358,7 @@ def build_staged_worker_v4_runtime(
                 process_guard=ownership_guard,
                 admission_observer=None if recovery_only else new_work,
                 stream_control=stream_control,
+                stage_observer=stage_observer,
             ),
             remote=remote,
             owner_identity=exact_owner,
@@ -379,6 +382,7 @@ def build_staged_worker_v4_campaign_runtime(
     stream_control: StreamAdmissionControl,
     publication_committed: Callable[[bool], None] = lambda _replaced: None,
     owner_identity: str | None = None,
+    stage_observer: StageObserverPort | None = None,
 ) -> StagedWorkerV4Runtime:
     """Explicit finite campaign; missing authority never falls back to all work."""
     campaign_scope = require_v4_campaign_scope(campaign_scope)
@@ -390,6 +394,7 @@ def build_staged_worker_v4_campaign_runtime(
         progress=progress, publication_committed=publication_committed,
         owner_identity=owner_identity, expected_capacity=expected_capacity,
         stream_control=stream_control, campaign_scope=campaign_scope,
+        stage_observer=stage_observer,
     )
 
 

@@ -21,6 +21,7 @@ from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
 from disclosure_anchor.application.ports.atomic_publication_artifact_readiness_v4 import (
     AtomicPublicationArtifactReadinessV4Port,
 )
+from disclosure_anchor.application.ports.staged_execution import note_stage
 from disclosure_anchor.application.ports.staged_provider_parser import (
     MaterializedProviderDocumentV4,
     V4ClaimGuard,
@@ -66,13 +67,19 @@ class PrepareAndPublishWholeDocumentV4:
         stage_guard: V4StageGuard,
     ) -> AtomicPublicationWinnerV4:
         document_id = checkpoint.document_id
+        # Measurement identifiers only; tolerant so observation never changes
+        # which checkpoint attributes the business path requires.
+        identity = _note_identity(getattr(checkpoint, "processing_run_id", None),
+                                  getattr(checkpoint, "attempt_id", None))
         with exclusive_document_producer(self._uow_factory, document_id):
+            note_stage(stage_guard, "producer_lock_acquired", **identity)
             request = self._publication_requests.build_or_reopen(
                 checkpoint=checkpoint,
                 materialized=materialized,
                 stage_guard=stage_guard,
             )
             stage_guard.checkpoint()
+            note_stage(stage_guard, "request_ready", **identity)
             reference = self._readiness.prepare_or_replay(
                 request=request,
                 checkpoint=checkpoint,
@@ -85,6 +92,7 @@ class PrepareAndPublishWholeDocumentV4:
                 reference=reference,
                 expected_request=request,
             )
+            note_stage(stage_guard, "readiness_prepared", **identity)
             winner = self._commit_or_resolve(
                 request=request,
                 claim=claim,
@@ -98,6 +106,7 @@ class PrepareAndPublishWholeDocumentV4:
                 expected_request=request,
                 expected_winner=winner,
             )
+            note_stage(stage_guard, "readiness_verified", **identity)
             return winner
 
     def _commit_or_resolve(
@@ -110,28 +119,51 @@ class PrepareAndPublishWholeDocumentV4:
     ) -> AtomicPublicationWinnerV4:
         # Keep the retry bound literal and visible: the first P plus at most
         # one exact retry after a read-only lookup proves there is no winner.
+        request_identity = getattr(request, "identity", None)
+        identity = _note_identity(getattr(request_identity, "processing_run_id", None),
+                                  getattr(request_identity, "attempt_id", None))
         for attempt in range(2):
             # Preparation or the preceding response-loss lookup may outlive
             # this stage. Revocation forbids another write, not read-only
             # reconciliation of a write whose outcome is already unknown.
             stage_guard.checkpoint()
+            note_stage(stage_guard, "transaction_p_started", attempt=attempt + 1, **identity)
             try:
-                return self._publisher.commit_whole_document(
+                committed = self._publisher.commit_whole_document(
                     request,
                     claim=claim,
                     artifacts_ready=ready,
                     stage_guard=stage_guard,
                 )
             except AtomicPublicationCommitResponseLost:
+                # One P interval ends here; the read-only winner lookup is a
+                # separate observation, never a second end of the same P.
+                note_stage(stage_guard, "transaction_p_ended", attempt=attempt + 1, outcome="response_lost", **identity)
                 winner = self._publisher.reload_commit_winner(
                     processing_run_id=request.identity.processing_run_id,
                     attempt_id=request.identity.attempt_id,
                 )
+                note_stage(stage_guard, "winner_resolved", attempt=attempt + 1,
+                           found=1 if winner is not None else 0, **identity)
                 if winner is not None:
                     return winner
                 if attempt == 1:
                     raise
+            except BaseException as exc:
+                note_stage(stage_guard, "transaction_p_ended", attempt=attempt + 1,
+                           outcome="error:" + type(exc).__name__, **identity)
+                raise
+            else:
+                note_stage(stage_guard, "transaction_p_ended", attempt=attempt + 1, outcome="committed", **identity)
+                return committed
         raise AssertionError("bounded transaction-P recovery did not terminate")
+
+
+def _note_identity(run_id: object, attempt_id: object) -> dict[str, str | None]:
+    return {
+        "run_id": run_id if isinstance(run_id, str) else None,
+        "checkpoint_attempt_id": attempt_id if isinstance(attempt_id, str) else None,
+    }
 
 
 __all__ = ["PrepareAndPublishWholeDocumentV4"]

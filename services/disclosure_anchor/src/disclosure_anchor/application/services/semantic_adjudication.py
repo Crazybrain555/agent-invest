@@ -27,6 +27,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticRouteAdjudicatorError,
     SemanticRouteCacheError,
 )
+from disclosure_anchor.application.ports.staged_execution import note_stage, semantic_group_scope
 
 
 _AVAILABILITY_REASON_CODES = frozenset(
@@ -82,6 +83,27 @@ class OrderedSemanticAdjudicationExecutor:
         group_hash: str,
         stage_guard: SemanticExecutionGuard | None = None,
     ) -> SemanticAdjudicationOutcome:
+        # Measurement only: one group_started/group_ended pair around the
+        # real group boundary, whatever path the adjudication takes.
+        note_stage(stage_guard, "group_started", group_hash=group_hash, providers=len(self._providers))
+        try:
+            outcome = self._adjudicate(batch, group_hash=group_hash, stage_guard=stage_guard)
+        except BaseException as exc:
+            note_stage(stage_guard, "group_ended", group_hash=group_hash, outcome=_failure_outcome(exc))
+            raise
+        note_stage(stage_guard, "group_ended", group_hash=group_hash, outcome=(
+            "degraded_unavailable" if outcome.degraded_unavailable
+            else outcome.attempts[-1].outcome if outcome.attempts else "succeeded"
+        ))
+        return outcome
+
+    def _adjudicate(
+        self,
+        batch: SemanticAdjudicationBatch,
+        *,
+        group_hash: str,
+        stage_guard: SemanticExecutionGuard | None,
+    ) -> SemanticAdjudicationOutcome:
         attempts: list[SemanticProviderAttempt] = []
         for ordinal, configured in enumerate(self._providers, start=1):
             if stage_guard is not None:
@@ -112,6 +134,8 @@ class OrderedSemanticAdjudicationExecutor:
                         response_sha256=cached.response_sha256,
                     )
                     attempts.append(attempt)
+                    note_stage(stage_guard, "cache_hit", group_hash=group_hash, ordinal=ordinal,
+                               provider_id=identity.provider_id)
                     return _successful_outcome(
                         group_hash=group_hash,
                         attempts=attempts,
@@ -119,13 +143,24 @@ class OrderedSemanticAdjudicationExecutor:
                         identity=identity,
                         response_sha256=cached.response_sha256,
                     )
+                note_stage(stage_guard, "provider_call_started", group_hash=group_hash, ordinal=ordinal,
+                           provider_id=identity.provider_id)
+                call_outcome = "succeeded"
                 try:
-                    result = (
-                        configured.adapter.adjudicate_with_result(batch)
-                        if stage_guard is None
-                        else configured.adapter.adjudicate_with_result(batch, stage_guard=stage_guard)
-                    )
+                    with semantic_group_scope(group_hash):
+                        result = (
+                            configured.adapter.adjudicate_with_result(batch)
+                            if stage_guard is None
+                            else configured.adapter.adjudicate_with_result(batch, stage_guard=stage_guard)
+                        )
                 except SemanticRouteAdjudicatorError as exc:
+                    call_outcome = (
+                        "cancelled" if exc.reason_code == _CANCELLED_REASON_CODE
+                        else "availability_failed" if exc.reason_code in _AVAILABILITY_REASON_CODES
+                        else "failed_closed"
+                    )
+                    note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
+                               provider_id=identity.provider_id, outcome=call_outcome, reason_code=exc.reason_code)
                     if stage_guard is not None:
                         stage_guard.checkpoint()
                     if exc.reason_code == _CANCELLED_REASON_CODE:
@@ -167,6 +202,14 @@ class OrderedSemanticAdjudicationExecutor:
                         )
                     )
                     continue
+                except BaseException as exc:
+                    # Lease loss, cancellation or any unexpected error: the call
+                    # interval is closed for measurement, the exception is untouched.
+                    note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
+                               provider_id=identity.provider_id, outcome=_failure_outcome(exc))
+                    raise
+                note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
+                           provider_id=identity.provider_id, outcome=call_outcome)
                 entry = SemanticAdjudicationCacheEntry(
                     cache_key=cache_key,
                     group_hash=group_hash,
@@ -215,6 +258,16 @@ class OrderedSemanticAdjudicationExecutor:
             group_response_sha256=None,
             degraded_unavailable=True,
         )
+
+
+def _failure_outcome(exc: BaseException) -> str:
+    """Name a failed measurement interval without touching the exception."""
+
+    if isinstance(exc, SemanticRouteAdjudicatorError):
+        return "cancelled" if exc.reason_code == _CANCELLED_REASON_CODE else "failed_closed"
+    if type(exc).__name__ == "StageLeaseLost":
+        return "lease_lost"
+    return "error:" + type(exc).__name__
 
 
 @contextmanager

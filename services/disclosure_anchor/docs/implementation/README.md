@@ -23,6 +23,7 @@
 - `design/synchronized-capacity-telemetry.md`：250–500ms/1s 同步遥测、clock-domain、向量信用与 durable-page 进度契约；默认禁用。
 - `design/m6-owner-control.md`：M6 原生测量 owner、控制协议与资源退出边界。
 - `design/m6-service-batch.md`：有界多 PDF 自动供给、原身份恢复和 functional CLI；与正式 M6 计分分开。
+- `design/staged-observation.md`：挂在既有 stage guard 上的标量计时观测（源 build / 语义准备 / group / slot / 子进程 / transaction P），默认关闭，有界 JSONL sink 与 sticky 丢失计数；不计分。
 - `design/m6-readonly-qualification.md`：已提交发布的只读 13 项 whole-document qualification（V3 外层校验 + 嵌套 V2 replay、完整来源重建、sealed PreId 投影比较、公开收据绑定）与薄 CLI；不发 owner 事件、不计分。
 - `design/mineru-stream-admission.md`：显式容量、动态准入的压力/身份绑定与收尾；有限 campaign 与正式 M6 的验证边界。
 - `design/mineru-diagnostic-lifecycle.md`：单次 v2 diagnostic 执行、原身份恢复、独立质量证据与清理/ACK；不授予发布或 M6 吞吐验收资格。

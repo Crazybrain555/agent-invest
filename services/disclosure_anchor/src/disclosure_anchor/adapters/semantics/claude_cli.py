@@ -25,6 +25,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticProviderResult,
     SemanticRouteAdjudicatorError,
 )
+from disclosure_anchor.application.ports.staged_execution import current_semantic_group, note_stage
 
 
 _CLAUDE_AUTH_DIAGNOSTICS = (
@@ -165,11 +166,15 @@ class ClaudeCliSemanticAdjudicator:
     ) -> SemanticProviderResult:
         if stage_guard is not None:
             stage_guard.checkpoint()
+        group_hash = current_semantic_group()
+        provider_id = self._provider_identity.provider_id
+        note_stage(stage_guard, "slot_requested", group_hash=group_hash, provider_id=provider_id)
         while not self._slot.acquire(timeout=0.1):
             if stage_guard is not None:
                 stage_guard.checkpoint()
             if codex_cli._SEMANTIC_SHUTDOWN_REQUESTED.is_set():
                 raise _cancelled("before admission")
+        note_stage(stage_guard, "slot_acquired", group_hash=group_hash, provider_id=provider_id)
         try:
             if stage_guard is not None:
                 stage_guard.checkpoint()
@@ -181,6 +186,7 @@ class ClaudeCliSemanticAdjudicator:
             return result
         finally:
             self._slot.release()
+            note_stage(stage_guard, "slot_released", group_hash=group_hash, provider_id=provider_id)
 
     def _adjudicate_serial(
         self,

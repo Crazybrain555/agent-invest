@@ -29,6 +29,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticProviderResult,
     SemanticRouteAdjudicatorError,
 )
+from disclosure_anchor.application.ports.staged_execution import current_semantic_group, note_stage
 
 
 _ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
@@ -260,6 +261,9 @@ def _run_process(
         start_new_session=True,
     )
     _register_process(process)
+    group_hash = current_semantic_group()
+    note_stage(stage_guard, "process_started", group_hash=group_hash)
+    failure: str | None = None
     try:
         try:
             if stage_guard is None:
@@ -284,11 +288,18 @@ def _run_process(
                         # communicate retains buffered output and pending stdin.
                         # Resupplying input on a retry is invalid.
                         pending_input = None
-        except BaseException:  # stop and reap our child, then preserve the original failure
+        except BaseException as exc:  # stop and reap our child, then preserve the original failure
+            failure = (
+                "timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                else "cancelled" if isinstance(exc, _SemanticProcessCancelled)
+                else "error:" + type(exc).__name__
+            )
             _stop_process_group(process)
             raise
     finally:
         cancelled = _unregister_process(process)
+        note_stage(stage_guard, "process_ended", group_hash=group_hash, returncode=process.returncode,
+                   reason="cancelled" if cancelled else failure)
     if cancelled:
         raise _SemanticProcessCancelled
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
@@ -671,6 +682,9 @@ class CodexCliSemanticAdjudicator:
     ) -> SemanticProviderResult:
         if stage_guard is not None:
             stage_guard.checkpoint()
+        group_hash = current_semantic_group()
+        provider_id = self._provider_identity.provider_id
+        note_stage(stage_guard, "slot_requested", group_hash=group_hash, provider_id=provider_id)
         while not self._slot.acquire(timeout=0.1):
             if stage_guard is not None:
                 stage_guard.checkpoint()
@@ -680,6 +694,7 @@ class CodexCliSemanticAdjudicator:
                     reason_code="cancelled",
                     retryable=True,
                 )
+        note_stage(stage_guard, "slot_acquired", group_hash=group_hash, provider_id=provider_id)
         try:
             if stage_guard is not None:
                 stage_guard.checkpoint()
@@ -695,6 +710,7 @@ class CodexCliSemanticAdjudicator:
             return result
         finally:
             self._slot.release()
+            note_stage(stage_guard, "slot_released", group_hash=group_hash, provider_id=provider_id)
 
     def _adjudicate_serial(
         self,

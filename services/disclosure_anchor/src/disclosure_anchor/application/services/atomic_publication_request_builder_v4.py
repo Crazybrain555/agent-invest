@@ -44,6 +44,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     semantic_route_receipts_file_bytes_v3,
 )
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
+from disclosure_anchor.application.ports.staged_execution import note_stage
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Authority,
 )
@@ -149,6 +150,8 @@ class ProductionAtomicPublicationRequestBuilderV4:
                 "source admission drifted from materialized provider evidence"
             )
         stage_guard.checkpoint()
+        note_stage(stage_guard, "source_admitted", run_id=checkpoint.processing_run_id,
+                   checkpoint_attempt_id=checkpoint.attempt_id)
         base_build = build_provider_units(admitted)
         if (
             base_build.provider_document_sha256
@@ -158,6 +161,8 @@ class ProductionAtomicPublicationRequestBuilderV4:
             raise AtomicPublicationRequestBuilderV4Error(
                 "provider Unit build does not close over its admitted document"
             )
+        note_stage(stage_guard, "units_built", units=len(base_build.units))
+        note_stage(stage_guard, "route_started", units=len(base_build.units))
         routed = self._semantic_router.route(
             admitted=admitted,
             document=semantic_document_context(context.document),
@@ -165,6 +170,8 @@ class ProductionAtomicPublicationRequestBuilderV4:
             stage_guard=stage_guard,
         )
         stage_guard.checkpoint()
+        note_stage(stage_guard, "route_finished", units=len(routed.units),
+                   adjudication_groups=len(routed.adjudication_outcomes))
 
         units = tuple(
             self._unit(

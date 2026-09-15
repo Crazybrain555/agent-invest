@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import os
@@ -22,9 +23,13 @@ from disclosure_anchor.adapters.db.postgres.connection import (
 )
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import MinerUDeploymentChecker
 from disclosure_anchor.adapters.runtime.mineru_stream_worker import owned_mineru_stream_control
+from disclosure_anchor.adapters.runtime.stage_observation import JsonlStageObserver, ProgressRecorder
 from disclosure_anchor.adapters.runtime.staged_worker_v4 import build_staged_worker_v4_runtime
+from disclosure_anchor.application.ports.staged_execution import StageObserverPort
 from disclosure_anchor.application.ports.staged_new_work_v4 import validate_admission_document_ids
-from disclosure_anchor.application.services.staged_parse_coordinator import CoordinatorTerminal
+from disclosure_anchor.application.services.staged_parse_coordinator import (
+    CoordinatorSnapshot, CoordinatorTerminal,
+)
 from disclosure_anchor.application.worker.locks import WORKER_NS
 from disclosure_anchor.cli.worker import (
     _assert_staged_singleton, _assert_worker_admission, _create_worker_db_engine,
@@ -87,12 +92,36 @@ def _outcomes(
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class CommissionHooks:
+    """Optional measurement callbacks; ``None`` keeps the original behaviour.
+
+    ``publication_committed`` receives the existing idempotent pruning signal
+    only. ``extra_stop`` returning True closes new admission while accepted
+    work drains; it cannot cancel accepted work.
+    """
+
+    progress: Callable[[CoordinatorSnapshot], None] | None = None
+    publication_committed: Callable[[bool], None] | None = None
+    stage_observer: StageObserverPort | None = None
+    extra_stop: Callable[[], bool] | None = None
+
+
 def run_commissioning(
     settings: Settings, *, document_ids: tuple[str, ...], max_seconds: int,
     stop_requested: Callable[[], bool] = lambda: False,
+    hooks: CommissionHooks | None = None,
 ) -> dict[str, Any]:
     """Reuse production locks, deployment gate, recovery and all seven lanes."""
     validate_admission_document_ids(document_ids)
+    if hooks is not None and type(hooks) is not CommissionHooks:
+        raise ValueError("commissioning hooks must be the exact CommissionHooks record")
+    progress = (hooks.progress if hooks is not None and hooks.progress is not None
+                else (lambda _snapshot: None))
+    publication_committed = (hooks.publication_committed if hooks is not None
+                             and hooks.publication_committed is not None else (lambda _replaced: None))
+    extra_stop = hooks.extra_stop if hooks is not None and hooks.extra_stop is not None else (lambda: False)
+    stage_observer = None if hooks is None else hooks.stage_observer
     if document_ids is None or type(max_seconds) is not int or not 1 <= max_seconds <= 86400:
         raise ValueError("commissioning requires explicit document IDs and 1..86400 seconds")
     if settings.worker_parse_execution_mode != "staged-v4":
@@ -126,14 +155,18 @@ def run_commissioning(
                         settings=settings, engine=engine, ownership_guard=ownership_guard,
                         admission_guard=admission_guard,
                         process_scope_classes=_process_scope_classes(settings),
-                        admission_document_ids=document_ids, progress=lambda _snapshot: None,
+                        admission_document_ids=document_ids, progress=progress,
+                        publication_committed=publication_committed,
                         expected_capacity=checker.expected_capacity, stream_control=stream_control,
+                        stage_observer=stage_observer,
                     )
                     try:
                         runtime.verify_startup()
                         deadline = time.monotonic() + max_seconds
                         result = runtime.coordinator.run(
-                            stop_requested=lambda: stop_requested() or time.monotonic() >= deadline,
+                            stop_requested=lambda: (
+                                stop_requested() or time.monotonic() >= deadline or extra_stop()
+                            ),
                         )
                         after = _documents(engine, document_ids)
                         outcomes = _outcomes(document_ids, before, after)
@@ -186,6 +219,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--document-id", action="append", required=True)
     parser.add_argument("--max-seconds", type=int, required=True)
     parser.add_argument("--receipt-out", type=Path, required=True)
+    parser.add_argument("--observation-out", type=Path, default=None,
+                        help="new directory under runtime root for stage/progress observation (measurement only)")
+    parser.add_argument("--observation-max-events", type=int, default=65536)
+    parser.add_argument("--observation-max-bytes", type=int, default=64 * 1024 * 1024)
     args = parser.parse_args(argv)
     settings = load_settings()
     document_ids = tuple(args.document_id)
@@ -199,6 +236,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--receipt-out requires an existing canonical directory under runtime root")
     if receipt.exists() or receipt.is_symlink():
         parser.error("receipt already exists; retain the previous run evidence")
+    observation_dir: Path | None = None
+    if args.observation_out is not None:
+        observation_dir = args.observation_out.absolute()
+        if (observation_dir.parent.resolve(strict=True) != observation_dir.parent
+                or not observation_dir.is_relative_to(settings.disclosure_runtime_root.resolve())):
+            parser.error("--observation-out requires an existing canonical parent under runtime root")
+        if observation_dir.exists() or observation_dir.is_symlink():
+            parser.error("observation directory already exists; retain the previous evidence")
+        if not 1 <= args.observation_max_events <= 10_000_000 or not 4096 <= args.observation_max_bytes <= 2**31:
+            parser.error("observation bounds are out of range")
     _write_new(receipt.with_name(receipt.name + ".intent.json"), {
         "contract_version": "staged-v4-commissioning-intent.v1", "document_ids": document_ids,
         "max_seconds": args.max_seconds, "created_at": datetime.now(UTC).isoformat(),
@@ -210,13 +257,54 @@ def main(argv: list[str] | None = None) -> int:
         stopped = True
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
+    hooks: CommissionHooks | None = None
+    observer: JsonlStageObserver | None = None
+    progress_recorder: ProgressRecorder | None = None
     try:
+        if observation_dir is not None:
+            observation_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+            observer = JsonlStageObserver(observation_dir, max_events=args.observation_max_events,
+                                          max_bytes=args.observation_max_bytes)
+            try:
+                progress_recorder = ProgressRecorder(observation_dir)
+            except BaseException:
+                # Never leave the real writer thread behind when composition fails.
+                observer.close()
+                raise
+            held_observer, held_progress = observer, progress_recorder
+            hooks = CommissionHooks(
+                progress=held_progress.record, publication_committed=held_progress.prune_signal,
+                stage_observer=held_observer, extra_stop=lambda: held_observer.writer_failed,
+            )
         result = run_commissioning(settings, document_ids=document_ids, max_seconds=args.max_seconds,
-                                   stop_requested=lambda: stopped)
+                                   stop_requested=lambda: stopped, hooks=hooks)
         _write_new(receipt, result)
         print(json.dumps(result, sort_keys=True), flush=True)
         return 0 if result["result"] == "PASS" else 1
     finally:
+        # Each measurement resource closes in its own step; a measurement
+        # failure lands in the summary and never replaces the commissioning
+        # result, its exception, or the signal restoration below.
+        observation_summary: dict[str, Any] = {}
+        closure_errors: list[str] = []
+        if progress_recorder is not None:
+            try:
+                observation_summary.update(progress_recorder.close())
+            except BaseException as exc:  # noqa: BLE001 - recorded, never masks the business outcome
+                closure_errors.append("progress:" + type(exc).__name__)
+        if observer is not None and not observer.closed:
+            try:
+                observation_summary.update(observer.close())
+            except BaseException as exc:  # noqa: BLE001 - recorded, never masks the business outcome
+                closure_errors.append("observer:" + type(exc).__name__)
+        if observation_dir is not None:
+            observation_summary["closure_errors"] = closure_errors
+            if closure_errors:
+                observation_summary["measurement_status"] = "invalid"
+            try:
+                print(json.dumps({"observation": observation_summary}, sort_keys=True), flush=True)
+            except Exception:  # noqa: BLE001 - stdout loss cannot block signal restoration
+                pass
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 

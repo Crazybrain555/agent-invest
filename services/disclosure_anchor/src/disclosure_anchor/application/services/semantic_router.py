@@ -48,6 +48,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticRouteAdjudicatorError,
     SemanticRouteCachePort,
 )
+from disclosure_anchor.application.ports.staged_execution import note_stage
 from disclosure_anchor.application.services.provider_unit_builder import (
     ProviderUnitReplayContext,
 )
@@ -307,6 +308,8 @@ class SemanticRouter:
             )
             for draft in drafts
         )
+        # Measurement only: the semantic input preparation boundary.
+        note_stage(stage_guard, "semantic_inputs_prepared", units=len(inputs))
         receipts: dict[int, SemanticRouteReceipt] = {}
         outcomes: list[SemanticAdjudicationOutcome] = []
         model_inputs: list[SemanticRouteUnitInput] = []
@@ -329,6 +332,7 @@ class SemanticRouter:
                 receipts[unit_input.unit_index] = self._rule_abstain_receipt(unit_input)
                 continue
             model_inputs.append(unit_input)
+        note_stage(stage_guard, "semantic_groups_planned", model_units=len(model_inputs))
 
         for requested in _semantic_adjudication_groups(
             model_inputs,

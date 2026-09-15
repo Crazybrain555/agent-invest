@@ -1040,6 +1040,18 @@
    "private_imports": [],
    "tests": 10
   },
+  "tests/unit/test_stage_chain_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_stage_cli_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_stage_observation_independent.py": {
+   "private_imports": [],
+   "tests": 12
+  },
   "tests/unit/test_staged_admission_observation.py": {
    "private_imports": [],
    "tests": 5
