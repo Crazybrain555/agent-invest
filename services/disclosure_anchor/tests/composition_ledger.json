@@ -420,6 +420,14 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_m6_qualification_verifier.py": {
+   "private_imports": [],
+   "tests": 20
+  },
+  "tests/unit/test_m6_qualify_readonly.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_m6_run_accounting.py": {
    "private_imports": [],
    "tests": 27
@@ -843,6 +851,10 @@
   "tests/unit/test_provider_quality.py": {
    "private_imports": [],
    "tests": 10
+  },
+  "tests/unit/test_provider_replay_context_independent.py": {
+   "private_imports": [],
+   "tests": 12
   },
   "tests/unit/test_provider_secret_envelope_v4.py": {
    "private_imports": [],

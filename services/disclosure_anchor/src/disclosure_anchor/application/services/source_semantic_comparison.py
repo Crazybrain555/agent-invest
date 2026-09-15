@@ -13,7 +13,9 @@ from typing import Literal
 
 from disclosure_anchor.application.contracts.diagnostic_json import bounded_json_bytes
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
-from disclosure_anchor.application.contracts.provider_unit import ProviderUnitBuildResult
+from disclosure_anchor.application.contracts.provider_quality import ProviderQualityOccurrence
+from disclosure_anchor.application.contracts.provider_table_projection import UnboundProviderTablePart
+from disclosure_anchor.application.contracts.provider_unit import ProviderUnitDraft
 from disclosure_anchor.application.services.provider_quality import assess_source_build_quality
 from disclosure_anchor.application.services.provider_source_semantics import derive_source_semantics
 from disclosure_anchor.application.services.provider_unit_builder import (
@@ -172,22 +174,67 @@ def _compare_build(
     differences: _Differences, proposed: SourceSemanticBuildCandidate,
     expected: SourceSemanticBuildCandidate,
 ) -> None:
-    build, reference = proposed.build, expected.build
-    differences.compare("page_closure", "unit_pages", tuple((u.unit_index, u.page_no) for u in build.units), tuple((u.unit_index, u.page_no) for u in reference.units))
-    differences.compare("block_conservation", "block_ownership", _block_ownership(build), _block_ownership(reference))
-    differences.compare("table_segment_conservation", "segment_ownership", _segment_ownership(build), _segment_ownership(reference))
-    differences.compare("logical_table_conservation", "ordered_partitions", _table_partitions(build), _table_partitions(reference))
-    differences.compare("logical_table_conservation", "unassigned_parts", build.unassigned_table_parts, reference.unassigned_table_parts)
-    differences.compare("retrieval_target_binding", "ordered_bindings", tuple(u.locator.search_targets for u in build.units), tuple(u.locator.search_targets for u in reference.units))
-    differences.compare("repair_binding", "locator_repairs", tuple(u.locator.source_text_reconciliations for u in build.units), tuple(u.locator.source_text_reconciliations for u in reference.units))
-    differences.compare("finding_binding", "locator_findings", tuple(u.locator.source_quality_findings for u in build.units), tuple(u.locator.source_quality_findings for u in reference.units))
-    differences.compare("finding_binding", "quality_occurrences", proposed.quality_occurrences, expected.quality_occurrences)
-    differences.compare("finding_binding", "unit_quality", tuple(u.quality_status for u in build.units), tuple(u.quality_status for u in reference.units))
+    _compare_units(
+        differences, proposed.build.units, expected.build.units,
+        candidate_unassigned=proposed.build.unassigned_table_parts,
+        reference_unassigned=expected.build.unassigned_table_parts,
+        candidate_quality_occurrences=proposed.quality_occurrences,
+        reference_quality_occurrences=expected.quality_occurrences,
+    )
+
+
+def compare_build_conservation(
+    candidate_units: tuple[ProviderUnitDraft, ...],
+    reference_units: tuple[ProviderUnitDraft, ...],
+    *,
+    candidate_unassigned: tuple[UnboundProviderTablePart, ...] = (),
+    reference_unassigned: tuple[UnboundProviderTablePart, ...] = (),
+    candidate_quality_occurrences: tuple[ProviderQualityOccurrence, ...] | None = None,
+    reference_quality_occurrences: tuple[ProviderQualityOccurrence, ...] | None = None,
+) -> dict[str, list[dict[str, object]]]:
+    """Name every conservation difference between two complete draft sequences.
+
+    Pure data comparison with equality semantics on both sides; it grants no
+    runtime authority and never treats an empty side as a passing default. The
+    result maps each data check to its mismatch contexts (empty when equal);
+    ``source_identity`` is always empty here because the caller owns it.
+    """
+
+    differences = _Differences()
+    _compare_units(
+        differences, candidate_units, reference_units,
+        candidate_unassigned=candidate_unassigned, reference_unassigned=reference_unassigned,
+        candidate_quality_occurrences=candidate_quality_occurrences,
+        reference_quality_occurrences=reference_quality_occurrences,
+    )
+    return {name: list(items) for name, items in differences.items.items()}
+
+
+def _compare_units(
+    differences: _Differences,
+    units: tuple[ProviderUnitDraft, ...], reference_units: tuple[ProviderUnitDraft, ...],
+    *,
+    candidate_unassigned: tuple[UnboundProviderTablePart, ...],
+    reference_unassigned: tuple[UnboundProviderTablePart, ...],
+    candidate_quality_occurrences: tuple[ProviderQualityOccurrence, ...] | None,
+    reference_quality_occurrences: tuple[ProviderQualityOccurrence, ...] | None,
+) -> None:
+    differences.compare("page_closure", "unit_pages", tuple((u.unit_index, u.page_no) for u in units), tuple((u.unit_index, u.page_no) for u in reference_units))
+    differences.compare("block_conservation", "block_ownership", _block_ownership(units), _block_ownership(reference_units))
+    differences.compare("table_segment_conservation", "segment_ownership", _segment_ownership(units, candidate_unassigned), _segment_ownership(reference_units, reference_unassigned))
+    differences.compare("logical_table_conservation", "ordered_partitions", _table_partitions(units), _table_partitions(reference_units))
+    differences.compare("logical_table_conservation", "unassigned_parts", candidate_unassigned, reference_unassigned)
+    differences.compare("retrieval_target_binding", "ordered_bindings", tuple(u.locator.search_targets for u in units), tuple(u.locator.search_targets for u in reference_units))
+    differences.compare("repair_binding", "locator_repairs", tuple(u.locator.source_text_reconciliations for u in units), tuple(u.locator.source_text_reconciliations for u in reference_units))
+    differences.compare("finding_binding", "locator_findings", tuple(u.locator.source_quality_findings for u in units), tuple(u.locator.source_quality_findings for u in reference_units))
+    if candidate_quality_occurrences is not None or reference_quality_occurrences is not None:
+        differences.compare("finding_binding", "quality_occurrences", candidate_quality_occurrences, reference_quality_occurrences)
+    differences.compare("finding_binding", "unit_quality", tuple(u.quality_status for u in units), tuple(u.quality_status for u in reference_units))
     # Complete Unit equality also covers non-retrieval payload, routes, hashes,
     # artifact references and order; contiguous indices alone cannot prove this.
-    differences.compare("reading_order_contiguity", "complete_ordered_units", build.units, reference.units)
-    differences.compare("reading_order_contiguity", "ordered_unassigned_parts", build.unassigned_table_parts, reference.unassigned_table_parts)
-    differences.compare("heading_occurrence_closure", "occurrences_and_titles", tuple((u.title, u.heading_path, u.locator.heading_chain) for u in build.units), tuple((u.title, u.heading_path, u.locator.heading_chain) for u in reference.units))
+    differences.compare("reading_order_contiguity", "complete_ordered_units", units, reference_units)
+    differences.compare("reading_order_contiguity", "ordered_unassigned_parts", candidate_unassigned, reference_unassigned)
+    differences.compare("heading_occurrence_closure", "occurrences_and_titles", tuple((u.title, u.heading_path, u.locator.heading_chain) for u in units), tuple((u.title, u.heading_path, u.locator.heading_chain) for u in reference_units))
 
 
 def _compare_derivations(
@@ -211,9 +258,9 @@ def _compare_derivations(
         differences.compare("finding_binding", "fresh_candidate_findings", candidate.source_quality_findings, derived.source_quality_findings)
 
 
-def _block_ownership(build: ProviderUnitBuildResult) -> tuple[object, ...]:
+def _block_ownership(units: tuple[ProviderUnitDraft, ...]) -> tuple[object, ...]:
     owners: list[object] = []
-    for unit in build.units:
+    for unit in units:
         locator = unit.locator
         owned = {
             source for part in locator.parts for source in part.block_source_indices
@@ -229,22 +276,25 @@ def _block_ownership(build: ProviderUnitBuildResult) -> tuple[object, ...]:
     return tuple(owners)
 
 
-def _segment_ownership(build: ProviderUnitBuildResult) -> tuple[object, ...]:
+def _segment_ownership(
+    units: tuple[ProviderUnitDraft, ...],
+    unassigned: tuple[UnboundProviderTablePart, ...],
+) -> tuple[object, ...]:
     owners: list[object] = [
         (unit.unit_index, part.part_index, segment)
-        for unit in build.units for part in unit.locator.parts
+        for unit in units for part in unit.locator.parts
         for segment in part.physical_table_segment_indices
     ]
-    owners.extend(("unassigned", part.part.physical_segment_index) for part in build.unassigned_table_parts if part.part.physical_segment_index is not None)
+    owners.extend(("unassigned", part.part.physical_segment_index) for part in unassigned if part.part.physical_segment_index is not None)
     return tuple(owners)
 
 
-def _table_partitions(build: ProviderUnitBuildResult) -> tuple[object, ...]:
+def _table_partitions(units: tuple[ProviderUnitDraft, ...]) -> tuple[object, ...]:
     return tuple((
         unit.unit_index,
         tuple(part for part in unit.locator.parts if part.kind == "table"),
         unit.locator.unbound_table_parts,
-    ) for unit in build.units)
+    ) for unit in units)
 
 
 def _replay_failure(

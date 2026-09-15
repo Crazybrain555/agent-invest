@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import re
+from typing import final
 
 from disclosure_anchor.application.contracts.applicability_selector import (
     applicability_selector_pairs,
@@ -119,6 +120,67 @@ def _admitted_build_input(admitted: AdmittedProviderDocument) -> _ProviderBuildI
         admitted.source_text_reconciliations,
         admitted.source_quality_findings,
     )
+
+
+@final
+class ProviderUnitReplayContext:
+    """One call-scoped admitted view for repeated binding replays.
+
+    ``AdmittedProviderDocument.effective_provider_document`` rebuilds the
+    repaired view on every access, so replaying every binding of every Unit
+    through the public one-shot helpers rebuilds the whole document once per
+    binding. This handle builds that view exactly once, through the same
+    ``_admitted_build_input`` projection the public helpers use, and binds it
+    to the exact admitted object identity.
+
+    It is not an admission capability and not a cache: nothing is keyed by
+    path, hash or document, nothing outlives the route/replay invocation that
+    created it, and every binding replay still performs the original locator
+    hash, Unit membership, owner, source and destination checks.
+
+    The admitted identity and the view built from it are frozen together at
+    construction; neither can be rebound afterwards, so the identity a caller
+    checks is always the identity the stored view was built from.
+    """
+
+    __slots__ = ("_admitted", "_build_input")
+    _admitted: AdmittedProviderDocument
+    _build_input: _ProviderBuildInput
+
+    def __init__(self, admitted: AdmittedProviderDocument) -> None:
+        build_input = _admitted_build_input(admitted)
+        object.__setattr__(self, "_build_input", build_input)
+        object.__setattr__(self, "_admitted", admitted)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("provider replay context is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("provider replay context is immutable")
+
+    @property
+    def admitted(self) -> AdmittedProviderDocument:
+        return self._admitted
+
+    def replay_search_binding(
+        self,
+        draft: ProviderUnitDraft,
+        binding: ProviderUnitSearchBinding,
+    ) -> tuple[str, ...]:
+        """Replay one flat binding against the shared view; same checks."""
+
+        return _replay_provider_unit_search_binding(self._build_input, draft, binding)
+
+    def replay_search_binding_source_text(
+        self,
+        draft: ProviderUnitDraft,
+        binding: ProviderUnitSearchBinding,
+    ) -> str:
+        """Replay the immutable scalar against the shared view; same checks."""
+
+        return _replay_provider_unit_search_binding_source_text(
+            self._build_input, draft, binding
+        )
 
 
 def _source_build_input(
@@ -1273,6 +1335,7 @@ def _validate_build(
 
 
 __all__ = [
+    "ProviderUnitReplayContext",
     "build_provider_units",
     "build_source_provider_units",
     "replay_source_provider_unit_search_binding",

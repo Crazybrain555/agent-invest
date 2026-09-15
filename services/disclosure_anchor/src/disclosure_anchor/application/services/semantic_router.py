@@ -49,8 +49,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticRouteCachePort,
 )
 from disclosure_anchor.application.services.provider_unit_builder import (
-    replay_provider_unit_search_binding,
-    replay_provider_unit_search_binding_source_text,
+    ProviderUnitReplayContext,
 )
 from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
 from disclosure_anchor.domain import entities as e
@@ -297,8 +296,15 @@ class SemanticRouter:
 
         if stage_guard is not None:
             stage_guard.checkpoint()
+        # One admitted view for this route call only; it is dropped with the frame.
+        replay_context = ProviderUnitReplayContext(admitted)
         inputs = tuple(
-            self._prepare_input(admitted=admitted, document=document, draft=draft)
+            self._prepare_input(
+                admitted=admitted,
+                document=document,
+                draft=draft,
+                replay_context=replay_context,
+            )
             for draft in drafts
         )
         receipts: dict[int, SemanticRouteReceipt] = {}
@@ -549,11 +555,14 @@ class SemanticRouter:
 
         if len(drafts) != len(receipts):
             raise SemanticRouteContractError("semantic receipt count differs from Units")
+        # One admitted view for this replay call only; it is dropped with the frame.
+        replay_context = ProviderUnitReplayContext(admitted)
         inputs = tuple(
             self._prepare_input(
                 admitted=admitted,
                 document=document,
                 draft=draft,
+                replay_context=replay_context,
             )
             for draft in drafts
         )
@@ -626,8 +635,14 @@ class SemanticRouter:
         admitted: AdmittedProviderDocument,
         document: SemanticDocumentContext,
         draft: ProviderUnitDraft,
+        replay_context: ProviderUnitReplayContext | None = None,
     ) -> SemanticRouteUnitInput:
-        sources = _unit_sources(admitted=admitted, document=document, draft=draft)
+        sources = _unit_sources(
+            admitted=admitted,
+            document=document,
+            draft=draft,
+            replay_context=replay_context,
+        )
         section_keys = self._section_keys(
             document=document,
             draft=draft,
@@ -2511,7 +2526,16 @@ def _unit_sources(
     admitted: AdmittedProviderDocument,
     document: SemanticDocumentContext,
     draft: ProviderUnitDraft,
+    replay_context: ProviderUnitReplayContext | None = None,
 ) -> tuple[SemanticRouteSource, ...]:
+    # Callers that prepare many Units pass one context per route/replay call;
+    # a direct caller still gets one bounded view per Unit, never per binding.
+    if replay_context is None:
+        replay_context = ProviderUnitReplayContext(admitted)
+    elif type(replay_context) is not ProviderUnitReplayContext:
+        raise TypeError("semantic Unit sources require an exact provider replay context")
+    elif replay_context.admitted is not admitted:
+        raise ValueError("provider replay context belongs to another admitted object")
     sources: list[SemanticRouteSource] = []
     if draft.title and draft.title.strip():
         sources.append(
@@ -2563,7 +2587,7 @@ def _unit_sources(
             owned_source_indices=owned_source_indices,
         ):
             continue
-        values = replay_provider_unit_search_binding(admitted, draft, binding)
+        values = replay_context.replay_search_binding(draft, binding)
         part_kind = part_kind_by_source.get(binding.source.source_index)
         default_kind: SemanticRouteSourceKind = (
             "table_text" if part_kind == "table" else "body_text"
@@ -2576,11 +2600,7 @@ def _unit_sources(
             and binding.source.transform == "html_visible_text_segments.v1"
         ):
             structured = html_table_semantic_segments(
-                replay_provider_unit_search_binding_source_text(
-                    admitted,
-                    draft,
-                    binding,
-                )
+                replay_context.replay_search_binding_source_text(draft, binding)
             )
             if tuple(item.text for item in structured) == values:
                 value_kinds = [item.role for item in structured]
