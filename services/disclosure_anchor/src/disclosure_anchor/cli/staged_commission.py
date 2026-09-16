@@ -299,8 +299,20 @@ def main(argv: list[str] | None = None) -> int:
                 closure_errors.append("observer:" + type(exc).__name__)
         if observation_dir is not None:
             observation_summary["closure_errors"] = closure_errors
-            if closure_errors:
+            # One combined status: the worse of the observer and progress
+            # components; either component's own status stays visible.
+            observer_status = observation_summary.pop("measurement_status", None)
+            if observer_status is not None:
+                observation_summary["observer_status"] = observer_status
+            components = [observer_status, observation_summary.get("progress_status")]
+            if closure_errors or None in components or any(
+                status not in ("complete", "partial") for status in components
+            ):
                 observation_summary["measurement_status"] = "invalid"
+            elif "partial" in components:
+                observation_summary["measurement_status"] = "partial"
+            else:
+                observation_summary["measurement_status"] = "complete"
             try:
                 print(json.dumps({"observation": observation_summary}, sort_keys=True), flush=True)
             except Exception:  # noqa: BLE001 - stdout loss cannot block signal restoration

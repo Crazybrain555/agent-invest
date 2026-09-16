@@ -836,6 +836,10 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_progress_measurement_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
   "tests/unit/test_provider_document_admission.py": {
    "private_imports": [],
    "tests": 36

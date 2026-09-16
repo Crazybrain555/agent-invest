@@ -319,9 +319,16 @@ class ProgressRecorder:
                         name = type(exc).__name__
                         if name not in self._failure_types and len(self._failure_types) < _MAX_FAILURE_TYPES:
                             self._failure_types.append(name)
+            # A dropped snapshot is missing evidence, never a complete record.
+            if self._failed:
+                status = "invalid"
+            elif self._dropped:
+                status = "partial"
+            else:
+                status = "complete"
             return {"progress_lines": self._lines, "progress_dropped": self._dropped,
                     "progress_write_errors": self._write_errors,
-                    "progress_status": "invalid" if self._failed else "complete",
+                    "progress_status": status,
                     "progress_failure_types": list(self._failure_types)}
 
 
