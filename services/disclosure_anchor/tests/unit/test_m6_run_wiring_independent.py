@@ -13,7 +13,8 @@ from unittest import mock
 
 from disclosure_anchor.adapters.runtime.m6_e2e_assembly import M6LifecycleSpool
 from disclosure_anchor.adapters.runtime.m6_e2e_run import (
-    M6RunDirectory, M6RunnerClosureFailed, build_runner_closure_receipts, execute_runner_closure,
+    M6RunDirectory, M6RunnerClosureFailed, build_runner_closure_receipts, close_verifier_assembly,
+    execute_runner_closure,
 )
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig
 from disclosure_anchor.application.contracts.m6_campaign import M6CampaignScope
@@ -68,6 +69,38 @@ class RunWiringIndependentTests(unittest.TestCase):
                     with self.assertRaisesRegex(OSError, "disk failed"):
                         module._write_new(path.with_suffix(".unflushed"), payload)
 
+    def test_campaign_receipt_appears_whole_and_never_replaces_prior_result(self):
+        original_write, original_sync = os.write, os.fsync
+        value = {"receipt": "完整结果" * 100, "status": "complete"}
+        path = self.root / "campaign.json"
+        checked = []
+
+        def short_write(fd, data):
+            self.assertFalse(path.exists(), "the completion name must not expose partial bytes")
+            checked.append(len(data))
+            return original_write(fd, data[:13])
+
+        def durable_data(fd):
+            if not checked:
+                raise AssertionError("write did not reach exact-byte path")
+            return original_sync(fd)
+
+        with mock.patch.object(os, "write", side_effect=short_write), \
+                mock.patch.object(os, "fsync", side_effect=durable_data):
+            staged_campaign._write_new(path, value)
+        self.assertGreater(len(checked), 1)
+        import json
+        self.assertEqual(json.loads(path.read_bytes()), value)
+        before = path.read_bytes()
+        with self.assertRaises(FileExistsError):
+            staged_campaign._write_new(path, {"replacement": "forbidden"})
+        self.assertEqual(path.read_bytes(), before)
+        failed = self.root / "failed-campaign.json"
+        with mock.patch.object(os, "fsync", side_effect=OSError("receipt durability failed")):
+            with self.assertRaisesRegex(OSError, "receipt durability failed"):
+                staged_campaign._write_new(failed, value)
+        self.assertFalse(failed.exists(), "a failed data fsync must leave no completion signal")
+
     def test_campaign_rejects_cross_run_inputs_before_runtime_or_db(self):
         request = CampaignRunRequest(
             manifest=self.fixture.manifest, scope=M6CampaignScope.from_manifest(self.fixture.manifest), max_seconds=60,
@@ -100,7 +133,9 @@ class RunWiringIndependentTests(unittest.TestCase):
 
     def test_verifier_drain_hash_resolves_to_exact_persisted_receipt(self):
         out = self.root / "public"
+        out.mkdir()
         assembly = mock.Mock()
+        assembly.is_drain_role = True
         observed = []
 
         def finish(digest):
@@ -110,6 +145,42 @@ class RunWiringIndependentTests(unittest.TestCase):
             return {"status": "complete", "drain_receipt_sha256": digest}
 
         assembly.finish.side_effect = finish
+        result = close_verifier_assembly(
+            assembly, output_dir=out,
+            summary={"started_utc": "fixture-start", "finished_utc": "fixture-end", "attempts": []},
+            producer_kind="public_verifier", verifier_identity="independent", exit_code=1, drained=True,
+            write=m6_public_verify._write_new, terminal=True,
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(len(observed), 1)
+        digest, persisted_before_drain = observed[0]
+        self.assertIn(digest, {"sha256:" + hashlib.sha256(raw).hexdigest() for raw in persisted_before_drain},
+                      "verifier_drained must name a durable exact-byte receipt, not an unpersisted intermediate dict")
+
+    def test_receipt_failure_closes_verifier_without_claiming_drain(self):
+        assembly = mock.Mock()
+        assembly.is_drain_role = True
+        real_write = m6_public_verify._write_new
+
+        def write(path, payload):
+            if path.name == "drain-receipt.json":
+                raise OSError("drain disk failed")
+            return real_write(path, payload)
+
+        with self.assertRaisesRegex(OSError, "drain disk failed"):
+            close_verifier_assembly(
+                assembly, output_dir=self.root,
+                summary={"started_utc": "fixture-start", "finished_utc": "fixture-end", "attempts": []},
+                producer_kind="public_verifier", verifier_identity="independent", exit_code=0, drained=True,
+                write=write, terminal=True,
+            )
+        assembly.finish.assert_not_called()
+        assembly.abort.assert_called_once()
+
+    def test_public_cli_completes_evidence_without_premature_terminal_drain(self):
+        assembly = mock.Mock()
+        assembly.complete.return_value = {"status": "complete", "terminal_drain": False}
+        out = self.root / "preparatory"
         with (
             mock.patch.object(m6_public_verify, "load_settings", return_value=mock.Mock()),
             mock.patch.object(m6_public_verify, "FileStorePathBuilder"),
@@ -123,44 +194,13 @@ class RunWiringIndependentTests(unittest.TestCase):
             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()),
         ):
             result = m6_public_verify.main([
-                "--attempt-id", "attempt-a", "--output-dir", str(out), "--verifier-identity", "independent",
-                "--m6-run-dir", str(self.root),
+                "--attempt-id", "attempt-a", "--output-dir", str(out),
+                "--verifier-identity", "independent", "--m6-run-dir", str(self.root),
             ])
-        self.assertEqual(result, 1)
-        self.assertEqual(len(observed), 1)
-        digest, persisted_before_drain = observed[0]
-        self.assertIn(digest, {"sha256:" + hashlib.sha256(raw).hexdigest() for raw in persisted_before_drain},
-                      "verifier_drained must name a durable exact-byte receipt, not an unpersisted intermediate dict")
-
-    def test_receipt_failure_closes_verifier_without_claiming_drain(self):
-        assembly = mock.Mock()
-        real_write = m6_public_verify._write_new
-
-        def write(path, payload):
-            if path.name == "drain-receipt.json":
-                raise OSError("drain disk failed")
-            return real_write(path, payload)
-
-        with (
-            mock.patch.object(m6_public_verify, "load_settings", return_value=mock.Mock()),
-            mock.patch.object(m6_public_verify, "FileStorePathBuilder"),
-            mock.patch.object(m6_public_verify, "load_m6_run_directory", return_value=self.run_directory()),
-            mock.patch.object(m6_public_verify, "M6VerifierAssembly", return_value=assembly),
-            mock.patch.object(m6_public_verify, "diagnostic_continuous_clock"),
-            mock.patch.object(m6_public_verify, "app_database_url", return_value="fixture"),
-            mock.patch.object(m6_public_verify, "reader_database_url", return_value="fixture"),
-            mock.patch.object(m6_public_verify, "create_db_engine", return_value=mock.Mock()),
-            mock.patch.object(m6_public_verify, "read_private_qualification_facts", side_effect=RuntimeError("retained failure")),
-            mock.patch.object(m6_public_verify, "_write_new", side_effect=write),
-            redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()),
-        ):
-            with self.assertRaisesRegex(OSError, "drain disk failed"):
-                m6_public_verify.main([
-                    "--attempt-id", "attempt-a", "--output-dir", str(self.root / "public-failure"),
-                    "--verifier-identity", "independent", "--m6-run-dir", str(self.root),
-                ])
+        self.assertEqual(result, 1, "the per-attempt failure must remain visible")
+        assembly.complete.assert_called_once()
         assembly.finish.assert_not_called()
-        assembly.abort.assert_called_once()
+        self.assertFalse((out / "drain-receipt.json").exists())
 
     def closure(self, *, missing_final=False):
         spec = self.fixture.spec

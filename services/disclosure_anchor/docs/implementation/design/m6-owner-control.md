@@ -94,14 +94,28 @@ owner lease close new admission only, and after the drain deposits its
 resource audit, any unresolved claims and the admission reconciliation,
 acknowledges `admission_closed` and deposits the ownership closure
 (`application/contracts/m6_control_receipts.py`, native shapes and attempt-set
-digest). The quality and public verifiers append `document_qualified` and
-`public_confirmation` per attempt and `verifier_drained` once, each as its own
-producer role over the same spool; `verifier_drained` names the digest of an
+digest). The verifiers then run in dependency order: the public verifier
+appends `public_confirmation` per attempt and leaves one public consumer
+audit file per attempt; an exact hashed public-inputs manifest built from
+those files feeds the quality verifier, which appends `document_qualified`
+per attempt (the e2e plan requires `public_units_hash_match`, so quality
+cannot run before public). `verifier_drained` is sent once, only by the run's
+drain role (`public_verifier` in e2e, `quality_verifier` in service mode, as
+the reducer and the native owner both require), after every attempt's
+evidence; attempt evidence arriving after it is invalid. Each producer role
+uses its own spool; `verifier_drained` names the digest of an
 immutable `drain-receipt.json` written before the event, and the run summary
 is a separate later file. A verifier whose database setup fails before any
 attempt, whose attempt loop does not run to its end, or whose drain receipt
 cannot be written whole closes its sender with an explicit abort and no drain
-claim; the original failure stays the reported error. The
+claim; the original failure stays the reported error. The supervisor accepts only this run's campaign receipt (contract,
+campaign, manifest, scope, run, spec, anchor and runner incarnation all
+bound) and requires a readable, started runner spool once that receipt
+exists. Receipts are published atomically: the runner writes the complete
+bytes under a hidden sibling name, fsyncs, links them to the final name
+(never overwriting) and fsyncs the directory, so a present receipt name
+always carries complete bytes and a malformed one is a failure rather than
+something to wait out. The
 controller then closes the owner with the runner's ownership receipt. A failed
 step anywhere leaves that receipt or summary marked failed and the run
 evidence-incomplete; nothing is retried blindly or declared closed from a

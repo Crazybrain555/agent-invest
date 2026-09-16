@@ -9,6 +9,7 @@ Outputs are new files only. No owner event, credit, ACK or model call is made.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -101,6 +102,54 @@ def read_public_inputs(path: Path) -> dict[str, dict[str, Any]]:
     return receipts
 
 
+@dataclass(frozen=True, slots=True)
+class QualityAttemptResult:
+    """One attempt's qualification evidence, its owner event, and the optional plan verdict."""
+
+    admission: M6AttemptAdmitted
+    evidence: Any
+    qualified: M6DocumentQualified
+    qualification: Any | None
+    files: tuple[str, ...]
+
+
+def qualify_attempt(
+    *, engine: Any, paths: FileStorePathBuilder, source: Any, taxonomy: Any, batch_size: int, attempt_id: str,
+    attempt_dir: Path, verifier_identity: str, public_receipt_for: Any, plan: M6QualityPlan | None,
+    files: list[str] | None = None,
+) -> QualityAttemptResult:
+    """Read the private facts, run the whole-document qualification, and persist every receipt for the attempt.
+
+    Reused by the CLI loop and by the ongoing verifier supervisor so both
+    produce identical evidence files and the same owner event.
+    """
+    written = [] if files is None else files
+
+    def sink(name: str, payload: bytes) -> None:
+        attempt_dir.mkdir(mode=0o700, exist_ok=True)
+        _write_new(attempt_dir / f"{name}.json", payload)
+        written.append(f"{name}.json:{_sha256(payload)}")
+
+    facts = read_private_qualification_facts(engine, attempt_id=attempt_id)
+
+    def facts_for(admission: M6AttemptAdmitted) -> M6PrivateQualificationFacts:
+        if admission != facts.admission:
+            raise ValueError("private facts were read for another admission")
+        return facts
+
+    verifier = M6ReadonlyQualificationVerifier(
+        private_facts_for=facts_for, paths=paths, source=source, taxonomy=taxonomy, batch_size=batch_size,
+        receipt_sink=sink, verifier_identity=verifier_identity, public_receipt_for=public_receipt_for,
+    )
+    evidence = verifier.qualify(facts.admission)
+    qualified = M6DocumentQualified(attempt_id=attempt_id, qualification_evidence_sha256=evidence.canonical_sha256())
+    qualification = None
+    if plan is not None:
+        qualification = qualify_document(evidence, plan)
+        sink("qualification", qualification.canonical_bytes())
+    return QualityAttemptResult(facts.admission, evidence, qualified, qualification, tuple(written))
+
+
 def public_receipt_loader(
     receipts: dict[str, dict[str, Any]], base: Path,
 ) -> Any:
@@ -126,8 +175,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--public-receipts", type=Path, default=None,
                         help="JSON manifest binding attempt ids to independent public receipt files and expected hashes")
     parser.add_argument("--m6-run-dir", type=Path, default=None,
-                        help="controller-prepared M6 run directory; appends document_qualified per attempt and "
-                             "verifier_drained at the end as quality_verifier (spool under the output directory)")
+                        help="controller-prepared M6 run directory; appends document_qualified per attempt as "
+                             "quality_verifier and completes the sender; verifier_drained only in service mode, "
+                             "where quality is the run's drain role")
     parser.add_argument("--plan", type=Path, default=None,
                         help="optional e2e M6QualityPlan canonical bytes; adds qualification.json per attempt")
     return parser
@@ -183,39 +233,22 @@ def main(argv: list[str] | None = None) -> int:
             summary["attempts"].append(item)
             attempt_dir = args.output_dir / attempt_id
             written: list[str] = []
-
-            def sink(name: str, payload: bytes, *, target: Path = attempt_dir, names: list[str] = written) -> None:
-                target.mkdir(mode=0o700, exist_ok=True)
-                _write_new(target / f"{name}.json", payload)
-                names.append(f"{name}.json:{_sha256(payload)}")
-
             try:
-                facts = read_private_qualification_facts(engine, attempt_id=attempt_id)
-                item["admission"] = facts.admission.model_dump(mode="json")
-
-                def facts_for(admission: M6AttemptAdmitted, *, held: M6PrivateQualificationFacts = facts) -> M6PrivateQualificationFacts:
-                    if admission != held.admission:
-                        raise ValueError("private facts were read for another admission")
-                    return held
-
-                verifier = M6ReadonlyQualificationVerifier(
-                    private_facts_for=facts_for, paths=paths, source=source, taxonomy=taxonomy,
-                    batch_size=settings.disclosure_semantic_batch_size, receipt_sink=sink,
+                result = qualify_attempt(
+                    engine=engine, paths=paths, source=source, taxonomy=taxonomy,
+                    batch_size=settings.disclosure_semantic_batch_size, attempt_id=attempt_id, attempt_dir=attempt_dir,
                     verifier_identity=args.verifier_identity,
-                    public_receipt_for=public_receipt_loader(receipts, manifest_base),
+                    public_receipt_for=public_receipt_loader(receipts, manifest_base), plan=plan, files=written,
                 )
-                evidence = verifier.qualify(facts.admission)
+                item["admission"] = result.admission.model_dump(mode="json")
+                evidence = result.evidence
                 item.update(status="evidence", evidence_sha256=evidence.canonical_sha256(),
                             checks={check.check_id: check.outcome for check in evidence.observation.checks},
                             review_reasons=list(evidence.observation.review_reasons))
                 if assembly is not None:
-                    assembly.record(M6DocumentQualified(
-                        attempt_id=attempt_id, qualification_evidence_sha256=evidence.canonical_sha256(),
-                    ), attempt_id=attempt_id)
-                if plan is not None:
-                    qualification = qualify_document(evidence, plan)
-                    sink("qualification", qualification.canonical_bytes())
-                    item.update(verdict=qualification.verdict, reasons=list(qualification.reasons))
+                    assembly.record(result.qualified, attempt_id=attempt_id)
+                if result.qualification is not None:
+                    item.update(verdict=result.qualification.verdict, reasons=list(result.qualification.reasons))
             except M6QualificationUnavailable as exc:
                 item.update(status="unavailable", phase=exc.phase, reason_code=exc.reason_code, error=str(exc))
                 exit_code = max(exit_code, 2)
@@ -244,10 +277,13 @@ def main(argv: list[str] | None = None) -> int:
         summary["finished_utc"] = datetime.now(UTC).isoformat()
         try:
             if assembly is not None:
+                # The quality verifier is the drain role only in service mode; in
+                # e2e publication it completes its evidence and the public verifier
+                # drains once everything downstream is done.
                 exit_code = close_verifier_assembly(
                     assembly, output_dir=args.output_dir, summary=summary, producer_kind="quality_verifier",
                     verifier_identity=args.verifier_identity, exit_code=exit_code,
-                    drained=drained and propagating is None, write=_write_new,
+                    drained=drained and propagating is None, write=_write_new, terminal=assembly.is_drain_role,
                 )
         finally:
             failing = sys.exc_info()[1]

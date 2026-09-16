@@ -7,7 +7,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
-import os
 from pathlib import Path
 import signal
 import time
@@ -18,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import NullPool
 
+from disclosure_anchor.adapters.runtime.exact_file_write import publish_new_exact
 from disclosure_anchor.adapters.db.postgres.connection import (
     require_runtime_app_connection, require_runtime_app_engine,
 )
@@ -199,19 +199,16 @@ def run_commissioning(
 
 
 def _write_new(path: Path, value: dict[str, Any]) -> None:
+    """Publish a receipt so that its name appears only with its complete durable bytes; never overwrite.
+
+    Receipts are read by other processes (the M6 verifier supervisor waits for
+    the campaign receipt); a name that appears before its content is complete
+    would let them act on a partial file.
+    """
     payload = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
     if len(payload) > 1024 * 1024:
         raise ValueError("commissioning receipt exceeds its bound")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+    publish_new_exact(path, payload)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -265,7 +265,16 @@ def execute_runner_closure(client: M6OwnerClient, receipts: RunnerClosureReceipt
 
 
 class M6VerifierAssembly:
-    """One verifier role's spool and sender: record closed payloads, then drain and declare drained."""
+    """One verifier role's spool and sender: record closed payloads, complete delivery, and drain only as the drain role.
+
+    Evidence-sender completion and the terminal drain are distinct. Every
+    verifier role completes: all recorded events are delivered and the sender
+    closes. Only the run's drain role (`public_verifier` in e2e publication,
+    `quality_verifier` in service diagnostics, as the owner and the reducer
+    require) may additionally declare `verifier_drained`, and only after every
+    downstream verifier has completed, because attempt evidence after the drain
+    is invalid.
+    """
 
     def __init__(
         self, run: M6RunDirectory, *, role: Literal["public_verifier", "quality_verifier"], spool_dir: Path,
@@ -273,6 +282,7 @@ class M6VerifierAssembly:
     ) -> None:
         spec = run.require_spec()
         self._role = role
+        self._drain_role = drain_role_for_mode(spec.mode)
         self._spool = M6LifecycleSpool(
             spool_dir, run_id=spec.run_id, spec_sha256=spec.canonical_sha256(), producer_epoch_sha256=run.epoch(role),
             max_facts=max_events, producer_kind=role,
@@ -293,46 +303,86 @@ class M6VerifierAssembly:
     def failed(self) -> bool:
         return self._spool.failed or self._worker.failed
 
+    @property
+    def role(self) -> str:
+        return self._role
+
+    @property
+    def is_drain_role(self) -> bool:
+        return self._role == self._drain_role
+
+    def complete(self, *, deadline_seconds: float = 300.0) -> dict[str, Any]:
+        """Deliver every recorded event and close the sender; no drain is claimed."""
+        status = self._worker.close(deadline_seconds) if self._started else {"worker_error": "worker never started"}
+        spool_status = self._spool.close()
+        failed = bool(spool_status["failed"]) or status.get("worker_error") is not None
+        return {**self._identity(), "status": "failed" if failed else "complete", "terminal_drain": False,
+                "drain_receipt_sha256": None, "spool": spool_status, "worker_error": status.get("worker_error")}
+
     def abort(self, reason: str, *, deadline_seconds: float = 30.0) -> dict[str, Any]:
         """Close the sender without any drain claim; the reason stays visible in the spool and status."""
         self._spool.note_failure("verifier aborted before drain: " + reason[:300])
         status = self._worker.close(deadline_seconds) if self._started else {"worker_error": "worker never started"}
         spool_status = self._spool.close()
-        spec = self._run.require_spec()
-        return {
-            "status": "failed", "run_id": spec.run_id, "spec_sha256": spec.canonical_sha256(),
-            "anchor_sha256": self._run.anchor.canonical_sha256(), "producer_kind": self._role,
-            "producer_epoch_sha256": self._run.epoch(self._role), "run_directory_pins": self._run.pins,
-            "drain_receipt_sha256": None, "abort_reason": reason[:300], "spool": spool_status,
-            "worker_error": status.get("worker_error"),
-        }
+        return {**self._identity(), "status": "failed", "terminal_drain": False, "drain_receipt_sha256": None,
+                "abort_reason": reason[:300], "spool": spool_status, "worker_error": status.get("worker_error")}
 
     def finish(self, drain_receipt_sha256: str, *, deadline_seconds: float = 300.0) -> dict[str, Any]:
-        """Declare the drain after every recorded event is delivered; failure stays visible."""
+        """Declare the terminal drain after every recorded event is delivered; failure stays visible.
+
+        Only the run's drain role may call this, and only once every downstream
+        verifier has completed; the caller binds that completion into the drain
+        receipt. Another role asking to drain is a wiring error, refused before
+        anything is sent.
+        """
+        if not self.is_drain_role:
+            raise M6VerifierRoleError(
+                f"{self._role} is not the drain role of a {self._run.require_spec().mode} run ({self._drain_role} is)"
+            )
         if not self._spool.failed:
             self._spool.record_event(M6VerifierDrained(drain_receipt_sha256=drain_receipt_sha256), attempt_id=self._role)
         status = self._worker.close(deadline_seconds) if self._started else {"worker_error": "worker never started"}
         spool_status = self._spool.close()
         failed = bool(spool_status["failed"]) or status.get("worker_error") is not None
+        return {**self._identity(), "status": "failed" if failed else "complete", "terminal_drain": True,
+                "drain_receipt_sha256": drain_receipt_sha256, "spool": spool_status,
+                "worker_error": status.get("worker_error")}
+
+    def _identity(self) -> dict[str, Any]:
         spec = self._run.require_spec()
         return {
-            "status": "failed" if failed else "complete", "run_id": spec.run_id, "spec_sha256": spec.canonical_sha256(),
+            "run_id": spec.run_id, "spec_sha256": spec.canonical_sha256(),
             "anchor_sha256": self._run.anchor.canonical_sha256(), "producer_kind": self._role,
             "producer_epoch_sha256": self._run.epoch(self._role), "run_directory_pins": self._run.pins,
-            "drain_receipt_sha256": drain_receipt_sha256, "spool": spool_status, "worker_error": status.get("worker_error"),
         }
+
+
+class M6VerifierRoleError(ValueError):
+    """A verifier asked for a closing step its role or the run's mode does not allow."""
+
+
+def drain_role_for_mode(mode: str) -> Literal["public_verifier", "quality_verifier"]:
+    """The single role that may declare `verifier_drained`; mirrors the owner's PayloadRole and the reducer."""
+    if mode == "e2e_publication":
+        return "public_verifier"
+    if mode == "service_diagnostic":
+        return "quality_verifier"
+    raise ValueError("M6 run mode has no drain role")
 
 
 
 def close_verifier_assembly(
     assembly: M6VerifierAssembly, *, output_dir: Path, summary: dict[str, Any], producer_kind: str,
     verifier_identity: str, exit_code: int, drained: bool, write: Callable[[Path, bytes], None],
+    terminal: bool = False, downstream: dict[str, Any] | None = None,
 ) -> int:
     """Turn the attempt loop's outcome into exactly one closing observation.
 
-    A loop that ran to its end writes the immutable drain receipt first and only
-    then lets the sender claim ``verifier_drained`` with that file's digest. An
-    interrupted loop, or a receipt that could not be written whole, aborts the
+    A loop that ran to its end completes its evidence sender. Only when
+    ``terminal`` is requested, by the run's drain role and with every downstream
+    verifier's completion bound in ``downstream``, is the immutable drain receipt
+    written first and then ``verifier_drained`` claimed with that file's digest.
+    An interrupted loop, or a receipt that could not be written whole, aborts the
     sender instead, so no drain is ever claimed for evidence that does not
     exist. The original failure stays the reported error; a failing abort is
     recorded beside it rather than replacing it.
@@ -340,12 +390,17 @@ def close_verifier_assembly(
     if not drained:
         summary["m6_assembly"] = assembly.abort("verification did not run to its end")
         return max(exit_code, 1)
+    if not terminal:
+        summary["m6_assembly"] = assembly.complete()
+        return exit_code if summary["m6_assembly"]["status"] == "complete" else max(exit_code, 1)
+    if not assembly.is_drain_role:
+        raise M6VerifierRoleError(f"{assembly.role} cannot declare the terminal drain of this run")
     receipt_path = output_dir / "drain-receipt.json"
     raw = json.dumps({
         "contract_version": DRAIN_RECEIPT_CONTRACT, "producer_kind": producer_kind,
         "verifier_identity": verifier_identity, "started_utc": summary["started_utc"],
         "finished_utc": summary["finished_utc"], "attempts": summary["attempts"],
-        "exit_code_before_assembly": exit_code,
+        "exit_code_before_assembly": exit_code, "downstream": downstream,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     try:
         write(receipt_path, raw)
@@ -364,7 +419,7 @@ def close_verifier_assembly(
 
 
 __all__ = [
-    "DRAIN_RECEIPT_CONTRACT", "close_verifier_assembly",
+    "DRAIN_RECEIPT_CONTRACT", "M6VerifierRoleError", "close_verifier_assembly", "drain_role_for_mode",
     "M6RunDirectory", "M6RunRole", "M6RunnerClosureFailed", "M6VerifierAssembly", "RunnerClosureReceipts", "build_runner_closure_receipts",
     "execute_runner_closure", "load_m6_run_directory", "m6_owner_client_factory",
 ]

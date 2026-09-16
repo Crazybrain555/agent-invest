@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 def write_new_exact(path: Path, payload: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     try:
         view = memoryview(payload)
         stalls = 0
@@ -33,4 +33,29 @@ def write_new_exact(path: Path, payload: bytes) -> None:
         os.close(fd)
 
 
-__all__ = ["write_new_exact"]
+def publish_new_exact(path: Path, payload: bytes) -> None:
+    """Make ``path`` appear only once its complete bytes are durable; never overwrite.
+
+    A file created under its final name and then filled can be observed by a
+    concurrent reader with partial content. The bytes are written whole and
+    fsynced under a hidden sibling name first (``write_new_exact`` semantics:
+    loop until complete, refuse to spin without progress, fsync, size check),
+    then linked to the final name, which fails if that name already exists,
+    and the directory entry is fsynced. A reader therefore sees either no file
+    or the exact bytes. The sibling is removed afterwards; a leftover sibling
+    after a crash is visible and never mistaken for the published file.
+    """
+    partial = path.with_name(f".{path.name}.partial.{os.getpid()}")
+    write_new_exact(partial, payload)
+    try:
+        os.link(partial, path)
+    finally:
+        os.unlink(partial)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+__all__ = ["publish_new_exact", "write_new_exact"]
