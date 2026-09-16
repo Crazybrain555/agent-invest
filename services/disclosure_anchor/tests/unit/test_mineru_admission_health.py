@@ -194,7 +194,19 @@ class AdmissionCollectorTests(unittest.TestCase):
                 self.assertEqual(io.open_calls, [("http://127.0.0.1:8000/health", 10)])
                 self.assertEqual(io.read_sizes, [65537])
                 self.assertTrue(io.response_closed)
-                self.assertEqual(len(io.file_reads), 8)
+                self.assertCountEqual(io.file_reads, [
+                    "/usr/local/lib/python3.12/dist-packages/" + relative
+                    for relative in (
+                        "mineru/cli/api_request.py", "mineru/cli/fast_api.py",
+                        "mineru/backend/vlm/vlm_analyze.py",
+                        "mineru/backend/hybrid/hybrid_analyze.py",
+                        "mineru/utils/model_utils.py",
+                        "mineru_vl_utils/post_process/__init__.py",
+                        "mineru_vl_utils/post_process/cross_page_table.py",
+                        "mineru_vl_utils/vlm_client/http_client.py",
+                        "mineru/cli/agent_task_protocol_v2.py",
+                    )
+                ])
         # Candidate qualification uses its new collector. Old deployment reads
         # retain the old pinned collector; this is not an observer fallback.
         io = CollectorIO(wire_health(legacy=True))

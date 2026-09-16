@@ -23,10 +23,11 @@ from tests.unit.test_capacity_host_observer import COLLECTOR, NODE, _payload as 
 
 
 class CpuThreadManifestTest(unittest.TestCase):
-    def test_default_and_explicit_one_preserve_pinned_original_v9_complete_bytes(self):
-        # Compatibility snapshot from the preserved pre-change builder, with
-        # deterministic borrowed client/code identities. Not a v10 oracle.
-        expected = 'ce62abcd157e24697fc8ad6fd2c11c8c2f715292bbadf7e345c675fe8b2d418e'
+    def test_default_and_explicit_one_preserve_pinned_v9_complete_bytes(self):
+        # S6 adds one independently observed module to compatibility evidence.
+        # Only that evidence hash and outer identity changed; CPU policy and
+        # every other v9 field retain the pre-S6 shape. Not a v10 oracle.
+        expected = '2d346fe5d3d90c10ca454434deba26179c83464265c05af83ec57baa292ea698'
         default = build()
         explicit = build(expected_api_cpu_threads=1)
         self.assertEqual(canonical(default), canonical(explicit))

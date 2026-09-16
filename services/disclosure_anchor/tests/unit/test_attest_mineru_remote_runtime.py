@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 from pathlib import Path
 import re
 import tempfile
@@ -46,6 +47,17 @@ PATCHER_DIGEST = "sha256:" + "8" * 64
 DOCKERFILE_DIGEST = "sha256:" + "9" * 64
 TASK_PROTOCOL_DIGEST = "sha256:" + "b" * 64
 API_IMAGE_ID = "sha256:" + "a" * 64
+# Observation inputs are independent of the attester's expected-key registry.
+# The S6 deployment added post_process/__init__.py; deriving both sides from
+# the same registry previously concealed the missing deployed-source check.
+OBSERVED_COMPAT_PATHS = (
+    "mineru/cli/api_request.py", "mineru/cli/fast_api.py",
+    "mineru/backend/vlm/vlm_analyze.py", "mineru/backend/hybrid/hybrid_analyze.py",
+    "mineru/utils/model_utils.py",
+    "mineru_vl_utils/post_process/cross_page_table.py", "mineru_vl_utils/vlm_client/http_client.py",
+    "mineru_vl_utils/post_process/__init__.py",
+)
+S6_PREIMAGE = "sha256:c1c426dfd5786d196a94854f8453b6deb800efd14c3749a8996ce201b29c9ad2"
 
 
 def _observation() -> dict[str, Any]:
@@ -127,12 +139,13 @@ def _observation() -> dict[str, Any]:
                 "mineru_vl_utils_version": "1.0.5",
                 "base_image_digest": EXPECTED_IMAGE_ID,
                 "patcher_sha256": PATCHER_DIGEST,
-                "preimage_sha256": EXPECTED_COMPAT_PREIMAGES,
+                "preimage_sha256": {**EXPECTED_COMPAT_PREIMAGES,
+                                    "mineru_vl_utils/post_process/__init__.py": S6_PREIMAGE},
                 "patched_source_sha256": {
                     path: "sha256:" + character * 64
                     for path, character in zip(
-                        EXPECTED_COMPAT_PREIMAGES,
-                        ("a", "b", "c", "d", "e", "f", "1"),
+                        OBSERVED_COMPAT_PATHS,
+                        ("a", "b", "c", "d", "e", "f", "1", "2"),
                         strict=True,
                     )
                 },
@@ -141,8 +154,8 @@ def _observation() -> dict[str, Any]:
             "actual_source_sha256": {
                 path: "sha256:" + character * 64
                 for path, character in zip(
-                    EXPECTED_COMPAT_PREIMAGES,
-                    ("a", "b", "c", "d", "e", "f", "1"),
+                    OBSERVED_COMPAT_PATHS,
+                    ("a", "b", "c", "d", "e", "f", "1", "2"),
                     strict=True,
                 )
             },
@@ -271,6 +284,47 @@ def _observation() -> dict[str, Any]:
 
 
 class AttestMinerURemoteRuntimeTests(unittest.TestCase):
+    def test_table_image_source_requires_observation_and_exact_marker_agreement(self) -> None:
+        target = "mineru_vl_utils/post_process/__init__.py"
+        collector = (Path(__file__).resolve().parents[2] / "scripts/windows/collect_mineru_runtime.ps1").read_text()
+        probe = re.search(r"paths = \((.*?)\n\)", collector, flags=re.DOTALL)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertIn('"' + target + '"', probe.group(1), "the deployed collector must actually read the S6 source")
+
+        def build(observation):
+            with (
+                patch("scripts.attest_mineru_remote_runtime.client_bundle_identity", return_value=CLIENT),
+                patch("scripts.attest_mineru_remote_runtime.writer_code_digest", return_value=CODE_DIGEST),
+            ):
+                return build_manifest(
+                    observation, mineru_bin=Path("/private/mineru"),
+                    ssh_host_key_sha256="sha256:" + "6" * 64, api_url="http://127.0.0.1:30002",
+                    observability_url="http://127.0.0.1:30001/v1",
+                    inference_upstream_url="http://mineru-openai-server:30000/v1",
+                    expected_compose_sha256="sha256:" + "3" * 64,
+                    expected_collector_sha256="sha256:" + "7" * 64,
+                    expected_compat_patcher_sha256=PATCHER_DIGEST,
+                    expected_compat_dockerfile_sha256=DOCKERFILE_DIGEST,
+                    expected_task_protocol_v2_sha256=TASK_PROTOCOL_DIGEST,
+                )
+
+        build(_observation())
+        for defect in ("missing-observation", "wrong-bytes", "missing-both", "wrong-upstream"):
+            observation = copy.deepcopy(_observation())
+            compat = observation["api_compatibility"]
+            if defect in ("missing-observation", "missing-both"):
+                del compat["actual_source_sha256"][target]
+            if defect == "missing-both":
+                del compat["marker"]["patched_source_sha256"][target]
+                del compat["marker"]["preimage_sha256"][target]
+            if defect == "wrong-bytes":
+                compat["actual_source_sha256"][target] = "sha256:" + "0" * 64
+            if defect == "wrong-upstream":
+                compat["marker"]["preimage_sha256"][target] = "sha256:" + "0" * 64
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                build(observation)
+
     def test_collector_exact_contract_feeds_attester_without_field_drift(self) -> None:
         collector = (
             Path(__file__).resolve().parents[2]

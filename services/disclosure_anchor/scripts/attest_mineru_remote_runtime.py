@@ -92,6 +92,9 @@ EXPECTED_COMPAT_PREIMAGES = {
     "mineru/utils/model_utils.py": (
         "sha256:7662656c5c406ab704065b8a3a6e662b662b0bb877b76b08c7d8a8a7eaf9c109"
     ),
+    "mineru_vl_utils/post_process/__init__.py": (
+        "sha256:c1c426dfd5786d196a94854f8453b6deb800efd14c3749a8996ce201b29c9ad2"
+    ),
     "mineru_vl_utils/post_process/cross_page_table.py": (
         "sha256:97581c69b92ae80df2a11f3dc986f329b26edca5af57e6052929aeadefab898f"
     ),

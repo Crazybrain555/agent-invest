@@ -712,6 +712,7 @@ paths = (
     "mineru/backend/hybrid/hybrid_analyze.py",
     "mineru/cli/fast_api.py",
     "mineru/utils/model_utils.py",
+    "mineru_vl_utils/post_process/__init__.py",
     "mineru_vl_utils/post_process/cross_page_table.py",
     "mineru_vl_utils/vlm_client/http_client.py",
 )

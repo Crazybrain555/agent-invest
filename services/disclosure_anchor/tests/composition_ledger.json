@@ -179,7 +179,7 @@
   },
   "tests/unit/test_attest_mineru_remote_runtime.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_audit_live_unit_replay.py": {
    "private_imports": [],
