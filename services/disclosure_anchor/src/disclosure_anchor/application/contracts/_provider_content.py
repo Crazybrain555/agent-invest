@@ -24,6 +24,7 @@ from disclosure_anchor.application.contracts.provider_document import (
     ProviderPage,
     ProviderPayload,
     ProviderPhysicalTableSegment,
+    ProviderTableImageUnmatched,
 )
 
 
@@ -102,7 +103,7 @@ def validate_provider_content(
 
 
 def provider_document_to_payload(document: ProviderDocument) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "artifacts": [
             {
                 "media_type": artifact.media_type,
@@ -131,6 +132,26 @@ def provider_document_to_payload(document: ProviderDocument) -> dict[str, object
             for segment in document.physical_table_segments
         ],
         "source_pdf_sha256": document.source_pdf_sha256,
+    }
+    if document.table_image_unmatched:
+        # Present only with evidence, so documents without it keep their bytes.
+        payload["table_image_unmatched"] = [
+            _table_image_unmatched_payload(item) for item in document.table_image_unmatched
+        ]
+    return payload
+
+
+def _table_image_unmatched_payload(item: ProviderTableImageUnmatched) -> dict[str, object]:
+    return {
+        "actual": item.actual,
+        "expected": item.expected,
+        "image_byte_count": item.image_byte_count,
+        "image_sha256": item.image_sha256,
+        "kind": item.kind,
+        "model_block_index": item.model_block_index,
+        "page_index": item.page_index,
+        "table_bbox": list(item.table_bbox),
+        "token": item.token,
     }
 
 
@@ -193,7 +214,17 @@ def provider_document_from_payload(value: object) -> ProviderDocument:
             "physical_table_segments",
             "source_pdf_sha256",
         },
+        optional={"table_image_unmatched"},
         label="provider document",
+    )
+    raw_table_images = payload.get("table_image_unmatched")
+    if raw_table_images is not None and not raw_table_images:
+        raise ProviderDocumentEnvelopeError(
+            "provider document table image evidence must be omitted when empty"
+        )
+    table_image_unmatched = () if raw_table_images is None else tuple(
+        _table_image_unmatched_from_payload(item)
+        for item in _sequence(raw_table_images, "table_image_unmatched")
     )
     artifacts = tuple(
         _artifact_from_payload(item)
@@ -218,7 +249,39 @@ def provider_document_from_payload(value: object) -> ProviderDocument:
         physical_table_segments=segments,
         artifacts=artifacts,
         bundle_sha256=_text(payload["bundle_sha256"], "bundle_sha256"),
+        table_image_unmatched=table_image_unmatched,
     )
+
+
+def _table_image_unmatched_from_payload(value: object) -> ProviderTableImageUnmatched:
+    payload = _exact_mapping(
+        value,
+        keys={
+            "actual", "expected", "image_byte_count", "image_sha256", "kind",
+            "model_block_index", "page_index", "table_bbox", "token",
+        },
+        label="provider table image evidence",
+    )
+    bbox = _sequence(payload["table_bbox"], "table_bbox")
+    if len(bbox) != 4:
+        raise ProviderDocumentEnvelopeError("table_bbox must have four values")
+    try:
+        return ProviderTableImageUnmatched(
+            page_index=_integer(payload["page_index"], "page_index"),
+            model_block_index=_integer(payload["model_block_index"], "model_block_index"),
+            table_bbox=(
+                _number(bbox[0], "table_bbox[0]"), _number(bbox[1], "table_bbox[1]"),
+                _number(bbox[2], "table_bbox[2]"), _number(bbox[3], "table_bbox[3]"),
+            ),
+            kind=_text(payload["kind"], "kind"),
+            token=_text(payload["token"], "token"),
+            expected=_integer(payload["expected"], "expected"),
+            actual=_integer(payload["actual"], "actual"),
+            image_sha256=_text(payload["image_sha256"], "image_sha256"),
+            image_byte_count=_integer(payload["image_byte_count"], "image_byte_count"),
+        )
+    except ValueError as exc:
+        raise ProviderDocumentEnvelopeError(f"provider table image evidence is invalid: {exc}") from exc
 
 
 def _artifact_from_payload(value: object) -> ProviderArtifact:
@@ -488,9 +551,11 @@ def _exact_mapping(
     *,
     keys: set[str],
     label: str,
+    optional: set[str] | None = None,
 ) -> Mapping[str, object]:
     payload = _exact_object(value, label)
-    if set(payload) != keys:
+    present = set(payload)
+    if not keys <= present <= keys | (optional or set()):
         raise ProviderDocumentEnvelopeError(f"{label} fields are not closed")
     return payload
 

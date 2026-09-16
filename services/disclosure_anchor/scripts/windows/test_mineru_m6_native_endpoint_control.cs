@@ -1070,4 +1070,150 @@ public static class MineruM6ControlTests {
             MineruM6NativeSuite.Equal("failed", rig.State(), "bound exhaustion is an incident");
         }
     }
+    // R19 independent deposit tests. Inputs and expected receipt bytes are
+    // constructed by this test; production is compiled in a separate assembly.
+    static string DQ(string value) { return MineruM6NativeSuite.JsonQuote(value); }
+    static string DepositRequest(MineruM6ControlRig rig, string kind, string raw, string sha) {
+        string command = "{\"kind\":\"deposit\",\"receipt_kind\":" + DQ(kind) +
+            ",\"receipt_sha256\":" + DQ(sha ?? MineruM6NativeSuite.Sha(raw)) +
+            ",\"receipt_utf8\":" + DQ(raw) + "}";
+        // Build test input independently so an intentionally oversized wire
+        // request reaches the production decoder, not the fixture's bounded Object().
+        return "{\"command\":" + command + ",\"contract_version\":\"m6.owner-request.v1\",\"request_id\":" +
+            DQ("deposit-" + Guid.NewGuid().ToString("N")) + ",\"run_id\":" + DQ(rig.RunId) +
+            ",\"spec_sha256\":" + DQ(rig.SpecSha) + "}";
+    }
+    static string AuditReceipt(MineruM6ControlRig rig, string padding) {
+        return "{\"contract_version\":\"m6.resource-audit.v1\",\"padding\":" + DQ(padding) +
+            ",\"run_id\":" + DQ(rig.RunId) + ",\"spec_sha256\":" + DQ(rig.SpecSha) + "}";
+    }
+    static string NewDepositStore() {
+        string path = Path.Combine(MineruM6NativeSuite.NewTempDir("deposit"), "private");
+        MineruM6PrivateStore.CreatePrivateDirectory(path);
+        return path;
+    }
+    static MineruM6ControlRig FreshDepositRig() {
+        MineruM6JournalRig journal = new MineruM6JournalRig(MineruM6NativeSuite.NewTempDir("deposit-journal"), false, 16384, 1000, 1000000);
+        long t0 = MineruResidentWire.Parse(MineruM6NativeSuite.FS("service", "anchor"), 65536).Get("t0_ticks").Integer();
+        // Adopt a genuinely empty journal; Fresh() already constructed a control
+        // and must not be rebuilt with the same process incarnation.
+        return new MineruM6ControlRig(journal, t0);
+    }
+    static void BuildDepositor(MineruM6ControlRig rig, MineruM6PrivateStore store, Action<string, byte[]> write) {
+        rig.Control = new MineruM6RunControl(rig.AnchorRaw, rig.SpecSha,
+            MineruM6NativeSuite.FS("identities", "owner_epoch"), "service_diagnostic", rig.Roles, rig.Journal.Journal,
+            delegate { return rig.Clock; }, MineruM6ControlRig.MaxLease, MineruM6ControlRig.Reserve,
+            delegate(string sha) { return store.ReadReceipt(sha); },
+            delegate(string name, string raw) { rig.Controls[name] = raw; },
+            delegate(string name) { string raw; return rig.Controls.TryGetValue(name, out raw) ? raw : null; },
+            delegate { rig.ClosureAsserts++; }, write ?? new Action<string, byte[]>(store.WriteImmutable));
+    }
+    static void DepositMustReject(MineruM6ControlRig rig, string request, string role, string message) {
+        try {
+            MineruJsonValue result = rig.Handle(request, role);
+            MineruM6NativeSuite.Equal("rejected", result.Get("outcome").String(), message);
+        } catch (FormatException) { /* wire refusal is also a rejection, never a successful deposit */ }
+        catch (MineruM6ControlRefusal) { /* authenticated binding refusal before reply */ }
+    }
+
+    public static void Test15_DepositPersistsExactBytesAndEnablesAckAndClose() {
+        string path = NewDepositStore(), retained = null, retainedSha = null;
+        using (MineruM6ControlRig rig = FreshDepositRig())
+        using (MineruM6PrivateStore store = new MineruM6PrivateStore(path, false, 16, 262144)) {
+            BuildDepositor(rig, store, null);
+            rig.Ok(rig.Bind(), "controller"); rig.Ok(rig.Simple("open"), "controller");
+            rig.Ok(rig.Append(rig.Producer("service_runner", rig.RunnerEpoch, 1, rig.Admitted("deposit-attempt"))), "service_runner");
+            rig.Ok(rig.Append(rig.Producer("service_runner", rig.RunnerEpoch, 2, rig.Final("deposit-attempt"))), "service_runner");
+            rig.Ok(rig.Simple("stop"), "service_runner");
+            string[] attempts = new string[] { "deposit-attempt" };
+            string reconSha = rig.ReconciliationReceipt(2, attempts, 0, null);
+            string recon = rig.Receipts[reconSha]; rig.Receipts.Clear();
+            rig.Ok(DepositRequest(rig, "admission_reconciliation", recon, null), "service_runner");
+            int remaining = store.RemainingArtifactCount; long bytes = store.RemainingArtifactBytes;
+            rig.Ok(DepositRequest(rig, "admission_reconciliation", recon, null), "service_runner");
+            MineruM6NativeSuite.Equal(remaining, store.RemainingArtifactCount, "same bytes with a new nonce consume no extra artifact");
+            MineruM6NativeSuite.Equal(bytes, store.RemainingArtifactBytes, "same bytes consume no extra budget");
+            MineruM6NativeSuite.Equal(recon, store.ReadReceipt(reconSha), "actual immutable-store readback");
+            rig.Ok(rig.Ack(2, 1, 0, reconSha), "service_runner");
+            rig.Ok(rig.Append(rig.Producer("quality_verifier", rig.VerifierEpoch, 1, rig.Drained())), "quality_verifier");
+            string audit = AuditReceipt(rig, "actual-store");
+            string auditSha = MineruM6NativeSuite.Sha(audit);
+            rig.Ok(DepositRequest(rig, "resource_audit", audit, null), "quality_verifier");
+            string setSha = MineruM6ControlRig.AttemptSet(attempts);
+            retained = "{\"admitted_attempt_count\":1,\"admitted_attempt_set_sha256\":" + DQ(setSha) +
+                ",\"children_exited\":true,\"contract_version\":\"m6.ownership-closure.v1\",\"final_attempt_count\":1," +
+                "\"final_attempt_set_sha256\":" + DQ(setSha) + ",\"residual_count\":0,\"resource_audit_sha256\":" + DQ(auditSha) +
+                ",\"run_id\":" + DQ(rig.RunId) + ",\"runner_epoch_sha256\":" + DQ(rig.RunnerEpoch) +
+                ",\"spec_sha256\":" + DQ(rig.SpecSha) + "}";
+            retainedSha = MineruM6NativeSuite.Sha(retained);
+            rig.Ok(DepositRequest(rig, "ownership_closure", retained, null), "service_runner");
+            rig.Ok(rig.Close(retainedSha, 0, true, "stop_requested"), "controller");
+            MineruM6NativeSuite.Equal("closed", rig.State(), "deposited dependencies enable close");
+            MineruM6NativeSuite.Equal(1, rig.ClosureAsserts, "native ownership assertion ran");
+            MineruM6NativeSuite.Equal(13, store.RemainingArtifactCount, "only three distinct receipts were stored");
+            DepositMustReject(rig, DepositRequest(rig, "resource_audit", AuditReceipt(rig, "late"), null), "service_runner", "new deposit after close");
+        }
+        using (MineruM6PrivateStore reopened = new MineruM6PrivateStore(path, true, 16, 262144)) {
+            MineruM6NativeSuite.Equal(retained, reopened.ReadReceipt(retainedSha), "durable exact receipt survives reopening");
+        }
+    }
+
+    public static void Test16_DepositRejectsIdentityRoleHashAndNoncanonicalBytes() {
+        using (MineruM6ControlRig rig = FreshDepositRig())
+        using (MineruM6PrivateStore store = new MineruM6PrivateStore(NewDepositStore(), false, 16, 262144)) {
+            BuildDepositor(rig, store, null);
+            string good = AuditReceipt(rig, "m");
+            DepositMustReject(rig, DepositRequest(rig, "resource_audit", good, null), "controller", "controller cannot deposit");
+            DepositMustReject(rig, DepositRequest(rig, "resource_audit", good, MineruM6NativeSuite.LabelHash("wrong")), "service_runner", "wrong hash");
+            DepositMustReject(rig, DepositRequest(rig, "resource_audit", good.Replace(rig.RunId, "other-run"), null), "service_runner", "inner run differs");
+            DepositMustReject(rig, DepositRequest(rig, "resource_audit", good.Replace(rig.SpecSha, MineruM6NativeSuite.LabelHash("other-spec")), null), "service_runner", "inner spec differs");
+            DepositMustReject(rig, DepositRequest(rig, "unresolved_claims", good, null), "service_runner", "kind/version differs");
+            string reconSha = rig.ReconciliationReceipt(0, new string[0], 0, null);
+            string badEpoch = rig.Receipts[reconSha].Replace(rig.RunnerEpoch, MineruM6NativeSuite.LabelHash("other-runner"));
+            DepositMustReject(rig, DepositRequest(rig, "admission_reconciliation", badEpoch, null), "service_runner", "runner epoch differs");
+            string reordered = "{\"padding\":\"m\",\"contract_version\":\"m6.resource-audit.v1\",\"run_id\":" + DQ(rig.RunId) + ",\"spec_sha256\":" + DQ(rig.SpecSha) + "}";
+            foreach (string bad in new string[] { " " + good, reordered, good.Replace("\"m\"", "\"\\u006d\""),
+                    good.Replace("\"padding\":", "\"padding\":\"duplicate\",\"padding\":"),
+                    good.Replace("\"padding\":\"m\"", "\"padding\":-0"),
+                    good.Replace("\"padding\":\"m\"", "\"padding\":[{\"value\":1.5}]") })
+                DepositMustReject(rig, DepositRequest(rig, "resource_audit", bad, null), "service_runner", "noncanonical inner bytes must not be stored");
+            MineruM6NativeSuite.Equal(16, store.RemainingArtifactCount, "every refused request leaves no receipt artifact");
+        }
+    }
+
+    public static void Test17_DepositBoundsCountUtf8AndEntireEscapedEnvelope() {
+        using (MineruM6ControlRig rig = FreshDepositRig())
+        using (MineruM6PrivateStore store = new MineruM6PrivateStore(NewDepositStore(), false, 16, 262144)) {
+            BuildDepositor(rig, store, null);
+            string empty = AuditReceipt(rig, "");
+            int baseBytes = MineruM6NativeSuite.Utf8.GetByteCount(empty);
+            string exact = AuditReceipt(rig, "汉" + new string('x', 49152 - baseBytes - 3));
+            MineruM6NativeSuite.Equal(49152, MineruM6NativeSuite.Utf8.GetByteCount(exact), "fixture exactly 48 KiB in UTF8");
+            rig.Ok(DepositRequest(rig, "resource_audit", exact, null), "service_runner");
+            string over = AuditReceipt(rig, "汉" + new string('x', 49152 - baseBytes - 2));
+            DepositMustReject(rig, DepositRequest(rig, "resource_audit", over, null), "service_runner", "one byte over inner bound");
+            string escaped = AuditReceipt(rig, new string('"', 20000));
+            MineruM6NativeSuite.Check(MineruM6NativeSuite.Utf8.GetByteCount(escaped) < 49152, "escaped receipt below inner bound");
+            string request = DepositRequest(rig, "resource_audit", escaped, null);
+            MineruM6NativeSuite.Check(MineruM6NativeSuite.Utf8.GetByteCount(request) > 65536, "outer escaping exceeds 64 KiB");
+            DepositMustReject(rig, request, "service_runner", "entire request bound survives escaping");
+            MineruM6NativeSuite.Equal(15, store.RemainingArtifactCount, "only exact-bound receipt persisted");
+        }
+    }
+
+    public static void Test18_DepositBudgetAndIoFailureCannotAcknowledgeSuccess() {
+        using (MineruM6ControlRig rig = FreshDepositRig())
+        using (MineruM6PrivateStore store = new MineruM6PrivateStore(NewDepositStore(), false, 8, 65536)) {
+            bool failWrite = false;
+            BuildDepositor(rig, store, delegate(string name, byte[] bytes) {
+                if (failWrite) throw new IOException("independent injected disk failure");
+                store.WriteImmutable(name, bytes);
+            });
+            for (int i = 0; i < 2; i++) rig.Ok(DepositRequest(rig, "resource_audit", AuditReceipt(rig, i + new string('x', 30000)), null), "service_runner");
+            DepositMustReject(rig, DepositRequest(rig, "resource_audit", AuditReceipt(rig, new string('y', 30000)), null), "service_runner", "storage byte budget exhausted");
+            MineruM6NativeSuite.Equal(6, store.RemainingArtifactCount, "budget refusal leaves count intact");
+            failWrite = true;
+            MineruM6NativeSuite.Throws<IOException>(delegate { rig.Handle(DepositRequest(rig, "resource_audit", AuditReceipt(rig, "fault"), null), "service_runner"); }, "unrecoverable storage error stays visible");
+        }
+    }
 }

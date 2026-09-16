@@ -20,6 +20,9 @@ import traceback
 from typing import Any
 
 from disclosure_anchor.adapters.db.postgres.connection import app_database_url, create_db_engine
+from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
+from disclosure_anchor.adapters.runtime.m6_continuous_clock import diagnostic_continuous_clock
+from disclosure_anchor.adapters.runtime.m6_e2e_run import M6VerifierAssembly, close_verifier_assembly, load_m6_run_directory
 from disclosure_anchor.adapters.parsers.pdf_text_observation import observe_pdf_text_rectangles
 from disclosure_anchor.adapters.runtime.m6_qualification_verifier import (
     M6PrivateQualificationFacts, M6PublicReceiptInput, M6QualificationUnavailable,
@@ -31,7 +34,7 @@ from pydantic import TypeAdapter
 
 from disclosure_anchor.application.contracts.m6_common import M6Id
 from disclosure_anchor.application.contracts.m6_document_qualification import M6QualityPlan, qualify_document
-from disclosure_anchor.application.contracts.m6_run_events import M6AttemptAdmitted
+from disclosure_anchor.application.contracts.m6_run_events import M6AttemptAdmitted, M6DocumentQualified
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.services.semantic_taxonomy import load_semantic_route_taxonomy
 from disclosure_anchor.settings import load_settings
@@ -65,15 +68,7 @@ def _read_bounded(path: Path, *, maximum: int) -> bytes:
 
 
 def _write_new(path: Path, payload: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
-    try:
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    write_new_exact(path, payload)
 
 
 def require_attempt_path_component(attempt_id: str) -> str:
@@ -130,6 +125,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verifier-identity", required=True)
     parser.add_argument("--public-receipts", type=Path, default=None,
                         help="JSON manifest binding attempt ids to independent public receipt files and expected hashes")
+    parser.add_argument("--m6-run-dir", type=Path, default=None,
+                        help="controller-prepared M6 run directory; appends document_qualified per attempt and "
+                             "verifier_drained at the end as quality_verifier (spool under the output directory)")
     parser.add_argument("--plan", type=Path, default=None,
                         help="optional e2e M6QualityPlan canonical bytes; adds qualification.json per attempt")
     return parser
@@ -159,8 +157,26 @@ def main(argv: list[str] | None = None) -> int:
     paths = FileStorePathBuilder(settings)
     source = ProviderDocumentFileSource(paths, text_reader=observe_pdf_text_rectangles)
     taxonomy = load_semantic_route_taxonomy()
-    engine = create_db_engine(app_database_url(settings))
+    assembly: M6VerifierAssembly | None = None
+    if args.m6_run_dir is not None:
+        run = load_m6_run_directory(args.m6_run_dir.absolute())
+        assembly = M6VerifierAssembly(
+            run, role="quality_verifier", spool_dir=args.output_dir / "m6-assembly",
+            max_events=len(args.attempt_ids) + 2, continuous_ns=diagnostic_continuous_clock().now_ns,
+        )
+        summary["m6_run"] = {"run_id": run.require_spec().run_id, "spec_sha256": run.require_spec().canonical_sha256(),
+                             "pins": run.pins}
+        assembly.start()
+    try:
+        engine = create_db_engine(app_database_url(settings))
+    except BaseException as exc:
+        # Nothing was verified: close the sender visibly without a drain claim.
+        if assembly is not None:
+            summary["m6_assembly"] = assembly.abort("engine unavailable: " + f"{type(exc).__name__}:{exc}"[:200])
+            _write_summary(args.output_dir, summary)
+        raise
     exit_code = 0
+    drained = False
     try:
         for attempt_id in args.attempt_ids:
             item: dict[str, Any] = {"attempt_id": attempt_id, "status": "error"}
@@ -192,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
                 item.update(status="evidence", evidence_sha256=evidence.canonical_sha256(),
                             checks={check.check_id: check.outcome for check in evidence.observation.checks},
                             review_reasons=list(evidence.observation.review_reasons))
+                if assembly is not None:
+                    assembly.record(M6DocumentQualified(
+                        attempt_id=attempt_id, qualification_evidence_sha256=evidence.canonical_sha256(),
+                    ), attempt_id=attempt_id)
                 if plan is not None:
                     qualification = qualify_document(evidence, plan)
                     sink("qualification", qualification.canonical_bytes())
@@ -209,14 +229,47 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 item["files"] = written
                 print(json.dumps(item, ensure_ascii=False, sort_keys=True), flush=True)
+        drained = True
     finally:
-        engine.dispose()
+        # An exception leaving the loop (interrupt or unexpected) means the
+        # verification did not run to its end: the sender is aborted, never
+        # drained. Engine disposal cannot skip that closure, and a failing
+        # summary write never replaces the failure being reported.
+        propagating = sys.exc_info()[1]
+        dispose_error: Exception | None = None
+        try:
+            engine.dispose()
+        except Exception as exc:  # noqa: BLE001 - reported after the sender is closed
+            dispose_error = exc
         summary["finished_utc"] = datetime.now(UTC).isoformat()
-        summary["exit_code"] = exit_code
-        _write_new(args.output_dir / "run-summary.json",
-                   json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
-        print(f"Summary: {args.output_dir / 'run-summary.json'}", file=sys.stderr, flush=True)
+        try:
+            if assembly is not None:
+                exit_code = close_verifier_assembly(
+                    assembly, output_dir=args.output_dir, summary=summary, producer_kind="quality_verifier",
+                    verifier_identity=args.verifier_identity, exit_code=exit_code,
+                    drained=drained and propagating is None, write=_write_new,
+                )
+        finally:
+            failing = sys.exc_info()[1]
+            summary["exit_code"] = exit_code
+            try:
+                _write_summary(args.output_dir, summary)
+            except Exception as exc:  # noqa: BLE001 - a failure already being reported is never replaced
+                if failing is None:
+                    raise
+                print(f"run summary not written: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        if dispose_error is not None:
+            if propagating is not None:
+                print(f"engine dispose failed: {type(dispose_error).__name__}: {dispose_error}", file=sys.stderr, flush=True)
+            else:
+                raise dispose_error
     return exit_code
+
+
+def _write_summary(output_dir: Path, summary: dict[str, Any]) -> None:
+    _write_new(output_dir / "run-summary.json",
+               json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"))
+    print(f"Summary: {output_dir / 'run-summary.json'}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,40 @@ public sealed class MineruJsonValue {
     }
     public int Count { get { if(items==null) throw new FormatException("JSON array required"); return items.Count; } }
     public MineruJsonValue Item(int index) { if(items==null) throw new FormatException("JSON array required"); return items[index]; }
+    // Python parity: json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=False)
+    // over the parsed tree. Keys sort by code point, strings re-escape exactly as
+    // Quote does, and only integer number tokens are reproducible without a
+    // float repr contract, so any other number is not canonical here.
+    public string Canonical() {
+        if(text!=null) return MineruResidentWire.Quote(text);
+        if(members!=null) {
+            List<string> names=new List<string>(members.Keys);
+            names.Sort(CompareCodePoints);
+            StringBuilder result=new StringBuilder("{"); bool first=true;
+            foreach(string name in names) {
+                if(!first) result.Append(','); first=false;
+                result.Append(MineruResidentWire.Quote(name)).Append(':').Append(members[name].Canonical());
+            }
+            return result.Append('}').ToString();
+        }
+        if(items!=null) {
+            StringBuilder result=new StringBuilder("["); bool first=true;
+            foreach(MineruJsonValue item in items) { if(!first) result.Append(','); first=false; result.Append(item.Canonical()); }
+            return result.Append(']').ToString();
+        }
+        // Python parses -0 as 0 and re-emits 0, so a literal -0 is never canonical.
+        if(Raw=="true" || Raw=="false" || Raw=="null" || Regex.IsMatch(Raw,@"\A(?:0|-?[1-9][0-9]*)\z")) return Raw;
+        throw new FormatException("canonical JSON requires integer numbers");
+    }
+    static int CompareCodePoints(string left,string right) {
+        int i=0,j=0;
+        while(i<left.Length && j<right.Length) {
+            int a=char.ConvertToUtf32(left,i),b=char.ConvertToUtf32(right,j);
+            if(a!=b) return a<b?-1:1;
+            i+=char.IsSurrogatePair(left,i)?2:1; j+=char.IsSurrogatePair(right,j)?2:1;
+        }
+        return (left.Length-i).CompareTo(right.Length-j);
+    }
     public void Keys(params string[] expected) {
         if(members==null || members.Count!=expected.Length) throw new FormatException("JSON object shape differs");
         Dictionary<string,bool> seen=new Dictionary<string,bool>(StringComparer.Ordinal);

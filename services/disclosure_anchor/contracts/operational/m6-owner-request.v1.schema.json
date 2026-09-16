@@ -371,6 +371,47 @@
       "title": "M6CloseOwner",
       "type": "object"
     },
+    "M6DepositReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "deposit",
+          "default": "deposit",
+          "title": "Kind",
+          "type": "string"
+        },
+        "receipt_kind": {
+          "enum": [
+            "admission_reconciliation",
+            "ownership_closure",
+            "resource_audit",
+            "unresolved_claims"
+          ],
+          "title": "Receipt Kind",
+          "type": "string"
+        },
+        "receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Receipt Sha256",
+          "type": "string"
+        },
+        "receipt_utf8": {
+          "maxLength": 49152,
+          "minLength": 2,
+          "title": "Receipt Utf8",
+          "type": "string"
+        }
+      },
+      "required": [
+        "receipt_kind",
+        "receipt_sha256",
+        "receipt_utf8"
+      ],
+      "title": "M6DepositReceipt",
+      "type": "object"
+    },
     "M6DocumentQualified": {
       "additionalProperties": false,
       "properties": {
@@ -1026,6 +1067,7 @@
           "append": "#/$defs/M6AppendObservation",
           "bind": "#/$defs/M6BindOwner",
           "close": "#/$defs/M6CloseOwner",
+          "deposit": "#/$defs/M6DepositReceipt",
           "lease": "#/$defs/M6OwnerControl",
           "open": "#/$defs/M6OwnerControl",
           "status": "#/$defs/M6OwnerControl",
@@ -1048,6 +1090,9 @@
         },
         {
           "$ref": "#/$defs/M6CloseOwner"
+        },
+        {
+          "$ref": "#/$defs/M6DepositReceipt"
         }
       ],
       "title": "Command"

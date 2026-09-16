@@ -6,6 +6,8 @@ using System.Text.RegularExpressions;
 
 public static class MineruM6OwnerWire {
     public const int MaximumWireBytes = 65536;
+    // A complete deposit request (envelope + receipt) must stay within MaximumWireBytes.
+    public const int MaximumDepositReceiptBytes = 49152;
     static string Q(string text) { return MineruResidentWire.Quote(text); }
     static int ScalarLength(string text) {
         int count=0;
@@ -37,6 +39,11 @@ public static class MineruM6OwnerWire {
                 throw new FormatException("M6 identifier bound");
             foreach(char c in text) if(c<32 || c==127 || (type=="id" && c==32))
                 throw new FormatException("M6 identifier control character");
+        } else if(type=="text") {
+            // Bounded UTF-8 payload carried inside the wire; canonical single-line JSON, no control characters.
+            int bytes=System.Text.Encoding.UTF8.GetByteCount(text);
+            if(bytes<2 || bytes>MaximumDepositReceiptBytes) throw new FormatException("M6 text payload bound");
+            foreach(char c in text) if(c<32 || c==127) throw new FormatException("M6 text payload control character");
         } else if(type.StartsWith("=")) {
             if(Array.IndexOf(type.Substring(1).Split('|'),text)<0) throw new FormatException("M6 closed vocabulary");
         } else throw new InvalidOperationException("unknown M6 wire type");
@@ -123,6 +130,9 @@ public static class MineruM6OwnerWire {
                 "reconciliation_receipt_sha256:hash");
             case "close": return Shape(value,"kind:=close","ownership_receipt_sha256:hash","residual_count:n",
                 "children_exited:bool","reason:=deadline_drained|stop_requested|failed");
+            case "deposit": return Shape(value,"kind:=deposit",
+                "receipt_kind:=admission_reconciliation|ownership_closure|resource_audit|unresolved_claims",
+                "receipt_sha256:hash","receipt_utf8:text");
             default: throw new FormatException("unknown M6 owner action");
         }
     }

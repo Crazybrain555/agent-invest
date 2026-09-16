@@ -189,6 +189,13 @@ class RemoteParseV4Repository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
+    def read_durable_publish_ledger_seq(self, processing_run_id: str) -> int:
+        _identity(processing_run_id, "processing run")
+        base = self._session.get(models.DurablePublishBase, processing_run_id)
+        if base is None:
+            raise V4HeadNotFound("durable publish base is absent for this run")
+        return int(base.ledger_seq)
+
     def read_publication_snapshot(self, attempt_id: str) -> PublicationSnapshotV4:
         """Reuse canonical decoders in one read-only repeatable snapshot.
 

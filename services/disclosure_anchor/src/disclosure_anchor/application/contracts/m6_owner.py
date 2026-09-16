@@ -7,6 +7,8 @@ models; the transport authenticates the caller, not an arbitrary claimed role.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
@@ -14,6 +16,7 @@ from pydantic import Field, model_validator
 from disclosure_anchor.application.contracts.m6_common import (
     M6ClosedModel, M6Hash, M6Id, M6NonnegativeInt, M6PositiveInt,
 )
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.contracts.m6_run import M6ClockDomain, M6ResourceEnvelope, M6RunSpec
 from disclosure_anchor.application.contracts.m6_run_events import M6ProducerEvent, M6RunEvent
 
@@ -86,8 +89,60 @@ class M6CloseOwner(M6ClosedModel):
     reason: Literal["deadline_drained", "stop_requested", "failed"]
 
 
+# The owner reads these control receipts by hash at admission_closed/close.
+# Deposit is the only authenticated way to place them in its private store.
+M6DepositReceiptKind = Literal[
+    "admission_reconciliation", "ownership_closure", "resource_audit", "unresolved_claims",
+]
+M6_DEPOSIT_RECEIPT_CONTRACTS: dict[str, str] = {
+    "admission_reconciliation": "m6.admission-reconciliation.v1",
+    "ownership_closure": "m6.ownership-closure.v1",
+    "resource_audit": "m6.resource-audit.v1",
+    "unresolved_claims": "m6.unresolved-claims.v1",
+}
+# Complete wire request stays inside MaximumWireBytes=65536 with its envelope.
+M6_DEPOSIT_RECEIPT_MAX_BYTES = 49152
+
+
+def _carries_float(value: object) -> bool:
+    if type(value) is float:
+        return True
+    if type(value) is dict:
+        return any(_carries_float(item) for item in value.values())
+    if type(value) is list:
+        return any(_carries_float(item) for item in value)
+    return False
+
+
+class M6DepositReceipt(M6ClosedModel):
+    kind: Literal["deposit"] = "deposit"
+    receipt_kind: M6DepositReceiptKind
+    receipt_sha256: M6Hash
+    receipt_utf8: Annotated[str, Field(min_length=2, max_length=M6_DEPOSIT_RECEIPT_MAX_BYTES)]
+
+    @model_validator(mode="after")
+    def canonical_receipt(self) -> Self:
+        raw = self.receipt_utf8.encode("utf-8")
+        if len(raw) > M6_DEPOSIT_RECEIPT_MAX_BYTES or any(byte < 32 or byte == 127 for byte in raw):
+            raise ValueError("deposit receipt exceeds its byte bound or contains control characters")
+        if "sha256:" + hashlib.sha256(raw).hexdigest() != self.receipt_sha256:
+            raise ValueError("deposit receipt hash differs from its bytes")
+        decoded = strict_json_loads(self.receipt_utf8)
+        if type(decoded) is not dict:
+            raise ValueError("deposit receipt must be a JSON object")
+        if _carries_float(decoded):
+            # The native owner reproduces canonical integers, not float repr.
+            raise ValueError("deposit receipt must not carry non-integer numbers")
+        canonical = json.dumps(decoded, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if canonical != self.receipt_utf8:
+            raise ValueError("deposit receipt must be canonical JSON")
+        if decoded.get("contract_version") != M6_DEPOSIT_RECEIPT_CONTRACTS[self.receipt_kind]:
+            raise ValueError("deposit receipt contract differs from its declared kind")
+        return self
+
+
 M6OwnerCommand = Annotated[
-    M6BindOwner | M6OwnerControl | M6AppendObservation | M6AdmissionClosedAck | M6CloseOwner,
+    M6BindOwner | M6OwnerControl | M6AppendObservation | M6AdmissionClosedAck | M6CloseOwner | M6DepositReceipt,
     Field(discriminator="kind"),
 ]
 
@@ -105,6 +160,11 @@ class M6OwnerRequest(M6ClosedModel):
             self.command.event.run_id != self.run_id or self.command.event.spec_sha256 != self.spec_sha256
         ):
             raise ValueError("owner request contains a different run/spec observation")
+        if isinstance(self.command, M6DepositReceipt):
+            receipt = strict_json_loads(self.command.receipt_utf8)
+            assert type(receipt) is dict
+            if receipt.get("run_id") != self.run_id or receipt.get("spec_sha256") != self.spec_sha256:
+                raise ValueError("owner request deposits a receipt for a different run/spec")
         return self
 
 

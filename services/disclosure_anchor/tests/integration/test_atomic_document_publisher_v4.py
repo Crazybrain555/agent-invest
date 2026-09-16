@@ -60,6 +60,7 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     MaterializedProviderDocumentV4,
     V4ClaimWitness,
 )
+from disclosure_anchor.application.ports.remote_parse_v4_repository import V4HeadNotFound
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.services.unit_hashing import query_projection
 from tests.integration._remote_parse_v4_factory import (
@@ -430,6 +431,9 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
         publisher = PostgresAtomicWholeDocumentPublisherV4(engine=self.engine)
         claim = self._claim()
         ready = self._ready()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            with self.assertRaises(V4HeadNotFound):
+                uow.remote_parse_v4.read_durable_publish_ledger_seq(self.fixture.processing_run_id)
         winner = publisher.commit_whole_document(
             self.request,
             claim=claim,
@@ -455,6 +459,16 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                 ).one()
             )
         self.assertEqual(counts_before, (1, 2, 1, 1))
+        with self.engine.connect() as conn:
+            committed_ledger_seq = conn.execute(
+                sa.text("SELECT ledger_seq FROM disclosure_ops.durable_publish_base WHERE processing_run_id=:run"),
+                {"run": self.fixture.processing_run_id},
+            ).scalar_one()
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(uow.remote_parse_v4.read_durable_publish_ledger_seq(self.fixture.processing_run_id),
+                             committed_ledger_seq)
+            with self.assertRaises(V4HeadNotFound):
+                uow.remote_parse_v4.read_durable_publish_ledger_seq("nonexistent-independent-run")
         self.assertEqual(winner.inserted_count, 1)
         self.assertEqual(winner.updated_count, 0)
         self.assertEqual(winner.deleted_count, 0)
@@ -478,6 +492,9 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
 
         self.assertEqual(replay, winner)
         self.assertEqual(reloaded, winner)
+        with SqlAlchemyUnitOfWork(engine=self.engine) as uow:
+            self.assertEqual(uow.remote_parse_v4.read_durable_publish_ledger_seq(self.fixture.processing_run_id),
+                             committed_ledger_seq)
         with self.engine.connect() as conn:
             row = conn.execute(
                 sa.text(

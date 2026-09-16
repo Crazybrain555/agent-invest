@@ -916,6 +916,14 @@ class RemoteParseV4Repository(Protocol):
         rewrap: V4SecretRewrap,
     ) -> tuple[SealedProviderSecretV4, ...]: ...
 
+    def read_durable_publish_ledger_seq(self, processing_run_id: str) -> int:
+        """Read the ledger sequence the durable publish base row received at commit.
+
+        Read-only keyed lookup; raises ``V4HeadNotFound`` when no durable base
+        exists for the run. It never claims, locks or mutates.
+        """
+        ...
+
 
 def _require_sha256(value: str, label: str) -> None:
     if (

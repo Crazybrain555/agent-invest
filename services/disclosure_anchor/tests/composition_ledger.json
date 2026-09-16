@@ -404,6 +404,18 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_m6_e2e_assembly_independent.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_m6_lifecycle_emission_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_m6_owner_deposit_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
   "tests/unit/test_m6_owner_fixture_generator.py": {
    "private_imports": [],
    "tests": 11
@@ -433,6 +445,10 @@
    "tests": 27
   },
   "tests/unit/test_m6_run_contract.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_m6_run_wiring_independent.py": {
    "private_imports": [],
    "tests": 8
   },
@@ -1068,6 +1084,10 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_staged_campaign_runner_independent.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_staged_campaign_sql_v4.py": {
    "private_imports": [],
    "tests": 7
@@ -1134,6 +1154,10 @@
    "private_imports": [],
    "tests": 2
   },
+  "tests/unit/test_stream_recovery_pending_independent.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_subject_resolver.py": {
    "private_imports": [],
    "tests": 12
@@ -1157,6 +1181,14 @@
   "tests/unit/test_synchronized_telemetry_observer_v3.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_table_image_conservation_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_table_image_projection_independent.py": {
+   "private_imports": [],
+   "tests": 6
   },
   "tests/unit/test_track_companies.py": {
    "private_imports": [],

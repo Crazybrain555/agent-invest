@@ -28,6 +28,10 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     RemoteParseCheckpointV4,
 )
+from disclosure_anchor.application.ports.staged_lifecycle_facts import StagedLifecycleFactsPort
+from disclosure_anchor.application.services.staged_lifecycle_reporting import (
+    report_attempt_admitted, require_lifecycle_facts_port,
+)
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RecoveryCandidate,
     RemoteParseV4Authority,
@@ -138,6 +142,7 @@ class DurableStagedCoordinatorPersistenceV4:
         utc_now: Callable[[], datetime] | None = None,
         outbox_event_id_factory: Callable[[], str] = ids.new_outbox_event_id,
         campaign_scope: V4CampaignAdmissionScope | None = None,
+        lifecycle_facts: StagedLifecycleFactsPort | None = None,
     ) -> None:
         if type(limits) is not CoordinatorLimits:
             raise ValueError("staged persistence requires exact coordinator limits")
@@ -156,6 +161,7 @@ class DurableStagedCoordinatorPersistenceV4:
         ):
             raise ValueError("staged persistence dependencies are invalid")
         self._uow_factory = uow_factory
+        self._lifecycle_facts = require_lifecycle_facts_port(lifecycle_facts)
         self._limits = limits
         self._owner_identity = owner_identity
         self._process_guard = process_guard
@@ -185,6 +191,11 @@ class DurableStagedCoordinatorPersistenceV4:
                 after_attempt_id=after_attempt_id,
                 limit=limit,
             )
+
+    def read_publication_ledger_seq(self, processing_run_id: str) -> int:
+        """Read-only ledger sequence of the committed durable publish base."""
+        with self._uow_factory() as uow:
+            return uow.remote_parse_v4.read_durable_publish_ledger_seq(processing_run_id)
 
     def claim_recovery(self, candidate: RecoveryCandidate) -> CoordinatorWork:
         self._process_guard()
@@ -466,6 +477,7 @@ class DurableStagedCoordinatorPersistenceV4:
                 and claimed.claim_owner_identity == self._owner_identity
             ):
                 durably_claimed.append(claimed)
+                report_attempt_admitted(self._lifecycle_facts, authority)
             if (
                 claimed.state != "prepared"
                 or claimed.lifecycle_version != 0

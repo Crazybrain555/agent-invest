@@ -50,6 +50,14 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
     PerAttemptResourceAllowance,
     ResourceCreditVector,
 )
+from disclosure_anchor.application.ports.staged_lifecycle_facts import StagedLifecycleFactsPort
+from disclosure_anchor.application.services.staged_lifecycle_reporting import (
+    report_attempt_final_acknowledged,
+    report_attempt_final_unsubmitted,
+    report_publication_committed,
+    report_remote_accepted,
+    require_lifecycle_facts_port,
+)
 from disclosure_anchor.application.ports.provider_secret_cipher_v4 import (
     ProviderSecretCipherPort,
 )
@@ -233,6 +241,7 @@ class DurableStagedCoordinatorBackendV4:
         new_work_admitter: V4NewWorkAdmissionPort | None = None,
         publication_committed: Callable[[bool], None] = lambda _replaced: None,
         wall_clock: Callable[[], float] = time.time,
+        lifecycle_facts: StagedLifecycleFactsPort | None = None,
     ) -> None:
         if not 0 < poll_seconds <= 300:
             raise ValueError("v4 backend poll interval is invalid")
@@ -255,6 +264,7 @@ class DurableStagedCoordinatorBackendV4:
         self._publication_committed = publication_committed
         self._poll_seconds = float(poll_seconds)
         self._wall_clock = wall_clock
+        self._lifecycle_facts = require_lifecycle_facts_port(lifecycle_facts)
 
     def list_recoverable(
         self,
@@ -569,6 +579,21 @@ class DurableStagedCoordinatorBackendV4:
             raise RuntimeError(
                 "transaction P returned without a durable publish_committed head"
             )
+        if self._lifecycle_facts is not None:
+            # The ledger sequence is assigned by the durable base row at commit;
+            # a failed read is reported as an unavailable fact, never as a
+            # failed commit.
+            ledger_error: str | None = None
+            try:
+                ledger_seq: int | None = self._persistence.read_publication_ledger_seq(
+                    winner.processing_run_id
+                )
+            except Exception as exc:  # noqa: BLE001 - surfaced through the facts port with its reason
+                ledger_seq = None
+                ledger_error = f"{type(exc).__name__}:{exc}"
+            report_publication_committed(
+                self._lifecycle_facts, authority, winner, ledger_seq, ledger_error=ledger_error,
+            )
         # Projection pruning is an idempotent generation signal. Replays can
         # notify again, but may never notify before both transaction P and its
         # durable lifecycle head are observable.
@@ -655,13 +680,18 @@ class DurableStagedCoordinatorBackendV4:
             successor,
             credit_allowance,
         )
-        return self._append(
+        appended = self._append(
             work,
             authority,
             successor,
             new_evidence=(encode_remote_parse_evidence_v4(receipt),),
             stage_guard=stage_guard,
         )
+        if target != "ack_pending":
+            report_attempt_final_unsubmitted(
+                self._lifecycle_facts, authority, final_state=target, cleanup_receipt=receipt,
+            )
+        return appended
 
     def acknowledge(
         self,
@@ -724,13 +754,18 @@ class DurableStagedCoordinatorBackendV4:
             held_resource_credit=ResourceCreditVector(),
             ack_receipt_sha256=receipt.sha256,
         )
-        return self._append(
+        appended = self._append(
             work,
             authority,
             successor,
             new_evidence=(encode_remote_parse_evidence_v4(receipt),),
             stage_guard=stage_guard,
         )
+        report_attempt_final_acknowledged(
+            self._lifecycle_facts, authority, final_state=target, accepted=accepted,
+            ack_receipt=receipt, cleanup_receipt=cleanup_receipt,
+        )
+        return appended
 
     def _submit(
         self,
@@ -809,7 +844,7 @@ class DurableStagedCoordinatorBackendV4:
             successor,
             credit_allowance,
         )
-        return self._append(
+        appended = self._append(
             work,
             authority,
             successor,
@@ -817,6 +852,8 @@ class DurableStagedCoordinatorBackendV4:
             sealed_secret=sealed,
             stage_guard=stage_guard,
         )
+        report_remote_accepted(self._lifecycle_facts, authority, accepted.receipt)
+        return appended
 
     def _poll(
         self,

@@ -51,7 +51,12 @@ class ProviderSourceCompatibilityTests(unittest.TestCase):
                 self.assertEqual(provider_document_envelope_from_bytes(encoded), admitted.envelope)
                 self.assertEqual([json_value(x) for x in admitted.source_text_reconciliations], expected["source_text_reconciliations"])
                 self.assertEqual([json_value(x) for x in admitted.source_quality_findings], expected["source_quality_findings"])
-                self.assertEqual(json_value(admitted.effective_provider_document), expected["effective_provider_document"])
+                # The historical snapshot predates the optional crop-evidence
+                # value. Keep its exact bytes/hashes above and all old fields
+                # unchanged; an old bundle has no newly invented findings.
+                self.assertEqual(json_value(admitted.effective_provider_document), {
+                    **expected["effective_provider_document"], "table_image_unmatched": [],
+                })
                 result = build_provider_units(admitted)
                 self.assertEqual(json_value(result), expected["build"])
                 replayed = [

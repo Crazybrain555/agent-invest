@@ -46,6 +46,9 @@ TARGET_PREIMAGE_SHA256: Final = {
     "mineru_vl_utils/post_process/cross_page_table.py": (
         "97581c69b92ae80df2a11f3dc986f329b26edca5af57e6052929aeadefab898f"
     ),
+    "mineru_vl_utils/post_process/__init__.py": (
+        "c1c426dfd5786d196a94854f8453b6deb800efd14c3749a8996ce201b29c9ad2"
+    ),
     "mineru_vl_utils/vlm_client/http_client.py": (
         "afe42d8a5e310d27cb0173abf4d59ed6197bc0b60a0258f321a6cdedd07c6ba7"
     ),
@@ -929,6 +932,126 @@ def _patch_explicit_capacity(source: str) -> str:
     for number, (old, new) in enumerate(replacements):
         source = _replace_exact(source, old, new, count=1, label=f"explicit capacity wiring {number}")
     return source
+
+
+_TABLE_IMAGE_CONSERVATION_SOURCE = (
+    "def table_image_conservation(original, replaced, token_map):\n"
+    "    \"\"\"Report every original in-table image crop that was not restored exactly once.\n"
+    "\n"
+    "    ``token_map`` is the crop map drawn before inference: each token stands for\n"
+    "    exactly one crop. ``original`` is the model output before token replacement\n"
+    "    and ``replaced`` the output after it. Occurrences are counted per token with\n"
+    "    the same rule ``replace_table_image_tokens`` uses; identical image bytes never\n"
+    "    merge two tokens. Kinds: ``missing`` (token absent), ``duplicate`` (token\n"
+    "    echoed more than once), ``unrestored`` (token seen once but not placed exactly\n"
+    "    once as an image). Nothing is edited or retried.\n"
+    "    \"\"\"\n"
+    "    if not token_map:\n"
+    "        return []\n"
+    "    original_text = original or \"\"\n"
+    "    replaced_text = replaced or \"\"\n"
+    "    occurrences = {}\n"
+    "    restored_expected = {}\n"
+    "    for token, data_uri in token_map.items():\n"
+    "        pattern = r\"\\[\\s*\" + re.escape(token[1:-1]) + r\"\\s*\\]\"\n"
+    "        occurrences[token] = len(re.findall(pattern, original_text))\n"
+    "        restored_expected[data_uri] = restored_expected.get(data_uri, 0) + occurrences[token]\n"
+    "    issues = []\n"
+    "    for token in sorted(token_map):\n"
+    "        data_uri = token_map[token]\n"
+    "        actual = occurrences[token]\n"
+    "        pattern = r\"\\[\\s*\" + re.escape(token[1:-1]) + r\"\\s*\\]\"\n"
+    "        restored_actual = replaced_text.count(\"<img src=\\\"\" + data_uri + \"\\\"/>\")\n"
+    "        if actual == 0:\n"
+    "            kind = \"missing\"\n"
+    "        elif actual > 1:\n"
+    "            kind = \"duplicate\"\n"
+    "        elif re.search(pattern, replaced_text) or restored_actual != restored_expected[data_uri]:\n"
+    "            kind = \"unrestored\"\n"
+    "        else:\n"
+    "            continue\n"
+    "        prefix = \"data:image/jpeg;base64,\"\n"
+    "        if not data_uri.startswith(prefix):\n"
+    "            raise RuntimeError(\"table image crop is not a JPEG data URI\")\n"
+    "        image = base64.b64decode(data_uri[len(prefix):], validate=True)\n"
+    "        issue = {\n"
+    "            \"kind\": kind,\n"
+    "            \"token\": token,\n"
+    "            \"expected\": 1,\n"
+    "            \"actual\": actual,\n"
+    "            \"image_sha256\": \"sha256:\" + hashlib.sha256(image).hexdigest(),\n"
+    "            \"image_byte_count\": len(image),\n"
+    "            \"image_data_uri\": data_uri,\n"
+    "        }\n"
+    "        if kind == \"unrestored\":\n"
+    "            issue[\"restored_expected\"] = restored_expected[data_uri]\n"
+    "            issue[\"restored_actual\"] = restored_actual\n"
+    "        issues.append(issue)\n"
+    "    return issues\n"
+)
+
+
+def _patch_table_image_conservation(source: str) -> str:
+    """Keep lost, duplicated or unrestored in-table crops visible in model output.
+
+    The model output is never rewritten; the check only records what the
+    unchanged replacement could not restore. Idempotent for an already
+    patched source.
+    """
+
+    if "def table_image_conservation(" in source:
+        return source
+    source = _replace_exact(
+        source,
+        "from loguru import logger\n\n",
+        "import base64\nimport hashlib\nimport re\n\nfrom loguru import logger\n\n",
+        count=1,
+        label="table image conservation imports",
+    )
+    source = _replace_exact(
+        source,
+        "def simple_process(\n",
+        _TABLE_IMAGE_CONSERVATION_SOURCE + "\n\ndef simple_process(\n",
+        count=1,
+        label="table image conservation helper",
+    )
+    return _replace_exact(
+        source,
+        "    for block in blocks:\n"
+        "        if block.type == \"table\" and block.content:\n"
+        "            content = block.content\n"
+        "            try:\n"
+        "                content = convert_otsl_to_html(content)\n"
+        "            except Exception as e:\n"
+        "                logger.warning(\"Failed to convert OTSL to HTML: {}; content: {}\", e, block.content)\n"
+        "            content = replace_table_image_tokens(content, block.get(TABLE_IMAGE_TOKEN_MAP_KEY))\n"
+        "            block.content = replace_table_formula_delimiters(content, enabled=enable_table_formula_eq_wrap)\n",
+        "    for block in blocks:\n"
+        "        if block.type == \"table\" and block.content:\n"
+        "            content = block.content\n"
+        "            try:\n"
+        "                content = convert_otsl_to_html(content)\n"
+        "            except Exception as e:\n"
+        "                logger.warning(\"Failed to convert OTSL to HTML: {}; content: {}\", e, block.content)\n"
+        "            table_image_source = content\n"
+        "            content = replace_table_image_tokens(content, block.get(TABLE_IMAGE_TOKEN_MAP_KEY))\n"
+        "            table_image_issues = table_image_conservation(\n"
+        "                table_image_source, content, block.get(TABLE_IMAGE_TOKEN_MAP_KEY)\n"
+        "            )\n"
+        "            if table_image_issues:\n"
+        "                block[\"table_image_unmatched\"] = table_image_issues\n"
+        "            block.content = replace_table_formula_delimiters(content, enabled=enable_table_formula_eq_wrap)\n"
+        "        elif block.type == \"table\":\n"
+        "            # An empty table output with an original crop map has lost every\n"
+        "            # crop; keep that evidence instead of accepting the empty table.\n"
+        "            table_image_issues = table_image_conservation(\n"
+        "                block.content, block.content, block.get(TABLE_IMAGE_TOKEN_MAP_KEY)\n"
+        "            )\n"
+        "            if table_image_issues:\n"
+        "                block[\"table_image_unmatched\"] = table_image_issues\n",
+        count=1,
+        label="table image conservation integration",
+    )
 
 
 def patch_source(relative_path: str, source: str) -> str:
@@ -3528,6 +3651,9 @@ def _hybrid_model_device_event(model, role, capacity):
             count=9,
             label="Hybrid native layout and postprocess resource drain",
         )
+
+    if relative_path == "mineru_vl_utils/post_process/__init__.py":
+        return _patch_table_image_conservation(source)
 
     raise ValueError(f"unapproved MinerU compatibility target: {relative_path}")
 

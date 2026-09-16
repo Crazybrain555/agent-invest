@@ -904,6 +904,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 "mineru_vl_utils/post_process/cross_page_table.py": (
                     "97581c69b92ae80df2a11f3dc986f329b26edca5af57e6052929aeadefab898f"
                 ),
+                "mineru_vl_utils/post_process/__init__.py": (
+                    "c1c426dfd5786d196a94854f8453b6deb800efd14c3749a8996ce201b29c9ad2"
+                ),
                 "mineru_vl_utils/vlm_client/http_client.py": (
                     "afe42d8a5e310d27cb0173abf4d59ed6197bc0b60a0258f321a6cdedd07c6ba7"
                 ),

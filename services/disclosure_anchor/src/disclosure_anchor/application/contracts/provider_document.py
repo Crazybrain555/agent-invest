@@ -248,6 +248,65 @@ class ProviderPage:
                 raise ValueError("provider page block order must be contiguous")
 
 
+_TABLE_IMAGE_KINDS = frozenset({"missing", "duplicate", "unrestored"})
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderTableImageUnmatched:
+    """One original in-table image crop the provider did not restore exactly once.
+
+    ``kind`` says how: ``missing`` (token absent from the model output),
+    ``duplicate`` (token echoed more than once) or ``unrestored`` (token seen
+    once but the image not placed exactly once). The crop bytes stay in the
+    retained model artifact; only their digest and size travel here.
+    """
+
+    page_index: int
+    model_block_index: int
+    table_bbox: tuple[float, float, float, float]
+    kind: str
+    token: str
+    expected: int
+    actual: int
+    image_sha256: str
+    image_byte_count: int
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.page_index, "page index"),
+            (self.model_block_index, "block index"),
+            (self.expected, "expected count"),
+            (self.actual, "actual count"),
+            (self.image_byte_count, "image byte count"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"table image {label} must be a non-negative integer")
+        if self.expected != 1 or self.image_byte_count < 1:
+            raise ValueError("table image evidence names exactly one crop with bytes")
+        if self.kind not in _TABLE_IMAGE_KINDS:
+            raise ValueError("table image kind is not closed")
+        if (self.kind == "missing") != (self.actual == 0) or (self.kind == "duplicate") != (self.actual > 1):
+            raise ValueError("table image kind differs from its count")
+        if (
+            type(self.token) is not str or not 1 <= len(self.token) <= 32
+            or self.token != self.token.strip() or not self.token.isprintable()
+        ):
+            raise ValueError("table image token is invalid")
+        if not _SHA256_RE.fullmatch(self.image_sha256):
+            raise ValueError("table image sha256 must be canonical")
+        bbox = self.table_bbox
+        if (
+            type(bbox) is not tuple or len(bbox) != 4
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not 0.0 <= value <= 1.0
+                for value in bbox
+            )
+            or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]
+        ):
+            raise ValueError("table image bbox must be normalized with positive size")
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderDocument:
     """DB-free diagnostic projection of one exact provider artifact bundle."""
@@ -261,6 +320,7 @@ class ProviderDocument:
     physical_table_segments: tuple[ProviderPhysicalTableSegment, ...]
     artifacts: tuple[ProviderArtifact, ...]
     bundle_sha256: str
+    table_image_unmatched: tuple[ProviderTableImageUnmatched, ...] = ()
 
     def __post_init__(self) -> None:
         if not _SHA256_RE.fullmatch(self.source_pdf_sha256):
@@ -311,6 +371,16 @@ class ProviderDocument:
                 and segment.crop_artifact_role not in role_set
             ):
                 raise ValueError("provider table segment crop role is not hash-bound")
+        previous_key: tuple[int, int, str] | None = None
+        for item in self.table_image_unmatched:
+            if type(item) is not ProviderTableImageUnmatched:
+                raise ValueError("provider table image evidence type is not exact")
+            if item.page_index >= len(self.pages):
+                raise ValueError("provider table image evidence page is out of range")
+            key = (item.page_index, item.model_block_index, item.token)
+            if previous_key is not None and key <= previous_key:
+                raise ValueError("provider table image evidence must be ordered and unique")
+            previous_key = key
 
     @property
     def blocks(self) -> tuple[ProviderBlock, ...]:
@@ -357,6 +427,7 @@ __all__ = [
     "ProviderPage",
     "ProviderPayload",
     "ProviderPhysicalTableSegment",
+    "ProviderTableImageUnmatched",
     "provider_artifact_bundle_sha256",
     "provider_payload_field_contract",
 ]

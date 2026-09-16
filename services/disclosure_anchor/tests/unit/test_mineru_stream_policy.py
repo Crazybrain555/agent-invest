@@ -92,10 +92,10 @@ class MineruStreamPolicyTests(unittest.TestCase):
         self.assertEqual(policy.evaluate(sample(5, 4, host_available_bytes=3*GIB), now=4).target, 0)
         self.assertEqual(policy.evaluate(sample(6, 5), now=5).target, 0)
         self.assertEqual(policy.evaluate(sample(7, 6, http_pending=50), now=6).target, 0)
-        self.assertEqual(policy.evaluate(sample(8, 7), now=7).target, 0)
-        self.assertEqual(policy.evaluate(sample(9, 8), now=8).target, 0)
-        self.assertEqual(policy.evaluate(sample(10, 9), now=9).target, 1)
-        previous = 1
+        self.assertEqual(policy.evaluate(sample(8, 7), now=7).target, 1)
+        self.assertEqual(policy.evaluate(sample(9, 8), now=8).target, 1)
+        self.assertEqual(policy.evaluate(sample(10, 9), now=9).target, 2)
+        previous = 2
         for tick in range(10, 25):
             target = policy.evaluate(sample(tick+1, tick), now=tick).target
             self.assertIn(target-previous, (0, 1))

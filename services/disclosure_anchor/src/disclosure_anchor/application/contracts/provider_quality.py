@@ -59,9 +59,27 @@ class TruncatedTitleOccurrence:
         return "suspected_truncated_markup_title"
 
 
+@dataclass(frozen=True, slots=True)
+class TableImageUnmatchedOccurrence:
+    """One in-table image crop the provider lost, duplicated or failed to restore."""
+
+    unit_index: int | None
+    page_index: int
+    model_block_index: int
+    conservation_kind: str
+    token: str
+    expected: int
+    actual: int
+    image_sha256: str
+
+    @property
+    def reason_id(self) -> str:
+        return "table_image_unmatched"
+
+
 ProviderQualityOccurrence = (
     SourceFindingOccurrence | UnboundTableOccurrence
-    | EncodedTextOccurrence | TruncatedTitleOccurrence
+    | EncodedTextOccurrence | TruncatedTitleOccurrence | TableImageUnmatchedOccurrence
 )
 
 
@@ -77,6 +95,7 @@ def quality_occurrence_to_payload(item: ProviderQualityOccurrence) -> dict[str, 
         UnboundTableOccurrence: "table_unbound",
         EncodedTextOccurrence: "encoded_text",
         TruncatedTitleOccurrence: "truncated_title",
+        TableImageUnmatchedOccurrence: "table_image_unmatched",
     }.get(type(item))
     if kind is None:
         raise ValueError("quality occurrence type is unsupported")
@@ -160,6 +179,22 @@ def quality_occurrence_from_payload(value: object) -> ProviderQualityOccurrence:
         item = TruncatedTitleOccurrence(
             _index(obj["unit_index"]), _text(obj["heading_id"]), tuple(parsed),
         )
+    elif kind == "table_image_unmatched":
+        _fields(obj, common | {
+            "page_index", "model_block_index", "conservation_kind", "token", "expected", "actual",
+            "image_sha256",
+        })
+        image_kind = _text(obj["conservation_kind"])
+        expected, actual = _index(obj["expected"]), _index(obj["actual"])
+        if (
+            image_kind not in {"missing", "duplicate", "unrestored"} or expected != 1
+            or (image_kind == "missing") != (actual == 0) or (image_kind == "duplicate") != (actual > 1)
+        ):
+            raise ValueError("quality table image occurrence kind differs from its counts")
+        item = TableImageUnmatchedOccurrence(
+            _optional_index(obj["unit_index"]), _index(obj["page_index"]), _index(obj["model_block_index"]),
+            image_kind, _text(obj["token"]), expected, actual, _sha(obj["image_sha256"]),
+        )
     else:
         raise ValueError("quality occurrence kind is unsupported")
     if _text(obj["reason_id"]) != item.reason_id:
@@ -194,6 +229,8 @@ def _order(item: ProviderQualityOccurrence) -> tuple[object, ...]:
         )
     elif isinstance(item, EncodedTextOccurrence):
         identity = (item.source_index, item.raw_block_sha256)
+    elif isinstance(item, TableImageUnmatchedOccurrence):
+        identity = (item.page_index, item.model_block_index, item.token, item.image_sha256)
     else:
         identity = (item.heading_id, tuple(
             (f.source_index, f.payload_ordinal, f.page_index, f.text, f.raw_block_sha256)

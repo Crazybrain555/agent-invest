@@ -65,6 +65,7 @@ from disclosure_anchor.adapters.storage.provider_document_source import (
 from disclosure_anchor.adapters.storage.v4_source_observation import BoundedV4SourcePdfObserver
 from disclosure_anchor.application.ports.parser import ParserIdentity, ParserOptions
 from disclosure_anchor.application.ports.staged_execution import StageObserverPort
+from disclosure_anchor.application.ports.staged_lifecycle_facts import StagedLifecycleFactsPort
 from disclosure_anchor.application.ports.staged_new_work_v4 import validate_v4_admission_scope
 from disclosure_anchor.application.contracts.staged_campaign_v4 import (
     V4CampaignAdmissionScope, require_v4_campaign_scope,
@@ -149,8 +150,14 @@ def build_staged_worker_v4_runtime(
     stream_control: StreamAdmissionControl | None = None,
     campaign_scope: V4CampaignAdmissionScope | None = None,
     stage_observer: StageObserverPort | None = None,
+    lifecycle_facts: StagedLifecycleFactsPort | None = None,
 ) -> StagedWorkerV4Runtime:
-    """Compose exactly one seven-lane runtime after explicit mode selection."""
+    """Compose exactly one seven-lane runtime after explicit mode selection.
+
+    ``lifecycle_facts`` receives durable lifecycle facts (admission, remote
+    acceptance, publication, final) from the persistence, admitter and backend;
+    it never takes part in claims, credits or scheduling.
+    """
 
     if settings.worker_parse_execution_mode != "staged-v4":
         raise ValueError("staged V4 composition requires explicit staged-v4 mode")
@@ -241,6 +248,7 @@ def build_staged_worker_v4_runtime(
         owner_identity=exact_owner,
         process_guard=ownership_guard,
         campaign_scope=campaign_scope,
+        lifecycle_facts=lifecycle_facts,
     )
     claim_guard = DurableV4ClaimGuard(uow_factory=uow_factory)
     remote = MinerUHttpRemoteV4(
@@ -335,6 +343,7 @@ def build_staged_worker_v4_runtime(
             process_guard=ownership_guard,
             admission_document_ids=admission_document_ids,
             campaign_scope=campaign_scope,
+            lifecycle_facts=lifecycle_facts,
         )
         backend = DurableStagedCoordinatorBackendV4(
             persistence=persistence,
@@ -349,6 +358,7 @@ def build_staged_worker_v4_runtime(
             poll_seconds=worker_profile.provider_poll_milliseconds / 1000,
             new_work_admitter=_RecoveryOnlyAdmission() if recovery_only else new_work,
             publication_committed=publication_committed,
+            lifecycle_facts=lifecycle_facts,
         )
         return StagedWorkerV4Runtime(
             coordinator=StagedParseCoordinator(
@@ -383,6 +393,7 @@ def build_staged_worker_v4_campaign_runtime(
     publication_committed: Callable[[bool], None] = lambda _replaced: None,
     owner_identity: str | None = None,
     stage_observer: StageObserverPort | None = None,
+    lifecycle_facts: StagedLifecycleFactsPort | None = None,
 ) -> StagedWorkerV4Runtime:
     """Explicit finite campaign; missing authority never falls back to all work."""
     campaign_scope = require_v4_campaign_scope(campaign_scope)
@@ -394,7 +405,7 @@ def build_staged_worker_v4_campaign_runtime(
         progress=progress, publication_committed=publication_committed,
         owner_identity=owner_identity, expected_capacity=expected_capacity,
         stream_control=stream_control, campaign_scope=campaign_scope,
-        stage_observer=stage_observer,
+        stage_observer=stage_observer, lifecycle_facts=lifecycle_facts,
     )
 
 

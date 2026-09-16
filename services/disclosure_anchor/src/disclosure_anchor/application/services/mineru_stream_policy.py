@@ -135,9 +135,11 @@ class MineruStreamPolicy:
             self._target = c.qualified_max
             self._initialized = True
             return self._decision(sample, "qualified_start")
+        # Recovery toward the certified baseline looks only at fresh memory
+        # hysteresis. Pending H demand is useful work: it neither vetoes this
+        # recovery nor justifies exceeding qualified_max. A missing pending
+        # value is still unknown above and pauses.
         clear = sample.gpu_free_bytes >= c.gpu_recover_bytes and sample.host_available_bytes >= c.host_recover_bytes
-        # Pending H demand is useful work; never use it to justify adding C.
-        clear = clear and sample.http_pending == 0
         if not clear:
             self._healthy_since = None
             return self._decision(sample, "holding_pressure")

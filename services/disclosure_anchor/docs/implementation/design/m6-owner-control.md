@@ -31,6 +31,82 @@ incarnation. This authorizes drain and exact retries of known predecessor stamps
 it permanently disables new admission. A failed status may advance to closed
 after cleanup, which confirms closure without making the run eligible for credit.
 
+## Receipt deposit
+
+The runner and the two verifiers may `deposit` one bounded canonical control
+receipt (`admission_reconciliation`, `ownership_closure`, `resource_audit`,
+`unresolved_claims`; whole request within the 64 KiB wire, receipt payload at
+most 49152 bytes). The owner verifies hash, canonical JSON, contract version and
+run/spec (and runner epoch where the receipt carries it), then writes it to the
+private store under its hash-derived fixed name through the existing immutable
+write (pending file, rename, reread). Canonical means the same bytes the Python
+owner would produce: a JSON object with code-point-sorted keys, no whitespace,
+minimal escapes and integer numbers only; the native owner re-serializes the
+parsed receipt and requires byte equality, so a receipt Python would reject is
+refused natively as well (`receipt_not_canonical`), and a receipt lacking a
+binding member is refused as `receipt_binding_differs`. Identical bytes are idempotent; different
+bytes under the same name are a conflict; budget exhaustion and over-bound
+payloads are refusals. A lost reply is retried with the same bytes. Deposit
+stamps no observation and confers no credit; `admission_closed` and `close`
+still read the receipts by hash exactly as before.
+
+## Lifecycle facts and the e2e assembly (runner events)
+
+The staged V4 runtime reports four kinds of durable lifecycle facts through
+`StagedLifecycleFactsPort` (`application/ports/staged_lifecycle_facts.py`):
+attempt admitted (after the H0 claim or a prepared re-claim is durable),
+remote accepted (after the accepted-submission receipt is appended),
+publication committed (after the `publish_committed` head is confirmed; the
+ledger sequence is read from the durable publish base row) and attempt final
+(after the ACK lane or the non-ACK cleanup lane appends the terminal state).
+The final fact binds the real provider ACK receipt, consumed or absent; a
+terminal receipt is parse status, never closure. Facts are emitted only after
+the durable transition exists and the port must not raise for storage or
+transport failure; a fact that cannot be built is reported as unavailable. A
+port failure right after the H0 claim surfaces through the existing
+`AdmissionInterrupted` path, so owned work is never lost to notification.
+
+`adapters/runtime/m6_e2e_assembly.py` turns facts into `e2e_runner` producer
+events: `M6LifecycleSpool` appends each canonical event with its producer
+sequence to a local fsynced JSONL spool (exact replays are recorded once, a
+changed fact for the same attempt is a conflict, a spool that already exists
+refuses to start), and `M6E2EAssemblyWorker` drains it on its own thread with
+an owner client it constructs itself. Transport faults retry the identical
+sequence and bytes a bounded number of times; each retry is a durable
+`transport_retry` spool record with the sequence, attempt number and error
+text, and a delivery that needed replays says so, so a later success never
+erases the fault it recovered from. Every owner conflict or rejection marks
+the run failed and stops delivery, because the owner journals the first
+variant and never re-accepts.
+
+Formal closure is composed from the same primitives. The controller
+(`cli/m6_run_control.py`) freezes the run spec from the owner's anchor and the
+frozen campaign inputs, binds it and opens admission. The spec file is written
+whole or not at all; a repeated bind with byte-identical inputs replays the
+owner's idempotent bind and checks the reply names this spec, while a
+different spec is refused, so a lost bind reply is recovered by readback and
+never by an alternate spec. The owner-bound campaign
+(`staged_campaign --m6-run-dir`) first requires the frozen spec to name its
+manifest, scope, campaign and `e2e_publication` mode, then the loaded process
+profile, runtime bundle and worker profile, before any lock, database or
+admission; it then spools its lifecycle facts, lets a lapsed
+owner lease close new admission only, and after the drain deposits its
+resource audit, any unresolved claims and the admission reconciliation,
+acknowledges `admission_closed` and deposits the ownership closure
+(`application/contracts/m6_control_receipts.py`, native shapes and attempt-set
+digest). The quality and public verifiers append `document_qualified` and
+`public_confirmation` per attempt and `verifier_drained` once, each as its own
+producer role over the same spool; `verifier_drained` names the digest of an
+immutable `drain-receipt.json` written before the event, and the run summary
+is a separate later file. A verifier whose database setup fails before any
+attempt, whose attempt loop does not run to its end, or whose drain receipt
+cannot be written whole closes its sender with an explicit abort and no drain
+claim; the original failure stays the reported error. The
+controller then closes the owner with the runner's ownership receipt. A failed
+step anywhere leaves that receipt or summary marked failed and the run
+evidence-incomplete; nothing is retried blindly or declared closed from a
+campaign receipt alone.
+
 ## Authentication, transport and retry
 
 One pinned SSH session opens one persistent `direct-tcpip` channel to a configured

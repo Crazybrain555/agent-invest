@@ -8,6 +8,8 @@ drain/reconciliation remains possible with this client.
 
 from __future__ import annotations
 
+import hashlib
+
 from collections.abc import Callable
 from dataclasses import dataclass
 import re
@@ -16,7 +18,7 @@ from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from disclosure_anchor.application.contracts.m6_owner import (
-    M6AdmissionClosedAck, M6AppendObservation, M6BindOwner, M6OwnerAnchor, M6OwnerCommand, M6OwnerControl,
+    M6AdmissionClosedAck, M6AppendObservation, M6DepositReceipt, M6DepositReceiptKind, M6BindOwner, M6OwnerAnchor, M6OwnerCommand, M6OwnerControl,
     M6OwnerReply, M6OwnerRequest, M6OwnerStatus,
 )
 from disclosure_anchor.application.contracts.m6_run import M6RunSpec
@@ -166,6 +168,7 @@ class M6OwnerClient:
             "lease": {runner}, "bind": {"controller"}, "open": {"controller"},
             "stop": {"controller", runner}, "admission_closed": {runner},
             "close": {"controller"}, "append": {runner, "public_verifier", "quality_verifier"},
+            "deposit": {runner, "public_verifier", "quality_verifier"},
         }
         if self._role not in permitted[command.kind]:
             self._lease_until_ns = 0
@@ -208,6 +211,8 @@ class M6OwnerClient:
             if isinstance(command, M6AppendObservation) and reply.outcome != "rejected":
                 if reply.record is None or reply.record.stamp.producer_event_sha256 != command.event.canonical_sha256():
                     raise M6OwnerProtocolError("M6 owner acknowledged different producer bytes")
+            if isinstance(command, M6DepositReceipt) and reply.record is not None:
+                raise M6OwnerProtocolError("M6 owner stamped an observation for a receipt deposit")
             if reply.outcome != "ok":
                 raise M6OwnerRejected(reply)
             if command.kind == "lease" and reply.status.admission_valid_until_ticks is not None:
@@ -238,10 +243,34 @@ class M6OwnerClient:
         self._assert_owner()
         return not self._admission_halted and self._now() < self._lease_until_ns
 
+    @property
+    def continuous_clock(self) -> Callable[[], int]:
+        """The continuous clock the lease deadline is measured on; safe to call from any thread."""
+        return self._clock
+
+    @property
+    def lease_until_ns(self) -> int:
+        """Granted lease deadline on the continuous clock; 0 once halted.
+
+        Readable from any thread as an observation only: a reader must compare
+        it with the same continuous clock itself and must never extend it.
+        """
+        return 0 if self._admission_halted or self._closed else self._lease_until_ns
+
     def append(self, event: M6ProducerEvent) -> M6RunEvent:
         reply = self.request(M6AppendObservation(event=event))
         assert reply.record is not None  # request() checks this before success.
         return reply.record
+
+    def deposit(self, receipt_kind: M6DepositReceiptKind, receipt_utf8: str) -> M6OwnerReply:
+        """Place one bounded canonical control receipt into the owner's private store.
+
+        Idempotent for identical bytes; a lost reply is retried with the same
+        bytes. Success means the owner persisted and reread the exact bytes; it
+        confers no credit and stamps no observation.
+        """
+        digest = "sha256:" + hashlib.sha256(receipt_utf8.encode("utf-8")).hexdigest()
+        return self.request(M6DepositReceipt(receipt_kind=receipt_kind, receipt_sha256=digest, receipt_utf8=receipt_utf8))
 
     def close(self) -> None:
         if self._closed:

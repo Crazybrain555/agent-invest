@@ -26,8 +26,12 @@ from disclosure_anchor.application.ports.staged_new_work_v4 import (
     validate_v4_admission_scope,
 )
 from disclosure_anchor.application.ports.remote_parse_v4_source_rejection import V4SourceRejectionCommit
+from disclosure_anchor.application.ports.staged_lifecycle_facts import StagedLifecycleFactsPort
 from disclosure_anchor.application.ports.staged_provider_parser import V4StageGuard
 from disclosure_anchor.application.services.staged_ingress_v4 import DurableStagedIngressV4
+from disclosure_anchor.application.services.staged_lifecycle_reporting import (
+    report_attempt_admitted, require_lifecycle_facts_port,
+)
 from disclosure_anchor.application.services.staged_parse_coordinator import (
     AdmissionInterrupted, AdmissionOutcome, CoordinatorWork,
 )
@@ -81,6 +85,7 @@ class StagedV4NewWorkAdmitter:
         process_guard: Callable[[], None] = lambda: None,
         admission_document_ids: tuple[str, ...] | None = None,
         campaign_scope: V4CampaignAdmissionScope | None = None,
+        lifecycle_facts: StagedLifecycleFactsPort | None = None,
     ) -> None:
         if (
             not callable(getattr(prepared_claims, "admit_new", None))
@@ -111,6 +116,7 @@ class StagedV4NewWorkAdmitter:
             raise V4CampaignScopeViolation("V4 campaign admission dependencies have different scopes")
         self._campaign_scope = campaign_scope
         self._admission_document_ids = admission_document_ids
+        self._lifecycle_facts = require_lifecycle_facts_port(lifecycle_facts)
         self._after_document_id: str | None = None
         self._scan_blocked_at: dict[str, int] = {}
         self._scan_ineligible: set[str] = set()
@@ -222,6 +228,9 @@ class StagedV4NewWorkAdmitter:
                         else:
                             work = self._claim_created_h0(authority)
                             durably_claimed.append(work)
+                            # The claim is durable and already witnessed above; a
+                            # failing report can only surface as AdmissionInterrupted.
+                            report_attempt_admitted(self._lifecycle_facts, authority)
                             remaining = remaining - work.credits
                             selected.append(work)
                 self._after_document_id = candidate.document_id

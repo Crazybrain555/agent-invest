@@ -54,7 +54,8 @@ sampler 仍拒绝陈旧或采集失败的样本，只有持续压力控制将其
 
 初始 C 为 0，第一份有效、未触发压力条件的样本才能放行。已知的任一 hard-low
 优先触发 C0，即使另一数据源 unknown；降额只阻止新增，恢复需要完整新鲜观测及
-配置的迟滞间隔。identity/clock/OOM 等 unsafe 会锁住新增直到重新核对和恢复运行。
+配置的迟滞间隔。恢复只以新鲜的 GPU/host 内存迟滞为条件；H pending 既不否决恢复，
+也不作为超过 qualified_max 的上调依据；pending 缺失仍是 unknown。identity/clock/OOM 等 unsafe 会锁住新增直到重新核对和恢复运行。
 
 每次新增 remote_waits grant 核对 durable + provisional + 本次申请不超过当前 target。
 降额后实际责任可以暂时高于 target；不能撤销已有 permit 来伪造立即达标。
@@ -73,6 +74,12 @@ unsafe 且已证明未提交的 intent 被单独停放并继续续租；已接�
 corpus 过滤，既有 carry-in 不得被计入本轮新增合格产出。
 `build_staged_worker_v4_campaign_runtime` 是显式 scoped 构造入口，不能用未限定的
 ordinary resident CLI 冒充有限 campaign。
+薄入口 `cli/staged_campaign.py` 读取 SHA 钉扎的冻结 manifest/scope，复用单例锁、部署门、显式
+stream activation、全局恢复与七 lane；准入上限就是冻结的普通成员本身，不另设配额，也不为此在协调器上加
+计数钩子；截止时间或停止文件只关闭新准入，已接受任务照常排空。收据 `staged-v4-campaign.v1` 只投影
+协调器的持久结果（admitted/completed/final_states/errors/credits）与 activation 角色（candidate/production
+只是标签）；哪些成员被认领由持久 attempt 行核对，收据不自造文档级准入清单。
+它不生成正式 M6 owner 事件、发布 credit 或资格。
 
 既有 `staged_commission` 小批量入口也接入同一 owned pressure context，并将同一个
 control 交给真实 staged runtime；未配置时保持关闭。它仍只接受显式的 1–8 个文档，

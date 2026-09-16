@@ -204,7 +204,8 @@ public static class MineruM6OwnerHost {
                 if(S(MineruResidentWire.Parse(record,65536).Get("event").Get("payload"),"kind")=="owner_resumed") resumes++;
             Require(!resume || resumes<8,"M6 original run recovery count exhausted");
             control=new MineruM6RunControl(anchorRaw,expectedSpecSha,ownerEpoch,mode,epochs,journal,
-                Stopwatch.GetTimestamp,maximumLease,reserve,store.ReadReceipt,store.WriteControl,store.ReadControl,AssertNativeClosure);
+                Stopwatch.GetTimestamp,maximumLease,reserve,store.ReadReceipt,store.WriteControl,store.ReadControl,AssertNativeClosure,
+                store.WriteImmutable);
             boundSpecSha=expectedSpecSha;
         }
         public void Run() {

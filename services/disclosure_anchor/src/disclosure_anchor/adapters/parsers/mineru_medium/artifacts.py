@@ -32,7 +32,11 @@ from disclosure_anchor.application.contracts.local_materialization_manifest_v4 i
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     PROVIDER_DOCUMENT_FILENAME,
+    ProviderDocumentEnvelopeError,
     provider_document_envelope_from_bytes,
+)
+from disclosure_anchor.adapters.parsers.mineru_medium.table_image_conservation import (
+    extract_table_image_unmatched,
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 
@@ -1681,7 +1685,14 @@ class MinerUMediumArtifactReader:
         page_sizes, parser_identity, ocr_enabled, middle_pages = _middle_document(
             tree.load_json(role_paths["middle_json"], label="middle_json"),
         )
-        tree.load_json(role_paths["model_json"], label="model_json")
+        try:
+            table_image_unmatched = extract_table_image_unmatched(
+                tree.load_json(role_paths["model_json"], label="model_json"),
+            )
+        except ProviderDocumentEnvelopeError as exc:
+            raise ParserOutputContractError(
+                f"MinerU model_json table image evidence is invalid: {exc}"
+            ) from exc
 
         block_specs: list[tuple[int, dict[str, Any], int, int]] = []
         page_orders = [0 for _ in page_sizes]
@@ -1764,6 +1775,7 @@ class MinerUMediumArtifactReader:
                 physical_table_segments=physical_table_segments,
                 artifacts=artifacts_tuple,
                 bundle_sha256=provider_artifact_bundle_sha256(artifacts_tuple),
+                table_image_unmatched=table_image_unmatched,
             ),
             artifact_root_relpath=artifact_root,
         )

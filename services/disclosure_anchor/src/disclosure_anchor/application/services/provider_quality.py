@@ -12,8 +12,8 @@ from disclosure_anchor.application.contracts.provider_table_projection import Un
 from disclosure_anchor.application.contracts.provider_unit import ProviderUnitBuildResult, ProviderUnitLocator
 from disclosure_anchor.application.contracts.provider_quality import (
     EncodedTextOccurrence, ProviderQualityOccurrence, ProviderUnitQualityAssessment,
-    SourceFindingOccurrence, TruncatedTitleOccurrence, UnboundTableOccurrence,
-    ordered_quality_occurrences,
+    SourceFindingOccurrence, TableImageUnmatchedOccurrence, TruncatedTitleOccurrence,
+    UnboundTableOccurrence, ordered_quality_occurrences,
 )
 from disclosure_anchor.application.services.document_outline import build_document_outline
 
@@ -73,6 +73,15 @@ def assess_source_build_quality(
         occurrences.extend(assessment.occurrences)
     occurrences.extend(
         _table_occurrence(document, None, part) for part in build.unassigned_table_parts
+    )
+    # Lost or ambiguous in-table crops are document-level provider evidence;
+    # they carry no unit because the affected table may span several units.
+    occurrences.extend(
+        TableImageUnmatchedOccurrence(
+            None, item.page_index, item.model_block_index, item.kind, item.token,
+            item.expected, item.actual, item.image_sha256,
+        )
+        for item in document.table_image_unmatched
     )
     return ordered_quality_occurrences(tuple(occurrences))
 

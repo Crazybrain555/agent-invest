@@ -17,6 +17,7 @@ public sealed class MineruM6RunControl {
     readonly Dictionary<string,string> roles;
     readonly Func<long> qpc;
     readonly Func<string,string> readReceipt;
+    readonly Action<string,byte[]> writeReceipt; // null: deposit unavailable on this owner
     readonly Action<string,string> archiveControl;
     readonly Func<string,string> readArchivedControl;
     readonly Action assertOwnResourcesClosed;
@@ -47,7 +48,7 @@ public sealed class MineruM6RunControl {
                              Func<long> physicalQpc,long maximumLeaseTicks,
                              long propagationReserveTicks,Func<string,string> readPinnedReceipt,
                              Action<string,string> persistControlReceipt,Func<string,string> readControlReceipt,
-                             Action assertNativeClosure) {
+                             Action assertNativeClosure,Action<string,byte[]> persistReceipt=null) {
         anchor=MineruResidentWire.Parse(anchorRaw,65536);
         Require(MineruM6OwnerWire.Anchor(anchor)==anchorRaw,"anchor_not_canonical");
         Require(mode=="service_diagnostic" || mode=="e2e_publication","unknown_run_mode");
@@ -67,7 +68,7 @@ public sealed class MineruM6RunControl {
         runId=S(anchor,"run_id"); specSha=boundSpecSha; anchorSha=Hash(anchorRaw); ownerEpoch=currentOwnerEpoch;
         runnerEpoch=roles[runnerRole]; journal=durableJournal; qpc=physicalQpc;
         readReceipt=readPinnedReceipt; archiveControl=persistControlReceipt; assertOwnResourcesClosed=assertNativeClosure;
-        readArchivedControl=readControlReceipt;
+        readArchivedControl=readControlReceipt; writeReceipt=persistReceipt;
         t0=anchor.Get("t0_ticks").Integer(); deadline=anchor.Get("deadline_ticks").Integer();
         stopBudget=anchor.Get("resources").Get("stop_admission_budget_ticks").Integer();
         maxAttempts=anchor.Get("resources").Get("max_attempts").Integer();
@@ -274,6 +275,42 @@ public sealed class MineruM6RunControl {
         Owner(Obj("kind",Q("run_closed"),"tclose_ticks",N(tick),"reason",Q(failed ? "failed" : S(command,"reason"))),tick);
         closureRaw=command.Raw;
     }
+    static readonly Dictionary<string,string> depositContracts=new Dictionary<string,string>(StringComparer.Ordinal) {
+        {"admission_reconciliation","m6.admission-reconciliation.v1"},{"ownership_closure","m6.ownership-closure.v1"},
+        {"resource_audit","m6.resource-audit.v1"},{"unresolved_claims","m6.unresolved-claims.v1"}};
+    void Deposit(MineruJsonValue command,string callerRole) {
+        Require(writeReceipt!=null,"deposit_unavailable");
+        Require(callerRole==runnerRole || callerRole=="public_verifier" || callerRole=="quality_verifier","deposit_role_differs");
+        Require(!closed,"owner_already_closed");
+        string kind=S(command,"receipt_kind"),sha=S(command,"receipt_sha256"),text=S(command,"receipt_utf8");
+        byte[] bytes=MineruResidentWire.Utf8.GetBytes(text);
+        Require(bytes.Length<=MineruM6OwnerWire.MaximumDepositReceiptBytes,"receipt_over_bound");
+        Require(MineruResidentWire.Hash(bytes)==sha,"receipt_hash_differs");
+        MineruJsonValue receipt;
+        try {
+            receipt=MineruResidentWire.Parse(text,65536);
+            // Parse alone accepts whitespace, key order and alternate escapes; the
+            // Python owner accepts only the canonical object form, so re-serialize
+            // and require byte equality before anything is persisted.
+            Require(text[0]=='{' && receipt.Canonical()==text,"receipt_not_canonical");
+        } catch(FormatException) { throw new MineruM6ControlRefusal("receipt_not_canonical"); }
+        // A receipt that lacks a binding member or carries it as a non-string
+        // is a binding mismatch, never a transport fault escaping as FormatException.
+        string contract,receiptRun,receiptSpec,receiptEpoch=null;
+        try {
+            contract=S(receipt,"contract_version"); receiptRun=S(receipt,"run_id"); receiptSpec=S(receipt,"spec_sha256");
+            if(kind=="admission_reconciliation" || kind=="ownership_closure") receiptEpoch=S(receipt,"runner_epoch_sha256");
+        } catch(FormatException) { throw new MineruM6ControlRefusal("receipt_binding_differs"); }
+        Require(contract==depositContracts[kind] && receiptRun==runId && receiptSpec==specSha,"receipt_binding_differs");
+        if(receiptEpoch!=null) Require(receiptEpoch==runnerEpoch,"receipt_binding_differs");
+        try { writeReceipt("receipt-"+sha.Substring(7)+".json",bytes); }
+        catch(ArgumentException) { throw new MineruM6ControlRefusal("receipt_over_bound"); }
+        catch(IOException io) {
+            if(io.Message.Contains("budget")) throw new MineruM6ControlRefusal("receipt_budget_exhausted");
+            if(io.Message.Contains("changed") || io.Message.Contains("differs")) throw new MineruM6ControlRefusal("receipt_conflict");
+            throw; // storage failure propagates to the host failure sink; no false success
+        }
+    }
     void ObserveRefusal(string code,string producerRaw) {
         // One bounded permanent incident makes rejected authenticated business
         // evidence visible to the accounting reducer. The host also retains raw
@@ -306,6 +343,7 @@ public sealed class MineruM6RunControl {
                 case "lease": Require(callerRole==runnerRole,"selected_runner_required"); lease=opened && !requested && !closed && !failed; break;
                 case "admission_closed": Require(callerRole==runnerRole,"selected_runner_required"); AdmissionClosed(command); break;
                 case "close": Require(callerRole=="controller","controller_required"); Close(command); break;
+                case "deposit": Deposit(command,callerRole); break;
                 case "append": {
                     MineruJsonValue producer=command.Get("event"),payload=producer.Get("payload");
                     string payloadKind=S(payload,"kind");
