@@ -117,8 +117,9 @@ class BootstrapAndIdentityTests(ClientCase):
         bind = self.owner.requests[-1]
         self.assertIsInstance(bind.command, M6BindOwner)
         self.assertEqual(bind.command.anchor_sha256, self.anchor.canonical_sha256())  # type: ignore[union-attr]
+        self.assertEqual(bind.command.spec_utf8.encode("utf-8"), self.spec.canonical_bytes())  # type: ignore[union-attr]
         self.assertEqual((bind.run_id, bind.spec_sha256), (self.spec.run_id, self.spec.canonical_sha256()))
-        self.assertEqual(self.owner.requests[-1].contract_version, "m6.owner-request.v1")
+        self.assertEqual(self.owner.requests[-1].contract_version, "m6.owner-request.v2")
 
         runner = self.client()
         with self.assertRaises(M6OwnerProtocolError):
@@ -491,14 +492,14 @@ class ControlStateTests(ClientCase):
         forbidden = {
             ("controller", m6.digest("controller-epoch")): [M6OwnerControl(kind="lease"), ack,
                                                             M6AppendObservation(event=self.admitted())],  # type: ignore[arg-type]
-            ("e2e_runner", m6.RUNNER_EPOCH): [M6BindOwner(anchor_sha256=self.anchor.canonical_sha256()),
+            ("e2e_runner", m6.RUNNER_EPOCH): [M6BindOwner(anchor_sha256=self.anchor.canonical_sha256(), spec_utf8=self.spec.canonical_bytes().decode("utf-8")),
                                               M6OwnerControl(kind="open"), close],
             ("service_runner", m6.RUNNER_EPOCH): [M6OwnerControl(kind="lease"), M6OwnerControl(kind="stop"), ack,
                                                   M6AppendObservation(event=self.admitted(kind="service_runner"))],  # type: ignore[arg-type]
             ("public_verifier", m6.PUBLIC_EPOCH): [M6OwnerControl(kind="lease"), M6OwnerControl(kind="stop"), ack,
                                                    M6OwnerControl(kind="open"), close],
             ("quality_verifier", m6.QUALITY_EPOCH): [M6OwnerControl(kind="lease"), M6OwnerControl(kind="stop"), ack,
-                                                     M6BindOwner(anchor_sha256=self.anchor.canonical_sha256())],
+                                                     M6BindOwner(anchor_sha256=self.anchor.canonical_sha256(), spec_utf8=self.spec.canonical_bytes().decode("utf-8"))],
         }
         for (role, epoch), commands in forbidden.items():
             client = self.client(role=role, epoch=epoch)

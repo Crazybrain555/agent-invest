@@ -28,7 +28,7 @@ if (
     throw "Docker CLI must resolve to one executable application"
 }
 
-# BEGIN MINERU NATIVE PROCESS V1
+# BEGIN MINERU NATIVE PROCESS V2
 function ConvertTo-WindowsCommandLineArgument {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
     if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
@@ -90,13 +90,76 @@ function Assert-NativeProcessArguments {
     }
 }
 
+# One optional monotonic budget for every native process this script runs.
+# Each call also carries its own deadline; the effective deadline is the
+# smaller one, measured from the actual process start.
+$script:NativeProcessBudget = $null
+function Start-NativeProcessBudget {
+    param([Parameter(Mandatory = $true)][long]$Seconds)
+    if ($Seconds -lt 1 -or $Seconds -gt 86400) { throw "native process budget out of range" }
+    $script:NativeProcessBudget = [pscustomobject]@{
+        Clock = [Diagnostics.Stopwatch]::StartNew()
+        TotalMilliseconds = [long]$Seconds * 1000
+    }
+}
+
+function Get-NativeProcessRemainingMilliseconds {
+    if ($null -eq $script:NativeProcessBudget) { return [long]::MaxValue }
+    return [long]($script:NativeProcessBudget.TotalMilliseconds - $script:NativeProcessBudget.Clock.ElapsedMilliseconds)
+}
+
+function New-NativeProcessRetention {
+    return [ordered]@{ Head = [IO.MemoryStream]::new(); Tail = [IO.MemoryStream]::new(); Total = [long]0; Eof = $false }
+}
+
+function Add-NativeProcessRetention {
+    param($Retention, [byte[]]$Buffer, [int]$Count, [long]$Limit, [bool]$HeadTail)
+    $Retention.Total += $Count
+    $headRoom = $Limit - [long]$Retention.Head.Length
+    if ($headRoom -gt 0) {
+        $take = [int][Math]::Min($headRoom, $Count)
+        $Retention.Head.Write($Buffer, 0, $take)
+    }
+    if (-not $HeadTail) {
+        return ($Retention.Total -le $Limit)
+    }
+    $Retention.Tail.Write($Buffer, 0, $Count)
+    if ($Retention.Tail.Length -gt (2 * $Limit)) {
+        $kept = $Retention.Tail.ToArray()
+        $Retention.Tail.SetLength(0)
+        $Retention.Tail.Write($kept, $kept.Length - [int]$Limit, [int]$Limit)
+    }
+    return $true
+}
+
+function Get-NativeProcessRetentionText {
+    param($Retention, [long]$Limit, [bool]$HeadTail)
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $head = $utf8.GetString($Retention.Head.ToArray())
+    if (-not $HeadTail -or $Retention.Total -le $Limit) { return $head }
+    $tailBytes = $Retention.Tail.ToArray()
+    $tailStart = [Math]::Max(0, $tailBytes.Length - [int]$Limit)
+    $tail = $utf8.GetString($tailBytes, $tailStart, $tailBytes.Length - $tailStart)
+    $dropped = $Retention.Total - $Retention.Head.Length - ($tailBytes.Length - $tailStart)
+    return ($head + "`n... [native process output: $dropped bytes dropped] ...`n" + $tail)
+}
+
 function Invoke-NativeProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][object[]]$Arguments,
-        [AllowNull()][string]$StandardInput = $null
+        [AllowNull()][string]$StandardInput = $null,
+        [long]$TimeoutMilliseconds = 120000,
+        [long]$MaximumOutputBytes = 1048576,
+        [switch]$HeadTail
     )
     Assert-NativeProcessArguments -Arguments $Arguments
+    if ($TimeoutMilliseconds -lt 1000 -or $MaximumOutputBytes -lt 1024) {
+        throw "native process bounds out of range"
+    }
+    $deadline = [Math]::Min($TimeoutMilliseconds, (Get-NativeProcessRemainingMilliseconds))
+    if ($deadline -le 0) { throw "native process budget exhausted before start: $FilePath" }
+    $retainLimit = if ($HeadTail) { [long][Math]::Max(1024, [Math]::Floor($MaximumOutputBytes / 2)) } else { $MaximumOutputBytes }
     $startInfo = New-Object Diagnostics.ProcessStartInfo
     $startInfo.FileName = $FilePath
     $startInfo.Arguments = (@(
@@ -107,31 +170,88 @@ function Invoke-NativeProcess {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.RedirectStandardInput = $null -ne $StandardInput
-    $utf8 = New-Object Text.UTF8Encoding($false)
-    $startInfo.StandardOutputEncoding = $utf8
-    $startInfo.StandardErrorEncoding = $utf8
 
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     $started = $false
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $stdout = New-NativeProcessRetention
+    $stderr = New-NativeProcessRetention
     try {
         $started = $process.Start()
         if (-not $started) { throw "native process did not start: $FilePath" }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        # Standard input is written asynchronously under the same deadline: a
+        # child that never reads its stdin cannot block this supervisor.
+        $inputTask = $null
+        $inputStream = $null
         if ($null -ne $StandardInput) {
             $inputBytes = [Text.Encoding]::UTF8.GetBytes($StandardInput)
-            $process.StandardInput.BaseStream.Write($inputBytes, 0, $inputBytes.Length)
-            $process.StandardInput.BaseStream.Flush()
-            $process.StandardInput.Close()
+            $inputStream = $process.StandardInput.BaseStream
+            $inputTask = $inputStream.WriteAsync($inputBytes, 0, $inputBytes.Length)
         }
-        $process.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
+        # Both pipes are drained continuously into bounded retention so a full
+        # pipe can never block the child, and the deadline is enforced during
+        # the drain rather than only after it.
+        $outStream = $process.StandardOutput.BaseStream
+        $errStream = $process.StandardError.BaseStream
+        $outBuffer = [byte[]]::new(16384)
+        $errBuffer = [byte[]]::new(16384)
+        $outTask = $outStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+        $errTask = $errStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+        while (-not ($stdout.Eof -and $stderr.Eof)) {
+            $remaining = $deadline - $clock.ElapsedMilliseconds
+            if ($remaining -le 0) {
+                throw "native_outcome_unknown: native process deadline exceeded after $($clock.ElapsedMilliseconds) ms: $FilePath $($Arguments -join ' ')"
+            }
+            $pending = @()
+            if ($null -ne $inputTask) { $pending += $inputTask }
+            if (-not $stdout.Eof) { $pending += $outTask }
+            if (-not $stderr.Eof) { $pending += $errTask }
+            $index = [Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending, [int][Math]::Min($remaining, 1000))
+            if ($index -lt 0) { continue }
+            $task = $pending[$index]
+            if ([object]::ReferenceEquals($task, $inputTask)) {
+                # A completed write yields a VoidTaskResult; discard it so only
+                # the final result object reaches the caller, but keep awaiting
+                # so a faulted write still raises here.
+                [void]$task.GetAwaiter().GetResult()
+                $inputStream.Flush()
+                $process.StandardInput.Close()
+                $inputTask = $null
+                continue
+            }
+            $count = $task.GetAwaiter().GetResult()
+            if ([object]::ReferenceEquals($task, $outTask)) {
+                if ($count -eq 0) { $stdout.Eof = $true }
+                else {
+                    if (-not (Add-NativeProcessRetention $stdout $outBuffer $count $retainLimit ([bool]$HeadTail))) {
+                        throw "native process stdout exceeded $MaximumOutputBytes bytes: $FilePath"
+                    }
+                    $outTask = $outStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+                }
+            }
+            else {
+                if ($count -eq 0) { $stderr.Eof = $true }
+                else {
+                    if (-not (Add-NativeProcessRetention $stderr $errBuffer $count $retainLimit ([bool]$HeadTail))) {
+                        throw "native process stderr exceeded $MaximumOutputBytes bytes: $FilePath"
+                    }
+                    $errTask = $errStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+                }
+            }
+        }
+        $remaining = [Math]::Max(1, $deadline - $clock.ElapsedMilliseconds)
+        if (-not $process.WaitForExit([int][Math]::Min($remaining, [int]::MaxValue))) {
+            throw "native_outcome_unknown: native process did not exit after closing its pipes: $FilePath"
+        }
         return [pscustomobject]@{
             ExitCode = [int]$process.ExitCode
-            StandardOutput = [string]$stdout
-            StandardError = [string]$stderr
+            StandardOutput = [string](Get-NativeProcessRetentionText $stdout $retainLimit ([bool]$HeadTail))
+            StandardError = [string](Get-NativeProcessRetentionText $stderr $retainLimit ([bool]$HeadTail))
+            StandardOutputBytes = [long]$stdout.Total
+            StandardErrorBytes = [long]$stderr.Total
+            Truncated = [bool]($HeadTail -and ($stdout.Total -gt $retainLimit -or $stderr.Total -gt $retainLimit))
+            ElapsedMilliseconds = [long]$clock.ElapsedMilliseconds
         }
     }
     catch {
@@ -139,7 +259,7 @@ function Invoke-NativeProcess {
         if ($started) {
             try {
                 if (-not $process.HasExited) { $process.Kill() }
-                $process.WaitForExit()
+                [void]$process.WaitForExit(30000)
             }
             catch {
                 # Cleanup is best-effort; preserve the original process error.
@@ -156,11 +276,15 @@ function Invoke-DockerProcess {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][object[]]$Arguments,
         [AllowNull()][string]$StandardInput = $null,
-        [int[]]$AllowedExitCodes = @(0)
+        [int[]]$AllowedExitCodes = @(0),
+        [long]$TimeoutMilliseconds = 120000,
+        [long]$MaximumOutputBytes = 1048576,
+        [switch]$HeadTail
     )
     Assert-NativeProcessArguments -Arguments $Arguments
     $result = Invoke-NativeProcess -FilePath $DockerCommand -Arguments $Arguments `
-        -StandardInput $StandardInput
+        -StandardInput $StandardInput -TimeoutMilliseconds $TimeoutMilliseconds `
+        -MaximumOutputBytes $MaximumOutputBytes -HeadTail:$HeadTail
     if ($AllowedExitCodes -notcontains $result.ExitCode) {
         $detail = ([string]$result.StandardError).Trim()
         if ([string]::IsNullOrWhiteSpace($detail)) {
@@ -177,13 +301,17 @@ function Invoke-DockerProcess {
 
 function Invoke-Docker {
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyString()][object[]]$Arguments
+        [Parameter(Mandatory = $true)][AllowEmptyString()][object[]]$Arguments,
+        [long]$TimeoutMilliseconds = 120000,
+        [long]$MaximumOutputBytes = 1048576,
+        [switch]$HeadTail
     )
     Assert-NativeProcessArguments -Arguments $Arguments
-    $result = Invoke-DockerProcess -Arguments $Arguments
+    $result = Invoke-DockerProcess -Arguments $Arguments -TimeoutMilliseconds $TimeoutMilliseconds `
+        -MaximumOutputBytes $MaximumOutputBytes -HeadTail:$HeadTail
     return @(ConvertFrom-NativeProcessText -Value $result.StandardOutput)
 }
-# END MINERU NATIVE PROCESS V1
+# END MINERU NATIVE PROCESS V2
 
 if ($CapacitySample -and $PhaseTrace) {
     throw "capacity sampling and phase-trace capture are mutually exclusive"
@@ -550,7 +678,7 @@ print(json.dumps({
     $logResult = Invoke-DockerProcess -Arguments @(
         "logs", "--since", $since.ToString("o"), "--until", $until.ToString("o"),
         "mineru-api"
-    )
+    ) -TimeoutMilliseconds 600000 -MaximumOutputBytes ([long]$MaxTraceBytes + 1048576)
     $stdoutLogLines = @(
         ConvertFrom-NativeProcessText -Value $logResult.StandardOutput
     )

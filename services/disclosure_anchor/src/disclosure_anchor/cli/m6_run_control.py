@@ -1,9 +1,9 @@
 """Controller side of one M6 run: bind the frozen spec, open, stop, read status and close.
 
 The native owner already holds its anchor (T0, clock, interval, resources).
-``bind`` freezes the run spec from that anchor plus the frozen campaign
-inputs and binds it once; the other commands are the controller's control
-requests. Every reply is printed as its canonical JSON; nothing here admits
+``bind`` freezes the run spec through the one pure factory (anchor plus the
+declared run intent and runtime binding) and binds it by value once; the
+other commands are the controller's control requests. Every reply is printed as its canonical JSON; nothing here admits
 work or stamps observations.
 """
 
@@ -20,9 +20,10 @@ from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
 from disclosure_anchor.adapters.runtime.m6_continuous_clock import diagnostic_continuous_clock
 from disclosure_anchor.adapters.runtime.m6_e2e_run import load_m6_run_directory, m6_owner_client_factory
 from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6OwnerClient, M6OwnerProtocolError, M6OwnerRejected
+from disclosure_anchor.application.contracts.m6_campaign_intent import M6CampaignRuntimeBinding, M6RunIntent
 from disclosure_anchor.application.contracts.m6_owner import M6CloseOwner, M6OwnerControl
-from disclosure_anchor.application.contracts.m6_run import M6RunSpec, M6RuntimeIdentity
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+from disclosure_anchor.application.services.m6_run_spec_factory import build_run_spec
 
 _MAX_RECEIPT_BYTES = 8 * 1024 * 1024
 
@@ -51,23 +52,19 @@ def bind(args: argparse.Namespace) -> int:
     run_dir = args.run_dir.absolute()
     run = load_m6_run_directory(run_dir, require_spec=False)
     anchor = run.anchor
-    runtime = M6RuntimeIdentity(
+    runtime = M6CampaignRuntimeBinding(
         source_commit=args.source_commit, source_manifest_sha256=args.source_manifest_sha256,
         runtime_bundle_identity_sha256=args.runtime_bundle_identity_sha256,
         process_profile_sha256=args.process_profile_sha256, worker_profile_sha256=args.worker_profile_sha256,
-        owner_source_sha256=anchor.owner_source_sha256, gpu_device_identity_sha256=anchor.gpu_device_identity_sha256,
         deployment_qualification_sha256=args.deployment_qualification_sha256,
     )
-    spec = M6RunSpec(
+    intent = M6RunIntent(
         run_id=anchor.run_id, campaign_id=args.campaign_id, mode=args.mode, phase=args.phase,
-        start_condition=args.start_condition, clock=anchor.clock, runtime=runtime,
-        manifest_sha256=args.manifest_sha256, scope_sha256=args.scope_sha256,
-        quality_plan_sha256=args.quality_plan_sha256, t0_ticks=anchor.t0_ticks,
-        planned_seconds=anchor.planned_seconds, deadline_ticks=anchor.deadline_ticks,
-        max_close_ticks=anchor.max_close_ticks, carry_in_attempt_ids=tuple(sorted(set(args.carry_in_attempt_ids))),
-        resources=anchor.resources,
+        start_condition=args.start_condition, manifest_sha256=args.manifest_sha256, scope_sha256=args.scope_sha256,
+        quality_plan_sha256=args.quality_plan_sha256, carry_in_attempt_ids=tuple(sorted(set(args.carry_in_attempt_ids))),
+        planned_seconds=anchor.planned_seconds, resources=anchor.resources,
     )
-    anchor.assert_spec(spec)
+    spec = build_run_spec(anchor=anchor, intent=intent, runtime=runtime)
     spec_path = run_dir / "run-spec.json"
     if run.spec is not None:
         if spec_path.read_bytes() != spec.canonical_bytes():

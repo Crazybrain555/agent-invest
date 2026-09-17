@@ -40,7 +40,8 @@ The config is baked root-owned 0444 at `/usr/local/etc/mineru/capacity.json`.
 Its path and SHA anchors belong to the image; compose cannot override them.
 
 Compose supplies the twelve exact original ENV projections and the configured H
-in the API command. An API-only capacity upgrade allows changes to those fields
+in the API command; both are projected by the codec's `capacity_environment()` and
+`capacity_http_arguments()` (see `mineru-release.md`), never by a hand-maintained mapping. An API-only capacity upgrade allows changes to those fields
 only, while comparing the remainder of resolved compose and retaining the actual
 proxy/inference service epochs. It uses the existing API-only recreation and
 fresh output/registry rollback witness. A failed or changed witness still blocks

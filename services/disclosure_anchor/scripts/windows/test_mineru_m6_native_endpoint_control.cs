@@ -546,11 +546,11 @@ public sealed class MineruM6ControlRig : IDisposable {
     static string Q(string s) { return MineruResidentWire.Quote(s); }
     static string N(long n) { return n.ToString(CultureInfo.InvariantCulture); }
     public string Request(string requestId, string commandRaw) {
-        return MineruResidentWire.Object("contract_version", "\"m6.owner-request.v1\"", "run_id", Q(RunId), "spec_sha256", Q(SpecSha),
+        return MineruResidentWire.Object("contract_version", "\"m6.owner-request.v2\"", "run_id", Q(RunId), "spec_sha256", Q(SpecSha),
             "request_id", Q(requestId), "command", commandRaw);
     }
     public string Simple(string kind) { return Request("req-" + kind + "-" + Guid.NewGuid().ToString("N").Substring(0, 8), "{\"kind\":\"" + kind + "\"}"); }
-    public string Bind() { return Request("req-bind", MineruResidentWire.Object("kind", "\"bind\"", "anchor_sha256", Q(MineruM6NativeSuite.Sha(AnchorRaw)))); }
+    public string Bind() { return Request("req-bind", MineruResidentWire.Object("kind", "\"bind\"", "anchor_sha256", Q(MineruM6NativeSuite.Sha(AnchorRaw)), "spec_utf8", Q(MineruM6NativeSuite.FS("service", "spec")))); }
     public string Append(string producerRaw) { return Request("req-append-" + Guid.NewGuid().ToString("N").Substring(0, 8), MineruResidentWire.Object("kind", "\"append\"", "event", producerRaw)); }
     public string Producer(string kind, string epoch, long sequence, string payloadRaw) {
         return MineruResidentWire.Object("contract_version", "\"m6.producer-event.v1\"", "run_id", Q(RunId), "spec_sha256", Q(SpecSha),
@@ -700,7 +700,7 @@ public static class MineruM6ControlTests {
             MineruM6NativeSuite.Equal("controller_required", rig.Rejected(rig.Simple("open"), "service_runner"), "runner cannot open");
             MineruM6NativeSuite.Equal("runner_or_controller_required", rig.Rejected(rig.Simple("stop"), "quality_verifier"), "verifier cannot stop");
             MineruM6NativeSuite.Equal("selected_runner_required", rig.Rejected(rig.Simple("lease"), "quality_verifier"), "verifier cannot lease");
-            string wrongAnchor = rig.Request("req-bind-wrong", MineruResidentWire.Object("kind", "\"bind\"", "anchor_sha256", MineruResidentWire.Quote(MineruM6NativeSuite.LabelHash("other-anchor"))));
+            string wrongAnchor = rig.Request("req-bind-wrong", MineruResidentWire.Object("kind", "\"bind\"", "anchor_sha256", MineruResidentWire.Quote(MineruM6NativeSuite.LabelHash("other-anchor")), "spec_utf8", MineruResidentWire.Quote(MineruM6NativeSuite.FS("service", "spec"))));
             MineruM6NativeSuite.Equal("bind_identity_or_role_differs", rig.Rejected(wrongAnchor, "controller"), "bind with a different anchor");
             MineruM6NativeSuite.Equal("bind_identity_or_role_differs", rig.Rejected(rig.Bind(), "service_runner"), "bind by runner");
             MineruM6ControlRefusal refusal = MineruM6NativeSuite.Throws<MineruM6ControlRefusal>(delegate { rig.Control.Handle(rig.Simple("status"), "controller", MineruM6NativeSuite.LabelHash("stale")); }, "stale caller epoch");
@@ -1079,7 +1079,7 @@ public static class MineruM6ControlTests {
             ",\"receipt_utf8\":" + DQ(raw) + "}";
         // Build test input independently so an intentionally oversized wire
         // request reaches the production decoder, not the fixture's bounded Object().
-        return "{\"command\":" + command + ",\"contract_version\":\"m6.owner-request.v1\",\"request_id\":" +
+        return "{\"command\":" + command + ",\"contract_version\":\"m6.owner-request.v2\",\"request_id\":" +
             DQ("deposit-" + Guid.NewGuid().ToString("N")) + ",\"run_id\":" + DQ(rig.RunId) +
             ",\"spec_sha256\":" + DQ(rig.SpecSha) + "}";
     }

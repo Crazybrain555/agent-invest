@@ -271,7 +271,7 @@ def generate() -> dict[str, Any]:
     ]
 
     bind_request = M6OwnerRequest(run_id=spec.run_id, spec_sha256=spec_sha, request_id="req-bind-1",
-                                  command=M6BindOwner(anchor_sha256=anchor.canonical_sha256()))
+                                  command=M6BindOwner(anchor_sha256=anchor.canonical_sha256(), spec_utf8=spec.canonical_bytes().decode("utf-8")))
     append_request = M6OwnerRequest(run_id=spec.run_id, spec_sha256=spec_sha, request_id="req-append-1",
                                     command=M6AppendObservation(event=records[2].event))
     drain_event = M6ProducerEvent(run_id=spec.run_id, spec_sha256=spec_sha, producer_kind="quality_verifier",

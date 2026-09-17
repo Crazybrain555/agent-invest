@@ -14,8 +14,9 @@ from threading import Lock
 
 from mineru.cli.agent_capacity_config import (
     MineruCapacityConfig,
+    capacity_environment,
+    capacity_http_arguments,
     decode_mineru_capacity_config,
-    encode_mineru_capacity_config,
 )
 from mineru.cli.agent_capacity_file import read_mineru_capacity_file
 
@@ -27,31 +28,8 @@ _PROCESS_INITIALIZED = False
 _PROCESS_ID: int | None = None
 _PROCESS_CONFIG: MineruCapacityConfig | None = None
 _PROCESS_ANCHORS: tuple[str | None, str | None] | None = None
-_ENVIRONMENT_FIELDS = {
-    "MINERU_API_MAX_CONCURRENT_REQUESTS": "parse_active_limit",
-    "MINERU_API_MAX_PENDING_TASKS": "total_nonterminal_limit",
-    "MINERU_API_FINALIZER_SLOTS": "finalizer_active_limit",
-    "MINERU_PROCESSING_WINDOW_SIZE": "processing_window_size",
-    "OMP_NUM_THREADS": "omp_num_threads",
-    "MKL_NUM_THREADS": "mkl_num_threads",
-    "OPENBLAS_NUM_THREADS": "openblas_num_threads",
-    "MINERU_PDF_RENDER_THREADS": "pdf_render_processes_requested",
-    "MINERU_HYBRID_BATCH_RATIO": "hybrid_batch_ratio_requested",
-    "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": "result_reservation_bytes",
-    "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES": "max_unacked_result_bytes",
-}
-
-
-def capacity_environment(config: MineruCapacityConfig) -> dict[str, str]:
-    """Project requested values to their original startup consumers."""
-
-    encode_mineru_capacity_config(config)
-    values = {
-        variable: str(getattr(config, field))
-        for variable, field in _ENVIRONMENT_FIELDS.items()
-    }
-    values["MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS"] = "1"
-    return values
+# The projection itself lives in the shared codec (one authority for the host
+# release builder and this bootstrap); it is re-exported here unchanged.
 
 
 def read_startup_capacity(
@@ -81,8 +59,10 @@ def read_startup_capacity(
 def verify_http_capacity(config: MineruCapacityConfig, requested_limit: int) -> None:
     """Check an actual CLI/client value; H is shared within one serving loop."""
 
-    encode_mineru_capacity_config(config)
-    if type(requested_limit) is not int or requested_limit != config.final_http_limit_per_loop:
+    if (
+        type(requested_limit) is not int
+        or capacity_http_arguments(config) != ("--max-concurrency", str(requested_limit))
+    ):
         raise ValueError("MinerU HTTP concurrency differs from the capacity config")
 
 
@@ -111,6 +91,6 @@ def get_process_capacity() -> MineruCapacityConfig | None:
 
 
 __all__ = [
-    "capacity_environment", "get_process_capacity", "read_startup_capacity",
-    "verify_http_capacity",
+    "capacity_environment", "capacity_http_arguments", "get_process_capacity",
+    "read_startup_capacity", "verify_http_capacity",
 ]

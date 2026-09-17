@@ -3,6 +3,10 @@
 This module also ships, byte for byte, as a standalone MinerU module. Keep it
 stdlib-only. The bounds describe supported configuration, not measured hardware
 capacity or a throughput recommendation. No runtime observations belong here.
+
+The projection of a config onto its startup consumers (environment variables
+and the shared HTTP limit argument) lives here as well, so the release builder
+and the API bootstrap derive it from one function instead of two mappings.
 """
 
 from __future__ import annotations
@@ -36,6 +40,24 @@ _FIELDS = frozenset(
         "max_unacked_result_bytes",
     }
 )
+# Requested value -> its original startup consumer. Order is the projection
+# order; every numeric field with a consumer appears exactly once. The two
+# process/loop limits have no consumer: they are validated to one above.
+CAPACITY_ENVIRONMENT_FIELDS = (
+    ("MINERU_API_MAX_CONCURRENT_REQUESTS", "parse_active_limit"),
+    ("MINERU_API_MAX_PENDING_TASKS", "total_nonterminal_limit"),
+    ("MINERU_API_FINALIZER_SLOTS", "finalizer_active_limit"),
+    ("MINERU_PROCESSING_WINDOW_SIZE", "processing_window_size"),
+    ("OMP_NUM_THREADS", "omp_num_threads"),
+    ("MKL_NUM_THREADS", "mkl_num_threads"),
+    ("OPENBLAS_NUM_THREADS", "openblas_num_threads"),
+    ("MINERU_PDF_RENDER_THREADS", "pdf_render_processes_requested"),
+    ("MINERU_HYBRID_BATCH_RATIO", "hybrid_batch_ratio_requested"),
+    ("MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES", "result_reservation_bytes"),
+    ("MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES", "max_unacked_result_bytes"),
+)
+CAPACITY_PIPELINE_LOCKS_VARIABLE = "MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS"
+CAPACITY_HTTP_OPTION = "--max-concurrency"
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +171,30 @@ def decode_mineru_capacity_config(payload: bytes) -> MineruCapacityConfig:
     return config
 
 
+def capacity_environment(config: MineruCapacityConfig) -> dict[str, str]:
+    """Project the requested values onto their startup environment consumers.
+
+    The result is a fresh mapping of the eleven numeric projections plus the
+    always-enabled pipeline lock flag. The config is revalidated at the byte
+    boundary first, so a forged or foreign object never projects.
+    """
+
+    encode_mineru_capacity_config(config)
+    values = {
+        variable: str(getattr(config, field))
+        for variable, field in CAPACITY_ENVIRONMENT_FIELDS
+    }
+    values[CAPACITY_PIPELINE_LOCKS_VARIABLE] = "1"
+    return values
+
+
+def capacity_http_arguments(config: MineruCapacityConfig) -> tuple[str, str]:
+    """Project the shared serving-loop HTTP limit onto the API command line."""
+
+    encode_mineru_capacity_config(config)
+    return (CAPACITY_HTTP_OPTION, str(config.final_http_limit_per_loop))
+
+
 def _positive_int(name: str, value: object, maximum: int) -> None:
     if type(value) is not int or not 1 <= value <= maximum:
         raise ValueError(f"MinerU capacity config {name} must be within 1..{maximum}")
@@ -169,7 +215,12 @@ def _reject_constant(value: str) -> Any:
 
 __all__ = [
     "CAPACITY_CONFIG_CONTRACT",
+    "CAPACITY_ENVIRONMENT_FIELDS",
+    "CAPACITY_HTTP_OPTION",
+    "CAPACITY_PIPELINE_LOCKS_VARIABLE",
     "MineruCapacityConfig",
+    "capacity_environment",
+    "capacity_http_arguments",
     "decode_mineru_capacity_config",
     "encode_mineru_capacity_config",
 ]

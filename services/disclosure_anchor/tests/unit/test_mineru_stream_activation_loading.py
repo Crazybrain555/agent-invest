@@ -162,13 +162,34 @@ class MineruStreamActivationLoadingTests(unittest.TestCase):
         self.assertEqual((decision.target, decision.reason), (0, "pressure_unknown"))
         self.assertEqual(loaded.policy.qualified_max, 5)
 
-    def test_maximum_c_can_be_lower_than_n_but_never_above_n(self):
-        self.document["policy"]["qualified_max"] = 4
-        self.write()
-        self.assertEqual(self.load().policy.qualified_max, 4)
+    def test_remote_wait_ceiling_spans_n_through_p_without_changing_parse_slots(self):
+        # R20: C owns pre-POST/finalize waits too; N remains the API parse bound.
+        for ceiling in (1, 4, 5, 6):
+            with self.subTest(ceiling=ceiling):
+                self.document["policy"]["qualified_max"] = ceiling
+                self.write()
+                loaded = self.load()
+                self.assertEqual(loaded.policy.qualified_max, ceiling)
+                self.assertEqual(loaded.binding.capacity.parse_active_limit, 5)
+                self.assertEqual(loaded.binding.capacity.total_nonterminal_limit, 6)
+                self.assertEqual(
+                    MineruStreamPolicy(loaded.policy).evaluate(None, now=0).target, 0,
+                )
+        for ceiling in (0, -1, 7, True, 6.0, "6"):
+            with self.subTest(invalid_ceiling=ceiling):
+                self.document["policy"]["qualified_max"] = ceiling
+                self.write()
+                with self.assertRaises(ValueError):
+                    self.load()
+
+    def test_larger_wait_ceiling_preserves_independent_capacity_and_owner_checks(self):
         self.document["policy"]["qualified_max"] = 6
         self.write()
-        with self.assertRaisesRegex(ValueError, "exceeds selected parse capacity"):
+        with self.assertRaisesRegex(ValueError, "capacity differs"):
+            self.load(expected_capacity=replace(self.capacity, total_nonterminal_limit=7))
+        self.document["owner"]["process_start_ticks"] += 1
+        self.write()
+        with self.assertRaisesRegex(ValueError, "runtime/owner"):
             self.load()
 
     def test_capacity_and_runtime_must_match_independent_authority(self):

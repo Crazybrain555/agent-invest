@@ -96,7 +96,8 @@ def load_mineru_stream_activation(
 
     Both independent expectations are required when enabled. This function does
     not obtain live owner/cgroup observations or prove a qualified maximum; it
-    only checks that the declared maximum fits the selected startup capacity.
+    only checks that the declared maximum fits the selected startup capacity's
+    nonterminal depth P (the remote-wait domain), not the parse slots N.
     File security, parsing and identity errors propagate, never disable silently.
     """
     if path is None and expected_sha256 is None:
@@ -145,8 +146,13 @@ def load_mineru_stream_activation(
         raise ValueError("stream policy differs from runtime/owner binding")
     if policy.sample_max_age_seconds < max(binding.api_max_age_seconds, binding.gpu_max_age_seconds):
         raise ValueError("stream policy maximum age is below a source maximum age")
-    if policy.qualified_max > expected_capacity.parse_active_limit:
-        raise ValueError("qualified stream maximum exceeds selected parse capacity")
+    # The ceiling bounds the worker's simultaneous remote waits (pre-POST,
+    # remote parse/finalize and terminal polling all hold one), whose structural
+    # domain is the accepted nonterminal depth P, not the parse slots N. A value
+    # above N does not add parse capacity; the API still admits at most N.
+    # The declared value stays a selected ceiling, never proof of qualification.
+    if policy.qualified_max > expected_capacity.total_nonterminal_limit:
+        raise ValueError("qualified stream maximum exceeds selected nonterminal capacity")
     return LoadedMineruStreamActivation(
         binding=binding, policy=policy, source_path=path,
         source_sha256="sha256:" + hashlib.sha256(payload).hexdigest(),

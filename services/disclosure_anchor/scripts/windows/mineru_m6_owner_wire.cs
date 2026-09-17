@@ -1,4 +1,4 @@
-// M6 v1 canonical closed wire on the already-qualified strict UTF-8 parser.
+// M6 canonical closed wire (request v2, bind by value) on the already-qualified strict UTF-8 parser.
 // No dynamic code, serializer type metadata, arbitrary dictionaries or commands.
 using System;
 using System.Collections.Generic;
@@ -6,7 +6,8 @@ using System.Text.RegularExpressions;
 
 public static class MineruM6OwnerWire {
     public const int MaximumWireBytes = 65536;
-    // A complete deposit request (envelope + receipt) must stay within MaximumWireBytes.
+    // A complete deposit or bind request (envelope + payload) must stay within MaximumWireBytes;
+    // the payload itself (receipt or canonical spec) is bounded here independently.
     public const int MaximumDepositReceiptBytes = 49152;
     static string Q(string text) { return MineruResidentWire.Quote(text); }
     static int ScalarLength(string text) {
@@ -108,21 +109,27 @@ public static class MineruM6OwnerWire {
     }
     public static string Request(string raw) {
         MineruJsonValue value=MineruResidentWire.Parse(raw,MaximumWireBytes);
-        string canonical=Shape(value,"contract_version:=m6.owner-request.v1","run_id:id","spec_sha256:hash",
+        string canonical=Shape(value,"contract_version:=m6.owner-request.v2","run_id:id","spec_sha256:hash",
             "request_id:id","command:command");
         if(canonical!=raw) throw new FormatException("M6 request is not complete canonical JSON");
-        if(value.Get("command").Get("kind").String()=="append") {
+        string kind=value.Get("command").Get("kind").String();
+        if(kind=="append") {
             MineruJsonValue producer=value.Get("command").Get("event");
             if(producer.Get("run_id").String()!=value.Get("run_id").String() ||
                 producer.Get("spec_sha256").String()!=value.Get("spec_sha256").String())
                 throw new FormatException("M6 request observation binding differs");
+        } else if(kind=="bind") {
+            // Bind by value: the envelope hash must name exactly the carried spec bytes.
+            byte[] spec=MineruResidentWire.Utf8.GetBytes(value.Get("command").Get("spec_utf8").String());
+            if(MineruResidentWire.Hash(spec)!=value.Get("spec_sha256").String())
+                throw new FormatException("M6 bind spec hash differs from payload");
         }
         return canonical;
     }
     public static string Command(MineruJsonValue value) {
         string kind=value.Get("kind").String();
         switch(kind) {
-            case "bind": return Shape(value,"kind:=bind","anchor_sha256:hash");
+            case "bind": return Shape(value,"kind:=bind","anchor_sha256:hash","spec_utf8:text");
             case "status": case "lease": case "open": case "stop": return Shape(value,"kind:="+kind);
             case "append": return Shape(value,"kind:=append","event:event");
             case "admission_closed": return Shape(value,"kind:=admission_closed","runner_epoch_sha256:hash",

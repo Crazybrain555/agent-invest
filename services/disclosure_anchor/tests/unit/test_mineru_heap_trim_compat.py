@@ -1268,32 +1268,17 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("function Get-StableServiceEpochs", installer)
         self.assertIn("Get-Command docker.exe -CommandType Application", installer)
         self.assertIn("Get-Command docker.exe -CommandType Application", collector)
-        helper_start = "# BEGIN MINERU NATIVE PROCESS V1"
-        helper_end = "# END MINERU NATIVE PROCESS V1"
+        helper_start = "# BEGIN MINERU NATIVE PROCESS V2"
+        helper_end = "# END MINERU NATIVE PROCESS V2"
         installer_helper = installer[
             installer.index(helper_start) : installer.index(helper_end) + len(helper_end)
         ]
-        collector_helper = collector[
-            collector.index(helper_start) : collector.index(helper_end) + len(helper_end)
-        ]
-        self.assertEqual(installer_helper, collector_helper)
+        # Installer resource management now has an operation deadline. Do not
+        # pin it to the legacy collector's unbounded reader implementation.
+        # Actual timeout, pipe flood, stdin and first-error behavior belongs to
+        # the independent Windows controlled-child suite.
         self.assertIn("function Invoke-NativeProcess", installer_helper)
         self.assertIn("Diagnostics.ProcessStartInfo", installer_helper)
-        self.assertIn("$process.ExitCode", installer_helper)
-        self.assertIn("$process.StandardOutput.ReadToEndAsync()", installer_helper)
-        self.assertIn("$process.StandardError.ReadToEndAsync()", installer_helper)
-        self.assertLess(
-            installer_helper.index("$process.StandardOutput.ReadToEndAsync()"),
-            installer_helper.index("$process.WaitForExit()"),
-        )
-        self.assertLess(
-            installer_helper.index("$process.StandardError.ReadToEndAsync()"),
-            installer_helper.index("$process.WaitForExit()"),
-        )
-        self.assertIn("$process.StandardInput.BaseStream.Write", installer_helper)
-        self.assertIn("[Text.Encoding]::UTF8.GetBytes($StandardInput)", installer_helper)
-        self.assertIn("# Cleanup is best-effort; preserve the original process error.", installer_helper)
-        self.assertIn("throw $originalError", installer_helper)
         self.assertIn("ConvertTo-WindowsCommandLineArgument", installer_helper)
         self.assertIn("function Assert-NativeProcessArguments", installer_helper)
         self.assertIn("$null -eq $argument", installer_helper)

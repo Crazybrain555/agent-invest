@@ -91,7 +91,7 @@ public static class MineruM6OwnerHost {
         readonly MineruM6OwnerDiagnostics diagnostics;
         readonly Dictionary<string,string> epochs=new Dictionary<string,string>(StringComparer.Ordinal);
         readonly string anchorRaw,anchorSha,mode,ownerEpoch,runId;
-        readonly long maximumLease,reserve;
+        readonly long maximumLease,reserve,bootstrapDeadline;
         readonly bool resume;
         MineruM6WriterGuard guard;
         MineruM6Journal journal;
@@ -106,8 +106,13 @@ public static class MineruM6OwnerHost {
             job=lifetime;resume=originalAnchorSha!="none";
             cfg.Keys("contract_version","run_id","run_root","mode","owner_source_sha256","expected_node_sha256","gpu_uuid",
                 "nvml_dll_sha256","port","resources","max_artifacts","max_artifact_bytes","maximum_lease_ticks",
-                "propagation_reserve_ticks","roles");
-            Require(S(cfg,"contract_version")=="m6.owner-deployment.v1","M6 deployment version");
+                "propagation_reserve_ticks","bootstrap_bind_seconds","roles");
+            Require(S(cfg,"contract_version")=="m6.owner-deployment.v2","M6 deployment version");
+            // An owner that is never bound must not idle until the hard deadline:
+            // the bootstrap bound is fixed from the original T0 and never renewed.
+            long bootstrapSeconds=cfg.Get("bootstrap_bind_seconds").Integer();
+            Require(bootstrapSeconds>=1 && bootstrapSeconds<=plannedSeconds+graceSeconds,"M6 bootstrap bind bound out of range");
+            bootstrapDeadline=checked(t0+checked(bootstrapSeconds*Stopwatch.Frequency));
             runId=S(cfg,"run_id");mode=S(cfg,"mode");
             MineruM6OwnerWire.Shape(MineruResidentWire.Parse(Obj("run_id",Q(runId),"mode",Q(mode),
                 "source",cfg.Get("owner_source_sha256").Raw,"node",cfg.Get("expected_node_sha256").Raw,
@@ -169,7 +174,14 @@ public static class MineruM6OwnerHost {
                 "M6 authenticated diagnostic reserve exhausted");
             store.Diagnostic(code,body);
         }
-        void Tick() { if(control!=null) control.Tick(); }
+        void Tick() {
+            if(control!=null) {control.Tick();return;}
+            if(Stopwatch.GetTimestamp()>=bootstrapDeadline) {
+                store.Diagnostic("bootstrap_bind_timeout",MineruResidentWire.Utf8.GetBytes(Obj("anchor_sha256",Q(anchorSha),
+                    "owner_epoch_sha256",Q(ownerEpoch),"qpc_ticks",N(Stopwatch.GetTimestamp()),"bootstrap_deadline_ticks",N(bootstrapDeadline))));
+                throw new MineruM6BootstrapTimeout();
+            }
+        }
         void AssertNativeClosure() {
             diagnostics.SealNoise();store.CloseReadPins();
             if(binaryPin!=null) {binaryPin.Dispose();binaryPin=null;}
@@ -180,11 +192,25 @@ public static class MineruM6OwnerHost {
         string Handle(string raw,MineruM6Principal principal) {
             MineruJsonValue request=MineruResidentWire.Parse(raw,65536);
             if(control==null) {
-                if(principal.Role!="controller" || S(request.Get("command"),"kind")!="bind")
-                    throw new MineruM6ControlRefusal("owner_not_bound");
-                if(S(request,"run_id")!=runId || S(request.Get("command"),"anchor_sha256")!=anchorSha)
-                    throw new MineruM6ControlRefusal("bind_identity_or_role_differs");
-                InitializeControl(S(request,"spec_sha256"));
+                // Bind by value. Authorization, closed shape, hash and anchor
+                // binding are all settled before the first private write.
+                if(principal.Role!="controller") throw new MineruM6ControlRefusal("unauthorized");
+                MineruJsonValue command=request.Get("command");
+                if(S(command,"kind")!="bind") throw new MineruM6ControlRefusal("owner_not_bound");
+                if(S(request,"run_id")!=runId || S(command,"anchor_sha256")!=anchorSha ||
+                    !epochs.ContainsKey(principal.Role) || epochs[principal.Role]!=principal.Epoch)
+                    throw new MineruM6ControlRefusal("bootstrap_binding_mismatch");
+                string specRaw=S(command,"spec_utf8"),specSha=S(request,"spec_sha256");
+                byte[] specBytes=MineruResidentWire.Utf8.GetBytes(specRaw);
+                if(H(specBytes)!=specSha) throw new MineruM6ControlRefusal("bootstrap_binding_mismatch");
+                MineruJsonValue spec;
+                try {spec=MineruM6OwnerBinding.Validate(specRaw,anchorRaw);}
+                catch(FormatException) {throw new MineruM6ControlRefusal("bootstrap_spec_invalid");}
+                if(S(spec,"mode")!=mode || S(spec,"run_id")!=runId) throw new MineruM6ControlRefusal("bootstrap_spec_invalid");
+                byte[] stored=store.Read("spec.json");
+                if(stored!=null && H(stored)!=specSha) throw new MineruM6ControlRefusal("stored_run_spec_differs");
+                if(stored==null) store.WriteImmutable("spec.json",specBytes);
+                InitializeControl(specSha);
             }
             string reply=control.Handle(raw,principal.Role,principal.Epoch);diagnostics.ObserveReply(raw,reply);return reply;
         }
@@ -258,9 +284,15 @@ public static class MineruM6OwnerHost {
             MineruJsonValue cfg=MineruResidentWire.Parse(MineruResidentWire.Utf8.GetString(ReadPrivate(args[0],args[1])),65536);
             using(Host host=new Host(job,cfg,args[1],args[2],t0,seconds,grace,hard,args[7])) host.Run();
             return 0;
+        } catch(MineruM6BootstrapTimeout) {
+            Console.Error.WriteLine("M6 owner was never bound within its bootstrap bound; exiting without a run");return 126;
         } catch(Exception error) {
             // Controlled parser/platform messages contain no config/token bytes.
             Console.Error.WriteLine(error.ToString());return 1;
         }
     }
+}
+
+public sealed class MineruM6BootstrapTimeout : IOException {
+    public MineruM6BootstrapTimeout() : base("M6 bootstrap bind bound passed while unbound") {}
 }

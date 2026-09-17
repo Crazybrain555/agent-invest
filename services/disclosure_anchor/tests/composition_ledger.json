@@ -404,6 +404,14 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_m6_bootstrap_wire_v2_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_m6_campaign_assembly_independent.py": {
+   "private_imports": [],
+   "tests": 12
+  },
   "tests/unit/test_m6_e2e_assembly_independent.py": {
    "private_imports": [],
    "tests": 10
@@ -447,6 +455,10 @@
   "tests/unit/test_m6_run_contract.py": {
    "private_imports": [],
    "tests": 8
+  },
+  "tests/unit/test_m6_run_spec_factory_independent.py": {
+   "private_imports": [],
+   "tests": 6
   },
   "tests/unit/test_m6_run_wiring_independent.py": {
    "private_imports": [],
@@ -778,6 +790,26 @@
    ],
    "tests": 8
   },
+  "tests/unit/test_mineru_release_binding_independent.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_mineru_release_compose_independent.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_mineru_release_install_independent.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_mineru_release_package_independent.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_mineru_release_projection_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_mineru_result_reservation_executor.py": {
    "private_imports": [],
    "tests": 1
@@ -804,7 +836,7 @@
   },
   "tests/unit/test_mineru_stream_activation_loading.py": {
    "private_imports": [],
-   "tests": 30
+   "tests": 31
   },
   "tests/unit/test_mineru_stream_backend_deferred.py": {
    "private_imports": [],
@@ -978,7 +1010,7 @@
   },
   "tests/unit/test_resident_owner_control.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 9
   },
   "tests/unit/test_resident_session_evidence.py": {
    "private_imports": [],
@@ -1156,7 +1188,7 @@
   },
   "tests/unit/test_staged_v4_capacity.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 7
   },
   "tests/unit/test_staged_worker_profile_v4.py": {
    "private_imports": [],

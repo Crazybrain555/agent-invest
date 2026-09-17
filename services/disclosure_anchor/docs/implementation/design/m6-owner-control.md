@@ -80,12 +80,17 @@ the run failed and stops delivery, because the owner journals the first
 variant and never re-accepts.
 
 Formal closure is composed from the same primitives. The controller
-(`cli/m6_run_control.py`) freezes the run spec from the owner's anchor and the
-frozen campaign inputs, binds it and opens admission. The spec file is written
-whole or not at all; a repeated bind with byte-identical inputs replays the
-owner's idempotent bind and checks the reply names this spec, while a
-different spec is refused, so a lost bind reply is recovered by readback and
-never by an alternate spec. The owner-bound campaign
+(`cli/m6_run_control.py`, or the campaign entry `cli/m6_campaign.py`) freezes
+the run spec through the one pure factory
+(`application/services/m6_run_spec_factory.build_run_spec`: the owner's anchor
+proves T0/clock/interval/resources/owner identity, the declared run intent
+supplies membership and phase, the release binding supplies the runtime
+identity), binds it **by value** in the `m6.owner-request.v2` bind command and
+opens admission. The spec file is written whole or not at all; a repeated bind
+with byte-identical inputs replays the owner's idempotent bind (same status,
+no new T0 or journal record) and checks the reply names this spec, while a
+different spec is refused (`stored_run_spec_differs`), so a lost bind reply is
+recovered by readback and never by an alternate spec. The owner-bound campaign
 (`staged_campaign --m6-run-dir`) first requires the frozen spec to name its
 manifest, scope, campaign and `e2e_publication` mode, then the loaded process
 profile, runtime bundle and worker profile, before any lock, database or
@@ -129,9 +134,16 @@ the existing business forwarding-only account intentionally forbids exec. Preser
 the existing GPU exporter port. No new SSH/firewall permissions are implied.
 
 Each request sends `M6-AUTH/1 <64 lowercase hex characters>` plus LF, then complete
-canonical `m6.owner-request.v1` bytes plus LF. A response is one canonical
+canonical `m6.owner-request.v2` bytes plus LF. A response is one canonical
 `m6.owner-reply.v1` line. The native protocol cap is 65,536 bytes per JSON body;
-its configured event cap must leave room for the reply envelope. The token comes
+its configured event cap must leave room for the reply envelope. The v2 bind
+command carries the exact canonical spec (`spec_utf8`, at most 49,152 UTF-8
+bytes, no control characters, hash equal to the envelope `spec_sha256`, run id
+equal to the envelope); the escaped whole request is bounded separately by the
+65,536-byte wire cap, and an oversized escaped bind is refused by the client
+before any exchange. Requests carrying `m6.owner-request.v1` are refused on both
+sides; journals, replies, status and receipts stay `v1`, so earlier evidence is
+readable offline and no live version fallback exists. The token comes
 from an owned private file and never appears in durable models or diagnostic
 exceptions. The owner must compare tokens without content-dependent early return,
 bind each token to its caller role/incarnation, and close unauthenticated requests
@@ -266,6 +278,12 @@ The fixed `mineru_m6_owner_host.cs` executable captures T0 at its first controll
 entry and enters its finite self-Job before reading the private deployment. Its
 eight arguments bind configuration path/hash, executable hash, planned seconds,
 close grace, memory bound, and the explicit original-deadline/anchor resume pair.
+The private deployment is `m6.owner-deployment.v2`; its one closed addition,
+`bootstrap_bind_seconds` (1..planned+grace, default 120 from the campaign
+intent), is the bound within which an unbound owner must receive its bind. At
+`T0 + bootstrap_bind_seconds` an unbound host writes the `bootstrap_bind_timeout`
+diagnostic and exits 126 (distinct from the watchdog's 124/125); the bound is
+fixed from the original T0 and never renewed.
 Build all production dependencies into that executable before a measured run;
 test libraries are not production dependencies. The immutable deployment binding
 contains only configuration and executable hashes. It does not contain tokens.
@@ -278,10 +296,17 @@ verify them and the content hash. Use the system machine identity, not optional
 environment variables, for the deployment host check. These requirements do not
 change SSH account policy or machine-wide PowerShell execution policy.
 
-For a fresh run, the controller publishes the canonical spec only after observing
-the original anchor; the host accepts only a matching controller bind before
-constructing control. A resumed process reads the existing spec and constructs
-recovered control before READY. READY advertises a flushed journal prefix length
+For a fresh run, the controller freezes the canonical spec only after observing
+the original anchor and sends it inside the bind request; nothing is uploaded
+ahead of the bind. The unbound host settles, in order and before any private
+write: the authenticated principal is the controller (else `unauthorized`),
+the command is `bind` (else `owner_not_bound`), run id, anchor hash, principal
+epoch and payload hash agree (`bootstrap_binding_mismatch`), the spec passes the
+closed canonical/anchor binding validation (`bootstrap_spec_invalid`), and any
+already stored `spec.json` is byte-identical (`stored_run_spec_differs`). Only
+then is `spec.json` written immutably, read back and control constructed. A
+resumed process reads the existing spec and constructs recovered control before
+READY. READY advertises a flushed journal prefix length
 and hash. The controller independently reads exactly that prefix, verifies its
 records and original owner chain, and only then constructs a recovered client.
 The journal writer permits read sharing; a concurrent read-only handle must allow
@@ -295,6 +320,44 @@ successful run then closes transport, journal, guard and credentials and writes 
 exit-intent explicitly marked as not externally verified. The controller must
 still verify the exact process handle and PID/birth. A watchdog exit, failed
 startup, socket EOF or missing external proof cannot establish successful closure.
+
+## Launcher parameter sets: Prepare, Run, Cancel
+
+`scripts/windows/run_mineru_m6_owner_host.ps1` is the only production parent of
+the owner host and has three parameter sets on one fresh campaign workspace
+(`<workspace_root>\m6-<run_id>`):
+
+- `-Prepare` creates `private`, `private\runs`, `private\staging` and
+  `private\attempts` through the qualified binary's own `CreatePrivateDirectory`
+  (owner SID + SYSTEM, protected DACL, must be new) and prints/writes
+  `m6.owner-workspace-prepare.v1` with each directory's SDDL. No secret exists at
+  this point; the controller validates the receipt (owner SID, `D:P`, only the
+  owner and SYSTEM allowed) and only then uploads the private deployment into
+  `private\staging` over the pinned sftp.
+- `-Run` re-validates every private ancestor, commits the staged deployment
+  (hash, closed `m6.owner-deployment.v2` structure, `run_id`, `run_root` equal
+  to `private\runs`, loopback port, bootstrap bound; owner set to this account;
+  atomic move; read-back of hash and ACL), creates the new attempt directory,
+  writes `process-start.json` (`m6.owner-external-start.v2`) and spawns the host
+  while holding its handle. The READY line must be exactly the seven fields with
+  the expected status/run/interval within `ReadyWaitSeconds` (default 30) or the
+  child is terminated through the held handle, reaped and the launcher exits 3.
+  Both pipes are drained continuously into bounded head/tail retention; the
+  attempt's `cancel.json` is polled every 250 ms; one deadline from spawn is
+  never renewed. `process-exit.json` (`m6.owner-external-exit.v2`) records the
+  actual exit code, forced termination and any accepted cancel.
+- `-Cancel` derives `m6.owner-cancel.v1` from the attempt's own
+  `process-start.json` (record hash, run, attempt, pid, creation time, binary
+  and configuration hashes, reason) and writes `cancel.json` create-new; an
+  identical repeat is idempotent, different content is refused (65). The running
+  launcher honours a cancel only when every field names its exact live instance
+  (pid and creation time of the handle it holds); a mismatching command is
+  recorded as rejected and ignored. There is no PID-only kill.
+
+Launcher exit codes: 0, 2 parameter, 3 READY deadline, 4 host non-zero, 65
+identity/ACL, 70 launcher failure; the last stdout line is one
+`M6-RESULT m6.owner-launcher-result.v1` JSON. The Mac composition root treats the
+local transport exit as no proof: it fetches `process-exit.json` and compares.
 
 ## Independent qualification entrypoints
 

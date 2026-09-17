@@ -17,6 +17,31 @@ from tests.unit.test_mineru_process_profile import _profile
 
 
 class StagedV4CapacityTests(unittest.TestCase):
+    def test_pending_depth_changes_remote_supply_without_reducing_tail_lanes(self) -> None:
+        # Literal cases deliberately hold parse concurrency and Mac tail capacity
+        # fixed. C may now reach P; P must remain an actual remote-wait capacity,
+        # not just a label on an unchanged N-sized pool.
+        for pending, primary in ((2, 15), (4, 17), (8, 21)):
+            with self.subTest(pending=pending):
+                profile = replace(_profile(), api_max_pending_tasks=pending)
+                worker = StagedWorkerProfileV4(profile.sha256, 3, 2)
+                limits = staged_v4_coordinator_limits(profile, worker_profile=worker)
+                database = staged_v4_database_concurrency(profile, worker_profile=worker)
+                self.assertEqual(profile.api_task_slots, 2)
+                self.assertEqual(limits.remote_workers, pending)
+                self.assertEqual(limits.credits.remote_waits, pending)
+                self.assertEqual(limits.admission_batch_size, pending)
+                self.assertEqual(limits.credits.provider_tasks, 72)
+                self.assertEqual(limits.credits.ack_items, 72)
+                self.assertEqual(limits.credits.materialization_items, 2)
+                self.assertEqual(
+                    (limits.local_prepare_workers, limits.local_workers,
+                     limits.commit_workers, limits.cleanup_workers, limits.ack_workers),
+                    (2, 2, 2, 2, 2),
+                )
+                self.assertEqual(database.primary_stage_checkouts, primary)
+                self.assertEqual(database.nested_commit_checkouts, 2)
+
     def test_every_credit_and_worker_limit_is_profile_derived(self) -> None:
         profile = _profile()
         limits = staged_v4_coordinator_limits(

@@ -4,9 +4,9 @@ Independent M6 native owner component suite runner (Windows PowerShell 5.1).
 
 .DESCRIPTION
 1. Fingerprints the compiler and the 12 production C# sources.
-2. Compiles the 12 production sources ALONE into the fixed owner executable
-   (csc.exe /noconfig /warnaserror+ /main:MineruM6OwnerHost) to prove they
-   build without test code, then compiles 4 test sources referencing that executable into
+2. Invokes the real production-only builder in a directory containing only the
+   independent literal twelve-file inventory and the builder, checks its receipt,
+   then compiles 4 test sources referencing that exact executable into
    the suite executable (/main:MineruM6NativeSuite).
 3. Runs the suite against the Python-generated wire vectors under a fresh
    disposable output root, then runs the finite self-Job child scenarios as
@@ -74,7 +74,7 @@ foreach ($forbidden in @("C:\ProgramData", "C:\Windows", "C:\Program Files")) {
     if ($OutputRoot.StartsWith($forbidden, [StringComparison]::OrdinalIgnoreCase)) { throw "output root must be a disposable location, not $forbidden" }
 }
 if (Test-Path -LiteralPath $OutputRoot) { throw "output root must be fresh: $OutputRoot" }
-foreach ($name in ($ProductionSources + $TestSources)) {
+foreach ($name in ($ProductionSources + $TestSources + @("build_mineru_m6_owner.ps1"))) {
     if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot $name) -PathType Leaf)) { throw "missing source: $name under $SourceRoot" }
 }
 if (-not (Test-Path -LiteralPath $FixturePath -PathType Leaf)) {
@@ -149,6 +149,19 @@ function Invoke-Native {
     finally { $process.Dispose() }
 }
 
+function Get-ProductionBuilderArguments {
+    param([string]$BuilderPath, [string]$SourcePath, [string]$DestinationPath, [string]$ExpectedSha='')
+    # PowerShell5.1 uses the machine OEM encoding unless selected explicitly.
+    # The independent held-process reader intentionally requires UTF8; set the
+    # child console contract before invoking the unmodified product script.
+    $code = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new(`$false); & '" + ($BuilderPath -replace "'","''") +
+        "' -SourceRoot '" + ($SourcePath -replace "'","''") + "' -OutputRoot '" + ($DestinationPath -replace "'","''") + "'"
+    if ($ExpectedSha -ne '') { $code += " -ExpectedProductionSourceManifestSha256 '" + ($ExpectedSha -replace "'","''") + "'" }
+    $code += '; if (-not $?) { exit 1 }'
+    return @('-NoProfile','-NonInteractive','-ExecutionPolicy','RemoteSigned','-EncodedCommand',
+        [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code)))
+}
+
 function Write-Utf8 {
     param([string]$Path, [string]$Text)
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
@@ -191,15 +204,90 @@ $CommonCscArguments = @(
 )
 $HostExe = Join-Path $BuildDir "mineru_m6_owner_host.exe"
 $SuiteExe = Join-Path $BuildDir "m6_native_suite.exe"
-$productionPaths = @($ProductionSources | ForEach-Object { Join-Path $SourceRoot $_ })
 $testPaths = @($TestSources | ForEach-Object { Join-Path $SourceRoot $_ })
+$ProductionInput = Join-Path $BuildDir "production-input"
+$ProductionOutput = Join-Path $BuildDir "production-output"
+[void](New-Item -ItemType Directory -Path $ProductionInput)
+# This is only a source/compiler prerequisite. No test.cs or test helper is
+# available to the real builder; the independent suite is compiled afterwards.
+foreach ($name in ($ProductionSources + @("build_mineru_m6_owner.ps1"))) {
+    Copy-Item -LiteralPath (Join-Path $SourceRoot $name) -Destination (Join-Path $ProductionInput $name)
+}
+$Builder = Join-Path $ProductionInput "build_mineru_m6_owner.ps1"
+$Evidence["production_builder_sha256"] = Get-Sha256File $Builder
+$buildArguments = Get-ProductionBuilderArguments $Builder $ProductionInput $ProductionOutput $Evidence.production_source_manifest_sha256
+Write-Host "compiling production-only source inventory through official builder"
+$hostBuild = Invoke-Native -FilePath (Join-Path $PSHOME "powershell.exe") -Arguments $buildArguments -TimeoutSeconds 330
+$Evidence["production_build"] = [ordered]@{
+    command = ($hostBuild.arguments -join " "); exit_code = $hostBuild.exit_code
+    stdout = $hostBuild.stdout; stderr = $hostBuild.stderr
+    exact_process_exited = $hostBuild.exact_process_exited; active_job_processes = $hostBuild.active_job_processes
+    forced_termination = $hostBuild.forced_termination; cleanup_failure = $hostBuild.cleanup_failure
+}
+$BuildReceiptPath = Join-Path $ProductionOutput "build-receipt.json"
+if ($hostBuild.exit_code -ne 0 -or -not $hostBuild.exact_process_exited -or
+    $hostBuild.active_job_processes -ne 0 -or $hostBuild.forced_termination -or
+    $hostBuild.cleanup_failure -or -not (Test-Path -LiteralPath $BuildReceiptPath -PathType Leaf)) {
+    throw ("official production builder failed: " + $hostBuild.stdout + $hostBuild.stderr)
+}
+$buildReceipt = Get-Content -LiteralPath $BuildReceiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$names = @($buildReceipt.sources.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+if (($names -join "|") -cne (($ProductionSources | Sort-Object) -join "|") -or
+    $buildReceipt.contract_version -cne "m6.owner-production-build.v1" -or $buildReceipt.status -cne "pass" -or
+    $buildReceipt.production_source_manifest_sha256 -cne $Evidence.production_source_manifest_sha256 -or
+    $buildReceipt.compiler_sha256 -cne $Evidence.compiler_sha256 -or $buildReceipt.compiler_exit_code -ne 0) {
+    throw "production build receipt differs from independent source/compiler identity"
+}
+foreach ($name in $ProductionSources) {
+    if ($buildReceipt.sources.PSObject.Properties[$name].Value -cne $Evidence.production_sources[$name]) {
+        throw ("production builder source mismatch: " + $name)
+    }
+}
+$compiledSourceNames = @($buildReceipt.compiler_arguments | Where-Object { $_ -like '*.cs' } |
+    ForEach-Object { Split-Path -Leaf $_ } | Sort-Object)
+if (($compiledSourceNames -join "|") -cne (($ProductionSources | Sort-Object) -join "|")) {
+    throw "production compiler did not receive exactly the independent twelve-file inventory"
+}
+$productionExe = Join-Path $ProductionOutput "mineru_m6_owner_host.exe"
+if ((Get-Sha256File $productionExe) -cne $buildReceipt.executable_sha256) { throw "production executable differs from receipt" }
+# The CLR resolves the referenced assembly beside the suite, so copy the
+# verified bytes there; this does not recompile or change the product binary.
+Copy-Item -LiteralPath $productionExe -Destination $HostExe
+if ((Get-Sha256File $HostExe) -cne $buildReceipt.executable_sha256) { throw "test staging changed the product binary" }
+$Evidence["production_build_receipt"] = $buildReceipt
+$Evidence["production_build_receipt_sha256"] = Get-Sha256File $BuildReceiptPath
+$Evidence["production_exe_sha256"] = Get-Sha256File $HostExe
 
-Write-Host "compiling production sources alone -> $HostExe"
-$hostBuild = Invoke-Native -FilePath $Csc -Arguments (@($CommonCscArguments) + @("/main:MineruM6OwnerHost", "/out:$HostExe") + $productionPaths) -TimeoutSeconds 300
-$Evidence["production_build"] = [ordered]@{ command = ($hostBuild.arguments -join " "); exit_code = $hostBuild.exit_code; stdout = $hostBuild.stdout; stderr = $hostBuild.stderr }
-Assert-True ($hostBuild.exit_code -eq 0 -and (Test-Path -LiteralPath $HostExe)) "production sources compile alone with /noconfig /warnaserror+"
-if ($hostBuild.exit_code -ne 0) { Write-Host $hostBuild.stdout; Write-Host $hostBuild.stderr }
-if (Test-Path -LiteralPath $HostExe) { $Evidence["production_exe_sha256"] = Get-Sha256File -Path $HostExe }
+# Independent early-failure cases also require an honest original-error receipt.
+# No production source is removed: only the fresh input copy is varied.
+$Evidence["production_build_rejections"] = @()
+foreach ($bad in @('wrong-source-manifest','missing-source')) {
+    $badInput = $ProductionInput
+    if ($bad -ceq 'missing-source') {
+        $badInput = Join-Path $BuildDir 'incomplete-production-input'
+        [void](New-Item -ItemType Directory -Path $badInput)
+        foreach ($name in ($ProductionSources | Where-Object { $_ -cne 'mineru_m6_owner_wire.cs' })) {
+            Copy-Item -LiteralPath (Join-Path $ProductionInput $name) -Destination (Join-Path $badInput $name)
+        }
+    }
+    $badOutput = Join-Path $BuildDir $bad
+    $badSha = if ($bad -ceq 'wrong-source-manifest') { 'sha256:' + ('0'*64) } else { '' }
+    $badArgs = Get-ProductionBuilderArguments $Builder $badInput $badOutput $badSha
+    $badRun = Invoke-Native -FilePath (Join-Path $PSHOME 'powershell.exe') -Arguments $badArgs -TimeoutSeconds 30
+    $badReceiptPath = Join-Path $badOutput 'build-receipt.json'
+    $rejection = [ordered]@{case=$bad;execution=$badRun;receipt=$null}
+    Assert-True ($badRun.exit_code -ne 0 -and $badRun.exact_process_exited -and
+        -not $badRun.forced_termination -and $badRun.active_job_processes -eq 0) ($bad + ' rejected and owned process closed')
+    Assert-True (Test-Path -LiteralPath $badReceiptPath -PathType Leaf) ($bad + ' has failure receipt')
+    if (Test-Path -LiteralPath $badReceiptPath -PathType Leaf) {
+        $badReceipt = Get-Content -LiteralPath $badReceiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $rejection.receipt = $badReceipt
+        $pattern = if ($bad -ceq 'missing-source') { 'missing production source.*mineru_m6_owner_wire' } else { 'source manifest differs' }
+        Assert-True ($badReceipt.status -ceq 'fail' -and $badReceipt.failure -match $pattern -and
+            $null -eq $badReceipt.executable_sha256) ($bad + ' preserves the original failure and grants no executable')
+    }
+    $Evidence.production_build_rejections += $rejection
+}
 
 Write-Host "compiling suite -> $SuiteExe"
 $suiteBuild = Invoke-Native -FilePath $Csc -Arguments (@($CommonCscArguments) + @("/main:MineruM6NativeSuite", "/out:$SuiteExe", "/r:$HostExe") + $testPaths) -TimeoutSeconds 300

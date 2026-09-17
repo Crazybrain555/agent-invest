@@ -1,0 +1,23 @@
+{
+  "contract_version": "mineru.deployment-profile.v1",
+  "project_name": "mineru-tailnet",
+  "base_image_repo_digest": "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
+  "api_image_reference": "agent-invest/mineru-api:3.4.4-serial-v1",
+  "api_device_profile": "cuda0",
+  "api_memory_limit_bytes": 32398557184,
+  "api_phase_trace": true,
+  "api_output_root_windows": "C:/ProgramData/agent-invest/mineru-api-output",
+  "api_task_retention_seconds": 600,
+  "api_task_cleanup_interval_seconds": 30,
+  "api_published_port": 30003,
+  "vllm_observability_published_port": 30001,
+  "inference_max_num_seqs": 128,
+  "inference_mm_processor_cache_gb": 0,
+  "inference_declared_defaults": {
+    "vllm_gpu_memory_utilization_millionths": 500000,
+    "vllm_tensor_parallel_size": 1,
+    "vllm_pipeline_parallel_size": 1,
+    "vllm_enforce_eager": false,
+    "vllm_enable_prefix_caching": true
+  }
+}

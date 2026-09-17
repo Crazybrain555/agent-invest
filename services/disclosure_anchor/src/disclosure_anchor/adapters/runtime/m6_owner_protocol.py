@@ -233,7 +233,9 @@ class M6OwnerClient:
             raise
 
     def bind(self) -> M6OwnerReply:
-        return self.request(M6BindOwner(anchor_sha256=self._anchor_sha))
+        """Bind by value: the exact canonical spec travels in the request (v2); no prior upload."""
+        return self.request(M6BindOwner(anchor_sha256=self._anchor_sha,
+                                        spec_utf8=self.spec.canonical_bytes().decode("utf-8")))
 
     def refresh_admission(self) -> bool:
         self.request(M6OwnerControl(kind="lease"))

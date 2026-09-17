@@ -233,6 +233,34 @@ public static class MineruM6WireTests {
             "append whose event run_id differs from request run_id");
     }
 
+    static string BindBoundaryRequest(string specText) {
+        string anchor = MineruM6NativeSuite.FS("service", "anchor");
+        string run = P(anchor).Get("run_id").String();
+        return "{\"command\":{\"anchor_sha256\":" + MineruResidentWire.Quote(MineruM6NativeSuite.Sha(anchor)) +
+            ",\"kind\":\"bind\",\"spec_utf8\":" + MineruResidentWire.Quote(specText) +
+            "},\"contract_version\":\"m6.owner-request.v2\",\"request_id\":\"boundary\",\"run_id\":" +
+            MineruResidentWire.Quote(run) + ",\"spec_sha256\":" + MineruResidentWire.Quote(MineruM6NativeSuite.Sha(specText)) + "}";
+    }
+
+    public static void Test13_BindV2PayloadIdentityShapeAndSeparateByteCaps() {
+        string good = MineruM6NativeSuite.FS("requests", "bind");
+        string spec = MineruM6NativeSuite.FS("service", "spec");
+        string missing = good.Replace(",\"spec_utf8\":" + MineruResidentWire.Quote(spec), "");
+        MineruM6NativeSuite.Check(missing != good, "missing-spec negative constructed");
+        string wrongHash = good.Replace(MineruM6NativeSuite.Sha(spec), MineruM6NativeSuite.LabelHash("wrong-spec"));
+        foreach (string bad in new string[] { good.Replace("m6.owner-request.v2", "m6.owner-request.v1"), missing, wrongHash }) {
+            MineruM6NativeSuite.Throws<FormatException>(delegate { MineruM6OwnerWire.Request(bad); }, "bind v2 rejects old shape or identity mismatch");
+        }
+        string unicode = new string('é', 24577);
+        string utf8Oversize = BindBoundaryRequest(unicode);
+        MineruM6NativeSuite.Check(unicode.Length < 49152 && MineruM6NativeSuite.Utf8.GetByteCount(unicode) > 49152 && MineruM6NativeSuite.Utf8.GetByteCount(utf8Oversize) < 65536, "payload byte cap isolated from scalar and full wire caps");
+        MineruM6NativeSuite.Throws<FormatException>(delegate { MineruM6OwnerWire.Request(utf8Oversize); }, "UTF8 payload over 49152");
+        string quoted = new string('"', 33000);
+        string escapedOversize = BindBoundaryRequest(quoted);
+        MineruM6NativeSuite.Check(MineruM6NativeSuite.Utf8.GetByteCount(quoted) < 49152 && MineruM6NativeSuite.Utf8.GetByteCount(escapedOversize) > 65536, "escaped whole-wire cap isolated from payload cap");
+        MineruM6NativeSuite.Throws<FormatException>(delegate { MineruM6OwnerWire.Request(escapedOversize); }, "escaped wire over 65536");
+    }
+
     public static void Test06_ReplyParsesWithClosedKeys() {
         MineruJsonValue reply = P(MineruM6NativeSuite.FS("reply", "canonical"));
         reply.Keys("contract_version", "error_code", "outcome", "record", "request_sha256", "status");

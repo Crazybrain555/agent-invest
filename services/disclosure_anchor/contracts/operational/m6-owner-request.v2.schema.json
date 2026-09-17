@@ -278,10 +278,17 @@
           "default": "bind",
           "title": "Kind",
           "type": "string"
+        },
+        "spec_utf8": {
+          "maxLength": 49152,
+          "minLength": 2,
+          "title": "Spec Utf8",
+          "type": "string"
         }
       },
       "required": [
-        "anchor_sha256"
+        "anchor_sha256",
+        "spec_utf8"
       ],
       "title": "M6BindOwner",
       "type": "object"
@@ -1056,7 +1063,7 @@
       "type": "object"
     }
   },
-  "$id": "urn:disclosure-anchor:operational:m6-owner-request.v1.schema.json",
+  "$id": "urn:disclosure-anchor:operational:m6-owner-request.v2.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -1098,8 +1105,8 @@
       "title": "Command"
     },
     "contract_version": {
-      "const": "m6.owner-request.v1",
-      "default": "m6.owner-request.v1",
+      "const": "m6.owner-request.v2",
+      "default": "m6.owner-request.v2",
       "title": "Contract Version",
       "type": "string"
     },

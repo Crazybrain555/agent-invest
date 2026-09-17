@@ -47,7 +47,7 @@ EXPECTED_FILES = {
     "m6-run-receipt.v1.schema.json": "m6.run-receipt.v1",
     "m6-service-run-receipt.v1.schema.json": "m6.service-run-receipt.v1",
     "m6-owner-anchor.v1.schema.json": "m6.owner-anchor.v1",
-    "m6-owner-request.v1.schema.json": "m6.owner-request.v1",
+    "m6-owner-request.v2.schema.json": "m6.owner-request.v2",
     "m6-owner-status.v1.schema.json": "m6.owner-status.v1",
     "m6-owner-reply.v1.schema.json": "m6.owner-reply.v1",
 }
@@ -84,7 +84,7 @@ class ClosedSchemaExportTests(unittest.TestCase):
         for filename, document in self.documents.items():
             self.assertEqual(document["$schema"], DRAFT, filename)
             self.assertEqual(document["$id"], ID_PREFIX + filename, filename)
-            self.assertTrue(filename.startswith("m6-") and filename.endswith(".v1.schema.json"), filename)
+            self.assertTrue(filename.startswith("m6-") and filename.endswith(".v2.schema.json" if filename.startswith("m6-owner-request.") else ".v1.schema.json"), filename)
             json.dumps(document, sort_keys=True)  # serialisable without custom encoders
             expected_version = EXPECTED_FILES[filename]
             version_schema = dict(document.get("properties", {})).get("contract_version")  # type: ignore[call-overload]
@@ -124,7 +124,7 @@ class ClosedSchemaExportTests(unittest.TestCase):
 
     def test_on_disk_exports_match_the_live_generator(self) -> None:
         root = _repo_root() / "contracts" / "operational"
-        present = {path.name for path in root.glob("m6-*.v1.schema.json")}
+        present = {path.name for path in root.glob("m6-*.schema.json")}
         self.assertEqual(present, set(EXPECTED_FILES), "canonical operational exports must be complete")
         for name in EXPECTED_FILES:
             path = root / name
@@ -168,7 +168,7 @@ class SchemaAcceptanceTests(unittest.TestCase):
             planned_seconds=spec.planned_seconds, deadline_ticks=spec.deadline_ticks,
             max_close_ticks=spec.max_close_ticks, resources=spec.resources)
         request = M6OwnerRequest(run_id=spec.run_id, spec_sha256=spec.canonical_sha256(), request_id="req-1",
-                                 command=M6BindOwner(anchor_sha256=anchor.canonical_sha256()))
+                                 command=M6BindOwner(anchor_sha256=anchor.canonical_sha256(), spec_utf8=spec.canonical_bytes().decode("utf-8")))
         status = M6OwnerStatus(run_id=spec.run_id, spec_sha256=spec.canonical_sha256(),
                                anchor_sha256=anchor.canonical_sha256(), owner_process_epoch_sha256=m6.OWNER_EPOCH,
                                observed_qpc_ticks=self.fixture.at(10), state="open", last_sequence=2,
@@ -202,7 +202,7 @@ class SchemaAcceptanceTests(unittest.TestCase):
             "m6-run-receipt.v1.schema.json": self.receipt,
             "m6-service-run-receipt.v1.schema.json": receipt_payload(),
             "m6-owner-anchor.v1.schema.json": anchor,
-            "m6-owner-request.v1.schema.json": request,
+            "m6-owner-request.v2.schema.json": request,
             "m6-owner-status.v1.schema.json": status,
             "m6-owner-reply.v1.schema.json": reply,
         }
@@ -261,11 +261,11 @@ class SchemaAcceptanceTests(unittest.TestCase):
         self.assert_rejects("m6-owner-reply.v1.schema.json", {**reply_wire, "record": {**reply_wire["record"], "stamp": {}}},
                             "a stamp without fields")
         request_wire = json.loads(request.canonical_bytes())
-        self.assert_rejects("m6-owner-request.v1.schema.json", {**request_wire, "command": {"kind": "exec", "argv": ["x"]}},
+        self.assert_rejects("m6-owner-request.v2.schema.json", {**request_wire, "command": {"kind": "exec", "argv": ["x"]}},
                             "an arbitrary command; the control protocol is closed")
-        self.assert_rejects("m6-owner-request.v1.schema.json", {**request_wire, "command": {"kind": "status", "token": "x"}},
+        self.assert_rejects("m6-owner-request.v2.schema.json", {**request_wire, "command": {"kind": "status", "token": "x"}},
                             "credentials inside a durable control model")
-        self.assert_accepts("m6-owner-request.v1.schema.json", {**request_wire, "command": {"kind": "status"}})
+        self.assert_accepts("m6-owner-request.v2.schema.json", {**request_wire, "command": {"kind": "status"}})
 
         self.assert_rejects("m6-service-quality-plan.v1.schema.json", {
             **service_plan, "required_checks": ["artifact_closure", *service_plan["required_checks"][1:]],

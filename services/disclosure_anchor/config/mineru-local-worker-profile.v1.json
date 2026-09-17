@@ -1,0 +1,43 @@
+{
+  "contract_version": "mineru.local-worker-profile.v1",
+  "mac_preflight_workers": 16,
+  "mac_finalize_workers": 2,
+  "provider_poll_milliseconds": 1000,
+  "admission_probe_milliseconds": 1000,
+  "commit_stage_seconds": 3600,
+  "archive_member_count_limit": 100000,
+  "stream_ceiling": 7,
+  "stream_source_ages": {
+    "api_max_age_seconds": 3.0,
+    "gpu_max_age_seconds": 8.0
+  },
+  "stream_policy": {
+    "gpu_pause_bytes": 536870912,
+    "gpu_reduce_bytes": 1073741824,
+    "gpu_recover_bytes": 1610612736,
+    "host_pause_bytes": 4294967296,
+    "host_recover_bytes": 6442450944,
+    "sample_max_age_seconds": 8.0,
+    "missing_pause_seconds": 10.0,
+    "recovery_seconds": 10.0,
+    "reduction_interval_seconds": 2.0
+  },
+  "process_ceilings": {
+    "source_pdf_bytes_limit": 134217728,
+    "rasterized_page_bytes_limit": 536870912,
+    "decoded_payload_bytes_limit": 2147483648,
+    "reorder_buffer_bytes_limit": 536870912,
+    "terminal_output_bytes_limit": 2147483648,
+    "temporary_disk_bytes_limit": 8589934592,
+    "db_staged_bytes_limit": 536870912,
+    "gpu_allocated_bytes_limit": 17094934528,
+    "resident_pages_limit": 16,
+    "unpublished_pages_limit": 4096,
+    "cpu_worker_threads": 3,
+    "raster_stage_slots": 1,
+    "layout_stage_slots": 1,
+    "postprocess_stage_slots": 1,
+    "native_owner_slots": 1,
+    "hybrid_ocr_override": false
+  }
+}

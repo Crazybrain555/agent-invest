@@ -51,9 +51,27 @@ class M6OwnerAnchor(M6ClosedModel):
             raise ValueError("owner source/device differs from frozen runtime")
 
 
+# The canonical spec travels inside the bind request; the escaped whole wire
+# (envelope + payload) is bounded separately by the transport's 65536 bytes.
+M6_BIND_SPEC_MAX_BYTES = 49152
+
+
 class M6BindOwner(M6ClosedModel):
     kind: Literal["bind"] = "bind"
     anchor_sha256: M6Hash
+    spec_utf8: Annotated[str, Field(min_length=2, max_length=M6_BIND_SPEC_MAX_BYTES)]
+
+    @model_validator(mode="after")
+    def canonical_spec(self) -> Self:
+        raw = self.spec_utf8.encode("utf-8")
+        if len(raw) > M6_BIND_SPEC_MAX_BYTES or any(byte < 32 or byte == 127 for byte in raw):
+            raise ValueError("bind spec exceeds its byte bound or contains control characters")
+        self.spec()
+        return self
+
+    def spec(self) -> M6RunSpec:
+        """The exact frozen spec these bytes denote (strict, canonical, closed)."""
+        return M6RunSpec.from_canonical_bytes(self.spec_utf8.encode("utf-8"), maximum_bytes=M6_BIND_SPEC_MAX_BYTES)
 
 
 class M6OwnerControl(M6ClosedModel):
@@ -148,7 +166,7 @@ M6OwnerCommand = Annotated[
 
 
 class M6OwnerRequest(M6ClosedModel):
-    contract_version: Literal["m6.owner-request.v1"] = "m6.owner-request.v1"
+    contract_version: Literal["m6.owner-request.v2"] = "m6.owner-request.v2"
     run_id: M6Id
     spec_sha256: M6Hash
     request_id: M6Id
@@ -156,6 +174,12 @@ class M6OwnerRequest(M6ClosedModel):
 
     @model_validator(mode="after")
     def observation_binding(self) -> Self:
+        if isinstance(self.command, M6BindOwner):
+            raw = self.command.spec_utf8.encode("utf-8")
+            if "sha256:" + hashlib.sha256(raw).hexdigest() != self.spec_sha256:
+                raise ValueError("owner request binds spec bytes whose hash differs from spec_sha256")
+            if self.command.spec().run_id != self.run_id:
+                raise ValueError("owner request binds a spec frozen for a different run")
         if isinstance(self.command, M6AppendObservation) and (
             self.command.event.run_id != self.run_id or self.command.event.spec_sha256 != self.spec_sha256
         ):

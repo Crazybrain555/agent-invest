@@ -38,7 +38,7 @@ def operational_m6_schema_documents() -> dict[str, dict[str, Any]]:
         "m6-run-receipt.v1.schema.json": M6RunReceipt,
         "m6-service-run-receipt.v1.schema.json": M6ServiceRunReceipt,
         "m6-owner-anchor.v1.schema.json": M6OwnerAnchor,
-        "m6-owner-request.v1.schema.json": M6OwnerRequest,
+        "m6-owner-request.v2.schema.json": M6OwnerRequest,
         "m6-owner-status.v1.schema.json": M6OwnerStatus,
         "m6-owner-reply.v1.schema.json": M6OwnerReply,
     }

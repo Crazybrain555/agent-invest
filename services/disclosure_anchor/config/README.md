@@ -8,6 +8,8 @@
 | 文件 | 管什么 | 改完跑什么 |
 |---|---|---|
 | `watchlist.csv` | 股票池**导入快照**（真源是 DB 的 tracked_company，round22 改判）：一行一只票 + 按公司覆盖（lookback_days / sync_frequency / process_classes，空=继承全局） | 导入：`make track`（自动先 config-check；`DRY_RUN=1` 只看计划；`PRUNE_DRIFT=YES` 全量恢复）；DB 导出必须用 `make track-export OUT=/timestamped/path/watchlist.csv`，不会默认覆盖本文件 |
+| `mineru-deployment-profile.v1.json` | MinerU Windows 部署拓扑输入（镜像、设备 profile、内存上限、端口、engine 声明默认值）；Compose 由 `mineru_release build` 生成，不手工编辑 compose | `python -m disclosure_anchor.cli.mineru_release build ...`，再 `verify`；变更需重新安装/资格/绑定 |
+| `mineru-local-worker-profile.v1.json` | Mac 本地并发、探测/提交预算、C 候选上限（≤P，非资格证明）、stream 策略阈值、process profile 声明 ceiling | 同上；只影响 `bind` 产物与私有 overlay |
 | `processing_policy.json` | 全局处理策略：`process`=下载+解析；`register_only`=只登记元数据。r4(2026-07-15)：process 20 类，`equity_share_change` 为完整股本/流通/解禁台账进入 process；dividend/related_party/financing 仍 register_only，必要时按公司覆盖拉回。carrier 例外：中介载体即使共码命中 process 也不放行，除非把 intermediary_report 加进生效集合。title_noise 总闸仍是绝对门，r12 只保留 12 个没有新增金融事实的 hard pattern，其余 67 个事实/条件项恢复到 class/process/carrier 正常路径；r13 再恢复 6 条自我标识副本/序次重复项（英文版/（英文）/H股季报年报/ST 退市链第 N 次提示）共 18 条——含事实的主件感知去重仍待可靠关联键后实施 | `make config-check` + `make load-rules`，再重启/kickstart resident worker 并跑 doctor |
 
 池子的增删改查（CSV 导入与 API PUT 是整行 upsert：空可选字段=清除覆盖回继承，响应/输出会回显
