@@ -10,8 +10,10 @@ its original bytes still pass the product's own resident checks; the two-child
 supervision; and the rule that neither a summary exit code nor a valid
 measurement is a business acceptance.
 
-The resident positive below is composed from the product's own shared session
-fixture, so it is a structural positive, not a real-machine acceptance; genuine
+The resident positive below is one real owner session over the product's own
+shared session fixture: the owner writes the evidence directory and its result
+document, and only its transport, observer child and lane close are scripted. It
+is therefore a structural positive, not a real-machine acceptance; genuine
 short-session bytes replace it when an actual session exists.
 """
 
@@ -20,6 +22,7 @@ from datetime import timedelta
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import signal
 import sys
@@ -29,19 +32,22 @@ import unittest
 from unittest import mock
 
 from disclosure_anchor.adapters.runtime import m6_campaign_assembly as assembly
+from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
+    verify_synchronized_telemetry_observer,
+)
 from disclosure_anchor.application.contracts.m6_delivery_report import (
     M6_DELIVERY_REPORT_MAX_BYTES, M6DeliveryReport,
 )
-from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu_v4
 from disclosure_anchor.application.contracts.resident_session_evidence import (
-    artifact_sha256, canonical_bytes, check_resident_closure, check_resident_ready,
+    artifact_sha256, canonical_bytes,
 )
-from disclosure_anchor.application.contracts.synchronized_telemetry import SynchronizedTelemetryFrameV2
+from disclosure_anchor.application.contracts.synchronized_telemetry import (
+    SynchronizedTelemetryFrameV2, SynchronizedTelemetryFrameV3,
+)
 from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import (
     CAMPAIGN_PRIVATE_BINDING_CONTRACT,
 )
 from disclosure_anchor.application.services.m6_launch_budget import launch_transport_budget
-from disclosure_anchor.adapters.runtime import resident_telemetry_owner as owner_module
 from tests import m6_support as m6
 from tests.integration import m6_measured_campaign_independent as driver
 from tests._mineru_capacity_config_fixture import CAPACITY_BYTES
@@ -49,7 +55,7 @@ from tests.m6_delivery_support import campaign_intent_for_spec, empty_report_wir
 from tests.unit.test_resident_session_evidence import (
     _mapping_fixture, _resident_capacity, _resident_profile,
 )
-from tests.unit.test_resident_telemetry_owner import _fixture
+from tests.unit.test_resident_telemetry_owner import _fixture, run_owner_session
 from tests.unit.test_synchronized_telemetry_contract import HASH, HASH_B, HASH_C, RUN_ID, START, _frame
 
 
@@ -89,23 +95,50 @@ _RUNTIME_FIELDS = ("source_commit", "source_manifest_sha256", "runtime_bundle_id
                    "process_profile_sha256", "worker_profile_sha256", "deployment_qualification_sha256")
 
 
-def frame(*, lane="host_slow", sequence=0, started_ns=0, first=True, provenance=True, changes=()):
-    """One v2 frame from the shared contract fixture plus resident provenance."""
+# One source QPC origin for the fixture stream, far from the Mac monotonic values so the two
+# domains can never be confused for one another.
+NATIVE_ORIGIN_NS = 5_000_000_000_000
+
+
+def frame(*, lane="host_slow", sequence=0, started_ns=0, first=True, changes=()):
+    """One v3 frame from the shared contract fixture plus its own fresh-pull witness.
+
+    The witness belongs to this record's own request: the cursor is the lane's wire sequence
+    minus one, the native capture sits inside the exporter's own request bracket, and the Mac
+    request bracket sits inside the frame's collection bracket. A v3 frame cannot omit it.
+    """
     value = _frame(sequence=sequence, lane=lane, started_ns=started_ns, first=first).model_dump()
-    value["contract_version"] = "mineru.synchronized-telemetry-frame.v2"
-    if provenance:
-        value["resident_exporter_provenance"] = {
-            "exporter_source_sha256": HASH, "host_assignment_identity_sha256": ASSIGNMENT,
-            "boot_identity_sha256": BOOT, "exporter_process_epoch_sha256": HASH_C,
-            "wire_sequence": sequence + 1, "wire_observed_at_utc": value["clock"]["observed_at_utc"],
-            "wire_sampled_monotonic_ns": started_ns,
-        }
+    value["contract_version"] = "mineru.synchronized-telemetry-frame.v3"
+    wire, native = sequence + 1, NATIVE_ORIGIN_NS + started_ns
+    value["resident_exporter_provenance"] = {
+        "exporter_source_sha256": HASH, "host_assignment_identity_sha256": ASSIGNMENT,
+        "boot_identity_sha256": BOOT, "exporter_process_epoch_sha256": HASH_C,
+        "wire_sequence": wire, "wire_observed_at_utc": value["clock"]["observed_at_utc"],
+        "wire_sampled_monotonic_ns": native + 1_000,
+        "request_nonce": f"{wire:032x}", "after_sequence": wire - 1,
+        "local_request_monotonic_ns": started_ns + 1,
+        "local_response_monotonic_ns": started_ns + 999_999,
+        "native_request_received_monotonic_ns": native,
+        "native_capture_finished_monotonic_ns": native + 2_000,
+        "native_reply_started_monotonic_ns": native + 3_000,
+    }
     for path, replacement in changes:
         target = value
         for part in path[:-1]:
             target = target[part]
         target[path[-1]] = replacement
-    return SynchronizedTelemetryFrameV2.model_validate(value)
+    return SynchronizedTelemetryFrameV3.model_validate(value)
+
+
+def superseded_frame_record(**kwargs):
+    """The same measurement as a still-valid v2 record: the shape this driver no longer reads."""
+    value = frame(**kwargs).model_dump(mode="json")
+    value["contract_version"] = "mineru.synchronized-telemetry-frame.v2"
+    for name in ("request_nonce", "after_sequence", "local_request_monotonic_ns",
+                 "local_response_monotonic_ns", "native_request_received_monotonic_ns",
+                 "native_capture_finished_monotonic_ns", "native_reply_started_monotonic_ns"):
+        value["resident_exporter_provenance"].pop(name)
+    return canonical_bytes(value)
 
 
 class FakeChild:
@@ -136,62 +169,32 @@ class FakeChild:
         return self._exit
 
 
-def owner_journal(request, external, result, *, drop=(), rewrite=(), reindex=True):
-    """Write the evidence directory the owner retains, then its own hash index over it.
+def owner_journal(request, retained, *, drop=(), rewrite=(), reindex=True):
+    """Rewrite the owner's own retained directory with one mutation applied.
 
-    `drop` removes files after indexing (named but absent), `rewrite` replaces
-    bytes; `reindex` decides whether the index is recomputed over the rewritten
-    bytes, which separates a corrupted file from a forged index.
+    `retained` is exactly what a real owner session wrote, so nothing here composes the
+    product's result document or its file set by hand: a field the owner adds, or a contract
+    version it bumps, cannot keep agreeing with a stand-in that was never told about it.
+    `drop` removes files after indexing (named but absent), `rewrite` replaces bytes;
+    `reindex` decides whether the index is recomputed over the rewritten bytes, which
+    separates a corrupted file from a forged index.
     """
     directory = request.evidence_directory
-    directory.mkdir(parents=True, exist_ok=True)
-    files = {
-        "owner-intent.json": canonical_bytes({
-            "run_id": request.run_id, "duration_seconds": request.duration_seconds,
-            "source_hashes": dict(request.source_hashes),
-            "ssh_executable_sha256": request.ssh_executable_sha256,
-            "qualification": "diagnostic-only; external runtime qualification and full-hour acceptance remain separate",
-        }),
-        "process-profile.json": request.process_profile_bytes,
-        "local-sources.json": canonical_bytes({
-            name: {"file": f"local-source-{index}.py", "sha256": driver.digest(payload)}
-            for index, (name, payload) in enumerate(owner_module._local_sources().items())}),
-    }
-    readies, closures = {}, {}
-    for lane, plan in zip(("gpu_fast", "host_slow"), (request.gpu, request.host), strict=True):
-        first, last = external[lane]
-        files[lane + "-config.json"] = plan.config_bytes
-        files[lane + "-manifest.json"] = plan.manifest_bytes
-        files[lane + "-ready.stdout"] = canonical_bytes(first)
-        files[lane + "-closed.stdout"] = canonical_bytes(last)
-        files[lane + "-start.stdout"] = last["job_raw"].encode() + b"\r\n"
-        readies[lane] = check_resident_ready(
-            config_bytes=plan.config_bytes, ready_bytes=first["ready_raw"].encode(),
-            manifest_bytes=plan.manifest_bytes, expected_source_hashes=request.source_hashes)
-        closures[lane] = check_resident_closure(
-            ready=readies[lane], closed_bytes=last["closed_raw"].encode(),
-            job_bytes=last["job_raw"].encode(),
-            linux_closed_bytes=last["linux_closed_raw"].encode() if lane == "host_slow" else None)
-    cpu = check_combined_resident_cpu_v4(gpu_ready=readies["gpu_fast"], host_ready=readies["host_slow"],
-                                      gpu_closure=closures["gpu_fast"], host_closure=closures["host_slow"],
-                                      receipt=result.receipt, seal=result.seal)
+    # The owner writes its result last, so its own index never contains itself.
+    document = json.loads(retained["owner-result.json"])
+    files = {name: payload for name, payload in retained.items() if name != "owner-result.json"}
     for name, payload in rewrite:
         files[name] = payload
     index = {name: driver.digest(payload) for name, payload in files.items()}
     if not reindex:
         for name, _ in rewrite:
-            index[name] = driver.digest(dict(files)[name] + b" ")
+            index[name] = driver.digest(files[name] + b" ")
+    for path in sorted(directory.iterdir()):
+        path.unlink()
     for name, payload in files.items():
         if name not in drop:
             (directory / name).write_bytes(payload)
-    document = {
-        "contract_version": "mineru.resident-owner-diagnostic.v1", "run_id": request.run_id,
-        "observer_status": result.evidence_status,
-        "observer_receipt_sha256": driver.digest(canonical_bytes(result.receipt.model_dump(mode="json"))),
-        "observer_seal_sha256": driver.digest(canonical_bytes(result.seal.model_dump(mode="json"))),
-        "total_cpu_ns": cpu.total_cpu_ns, "within_two_percent": cpu.within_two_percent,
-        "evidence_sha256": index, "activation_authorized": False,
-    }
+    document = {**document, "evidence_sha256": index}
     (directory / "owner-result.json").write_bytes(canonical_bytes(document))
     return document
 
@@ -347,7 +350,6 @@ class MeasuredDriverFrameTests(unittest.TestCase):
             "frame_run_id": frame(changes=((("run_id",), "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),)),
             "frame_process_profile": frame(changes=((("process_profile_sha256",), HASH_C),)),
             "frame_runtime_bundle": frame(changes=((("runtime_bundle_identity_sha256",), HASH_C),)),
-            "frame_resident_provenance_absent": frame(provenance=False),
             "frame_boot_identity": frame(changes=((("resident_exporter_provenance", "boot_identity_sha256"),
                                                    "sha256:" + "9" * 64),)),
             "frame_host_assignment": frame(changes=(
@@ -367,7 +369,7 @@ class MeasuredDriverFrameTests(unittest.TestCase):
 
     def test_frame_probe_reads_whole_records_inside_its_head_bound(self):
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "frames.v2.jsonl"
+            path = Path(root) / driver.FRAME_V3_FILENAME
             self.assertEqual(driver.probe_frames(path), ())
             records = [canonical_bytes(frame(lane="gpu_fast", sequence=index,
                                              started_ns=index * 250_000_000,
@@ -383,7 +385,7 @@ class MeasuredDriverFrameTests(unittest.TestCase):
 
     def test_the_frame_gate_fails_closed_on_a_dead_owner_and_a_filled_head(self):
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "frames.v2.jsonl"
+            path = Path(root) / driver.FRAME_V3_FILENAME
             ticks = iter(range(0, 1000))
             wait = {"frames_path": path, "wait_seconds": 60, "sleep": lambda _: None,
                     "now": lambda: float(next(ticks)), **FROZEN}
@@ -401,11 +403,13 @@ class MeasuredDriverFrameTests(unittest.TestCase):
                 driver.await_trusted_frames(telemetry=FakeChild(), probe_bytes=len(host) + 1, **wait)
             self.assertIn("bounded frame head filled", str(filled.exception))
             gpu = canonical_bytes(frame(lane="gpu_fast", sequence=1).model_dump(mode="json"))
-            foreign = canonical_bytes(frame(lane="gpu_fast", sequence=2, provenance=False).model_dump(mode="json"))
+            foreign = canonical_bytes(frame(lane="gpu_fast", sequence=2, changes=(
+                (("resident_exporter_provenance", "boot_identity_sha256"), "sha256:" + "9" * 64),
+            )).model_dump(mode="json"))
             path.write_bytes(foreign + b"\n" + host + b"\n" + gpu + b"\n")
             first, rejected, session_first = driver.await_trusted_frames(telemetry=FakeChild(), **wait)
             self.assertEqual(sorted(first), ["gpu_fast", "host_slow"])
-            self.assertEqual(rejected, {"gpu_fast:frame_resident_provenance_absent": 1})
+            self.assertEqual(rejected, {"gpu_fast:frame_boot_identity": 1})
             # The session anchor is the first record written, trusted or not, never the first trusted one.
             self.assertEqual(session_first, min(f.clock.observed_at_utc for f in driver.probe_frames(path)))
 
@@ -453,8 +457,12 @@ class MeasuredDriverFrameTests(unittest.TestCase):
 
 class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
     def _session(self, root):
-        request, external, result = _fixture(Path(root))
-        return request, external, result
+        """One real owner session, and the exact bytes the product retained for it."""
+        request, external, result = _fixture(Path(root).resolve())
+        run_owner_session(request, external, result)
+        retained = {path.name: path.read_bytes()
+                    for path in sorted(request.evidence_directory.iterdir())}
+        return request, external, result, retained
 
     def _problems(self, request, result, document):
         return driver.resident_evidence_problems(
@@ -462,40 +470,99 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
             sampling_plan=result.plan, result_document=document,
         )
 
+    def _whole(self, request, result):
+        """The whole owner entry, with the receipt/seal digests computed the way `verify` does."""
+        problems, _ = driver.owner_evidence_problems(
+            request, frames=result.frames, receipt=result.receipt, seal=result.seal,
+            sampling_plan=result.plan,
+            receipt_sha256=artifact_sha256(canonical_bytes(result.receipt.model_dump(mode="json"))),
+            seal_sha256=artifact_sha256(canonical_bytes(result.seal.model_dump(mode="json"))))
+        return problems
+
+    def _rewrite_result(self, request, document):
+        (request.evidence_directory / "owner-result.json").write_bytes(canonical_bytes(document))
+
+    def test_the_actual_v3_stream_probes_into_a_trusted_pair_and_the_frozen_plan(self):
+        # Root's r6 counterexample: this driver probed the superseded v2 stream name and built
+        # a v2 frame from whatever it read, so an R22 run either raised eight validation errors
+        # on the real records or, at the real path, found no file at all - indistinguishable
+        # from two lanes that never sampled. Over the artifacts an owner session actually
+        # retains, probe, first trusted pair and plan pin have to compose as one sequence.
+        with tempfile.TemporaryDirectory() as root:
+            request, external, result, retained = self._session(root)
+            observer_run = request.observer_artifact_root / request.run_id
+            # The v4 protocol retains exactly one frame stream, and this driver must probe that
+            # name: the superseded v2 name is a file the observer never writes at all.
+            streams = sorted(item.name for item in observer_run.glob("frames.*.jsonl"))
+            self.assertEqual(streams, ["frames.v3.jsonl"])
+            self.assertEqual(driver.FRAME_V3_FILENAME, streams[0])
+            path = observer_run / driver.FRAME_V3_FILENAME
+            probed = driver.probe_frames(path)
+            self.assertEqual([record.contract_version for record in probed],
+                             ["mineru.synchronized-telemetry-frame.v3"] * len(result.frames))
+            profile = driver.decode_mineru_process_profile(request.process_profile_bytes)
+            frozen = {"run_id": request.run_id,
+                      "runtime_bundle_sha256": profile.runtime_bundle_identity_sha256,
+                      "process_profile_sha256": profile.sha256,
+                      "lane_identity": driver.lane_identities(request)}
+            first, rejected, session_first = driver.await_trusted_frames(
+                telemetry=FakeChild(), frames_path=path, wait_seconds=60,
+                sleep=lambda _: None, now=lambda: 0.0, **frozen)
+            self.assertEqual(sorted(first), ["gpu_fast", "host_slow"])
+            self.assertEqual(rejected, {})
+            self.assertEqual(session_first, min(record.clock.observed_at_utc for record in probed))
+            plan, plan_sha256, problems = driver.pin_sampling_plan(
+                observer_run=observer_run, request=request,
+                evidence_directory=request.evidence_directory,
+                # This fixture's own observer identity; `main` reads the live one, and that
+                # binding is decided in the plan cases.
+                local_clock_domain_sha256=result.plan.observer_clock_domain_identity_sha256)
+            self.assertEqual(problems, ())
+            self.assertEqual(plan.run_id, first["gpu_fast"].run_id)
+            self.assertEqual(plan_sha256, result.receipt.sampling_plan_sha256)
+            # A superseded record on this path is refused, not read. It is still a valid v2
+            # frame, which is why silently accepting one would score an R22 run from evidence
+            # that carries no request witness at all.
+            superseded = superseded_frame_record(lane="gpu_fast", sequence=3, first=False,
+                                                 started_ns=750_000_000)
+            SynchronizedTelemetryFrameV2.model_validate(json.loads(superseded))
+            path.write_bytes(superseded + b"\n")
+            with self.assertRaises(ValueError) as refused:
+                driver.probe_frames(path)
+            self.assertIn("mineru.synchronized-telemetry-frame.v3", str(refused.exception))
+
     def test_retained_resident_evidence_passes_the_owner_s_own_checks(self):
         with tempfile.TemporaryDirectory() as root:
-            request, external, result = self._session(root)
-            document = owner_journal(request, external, result)
+            request, external, result, retained = self._session(root)
+            document = owner_journal(request, retained)
             problems, facts = self._problems(request, result, document)
             self.assertEqual(problems, ())
             self.assertEqual(sorted(facts), ["gpu_fast", "host_slow", "total_cpu_ns", "within_two_percent"])
             self.assertTrue(facts["within_two_percent"])
             self.assertEqual(facts["total_cpu_ns"], document["total_cpu_ns"])
             self.assertNotEqual(facts["gpu_fast"]["session"], facts["host_slow"]["session"])
-            whole, _ = driver.owner_evidence_problems(
-                request, frames=result.frames, receipt=result.receipt, seal=result.seal,
-                sampling_plan=result.plan, receipt_sha256=document["observer_receipt_sha256"],
-                seal_sha256=document["observer_seal_sha256"])
-            self.assertEqual(whole, ())
+            # The contract the owner actually writes. This entry expected the superseded v1
+            # until r5, so an actual run would have been refused here for its version alone.
+            self.assertEqual(document["contract_version"], "mineru.resident-owner-diagnostic.v2")
+            self.assertEqual(document["receipt_version"], 4)
+            self.assertEqual(self._whole(request, result), ())
 
     def test_named_evidence_without_original_bytes_never_passes(self):
         with tempfile.TemporaryDirectory() as root:
-            request, external, result = self._session(root)
+            request, external, result, retained = self._session(root)
             # Root's counterexample: a complete index whose six raw lane files do not exist.
-            named = [name for name in owner_journal(request, external, result)["evidence_sha256"]
+            named = [name for name in owner_journal(request, retained)["evidence_sha256"]
                      if name.endswith(".stdout")]
             self.assertEqual(len(named), 6)
-            for name in named:
-                (request.evidence_directory / name).unlink()
             problems, facts = self._problems(request, result, owner_journal(
-                request, external, result, drop=tuple(named)))
+                request, retained, drop=tuple(named)))
             self.assertTrue(any(problem.startswith("resident_evidence_rejected:gpu_fast") for problem in problems))
             self.assertTrue(any(problem.startswith("resident_evidence_rejected:host_slow") for problem in problems))
             self.assertEqual(facts, {})
 
     def test_truncated_forged_and_foreign_evidence_are_each_rejected(self):
         with tempfile.TemporaryDirectory() as root:
-            request, external, result = self._session(root)
+            request, external, result, retained = self._session(root)
             good = canonical_bytes(external["gpu_fast"][1])
             cases = {
                 # Bytes changed under an unchanged index: the index read-back catches it first.
@@ -511,9 +578,7 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
             }
             for label, mutation in cases.items():
                 with self.subTest(case=label):
-                    for name in list(request.evidence_directory.glob("*")):
-                        name.unlink()
-                    document = owner_journal(request, external, result, **mutation)
+                    document = owner_journal(request, retained, **mutation)
                     problems, facts = self._problems(request, result, document)
                     self.assertTrue(any(problem.startswith("resident_evidence_rejected:gpu_fast")
                                         for problem in problems), problems)
@@ -522,8 +587,8 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
 
     def test_owner_result_claims_are_bound_to_the_independent_replay(self):
         with tempfile.TemporaryDirectory() as root:
-            request, external, result = self._session(root)
-            document = owner_journal(request, external, result)
+            request, external, result, retained = self._session(root)
+            document = owner_journal(request, retained)
             mismatched = {**document, "total_cpu_ns": document["total_cpu_ns"] + 1}
             problems, _ = self._problems(request, result, mismatched)
             self.assertEqual(problems, ("owner_result_cpu_differs_from_the_independent_replay",))
@@ -532,24 +597,105 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
             # The owner's own composition snapshot must still be this checkout's product source.
             drifted = canonical_bytes({"adapters.runtime.resident_telemetry_owner":
                                        {"file": "local-source-0.py", "sha256": HASH}})
-            document = owner_journal(request, external, result,
+            document = owner_journal(request, retained,
                                      rewrite=(("local-sources.json", drifted),))
             self.assertEqual(self._problems(request, result, document)[0],
                              ("owner_composition_source_differs_from_this_checkout",))
-            (request.evidence_directory / "owner-result.json").write_bytes(canonical_bytes(
-                {**document, "observer_receipt_sha256": HASH, "within_two_percent": False}))
-            whole, _ = driver.owner_evidence_problems(
-                request, frames=result.frames, receipt=result.receipt, seal=result.seal,
-                sampling_plan=result.plan, receipt_sha256=document["observer_receipt_sha256"],
-                seal_sha256=document["observer_seal_sha256"])
-            self.assertEqual([problem for problem in whole if problem.startswith("owner_result_differs")],
+            self._rewrite_result(request, {**document, "observer_receipt_sha256": HASH,
+                                           "within_two_percent": False})
+            self.assertEqual([problem for problem in self._whole(request, result)
+                              if problem.startswith("owner_result_differs")],
                              ["owner_result_differs:observer_receipt_sha256",
                               "owner_result_differs:within_two_percent"])
+            # v2 binds the owner's result to three further facts: the receipt protocol it
+            # replayed, the frozen plan's exact bytes and the original intent it retained. Each
+            # is compared with this driver's own value - the digest of the plan it replayed,
+            # and the owner's index entry for the intent, whose agreement with the bytes on
+            # disk the index read-back proves separately - so the version this entry accepts
+            # is not a label it takes on trust.
+            document = owner_journal(request, retained)
+            self.assertEqual(document["sampling_plan_sha256"],
+                             artifact_sha256(canonical_bytes(result.plan.model_dump(mode="json"))))
+            self.assertEqual(document["owner_intent_sha256"], artifact_sha256(
+                (request.evidence_directory / "owner-intent.json").read_bytes()))
+            for key, forged in (("contract_version", "mineru.resident-owner-diagnostic.v1"),
+                                ("contract_version", "mineru.resident-owner-diagnostic.v3"),
+                                ("contract_version", 2), ("contract_version", None),
+                                ("receipt_version", 3), ("sampling_plan_sha256", HASH),
+                                ("owner_intent_sha256", HASH_B)):
+                with self.subTest(key=key, forged=forged):
+                    self._rewrite_result(request, {**document, key: forged})
+                    self.assertIn("owner_result_differs:" + key, self._whole(request, result))
             (request.evidence_directory / "owner-result.json").unlink()
             with self.assertRaises(AssertionError):
                 driver.owner_evidence_problems(
                     request, frames=result.frames, receipt=result.receipt, seal=result.seal,
                     sampling_plan=result.plan, receipt_sha256=HASH, seal_sha256=HASH_B)
+
+
+class MeasuredDriverActualSessionTests(unittest.TestCase):
+    """This driver's own replay of one ACTUAL R22 session, when its originals are present.
+
+    Opt-in: `M6_R22_ACTUAL_SESSION_DIR` names a real telemetry-child session directory - the
+    staged request, the observer artifact root it names, and the owner evidence that session
+    retained. Every path opened here is read-only; the originals are never rewritten, reindexed
+    or moved. What it decides is narrow and exact: an actual session may be refused for its
+    measured CPU share and for nothing else. A version, provenance, identity, coverage or plan
+    mismatch on real bytes is a defect in this driver, not a property of the run.
+    """
+
+    SESSION_ENV = "M6_R22_ACTUAL_SESSION_DIR"
+    # The observer's own CPU share is the one criterion an actual session may fail here. The
+    # seal marks the run unsafe above two percent and the owner records that verdict, so all
+    # three names are the same measured fact seen from three places.
+    CPU_FAMILY = frozenset({"observer_overhead_above_two_percent",
+                            "owner_result_differs:observer_status",
+                            "owner_result_differs:within_two_percent"})
+
+    def setUp(self):
+        directory = os.environ.get(self.SESSION_ENV)
+        if not directory:
+            self.skipTest(self.SESSION_ENV + " is unset: no actual R22 session directory to replay")
+        self.session = Path(directory).resolve()
+
+    def test_an_actual_session_is_refused_for_its_measured_cpu_and_for_nothing_else(self):
+        document = driver.load_bounded(self.session / "telemetry-request.v2.json",
+                                       maximum=driver.MAX_REQUEST_BYTES)
+        request = driver.build_owner_request(document)
+        observer_run = request.observer_artifact_root / request.run_id
+        result = verify_synchronized_telemetry_observer(
+            artifact_root=request.observer_artifact_root, run_id=request.run_id, receipt_version=4)
+        # The same bounded head probe the live wait uses, over the stream this session wrote.
+        probed = driver.probe_frames(observer_run / driver.FRAME_V3_FILENAME)
+        self.assertTrue(probed, "the probe read no whole record from the actual frame stream")
+        self.assertEqual({record.contract_version for record in probed},
+                         {"mineru.synchronized-telemetry-frame.v3"})
+        profile = driver.decode_mineru_process_profile(request.process_profile_bytes)
+        frozen = {"run_id": request.run_id,
+                  "runtime_bundle_sha256": profile.runtime_bundle_identity_sha256,
+                  "process_profile_sha256": profile.sha256,
+                  "lane_identity": driver.lane_identities(request)}
+        self.assertEqual(len(driver.trusted_frames(result.frames, **frozen)), len(result.frames),
+                         "every original frame of an actual session must be usable evidence")
+        self.assertEqual(result.receipt.status, "complete")
+        _, _, plan_problems = driver.pin_sampling_plan(
+            observer_run=observer_run, request=request, evidence_directory=request.evidence_directory,
+            local_clock_domain_sha256=result.plan.observer_clock_domain_identity_sha256)
+        self.assertEqual(plan_problems, ())
+        problems, facts = driver.owner_evidence_problems(
+            request, frames=result.frames, receipt=result.receipt, seal=result.seal,
+            sampling_plan=result.plan,
+            receipt_sha256=artifact_sha256(canonical_bytes(result.receipt.model_dump(mode="json"))),
+            seal_sha256=artifact_sha256(canonical_bytes(result.seal.model_dump(mode="json"))))
+        self.assertEqual(set(problems) - self.CPU_FAMILY, set(),
+                         "an actual session was refused for something other than its CPU share")
+        # The CPU criterion itself is not relaxed here: the flag is exactly the independent
+        # replay's verdict, and the owner's own record has to agree with it.
+        owner = driver.load_bounded(request.evidence_directory / "owner-result.json",
+                                    maximum=driver.MAX_OWNER_RESULT_BYTES)
+        self.assertEqual("observer_overhead_above_two_percent" in problems,
+                         not facts["within_two_percent"])
+        self.assertEqual(facts["within_two_percent"], owner["within_two_percent"])
 
 
 class MeasuredDriverSupervisionTests(unittest.TestCase):

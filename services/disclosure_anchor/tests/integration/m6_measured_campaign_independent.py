@@ -40,7 +40,7 @@ from disclosure_anchor.adapters.runtime.resident_telemetry_owner import (
     ResidentLaneLaunch, ResidentTelemetryOwnerRequest, run_resident_telemetry_session,
 )
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
-    FRAME_FILENAME, verify_synchronized_telemetry_observer,
+    FRAME_V3_FILENAME, verify_synchronized_telemetry_observer,
 )
 from disclosure_anchor.application.contracts.m6_campaign_intent import M6CampaignIntent, decode_campaign_intent
 from disclosure_anchor.application.contracts.m6_delivery_report import (
@@ -57,7 +57,7 @@ from disclosure_anchor.application.contracts.resident_session_evidence import (
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
-    SynchronizedSamplingPlanV1, SynchronizedTelemetryFrameV2, parse_canonical_jsonl_artifact,
+    SynchronizedSamplingPlanV1, SynchronizedTelemetryFrameV3, parse_canonical_jsonl_artifact,
 )
 from disclosure_anchor.application.services import m6_launch_budget as assembly_budget
 from disclosure_anchor.application.services.m6_launch_budget import (
@@ -431,14 +431,13 @@ def frame_problems(frame, *, run_id, runtime_bundle_sha256, process_profile_sha2
         problems.append("frame_lane")
     else:
         identity = lane_identity[frame.lane]
+        # A v3 frame always carries its request witness; the model makes it mandatory, so the
+        # only question left here is whether it names this host's boot and assignment.
         provenance = frame.resident_exporter_provenance
-        if provenance is None:
-            problems.append("frame_resident_provenance_absent")
-        else:
-            if provenance.boot_identity_sha256 != identity["boot_identity_sha256"]:
-                problems.append("frame_boot_identity")
-            if provenance.host_assignment_identity_sha256 != identity["host_assignment_identity_sha256"]:
-                problems.append("frame_host_assignment")
+        if provenance.boot_identity_sha256 != identity["boot_identity_sha256"]:
+            problems.append("frame_boot_identity")
+        if provenance.host_assignment_identity_sha256 != identity["host_assignment_identity_sha256"]:
+            problems.append("frame_host_assignment")
     if frame.quality.status not in ("first", "on_time") or frame.quality.missed_deadlines:
         problems.append("frame_sample_quality")
     if frame.lane == "gpu_fast":
@@ -477,7 +476,9 @@ def probe_frames(path, *, maximum_bytes=MAX_FRAME_PROBE_BYTES):
     records = parse_canonical_jsonl_artifact(
         raw[: end + 1], label="observer frame probe", maximum_bytes=maximum_bytes,
     )
-    return tuple(SynchronizedTelemetryFrameV2.model_validate(record) for record in records)
+    # The stream this driver probes is the R22 observer's own v3 frame file; a superseded
+    # record on this path is refused here rather than read as evidence for a v4 run.
+    return tuple(SynchronizedTelemetryFrameV3.model_validate(record) for record in records)
 
 
 def frame_identity(frame):
@@ -984,9 +985,21 @@ def resident_evidence_problems(request, *, frames, receipt, seal, sampling_plan,
 def owner_evidence_problems(request, *, frames, receipt, seal, sampling_plan, receipt_sha256, seal_sha256):
     """The owner's result document and the original bytes behind every claim in it."""
     document = load_bounded(request.evidence_directory / "owner-result.json", maximum=MAX_OWNER_RESULT_BYTES)
+    index = document.get("evidence_sha256")
     problems = []
-    for key, expected in (("contract_version", "mineru.resident-owner-diagnostic.v1"),
-                          ("run_id", request.run_id), ("observer_receipt_sha256", receipt_sha256),
+    # The R22 owner writes v2, which binds its own result to three further facts: the receipt
+    # protocol it replayed, the exact frozen plan bytes, and the original intent it retained.
+    # Each expectation below is this driver's own value - the digest of the plan this driver
+    # replayed, and the owner's index entry for the intent, whose agreement with the bytes on
+    # disk `_pinned` proves separately. The version stays a literal here on purpose: importing
+    # the product's constant would make this validator agree with the product by construction.
+    for key, expected in (("contract_version", "mineru.resident-owner-diagnostic.v2"),
+                          ("run_id", request.run_id), ("receipt_version", RECEIPT_VERSION),
+                          ("sampling_plan_sha256",
+                           digest(canonical_bytes(sampling_plan.model_dump(mode="json")))),
+                          ("owner_intent_sha256",
+                           index.get("owner-intent.json") if type(index) is dict else None),
+                          ("observer_receipt_sha256", receipt_sha256),
                           ("observer_seal_sha256", seal_sha256), ("observer_status", "complete"),
                           ("within_two_percent", True), ("activation_authorized", False)):
         if document.get(key) != expected or type(document.get(key)) is not type(expected):
@@ -1218,7 +1231,9 @@ def main(argv=None):
 
         # Sampling must be proven by original frames from both lanes, never by a progress line.
         first, rejected, session_first = await_trusted_frames(
-            telemetry=telemetry, frames_path=observer_run / FRAME_FILENAME,
+            # `FRAME_FILENAME` is the superseded v2 stream; a v4 run writes the v3 one, and
+            # probing the wrong name looks exactly like two lanes that never sampled.
+            telemetry=telemetry, frames_path=observer_run / FRAME_V3_FILENAME,
             wait_seconds=allowances["first_frame_wait_seconds"], run_id=request.run_id,
             runtime_bundle_sha256=profile.runtime_bundle_identity_sha256,
             process_profile_sha256=profile.sha256, lane_identity=lane_identities(request),
