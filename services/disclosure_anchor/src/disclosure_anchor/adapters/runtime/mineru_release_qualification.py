@@ -9,6 +9,8 @@ M6 runtime identity.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from dataclasses import dataclass
 import hashlib
 import os
@@ -17,6 +19,7 @@ import sys
 from typing import Any
 
 from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
+from disclosure_anchor.application.contracts.mineru_capacity_config import capacity_environment
 from disclosure_anchor.adapters.runtime.mineru_release_package import (
     CAPACITY_INPUT_PATH,
     ReleaseIdentityError,
@@ -136,13 +139,15 @@ class StepResult:
     stderr_sha256: str
 
 
-def run_step(output: Path, label: str, argv: list[str], *, timeout_seconds: float) -> StepResult:
+def run_step(
+    output: Path, label: str, argv: list[str], *, timeout_seconds: float, environment: Mapping[str, str] | None = None,
+) -> StepResult:
     """Run one product executor as an owned bounded command; retain raw output."""
 
     write_new_json(output / f"{label}-command.json", {"argv": argv, "timeout_seconds": timeout_seconds})
     command = BoundedOwnerCommand(
         argv, timeout_seconds=timeout_seconds, maximum_bytes=_STEP_OUTPUT_BYTES,
-        environment=_product_env(), cwd=str(service_root()),
+        environment=dict(_product_env() if environment is None else environment), cwd=str(service_root()),
     )
     try:
         result = command.finish()
@@ -185,6 +190,10 @@ def qualify_release(
     capacity_sha = report.inputs.capacity.sha256
     root = service_root()
     python = sys.executable
+    # The smoke executor pins MINERU_PROCESSING_WINDOW_SIZE to the served window; the official entry
+    # supplies it from the release capacity through the one projection, never from an operator's shell.
+    step_env = _product_env()
+    step_env["MINERU_PROCESSING_WINDOW_SIZE"] = capacity_environment(report.inputs.capacity)["MINERU_PROCESSING_WINDOW_SIZE"]
     output.mkdir(mode=0o700)
     steps: list[StepResult] = []
 
@@ -204,7 +213,7 @@ def qualify_release(
             argv += ["--input", str(document.path), "--expected-input-sha256", document.expected_sha256]
         elif canary.fixture_input is not None:
             argv += ["--input", str(canary.fixture_input)]
-        result = run_step(output, label, argv, timeout_seconds=_SMOKE_TIMEOUT_SECONDS + 120)
+        result = run_step(output, label, argv, timeout_seconds=_SMOKE_TIMEOUT_SECONDS + 120, environment=step_env)
         steps.append(result)
         if result.exit_code != 0:
             raise ReleaseIdentityError(f"{label}: smoke executor exited {result.exit_code}")
@@ -223,7 +232,7 @@ def qualify_release(
             "--capacity-config", str(capacity_path), "--capacity-config-sha256", capacity_sha,
             "--mineru-bin", str(binding.mineru_bin), "--runtime-bundle-identity", bundle_identity,
         ]
-        result = run_step(output, label, argv, timeout_seconds=180)
+        result = run_step(output, label, argv, timeout_seconds=180, environment=step_env)
         steps.append(result)
         if result.exit_code != 0:
             raise ReleaseIdentityError(f"{label}: epoch freeze exited {result.exit_code}")
@@ -240,7 +249,7 @@ def qualify_release(
         "--epoch-before", str(output / "epoch-before.json"), "--epoch-after", str(output / "epoch-after.json"),
         "--receipt-out", str(output / "validation-final.json"),
     ]
-    result = run_step(output, "validation-receipt", receipt_argv, timeout_seconds=120)
+    result = run_step(output, "validation-receipt", receipt_argv, timeout_seconds=120, environment=step_env)
     steps.append(result)
     if result.exit_code != 0:
         raise ReleaseIdentityError(f"validation receipt builder exited {result.exit_code}")

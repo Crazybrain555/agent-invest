@@ -810,6 +810,10 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_mineru_release_qualification_independent.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/unit/test_mineru_result_reservation_executor.py": {
    "private_imports": [],
    "tests": 1
