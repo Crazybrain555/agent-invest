@@ -189,7 +189,7 @@ class ResidentTelemetryOwnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             request, external, result = _fixture(Path(directory).resolve())
             invalid = [replace(request, source_hashes={**request.source_hashes, "start_mineru_resident_telemetry.ps1": artifact_sha256(b"wrong")})]
-            for field, value in (("lane", "gpu_fast"), ("port", 30316), ("lifetime_ms", 7180001), ("lifetime_ms", 7190000)):
+            for field, value in (("lane", "gpu_fast"), ("port", 30316), ("lifetime_ms", 8380001), ("lifetime_ms", 8390000)):
                 config = json.loads(request.host.config_bytes)
                 config[field] = value
                 if field == "lifetime_ms":
@@ -200,8 +200,8 @@ class ResidentTelemetryOwnerTests(unittest.TestCase):
                     self._run(changed, external, result)
                 self.assertFalse(request.evidence_directory.exists())
             config = json.loads(request.host.config_bytes)
-            config["lifetime_ms"] = 7180000
-            config["backend"]["linux_config"]["lifetime_ms"] = 7180000
+            config["lifetime_ms"] = 8380000
+            config["backend"]["linux_config"]["lifetime_ms"] = 8380000
             owner._validate_request(replace(request, host=replace(request.host, config_bytes=canonical_bytes(config))))
 
     def test_journal_pins_private_new_only_directory_and_detects_replacement(self):
@@ -226,10 +226,11 @@ class ResidentTelemetryOwnerTests(unittest.TestCase):
             request = replace(request, ssh_executable=executable, ssh_executable_sha256=artifact_sha256(executable.read_bytes()))
             journal = owner._Journal(request.evidence_directory)
             try:
-                def create(command, *, timeout_seconds):
+                def create(command, *, timeout_seconds, lifetime_ceiling_seconds):
                     intent = json.loads((request.evidence_directory / "gpu_fast-start-intent.json").read_bytes())
                     self.assertEqual(intent["command"], command)
                     self.assertEqual(timeout_seconds, 140)
+                    self.assertEqual(lifetime_ceiling_seconds, 8400)
                     self.assertIn("IdentityFile=none", command)
                     return SimpleNamespace()
                 with patch.object(owner, "BoundedOwnerCommand", side_effect=create) as constructor:

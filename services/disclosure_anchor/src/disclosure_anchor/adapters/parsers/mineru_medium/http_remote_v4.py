@@ -245,6 +245,14 @@ class MinerUHttpRemoteV4:
                             ),
                         )
                     post_started = True
+                    # The instant the first real POST leaves this process; the
+                    # guard binds the note to its own attempt and lane.
+                    command.step_guard.note(
+                        "remote_post_send",
+                        fence_identity=intent.fence_identity,
+                        source_pdf_sha256=intent.source_pdf_sha256,
+                        submission_intent_sha256=intent.sha256,
+                    )
 
                 try:
                     status_code, exact = self._request_bytes(

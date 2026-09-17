@@ -117,7 +117,7 @@ class VerifierSupervisorIndependentTests(unittest.TestCase):
         public.is_drain_role, quality.is_drain_role = True, False
         return public, quality
 
-    def supervisor(self, batches, *, confirm=None, max_attempts=2):
+    def supervisor(self, batches, *, confirm=None, max_attempts=2, monotonic_ns=None):
         public, quality = self.assemblies()
         def source():
             return batches.pop(0) if batches else ()
@@ -132,8 +132,33 @@ class VerifierSupervisorIndependentTests(unittest.TestCase):
 
         qualify = mock.Mock(side_effect=qualification)
         supervisor = VerifierSupervisor(public=public, quality=quality, source=source,
-                                        confirm=confirm or confirmation, qualify=qualify, max_attempts=max_attempts)
+                                        confirm=confirm or confirmation, qualify=qualify, max_attempts=max_attempts,
+                                        **({} if monotonic_ns is None else {"monotonic_ns": monotonic_ns}))
         return supervisor, public, quality, qualify
+
+    def test_public_instant_and_identity_precede_quality_and_spool_wait(self):
+        clock = [100]
+        payload = self.payloads("a")[2]
+
+        def confirm(_attempt):
+            clock[0] = 140
+            return PublicOutcome(payload, b"public-bytes")
+
+        supervisor, public, _, qualify = self.supervisor(
+            [(ReadyAttempt("att-a", 1, 2, 2),)], confirm=confirm, monotonic_ns=lambda: clock[0],
+        )
+        public.record.side_effect = lambda *args, **kwargs: clock.__setitem__(0, 400)
+
+        def qualification(*_args):
+            clock[0] = 900
+            return QualityOutcome(self.payloads("a")[3])
+
+        qualify.side_effect = qualification
+        supervisor.step()
+        record = supervisor.status()["attempts"][0]
+        self.assertEqual(record["public_ns"], 140)
+        self.assertEqual(record["finished_ns"], 900)
+        self.assertEqual(record["public_confirmation_sha256"], payload.canonical_sha256())
 
     def test_evidence_flows_on_each_poll_and_drain_requires_exact_closed_set(self):
         supervisor, public, quality, _ = self.supervisor([
@@ -173,6 +198,8 @@ class VerifierSupervisorIndependentTests(unittest.TestCase):
                     pass
                 if phase == "public":
                     qualify.assert_not_called()
+                    self.assertIsNone(supervisor.status()["attempts"][0].get("public_ns"))
+                    self.assertIsNone(supervisor.status()["attempts"][0].get("public_confirmation_sha256"))
                 self.assertIn(str(error), json.dumps(supervisor.status()))
                 self.assertIsNotNone(supervisor.failed, "a caught per-attempt error must prevent successful terminal closure")
                 try:

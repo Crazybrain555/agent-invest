@@ -412,6 +412,10 @@
    "private_imports": [],
    "tests": 12
   },
+  "tests/unit/test_m6_delivery_report_independent.py": {
+   "private_imports": [],
+   "tests": 23
+  },
   "tests/unit/test_m6_e2e_assembly_independent.py": {
    "private_imports": [],
    "tests": 10
@@ -420,9 +424,19 @@
    "private_imports": [],
    "tests": 6
   },
+  "tests/unit/test_m6_measurement_independent.py": {
+   "private_imports": [],
+   "tests": 17
+  },
   "tests/unit/test_m6_owner_deposit_independent.py": {
    "private_imports": [],
    "tests": 6
+  },
+  "tests/unit/test_m6_owner_evidence_independent.py": {
+   "private_imports": [
+    "_Reader"
+   ],
+   "tests": 8
   },
   "tests/unit/test_m6_owner_fixture_generator.py": {
    "private_imports": [],
@@ -522,7 +536,7 @@
   },
   "tests/unit/test_m6_verifier_supervisor_independent.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 7
   },
   "tests/unit/test_mac_observer_identity.py": {
    "private_imports": [
@@ -1012,6 +1026,10 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_resident_lifetime_budget_independent.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_resident_owner_control.py": {
    "private_imports": [],
    "tests": 9
@@ -1118,7 +1136,7 @@
   },
   "tests/unit/test_stage_observation_independent.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 13
   },
   "tests/unit/test_staged_admission_observation.py": {
    "private_imports": [],
@@ -1156,7 +1174,7 @@
   },
   "tests/unit/test_staged_coordinator_backend_v4.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 13
   },
   "tests/unit/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],

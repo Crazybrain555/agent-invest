@@ -197,7 +197,7 @@ public static class MineruResidentWire {
         }
     }
     public static long Deadline(int milliseconds) {
-        if(milliseconds<1 || milliseconds>7200000) throw new ArgumentException("finite deadline required");
+        if(milliseconds<1 || milliseconds>8400000) throw new ArgumentException("finite deadline required");
         return checked(Stopwatch.GetTimestamp()+(long)Math.Ceiling(milliseconds*(decimal)Stopwatch.Frequency/1000));
     }
     public static int Remaining(long deadline) {
@@ -566,7 +566,7 @@ public sealed class MineruResidentEndpoint : IDisposable {
            !((requestedLane=="gpu_fast" && (cadenceMilliseconds==250 || cadenceMilliseconds==500)) ||
              (requestedLane=="host_slow" && cadenceMilliseconds==1000)) ||
            leaseMilliseconds<2000 || leaseMilliseconds>30000 || lifetimeMilliseconds<leaseMilliseconds ||
-           lifetimeMilliseconds>7190000 || responseMilliseconds<1 || responseMilliseconds>1000)
+           lifetimeMilliseconds>8390000 || responseMilliseconds<1 || responseMilliseconds>1000)
             throw new ArgumentException("invalid finite resident endpoint configuration");
         MineruJsonValue id=MineruResidentWire.Parse(identityJson,4096);
         id.Keys("exporter_source_sha256","host_assignment_identity_sha256","boot_identity_sha256",

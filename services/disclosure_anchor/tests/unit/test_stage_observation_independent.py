@@ -34,7 +34,9 @@ class Collector:
 class ObservationSinkTests(unittest.TestCase):
     def test_real_writer_drains_every_accepted_tail_and_joins(self):
         with tempfile.TemporaryDirectory() as tmp:
-            sink = JsonlStageObserver(Path(tmp), max_events=128, max_bytes=65536)
+            clock = {"source": "python.time.monotonic_ns", "implementation": "test-monotonic",
+                     "boot_session_uuid": "11111111-1111-4111-8111-111111111111"}
+            sink = JsonlStageObserver(Path(tmp), max_events=128, max_bytes=65536, clock_binding=clock)
             live = guard(sink)
             for i in range(50):
                 live.note('units_built', units=i)
@@ -45,6 +47,7 @@ class ObservationSinkTests(unittest.TestCase):
             self.assertEqual(summary['events_written'], len(rows))
             self.assertEqual(summary['bytes_written'], (Path(tmp)/'stage-events.jsonl').stat().st_size)
             self.assertEqual(summary['measurement_status'], 'complete')
+            self.assertEqual(summary['clock'], clock)
             self.assertFalse(sink._thread.is_alive())  # Actual thread, not mocked join.
             self.assertEqual(json.loads((Path(tmp)/'observation-summary.json').read_text()), summary)
 
@@ -171,6 +174,39 @@ class ProgressFailureTests(unittest.TestCase):
                 recorder.close()
 
 class SinkCloseProtocolTests(unittest.TestCase):
+    def test_producer_paused_before_enqueue_cannot_accept_after_close(self):
+        from disclosure_anchor.adapters.runtime import stage_observation as module
+        encoded, release = threading.Event(), threading.Event()
+        original = module._encode
+
+        def pause_payload(value):
+            raw = original(value)
+            if value.get("kind") == "units_built":
+                encoded.set()
+                if not release.wait(3):
+                    raise RuntimeError("independent producer barrier timed out")
+            return raw
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(module, "_encode", pause_payload):
+            sink = JsonlStageObserver(Path(tmp), max_events=8, max_bytes=4096)
+            producer = threading.Thread(target=lambda: guard(sink).note("units_built", units=1))
+            producer.start()
+            try:
+                self.assertTrue(encoded.wait(1))
+                summary = sink.close()
+                self.assertFalse(sink._thread.is_alive())
+            finally:
+                release.set()
+                producer.join(timeout=2)
+                if sink._thread.is_alive():
+                    sink.close()
+            self.assertFalse(producer.is_alive())
+            self.assertEqual(sink._queue.qsize(), 0, "a stopped writer cannot drain a post-close enqueue")
+            self.assertEqual(sink._counts["late_notes"], 1)
+            rows = (Path(tmp) / "stage-events.jsonl").read_text().splitlines()
+            self.assertEqual(len(rows), summary["events_written"])
+            self.assertEqual([json.loads(row)["kind"] for row in rows], ["observation_closed"])
+
     def test_close_timeout_eventually_releases_writer_after_io_recovers(self):
         from disclosure_anchor.adapters.runtime import stage_observation as module
         entered,release,recovered=threading.Event(),threading.Event(),threading.Event()

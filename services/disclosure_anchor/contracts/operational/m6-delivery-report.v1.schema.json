@@ -1,0 +1,1318 @@
+{
+  "$defs": {
+    "M6BusinessObligationsClosed": {
+      "additionalProperties": false,
+      "description": "Every claimed obligation's final disposition, its ACK/absence proof and the external exits.",
+      "properties": {
+        "ack_or_absence_proven": {
+          "title": "Ack Or Absence Proven",
+          "type": "boolean"
+        },
+        "admission_reconciled": {
+          "title": "Admission Reconciled",
+          "type": "boolean"
+        },
+        "admitted_attempts": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Admitted Attempts",
+          "type": "integer"
+        },
+        "all_closed": {
+          "title": "All Closed",
+          "type": "boolean"
+        },
+        "attempts_without_final": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 100000,
+          "title": "Attempts Without Final",
+          "type": "array"
+        },
+        "external_owner_exit_verified": {
+          "title": "External Owner Exit Verified",
+          "type": "boolean"
+        },
+        "final_attempts": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Final Attempts",
+          "type": "integer"
+        },
+        "local_children_reaped": {
+          "title": "Local Children Reaped",
+          "type": "boolean"
+        },
+        "missing": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Missing",
+          "type": "array"
+        },
+        "ownership_closed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6OwnershipClosed"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_open": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 100000,
+          "title": "Remote Open",
+          "type": "array"
+        },
+        "run_closed_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "deadline_drained",
+                "stop_requested",
+                "failed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Run Closed Reason"
+        }
+      },
+      "required": [
+        "all_closed",
+        "admitted_attempts",
+        "final_attempts",
+        "attempts_without_final",
+        "remote_open",
+        "ack_or_absence_proven",
+        "admission_reconciled",
+        "ownership_closed",
+        "run_closed_reason",
+        "external_owner_exit_verified",
+        "local_children_reaped",
+        "missing"
+      ],
+      "title": "M6BusinessObligationsClosed",
+      "type": "object"
+    },
+    "M6DeliveryEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "items": {
+            "$ref": "#/$defs/M6EvidenceInput"
+          },
+          "maxItems": 100000,
+          "title": "Inputs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "inputs"
+      ],
+      "title": "M6DeliveryEvidence",
+      "type": "object"
+    },
+    "M6DeliveryMainWindow": {
+      "additionalProperties": false,
+      "description": "The plan's frozen interval in owner ticks; rates use the plan span, never the observed interval.",
+      "properties": {
+        "documents": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Documents",
+          "type": "integer"
+        },
+        "documents_per_hour": {
+          "maximum": 1000000000000000.0,
+          "minimum": 0.0,
+          "title": "Documents Per Hour",
+          "type": "number"
+        },
+        "end_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "End Ticks",
+          "type": "integer"
+        },
+        "excluded": {
+          "$ref": "#/$defs/M6WindowExclusions"
+        },
+        "pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Pages",
+          "type": "integer"
+        },
+        "pages_per_minute": {
+          "maximum": 1000000000000000.0,
+          "minimum": 0.0,
+          "title": "Pages Per Minute",
+          "type": "number"
+        },
+        "span_seconds": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Span Seconds",
+          "type": "integer"
+        },
+        "start_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Start Ticks",
+          "type": "integer"
+        },
+        "sub_windows": {
+          "items": {
+            "$ref": "#/$defs/M6SubWindow"
+          },
+          "maxItems": 1440,
+          "title": "Sub Windows",
+          "type": "array"
+        }
+      },
+      "required": [
+        "start_ticks",
+        "end_ticks",
+        "span_seconds",
+        "documents",
+        "pages",
+        "documents_per_hour",
+        "pages_per_minute",
+        "sub_windows",
+        "excluded"
+      ],
+      "title": "M6DeliveryMainWindow",
+      "type": "object"
+    },
+    "M6Drain": {
+      "additionalProperties": false,
+      "description": "Credit that closed after the admission deadline: whole-run only, never the main window.",
+      "properties": {
+        "documents": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Documents",
+          "type": "integer"
+        },
+        "pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "documents",
+        "pages"
+      ],
+      "title": "M6Drain",
+      "type": "object"
+    },
+    "M6EvidenceInput": {
+      "additionalProperties": false,
+      "description": "One immutable file the report was derived from, by the exact bytes read.",
+      "properties": {
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "M6EvidenceInput",
+      "type": "object"
+    },
+    "M6LatencyBySize": {
+      "additionalProperties": false,
+      "properties": {
+        "classes": {
+          "$ref": "#/$defs/M6LatencyClasses"
+        },
+        "clocks": {
+          "$ref": "#/$defs/M6LatencyClocks",
+          "default": {
+            "owner": "owner_qpc_received_ticks",
+            "stage": "mac_monotonic_ns"
+          }
+        },
+        "gates": {
+          "$ref": "#/$defs/M6LatencyGateResult"
+        },
+        "stage_timing": {
+          "$ref": "#/$defs/M6StageTiming"
+        }
+      },
+      "required": [
+        "classes",
+        "stage_timing",
+        "gates"
+      ],
+      "title": "M6LatencyBySize",
+      "type": "object"
+    },
+    "M6LatencyClass": {
+      "additionalProperties": false,
+      "description": "One size class: owner-tick measures, plus the stage-clock remote/public measures.\n\nThe owner measures are stamped by the physical owner; the stage measures are\nstamped by the Mac runner and verifier processes. The two clocks are never\nmixed inside one measure, and `remote_samples`/`public_samples` say how many\nattempts actually produced each stage measure.",
+      "properties": {
+        "admission_to_public_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6LatencyMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "admission_to_remote_accepted": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6LatencyMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "n": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "N",
+          "type": "integer"
+        },
+        "public_samples": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Public Samples",
+          "type": "integer"
+        },
+        "publication_committed_to_public_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6LatencyMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_accepted_to_publication_committed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6LatencyMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_post_to_terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6LatencyMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remote_resends": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Remote Resends",
+          "type": "integer"
+        },
+        "remote_samples": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Remote Samples",
+          "type": "integer"
+        },
+        "remote_terminal_failures": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Remote Terminal Failures",
+          "type": "integer"
+        },
+        "terminal_to_public_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6LatencyMeasure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "n",
+        "admission_to_remote_accepted",
+        "remote_accepted_to_publication_committed",
+        "publication_committed_to_public_confirmation",
+        "admission_to_public_confirmation",
+        "remote_post_to_terminal",
+        "terminal_to_public_confirmation",
+        "remote_samples",
+        "public_samples",
+        "remote_resends",
+        "remote_terminal_failures"
+      ],
+      "title": "M6LatencyClass",
+      "type": "object"
+    },
+    "M6LatencyClasses": {
+      "additionalProperties": false,
+      "properties": {
+        "long": {
+          "$ref": "#/$defs/M6LatencyClass"
+        },
+        "medium": {
+          "$ref": "#/$defs/M6LatencyClass"
+        },
+        "short": {
+          "$ref": "#/$defs/M6LatencyClass"
+        }
+      },
+      "required": [
+        "short",
+        "medium",
+        "long"
+      ],
+      "title": "M6LatencyClasses",
+      "type": "object"
+    },
+    "M6LatencyClocks": {
+      "additionalProperties": false,
+      "description": "The two clock domains a measure may be stamped by; they are never subtracted from each other.",
+      "properties": {
+        "owner": {
+          "const": "owner_qpc_received_ticks",
+          "default": "owner_qpc_received_ticks",
+          "title": "Owner",
+          "type": "string"
+        },
+        "stage": {
+          "const": "mac_monotonic_ns",
+          "default": "mac_monotonic_ns",
+          "title": "Stage",
+          "type": "string"
+        }
+      },
+      "title": "M6LatencyClocks",
+      "type": "object"
+    },
+    "M6LatencyGateResult": {
+      "additionalProperties": false,
+      "properties": {
+        "failed": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Failed",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "unknown"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "failed"
+      ],
+      "title": "M6LatencyGateResult",
+      "type": "object"
+    },
+    "M6LatencyMeasure": {
+      "additionalProperties": false,
+      "properties": {
+        "max_s": {
+          "maximum": 1000000000000000.0,
+          "minimum": 0.0,
+          "title": "Max S",
+          "type": "number"
+        },
+        "p95_s": {
+          "maximum": 1000000000000000.0,
+          "minimum": 0.0,
+          "title": "P95 S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "p95_s",
+        "max_s"
+      ],
+      "title": "M6LatencyMeasure",
+      "type": "object"
+    },
+    "M6OwnershipClosed": {
+      "additionalProperties": false,
+      "properties": {
+        "children_exited": {
+          "title": "Children Exited",
+          "type": "boolean"
+        },
+        "receipt_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Receipt Sha256",
+          "type": "string"
+        },
+        "residual_count": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Residual Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "residual_count",
+        "children_exited",
+        "receipt_sha256"
+      ],
+      "title": "M6OwnershipClosed",
+      "type": "object"
+    },
+    "M6PublicationMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "carry_in_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Carry In Pages",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "first_qualified_publication",
+          "default": "first_qualified_publication",
+          "title": "Kind",
+          "type": "string"
+        },
+        "whole_run_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Whole Run Pages",
+          "type": "integer"
+        },
+        "window_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "window_pages",
+        "whole_run_pages",
+        "carry_in_pages"
+      ],
+      "title": "M6PublicationMetrics",
+      "type": "object"
+    },
+    "M6PublicationQualified": {
+      "additionalProperties": false,
+      "properties": {
+        "documents": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Documents",
+          "type": "integer"
+        },
+        "pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Pages",
+          "type": "integer"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/M6QualifiedSource"
+          },
+          "maxItems": 10000,
+          "title": "Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "documents",
+        "pages",
+        "sources"
+      ],
+      "title": "M6PublicationQualified",
+      "type": "object"
+    },
+    "M6QualifiedSource": {
+      "additionalProperties": false,
+      "description": "One deduplicated source that earned first-qualified-publication credit.",
+      "properties": {
+        "attempt_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "credited_window",
+            "credited_whole_run_only"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "page_count": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Page Count",
+          "type": "integer"
+        },
+        "ready_received_ticks": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Ready Received Ticks"
+        },
+        "source_pdf_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Source Pdf Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_pdf_sha256",
+        "attempt_id",
+        "page_count",
+        "ready_received_ticks",
+        "outcome"
+      ],
+      "title": "M6QualifiedSource",
+      "type": "object"
+    },
+    "M6ResourceGates": {
+      "additionalProperties": false,
+      "properties": {
+        "gpu_free_min_bytes": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Gpu Free Min Bytes",
+          "type": "integer"
+        },
+        "oom_max": {
+          "const": 0,
+          "title": "Oom Max",
+          "type": "integer"
+        },
+        "preemption_max": {
+          "const": 0,
+          "title": "Preemption Max",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "gpu_free_min_bytes",
+        "oom_max",
+        "preemption_max"
+      ],
+      "title": "M6ResourceGates",
+      "type": "object"
+    },
+    "M6ResourceSafety": {
+      "additionalProperties": false,
+      "description": "`unknown` whenever the plan's gates cannot be measured from the supplied receipt.",
+      "properties": {
+        "evidence_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Evidence Sha256"
+        },
+        "gates": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/M6ResourceGates"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[^\\x00-\\x20\\x7f]+$",
+          "title": "Reason",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "unknown"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "gates",
+        "evidence_sha256",
+        "reason"
+      ],
+      "title": "M6ResourceSafety",
+      "type": "object"
+    },
+    "M6RunValidity": {
+      "additionalProperties": false,
+      "description": "The reduced journal's own verdict; `unknown` when no receipt could be produced.",
+      "properties": {
+        "deadline_ticks": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Deadline Ticks",
+          "type": "integer"
+        },
+        "duplicate_events": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Duplicate Events",
+          "type": "integer"
+        },
+        "evaluation_plan_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Evaluation Plan Sha256",
+          "type": "string"
+        },
+        "events_total": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Events Total",
+          "type": "integer"
+        },
+        "incomplete_reasons": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Incomplete Reasons",
+          "type": "array"
+        },
+        "intent_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Intent Sha256"
+        },
+        "invalid_reasons": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Invalid Reasons",
+          "type": "array"
+        },
+        "journal_prefix_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Journal Prefix Sha256"
+        },
+        "owner_epoch_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Owner Epoch Sha256"
+        },
+        "qpc_frequency_hz": {
+          "exclusiveMinimum": 0,
+          "maximum": 9223372036854775807,
+          "title": "Qpc Frequency Hz",
+          "type": "integer"
+        },
+        "spec_sha256": {
+          "maxLength": 71,
+          "minLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Spec Sha256",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "incomplete",
+            "invalid",
+            "unknown"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "t0_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "T0 Ticks",
+          "type": "integer"
+        },
+        "tclose_ticks": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tclose Ticks"
+        }
+      },
+      "required": [
+        "status",
+        "incomplete_reasons",
+        "invalid_reasons",
+        "spec_sha256",
+        "intent_sha256",
+        "evaluation_plan_sha256",
+        "journal_prefix_sha256",
+        "events_total",
+        "duplicate_events",
+        "owner_epoch_sha256",
+        "t0_ticks",
+        "deadline_ticks",
+        "tclose_ticks",
+        "qpc_frequency_hz"
+      ],
+      "title": "M6RunValidity",
+      "type": "object"
+    },
+    "M6ServiceDiagnostic": {
+      "additionalProperties": false,
+      "properties": {
+        "replay_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Replay Pages",
+          "type": "integer"
+        },
+        "validated_documents": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Validated Documents",
+          "type": "integer"
+        },
+        "validated_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Validated Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "validated_documents",
+        "validated_pages",
+        "replay_pages"
+      ],
+      "title": "M6ServiceDiagnostic",
+      "type": "object"
+    },
+    "M6ServiceMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "carry_in_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Carry In Pages",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "service_validated_source_pages",
+          "default": "service_validated_source_pages",
+          "title": "Kind",
+          "type": "string"
+        },
+        "replay_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Replay Pages",
+          "type": "integer"
+        },
+        "whole_run_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Whole Run Pages",
+          "type": "integer"
+        },
+        "window_pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "window_pages",
+        "whole_run_pages",
+        "replay_pages",
+        "carry_in_pages"
+      ],
+      "title": "M6ServiceMetrics",
+      "type": "object"
+    },
+    "M6StageTiming": {
+      "additionalProperties": false,
+      "description": "Whether the Mac stage observation could time this run at all, and why not.\n\n`measured` requires a complete, lossless observation, one agreed monotonic\nclock binding across the runner and verifier processes, and at least one\nattempt whose remote episode was timed end to end.",
+      "properties": {
+        "attempts_measured": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Attempts Measured",
+          "type": "integer"
+        },
+        "attempts_required": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Attempts Required",
+          "type": "integer"
+        },
+        "clock_binding_sha256": {
+          "anyOf": [
+            {
+              "maxLength": 71,
+              "minLength": 71,
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Clock Binding Sha256"
+        },
+        "notes_total": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Notes Total",
+          "type": "integer"
+        },
+        "observation_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "complete",
+                "partial",
+                "invalid"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observation Status"
+        },
+        "reasons": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\x00-\\x20\\x7f]+$",
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Reasons",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "measured",
+            "unknown"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "reasons",
+        "observation_status",
+        "clock_binding_sha256",
+        "attempts_required",
+        "attempts_measured",
+        "notes_total"
+      ],
+      "title": "M6StageTiming",
+      "type": "object"
+    },
+    "M6SubWindow": {
+      "additionalProperties": false,
+      "properties": {
+        "documents": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Documents",
+          "type": "integer"
+        },
+        "end_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "End Ticks",
+          "type": "integer"
+        },
+        "index": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Index",
+          "type": "integer"
+        },
+        "pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Pages",
+          "type": "integer"
+        },
+        "start_ticks": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Start Ticks",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "start_ticks",
+        "end_ticks",
+        "documents",
+        "pages"
+      ],
+      "title": "M6SubWindow",
+      "type": "object"
+    },
+    "M6WholeRun": {
+      "additionalProperties": false,
+      "properties": {
+        "documents": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Documents",
+          "type": "integer"
+        },
+        "elapsed_seconds": {
+          "anyOf": [
+            {
+              "maximum": 1000000000000000.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Elapsed Seconds"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "first_qualified_publication": "#/$defs/M6PublicationMetrics",
+                  "service_validated_source_pages": "#/$defs/M6ServiceMetrics"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/M6PublicationMetrics"
+                },
+                {
+                  "$ref": "#/$defs/M6ServiceMetrics"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Metrics"
+        },
+        "pages": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "documents",
+        "pages",
+        "metrics",
+        "elapsed_seconds"
+      ],
+      "title": "M6WholeRun",
+      "type": "object"
+    },
+    "M6WindowExclusions": {
+      "additionalProperties": false,
+      "description": "Why an admitted source is not in the main-window numerator; one bucket per accounting outcome.",
+      "properties": {
+        "after_deadline": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "After Deadline",
+          "type": "integer"
+        },
+        "carry_in": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Carry In",
+          "type": "integer"
+        },
+        "confirmation_missing": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Confirmation Missing",
+          "type": "integer"
+        },
+        "failed": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Failed",
+          "type": "integer"
+        },
+        "late_or_after_window": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Late Or After Window",
+          "type": "integer"
+        },
+        "not_first_publish": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Not First Publish",
+          "type": "integer"
+        },
+        "novelty_unverified": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Novelty Unverified",
+          "type": "integer"
+        },
+        "page_count_conflict": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Page Count Conflict",
+          "type": "integer"
+        },
+        "qualification_missing": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Qualification Missing",
+          "type": "integer"
+        },
+        "quality_not_scorable": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Quality Not Scorable",
+          "type": "integer"
+        },
+        "quality_review_pending": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Quality Review Pending",
+          "type": "integer"
+        },
+        "replay": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Replay",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "replay",
+        "carry_in",
+        "not_first_publish",
+        "late_or_after_window",
+        "after_deadline",
+        "failed",
+        "quality_not_scorable",
+        "quality_review_pending",
+        "confirmation_missing",
+        "page_count_conflict",
+        "novelty_unverified",
+        "qualification_missing"
+      ],
+      "title": "M6WindowExclusions",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-delivery-report.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One frozen plan scored against one run's immutable evidence.",
+  "properties": {
+    "business_obligations_closed": {
+      "$ref": "#/$defs/M6BusinessObligationsClosed"
+    },
+    "contract_version": {
+      "const": "m6.delivery-report.v1",
+      "default": "m6.delivery-report.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "delivery_pass": {
+      "title": "Delivery Pass",
+      "type": "boolean"
+    },
+    "drain": {
+      "$ref": "#/$defs/M6Drain"
+    },
+    "evidence": {
+      "$ref": "#/$defs/M6DeliveryEvidence"
+    },
+    "latency_by_size": {
+      "$ref": "#/$defs/M6LatencyBySize"
+    },
+    "main_window": {
+      "$ref": "#/$defs/M6DeliveryMainWindow"
+    },
+    "publication_qualified": {
+      "$ref": "#/$defs/M6PublicationQualified"
+    },
+    "resource_safety": {
+      "$ref": "#/$defs/M6ResourceSafety"
+    },
+    "run_validity": {
+      "$ref": "#/$defs/M6RunValidity"
+    },
+    "service_diagnostic": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/M6ServiceDiagnostic"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "unknowns": {
+      "items": {
+        "maxLength": 256,
+        "minLength": 1,
+        "pattern": "^[^\\x00-\\x20\\x7f]+$",
+        "type": "string"
+      },
+      "maxItems": 4096,
+      "title": "Unknowns",
+      "type": "array"
+    },
+    "whole_run": {
+      "$ref": "#/$defs/M6WholeRun"
+    }
+  },
+  "required": [
+    "run_validity",
+    "business_obligations_closed",
+    "publication_qualified",
+    "main_window",
+    "whole_run",
+    "drain",
+    "service_diagnostic",
+    "resource_safety",
+    "latency_by_size",
+    "unknowns",
+    "delivery_pass",
+    "evidence"
+  ],
+  "title": "M6DeliveryReport",
+  "type": "object"
+}

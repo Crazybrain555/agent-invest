@@ -17,6 +17,7 @@ from disclosure_anchor.adapters.runtime.m6_campaign_assembly import (
 from disclosure_anchor.adapters.runtime.resident_owner_control import BoundedOwnerCommand, OwnerCommandResult
 from tests import m6_owner_support as owner
 from tests import m6_support as m6
+from tests.m6_delivery_support import campaign_intent_for_spec, evaluation_plan
 
 
 def canonical(value):
@@ -44,15 +45,17 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                                   python_executable=Path(sys.executable), env_dir=root,
                                   mac_exclusive_lock_path=root / "campaign.lock",
                                   env_files=lambda: (root / "worker.env", root / "cninfo.env"))
-        intent = SimpleNamespace(run=SimpleNamespace(run_id=self.spec.run_id, planned_seconds=60,
-                                                     mode=self.spec.mode,
-                                                     manifest_sha256=self.spec.manifest_sha256, scope_sha256=self.spec.scope_sha256),
-                                 runner_stop_reserve_seconds=5, verifier_deadline_seconds=80, verifier_identity="test-verifier",
-                                 close_grace_seconds=30, binding_sha256=m6.digest("release-binding"),
-                                 release_manifest_sha256=m6.digest("release-manifest"))
-        inputs = SimpleNamespace(intent=intent, binding=binding, intent_sha256=m6.digest("intent"),
+        plan = evaluation_plan()
+        intent = campaign_intent_for_spec(
+            self.spec, plan, runner_stop_reserve_seconds=5, verifier_deadline_seconds=80, bootstrap_bind_seconds=60,
+            verifier_identity="test-verifier", close_grace_seconds=30,
+            binding_sha256=m6.digest("release-binding"), release_manifest_sha256=m6.digest("release-manifest"),
+        )
+        inputs = SimpleNamespace(intent=intent, binding=binding, intent_sha256=intent.canonical_sha256(),
+                                 intent_raw=intent.canonical_bytes(),
                                  manifest_path=root / "manifest.json", scope_path=root / "scope.json",
-                                 quality_plan_path=root / "quality.json", worker_env_sha256=m6.digest("worker-env"))
+                                 quality_plan_path=root / "quality.json", worker_env_sha256=m6.digest("worker-env"),
+                                 evaluation_plan=plan, evaluation_plan_raw=plan.canonical_bytes())
         assembly = M6CampaignAssembly(inputs, output=root / "output", mode=mode, attempt_id="attempt-1",
                                       launch=launch or Mock(), continuous_ns=lambda: 1_000_000_000)
         if create_output:
@@ -269,6 +272,13 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                     assembly._launcher = Mock()
                     assembly._controller = controller
                 prefix = "disclosure_anchor.adapters.runtime.m6_campaign_assembly."
+                def inspect_frozen_inputs():
+                    self.assertEqual((assembly._output / "campaign-intent.json").read_bytes(),
+                                     assembly._inputs.intent.canonical_bytes())
+                    self.assertEqual((assembly._output / "evaluation-plan.json").read_bytes(),
+                                     assembly._inputs.evaluation_plan_raw)
+                    frozen = json.loads((assembly._output / "campaign-inputs.json").read_bytes())
+                    self.assertEqual(frozen["intent_sha256"], assembly._inputs.intent.canonical_sha256())
                 ready = SimpleNamespace(anchor_sha256=self.anchor.canonical_sha256(),
                                         owner_epoch_sha256=self.anchor.owner_process_epoch_sha256)
                 status = owner.ScriptedOwner(self.spec, self.anchor, owner.ManualClock()).status(observed=self.spec.t0_ticks)
@@ -276,7 +286,7 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                       patch(prefix + "generate_roles", return_value={}),
                       patch(prefix + "write_run_directory"),
                       patch(prefix + "deployment_document", return_value={"declared": "private deployment"}),
-                      patch.object(assembly, "_prepare"), patch.object(assembly, "_stage_deployment", return_value="staged.json"),
+                      patch.object(assembly, "_prepare", side_effect=inspect_frozen_inputs), patch.object(assembly, "_stage_deployment", return_value="staged.json"),
                       patch.object(assembly, "_start_launcher", side_effect=start),
                       patch.object(assembly, "_await_ready", return_value=ready),
                       patch.object(assembly, "_bind_and_open", return_value=(self.spec, status, 1_000_000_000)),

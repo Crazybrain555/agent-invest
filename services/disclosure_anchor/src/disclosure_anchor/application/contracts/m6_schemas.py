@@ -6,6 +6,8 @@ from typing import Any
 
 from disclosure_anchor.application.contracts.m6_campaign import M6CampaignScope, M6CorpusManifest
 from disclosure_anchor.application.contracts.m6_common import M6ClosedModel
+from disclosure_anchor.application.contracts.m6_delivery_report import M6DeliveryReport
+from disclosure_anchor.application.contracts.m6_evaluation_plan import M6EvaluationPlan
 from disclosure_anchor.application.contracts.m6_document_qualification import (
     M6DocumentQualification, M6QualificationEvidence, M6QualityPlan,
 )
@@ -41,6 +43,8 @@ def operational_m6_schema_documents() -> dict[str, dict[str, Any]]:
         "m6-owner-request.v2.schema.json": M6OwnerRequest,
         "m6-owner-status.v1.schema.json": M6OwnerStatus,
         "m6-owner-reply.v1.schema.json": M6OwnerReply,
+        "m6-evaluation-plan.v1.schema.json": M6EvaluationPlan,
+        "m6-delivery-report.v1.schema.json": M6DeliveryReport,
     }
     result: dict[str, dict[str, Any]] = {}
     for filename, model in models.items():

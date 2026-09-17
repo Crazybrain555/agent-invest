@@ -1,6 +1,6 @@
 # M6 campaign 入口：一个 Mac 组合根、按值绑定的 spec 与跨机生命周期
 
-状态：implementation-contract（WP2，R20）。从属于 `m6-owner-control.md` 与 `mineru-release.md`；
+状态：implementation-contract（WP2/WP3，R20；R21 证明闭合候选）。从属于 `m6-owner-control.md` 与 `mineru-release.md`；
 不改变解析/模型/表格/发布/ACK 语义，也不引入新的账本、调度器或框架。
 
 ## 1. 决定
@@ -27,7 +27,7 @@
 
 | 输入 | 契约 | 说明 |
 | --- | --- | --- |
-| campaign intent | `m6.campaign-intent.v1`（canonical 字节即身份） | run 意图、runtime 身份引用、预算、`binding_sha256`、`release_manifest_sha256` |
+| campaign intent | `m6.campaign-intent.v2`（canonical 字节即身份） | run 意图、runtime 身份引用、预算、`binding_sha256`、`release_manifest_sha256`、`evaluation_plan_sha256`；v1 只读历史，不作新版冻结证明 |
 | 私有绑定 | `m6.campaign-private-binding.v1`（0600） | env 目录、service root、python、runtime root、pinned ssh/sftp、Windows 目标与 owner 二进制/launcher 哈希 |
 | 发布绑定 | WP1 `binding.json`（intent 钉住哈希） | source head、bundle/profile/qualification、`worker_env_sha256` 必须与实际 env 一致 |
 | 发布清单 | `m6.release.v1` | launcher 与 native 源清单哈希必须等于私有绑定所指 |
@@ -47,9 +47,96 @@ admission_reconciliation / ownership_closure 收据并 ACK，quality/public veri
 `drain-receipt.json` 发出唯一 `verifier_drained`，controller close；摘要钉住 `admitted_count=0`、
 `database_access=none`、`hidden_setup=false`。
 
+## 3a. WP3：冻结评估计划与派生交付报告（Pro R20 §4）
+
+- **一个冻结计划**：`m6.evaluation-plan.v1`（`application/contracts/m6_evaluation_plan.py`）固定主窗口
+  `[T0+start, T0+end)`、等分子窗口、readiness 规则（复用 accounting 的 ready tick：`max(document_qualified,
+  publication_committed, public_confirmation)`，最多 3 次观测）、信用排除（replay/carry-in/非首发，不回填 late quality）、
+  页数尺寸桶（short ≤50、medium 51–149、long ≥150）与可选的交付/延迟/资源门。计划 canonical 字节即身份。
+- **intent v2**：`m6.campaign-intent.v2` 新增必填 `evaluation_plan_sha256`；官方入口 `run|bootstrap-check --evaluation-plan`
+  在 Prepare 之前把 intent 原字节复制到 `<output>/campaign-intent.json`、计划复制到 `<output>/evaluation-plan.json`，
+  并把两者哈希写入 `campaign-inputs.json`（准入之前冻结，输出目录自包含）。`summary` 只读 `campaign-intent.json` 并按
+  `campaign-inputs.intent_sha256` 校验；字节不符即 identity 错误（65），不会改用别的副本；仅当该副本不存在（历史证据）才
+  经驱动器 `input-hashes.json` 索引按哈希查找。intent 必须标识整个 run：用 `build_run_spec(anchor, intent.run,
+  intent.runtime)` 重建 spec，canonical 哈希必须等于冻结的 `run/run-spec.json`。
+  `M6CampaignIntentV1` 保留只读解码（`decode_campaign_intent`），G0 证据仍可读；`M6RunSpec` 不变。
+- **只读证据回读**：`run` 模式在 owner 关闭后经 sftp 只读取回 `private\runs\<H(run_id)>` 的 `events.jsonl`
+  与 `admission-closed/resources-closed/exit-observation` 到 `<output>/native/`；取不到即 unknown，不写远端。
+- **`m6_campaign summary --run-dir --evaluation-plan --output`**：只读；用不变的 `reduce_m6_run` 从原始 journal、
+  verifier 不可变证据（`qualification-evidence.json`、`public-confirmation.json`、`private-history-audit.json`）、runner
+  闭合收据、owner 侧 sidecar、launcher 外部退出记录与 campaign summary 派生 `m6.delivery-report.v1`：`run_validity`、
+  `business_obligations_closed`、`publication_qualified`、`main_window`（3 个子窗口、按 outcome 的排除计数）、`whole_run`、
+  `drain`、`service_diagnostic`、`resource_safety`、`latency_by_size`（owner 事件延迟与下述同机 stage 端点延迟分别报告）、`unknowns`、`delivery_pass`。分母是原始 PDF 页数与去重的 source 哈希；缺失的资源/延迟证明是
+  unknown，不是 safe/fast；任何未闭合义务或外部退出缺证都使 `delivery_pass=false`。
+- **证明规则（独立测试固定）**：`run/run-spec.json` 与 `run/anchor.json` 是必需输入（缺失退出 64），其余证据缺失记入
+  `unknowns`。`delivery_pass` 只在 intent 为 v2 且冻结了所评分的计划、`run_validity=complete`、且下列每项控制证明都存在并
+  一致时为真：runner 收据 `status=complete`/`closure.complete`、runner 与 `native/admission-closed.json` 的 reconciliation 哈希
+  与计数同 journal 一致（未决 0、`last_producer_sequence` 等于 journal 内 runner 事件最大序号）、owner `resources_closed`
+  事件、runner 闭合块与 `native/resources-closed.json` 三方一致且残留 0、verifier `run-summary.json` 为 complete、
+  `verifier/drain-receipt.json` 哈希等于 journal `verifier_drained` 所记、launcher 外部退出 `exit_code=0` 且无强杀/取消、
+  本地子进程已回收且无清理失败。`admission_to_public_max_s` 使用 owner 戳；尺寸桶的 remote 门及
+  `remote_to_public_*` 门使用下面的实际 POST/terminal/public 端点，端点或证明缺失才为 unmeasured/unknown。
+- **远端尾部与资源门的测量（B.2/B.3）**：不新建平台。runner 进程内 `StageLeaseGuard.note`（`V4StageGuard.note`）经
+  现有有界 `JsonlStageObserver` 写 `runner/observation/stage-events.jsonl`：`remote_post_send`（transport 在
+  `client.send(POST /tasks)` 之前、submission guard 之后）、`remote_terminal_observed`/`remote_terminal_failed`（backend
+  `_poll`）；note 绑定 guard 自己的 attempt/lane（`remote`），scalar 只携带 fence/source/intent/remote task 身份用于与
+  journal 对账。verifier 在 `_confirm` 返回后立即记 `public_ns` 与 payload canonical sha 到 `verifier/run-summary.json`。
+  runner 与 verifier 都把 `clock`（`python.time.monotonic_ns`、实现名、`kern.bootsessionuuid`）写入各自摘要；两者不等或
+  observation 非 `complete`（任何 dropped/late/truncated/writer error）则所有 stage 门 unknown。门映射：`short_*/long_*` →
+  该尺寸桶 `remote_post_to_terminal`（首个真实 POST → Mac 观测到 remote terminal）、`remote_to_public_*` → 全桶
+  `terminal_to_public_confirmation`、`admission_to_public_max_s` 仍用 owner tick。任何必需 attempt 缺样本/失败/矛盾/时间
+  倒置都不允许用更小子集通过。资源门：`summary --telemetry-artifact-root --telemetry-run-id` 经现有
+  `verify_synchronized_telemetry_observer`（v3 receipt/seal）回放帧，帧身份须匹配本 campaign 的 runtime/profile/GPU
+  device/host+boot（不同 boot 编码须经下述原始身份记录桥接，禁止填入相同假 hash），覆盖用 `campaign-summary` 的 UTC 括号
+  （只判覆盖，不跨机相减），聚合为分量增量（`oom_total`/`oom_kill_total`/`oom_group_kill_total`/`vllm_preemptions_total`
+  任一正值即 fail；重置/递减/unsupported/样本不足 → unknown）与受支持样本的 GPU free 最小值。
+- **unknowns 归属**：读取器发现的每一项证据缺口都进入主报告 `unknowns`（不只放在 `delivery-report-inputs.json`），
+  例外只有描述"如何找到证据"的可选发现索引（`driver_input_hashes_absent`）以及计划未声明资源门时的
+  `resource_telemetry_receipt_absent`；与 `business_obligations_closed.missing` 同义的 `<x>_absent` 不重复列出。阻断
+  `delivery_pass` 的 unknown 按词干匹配其 `_absent`/`_unreadable:*`/`_exceeds_byte_bound`/`_is_not_an_object` 形态：
+  `run_receipt`、`owner_journal`、`campaign_intent`/`campaign-intent.json`、`campaign_inputs`/`campaign-inputs.json`、
+  `evaluation_plan_not_frozen_in_intent`、`evaluation_plan_not_in_run_output`/`evaluation-plan.json`，以及
+  `resource_safety_unproven:*`、`latency_gate_unmeasured:*`。`native_*_absent`（owner 侧重复副本）、
+  `verifier_public_inputs_absent`、`verifier_quality_evidence_absent` 等只报告不阻断：它们的效果已体现在计数或义务里。
+
+## 3b. R21：同一证明规则，不以摘要布尔授权通过
+
+1. **共享外部退出校验**：在线 `_external_exit_verified` 和离线 `_external_facts` 都调用
+   `m6_campaign_assembly.external_exit_problems`。既有 `launcher-command.json` 在 spawn 前记录
+   `intent_sha256` 和非秘密 `expected_start` 投影；它不是第二配置源。原 `process-start.json`、根目录与
+   fetched `ready.json`、`process-exit.json` 必须绑定相同 run/attempt/host/binary/launcher/configuration、
+   预算及 PID/birth，并重现 READY 的 owner epoch。要求真实 handle opened/signaled、READY、两管 EOF、
+   整数 exit0，明确无 timeout/forced/cancel/parent failure；缺字段也不等于 false/null。
+   原 transport 的 M6-EXIT 如存在须与 fetched record 一致。summary 的 true 不提供正证；已记录失败仍保留。
+2. **两个 boot 编码的显式适配**：原生 `owner_identity` diagnostic 已含 boot counter、原七位小数 UTC、
+   node/GPU、clock、PID/birth。在线经原 pinned SSH 有界只读取回一个 metadata/body 对，保留原随机文件名
+   和原字节；不得新查一套 boot 代替旧事实。纯 `bind_physical_owner_boot` 校验 metadata body SHA、canonical
+   native v2 原文、anchor/QPC/GPU/epoch 后才派生 resident UTC hash；它与 native counter hash 保持不同。
+   有界取回失败使 campaign 失败，但不把已经验证的进程退出改说成未退出。此传输需要 Windows 零 PDF 实测。
+3. **raw 守恒**：stage reader 同一次 limit+1 读取统计全部 raw bytes/JSONL records（包括不计分的 note kinds），
+   与 writer 的 bytes_written/events_written 精确相等。要求真实 writer 已退出、关闭时间区间、末条唯一
+   observation_closed、全部损失计数及 summary_write_error 为零。缺省补 0、忽略合法截断、只数 remote notes
+   均不允许。writer 的 note 入队与 closed 置位在同一短锁内，close 后不能再成功接受一个遗失的 note。
+4. **先绑定再相减**：一个 attempt 完整检查 source/fence/submission/task/acceptance/terminal receipt 与
+   journal identity，public 还须 confirmed=true、精确 payload canonical hash 和 verifier run/spec。
+   重复/矛盾不能 last-write-wins。runner/verifier monotonic source、implementation、boot 不同，跨进程
+   public duration 必须 null；独立成立的 runner 内 remote duration 可作诊断保留，但整项门不能借较小子集通过。
+5. **计数器保守包络**：可信 host_slow frames 取窗口 start 前/恰好 start 的最近点与 end 后/恰好 end 的最近点，
+   两端外延不超过一个既有 nominal period；要求完整 scheduled cadence、无 missed/late、unsupported 或 reset。
+   四个累计异常分量分别相减；无边界就是 unknown，不是零。外延中增量按保守上界拒绝零异常证明，不能宣称
+   精确发生于窗口内。GPU gauge 仍是窗口内有效样本最低值；采样不证明每一个未采到的瞬间。
+6. **原始文件与限额**：reader 以文件描述符读取普通非 symlink 文件，先 limit+1 后解码，读前后大小/mtime
+   改变拒绝；不以 read_all 后检查充当内存上限。输入清单在 run 内用相对路径，run 外用绝对路径；每项保留
+   exact-byte SHA。缺失/损坏原件不能由手工编辑 summary 修成成功。
+
+以上验证确认受信任生产者保留的原始记录之间一致，不是抗整包伪造的硬件远程证明。
+不新造 Mac 子进程账本；Mac 精确生命周期仍由既有 bounded owner、runner closure 与原监督回执承担。
+私有 operational delivery schema 从当前模型生成；公有 v1 schema、解析语义与数据库结构不变。
+
 ## 4. 退出码与失败可见性
 
-CLI：0 complete；1 failed；64 输入；65 身份不一致；70 outcome unknown。摘要 `status` 只在 owner 关闭回复
+`run|bootstrap-check`：0 complete；1 failed；64 输入；65 身份不一致；70 outcome unknown。
+`summary` 的 exit0 仅表示成功生成报告，**必须另查 delivery_pass**；它可以合法输出 unknown/false。摘要 `status` 只在 owner 关闭回复
 `ok`、本地子进程全部回收、外部退出记录取回且 `exit_code=0` 且非强制终止时为 `complete`。任何部分或不确定
 结果都是 `failed`/`unknown`，绝不报告为成功。B×P≤L 的 Mac process profile 限制保持为显式既有兼容约束。
 

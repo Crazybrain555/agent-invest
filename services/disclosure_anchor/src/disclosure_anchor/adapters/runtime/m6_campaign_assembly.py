@@ -15,6 +15,7 @@ remote proof: the launcher's exit record is fetched and compared separately.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import base64
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
@@ -44,11 +45,14 @@ from disclosure_anchor.application.contracts.closed_document import (
 )
 from disclosure_anchor.application.contracts.m6_campaign import M6CampaignScope, M6CorpusManifest
 from disclosure_anchor.application.contracts.m6_campaign_intent import M6_CAMPAIGN_INTENT_MAX_BYTES, M6CampaignIntent
+from disclosure_anchor.application.contracts.m6_evaluation_plan import M6_EVALUATION_PLAN_MAX_BYTES, M6EvaluationPlan
 from disclosure_anchor.application.contracts.m6_control_receipts import (
     M6AdmissionReconciliationReceipt, M6OwnershipClosureReceipt, M6ResourceAuditReceipt, attempt_set_sha256,
 )
 from disclosure_anchor.application.contracts.m6_document_qualification import M6QualityPlan
-from disclosure_anchor.application.contracts.m6_owner import M6CloseOwner, M6OwnerAnchor, M6OwnerControl, M6OwnerStatus
+from disclosure_anchor.application.contracts.m6_owner import (
+    M6CloseOwner, M6OwnerAnchor, M6OwnerControl, M6OwnerStatus, bind_physical_owner_boot, physical_owner_epoch_sha256,
+)
 from disclosure_anchor.application.contracts.m6_run import M6RunSpec
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.services.m6_run_spec_factory import build_run_spec
@@ -114,7 +118,8 @@ def _quoted(value: str) -> str:
 def _read_pinned(path: Path, expected_sha256: str, *, label: str) -> bytes:
     if not path.is_absolute() or not path.is_file() or path.is_symlink():
         raise CampaignInputError(f"{label} must be an existing absolute regular file")
-    raw = path.read_bytes()
+    with path.open("rb") as source:
+        raw = source.read(_MAX_INPUT_BYTES + 1)
     if len(raw) > _MAX_INPUT_BYTES:
         raise CampaignInputError(f"{label} exceeds its byte bound")
     if sha256_of(raw) != expected_sha256:
@@ -187,6 +192,133 @@ def parse_ready_line(
         spec_sha256=spec_sha, journal_prefix_bytes=prefix_bytes, journal_prefix_sha256=prefix_sha,
     )
 
+
+
+def external_exit_problems(
+    *, record: Mapping[str, Any], start: Mapping[str, Any], expected_start: Mapping[str, Any],
+    ready_raw: bytes | None, observed_ready_raw: bytes | None,
+    expected_anchor: M6OwnerAnchor | None = None, printed_exit: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """One pure fresh-owner exit rule for online supervision AND offline replay.
+
+    The expected values are the launch command's projection of pinned inputs,
+    never a summary success boolean. A record-shaped object is not proof that
+    a process ran; this checks agreement of the retained original observations.
+    """
+    problems: list[str] = []
+    expected_fields = {
+        "run_id", "attempt_id", "hostname", "binary_sha256", "launcher_sha256", "configuration_sha256",
+        "planned_seconds", "close_grace_seconds", "memory_bytes", "bootstrap_bind_seconds", "ready_wait_seconds",
+    }
+    if set(expected_start) != expected_fields:
+        problems.append("launch_expectation_fields_differ")
+    for key in expected_fields:
+        value = expected_start.get(key)
+        if key.endswith("sha256"):
+            valid = type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+        elif key in {"run_id", "attempt_id", "hostname"}:
+            valid = type(value) is str and bool(value) and len(value) <= 128
+        else:
+            valid = type(value) is int and value > 0
+        if not valid:
+            problems.append("launch_expectation_invalid:" + key)
+        if key not in start or type(start[key]) is not type(value) or start[key] != value:
+            problems.append("start_record_differs:" + key)
+    if start.get("contract_version") != "m6.owner-external-start.v2":
+        problems.append("start_record_contract_differs")
+    if record.get("contract_version") != EXTERNAL_EXIT_CONTRACT:
+        problems.append("exit_record_contract_differs")
+    if record.get("scope") != "production_owner_run":
+        problems.append("exit_record_scope_differs")
+    if start.get("resume") is not False or start.get("original_anchor_sha256") != "none":
+        problems.append("fresh_campaign_cannot_reuse_a_recovered_owner_start")
+    for key in ("pid", "creation_filetime_100ns"):
+        for label, value in (("start", start.get(key)), ("exit", record.get(key))):
+            if type(value) is not int or value <= 0:
+                problems.append(label + "_record_positive_integer_missing:" + key)
+        if start.get(key) != record.get(key):
+            problems.append("exit_record_differs_from_start:" + key)
+    for key in ("run_id", "attempt_id", "hostname", "binary_sha256", "configuration_sha256", "launcher_sha256"):
+        if key not in record or record[key] != expected_start.get(key):
+            problems.append("exit_record_differs_from_expected_instance:" + key)
+    if ready_raw is None or observed_ready_raw is None:
+        problems.append("original_READY_observations_missing")
+    elif ready_raw.rstrip(b"\r\n") != observed_ready_raw.rstrip(b"\r\n"):
+        problems.append("fetched_READY_differs_from_transport_READY")
+    else:
+        try:
+            ready = parse_ready_line(ready_raw.decode("utf-8").rstrip("\r\n"),
+                                     expected_run_id=str(expected_start.get("run_id", "")))
+            if expected_anchor is not None and ready.anchor != expected_anchor:
+                problems.append("READY_differs_from_original_run_anchor")
+            if (physical_owner_epoch_sha256(ready.anchor, pid=start.get("pid"),
+                                            creation_filetime_100ns=start.get("creation_filetime_100ns"))
+                    != ready.owner_epoch_sha256):
+                problems.append("external_PID/birth_does_not_reproduce_READY_owner_epoch")
+        except (ValueError, UnicodeError, TypeError) as exc:
+            problems.append("READY_binding_invalid:" + type(exc).__name__)
+    if printed_exit is not None and printed_exit != record:
+        problems.append("printed_exit_differs_from_fetched_exit")
+    for key, expected in {
+        "exact_process_handle_opened": True, "process_handle_signaled": True,
+        "ready_received": True, "ready_timeout": False, "forced_termination": False,
+        "cancel": None, "parent_failure": None, "stdout_eof": True, "stderr_eof": True,
+    }.items():
+        if key not in record or record[key] is not expected:
+            problems.append("exit_record_unproved:" + key)
+    if type(record.get("exit_code")) is not int or record["exit_code"] != 0:
+        problems.append("exit_code_is_not_integer_zero")
+    return tuple(sorted(set(problems)))
+
+
+
+def owner_identity_read_script(run_store: PureWindowsPath) -> str:
+    """Read only the existing native owner_identity pair, with bounded enumeration/bytes.
+
+    The private namespace is already created by the native store. This does not
+    generate identity, change ACLs, query a new boot, or copy unrelated diagnostic
+    bodies. The exact original pair, including its random basename, is retained.
+    """
+    if not _SAFE_PATH_RE.fullmatch(str(run_store)):
+        raise ValueError("owner store path is outside the supported path grammar")
+    return "$root='" + str(run_store) + "'\n" + r"""
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version 2
+function Read-Bounded([string]$Path,[int]$Maximum) {
+    $item=Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'identity file is not ordinary' }
+    $stream=[IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        if ($stream.Length -gt $Maximum) { throw 'identity file exceeds byte bound' }
+        $buffer=[byte[]]::new($Maximum+1); $used=0
+        while ($used -lt $buffer.Length) {
+            $n=$stream.Read($buffer,$used,$buffer.Length-$used)
+            if ($n -eq 0) { break }; $used += $n
+        }
+        if ($used -gt $Maximum) { throw 'identity file exceeds byte bound' }
+        $result=[byte[]]::new($used); [Array]::Copy($buffer,$result,$used)
+        return ,$result
+    } finally { $stream.Dispose() }
+}
+$directory=Get-Item -LiteralPath $root -Force
+if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'owner store is not an ordinary directory' }
+$utf8=[Text.UTF8Encoding]::new($false,$true)
+$count=0; $selected=$null
+foreach ($path in [IO.Directory]::EnumerateFiles($root,'diagnostic-*.json')) {
+    $count++; if ($count -gt 4096) { throw 'diagnostic enumeration exceeds bound' }
+    $name=[IO.Path]::GetFileName($path)
+    if ($name -cnotmatch '^diagnostic-[0-9a-f]{32}\.json$') { throw 'diagnostic name differs' }
+    $metadata=Read-Bounded $path 1024
+    $value=$utf8.GetString($metadata) | ConvertFrom-Json
+    if ($value.code -ceq 'owner_identity') {
+        if ($null -ne $selected) { throw 'multiple owner identities' }
+        $body=Read-Bounded ([IO.Path]::ChangeExtension($path,'.bin')) 65536
+        $selected=[ordered]@{metadata_name=$name;metadata_base64=[Convert]::ToBase64String($metadata);body_base64=[Convert]::ToBase64String($body)}
+    }
+}
+if ($null -eq $selected) { throw 'owner identity absent' }
+'M6-IDENTITY ' + ($selected | ConvertTo-Json -Compress)
+"""
 
 def remaining_budget_seconds(*, anchor: M6OwnerAnchor, status: M6OwnerStatus, sent_ns: int, now_ns: int, until_ticks: int) -> float:
     """Conservative seconds left until ``until_ticks`` on the owner clock.
@@ -292,6 +424,7 @@ def zero_admission_receipts(*, run_id: str, spec_sha256: str, runner_epoch_sha25
 @dataclass(frozen=True, slots=True)
 class CampaignInputs:
     intent: M6CampaignIntent
+    intent_raw: bytes
     intent_sha256: str
     binding: CampaignPrivateBinding
     release_binding: dict[str, Any]
@@ -303,18 +436,32 @@ class CampaignInputs:
     scope: M6CampaignScope
     quality_plan: M6QualityPlan
     worker_env_sha256: str
+    evaluation_plan: M6EvaluationPlan
+    evaluation_plan_raw: bytes
 
 
 def load_campaign_inputs(
     *, intent_path: Path, intent_sha256: str, private_binding_path: Path, binding_path: Path,
     release_manifest_path: Path, manifest_path: Path, scope_path: Path, quality_plan_path: Path,
+    evaluation_plan_path: Path,
 ) -> CampaignInputs:
-    """Load and pin every input; every cross-reference is checked before anything is created."""
+    """Load and pin every input; every cross-reference is checked before anything is created.
+
+    The evaluation plan (Pro R20 §4) is part of the frozen intent: its bytes must hash to
+    `intent.evaluation_plan_sha256` and its mode must be the run's mode, before Prepare.
+    """
     intent_raw = _read_pinned(intent_path, intent_sha256, label="campaign intent")
     try:
         intent = M6CampaignIntent.from_canonical_bytes(intent_raw, maximum_bytes=M6_CAMPAIGN_INTENT_MAX_BYTES)
     except ValueError as exc:
-        raise CampaignInputError(f"campaign intent invalid: {exc}") from exc
+        raise CampaignInputError(f"campaign intent invalid (the live entry requires {M6CampaignIntent.model_fields['contract_version'].default}): {exc}") from exc
+    evaluation_plan_raw = _read_pinned(evaluation_plan_path, intent.evaluation_plan_sha256, label="evaluation plan")
+    try:
+        evaluation_plan = M6EvaluationPlan.from_canonical_bytes(evaluation_plan_raw, maximum_bytes=M6_EVALUATION_PLAN_MAX_BYTES)
+    except ValueError as exc:
+        raise CampaignInputError(f"evaluation plan invalid: {exc}") from exc
+    if evaluation_plan.mode != intent.run.mode:
+        raise CampaignIdentityError("evaluation plan mode differs from the run intent")
     try:
         binding = load_campaign_private_binding(private_binding_path)
         assert_known_hosts_pins_address(binding.ssh)
@@ -370,10 +517,10 @@ def load_campaign_inputs(
     if scope.campaign_id != intent.run.campaign_id:
         raise CampaignIdentityError("campaign scope names another campaign than the intent")
     return CampaignInputs(
-        intent=intent, intent_sha256=intent_sha256, binding=binding, release_binding=release_binding,
+        intent=intent, intent_raw=intent_raw, intent_sha256=intent_sha256, binding=binding, release_binding=release_binding,
         release_manifest=release_manifest, manifest_path=manifest_path, scope_path=scope_path,
         quality_plan_path=quality_plan_path, manifest=manifest, scope=scope, quality_plan=plan,
-        worker_env_sha256=worker_env_sha256,
+        worker_env_sha256=worker_env_sha256, evaluation_plan=evaluation_plan, evaluation_plan_raw=evaluation_plan_raw,
     )
 
 
@@ -579,6 +726,16 @@ class M6CampaignAssembly:
             raise CampaignOutcomeUnknown(f"staging the private deployment failed with sftp exit {result.exit_code}")
         return staged_name
 
+    def _expected_external_start(self, deployment_sha256: str | None) -> dict[str, Any]:
+        windows, intent = self._binding.windows, self._intent
+        return {
+            "run_id": intent.run.run_id, "attempt_id": self._attempt_id, "hostname": windows.hostname,
+            "binary_sha256": windows.owner_executable_sha256, "launcher_sha256": windows.launcher_sha256,
+            "configuration_sha256": deployment_sha256, "planned_seconds": intent.run.planned_seconds,
+            "close_grace_seconds": intent.close_grace_seconds, "memory_bytes": intent.memory_bytes,
+            "bootstrap_bind_seconds": intent.bootstrap_bind_seconds, "ready_wait_seconds": intent.ready_wait_seconds,
+        }
+
     def _start_launcher(self, *, staged_name: str, deployment_sha256: str) -> None:
         windows, intent = self._binding.windows, self._intent
         script = self._script({
@@ -593,6 +750,8 @@ class M6CampaignAssembly:
         timeout = min(7200.0, intent.run.planned_seconds + intent.close_grace_seconds + 180.0 + _SSH_OVERHEAD_SECONDS)
         write_new_exact(self._output / "launcher-command.json", canonical_bytes({
             "argv": argv, "timeout_seconds": timeout, "started_utc": _utc(),
+            "intent_sha256": self._inputs.intent_sha256,
+            "expected_start": self._expected_external_start(deployment_sha256),
         }) + b"\n")
         self._spawned_local_ns = self._now_ns()
         self._launcher = self._launch(argv, timeout_seconds=timeout, maximum_bytes=_LAUNCHER_CAPTURE_BYTES, retention="head_tail")
@@ -839,7 +998,11 @@ class M6CampaignAssembly:
         if not path.is_file():
             self._summary.fail("runner_receipt", "runner receipt missing")
             return {}
-        raw = path.read_bytes()
+        with path.open("rb") as source:
+            raw = source.read(_MAX_INPUT_BYTES + 1)
+        if len(raw) > _MAX_INPUT_BYTES:
+            self._summary.fail("runner_receipt", "runner receipt exceeds its byte bound")
+            return {}
         value = strict_json_loads(raw.decode("utf-8"))
         assembly = value.get("m6_assembly") if type(value) is dict else None
         if type(assembly) is not dict or assembly.get("run_id") != spec.run_id or assembly.get("spec_sha256") != spec.canonical_sha256():
@@ -851,7 +1014,12 @@ class M6CampaignAssembly:
         if not path.is_file():
             self._summary.fail("verifier_summary", "verifier summary missing")
             return {}
-        value = strict_json_loads(path.read_bytes().decode("utf-8"))
+        with path.open("rb") as source:
+            raw = source.read(_MAX_INPUT_BYTES + 1)
+        if len(raw) > _MAX_INPUT_BYTES:
+            self._summary.fail("verifier_summary", "verifier summary exceeds its byte bound")
+            return {}
+        value = strict_json_loads(raw.decode("utf-8"))
         return value if type(value) is dict else {}
 
     def _bootstrap_closure(self, spec: M6RunSpec) -> dict[str, Any]:
@@ -961,6 +1129,65 @@ class M6CampaignAssembly:
                 transport_record["launcher_first_error"] = value.get("first_error")
         self._summary.values["launcher"] = transport_record
 
+    def _fetch_owner_identity(self, *, start: Mapping[str, Any]) -> None:
+        """Retain the existing exact native pair and bind both boot encodings to this anchor."""
+        if self._run is None:
+            raise CampaignOutcomeUnknown("owner identity requires the bound original anchor")
+        run_store = self._private_root / "runs" / hashlib.sha256(self._intent.run.run_id.encode("utf-8")).hexdigest()
+        result = self._owned(self._ssh_argv(owner_identity_read_script(run_store)),
+                             label="owner-identity-fetch", timeout_seconds=60, maximum_bytes=262144)
+        lines = launcher_lines(result.stdout, "M6-IDENTITY")
+        if result.exit_code != 0 or len(lines) != 1:
+            raise CampaignOutcomeUnknown("bounded owner identity read failed or did not return exactly one pair")
+        value = load_closed_object(lines[0].encode("utf-8"), label="owner identity transport", maximum_bytes=131072)
+        require_fields(value, {"metadata_name", "metadata_base64", "body_base64"}, label="owner identity transport")
+        name = value["metadata_name"]
+        if (type(name) is not str or re.fullmatch(r"diagnostic-[0-9a-f]{32}\.json", name) is None
+                or type(value["metadata_base64"]) is not str or type(value["body_base64"]) is not str):
+            raise ValueError("owner identity transport fields differ")
+        metadata = base64.b64decode(value["metadata_base64"], validate=True)
+        body = base64.b64decode(value["body_base64"], validate=True)
+        # Preserve original bounded bytes even when their binding later fails.
+        if len(metadata) > 1024 or len(body) > 65536:
+            raise ValueError("owner identity transport exceeds original store bounds")
+        local_dir = self._output / "native"
+        if local_dir.is_symlink():
+            raise ValueError("native evidence directory cannot be a symlink")
+        local_dir.mkdir(mode=0o700, exist_ok=True)
+        write_new_exact(local_dir / name, metadata)
+        write_new_exact(local_dir / (name[:-5] + ".bin"), body)
+        alias = bind_physical_owner_boot(
+            metadata_raw=metadata, body_raw=body, anchor=self._run.anchor,
+            pid=start.get("pid"), creation_filetime_100ns=start.get("creation_filetime_100ns"),
+        )
+        self._summary.stage("native_identity_fetched", metadata_name=name, body_sha256=sha256_of(body),
+                            resident_boot_identity_sha256=alias)
+
+    def _fetch_native_evidence(self) -> None:
+        """Read-only sftp copy of the owner's private run store (journal and sidecars) for the summary; never writes remotely."""
+        run_store = self._private_root / "runs" / hashlib.sha256(self._intent.run.run_id.encode("utf-8")).hexdigest()
+        local_dir = self._output / "native"
+        if local_dir.is_symlink():
+            raise ValueError("native evidence directory cannot be a symlink")
+        local_dir.mkdir(mode=0o700, exist_ok=True)
+        names = ("events.jsonl", "spec.json", "anchor.json", "admission-closed.json", "resources-closed.json", "exit-observation.json")
+        batch = self._output / "native-fetch.batch"
+        write_new_exact(batch, ("\n".join(f"-get {_quoted(_sftp_path(run_store / name))} {_quoted(str(local_dir / name))}" for name in names) + "\n").encode("utf-8"))
+        try:
+            result = self._owned(self._sftp_argv(batch), label="native-fetch", timeout_seconds=_FETCH_TIMEOUT_SECONDS, maximum_bytes=_LAUNCHER_CAPTURE_BYTES)
+        except CampaignOutcomeUnknown as exc:
+            self._summary.stage("native_fetch_failed", message=str(exc)[:300])
+            return
+        present = sorted(name for name in names if (local_dir / name).is_file())
+        hashes = {}
+        for name in present:
+            with (local_dir / name).open("rb") as source:
+                hashes[name] = "sha256:" + hashlib.file_digest(source, "sha256").hexdigest()
+        self._summary.values["native_evidence"] = {
+            "sftp_exit": result.exit_code, "present": present, "sha256": hashes,
+        }
+        self._summary.stage("native_fetched", present=present, sftp_exit=result.exit_code)
+
     def _verify_external_exit(self) -> bool:
         """Fetch the launcher's exit record over sftp and compare it with the transport's view; the file is the proof."""
         batch = self._output / "fetch.batch"
@@ -981,58 +1208,48 @@ class M6CampaignAssembly:
                                         f"start record {'present' if start_path.is_file() else 'absent'}")
             return False
         try:
-            record = strict_json_loads(exit_path.read_bytes().decode("utf-8"))
-            start = strict_json_loads(start_path.read_bytes().decode("utf-8"))
+            originals = []
+            for path in (exit_path, start_path):
+                if path.is_symlink():
+                    raise ValueError("launcher record cannot be a symlink")
+                with path.open("rb") as source:
+                    raw = source.read(_LAUNCHER_CAPTURE_BYTES + 1)
+                if len(raw) > _LAUNCHER_CAPTURE_BYTES:
+                    raise ValueError("launcher record exceeds its byte bound")
+                originals.append(strict_json_loads(raw.decode("utf-8")))
+            record, start = originals
         except ValueError as exc:
             self._summary.fail("external_exit", f"launcher record unreadable: {exc}")
             return False
         if type(record) is not dict or type(start) is not dict:
             self._summary.fail("external_exit", "launcher records are not objects")
             return False
-        return self._external_exit_verified(record=record, start=start, ready_path=ready_path)
+        verified = self._external_exit_verified(record=record, start=start, ready_path=ready_path)
+        if verified:
+            try:
+                self._fetch_owner_identity(start=start)
+            except (CampaignOutcomeUnknown, ValueError, OSError) as exc:
+                # An identity-read failure blocks the campaign but is NOT evidence
+                # that an already verified native process failed to exit.
+                self._summary.fail("native_identity_fetch", str(exc))
+        return verified
 
     def _external_exit_verified(self, *, record: dict[str, Any], start: dict[str, Any], ready_path: Path) -> bool:
         """Typed, exact cross-check: start record, READY, expected identities, printed exit line and fetched exit record."""
-        windows = self._binding.windows
-        problems: list[str] = []
-        if record.get("contract_version") != EXTERNAL_EXIT_CONTRACT:
-            problems.append("exit record contract differs")
-        if start.get("contract_version") != "m6.owner-external-start.v2":
-            problems.append("start record contract differs")
-        expected_start = {
-            "run_id": self._intent.run.run_id, "attempt_id": self._attempt_id, "binary_sha256": windows.owner_executable_sha256,
-            "launcher_sha256": windows.launcher_sha256, "configuration_sha256": self._summary.values.get("deployment_sha256"),
-            "planned_seconds": self._intent.run.planned_seconds, "close_grace_seconds": self._intent.close_grace_seconds,
-        }
-        problems.extend(f"start record {key} differs" for key, value in expected_start.items() if start.get(key) != value)
-        for key in ("pid", "creation_filetime_100ns"):
-            for label, document in (("start", start), ("exit", record)):
-                if isinstance(document.get(key), bool) or type(document.get(key)) is not int or document[key] <= 0:
-                    problems.append(f"{label} record {key} is not a positive integer")
-            if start.get(key) != record.get(key):
-                problems.append(f"exit record {key} differs from the start record")
-        for key in ("run_id", "attempt_id", "binary_sha256", "configuration_sha256", "launcher_sha256"):
-            if record.get(key) != expected_start.get(key):
-                problems.append(f"exit record {key} differs from the expected instance")
-        observed_ready = self._summary.values.get("ready_line")
-        if not ready_path.is_file():
-            problems.append("READY record absent on the owner host")
-        elif observed_ready is None or ready_path.read_bytes().rstrip(b"\r\n") != observed_ready.encode("utf-8"):
-            problems.append("fetched READY record differs from the READY line observed over the transport")
-        printed = self._summary.values.get("printed_exit_record")
-        if printed is not None and printed != record:
-            problems.append("printed exit line differs from the fetched exit record")
-        typed = {
-            "process_handle_signaled": True, "ready_received": True, "ready_timeout": False,
-            "forced_termination": False, "cancel": None, "parent_failure": None,
-        }
-        for key, value in typed.items():
-            actual = record.get(key)
-            if actual is not value and not (value is None and actual is None):
-                problems.append(f"exit record {key} is {actual!r}, expected {value!r}")
+        ready_raw = None
+        if ready_path.is_file() and not ready_path.is_symlink():
+            with ready_path.open("rb") as source:
+                ready_raw = source.read(65537)
+        observed = self._summary.values.get("ready_line")
+        problems = list(external_exit_problems(
+            record=record, start=start,
+            expected_start=self._expected_external_start(self._summary.values.get("deployment_sha256")),
+            ready_raw=ready_raw,
+            observed_ready_raw=observed.encode("utf-8") if type(observed) is str else None,
+            expected_anchor=None if self._run is None else self._run.anchor,
+            printed_exit=self._summary.values.get("printed_exit_record"),
+        ))
         exit_code = record.get("exit_code")
-        if isinstance(exit_code, bool) or type(exit_code) is not int or exit_code != 0:
-            problems.append(f"exit record exit_code is {exit_code!r}, expected the integer 0")
         external = {
             "exit_code": exit_code, "forced_termination": record.get("forced_termination"), "cancel": record.get("cancel"),
             "process_handle_signaled": record.get("process_handle_signaled"), "ready_received": record.get("ready_received"),
@@ -1052,10 +1269,19 @@ class M6CampaignAssembly:
         self._output.mkdir(mode=0o700)
         (self._output / "private").mkdir(mode=0o700)
         started = _utc()
+        # The intent and the evaluation plan are frozen into the run output before Prepare, i.e. before
+        # any admission can exist; the summary reads these exact bytes back against the recorded hashes.
+        write_new_exact(self._output / "campaign-intent.json", self._inputs.intent_raw)
+        write_new_exact(self._output / "evaluation-plan.json", self._inputs.evaluation_plan_raw)
         write_new_exact(self._output / "campaign-inputs.json", canonical_bytes({
-            "contract_version": "m6.campaign-inputs.v1", "mode": self._mode, "attempt_id": self._attempt_id,
-            "intent_sha256": self._inputs.intent_sha256, "binding_sha256": intent.binding_sha256,
+            "contract_version": "m6.campaign-inputs.v2", "mode": self._mode, "attempt_id": self._attempt_id,
+            "intent_sha256": self._inputs.intent_sha256, "intent_contract_version": intent.contract_version,
+            "binding_sha256": intent.binding_sha256,
             "release_manifest_sha256": intent.release_manifest_sha256, "worker_env_sha256": self._inputs.worker_env_sha256,
+            "evaluation_plan_sha256": intent.evaluation_plan_sha256, "manifest_sha256": intent.run.manifest_sha256,
+            "scope_sha256": intent.run.scope_sha256, "quality_plan_sha256": intent.run.quality_plan_sha256,
+            "manifest_path": str(self._inputs.manifest_path), "scope_path": str(self._inputs.scope_path),
+            "quality_plan_path": str(self._inputs.quality_plan_path),
             "workspace": str(self._workspace), "started_utc": started,
         }) + b"\n")
         lock: ExclusivityLock | None = None
@@ -1116,6 +1342,10 @@ class M6CampaignAssembly:
                 if self._launcher is not None:
                     external["verified"] = bool(self._verify_external_exit())
 
+            def fetch_native() -> None:
+                if self._launcher is not None and self._mode == "run":
+                    self._fetch_native_evidence()
+
             def release_lock() -> None:
                 if lock is not None:
                     lock.release()
@@ -1124,7 +1354,7 @@ class M6CampaignAssembly:
             # and never becomes success. Interrupts are held until every step was attempted.
             for name, step in (("controller_close", close_controller), ("cancel", cancel_if_needed),
                                ("launcher_finish", finish_launcher), ("external_exit_readback", read_external_proof),
-                               ("lock_release", release_lock)):
+                               ("native_evidence_fetch", fetch_native), ("lock_release", release_lock)):
                 try:
                     step()
                 except Exception as exc:  # noqa: BLE001 - recorded as a named cleanup failure
@@ -1157,7 +1387,8 @@ class M6CampaignAssembly:
             "database_access": "none" if self._mode == "bootstrap-check" else "worker_env",
             "hidden_setup": False,
             "owner_external_exit_verified": external_verified, "local_children_reaped": local_children_reaped,
-            "cleanup_failures": cleanup_failures,
+            "cleanup_failures": cleanup_failures, "native_evidence": summary.values.get("native_evidence"),
+            "evaluation_plan_sha256": intent.evaluation_plan_sha256,
             "first_error": summary.first_error, "stages": summary.stages,
             "files": {"output": str(self._output), "run_dir": str(self._output / "run")},
             "started_utc": started, "finished_utc": _utc(),
@@ -1173,6 +1404,6 @@ class M6CampaignAssembly:
 __all__ = [
     "CAMPAIGN_SUMMARY_CONTRACT", "OWNER_DEPLOYMENT_CONTRACT", "CampaignIdentityError", "CampaignInputError",
     "CampaignInputs", "CampaignMode", "CampaignOutcomeUnknown", "M6CampaignAssembly", "ReadyObservation",
-    "deployment_document", "generate_roles", "launcher_lines", "load_campaign_inputs", "parse_ready_line",
+    "deployment_document", "external_exit_problems", "generate_roles", "launcher_lines", "load_campaign_inputs", "parse_ready_line",
     "remaining_budget_seconds", "sourced_child_argv", "write_run_directory", "zero_admission_receipts",
 ]

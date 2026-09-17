@@ -351,7 +351,7 @@ def emit(value: object, *, deadline: float, fd: int = 1) -> None:
 def run(config: dict[str, Any], source_sha256: str) -> None:
     lease = integer(config["lease_ms"], minimum=1000) / 1000
     lifetime = integer(config["lifetime_ms"], minimum=1000) / 1000
-    if lease > 30 or lifetime > 7200 or lease > lifetime:
+    if lease > 30 or lifetime > 8400 or lease > lifetime:
         raise ValueError("lease/lifetime exceeds bound")
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
     started = time.monotonic()

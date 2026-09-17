@@ -52,6 +52,7 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
 )
 from disclosure_anchor.application.ports.staged_lifecycle_facts import StagedLifecycleFactsPort
 from disclosure_anchor.application.services.staged_lifecycle_reporting import (
+    remote_task_identity_sha256,
     report_attempt_final_acknowledged,
     report_attempt_final_unsubmitted,
     report_publication_committed,
@@ -893,6 +894,11 @@ class DurableStagedCoordinatorBackendV4:
                 retry_after_seconds=self._poll_seconds,
             ) from exc
         except RemoteProviderProtocolErrorV4 as exc:
+            stage_guard.note(
+                "remote_terminal_failed", fence_identity=accepted.fence_identity,
+                remote_task_identity_sha256=remote_task_identity_sha256(accepted.remote_task_identity),
+                error_code="provider_protocol_error",
+            )
             return self._fail_attempt(
                 work,
                 authority,
@@ -920,6 +926,15 @@ class DurableStagedCoordinatorBackendV4:
             )
         if type(outcome) is RemoteProviderCompletedV4:
             terminal = outcome.receipt
+            # The instant this process observed the remote terminal; bound to the
+            # accepted task identity the same way the journal's remote_accepted is.
+            stage_guard.note(
+                "remote_terminal_observed", fence_identity=terminal.fence_identity,
+                remote_task_identity_sha256=remote_task_identity_sha256(terminal.remote_task_identity),
+                terminal_receipt_sha256=terminal.sha256,
+                accepted_submission_receipt_sha256=terminal.accepted_submission_receipt_sha256,
+                lease_observed_at_unix=repr(float(outcome.lease_observed_at_unix)),
+            )
             successor = advance_remote_parse_checkpoint_v4(
                 authority.checkpoint,
                 state="remote_terminal",
@@ -947,6 +962,11 @@ class DurableStagedCoordinatorBackendV4:
             )
         if type(outcome) is not RemoteProviderFailedV4:
             raise ValueError("provider poll returned a forged V4 outcome")
+        stage_guard.note(
+            "remote_terminal_failed", fence_identity=accepted.fence_identity,
+            remote_task_identity_sha256=remote_task_identity_sha256(outcome.remote_task_identity),
+            error_code="provider_terminal_failure",
+        )
         return self._fail_attempt(
             work,
             authority,

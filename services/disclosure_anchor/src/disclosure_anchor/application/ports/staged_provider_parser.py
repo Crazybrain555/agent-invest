@@ -1179,11 +1179,17 @@ class V4ClaimGuard(Protocol):
 
 
 class V4StageGuard(Protocol):
-    """Cooperative monotonic deadline guard for one remote/file stage."""
+    """Cooperative monotonic deadline guard for one remote/file stage.
+
+    ``note`` records one scalar observation bound to the guard's own attempt and
+    lane; it never raises, never blocks and never affects the deadline.
+    """
 
     def checkpoint(self) -> None: ...
 
     def remaining_seconds(self) -> float: ...
+
+    def note(self, kind: str, **scalars: int | str | None) -> None: ...
 
 
 def validate_v4_materialization_authorization(

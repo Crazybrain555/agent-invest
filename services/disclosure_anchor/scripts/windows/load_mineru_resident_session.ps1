@@ -67,7 +67,7 @@ function Initialize-MineruResidentSession {
     $cadence = Get-MineruInteger $config 'cadence_ms' 250 1000
     if (-not (($lane -ceq 'gpu_fast' -and $cadence -in @(250,500)) -or ($lane -ceq 'host_slow' -and $cadence -eq 1000))) { throw 'lane cadence mismatch' }
     $lease = Get-MineruInteger $config 'lease_ms' 2000 30000
-    $lifetime = Get-MineruInteger $config 'lifetime_ms' $lease 7190000
+    $lifetime = Get-MineruInteger $config 'lifetime_ms' $lease 8390000
     $port = Get-MineruInteger $config 'port' 1024 65535
     $samplingTimeout = Get-MineruInteger $config 'sampling_timeout_ms' 1 $cadence
     $responseTimeout = Get-MineruInteger $config 'response_timeout_ms' 1 1000

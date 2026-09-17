@@ -285,6 +285,9 @@ class AttemptRecord:
     quality: QualityOutcome | None = None
     started_ns: int = 0
     finished_ns: int = 0
+    # The instant this process held the exact confirmation payload, and that payload's identity.
+    public_ns: int | None = None
+    public_confirmation_sha256: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -295,6 +298,7 @@ class AttemptRecord:
             "quality": None if self.quality is None else {"qualified": self.quality.payload is not None,
                                                           "error": self.quality.error, "files": list(self.quality.files)},
             "started_ns": self.started_ns, "finished_ns": self.finished_ns,
+            "public_ns": self.public_ns, "public_confirmation_sha256": self.public_confirmation_sha256,
         }
 
 
@@ -391,6 +395,8 @@ class VerifierSupervisor:
             record.finished_ns = self._clock()
             self._failed = f"attempt {item.attempt_id}: public confirmation failed: {public.error}"
             return
+        record.public_ns = self._clock()
+        record.public_confirmation_sha256 = public.payload.canonical_sha256()
         self._public.record(public.payload, attempt_id=item.attempt_id)
         try:
             quality = self._qualify(item, public)

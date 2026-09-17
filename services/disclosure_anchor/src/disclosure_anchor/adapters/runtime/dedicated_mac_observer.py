@@ -45,7 +45,8 @@ class DedicatedMacObserverRequest:
     def __post_init__(self) -> None:
         if not isinstance(self.process_profile, FrozenApiProcessProfile):
             raise ValueError("dedicated Mac observer requires a frozen v3 API profile")
-        if not math.isfinite(self.duration_seconds) or not 0 < self.duration_seconds <= 7100:
+        if (isinstance(self.duration_seconds, bool) or not isinstance(self.duration_seconds, (int, float))
+                or not math.isfinite(self.duration_seconds) or not 0 < self.duration_seconds <= 8300):
             raise ValueError("dedicated Mac observer duration is invalid")
         if self.gpu_interval_ms not in {250, 500} or str(uuid.UUID(self.run_id)) != self.run_id:
             raise ValueError("dedicated Mac observer cadence/run ID is invalid")

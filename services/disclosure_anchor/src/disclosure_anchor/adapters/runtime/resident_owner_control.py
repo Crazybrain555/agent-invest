@@ -71,14 +71,20 @@ class BoundedOwnerCommand:
     supervised children whose canonical evidence lives in their own files: it
     keeps the first and last ``maximum_bytes // 2`` of each pipe, counts what
     was dropped in between and never fails on volume.
+
+    ``lifetime_ceiling_seconds`` is the absolute ceiling this one command may
+    request; a caller raises it only for an explicitly longer finite session.
     """
 
     def __init__(
         self, command: list[str], *, timeout_seconds: float, maximum_bytes: int = 262144,
         environment: Mapping[str, str] | None = None, cwd: str | None = None,
-        retention: OwnerCommandRetention = "strict",
+        retention: OwnerCommandRetention = "strict", lifetime_ceiling_seconds: int = 7200,
     ) -> None:
-        if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 7200:
+        if type(lifetime_ceiling_seconds) is not int or not 1 <= lifetime_ceiling_seconds <= 8400:
+            raise ValueError("owner command lifetime ceiling invalid")
+        if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= lifetime_ceiling_seconds):
             raise ValueError("owner command timeout invalid")
         if type(maximum_bytes) is not int or not 1 <= maximum_bytes <= 1048576:
             raise ValueError("owner command output cap invalid")

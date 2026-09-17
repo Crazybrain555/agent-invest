@@ -1,0 +1,300 @@
+{
+  "$defs": {
+    "M6CreditRule": {
+      "additionalProperties": false,
+      "properties": {
+        "carry_in_excluded": {
+          "const": true,
+          "title": "Carry In Excluded",
+          "type": "boolean"
+        },
+        "late_backfill": {
+          "const": false,
+          "title": "Late Backfill",
+          "type": "boolean"
+        },
+        "not_first_excluded": {
+          "const": true,
+          "title": "Not First Excluded",
+          "type": "boolean"
+        },
+        "replay_excluded": {
+          "const": true,
+          "title": "Replay Excluded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "replay_excluded",
+        "carry_in_excluded",
+        "not_first_excluded",
+        "late_backfill"
+      ],
+      "title": "M6CreditRule",
+      "type": "object"
+    },
+    "M6DeliveryGates": {
+      "additionalProperties": false,
+      "properties": {
+        "main_docs_per_hour_min": {
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Main Docs Per Hour Min",
+          "type": "integer"
+        },
+        "main_pages_per_min_min": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Main Pages Per Min Min",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "main_docs_per_hour_min",
+        "main_pages_per_min_min"
+      ],
+      "title": "M6DeliveryGates",
+      "type": "object"
+    },
+    "M6LatencyGates": {
+      "additionalProperties": false,
+      "properties": {
+        "admission_to_public_max_s": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Admission To Public Max S",
+          "type": "integer"
+        },
+        "long_max_s": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Long Max S",
+          "type": "integer"
+        },
+        "long_p95_s": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Long P95 S",
+          "type": "integer"
+        },
+        "remote_to_public_max_s": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Remote To Public Max S",
+          "type": "integer"
+        },
+        "remote_to_public_p95_s": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Remote To Public P95 S",
+          "type": "integer"
+        },
+        "short_max_s": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Short Max S",
+          "type": "integer"
+        },
+        "short_p95_s": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Short P95 S",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "short_p95_s",
+        "short_max_s",
+        "long_p95_s",
+        "long_max_s",
+        "remote_to_public_p95_s",
+        "remote_to_public_max_s",
+        "admission_to_public_max_s"
+      ],
+      "title": "M6LatencyGates",
+      "type": "object"
+    },
+    "M6MainWindow": {
+      "additionalProperties": false,
+      "properties": {
+        "end_offset_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "End Offset Seconds",
+          "type": "integer"
+        },
+        "start_offset_seconds": {
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Start Offset Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_offset_seconds",
+        "end_offset_seconds"
+      ],
+      "title": "M6MainWindow",
+      "type": "object"
+    },
+    "M6ReadinessRule": {
+      "additionalProperties": false,
+      "properties": {
+        "max_observations": {
+          "maximum": 3,
+          "minimum": 1,
+          "title": "Max Observations",
+          "type": "integer"
+        },
+        "rule": {
+          "const": "max_qualified_committed_confirmed",
+          "title": "Rule",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule",
+        "max_observations"
+      ],
+      "title": "M6ReadinessRule",
+      "type": "object"
+    },
+    "M6ResourceGates": {
+      "additionalProperties": false,
+      "properties": {
+        "gpu_free_min_bytes": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Gpu Free Min Bytes",
+          "type": "integer"
+        },
+        "oom_max": {
+          "const": 0,
+          "title": "Oom Max",
+          "type": "integer"
+        },
+        "preemption_max": {
+          "const": 0,
+          "title": "Preemption Max",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "gpu_free_min_bytes",
+        "oom_max",
+        "preemption_max"
+      ],
+      "title": "M6ResourceGates",
+      "type": "object"
+    },
+    "M6SizeClasses": {
+      "additionalProperties": false,
+      "properties": {
+        "medium_max_pages": {
+          "maximum": 100000,
+          "minimum": 2,
+          "title": "Medium Max Pages",
+          "type": "integer"
+        },
+        "short_max_pages": {
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Short Max Pages",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "short_max_pages",
+        "medium_max_pages"
+      ],
+      "title": "M6SizeClasses",
+      "type": "object"
+    }
+  },
+  "$id": "urn:disclosure-anchor:operational:m6-evaluation-plan.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {
+      "const": "m6.evaluation-plan.v1",
+      "default": "m6.evaluation-plan.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "credit": {
+      "$ref": "#/$defs/M6CreditRule"
+    },
+    "delivery_gates": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/M6DeliveryGates"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "latency_gates": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/M6LatencyGates"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "main_window": {
+      "$ref": "#/$defs/M6MainWindow"
+    },
+    "metrics_version": {
+      "const": "m6.delivery-metrics.v1",
+      "default": "m6.delivery-metrics.v1",
+      "title": "Metrics Version",
+      "type": "string"
+    },
+    "mode": {
+      "enum": [
+        "service_diagnostic",
+        "e2e_publication"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "readiness": {
+      "$ref": "#/$defs/M6ReadinessRule"
+    },
+    "resource_gates": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/M6ResourceGates"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "size_classes": {
+      "$ref": "#/$defs/M6SizeClasses"
+    },
+    "sub_window_seconds": {
+      "maximum": 86400,
+      "minimum": 60,
+      "title": "Sub Window Seconds",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "mode",
+    "main_window",
+    "sub_window_seconds",
+    "readiness",
+    "credit",
+    "size_classes",
+    "delivery_gates",
+    "latency_gates",
+    "resource_gates"
+  ],
+  "title": "M6EvaluationPlan",
+  "type": "object"
+}

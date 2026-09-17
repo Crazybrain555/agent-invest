@@ -34,7 +34,9 @@ from disclosure_anchor.adapters.runtime.m6_e2e_run import (
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import MinerUDeploymentChecker
 from disclosure_anchor.adapters.runtime.mineru_stream_activation import load_mineru_stream_activation
 from disclosure_anchor.adapters.runtime.mineru_stream_worker import owned_mineru_stream_control
-from disclosure_anchor.adapters.runtime.stage_observation import JsonlStageObserver, ProgressRecorder
+from disclosure_anchor.adapters.runtime.stage_observation import (
+    JsonlStageObserver, ProgressRecorder, mac_stage_clock_binding,
+)
 from disclosure_anchor.adapters.runtime.staged_worker_v4 import build_staged_worker_v4_campaign_runtime
 from disclosure_anchor.application.services.staged_campaign_runner import (
     CampaignInputError, CampaignRunRequest, CampaignRuntimeIdentity, CampaignStopState,
@@ -354,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         if observation_dir is not None:
             observation_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
             observer = JsonlStageObserver(observation_dir, max_events=args.observation_max_events,
-                                          max_bytes=args.observation_max_bytes)
+                                          max_bytes=args.observation_max_bytes, clock_binding=mac_stage_clock_binding())
             try:
                 progress_recorder = ProgressRecorder(observation_dir)
             except BaseException:

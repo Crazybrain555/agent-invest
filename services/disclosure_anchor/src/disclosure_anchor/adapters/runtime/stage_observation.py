@@ -26,6 +26,7 @@ import threading
 import time
 from typing import Any
 
+from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.application.ports.staged_execution import StageNote, StageObserverPort
 from disclosure_anchor.application.services.staged_parse_coordinator import CoordinatorSnapshot
 
@@ -47,6 +48,19 @@ def _encode(payload: dict[str, Any]) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
+def mac_stage_clock_binding() -> dict[str, str]:
+    """The clock every stage note in this process is stamped with, bound to this boot.
+
+    Two processes on the same Mac boot that record equal bindings share one
+    monotonic domain; a reader must refuse to subtract instants otherwise.
+    """
+    return {
+        "source": "python.time.monotonic_ns",
+        "implementation": time.get_clock_info("monotonic").implementation,
+        "boot_session_uuid": MacObserverIdentityReader().boot_session_uuid(),
+    }
+
+
 class JsonlStageObserver(StageObserverPort):
     """Thread-safe bounded queue drained by one real, non-daemon writer thread.
 
@@ -57,7 +71,9 @@ class JsonlStageObserver(StageObserverPort):
     def __init__(
         self, directory: Path, *, max_events: int, max_bytes: int,
         flush_interval_seconds: float = 1.0, monotonic_ns: Any = time.monotonic_ns,
+        clock_binding: dict[str, str] | None = None,
     ) -> None:
+        self._clock_binding = None if clock_binding is None else dict(clock_binding)
         if type(max_events) is not int or not 1 <= max_events <= 10_000_000:
             raise ValueError("stage observation queue capacity must be in 1..10000000")
         if type(max_bytes) is not int or not 4096 <= max_bytes <= 2**31:
@@ -86,16 +102,19 @@ class JsonlStageObserver(StageObserverPort):
 
     def note(self, record: StageNote) -> None:
         try:
-            if self._closed:
-                self._bump("late_notes")
-                return
             if type(record) is not StageNote:
                 raise TypeError("stage observer requires an exact StageNote")
             payload = {"attempt_id": record.attempt_id, "lane": record.lane, "kind": record.kind,
                        "monotonic_ns": record.monotonic_ns, "scalars": dict(record.scalars)}
-            self._queue.put_nowait(_encode(payload))
-        except queue.Full:
-            self._bump("dropped")
+            encoded = _encode(payload)
+            with self._lock:
+                if self._closed:
+                    self._counts["late_notes"] += 1
+                    return
+                try:
+                    self._queue.put_nowait(encoded)
+                except queue.Full:
+                    self._counts["dropped"] += 1
         except Exception as exc:  # noqa: BLE001 - measurement failure is counted, never raised
             self._bump("note_errors", type(exc).__name__)
 
@@ -183,9 +202,10 @@ class JsonlStageObserver(StageObserverPort):
         status becomes ``partial`` or ``invalid``. A second close is a caller error.
         """
 
-        if self._closed:
-            raise RuntimeError("stage observer is already closed")
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("stage observer is already closed")
+            self._closed = True
         closed_ns = int(self._clock())
         try:
             self._queue.put(_encode({"attempt_id": None, "lane": None, "kind": "observation_closed",
@@ -211,7 +231,7 @@ class JsonlStageObserver(StageObserverPort):
             **counts, "queue_capacity": self._max_events, "max_bytes": self._max_bytes,
             "started_monotonic_ns": self._started_ns, "closed_monotonic_ns": closed_ns,
             "failure_types": list(self._failure_types), "events_file": _EVENTS_FILENAME,
-            "writer_thread_alive": self._thread.is_alive(),
+            "writer_thread_alive": self._thread.is_alive(), "clock": self._clock_binding,
         }
         try:
             fd = _open_new(self._directory / _SUMMARY_FILENAME)

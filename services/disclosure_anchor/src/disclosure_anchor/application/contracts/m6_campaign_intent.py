@@ -17,7 +17,7 @@ from disclosure_anchor.application.contracts.m6_campaign import M6Mode
 from disclosure_anchor.application.contracts.m6_common import M6ClosedModel, M6Hash, M6Id, M6PositiveInt
 from disclosure_anchor.application.contracts.m6_run import M6ResourceEnvelope
 
-M6_CAMPAIGN_INTENT_CONTRACT = "m6.campaign-intent.v1"
+M6_CAMPAIGN_INTENT_CONTRACT = "m6.campaign-intent.v2"
 M6_CAMPAIGN_INTENT_MAX_BYTES = 1_048_576
 
 
@@ -58,8 +58,9 @@ class M6RunIntent(M6ClosedModel):
         return self
 
 
-class M6CampaignIntent(M6ClosedModel):
-    contract_version: Literal["m6.campaign-intent.v1"] = "m6.campaign-intent.v1"
+class _M6CampaignIntentFields(M6ClosedModel):
+    """Fields and validation shared by every intent version; a version only fixes what it freezes."""
+
     run: M6RunIntent
     runtime: M6CampaignRuntimeBinding
     release_manifest_sha256: M6Hash
@@ -92,7 +93,35 @@ class M6CampaignIntent(M6ClosedModel):
         return self.run.planned_seconds
 
 
+class M6CampaignIntentV1(_M6CampaignIntentFields):
+    """The frozen first intent contract, retained so archived G0 inputs still decode; not accepted by the live entry."""
+
+    contract_version: Literal["m6.campaign-intent.v1"] = "m6.campaign-intent.v1"
+
+
+class M6CampaignIntent(_M6CampaignIntentFields):
+    """v2: identical to v1 plus the evaluation plan frozen before any admission (Pro R20 §4)."""
+
+    contract_version: Literal["m6.campaign-intent.v2"] = "m6.campaign-intent.v2"
+    evaluation_plan_sha256: M6Hash
+
+
+def decode_campaign_intent(raw: bytes) -> M6CampaignIntent | M6CampaignIntentV1:
+    """Decode an intent of either contract version from exact canonical bytes (version read first, then the exact model)."""
+    from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+
+    if len(raw) > M6_CAMPAIGN_INTENT_MAX_BYTES:
+        raise ValueError("campaign intent exceeds its byte bound")
+    value = strict_json_loads(raw.decode("utf-8"))
+    version = value.get("contract_version") if type(value) is dict else None
+    if version == "m6.campaign-intent.v1":
+        return M6CampaignIntentV1.from_canonical_bytes(raw, maximum_bytes=M6_CAMPAIGN_INTENT_MAX_BYTES)
+    if version == "m6.campaign-intent.v2":
+        return M6CampaignIntent.from_canonical_bytes(raw, maximum_bytes=M6_CAMPAIGN_INTENT_MAX_BYTES)
+    raise ValueError("campaign intent contract version is unsupported")
+
+
 __all__ = [
     "M6_CAMPAIGN_INTENT_CONTRACT", "M6_CAMPAIGN_INTENT_MAX_BYTES",
-    "M6CampaignIntent", "M6CampaignRuntimeBinding", "M6RunIntent",
+    "M6CampaignIntent", "M6CampaignIntentV1", "M6CampaignRuntimeBinding", "M6RunIntent", "decode_campaign_intent",
 ]

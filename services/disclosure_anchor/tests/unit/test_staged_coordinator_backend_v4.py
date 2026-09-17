@@ -25,6 +25,7 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4SuccessorAppend,
 )
 from disclosure_anchor.application.ports.remote_provider_v4 import (
+    RemoteProviderCompletedV4,
     RemoteProviderFailedV4,
     RemoteProviderUnavailableV4,
     RemoteProviderWaitingV4,
@@ -249,6 +250,46 @@ def _backend(
 
 
 class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
+    def test_terminal_measurement_precedes_durable_append_and_cannot_fail_business(self) -> None:
+        authority = _authority("submitted")
+        terminal = _fixture()[1][4]
+        for observer_broken in (False, True):
+            with self.subTest(observer_broken=observer_broken):
+                observer = mock.Mock()
+                if observer_broken:
+                    observer.note.side_effect = OSError("measurement sink failed")
+                guard = replace(_guard(), attempt_id=authority.attempt_id, lane="remote", observer=observer)
+                inputs = mock.Mock(spec=V4StageInputResolver)
+                inputs.poll_command.return_value = mock.sentinel.poll
+                remote = mock.Mock()
+                remote.poll_once.return_value = RemoteProviderCompletedV4(
+                    receipt=terminal, result_lease_until_unix=1000.0, lease_observed_at_unix=2.0,
+                    lease_response_sha256="sha256:" + "1" * 64, lease_response_byte_count=2,
+                )
+                backend, persistence, _, _ = _backend(authority, inputs=inputs, remote=remote)
+                append = persistence.append_successor
+
+                def observed_append(*args, **kwargs):
+                    observer.note.assert_called_once()
+                    observation = observer.note.call_args.args[0]
+                    self.assertEqual(observation.kind, "remote_terminal_observed")
+                    self.assertEqual(observation.attempt_id, authority.attempt_id)
+                    self.assertEqual(dict(observation.scalars)["terminal_receipt_sha256"], terminal.sha256)
+                    return append(*args, **kwargs)
+
+                with (mock.patch.object(backend, "_capability", return_value=mock.sentinel.capability),
+                      mock.patch.object(persistence, "append_successor", side_effect=observed_append)):
+                    updated = backend.run_remote(
+                        _work(authority), credit_allowance=ResourceCreditVector(provider_result_bytes=1_000_000),
+                        stage_guard=guard,
+                    )
+                self.assertEqual(updated.state, "remote_terminal")
+                self.assertEqual(len(persistence.appends), 1)
+                if observer_broken:
+                    observer.record_failure.assert_called_once()
+                else:
+                    observer.record_failure.assert_not_called()
+
     def test_composition_guard_precedes_effects_in_every_recovery_stage(self) -> None:
         stages = {
             "prepared": "prepare_remote_io", "reconciling": "run_remote",

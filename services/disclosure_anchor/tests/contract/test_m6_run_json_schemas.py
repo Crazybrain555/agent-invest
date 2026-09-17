@@ -24,6 +24,7 @@ from disclosure_anchor.application.contracts.m6_owner import (
 )
 from disclosure_anchor.application.contracts.m6_schemas import operational_m6_schema_documents
 
+from tests.m6_delivery_support import empty_report_wire, evaluation_plan
 from tests import m6_support as m6
 from tests import _m6_service_quality_fixture as service_quality
 from tests._m6_service_run_fixture import receipt_payload
@@ -32,6 +33,8 @@ import jsonschema
 
 
 EXPECTED_FILES = {
+    "m6-evaluation-plan.v1.schema.json": "m6.evaluation-plan.v1",
+    "m6-delivery-report.v1.schema.json": "m6.delivery-report.v1",
     "m6-campaign-scope.v1.schema.json": "m6.campaign-scope.v1",
     "m6-corpus-manifest.v1.schema.json": "m6.corpus-manifest.v1",
     "m6-quality-plan.v1.schema.json": "m6.quality-plan.v1",
@@ -187,6 +190,8 @@ class SchemaAcceptanceTests(unittest.TestCase):
             "verdict": "scorable", "reasons": [], "scorable_page_count": 2,
         }
         instances = {
+            "m6-evaluation-plan.v1.schema.json": evaluation_plan(),
+            "m6-delivery-report.v1.schema.json": empty_report_wire(),
             "m6-campaign-scope.v1.schema.json": scope,
             "m6-corpus-manifest.v1.schema.json": corpus,
             "m6-quality-plan.v1.schema.json": plan,

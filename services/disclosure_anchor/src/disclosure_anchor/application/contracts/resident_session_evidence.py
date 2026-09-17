@@ -169,7 +169,7 @@ def check_resident_configuration(
     if (lane, cadence) not in {("gpu_fast", 250), ("gpu_fast", 500), ("host_slow", 1000)}:
         raise ValueError("resident lane cadence differs")
     config.integer("port", 1024, 65535)
-    config.integer("lifetime_ms", config.integer("lease_ms", 2000, 30000), 7190000)
+    config.integer("lifetime_ms", config.integer("lease_ms", 2000, 30000), 8390000)
     config.integer("sampling_timeout_ms", 1, cadence)
     config.integer("response_timeout_ms", 1, 1000)
     config.sha("powershell_executable_sha256")

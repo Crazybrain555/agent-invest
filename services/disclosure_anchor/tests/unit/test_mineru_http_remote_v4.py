@@ -70,6 +70,10 @@ class _Guard:
         self.checkpoints = 0
         self.remaining = 60.0
         self.fail = False
+        self.notes: list[tuple[str, dict[str, int | str | None]]] = []
+
+    def note(self, kind: str, **scalars: int | str | None) -> None:
+        self.notes.append((kind, scalars))
 
     def checkpoint(self) -> None:
         self.checkpoints += 1
@@ -164,7 +168,13 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append(f"{request.method} {request.url.path}")
             if request.method == "GET":
+                self.assertEqual(self.guard.notes, [], "lookup is not a POST send")
                 return httpx.Response(404, json={"detail": "Task not found"})
+            self.assertEqual(len(self.guard.notes), 1, "send must already be observed at transport entry")
+            kind, identity = self.guard.notes[0]
+            self.assertEqual(kind, "remote_post_send")
+            self.assertEqual(identity["source_pdf_sha256"], self.source_sha)
+            self.assertEqual(identity["fence_identity"], "fence-1")
             body = request.read()
             self.assertIn(b"agent_idempotency_key", body)
             self.assertIn(self.key.encode(), body)
@@ -209,6 +219,7 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
         self.assertEqual(calls, ["GET"])
         self.assertEqual(source.opens, 0)
         self.assertIsNone(result.absence_proof)
+        self.assertEqual(self.guard.notes, [], "reconciliation must not fabricate a send")
 
     def test_lookup_failure_never_authorizes_post_or_snapshot_open(self) -> None:
         cases: tuple[
@@ -311,6 +322,7 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
             result = provider.reconcile_or_submit(self._submission_command())
         self.assertEqual(calls, ["GET", "POST", "GET"])
         self.assertEqual(result.receipt.remote_task_identity, "task-1")
+        self.assertEqual([kind for kind, _ in self.guard.notes], ["remote_post_send"])
 
     def test_invalid_post_response_reconciles_once_without_resubmit(self) -> None:
         calls: list[str] = []
@@ -369,6 +381,8 @@ class MinerUHttpRemoteV4Tests(unittest.TestCase):
                     provider.reconcile_or_submit(self._submission_command())
         self.assertEqual(calls, ["GET", "POST", "GET"] * 2)
         self.assertEqual(len(bodies), 2)
+        self.assertEqual([kind for kind, _ in self.guard.notes], ["remote_post_send"] * 2)
+        self.assertEqual(self.guard.notes[0][1], self.guard.notes[1][1])
         for body in bodies:
             self.assertIn(self.key.encode(), body)
             self.assertIn(self.source, body)

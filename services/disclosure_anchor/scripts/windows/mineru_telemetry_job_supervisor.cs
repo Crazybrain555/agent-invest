@@ -98,7 +98,7 @@ public static class MineruTelemetryJobSupervisor
 
     public static string Run(string executable, string[] arguments, int lifetimeMilliseconds,
                              int cleanupMilliseconds, string sourceSha256) {
-        if (lifetimeMilliseconds < 1000 || lifetimeMilliseconds > 7200000 ||
+        if (lifetimeMilliseconds < 1000 || lifetimeMilliseconds > 8400000 ||
             cleanupMilliseconds < 1000 || cleanupMilliseconds > 10000)
             throw new ArgumentException("finite lifetime/cleanup bounds required");
         if (!System.Text.RegularExpressions.Regex.IsMatch(sourceSha256, @"\Asha256:[0-9a-f]{64}\z"))

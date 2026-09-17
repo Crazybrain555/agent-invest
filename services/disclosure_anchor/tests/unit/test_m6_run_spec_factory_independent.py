@@ -32,6 +32,7 @@ class RunSpecFactoryTests(unittest.TestCase):
     def campaign(self, **overrides):
         _, _, intent, runtime = self.parts()
         values = dict(run=intent, runtime=runtime, release_manifest_sha256=m6.digest("release"),
+                      evaluation_plan_sha256=m6.digest("frozen-evaluation-plan"),
                       binding_sha256=m6.digest("binding"), close_grace_seconds=30, memory_bytes=268435456,
                       bootstrap_bind_seconds=60, ready_wait_seconds=30, runner_stop_reserve_seconds=5,
                       verifier_deadline_seconds=80, verifier_identity="verifier-independent",

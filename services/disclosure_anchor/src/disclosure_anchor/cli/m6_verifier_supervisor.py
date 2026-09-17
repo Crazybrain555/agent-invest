@@ -34,6 +34,7 @@ from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
 from disclosure_anchor.adapters.runtime.m6_continuous_clock import diagnostic_continuous_clock
 from disclosure_anchor.adapters.runtime.m6_e2e_run import M6RunDirectory, M6VerifierAssembly, load_m6_run_directory
 from disclosure_anchor.adapters.runtime.m6_qualification_verifier import M6PublicReceiptInput
+from disclosure_anchor.adapters.runtime.stage_observation import mac_stage_clock_binding
 from disclosure_anchor.adapters.runtime.m6_verifier_supervisor import (
     PublicOutcome, QualityOutcome, ReadyAttempt, RunnerSpoolTail, SupervisorRefused, VerifierSupervisor,
     write_receipt_file,
@@ -169,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     clock = diagnostic_continuous_clock().now_ns
     summary: dict[str, Any] = {
+        "clock": mac_stage_clock_binding(),
         "contract_version": SUMMARY_CONTRACT, "started_utc": datetime.now(UTC).isoformat(),
         "verifier_identity": args.verifier_identity, "plan_sha256": plan.canonical_sha256(),
         "m6_run": {"run_id": spec.run_id, "spec_sha256": spec.canonical_sha256(), "pins": run.pins},

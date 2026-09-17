@@ -8,11 +8,15 @@ models; the transport authenticates the caller, not an arbitrary claimed role.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 import json
 from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
+from disclosure_anchor.application.contracts.closed_document import (
+    canonical_bytes, load_closed_object, require_fields, require_int, require_sha256, sha256_of,
+)
 from disclosure_anchor.application.contracts.m6_common import (
     M6ClosedModel, M6Hash, M6Id, M6NonnegativeInt, M6PositiveInt,
 )
@@ -49,6 +53,74 @@ class M6OwnerAnchor(M6ClosedModel):
         if (self.owner_source_sha256 != spec.runtime.owner_source_sha256
                 or self.gpu_device_identity_sha256 != spec.runtime.gpu_device_identity_sha256):
             raise ValueError("owner source/device differs from frozen runtime")
+
+
+
+def physical_owner_epoch_sha256(anchor: M6OwnerAnchor, *, pid: object, creation_filetime_100ns: object) -> str:
+    """Exactly MineruM6OwnerIdentity.ProcessEpoch; no wall clock or host IO."""
+    pid = require_int(pid, label="owner pid", maximum=2**31 - 1)
+    creation_filetime_100ns = require_int(creation_filetime_100ns, label="owner creation_filetime_100ns")
+    return sha256_of(canonical_bytes({
+        "run_id": anchor.run_id, "owner_source_sha256": anchor.owner_source_sha256,
+        "boot_identity_sha256": anchor.clock.boot_identity_sha256,
+        "pid": pid, "creation_filetime_100ns": creation_filetime_100ns,
+    }))
+
+
+def bind_physical_owner_boot(
+    *, metadata_raw: bytes, body_raw: bytes, anchor: M6OwnerAnchor,
+    pid: object, creation_filetime_100ns: object,
+) -> str:
+    """Bind the existing native diagnostic to the anchor and return its resident UTC encoding.
+
+    Native BootId and resident LastBootUpTime hashes are NOT interchangeable.
+    Both derive from this one existing physical identity record; metadata,
+    original bytes, native clock, GPU and PID/birth/epoch must all agree first.
+    This checks recorded evidence, not an independent hardware attestation.
+    """
+    metadata = load_closed_object(metadata_raw, label="owner identity metadata", maximum_bytes=1024)
+    require_fields(metadata, {"contract_version", "code", "body_sha256"}, label="owner identity metadata")
+    if (metadata["contract_version"] != "m6.transport-diagnostic.v1"
+            or metadata["code"] != "owner_identity"
+            or metadata["body_sha256"] != sha256_of(body_raw)):
+        raise ValueError("owner identity metadata does not bind the exact body")
+    body = load_closed_object(body_raw, label="physical owner identity", maximum_bytes=65536)
+    require_fields(body, {"contract_version", "boot_counter", "boot_identity_version", "clock",
+                         "creation_filetime_100ns", "gpu_device_identity_sha256", "pid",
+                         "windows_boot_utc", "windows_node_identity_sha256"}, label="physical owner identity")
+    if (body["contract_version"] != "m6.physical-owner-identity.v2"
+            or body["boot_identity_version"] != "m6.windows-boot-counter.v1"
+            or canonical_bytes(body) != body_raw):
+        raise ValueError("physical owner identity is not the canonical native v2 record")
+    node = require_sha256(body["windows_node_identity_sha256"], label="physical owner node")
+    counter = require_int(body["boot_counter"], label="physical owner boot counter", minimum=0, maximum=2**32 - 1)
+    native_boot = sha256_of(canonical_bytes({"contract_version": "m6.windows-boot-counter.v1",
+                                           "windows_node_identity_sha256": node, "boot_counter": counter}))
+    clock = M6ClockDomain.model_validate(body["clock"])
+    clock_domain = sha256_of(canonical_bytes({"boot_identity_sha256": native_boot,
+                                              "clock_source": "QueryPerformanceCounter",
+                                              "frequency_hz": clock.qpc_frequency_hz}))
+    if (clock != anchor.clock or native_boot != clock.boot_identity_sha256
+            or clock_domain != clock.clock_domain_identity_sha256
+            or body["gpu_device_identity_sha256"] != anchor.gpu_device_identity_sha256):
+        raise ValueError("physical owner identity differs from the original anchor clock/GPU")
+    pid = require_int(pid, label="external owner pid", maximum=2**31 - 1)
+    creation_filetime_100ns = require_int(creation_filetime_100ns, label="external owner creation_filetime_100ns")
+    body_pid = require_int(body["pid"], label="physical owner pid", maximum=2**31 - 1)
+    birth = require_int(body["creation_filetime_100ns"], label="physical owner creation_filetime_100ns")
+    if (body_pid != pid or birth != creation_filetime_100ns
+            or physical_owner_epoch_sha256(anchor, pid=body_pid, creation_filetime_100ns=birth)
+            != anchor.owner_process_epoch_sha256):
+        raise ValueError("physical owner identity differs from the external start/original owner epoch")
+    boot_utc = body["windows_boot_utc"]
+    if type(boot_utc) is not str or not boot_utc.endswith("Z"):
+        raise ValueError("physical owner boot UTC is not the original UTC string")
+    parsed = datetime.fromisoformat(boot_utc)
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError("physical owner boot UTC has no UTC timezone")
+    # Keep all seven .NET fractional digits. Reserializing via Python datetime
+    # would change the historical resident identity even for the same instant.
+    return sha256_of(canonical_bytes({"windows_node_identity_sha256": node, "boot_utc": boot_utc}))
 
 
 # The canonical spec travels inside the bind request; the escaped whole wire

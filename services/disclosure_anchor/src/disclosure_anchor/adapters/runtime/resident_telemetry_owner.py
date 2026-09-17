@@ -134,7 +134,8 @@ def _configuration(plan: ResidentLaneLaunch) -> dict[str, object]:
 
 
 def _validate_request(request: ResidentTelemetryOwnerRequest) -> None:
-    if not math.isfinite(request.duration_seconds) or not 0 < request.duration_seconds <= 7100:
+    if (isinstance(request.duration_seconds, bool) or not isinstance(request.duration_seconds, (int, float))
+            or not math.isfinite(request.duration_seconds) or not 0 < request.duration_seconds <= 8300):
         raise ValueError("resident owner sampling duration invalid")
     if str(uuid.UUID(request.run_id)) != request.run_id:
         raise ValueError("resident owner run ID is not canonical")
@@ -149,8 +150,8 @@ def _validate_request(request: ResidentTelemetryOwnerRequest) -> None:
             raise ValueError("resident owner lane/config path differs")
         if cast(int, config["lease_ms"]) != 30000 or cast(int, config["lifetime_ms"]) < (request.duration_seconds + 60) * 1000:
             raise ValueError("resident owner needs 30s leases and 60s lifecycle headroom")
-        if cast(int, config["lifetime_ms"]) > 7_180_000:
-            raise ValueError("resident owner lifetime plus control allowance exceeds 7200s")
+        if cast(int, config["lifetime_ms"]) > 8_380_000:
+            raise ValueError("resident owner lifetime plus control allowance exceeds 8400s")
         owner = cast(dict[str, object], config["owner_identity"])
         if owner["runtime_bundle_identity_sha256"] != profile.runtime_bundle_identity_sha256 or owner["process_profile_sha256"] != artifact_sha256(request.process_profile_bytes):
             raise ValueError("resident owner exact process profile binding differs")
@@ -195,6 +196,10 @@ def _launch_command(
     # Persist before Popen: loss of the launch reply cannot justify a retry.
     journal.put(f"{config['lane']}-{phase}-intent.json", canonical_bytes({"command": command, "script_sha256": artifact_sha256(script.encode()), "config_sha256": artifact_sha256(plan.config_bytes)}))
     timeout = cast(int, config["lifetime_ms"]) / 1000 + 20 if phase == "start" else 25
+    # Only the start transport may span the extended finite lane lifetime;
+    # the ready/closed controls keep the default outer-command ceiling.
+    if phase == "start":
+        return BoundedOwnerCommand(command, timeout_seconds=timeout, lifetime_ceiling_seconds=8400)
     return BoundedOwnerCommand(command, timeout_seconds=timeout)
 
 
