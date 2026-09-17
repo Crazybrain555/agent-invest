@@ -134,6 +134,66 @@ class _Provider:
 
 
 class MinerUDiagnosticTests(unittest.TestCase):
+    def interrupt_after_acceptance(self, provider: _Provider) -> dict[str, bytes]:
+        original = provider.handle
+
+        def stop_at_first_poll(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/tasks/task-1":
+                raise KeyboardInterrupt("declared process interruption after durable acceptance")
+            return original(request)
+
+        with patch.object(provider, "handle", side_effect=stop_at_first_poll):
+            with self.assertRaises(KeyboardInterrupt):
+                provider.run()
+        return {name: (provider.journal / name).read_bytes()
+                for name in ("01-intent.json", "02-submit-response.json", "02-accepted.json")}
+
+    def test_explicit_accepted_recovery_validates_original_task_without_rewriting_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _Provider(Path(tmp))
+            before = self.interrupt_after_acceptance(provider)
+            evidence, disposal = provider.run(reconcile=True)
+            self.assertEqual(evidence["page_count"], 2)
+            self.assertEqual(disposal["task_id"], "task-1")
+            self.assertTrue(provider.acked)
+            self.assertEqual(provider.calls.count(("POST", "/tasks")), 1)
+            self.assertEqual(provider.calls.count(("POST", "/tasks/task-1/ack")), 1)
+            self.assertFalse((provider.journal / "resources").exists())
+            for name, raw in before.items():
+                self.assertEqual((provider.journal / name).read_bytes(), raw)
+            self.assertTrue((provider.journal / "06-disposed.json").is_file())
+
+    def test_accepted_recovery_refuses_identity_drift_absence_and_later_partial_state(self) -> None:
+        fields = {"accepted_task": "task_id", "accepted_fence": "fence_identity",
+                  "accepted_key": "idempotency_key", "accepted_attempt": "attempt_identity"}
+        for failure in (*fields, "mode", "symlink", "duplicate", "identity", "reconcile_absence", "later_stage"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                provider = _Provider(Path(tmp))
+                self.interrupt_after_acceptance(provider)
+                accepted = provider.journal / "02-accepted.json"
+                if failure in fields:
+                    value = json.loads(accepted.read_bytes())
+                    value[fields[failure]] = "another-task-or-identity"
+                    accepted.write_text(json.dumps(value))
+                elif failure == "mode":
+                    accepted.chmod(0o644)
+                elif failure == "symlink":
+                    original = provider.root / "original-accepted.json"
+                    accepted.rename(original)
+                    accepted.symlink_to(original)
+                elif failure == "duplicate":
+                    accepted.write_text(accepted.read_text().rstrip()[:-1] + ',"task_id":"task-1"}')
+                elif failure == "later_stage":
+                    (provider.journal / "03-terminal.json").write_text("{}")
+                else:
+                    provider.failure = failure
+                with self.assertRaises((ValueError, OSError)):
+                    provider.run(reconcile=True)
+                self.assertFalse(provider.acked)
+                self.assertEqual(provider.calls.count(("POST", "/tasks")), 1)
+                self.assertTrue((provider.journal / "resources" / "source.pdf").exists())
+                self.assertFalse((provider.journal / "05-disposal-intent.json").exists())
+
     def test_real_wire_zip_reader_closure_before_owned_cleanup_and_ack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             provider = _Provider(Path(tmp))

@@ -103,6 +103,17 @@ def validate_diagnostic_disposal(
         raise ValueError("diagnostic disposal task/result/ACK identity drifted")
 
 
+def _owned_record_bytes(path: Path, *, label: str) -> bytes:
+    """Bytes of one immutable journal record this user wrote: regular, 0600, single link."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise ValueError(f"diagnostic {label} ownership drifted")
+        return source.read(MAX_WIRE_JSON_BYTES + 1)
+
+
 def run_diagnostic_pdf(
     *, input_pdf: Path, source_pdf_sha256: str, source_page_count: int,
     api_url: str, server_url: str, options: ParserOptions, journal_root: Path,
@@ -116,9 +127,13 @@ def run_diagnostic_pdf(
     """Validate one whole PDF, dispose only its diagnostics, retain audit proof.
 
     Existing journals are never overwritten or resumed by guessing. Explicit
-    reconciliation supports only a pre-accepted intent and its intact snapshot,
-    validates every supplied identity, and issues GET by the original key only.
-    Absence or drift is a failure, never permission to POST. In
+    reconciliation supports exactly two durable states with an intact snapshot:
+    a pre-accepted intent (01/02-submit-response) or a durably accepted task
+    (01/02-submit-response/02-accepted). It validates every supplied identity,
+    issues GET by the original key only, and for the accepted state requires the
+    same-key lookup to name the recorded task before any write; the recorded
+    acceptance is never rewritten. Any later partial state (03 onwards) is
+    refused. Absence or drift is a failure, never permission to POST. In
     particular a POST response loss is a FAIL with a durable lookup identity,
     not permission to submit again. Network inactivity is bounded to 30 seconds;
     every request/chunk also checks the whole operation deadline.
@@ -148,19 +163,20 @@ def run_diagnostic_pdf(
         return min(30.0, remaining)
 
     prior: dict[str, Any] | None = None
+    recorded_acceptance: bytes | None = None
     if reconcile_submitted:
-        if (set(item.name for item in journal_root.iterdir()) - {
-                "01-intent.json", "02-submit-response.json", "resources"}
-                or set(item.name for item in resources.iterdir()) != {"source.pdf"}):
-            raise ValueError("diagnostic reconciliation requires an untouched pre-accepted journal")
-        fd = os.open(journal_root / "01-intent.json", os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(fd, "rb") as source:
-            info = os.fstat(source.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
-                raise ValueError("diagnostic intent ownership drifted")
-            prior = decode_closed_json_v2(source.read(MAX_WIRE_JSON_BYTES + 1),
-                                          required=frozenset(), allowed=None)
+        names = set(item.name for item in journal_root.iterdir())
+        pre_accepted = {"01-intent.json", "02-submit-response.json", "resources"}
+        if names <= pre_accepted:
+            pass  # intent with or without the submit response: the existing pre-accepted state
+        elif names == pre_accepted | {"02-accepted.json"}:
+            recorded_acceptance = _owned_record_bytes(journal_root / "02-accepted.json", label="acceptance")
+        else:
+            raise ValueError("diagnostic reconciliation requires an untouched pre-accepted or accepted journal")
+        if set(item.name for item in resources.iterdir()) != {"source.pdf"}:
+            raise ValueError("diagnostic reconciliation requires the intact source snapshot only")
+        prior = decode_closed_json_v2(_owned_record_bytes(journal_root / "01-intent.json", label="intent"),
+                                      required=frozenset(), allowed=None)
         identity = prior["prepared_identity"]
         attempt, fence, epoch = (identity["attempt_identity"], identity["fence_identity"],
                                  identity["submission_epoch_unix"])
@@ -242,11 +258,19 @@ def run_diagnostic_pdf(
                 return result
 
         if reconcile_submitted:
+            # The recorded acceptance must already bind this exact key/attempt/fence
+            # before any network exchange; an edited or foreign record never proceeds.
+            recorded = None if recorded_acceptance is None else observation(recorded_acceptance)
             status, exact = request("GET", task_lookup_url_v2(
                 api_origin=api_url, idempotency_key=prepared.client_submit_key,
             ))
             if status != 200:
                 raise ValueError(f"diagnostic reconciliation returned HTTP {status}; never resubmit")
+            if recorded is not None:
+                looked_up = observation(exact, recorded.task_id)
+                if (looked_up.status_url != recorded.status_url
+                        or looked_up.result_url != recorded.result_url):
+                    raise ValueError("diagnostic reconciliation lookup names a different task route than the recorded acceptance")
         else:
             with GuardedUpload(io.FileIO(snapshot, "r")) as upload, client.stream(
                 "POST", api_url.rstrip("/") + "/tasks", data=data,
@@ -263,8 +287,9 @@ def run_diagnostic_pdf(
                 "http_status": status, "response_sha256": _digest(exact),
             })
             raise ValueError(f"diagnostic submit returned HTTP {status}; evidence retained")
-        accepted = observation(exact)
-        _record(journal_root, "02-accepted.json", json.loads(exact))
+        accepted = observation(exact, None if recorded_acceptance is None else json.loads(recorded_acceptance)["task_id"])
+        if recorded_acceptance is None:
+            _record(journal_root, "02-accepted.json", json.loads(exact))
         current = accepted
         while current.status in {"pending", "processing"}:
             pause(min(1.0, checkpoint()))

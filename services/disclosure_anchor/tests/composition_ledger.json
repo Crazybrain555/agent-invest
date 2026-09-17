@@ -624,7 +624,7 @@
   },
   "tests/unit/test_mineru_diagnostic.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 12
   },
   "tests/unit/test_mineru_diagnostic_before_submit.py": {
    "private_imports": [],
