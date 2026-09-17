@@ -26,11 +26,14 @@ from disclosure_anchor.adapters.db.postgres.connection import (
     require_runtime_app_connection, require_runtime_app_engine,
 )
 from disclosure_anchor.adapters.runtime.m6_continuous_clock import diagnostic_continuous_clock
-from disclosure_anchor.adapters.runtime.m6_e2e_assembly import M6E2EAssemblyWorker, M6LifecycleSpool
+from disclosure_anchor.adapters.runtime.m6_e2e_assembly import (
+    M6E2EAssemblyWorker, M6LeaseStartupError, M6LifecycleSpool,
+)
 from disclosure_anchor.adapters.runtime.m6_e2e_run import (
     M6RunDirectory, M6RunnerClosureFailed, build_runner_closure_receipts, execute_runner_closure,
     load_m6_run_directory, m6_owner_client_factory,
 )
+from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6_CONTROL_EXCHANGE_TIMEOUT_NS
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import MinerUDeploymentChecker
 from disclosure_anchor.adapters.runtime.mineru_stream_activation import load_mineru_stream_activation
 from disclosure_anchor.adapters.runtime.mineru_stream_worker import owned_mineru_stream_control
@@ -52,6 +55,11 @@ from disclosure_anchor.cli.worker import (
 from disclosure_anchor.settings import Settings, load_settings
 
 CAMPAIGN_INPUT_FILE_MAX_BYTES = 8 * 1024 * 1024
+# The runner's first lease is one control exchange whose deadline already covers
+# the pinned SSH startup; twice that bound is the whole startup allowance, and the
+# campaign's own admission deadline caps it. It is a sequencing wait, not a grace
+# window: the grant it observes keeps expiring on the continuous clock.
+M6_FIRST_LEASE_WAIT_SECONDS = 2 * M6_CONTROL_EXCHANGE_TIMEOUT_NS / 1_000_000_000
 
 
 def _read_pinned(path: Path, label: str) -> bytes:
@@ -214,6 +222,12 @@ def _run_owned_campaign(
             if pinned_worker_profile is not None and pinned_worker_profile != runtime.worker_profile_sha256:
                 raise CampaignInputError("owner run spec names a different worker profile")
             runtime.verify_startup()
+            if worker is not None:
+                # The stop predicate below latches its first reason for the whole
+                # run, so it is installed only once the sender holds a granted
+                # lease; a sender that fails or gets no grant ends the run here,
+                # visibly, before any admission.
+                _await_first_owner_lease(worker, bound_seconds=min(float(request.max_seconds), M6_FIRST_LEASE_WAIT_SECONDS))
             started_utc = datetime.now(UTC)
             started_monotonic = time.monotonic()
             state = CampaignStopState()
@@ -244,6 +258,14 @@ def _run_owned_campaign(
             finished_utc=datetime.now(UTC), monotonic_elapsed_s=finished_monotonic - started_monotonic,
             stop_reason=state.reason if state.reason is not None else "quiescent", assembly=assembly,
         )
+
+
+def _await_first_owner_lease(worker: M6E2EAssemblyWorker, *, bound_seconds: float) -> None:
+    """Hold the campaign until its sender holds a first granted owner lease, or fail visibly."""
+    if worker.wait_for_first_lease(bound_seconds):
+        return
+    reason = "the sender failed before holding a lease" if worker.failed else f"no lease was granted within {bound_seconds:g} s"
+    raise M6LeaseStartupError(f"M6 owner lease handshake failed: {reason}; new admission never opened")
 
 
 def _finish_assembly(
@@ -377,6 +399,12 @@ def main(argv: list[str] | None = None) -> int:
         except CampaignInputError as exc:
             print(json.dumps({"campaign_input_error": type(exc).__name__, "message": str(exc)}), flush=True)
             return 2
+        except M6LeaseStartupError as exc:
+            # The owner never granted this runner a lease: no admission happened,
+            # the spool and worker were closed with their evidence, no receipt is
+            # written because there is no campaign outcome to project.
+            print(json.dumps({"campaign_startup_error": type(exc).__name__, "message": str(exc)}), flush=True)
+            return 3
         _write_new(receipt, result)
         print(json.dumps(result, sort_keys=True), flush=True)
         return 0

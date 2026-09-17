@@ -410,15 +410,17 @@
   },
   "tests/unit/test_m6_campaign_assembly_independent.py": {
    "private_imports": [],
-   "tests": 15
+   "tests": 18
   },
   "tests/unit/test_m6_delivery_report_independent.py": {
    "private_imports": [],
    "tests": 29
   },
   "tests/unit/test_m6_e2e_assembly_independent.py": {
-   "private_imports": [],
-   "tests": 10
+   "private_imports": [
+    "_await_first_owner_lease"
+   ],
+   "tests": 15
   },
   "tests/unit/test_m6_lifecycle_emission_independent.py": {
    "private_imports": [],
@@ -448,7 +450,7 @@
   },
   "tests/unit/test_m6_owner_protocol.py": {
    "private_imports": [],
-   "tests": 23
+   "tests": 24
   },
   "tests/unit/test_m6_private_publication.py": {
    "private_imports": [],

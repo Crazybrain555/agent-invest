@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6LineOwnerTransport
+from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6_CONTROL_EXCHANGE_TIMEOUT_NS, M6LineOwnerTransport
 from disclosure_anchor.adapters.runtime.resident_ssh_http import (
     ResidentSSHConfig, _Session, _read_private_config,
 )
@@ -15,9 +15,12 @@ from disclosure_anchor.adapters.runtime.resident_ssh_http import (
 
 def m6_ssh_owner_transport(
     *, config: ResidentSSHConfig, token_path: str, remote_port: int,
-    continuous_ns: Callable[[], int], timeout_ns: int = 5_000_000_000,
+    continuous_ns: Callable[[], int], timeout_ns: int = M6_CONTROL_EXCHANGE_TIMEOUT_NS,
 ) -> M6LineOwnerTransport:
     """Explicit account/port/key files; never fall back to a business SSH key.
+
+    The pinned SSH startup is charged against the same exchange deadline as the
+    first request, so one bound covers "channel open plus reply".
 
     Reuses the existing component's owner-thread, private-file and exact-host-key
     checks. The optional reviewed Paramiko dependency is loaded on first use;

@@ -308,6 +308,10 @@ def _payload(fact: LifecycleFact | M6EventPayload) -> M6EventPayload:
     raise TypeError("lifecycle fact type is not closed")
 
 
+class M6LeaseStartupError(RuntimeError):
+    """The sender did not hold a first granted owner lease inside the startup bound."""
+
+
 class M6E2EAssemblyWorker:
     """Single sender thread: exact bytes, exact sequence, bounded retries, no dedup by conflict."""
 
@@ -341,6 +345,10 @@ class M6E2EAssemblyWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: str | None = None
+        # Startup handshake: the first granted lease, or the end of the sender,
+        # settles a caller's bounded wait. Neither event is permission by itself.
+        self._first_lease = threading.Event()
+        self._settled = threading.Event()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -348,12 +356,36 @@ class M6E2EAssemblyWorker:
         self._thread = threading.Thread(target=self._run, name="m6-e2e-assembly", daemon=True)
         self._thread.start()
 
+    def wait_for_first_lease(self, timeout_seconds: float) -> bool:
+        """Block until the sender holds its first granted lease, or ends, or the bound passes.
+
+        True only when a lease was granted and the sender is still alive and
+        unfailed at that moment. This is sequencing for the caller's stop
+        predicate ("no lease yet" is not "lease lost"), never permission: new
+        admission is still decided by ``admission_allowed`` against the live
+        grant and the same continuous clock. A sender that failed before its
+        first grant, or that got no grant inside the bound, reads False.
+        Without a configured lease refresh the sender never requests a lease
+        (admission then means a live sender), so this handshake has no meaning
+        there and is refused rather than silently timing out.
+        """
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 <= timeout_seconds <= 3600:
+            raise ValueError("first lease wait bound is out of range")
+        if self._lease_refresh is None:
+            raise RuntimeError("first lease handshake requires a configured lease refresh")
+        if self._thread is None:
+            raise RuntimeError("assembly worker not started")
+        self._settled.wait(float(timeout_seconds))
+        return self._first_lease.is_set() and not self._exited and not self.failed
+
     def admission_allowed(self) -> bool:
         """Readable from any thread: a live, unfailed sender holding an unexpired lease.
 
         The deadline is the client's own granted lease compared with the same
         continuous clock, so a blocked exchange cannot keep admission open past
         it, and a sender that failed or exited never keeps a granted lease visible.
+        A refresh in flight leaves the previous grant visible until it expires
+        or its reply replaces it; only that expiry, a failure or a stop closes.
         """
         if self.failed or self._exited:
             return False
@@ -403,13 +435,41 @@ class M6E2EAssemblyWorker:
         if now - last_refresh < self._lease_refresh:
             return last_refresh
         try:
-            client.refresh_admission()
+            granted = client.refresh_admission()
         except (M6OwnerProtocolError, M6OwnerRejected, EOFError, OSError, RuntimeError, TimeoutError) as exc:
             # A failed refresh never extends the lease the client already holds;
             # it is recorded and the sender stops, which closes admission.
             self._spool.note_failure("lease refresh: " + f"{type(exc).__name__}:{exc}"[:200])
             raise
+        if granted and not self._first_lease.is_set():
+            self._first_lease.set()
+            self._settled.set()
         return now
+
+    def _wait(self, client: M6OwnerClient, last_refresh: float, seconds: float) -> float:
+        """Sleep at most ``seconds`` without letting a due lease refresh slip past its slot.
+
+        The refresh interval is a fraction of the grant, so an idle poll or a
+        retry backoff longer than that fraction would let a healthy grant expire
+        unrefreshed. Every refresh made here is a real exchange with the owner,
+        and its failure ends the sender exactly as anywhere else.
+        """
+        deadline = time.monotonic() + seconds
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                return last_refresh
+            slice_seconds = deadline - now
+            if self._lease_refresh is not None:
+                due_in = last_refresh + self._lease_refresh - now
+                if due_in <= 0:
+                    refreshed = self._refresh_lease(client, last_refresh)
+                    if refreshed == last_refresh:  # float rounding at the slot edge; never spin
+                        time.sleep(0.001)
+                    last_refresh = refreshed
+                    continue
+                slice_seconds = min(slice_seconds, due_in)
+            time.sleep(max(0.001, slice_seconds))
 
     def _run(self) -> None:
         client: M6OwnerClient | None = None
@@ -426,7 +486,7 @@ class M6E2EAssemblyWorker:
                         if self._after_drain is not None and not self._spool.failed:
                             self._after_drain_result = self._after_drain(client)
                         return
-                    time.sleep(self._poll)
+                    last_refresh = self._wait(client, last_refresh, self._poll)
                     continue
                 entry = pending[0]
                 event = M6ProducerEvent.from_canonical_bytes(entry.event_utf8.encode("utf-8"), maximum_bytes=self._maximum)
@@ -448,7 +508,7 @@ class M6E2EAssemblyWorker:
                         self._spool.mark_refused(entry.producer_sequence, "transport_exhausted", detail=error_text)
                         return
                     self._spool.note_transport_retry(entry.producer_sequence, attempt=count, error=error_text)
-                    time.sleep(self._backoff)
+                    last_refresh = self._wait(client, last_refresh, self._backoff)
                     continue
                 self._spool.mark_delivered(entry.producer_sequence, record.stamp.sequence,
                                            retries=attempts.get(entry.producer_sequence, 0))
@@ -457,8 +517,10 @@ class M6E2EAssemblyWorker:
             self._spool.note_failure("assembly worker error: " + self._error)
         finally:
             # Order matters for cross-thread readers: admission is closed before
-            # the client releases anything, whatever path brought us here.
+            # the client releases anything, whatever path brought us here, and a
+            # caller still waiting for the first lease is released after that.
             self._exited = True
+            self._settled.set()
             if client is not None:
                 try:
                     client.close()
@@ -466,4 +528,4 @@ class M6E2EAssemblyWorker:
                     self._spool.note_failure("assembly client close: " + f"{type(exc).__name__}:{exc}"[:200])
 
 
-__all__ = ["M6E2EAssemblyWorker", "M6LifecycleSpool", "SPOOL_CONTRACT", "SPOOL_FILENAME", "SpoolEntry"]
+__all__ = ["M6E2EAssemblyWorker", "M6LeaseStartupError", "M6LifecycleSpool", "SPOOL_CONTRACT", "SPOOL_FILENAME", "SpoolEntry"]

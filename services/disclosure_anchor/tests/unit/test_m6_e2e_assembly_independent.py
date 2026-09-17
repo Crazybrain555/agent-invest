@@ -9,8 +9,14 @@ import threading
 import unittest
 from unittest import mock
 
-from disclosure_anchor.adapters.runtime.m6_e2e_assembly import M6E2EAssemblyWorker, M6LifecycleSpool
+from disclosure_anchor.adapters.runtime.m6_e2e_assembly import (
+    M6E2EAssemblyWorker, M6LeaseStartupError, M6LifecycleSpool,
+)
 from disclosure_anchor.application.ports.staged_lifecycle_facts import AttemptAdmittedFact
+from disclosure_anchor.application.services.staged_campaign_runner import (
+    CampaignStopState, campaign_stop_predicate,
+)
+from disclosure_anchor.cli.staged_campaign import _await_first_owner_lease
 from tests import m6_owner_support as owner_support
 from tests import m6_support as m6
 
@@ -50,6 +56,56 @@ class AssemblyIndependentTests(unittest.TestCase):
             error_code="producer_conflict" if outcome == "conflict" else None,
             record_for=lambda request: owner.stamp(request.command.event, sequence=1, tick=self.fixture.at(10)),
         )
+
+    def campaign_stop(self, worker):
+        """The stop predicate `cli/staged_campaign.py` composes around this worker.
+
+        Same shape as the entry: `inner() or worker.failed or not worker.admission_allowed()`,
+        evaluated by the product's own predicate, whose first reason latches for the run.
+        """
+        state = CampaignStopState()
+        stop_requested = campaign_stop_predicate(
+            monotonic=lambda: 0.0, deadline_monotonic=1e9,
+            external_stop=lambda: worker.failed or not worker.admission_allowed(), state=state)
+        return stop_requested, state
+
+    def new_spool(self, name):
+        """One more spool in this test's own directory; each sender needs its own."""
+        spool = M6LifecycleSpool(
+            Path(self.temp.name) / name, run_id=self.spec.run_id,
+            spec_sha256=self.spec.canonical_sha256(), producer_epoch_sha256=m6.RUNNER_EPOCH, max_facts=2,
+        )
+        self.addCleanup(spool.close)
+        return spool
+
+    def handshake(self, worker, *, bound_seconds):
+        """Run the entry's own bounded handshake on its own thread; returns (thread, outcome)."""
+        outcome = []
+
+        def wait():
+            try:
+                _await_first_owner_lease(worker, bound_seconds=bound_seconds)
+            except BaseException as exc:  # noqa: BLE001 - the case asserts the exact type
+                outcome.append(exc)
+            else:
+                outcome.append("ready")
+
+        thread = threading.Thread(target=wait, name="m6-handshake", daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        return thread, outcome
+
+    def granting_owner(self):
+        """A scripted owner that grants one lease inside the guard and keeps granting."""
+        owner = self.owner()
+
+        def grant(request):
+            owner.handlers.append(grant)
+            return owner.reply(request, owner.status(observed=self.fixture.at(10),
+                                                     lease=self.fixture.at(10.5)))
+
+        owner.handlers.append(grant)
+        return owner
 
     def run_worker(self, owner):
         threads = []
@@ -219,6 +275,278 @@ class AssemblyIndependentTests(unittest.TestCase):
         self.assertFalse(status["failed"], status)
         self.assertEqual(status["delivered"], 1)
         self.assertFalse(worker.admission_allowed())
+
+    def test_the_entry_waits_for_the_first_grant_before_its_stop_can_latch(self):
+        """Startup sequencing: the bounded handshake runs before the latching predicate exists.
+
+        Admission is closed while the sender is still building its client, and that is correct.
+        What must not happen is the campaign reading that as an external stop: the entry holds
+        in `_await_first_owner_lease` until the sender holds a grant, and only then builds the
+        predicate whose first reason latches for the whole run.
+        """
+        owner = self.granting_owner()
+        release, granted = threading.Event(), threading.Event()
+
+        def factory():
+            if not release.wait(3):
+                raise TimeoutError("test withheld the client")
+            client = owner_support.client_for(owner)
+            original = client.refresh_admission
+
+            def refresh():
+                result = original()
+                granted.set()
+                return result
+
+            client.refresh_admission = refresh
+            return client
+
+        worker = M6E2EAssemblyWorker(self.spool, client_factory=factory, lease_refresh_seconds=30,
+                                     poll_seconds=0.05)
+        worker.start()
+        try:
+            thread, outcome = self.handshake(worker, bound_seconds=10)
+            self.assertFalse(worker.admission_allowed(), "no grant yet is not permission")
+            self.assertFalse(worker.failed, "and it is not a failure either")
+            # Returning here would need either a grant (withheld) or the whole 10 s bound.
+            thread.join(0.2)
+            self.assertTrue(thread.is_alive(), "the entry must still be holding the campaign")
+            self.assertEqual(outcome, [])
+            release.set()
+            self.assertTrue(granted.wait(3))
+            thread.join(3)
+            self.assertEqual(outcome, ["ready"], "the handshake succeeds once the grant lands")
+            self.assertTrue(worker.admission_allowed())
+            # Only now does the campaign install its latching stop - and it does not latch.
+            stop_requested, state = self.campaign_stop(worker)
+            self.assertFalse(stop_requested())
+            self.assertIsNone(state.reason)
+        finally:
+            release.set()
+            worker.close(3)
+        self.assertFalse(worker.admission_allowed())
+
+    def test_a_sender_without_a_first_grant_fails_the_handshake_instead_of_latching(self):
+        """Failure, bound and early exit each end the wait with a visible startup error."""
+        for label in ("sender_failed", "no_grant_inside_the_bound", "sender_exited_first"):
+            with self.subTest(case=label):
+                owner = self.owner()
+                spool = self.new_spool("spool-" + label)
+                settled = threading.Event()
+                if label == "sender_failed":
+                    owner.raise_on_exchange(TimeoutError("control channel lost before the first lease"))
+                else:
+                    def refuse(request):
+                        owner.handlers.append(refuse)
+                        settled.set()
+                        return owner.reply(request, owner.status(observed=self.fixture.at(10), lease=None))
+
+                    owner.handlers.append(refuse)
+                worker = M6E2EAssemblyWorker(spool, client_factory=lambda: owner_support.client_for(owner),
+                                             lease_refresh_seconds=0.1, poll_seconds=0.05)
+                worker.start()
+                try:
+                    bound = 0.05 if label == "no_grant_inside_the_bound" else 10
+                    if label == "sender_exited_first":
+                        self.assertTrue(settled.wait(3))
+                        worker.close(3)
+                    thread, outcome = self.handshake(worker, bound_seconds=bound)
+                    thread.join(3)
+                    self.assertEqual(len(outcome), 1, "the bounded wait must have ended")
+                    self.assertIsInstance(outcome[0], M6LeaseStartupError)
+                    message = str(outcome[0])
+                    self.assertIn("new admission never opened", message)
+                    if label == "sender_failed":
+                        self.assertIn("the sender failed before holding a lease", message)
+                    else:
+                        self.assertIn("no lease was granted", message)
+                    self.assertFalse(worker.admission_allowed())
+                finally:
+                    worker.close(3)
+
+        # A sender with no configured refresh never requests a lease at all, so this handshake
+        # has no meaning there: it is refused by name rather than silently timing out, and that
+        # mode's own permission - a live sender - is untouched.
+        owner = self.owner()
+        worker = M6E2EAssemblyWorker(self.new_spool("spool-no-refresh"),
+                                     client_factory=lambda: owner_support.client_for(owner),
+                                     poll_seconds=0.05)
+        worker.start()
+        try:
+            with self.assertRaises(RuntimeError) as refusal:
+                worker.wait_for_first_lease(10)
+            self.assertIn("requires a configured lease refresh", str(refusal.exception))
+            self.assertTrue(worker.admission_allowed(), "a live sender is this mode's permission")
+        finally:
+            worker.close(3)
+
+    def test_a_refresh_in_flight_keeps_an_unexpired_grant_and_only_expiry_closes_it(self):
+        """The refresh window: pending is not lost, and a grant that really expires still closes."""
+        owner = self.owner()
+        clients, refreshed = [], []
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+
+        def grant(request):
+            owner.handlers.append(grant)
+            return owner.reply(request, owner.status(observed=self.fixture.at(10),
+                                                     lease=self.fixture.at(10.5)))
+
+        def held_grant(request):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("test withheld the lease reply")
+            owner.handlers.append(grant)
+            return owner.reply(request, owner.status(observed=self.fixture.at(10),
+                                                     lease=self.fixture.at(10.5)))
+
+        owner.handlers.extend([grant, held_grant])
+
+        def factory():
+            client = owner_support.client_for(owner)
+            clients.append(client)
+            original = client.refresh_admission
+
+            def refresh():
+                result = original()
+                # Recorded on the sender thread, so no reading below is a race.
+                refreshed.append((client.lease_until_ns, owner.clock.value))
+                returned.set()
+                return result
+
+            client.refresh_admission = refresh
+            return client
+
+        worker = M6E2EAssemblyWorker(self.spool, client_factory=factory, lease_refresh_seconds=0.1,
+                                     poll_seconds=0.05)
+        stop_requested, state = self.campaign_stop(worker)
+        worker.start()
+        try:
+            self.assertTrue(returned.wait(3), "the first refresh must grant a lease")
+            first_grant, clock_at_grant = refreshed[0]
+            self.assertGreater(first_grant, clock_at_grant)
+            self.assertTrue(entered.wait(3), "the second refresh must reach the owner")
+            client = clients[0]
+            # The window r8 recorded as a false stop: the grant is still there and still valid.
+            self.assertEqual(client.lease_until_ns, first_grant, "a pending refresh keeps the grant")
+            self.assertEqual(owner.clock.value, clock_at_grant, "no time has passed")
+            self.assertTrue(worker.admission_allowed(), "an unexpired grant stays admitted")
+            self.assertFalse(stop_requested(), "the campaign does not stop for a pending refresh")
+            self.assertIsNone(state.reason)
+            # The same window closes the moment the grant actually expires, still in flight.
+            owner.clock.advance(owner_support.NS)
+            self.assertFalse(worker.admission_allowed(), "an expired grant is not kept alive")
+            self.assertTrue(stop_requested(), "real expiry still closes new admission")
+            self.assertEqual(state.reason, "external_stop")
+        finally:
+            release.set()
+            worker.close(3)
+        self.assertFalse(worker.admission_allowed())
+
+    def test_a_due_refresh_is_taken_during_idle_and_backoff_without_disturbing_the_retry(self):
+        """The refresh interval is a fraction of the grant; a long idle or backoff cannot eat it.
+
+        Both phases are decided by construction rather than by wall time: the scripted owner
+        answers in order, so a refresh that did not happen inside the wait would hand a lease
+        reply to an append and the sender would fail on the spot.
+        """
+        owner = self.owner()
+        idle_refresh, backoff_refresh = threading.Event(), threading.Event()
+
+        def granting(event=None, last_sequence=0, repeat=False):
+            def handler(request):
+                if repeat:
+                    owner.handlers.append(handler)
+                if event is not None:
+                    event.set()
+                return owner.reply(request, owner.status(
+                    observed=self.fixture.at(10), last_sequence=last_sequence,
+                    lease=self.fixture.at(10.5)))
+
+            return handler
+
+        # Idle: the poll is ten times the refresh interval, so a second grant inside 0.4 s can
+        # only come from the idle wait honouring the due refresh.
+        owner.handlers.extend([granting(), granting(idle_refresh, repeat=True)])
+        idle_worker = M6E2EAssemblyWorker(
+            self.new_spool("idle-spool"), client_factory=lambda: owner_support.client_for(owner),
+            lease_refresh_seconds=0.1, poll_seconds=1.0)
+        idle_worker.start()
+        try:
+            self.assertTrue(idle_refresh.wait(0.4), "an idle poll must not swallow a due refresh")
+        finally:
+            idle_worker.close(3)
+        self.assertEqual({item.command.kind for item in owner.requests}, {"lease"})
+
+        def lose_the_reply(request):
+            raise TimeoutError("reply lost")
+
+        def stamped_append(request):
+            return owner.reply(
+                request, owner.status(observed=self.fixture.at(10), last_sequence=1),
+                record=owner.stamp(request.command.event, sequence=1, tick=self.fixture.at(10)))
+
+        # Backoff: one lost append reply, one due refresh inside the backoff, then the retry
+        # with the original bytes. The backoff is shorter than two refresh intervals, so the
+        # interleaving is exactly one lease between the two appends.
+        owner.handlers.clear()
+        owner.requests.clear()
+        owner.handlers.extend([granting(), lose_the_reply, granting(backoff_refresh),
+                               stamped_append, granting(last_sequence=1, repeat=True)])
+        self.spool.attempt_admitted(self.fact)
+        worker = M6E2EAssemblyWorker(self.spool, client_factory=lambda: owner_support.client_for(owner),
+                                     retry_limit=2, lease_refresh_seconds=0.1, poll_seconds=0.1,
+                                     backoff_seconds=0.15)
+        worker.start()
+        try:
+            self.assertTrue(backoff_refresh.wait(3), "a retry backoff must not swallow a due refresh")
+        finally:
+            status = worker.close(3)
+        kinds = [item.command.kind for item in owner.requests]
+        self.assertEqual(kinds[:4], ["lease", "append", "lease", "append"], kinds)
+        appends = [item for item in owner.requests if item.command.kind == "append"]
+        self.assertEqual(appends[0].command.event.canonical_bytes(),
+                         appends[1].command.event.canonical_bytes(),
+                         "the retry re-sends the original producer bytes")
+        self.assertFalse(status["failed"], status)
+        self.assertEqual(status["delivered"], 1)
+
+    def test_a_first_grant_that_already_expired_is_never_credited_as_admission(self):
+        """The handshake reports that a grant happened, never that one is still live.
+
+        `wait_for_first_lease` is sequencing, as its contract says. If that first grant has
+        already expired when the entry looks, admission is still closed and the campaign stops
+        on its own guard - no credit is invented anywhere.
+        """
+        owner = self.granting_owner()
+        granted = threading.Event()
+
+        def factory():
+            client = owner_support.client_for(owner)
+            original = client.refresh_admission
+
+            def refresh():
+                result = original()
+                granted.set()
+                return result
+
+            client.refresh_admission = refresh
+            return client
+
+        worker = M6E2EAssemblyWorker(self.spool, client_factory=factory, lease_refresh_seconds=30,
+                                     poll_seconds=0.05)
+        worker.start()
+        try:
+            self.assertTrue(granted.wait(3))
+            self.assertTrue(worker.admission_allowed())
+            owner.clock.advance(owner_support.NS)
+            self.assertTrue(worker.wait_for_first_lease(0.05),
+                            "the handshake records that a grant happened")
+            self.assertFalse(worker.admission_allowed(), "an expired grant is never admission")
+            stop_requested, state = self.campaign_stop(worker)
+            self.assertTrue(stop_requested(), "the campaign closes on the live guard, not the handshake")
+            self.assertEqual(state.reason, "external_stop")
+        finally:
+            worker.close(3)
 
     def test_spool_io_failure_closes_admission_without_waiting_for_another_refresh(self):
         owner = self.owner()

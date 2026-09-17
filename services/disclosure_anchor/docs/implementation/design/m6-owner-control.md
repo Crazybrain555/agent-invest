@@ -94,8 +94,19 @@ recovered by readback and never by an alternate spec. The owner-bound campaign
 (`staged_campaign --m6-run-dir`) first requires the frozen spec to name its
 manifest, scope, campaign and `e2e_publication` mode, then the loaded process
 profile, runtime bundle and worker profile, before any lock, database or
-admission; it then spools its lifecycle facts, lets a lapsed
-owner lease close new admission only, and after the drain deposits its
+admission; it then spools its lifecycle facts and, before the run's stop
+predicate is installed (that predicate latches its first reason for the whole
+run), waits until its sender holds a first granted lease, bounded by twice the
+control exchange deadline and by the campaign deadline; a sender that fails or
+gets no grant inside that bound ends the run visibly (`campaign_startup_error`,
+exit 3) before any admission: no receipt, no runner `admission_closed` ack, and
+the owner-side run is left to the controller's own closure path. The client keeps the previous unexpired grant
+visible while a refresh is in flight and replaces it with exactly what the
+reply authorises (a null lease, a grant consumed by the round trip, or a halted
+guard leaves none), so only an actual expiry on the continuous clock, a failed
+exchange, a stop or the sender's exit closes new admission, and that close
+latches for the run. The sender refreshes on schedule even while idle or
+backing off a retry. After the drain it deposits its
 resource audit, any unresolved claims and the admission reconciliation,
 acknowledges `admission_closed` and deposits the ownership closure
 (`application/contracts/m6_control_receipts.py`, native shapes and attempt-set
@@ -183,7 +194,16 @@ physical-clock qualification claim.
 The caller must explicitly supply `stop_propagation_reserve_ns`, derived from the
 selected runner's bounded in-flight claim completion, observation append, control
 poll and admission-closed ACK. The accepted grant must fit both the configured
-lease maximum and `stop_admission_budget - propagation_reserve`. If that leaves
+lease maximum and `stop_admission_budget - propagation_reserve`. The campaign
+entry does not configure that maximum separately: it derives the runner's
+`maximum_lease_ns` from the frozen private binding's `maximum_lease_ticks` (the
+same value the native owner is deployed with) converted at the READY anchor's
+actual QPC frequency, requires the binding's `propagation_reserve_ticks` to equal
+the intent's `stop_propagation_reserve_ns` at that frequency, and writes
+`transport.json` exactly once after READY and before any client, bind or open.
+An inexact conversion, a lease outside the policy bounds or above
+`stop_admission_budget - propagation_reserve` fails there. Margin and drift stay
+the policy defaults. If that leaves
 no usable lease, construction fails. A nominal one-second grant with a one-second
 total stop budget is insufficient. Real runner integration must establish those
 bounds; a synthetic test reserve is not operational qualification.

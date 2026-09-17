@@ -37,7 +37,9 @@ from disclosure_anchor.adapters.runtime.m6_e2e_run import (
     M6RunDirectory, M6RunnerClosureFailed, M6VerifierAssembly, RunnerClosureReceipts, close_verifier_assembly,
     execute_runner_closure, load_m6_run_directory, m6_owner_client_factory,
 )
-from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6OwnerClient, M6OwnerProtocolError, M6OwnerRejected
+from disclosure_anchor.adapters.runtime.m6_owner_protocol import (
+    M6LeasePolicy, M6OwnerClient, M6OwnerProtocolError, M6OwnerRejected,
+)
 from disclosure_anchor.adapters.runtime.mineru_release_install import ExclusivityLock, acquire_exclusivity
 from disclosure_anchor.adapters.runtime.resident_owner_control import (
     BoundedOwnerCommand, OwnerCommandResult, owner_ssh_command, pinned_windows_script,
@@ -537,9 +539,14 @@ def load_campaign_inputs(
 # --- run directory ------------------------------------------------------------------
 
 def write_run_directory(
-    run_dir: Path, *, binding: CampaignPrivateBinding, intent: M6CampaignIntent, roles: Mapping[str, tuple[str, str]],
+    run_dir: Path, *, roles: Mapping[str, tuple[str, str]],
 ) -> None:
-    """The existing `M6RunDirectory` layout: tokens (0600), roles.json, transport.json; anchor/spec follow later."""
+    """Stage the private part of the `M6RunDirectory` layout before READY: tokens (0600) and roles.json.
+
+    The transport, whose lease policy needs the owner's actual QPC frequency, is
+    written exactly once by ``write_run_transport`` after READY; anchor and spec
+    follow with the bind.
+    """
     if run_dir.exists() or run_dir.is_symlink():
         raise CampaignInputError("run directory must be new")
     run_dir.mkdir(mode=0o700)
@@ -550,6 +557,59 @@ def write_run_directory(
         write_new_exact(token_path, token.encode("ascii") + b"\n")
         role_entries[role] = {"epoch_sha256": epoch, "token_path": str(token_path)}
     write_new_exact(run_dir / "roles.json", canonical_bytes(role_entries) + b"\n")
+
+
+def derive_runner_lease_policy(
+    *, binding: CampaignPrivateBinding, intent: M6CampaignIntent, qpc_frequency_hz: int,
+) -> M6LeasePolicy:
+    """The runner's lease guard from the frozen binding the owner itself was configured with.
+
+    One authority: the native owner grants ``windows.maximum_lease_ticks`` and
+    reserves ``windows.propagation_reserve_ticks``; the client ceiling is those
+    same ticks converted at the READY anchor's actual QPC frequency, never a
+    default and never an assumed frequency. An inexact conversion, a reserve
+    that disagrees with the intent, a lease outside the policy bounds, or a
+    lease the stop budget cannot cover fails here, before any bind, open,
+    admission or business work. Margin and drift keep the policy defaults.
+    """
+    if isinstance(qpc_frequency_hz, bool) or type(qpc_frequency_hz) is not int or qpc_frequency_hz <= 0:
+        raise CampaignInputError("READY anchor QPC frequency is not a positive integer")
+    windows = binding.windows
+    lease_ns, lease_remainder = divmod(windows.maximum_lease_ticks * 1_000_000_000, qpc_frequency_hz)
+    reserve_ns, reserve_remainder = divmod(windows.propagation_reserve_ticks * 1_000_000_000, qpc_frequency_hz)
+    if lease_remainder or reserve_remainder:
+        raise CampaignInputError(
+            f"binding lease/reserve ticks are not exact nanoseconds at the READY QPC frequency {qpc_frequency_hz} Hz",
+        )
+    if reserve_ns != intent.stop_propagation_reserve_ns:
+        raise CampaignInputError(
+            f"binding propagation reserve ({reserve_ns} ns at {qpc_frequency_hz} Hz) differs from the intent's "
+            f"stop propagation reserve ({intent.stop_propagation_reserve_ns} ns)",
+        )
+    try:
+        policy = M6LeasePolicy(stop_propagation_reserve_ns=intent.stop_propagation_reserve_ns, maximum_lease_ns=lease_ns)
+    except ValueError as exc:
+        raise CampaignInputError(f"binding lease of {lease_ns} ns is outside the runner lease policy: {exc}") from exc
+    budget_ns = intent.run.resources.stop_admission_budget_ticks * 1_000_000_000 // qpc_frequency_hz
+    if lease_ns > budget_ns - policy.stop_propagation_reserve_ns:
+        raise CampaignInputError(
+            f"binding lease of {lease_ns} ns exceeds the stop budget minus the propagation reserve "
+            f"({budget_ns - policy.stop_propagation_reserve_ns} ns); the runner would refuse the owner's own grant",
+        )
+    if lease_ns <= policy.uncertainty_margin_ns:
+        raise CampaignInputError("binding lease leaves no usable grant after the uncertainty margin")
+    return policy
+
+
+def write_run_transport(
+    run_dir: Path, *, binding: CampaignPrivateBinding, intent: M6CampaignIntent, qpc_frequency_hz: int,
+) -> M6LeasePolicy:
+    """Write `transport.json` exactly once, after READY, with the lease policy derived from the binding.
+
+    ``write_new_exact`` refuses an existing file, so a transport that a client
+    may already have consumed is never rewritten.
+    """
+    policy = derive_runner_lease_policy(binding=binding, intent=intent, qpc_frequency_hz=qpc_frequency_hz)
     ssh = binding.ssh
     transport = {
         "ssh": {
@@ -557,9 +617,15 @@ def write_run_directory(
             "private_key_path": ssh.private_key_path, "known_hosts_path": ssh.known_hosts_path,
         },
         "remote_port": binding.windows.port,
-        "lease": {"stop_propagation_reserve_ns": intent.stop_propagation_reserve_ns},
+        "lease": {
+            "stop_propagation_reserve_ns": policy.stop_propagation_reserve_ns,
+            "maximum_lease_ns": policy.maximum_lease_ns,
+            "uncertainty_margin_ns": policy.uncertainty_margin_ns,
+            "maximum_clock_drift_ppm": policy.maximum_clock_drift_ppm,
+        },
     }
     write_new_exact(run_dir / "transport.json", canonical_bytes(transport) + b"\n")
+    return policy
 
 
 # --- the composition root ----------------------------------------------------------
@@ -813,6 +879,18 @@ class M6CampaignAssembly:
         write_new_exact(run_dir / "anchor.json", ready.anchor.canonical_bytes())
         spec = build_run_spec(anchor=ready.anchor, intent=self._intent.run, runtime=self._intent.runtime)
         write_new_exact(run_dir / "run-spec.json", spec.canonical_bytes())
+        # The runner's lease ceiling is the owner's own configured grant, converted at
+        # the frequency the owner just reported; it is fixed here, once, before any
+        # client loads the transport and before the controller binds or opens.
+        lease = write_run_transport(
+            run_dir, binding=self._binding, intent=self._intent, qpc_frequency_hz=ready.anchor.clock.qpc_frequency_hz,
+        )
+        self._summary.values["runner_lease"] = {
+            "qpc_frequency_hz": ready.anchor.clock.qpc_frequency_hz,
+            "maximum_lease_ticks": self._binding.windows.maximum_lease_ticks,
+            "maximum_lease_ns": lease.maximum_lease_ns, "stop_propagation_reserve_ns": lease.stop_propagation_reserve_ns,
+            "uncertainty_margin_ns": lease.uncertainty_margin_ns, "maximum_clock_drift_ppm": lease.maximum_clock_drift_ppm,
+        }
         self._run = load_m6_run_directory(run_dir)
         self._controller = m6_owner_client_factory(self._run, role="controller", continuous_ns=self._now_ns)()
         reply = self._controller.bind()
@@ -1371,7 +1449,7 @@ class M6CampaignAssembly:
                 "pid": os.getpid(), "started_utc": started, "purpose": f"m6-campaign-{self._mode}", "run_id": intent.run.run_id,
             })
             roles = generate_roles(intent.run.mode)
-            write_run_directory(self._output / "run", binding=binding, intent=intent, roles=roles)
+            write_run_directory(self._output / "run", roles=roles)
             deployment_raw = canonical_bytes(deployment_document(
                 intent=intent, binding=binding, run_root=self._private_root / "runs", roles=roles,
             ))
@@ -1484,8 +1562,9 @@ class M6CampaignAssembly:
 
 
 __all__ = [
+    "derive_runner_lease_policy",
     "CAMPAIGN_SUMMARY_CONTRACT", "LOCAL_MEASUREMENT_WINDOW_CONTRACT", "OWNER_DEPLOYMENT_CONTRACT", "CampaignIdentityError", "CampaignInputError",
     "CampaignInputs", "CampaignMode", "CampaignOutcomeUnknown", "M6CampaignAssembly", "ReadyObservation",
     "deployment_document", "external_exit_problems", "generate_roles", "launcher_lines", "load_campaign_inputs", "parse_ready_line",
-    "remaining_budget_seconds", "sourced_child_argv", "write_run_directory", "zero_admission_receipts",
+    "remaining_budget_seconds", "sourced_child_argv", "write_run_directory", "write_run_transport", "zero_admission_receipts",
 ]

@@ -4,6 +4,12 @@ No business queue, retries, clocks selected globally, or cleanup assertions.
 The producer owns its immutable pending envelope and may retry those exact
 bytes after an ambiguous response. Transport loss latches admission closed;
 drain/reconciliation remains possible with this client.
+
+The granted lease is one deadline on the caller's continuous clock. While a
+refresh is in flight the previous grant stays visible and keeps expiring on
+that clock; the reply then replaces it with exactly what the owner authorised,
+and any failed exchange, stop or close halts the guard. Nothing here extends a
+grant without a reply that says so.
 """
 
 from __future__ import annotations
@@ -26,6 +32,11 @@ from disclosure_anchor.application.contracts.m6_run_events import M6OwnerResumed
 
 
 M6CallerRole = Literal["controller", "e2e_runner", "service_runner", "public_verifier", "quality_verifier"]
+
+# One control exchange, including a pinned SSH startup when the channel is not
+# yet open, must complete within this bound; callers that wait for the first
+# lease derive their startup allowance from it rather than guessing another.
+M6_CONTROL_EXCHANGE_TIMEOUT_NS = 5_000_000_000
 
 
 class M6OwnerTransport(Protocol):
@@ -176,8 +187,6 @@ class M6OwnerClient:
         if isinstance(command, M6AdmissionClosedAck) and command.runner_epoch_sha256 != self._epoch:
             self._lease_until_ns = 0
             raise M6OwnerProtocolError("M6 admission closure belongs to another runner incarnation")
-        if command.kind == "lease":
-            self._lease_until_ns = 0
         if command.kind in {"stop", "admission_closed", "close"}:
             self._admission_halted = True
             self._lease_until_ns = 0
@@ -215,17 +224,26 @@ class M6OwnerClient:
                 raise M6OwnerProtocolError("M6 owner stamped an observation for a receipt deposit")
             if reply.outcome != "ok":
                 raise M6OwnerRejected(reply)
-            if command.kind == "lease" and reply.status.admission_valid_until_ticks is not None:
-                duration_ticks = reply.status.admission_valid_until_ticks - reply.status.observed_qpc_ticks
-                duration_ns = duration_ticks * 1_000_000_000 // self.spec.clock.qpc_frequency_hz
-                if duration_ns > self._maximum_grant_ns:
-                    raise M6OwnerProtocolError("M6 owner lease exceeds guard or stop propagation budget")
-                # Earliest local point in the exchange, never response receipt.
-                # Clock drift shortens the grant; suspend is included by _clock.
-                conservative = duration_ns * 1_000_000 // (1_000_000 + self._policy.maximum_clock_drift_ppm)
-                until = sent_ns + conservative - self._policy.uncertainty_margin_ns
-                if until > received_ns and not self._admission_halted:
-                    self._lease_until_ns = until
+            if command.kind == "lease":
+                # The reply replaces the remaining grant with exactly what the
+                # owner just authorised: nothing older, nothing more. A null
+                # lease, a grant already consumed by the round trip, or a halted
+                # guard leaves none. Until the reply lands the previous grant
+                # stays visible to other threads and keeps expiring on the same
+                # continuous clock; a failed exchange halts below.
+                granted = 0
+                if reply.status.admission_valid_until_ticks is not None:
+                    duration_ticks = reply.status.admission_valid_until_ticks - reply.status.observed_qpc_ticks
+                    duration_ns = duration_ticks * 1_000_000_000 // self.spec.clock.qpc_frequency_hz
+                    if duration_ns > self._maximum_grant_ns:
+                        raise M6OwnerProtocolError("M6 owner lease exceeds guard or stop propagation budget")
+                    # Earliest local point in the exchange, never response receipt.
+                    # Clock drift shortens the grant; suspend is included by _clock.
+                    conservative = duration_ns * 1_000_000 // (1_000_000 + self._policy.maximum_clock_drift_ppm)
+                    until = sent_ns + conservative - self._policy.uncertainty_margin_ns
+                    if until > received_ns and not self._admission_halted:
+                        granted = until
+                self._lease_until_ns = granted
             return reply
         except BaseException:
             self._admission_halted = True
@@ -255,7 +273,9 @@ class M6OwnerClient:
         """Granted lease deadline on the continuous clock; 0 once halted.
 
         Readable from any thread as an observation only: a reader must compare
-        it with the same continuous clock itself and must never extend it.
+        it with the same continuous clock itself and must never extend it. It
+        stays visible while a lease refresh is in flight and is replaced by
+        that reply; it never reads as lost merely because a refresh is pending.
         """
         return 0 if self._admission_halted or self._closed else self._lease_until_ns
 
@@ -295,7 +315,7 @@ class M6LineOwnerTransport:
 
     def __init__(
         self, *, token: str, open_channel: Callable[[float], Any], close_session: Callable[[], None],
-        continuous_ns: Callable[[], int], timeout_ns: int = 5_000_000_000, maximum_wire_bytes: int = 65536,
+        continuous_ns: Callable[[], int], timeout_ns: int = M6_CONTROL_EXCHANGE_TIMEOUT_NS, maximum_wire_bytes: int = 65536,
     ) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", token):
             raise ValueError("M6 private caller token must contain exactly 32 random bytes")

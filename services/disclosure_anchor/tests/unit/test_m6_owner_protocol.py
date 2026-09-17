@@ -243,6 +243,65 @@ class LeaseGuardTests(ClientCase):
         self.lease(rtt_ns=20 * MS)
         self.assertTrue(client.refresh_admission(), "a prompt reply after slow ones still leases normally")
 
+    def test_a_pending_lease_exchange_keeps_the_old_grant_visible_and_its_reply_replaces_it(self) -> None:
+        """A refresh in flight is not a lost lease, and its reply credits only what it says.
+
+        The handler below runs inside `exchange`, so what it reads is exactly what another
+        thread reading `lease_until_ns` would see while the refresh is still outstanding.
+        """
+        client = self.client()
+        self.clock.value = NS
+        self.lease(rtt_ns=20 * MS)
+        self.assertTrue(client.refresh_admission())
+        first = client.lease_until_ns
+        self.assertGreater(first, self.clock.value)
+
+        seen: list[int] = []
+
+        def observe_then_grant(tick: int):
+            def handler(request: M6OwnerRequest) -> bytes:
+                seen.append(client.lease_until_ns)
+                self.clock.advance(20 * MS)
+                return self.owner.reply(request, self.owner.status(
+                    observed=tick, state="open", lease=tick + GRANT_TICKS))
+
+            return handler
+
+        self.clock.value = NS + 100 * MS
+        self.owner.answer_raw(observe_then_grant(self.fixture.at(11)))
+        self.assertTrue(client.refresh_admission())
+        self.assertEqual(seen, [first], "the previous grant stays visible while its refresh is in flight")
+        self.assertGreater(client.lease_until_ns, first, "the reply replaces it with the new grant")
+
+        # A lease reply that grants nothing replaces an unexpired grant with nothing.
+        self.clock.value = client.lease_until_ns - 100 * MS
+        self.assertTrue(client.admission_allowed())
+        self.status_ok(observed=self.fixture.at(12), lease=None)
+        self.assertFalse(client.refresh_admission())
+        self.assertEqual(client.lease_until_ns, 0, "a null grant is not the old deadline")
+
+        # Neither does a grant already consumed by its own round trip.
+        self.clock.value = 3 * NS
+        self.lease(observed=self.fixture.at(13), rtt_ns=20 * MS)
+        self.assertTrue(client.refresh_admission())
+        self.assertGreater(client.lease_until_ns, self.clock.value)
+        self.lease(observed=self.fixture.at(14), rtt_ns=495 * MS)
+        self.assertFalse(client.refresh_admission())
+        self.assertEqual(client.lease_until_ns, 0, "a consumed grant leaves nothing behind")
+
+        # And an expired grant stays visible during the next exchange without being permission:
+        # the reader's own clock is what closes it.
+        self.clock.value = 5 * NS
+        self.lease(observed=self.fixture.at(15), rtt_ns=20 * MS)
+        self.assertTrue(client.refresh_admission())
+        expired = client.lease_until_ns
+        self.clock.value = expired + MS
+        self.assertFalse(client.admission_allowed())
+        seen.clear()
+        self.owner.answer_raw(observe_then_grant(self.fixture.at(16)))
+        self.assertTrue(client.refresh_admission())
+        self.assertEqual(seen, [expired], "visibility is not permission; the clock decides")
+
     def test_sleep_or_expiry_cannot_preserve_admission(self) -> None:
         client = self.client()
         self.clock.value = NS
