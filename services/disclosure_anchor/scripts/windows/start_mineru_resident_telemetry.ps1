@@ -7,6 +7,34 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $pins = [Collections.Generic.List[IO.FileStream]]::new()
 $failures = [Collections.Generic.List[Exception]]::new()
+$failureContexts = [Collections.Generic.List[string]]::new()
+function Add-MineruFailure($ErrorRecord) {
+    $failures.Add($ErrorRecord.Exception)
+    $failureContexts.Add([string]$ErrorRecord.ScriptStackTrace)
+}
+function Write-MineruFailureDetail([string]$Role,[string]$ArtifactName) {
+    # PowerShell prints only the outer AggregateException message, so the full
+    # nested chain (Exception.ToString includes every inner exception) is echoed
+    # to stderr and persisted next to the session artifacts before the rethrow.
+    # Guarded end to end: a failure here is reported and never replaces the
+    # original terminal throw.
+    try {
+        $lines = [Collections.Generic.List[string]]::new()
+        $lines.Add($Role + ' failure detail: ' + $failures.Count + ' failure(s)')
+        for ($index = 0; $index -lt $failures.Count; $index++) {
+            $lines.Add('[' + $index + '] ' + $failures[$index].ToString())
+            if ($index -lt $failureContexts.Count -and $failureContexts[$index].Length -gt 0) { $lines.Add('    script: ' + $failureContexts[$index]) }
+        }
+        $text = $lines -join "`n"
+        [Console]::Error.WriteLine($text)
+        $directory = Get-Variable -Name runDirectory -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -ne $directory -and [IO.Directory]::Exists([string]$directory)) {
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
+            $output = [IO.FileStream]::new([IO.Path]::Combine([string]$directory,$ArtifactName),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            try { $output.Write($bytes,0,$bytes.Length); $output.Flush($true) } finally { $output.Dispose() }
+        }
+    } catch { try { [Console]::Error.WriteLine($Role + ' failure detail unavailable: ' + $_.Exception.Message) } catch { } }
+}
 function Get-MineruBootstrapSha([byte[]]$Bytes) {
     $hash = [Security.Cryptography.SHA256]::Create()
     try { return 'sha256:' + ([BitConverter]::ToString($hash.ComputeHash($Bytes))).Replace('-','').ToLowerInvariant() }
@@ -50,10 +78,13 @@ try {
     $job = [MineruResidentWire]::Parse($jobJson,8192)
     if ($job.Get('forced_termination').Raw -cne 'false' -or $job.Get('child_exit_code').Integer() -ne 0 -or $job.Get('job_active_processes').Integer() -ne 0) { throw 'resident Job did not close normally; retained receipt is unverified' }
     [Console]::Out.WriteLine($receipt)
-} catch { $failures.Add($_.Exception) }
+} catch { Add-MineruFailure $_ }
 finally {
     foreach ($pin in $pins) {
         try { $pin.Dispose() } catch { $failures.Add($_.Exception) }
     }
 }
-if ($failures.Count -gt 0) { throw [AggregateException]::new('resident supervisor failed',$failures) }
+if ($failures.Count -gt 0) {
+    Write-MineruFailureDetail 'resident supervisor' 'supervisor-failure.txt'
+    throw [AggregateException]::new('resident supervisor failed',$failures)
+}

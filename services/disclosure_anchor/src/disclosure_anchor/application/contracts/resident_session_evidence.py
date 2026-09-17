@@ -43,6 +43,8 @@ _OWNER_FIELDS = (
     "host_assignment_identity_sha256", "boot_identity_sha256",
     "runtime_bundle_identity_sha256", "process_profile_sha256",
 )
+# Wire/config lane lifetime bound; the Windows loader and endpoint mirror it.
+RESIDENT_WIRE_LIFETIME_CEILING_MS = 8_390_000
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -169,7 +171,7 @@ def check_resident_configuration(
     if (lane, cadence) not in {("gpu_fast", 250), ("gpu_fast", 500), ("host_slow", 1000)}:
         raise ValueError("resident lane cadence differs")
     config.integer("port", 1024, 65535)
-    config.integer("lifetime_ms", config.integer("lease_ms", 2000, 30000), 8390000)
+    config.integer("lifetime_ms", config.integer("lease_ms", 2000, 30000), RESIDENT_WIRE_LIFETIME_CEILING_MS)
     config.integer("sampling_timeout_ms", 1, cadence)
     config.integer("response_timeout_ms", 1, 1000)
     config.sha("powershell_executable_sha256")
@@ -270,7 +272,7 @@ def check_resident_ready(
 
 
 def _check_linux_configuration(config: _Object) -> _Object:
-    backend = _Object(config.get("backend"), "docker_path docker_sha256 image_id linux_config api_port vllm_port api_namespace_pid model_name")
+    backend = _Object(config.get("backend"), "docker_path docker_sha256 image_id linux_config api_port vllm_port api_namespace_pid model_name capacity_config_sha256")
     backend.sha("image_id")
     backend.sha("docker_sha256")
     if not PureWindowsPath(backend.text("docker_path")).is_absolute():
@@ -279,6 +281,10 @@ def _check_linux_configuration(config: _Object) -> _Object:
     backend.integer("vllm_port", 1024, 65535)
     backend.integer("api_namespace_pid", 1)
     backend.text("model_name")
+    # The release's frozen MineruCapacityConfig identity. The exporter binds the
+    # serving API's own capacity identity to it at the source and forwards the
+    # raw health; the owner binds it to the exact capacity bytes and profile.
+    backend.sha("capacity_config_sha256")
     linux_config = _Object(backend.get("linux_config"), "boot_id members parent_device parent_inode lease_ms lifetime_ms")
     for name in ("lease_ms", "lifetime_ms"):
         linux_config.expect(name, config.get(name))

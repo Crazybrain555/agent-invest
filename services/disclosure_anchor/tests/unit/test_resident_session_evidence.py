@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import unittest
 from datetime import timedelta
 
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
 from disclosure_anchor.application.contracts.resident_session_evidence import (
     artifact_sha256, canonical_bytes, check_resident_closure, check_resident_ready,
     check_resident_observer_mapping,
@@ -14,6 +16,24 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
 from tests.unit.test_synchronized_telemetry_contract import (
     START, HASH_C, _complete_frames, _receipt,
 )
+from tests._mineru_capacity_config_fixture import capacity_payload
+from tests.unit.test_mineru_process_profile import _profile
+
+
+def _resident_capacity() -> MineruCapacityConfig:
+    """A nonserial frozen authority shared by the session and its observer."""
+    return MineruCapacityConfig(**capacity_payload(
+        parse_active_limit=2, total_nonterminal_limit=4,
+        finalizer_active_limit=2, final_http_limit_per_loop=7,
+        omp_num_threads=8, hybrid_batch_ratio_requested=4,
+        result_reservation_bytes=256 * 1024 * 1024,
+        max_unacked_result_bytes=2 * 1024 * 1024 * 1024,
+    ))
+
+
+def _resident_profile():
+    return replace(_profile(), registry_nonterminal_cap=4, gpu_request_slots=7,
+                   processing_window_size=16)
 
 
 def _fixture(host: bool = False) -> dict:
@@ -65,6 +85,7 @@ def _fixture(host: bool = False) -> dict:
             "api_namespace_pid": 1, "api_port": 30003, "docker_path": r"C:\docker\docker.exe",
             "docker_sha256": h("docker"), "image_id": h("image"), "linux_config": linux_config,
             "model_name": "fixture-model", "vllm_port": 30001,
+            "capacity_config_sha256": _resident_capacity().sha256,
         }
         namespaces = {"pid": "pid:[1234]", "cgroup": "cgroup:[5678]"}
         supervisor = {"boot_id": linux_config["boot_id"], "namespaces": namespaces, "pid": 100,

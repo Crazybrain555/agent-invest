@@ -461,9 +461,22 @@ configured/exact-current identity，再从 owner-owned mode 0600 raw JSONL 按 r
 安装或接入现有 worker；显式授权的有限机制诊断使用 `test_mineru_resident_endpoint.ps1` 或
 `test_mineru_resident_session.ps1`，先核验私有 config、source、prepared manifest 与实际 runtime。
 诊断用新 session/私有目录，不复用旧 READY；零 sample 只证明关闭链，不能冒充采样通过。
+host_slow session config 的 `backend` 必须携带 `capacity_config_sha256`（release 冻结 capacity 的 hash）；resident owner 请求
+必须携带同一 capacity 的 exact bytes（`capacity_config_bytes`），owner 核对 profile 是其投影、config hash 一致，Mac 侧对每个
+host 样本的原始 health 运行共用 capacity validator（wire v2 转发原始字节，C# 不再镜像规则）。失败会话在 run 目录留下
+`exporter-failure.txt` / `supervisor-failure.txt`（嵌套异常链），reconciliation 读它而不是 stderr 的外层消息；改动 PS1 源后须
+重新 stage 并刷新 config `sources` hash，改动 .cs 源后还须重建 telemetry assembly 并刷新 release inventory/native proof。
+改动任一 Windows 入口脚本后、stage 之前，必须先做静态“函数定义/调用”核对（入口 + dot-source 的 load 脚本），并由 root 在
+Windows 上对已 stage 的入口跑一次不存在 config 的负向调用：Mac 上没有 PowerShell，Python gate 不执行入口，2026-09-17 r5
+两个入口丢失 `Get-MineruBootstrapSha`/`Read-MineruBootstrap` 正是这样漏到实机的。resident owner 在等 READY 控制时同步
+轮询两个 starter：starter 先于 READY/observer 结束即按 lane 命名失败并立即保留其 exit/stdout/stderr；失败路径先做有界
+drain（poll ≤0.25 s）再 abort，`failure-command-N.state.json` 记录 exit/是否先于 abort 结束/保留统计。
+任何 live session/负载之前，先把最近一次真实捕获的 `/health`+HTTP snapshot+metrics 离线推过当前产品路径
+（`decode_windows_resident_sample` → `project_queue_vllm`，绑定 exact capacity/profile/READY 身份）：hash 一致只证明跑的是哪份代码，
+不证明它与当前 serving API 兼容。
 有限诊断链的寿命上限（R21 F10，仅此链）：Mac observer/resident 采样 ≤8300 s，resident-owner lane lifetime ≤8380 s，
 wire/config lane lifetime ≤8390 s，底层 finite deadline/Job 上限 8400 s；60 s 采样收尾、20 s 控制余量与 30 s lease 不变。
-`BoundedOwnerCommand` 默认上限仍 7200 s，只有 resident start 传输显式选 8400 s；安装器 7200000 ms 与 M6 业务
+`BoundedOwnerCommand` 默认上限仍 7200 s，只有 resident start 传输与 M6 campaign 的 launcher 传输（预算超过 7200 s 时，G3 为 7605 s）显式选 8400 s；生产 worker 循环不经 `BoundedOwnerCommand`，无总运行时限；安装器 7200000 ms 与 M6 业务
 planned/grace/max_close（4800/2400/7200）不变。跨语言常量由独立上限向量核验，改动 telemetry assembly 源后须重建其
 manifest/DLL 并刷新 release inventory，不重装 API。
 跨主机运行显式选择 observer receipt/seal v3：API profile 不携带本机启动时钟，Mac observer

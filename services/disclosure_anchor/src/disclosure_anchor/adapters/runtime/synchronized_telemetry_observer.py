@@ -1404,6 +1404,11 @@ def validate_synchronized_telemetry_v2(
         if isinstance(receipt, SynchronizedTelemetryReceiptV3) and frame.api_process.values is not None:
             if frame.api_process.values.process_epoch_sha256 != receipt.process_profile.process_epoch_sha256:
                 raise ValueError("v3 API process epoch differs from the observed profile")
+        if isinstance(receipt, SynchronizedTelemetryReceiptV3) and frame.queue_vllm.values is not None:
+            # The admission limit a frame reports is the profile's, not a
+            # collector constant; a serial-1 or foreign-capacity frame fails here.
+            if frame.queue_vllm.values.api_max_pending_tasks != receipt.process_profile.parameters.api_max_pending_tasks:
+                raise ValueError("v3 queue admission limit differs from the observed profile")
         provenance = frame.resident_exporter_provenance
         if provenance is None:
             resident_missing_lanes.add(frame.lane)

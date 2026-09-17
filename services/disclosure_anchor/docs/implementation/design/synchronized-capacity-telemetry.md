@@ -85,8 +85,23 @@ loopback port 和 health/private HTTP/metrics 三个路径；禁用 proxy/redire
 读取，响应头上限 16 KiB、body 至多 192 KiB、严格 UTF-8，拒绝状态/编码/长度异常。
 失败永久停用该实例，cancel/dispose 后等待 pending I/O 结束；无法 quiesce 必须暴露失败。
 native startup/disposal 的最终 hard fuse 仍是外层 Job。
-`MineruQueueTelemetry` 镜像既有 closed wire health/runtime；HTTP PID 由 owner 从已固定 host PID 的
-实际 NSpid 映射取得并绑定 boot/starttime，禁止猜测 PID 1。vLLM 只接受四个精确 metric 名称，各唯一
+`MineruQueueTelemetry` 不再镜像任何 health/runtime/admission/capacity 规则：它只在源头把 serving API 自报的
+`task_protocol_runtime.capacity_config_sha256` 与 `capacity_observation.capacity_config_sha256` 绑定到 session config
+`backend.capacity_config_sha256`（release 冻结的 `MineruCapacityConfig` hash），然后把原始 `/health` 与 HTTP snapshot 字节作为
+JSON 字符串原样转发（wire `mineru.windows-resident-telemetry.v2`，`queue_vllm.values = {api_health, api_http, vllm}`）。
+闭合的 capacity 规则只在 Mac 侧、由所有 capacity consumer 共用的 `validate_mineru_capacity_wire_health` 对每个样本评估一次
+（`windows_resident_telemetry.project_queue_vllm`），期望值来自 owner 请求携带的 exact capacity bytes：owner 先用
+`assert_profile_matches_capacity` 证明 process profile 是该 capacity 的投影、再核对 host config 的 capacity hash，并把 host READY
+的 API `boot_id`/`start_ticks` 与 `api_namespace_pid` 一起作为 `HostQueueBinding` 交给 collector：health 的 owner 必须就是同一帧里
+Linux sampler 度量的那个 API 进程，drain/关闭准入视为漂移。帧值 `api_max_pending_tasks` 取实际 `max_pending_tasks_effective`
+（已等于 capacity P），replay 再把它绑定到 receipt 的 profile `api_max_pending_tasks`。这样 N/P/F/H/B/L/window 只有一个权威
+（capacity config），Windows 侧没有第二份常量可漂移；2026-09-17 r3 的 host_slow 首样本失败正是旧 C# 仍镜像 serial v1/v2
+规则、与 09-14 起的 capacity v3 producer 漂移且本地 Python-only gate 覆盖不到的结果。HTTP PID 由 owner 从已固定 host PID 的
+实际 NSpid 映射取得并绑定 boot/starttime，禁止猜测 PID 1。exporter/start 入口在 rethrow 前把嵌套异常链
+（`Exception.ToString()`）回显到 stderr 并持久化为 `exporter-failure.txt` / `supervisor-failure.txt`：PowerShell 只打印外层
+AggregateException 消息；该写入整体受保护，失败只报告、绝不替换原始 throw。两个入口自带的 bootstrap 函数
+（`Get-MineruBootstrapSha`/`Read-MineruBootstrap`，dot-source 的 load 脚本也依赖前者）是入口不可删的前置；Mac owner 在
+READY 等待中并发轮询 starter，starter 提前结束即命名失败并保留原始 exit/stdout/stderr，abort 前先有界 drain。vLLM 只接受四个精确 metric 名称，各唯一
 `engine="0"`/固定 `model_name` series，无 alias/sum/stale fallback；计数使用精确十进制数位处理，
 不通过 float/decimal 四舍五入；仅 preemption 是单调 counter，health terminal registry gauge 允许下降。
 `test_mineru_resident_wire.ps1` 和 `test_mineru_bounded_http.ps1` 是显式独立机制测试；其中 test-only

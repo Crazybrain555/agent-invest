@@ -15,6 +15,7 @@ from disclosure_anchor.adapters.runtime.m6_campaign_assembly import (
     CampaignOutcomeUnknown, M6CampaignAssembly, launcher_lines, parse_ready_line, sourced_child_argv,
 )
 from disclosure_anchor.adapters.runtime.resident_owner_control import BoundedOwnerCommand, OwnerCommandResult
+from disclosure_anchor.application.services.m6_launch_budget import finish_wait_seconds
 from tests import m6_owner_support as owner
 from tests import m6_support as m6
 from tests.m6_delivery_support import campaign_intent_for_spec, evaluation_plan
@@ -100,6 +101,53 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
         self.assertEqual(launcher_lines(first + partial + b'2}\r\n', "M6-READY"), ['{"first":1}', '{"second":2}'])
         with self.assertRaises((UnicodeError, ValueError)):
             launcher_lines(b'M6-READY {"value":"\xff"}\n', "M6-READY")
+
+    def test_launcher_transport_covers_delayed_t0_and_the_full_business_window(self):
+        for planned, grace, ready_wait in ((60, 30, 30), (4800, 2400, 30)):
+            with self.subTest(planned=planned), tempfile.TemporaryDirectory() as directory:
+                launch = Mock()
+                assembly = self.assembly(Path(directory), launch=launch)
+                assembly._intent = assembly._intent.model_copy(update={
+                    "run": assembly._intent.run.model_copy(update={"planned_seconds": planned}),
+                    "close_grace_seconds": grace, "ready_wait_seconds": ready_wait,
+                })
+                with (patch.object(assembly, "_script", return_value="declared-test-launch"),
+                      patch.object(assembly, "_ssh_argv", return_value=["declared-test-transport"])):
+                    assembly._start_launcher(staged_name="test.json", deployment_sha256=m6.digest("config"))
+                options = launch.call_args.kwargs
+                # Transport starts before native T0. A legal delayed READY must not
+                # shorten the 4800+2400 business deadline or force an unknown close.
+                self.assertGreaterEqual(options["timeout_seconds"], planned + grace + ready_wait)
+                self.assertLessEqual(options["timeout_seconds"], options.get("lifetime_ceiling_seconds", 7200))
+                self.assertLessEqual(options.get("lifetime_ceiling_seconds", 7200), 8400)
+                projection = json.loads((assembly._output / "launcher-command.json").read_text())
+                self.assertEqual(projection["timeout_seconds"], options["timeout_seconds"])
+                self.assertEqual(projection["expected_start"]["planned_seconds"], planned)
+                self.assertEqual(projection["expected_start"]["close_grace_seconds"], grace)
+
+    def test_insufficient_transport_tail_stops_before_either_business_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launch = Mock()
+            assembly = self.assembly(Path(directory), launch=launch)
+            status = self.attach_owner(assembly, directory)
+            remaining = (self.anchor.max_close_ticks - self.spec.t0_ticks) / self.anchor.clock.qpc_frequency_hz
+            # The transport can reach max_close, but cannot leave its promised
+            # exit/readback tail. No work may start under this truncated budget.
+            assembly._launcher_deadline_ns = 1_000_000_000 + int(remaining * 1e9)
+            with self.assertRaisesRegex(CampaignOutcomeUnknown, "transport deadline"):
+                assembly._supervise_children(self.spec, status, 1_000_000_000)
+            launch.assert_not_called()
+            self.assertFalse((assembly._output / "runner").exists())
+            self.assertFalse((assembly._output / "verifier").exists())
+
+    def test_finish_wait_consumes_one_absolute_deadline_without_renewal(self):
+        deadline = 101_000_000_000
+        waits = [finish_wait_seconds(launcher_deadline_ns=deadline, now_ns=now)
+                 for now in (1_000_000_000, 41_000_000_000, deadline, deadline + 1_000_000_000)]
+        self.assertEqual(waits[0] - waits[1], 40)
+        self.assertEqual(waits[1] - waits[2], 60)
+        self.assertLessEqual(waits[2], 5)
+        self.assertEqual(waits[2], waits[3], "expiry must not restart a business/grace window")
 
     def test_env_source_error_prevents_second_source_and_child_but_valid_shell_values_work(self):
         with tempfile.TemporaryDirectory(prefix="m6 env '") as directory:

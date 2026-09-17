@@ -7,6 +7,34 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $pins = [Collections.Generic.List[IO.FileStream]]::new()
 $failures = [Collections.Generic.List[Exception]]::new()
+$failureContexts = [Collections.Generic.List[string]]::new()
+function Add-MineruFailure($ErrorRecord) {
+    $failures.Add($ErrorRecord.Exception)
+    $failureContexts.Add([string]$ErrorRecord.ScriptStackTrace)
+}
+function Write-MineruFailureDetail([string]$Role,[string]$ArtifactName) {
+    # PowerShell prints only the outer AggregateException message, so the full
+    # nested chain (Exception.ToString includes every inner exception) is echoed
+    # to stderr and persisted next to the session artifacts before the rethrow.
+    # Guarded end to end: a failure here is reported and never replaces the
+    # original terminal throw.
+    try {
+        $lines = [Collections.Generic.List[string]]::new()
+        $lines.Add($Role + ' failure detail: ' + $failures.Count + ' failure(s)')
+        for ($index = 0; $index -lt $failures.Count; $index++) {
+            $lines.Add('[' + $index + '] ' + $failures[$index].ToString())
+            if ($index -lt $failureContexts.Count -and $failureContexts[$index].Length -gt 0) { $lines.Add('    script: ' + $failureContexts[$index]) }
+        }
+        $text = $lines -join "`n"
+        [Console]::Error.WriteLine($text)
+        $directory = Get-Variable -Name runDirectory -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -ne $directory -and [IO.Directory]::Exists([string]$directory)) {
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text)
+            $output = [IO.FileStream]::new([IO.Path]::Combine([string]$directory,$ArtifactName),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            try { $output.Write($bytes,0,$bytes.Length); $output.Flush($true) } finally { $output.Dispose() }
+        }
+    } catch { try { [Console]::Error.WriteLine($Role + ' failure detail unavailable: ' + $_.Exception.Message) } catch { } }
+}
 function Get-MineruBootstrapSha([byte[]]$Bytes) {
     $hash = [Security.Cryptography.SHA256]::Create()
     try { return 'sha256:' + ([BitConverter]::ToString($hash.ComputeHash($Bytes))).Replace('-','').ToLowerInvariant() }
@@ -71,7 +99,7 @@ try {
         $gpu = [MineruNvmlBackend]::new((Get-MineruString $backend 'nvml_dll_sha256'),(Get-MineruString $backend 'gpu_uuid'))
         $backendReady = New-MineruJson @('nvml_dll_sha256',(Quote-MineruJson $gpu.DllSha256),'device_identity_sha256',(Quote-MineruJson $gpu.DeviceIdentitySha256))
     } else {
-        $backend.Keys([string[]]@('docker_path','docker_sha256','image_id','linux_config','api_port','vllm_port','api_namespace_pid','model_name'))
+        $backend.Keys([string[]]@('docker_path','docker_sha256','image_id','linux_config','api_port','vllm_port','api_namespace_pid','model_name','capacity_config_sha256'))
         $linuxConfig = $backend.Get('linux_config')
         $linuxConfig.Keys([string[]]@('boot_id','members','parent_device','parent_inode','lease_ms','lifetime_ms'))
         if ($linuxConfig.Get('lease_ms').Integer() -ne $state.Lease -or $linuxConfig.Get('lifetime_ms').Integer() -ne $state.Lifetime) { throw 'Linux and Windows finite lease/lifetime mismatch' }
@@ -114,7 +142,7 @@ try {
         $script:linuxLastFinished = $samplerReady.Get('monotonic_ns').Integer()
         $apiHttp = [MineruBoundedHttp]::new((Get-MineruInteger $backend 'api_port' 1024 65535),$state.Loaded.Manifest.http_assembly_sha256)
         $vllmHttp = [MineruBoundedHttp]::new((Get-MineruInteger $backend 'vllm_port' 1024 65535),$state.Loaded.Manifest.http_assembly_sha256)
-        $queue = [MineruQueueTelemetry]::new((Get-MineruInteger $backend 'api_namespace_pid' 1 ([long]::MaxValue)),(Get-MineruString $backend 'model_name'))
+        $queue = [MineruQueueTelemetry]::new((Get-MineruInteger $backend 'api_namespace_pid' 1 ([long]::MaxValue)),(Get-MineruString $backend 'model_name'),(Get-MineruString $backend 'capacity_config_sha256'))
         $backendReady = New-MineruJson @('container_name',(Quote-MineruJson $containerName),'docker_pid',[string]$linux.Pid,'docker_creation_filetime_100ns',[string]$linux.CreationFiletime100ns,'docker_sha256',(Quote-MineruJson $linux.ExecutableSha256),'linux_ready',$linuxReady.Raw)
     }
     $readyJson = New-MineruJson @('contract_version','"mineru.windows-resident-ready.v1"','session',(Quote-MineruJson $state.Session),'lane',(Quote-MineruJson $state.Lane),'port',[string]$state.Port,'cadence_ms',[string]$state.Cadence,'config_sha256',(Quote-MineruJson $ExpectedConfigSha256),'identity',$state.Identity,'process',$state.Epoch,'clock',$state.Clock,'backend',$backendReady)
@@ -164,7 +192,7 @@ try {
         return $closedJson
     }
     $endpoint.Run($readyAction,$sampleAction,$closeAction)
-} catch { $failures.Add($_.Exception) }
+} catch { Add-MineruFailure $_ }
 finally {
     foreach ($resource in @($endpoint,$gpu,$apiHttp,$vllmHttp,$linux)) {
         if ($null -ne $resource) {
@@ -175,4 +203,7 @@ finally {
         try { $pin.Dispose() } catch { $failures.Add($_.Exception) }
     }
 }
-if ($failures.Count -gt 0) { throw [AggregateException]::new('resident exporter failed',$failures) }
+if ($failures.Count -gt 0) {
+    Write-MineruFailureDetail 'resident exporter' 'exporter-failure.txt'
+    throw [AggregateException]::new('resident exporter failed',$failures)
+}

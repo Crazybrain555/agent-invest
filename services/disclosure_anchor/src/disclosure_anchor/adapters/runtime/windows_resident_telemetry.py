@@ -16,10 +16,12 @@ from disclosure_anchor.adapters.runtime.bounded_http import (
     ThreadOwnedPersistentHTTPClient,
 )
 from disclosure_anchor.application.contracts.windows_resident_telemetry import (
+    HostQueueBinding,
     ResidentIdentity,
     WindowsGpuResidentSample,
     WindowsHostResidentSample,
     decode_windows_resident_sample,
+    project_queue_vllm,
 )
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
     ResidentExporterSampleProvenance,
@@ -48,12 +50,15 @@ class _Config:
     observer_clock_domain_identity_sha256: str
     expected_identity: ResidentIdentity
     ssh: dict[str, object] | None = None
+    host_binding: HostQueueBinding | None = None
 
 
 class WindowsResidentTelemetrySampler:
     """One owning collector process reuses one direct HTTP connection."""
 
     def __init__(self, config: _Config) -> None:
+        if (config.lane == "host_slow") != (config.host_binding is not None):
+            raise ValueError("the host lane requires exactly one frozen capacity binding")
         self._config = config
         self._client: ThreadOwnedPersistentHTTPClient
         if config.ssh is None:
@@ -161,13 +166,15 @@ class WindowsResidentTelemetrySampler:
                 gpu=sample.gpu,
                 resident_exporter_provenance=_provenance(sample),
             )
-        if not isinstance(sample, WindowsHostResidentSample):
+        if not isinstance(sample, WindowsHostResidentSample) or self._config.host_binding is None:
             raise AssertionError("closed decoder returned an unknown sample")
+        # The forwarded producer bytes pass the shared capacity validator here,
+        # against the release's frozen capacity, before they become frame values.
         return HostLaneSnapshot(
             identity=identity,
             api_process=sample.api_process,
             host_cgroup=sample.host_cgroup,
-            queue_vllm=sample.queue_vllm,
+            queue_vllm=project_queue_vllm(sample.queue_vllm, binding=self._config.host_binding),
             resident_exporter_provenance=_provenance(sample),
         )
 
@@ -189,7 +196,8 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
         "observer_clock_domain_identity_sha256",
         "expected_identity",
     }
-    if set(config) not in (expected_keys, expected_keys | {"ssh"}):
+    optional_keys = {"ssh", "host_binding"}
+    if not expected_keys <= set(config) <= expected_keys | optional_keys:
         raise ValueError("resident telemetry collector config shape is invalid")
     ssh = config.get("ssh")
     if "ssh" in config and (
@@ -230,6 +238,7 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
     if not isinstance(base_url, str):
         raise ValueError("base_url is invalid")
     identity = ResidentIdentity.model_validate(config["expected_identity"])
+    host_binding = HostQueueBinding.from_config(config["host_binding"]) if "host_binding" in config else None
     return WindowsResidentTelemetrySampler(
         _Config(
             cast(Literal["gpu_fast", "host_slow"], lane),
@@ -242,6 +251,7 @@ def build_windows_resident_telemetry_sampler(config: dict[str, object]) -> Windo
             observer_clock,
             identity,
             cast(dict[str, object] | None, ssh),
+            host_binding,
         )
     )
 
@@ -262,9 +272,12 @@ def windows_resident_collector_spec(
     nominal_interval_ms: int,
     expected_identity: ResidentIdentity,
     ssh: dict[str, object] | None = None,
+    host_binding: HostQueueBinding | None = None,
 ) -> ResidentTelemetryCollectorSpec:
     """Build the closed default-off spec; the config contains no credential."""
 
+    if (lane == "host_slow") != (host_binding is not None):
+        raise ValueError("the host lane requires exactly one frozen capacity binding")
     return ResidentTelemetryCollectorSpec(
         factory_module=__name__,
         factory_qualname="build_windows_resident_telemetry_sampler",
@@ -279,6 +292,7 @@ def windows_resident_collector_spec(
             observer_clock_domain_identity_sha256=observer_clock_domain_identity_sha256,
             expected_identity=expected_identity.model_dump(mode="json"),
             **({"ssh": ssh} if ssh is not None else {}),
+            **({"host_binding": host_binding.as_config()} if host_binding is not None else {}),
         ),
         expected_collector_identity_sha256=collector_identity_sha256,
         descendants_capability="forbidden",

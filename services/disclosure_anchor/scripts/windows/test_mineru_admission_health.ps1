@@ -170,70 +170,16 @@ try {
     }
 
     [void][Reflection.Assembly]::LoadFrom([IO.Path]::GetFullPath($WireAssemblyPath))
-    $script:Http = '{"contract_version":"mineru.api-http-request-snapshot.v1","process_id":7,"active_requests":2,"pending_requests":3}'
-    $script:Metrics = @(
-        'vllm:num_requests_running{engine="0",model_name="independent-model"} 2',
-        'vllm:num_requests_waiting{engine="0",model_name="independent-model"} 3',
-        'vllm:kv_cache_usage_perc{engine="0",model_name="independent-model"} 0.125',
-        'vllm:num_preemptions_total{engine="0",model_name="independent-model"} 0'
-    ) -join "`n"
-    function Observe {
-        param([object]$Health)
-        $queue = [MineruQueueTelemetry]::new(7, 'independent-model')
-        return [MineruResidentWire]::Parse($queue.Observe((Json $Health), $script:Http, $script:Metrics), 8192).Get('values')
-    }
-    Case 'native observer preserves explicit legacy and v2 idle' {
+    # Installer legacy-read support is intentionally separate from current
+    # capacity-bound telemetry. The raw queue bridge must not silently accept
+    # either old envelope. Current-v3 native forwarding and metric cases live
+    # in test_mineru_resident_wire.ps1; full admission semantics are exercised
+    # through the one Python capacity validator and bridge tests.
+    Case 'legacy installer health cannot masquerade as current capacity telemetry' {
         foreach ($health in @((New-Health -Legacy),(New-Health))) {
-            $value = Observe $health
-            Check ($value.Get('api_nonterminal_tasks').Integer() -eq 0) 'idle N differs'
-            Check ($value.Get('api_http_active_requests').Integer() -eq 2) 'HTTP count conflated with task count'
-            Check ($value.Get('vllm_requests_waiting').Integer() -eq 3) 'VLM count conflated with task count'
+            $queue = [MineruQueueTelemetry]::new(7, 'independent-model', ('sha256:' + ('a' * 64)))
+            Reject { $queue.Observe((Json $health), '{}', '') }
         }
-    }
-    Case 'native observer counts all durable phases without physical queue substitution' {
-        foreach ($phase in @('ingress','pending','processing','finalizing','cleanup','unowned','routeless')) {
-            $health = New-Responsibility $phase
-            $value = Observe $health
-            Check ($value.Get('api_nonterminal_tasks').Integer() -eq 1) ('lost responsibility: ' + $phase)
-            Check ($value.Get('api_queued_tasks').Integer() -eq $health.queued_tasks) ('queued drift: ' + $phase)
-            Check ($value.Get('api_processing_tasks').Integer() -eq $health.processing_tasks) ('processing drift: ' + $phase)
-        }
-        $health = New-Responsibility 'pending'; $health.task_admission.queue_depth = 0
-        Check ((Observe $health).Get('api_queued_tasks').Integer() -eq 1) 'pending confused with queue depth'
-    }
-    Case 'native v2 cannot omit or mix the admission proof' {
-        $health = New-Health; $health.PSObject.Properties.Remove('task_admission')
-        Reject { Observe $health }
-        $health = New-Health -Legacy; $health | Add-Member -NotePropertyName task_admission -NotePropertyValue (New-Health).task_admission
-        Reject { Observe $health }
-        foreach ($field in @('schema','registry_schema','admission_scope')) {
-            $health = New-Health; $health.task_protocol_runtime.$field = 'unknown'
-            Reject { Observe $health }
-        }
-    }
-    Case 'native admission shape counts and reason cannot contradict retained responsibility' {
-        foreach ($field in @((New-Health).task_admission.PSObject.Properties.Name)) {
-            $health = New-Health; $health.task_admission.PSObject.Properties.Remove($field)
-            Reject { Observe $health }
-        }
-        $health = New-Responsibility 'ingress'; $health.queued_tasks = 0
-        Reject { Observe $health }
-        $health = New-Responsibility 'pending'; $health.task_admission.active_processors = 1
-        Reject { Observe $health }
-        $health = New-Responsibility 'cleanup'; $health.task_admission.blocked_reason = 'capacity_full'
-        Reject { Observe $health }
-        foreach ($field in @('ingress_tasks','durable_nonterminal_tasks','scheduled_tasks')) {
-            $health = New-Health; $health.task_admission.$field = $false
-            Reject { Observe $health }
-        }
-    }
-    Case 'native overcommitted health remains unqualified rather than zeroed' {
-        $health = New-Responsibility 'pending'; $health.status = 'recovering'; $health.queued_tasks = 2
-        $health.task_admission.accepted_pending_tasks = 2; $health.task_admission.durable_nonterminal_tasks = 2
-        $health.task_admission.recovery_overcommitted = $true; $health.task_admission.blocked_reason = 'recovery_overcommitted'
-        Reject { Observe $health }
-        $health.status = 'healthy'
-        Reject { Observe $health }
     }
     foreach ($pin in $script:SourcePins) {
         Check ((Get-FileHash -LiteralPath $pin.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $pin.sha256) ('input changed during suite: ' + $pin.path)
@@ -250,6 +196,6 @@ $receipt = [ordered]@{
 [IO.File]::WriteAllText((Join-Path $OutputRoot 'receipt.json'), ($receipt | ConvertTo-Json -Depth 8), $utf8)
 if ($null -ne $outerError) { Write-Output $outerError; exit 1 }
 if ($failures -ne 0) { exit 1 }
-if ($script:Results.Count -ne 12) { throw 'expected all seven installer and five native families' }
-Write-Output 'PASS all 12 independent installer/native admission-health families'
+if ($script:Results.Count -ne 8) { throw 'expected seven installer and one current/legacy boundary families' }
+Write-Output 'PASS all 8 independent installer/current-capacity boundary families'
 exit 0

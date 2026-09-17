@@ -15,6 +15,7 @@ from disclosure_anchor.application.contracts.mineru_capacity_config import (
     MineruCapacityConfig,
     encode_mineru_capacity_config,
 )
+from disclosure_anchor.application.contracts.mineru_process_profile import MineruProcessProfile
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
@@ -190,3 +191,32 @@ def parse_mineru_capacity_wire_health(
         expected_task_retention_seconds=expected_task_retention_seconds,
         expected_cleanup_interval_seconds=expected_cleanup_interval_seconds,
     )
+
+
+# Process-profile fields that are projections of the capacity config. The
+# capacity is the one authority; a profile that disagrees is not this release's.
+PROFILE_CAPACITY_PROJECTION = (
+    ("api_task_slots", "parse_active_limit"),
+    ("api_max_pending_tasks", "total_nonterminal_limit"),
+    ("registry_nonterminal_cap", "total_nonterminal_limit"),
+    ("finalizer_slots", "finalizer_active_limit"),
+    ("inference_concurrency", "final_http_limit_per_loop"),
+    ("gpu_request_slots", "final_http_limit_per_loop"),
+    ("processing_window_size", "processing_window_size"),
+    ("omp_thread_count", "omp_num_threads"),
+    ("requested_hybrid_batch_ratio", "hybrid_batch_ratio_requested"),
+    ("pipeline_inference_locks", "pipeline_inference_locks"),
+    ("result_reservation_bytes", "result_reservation_bytes"),
+    ("max_unacked_result_bytes", "max_unacked_result_bytes"),
+)
+
+
+def assert_profile_matches_capacity(profile: MineruProcessProfile, capacity: MineruCapacityConfig) -> None:
+    """Refuse a process profile that is not the projection of this exact capacity config."""
+    encode_mineru_capacity_config(capacity)
+    differing = sorted(
+        profile_field for profile_field, capacity_field in PROFILE_CAPACITY_PROJECTION
+        if getattr(profile, profile_field) != getattr(capacity, capacity_field)
+    )
+    if differing:
+        raise ValueError("process profile is not the projection of the capacity config: " + ", ".join(differing))

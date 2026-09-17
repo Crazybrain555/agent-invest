@@ -85,6 +85,18 @@ class SynchronizedTelemetryObserverV3Tests(unittest.TestCase):
             changed = result.receipt.model_copy(update={"process_profile": _api_profile().model_copy(update={"process_epoch_sha256": OBSERVER_EPOCH})})
             with self.assertRaisesRegex(ValueError, "API process epoch"):
                 validate_synchronized_telemetry_v2(result.frames, receipt=changed)
+            changed_frames = list(result.frames)
+            host_index = next(index for index, frame in enumerate(result.frames)
+                              if frame.queue_vllm.values is not None)
+            host_frame = changed_frames[host_index]
+            queue = host_frame.queue_vllm
+            changed_frames[host_index] = host_frame.model_copy(update={
+                "queue_vllm": queue.model_copy(update={"values": queue.values.model_copy(update={
+                    "api_max_pending_tasks": result.receipt.process_profile.parameters.api_max_pending_tasks + 1,
+                })}),
+            })
+            with self.assertRaisesRegex(ValueError, "queue admission limit"):
+                validate_synchronized_telemetry_v2(tuple(changed_frames), receipt=result.receipt)
             payload = result.receipt.model_dump(mode="json")
             payload["observer_identity"]["clock_domain_identity_sha256"] = HASH_B
             with self.assertRaisesRegex(ValueError, "observer clock domain"):

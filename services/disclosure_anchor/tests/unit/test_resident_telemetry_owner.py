@@ -24,14 +24,13 @@ from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import O
 from disclosure_anchor.application.contracts.resident_session_evidence import artifact_sha256, canonical_bytes, check_mac_observer_identity
 from disclosure_anchor.application.contracts.synchronized_telemetry import ProcessProfileParameters, SynchronizedTelemetryFrameV2, SynchronizedTelemetryReceiptV3, SynchronizedTelemetrySealV3
 from tests.unit.test_dedicated_mac_observer import _identity_bytes
-from tests.unit.test_mineru_process_profile import _profile
 from tests.unit.test_resident_external_observation import _external_fixture, NODE
-from tests.unit.test_resident_session_evidence import _mapping_fixture, _rebind_ready
+from tests.unit.test_resident_session_evidence import _mapping_fixture, _rebind_ready, _resident_capacity, _resident_profile
 from tests.unit.test_synchronized_telemetry_contract import START
 
 
 def _fixture(root):
-    profile = replace(_profile(), host_runtime_identity_sha256=NODE)
+    profile = replace(_resident_profile(), host_runtime_identity_sha256=NODE)
     fixtures, external, frames = [], {}, []
     mac = check_mac_observer_identity(_identity_bytes())
     for host in (False, True):
@@ -74,7 +73,7 @@ def _fixture(root):
     seal = SynchronizedTelemetrySealV3(run_id=receipt.run_id, receipt_sha256=artifact_sha256(canonical_bytes(receipt.model_dump(mode="json"))), frames_jsonl_sha256=receipt.artifacts.frames_jsonl_sha256, preseal_observer_process_cpu_started_ns=0, preseal_observer_process_cpu_finished_ns=100, preseal_observer_cpu_ns=100, sampling_elapsed_ns_denominator=2_000_000_000, receipt_status="complete", status="complete")
     result = SynchronizedObserverResult(ObserverState.SEALED, root / "observer" / receipt.run_id, receipt, seal, tuple(frames))
     plans = [owner.ResidentLaneLaunch(canonical_bytes(f["config"]), canonical_bytes(f["manifest"]), "C:\\fixture\\" + f["config"]["lane"] + ".json") for f in fixtures]
-    request = owner.ResidentTelemetryOwnerRequest(root / "owner", root / "observer", receipt.run_id, plans[0], plans[1], {**fixtures[0]["hashes"], "observe_mineru_resident_session.ps1": artifact_sha256(b"control")}, profile.exact_bytes, NODE, ResidentSSHConfig("192.0.2.1", 22, "fixture", "/fixture/key", "/fixture/known-hosts"), Path("/fixture/ssh"), artifact_sha256(b"ssh"), 2)
+    request = owner.ResidentTelemetryOwnerRequest(root / "owner", root / "observer", receipt.run_id, plans[0], plans[1], {**fixtures[0]["hashes"], "observe_mineru_resident_session.ps1": artifact_sha256(b"control")}, profile.exact_bytes, NODE, ResidentSSHConfig("192.0.2.1", 22, "fixture", "/fixture/key", "/fixture/known-hosts"), Path("/fixture/ssh"), artifact_sha256(b"ssh"), 2, _resident_capacity().exact_bytes)
     return request, external, result
 
 
@@ -218,6 +217,60 @@ class ResidentTelemetryOwnerTests(unittest.TestCase):
                     journal.put("after.stdout", b"not accepted")
             finally:
                 journal.close()
+
+    def test_capacity_authority_mismatch_stops_before_any_remote_operation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request, external, result = _fixture(Path(directory).resolve())
+            changed_config = json.loads(request.host.config_bytes)
+            changed_config["backend"]["capacity_config_sha256"] = artifact_sha256(b"other capacity")
+            invalid = (
+                replace(request, host=replace(request.host, config_bytes=canonical_bytes(changed_config))),
+                replace(request, capacity_config_bytes=replace(
+                    _resident_capacity(), final_http_limit_per_loop=8,
+                ).exact_bytes),
+                replace(request, capacity_config_bytes=replace(
+                    _resident_capacity(), pdf_render_processes_requested=4,
+                ).exact_bytes),
+            )
+            for changed in invalid:
+                with self.subTest(capacity=changed.capacity_config_bytes), self.assertRaises(ValueError):
+                    self._run(changed, external, result)
+                self.assertEqual(self.last_events, [])
+                self.assertFalse(request.evidence_directory.exists())
+
+    def _real_startup_failure(self, *, early_exit):
+        """Real pipe/exit behavior; only remote execution is substituted."""
+        with tempfile.TemporaryDirectory() as directory:
+            request, _, _ = _fixture(Path(directory).resolve())
+            commands = []
+
+            def launch(_request, _plan, *, phase, journal, **_kwargs):
+                if phase == "start":
+                    code = "import os,time;os.write(2,b'ORIGINAL_STARTUP_FAILURE_BYTES\\n');"
+                    code += "raise SystemExit(17)" if early_exit else "time.sleep(10)"
+                else:
+                    code = "import os,time;time.sleep(0.4);os.write(2,b'READY_FAILED\\n');raise SystemExit(2)"
+                command = owner.BoundedOwnerCommand([sys.executable, "-c", code], timeout_seconds=5)
+                commands.append(command)
+                return command
+
+            with patch.object(owner, "_launch_command", side_effect=launch):
+                with self.assertRaises(BaseExceptionGroup):
+                    owner.run_resident_telemetry_session(request)
+            self.assertTrue(all(command._process.poll() is not None for command in commands))
+            retained = b"\n".join(path.read_bytes() for path in request.evidence_directory.glob("*.stderr"))
+            self.assertIn(b"ORIGINAL_STARTUP_FAILURE_BYTES", retained)
+            self.assertFalse((request.evidence_directory / "owner-result.json").exists())
+            if early_exit:
+                exits = [json.loads(path.read_bytes())["exit_code"]
+                         for path in request.evidence_directory.glob("*.exit.json")]
+                self.assertIn(17, exits)
+
+    def test_failed_starter_is_observed_before_ready_without_losing_its_original_error(self):
+        self._real_startup_failure(early_exit=True)
+
+    def test_ready_failure_retains_already_written_output_before_aborting_live_starters(self):
+        self._real_startup_failure(early_exit=False)
 
     def test_real_control_composition_records_intent_before_process_constructor(self):
         with tempfile.TemporaryDirectory() as directory:

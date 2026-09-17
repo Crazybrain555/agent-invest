@@ -55,6 +55,9 @@ from disclosure_anchor.application.contracts.m6_owner import (
 )
 from disclosure_anchor.application.contracts.m6_run import M6RunSpec
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+from disclosure_anchor.application.services.m6_launch_budget import (
+    LaunchTransportBudget, finish_wait_seconds, launch_transport_budget, transport_headroom_seconds,
+)
 from disclosure_anchor.application.services.m6_run_spec_factory import build_run_spec
 
 CAMPAIGN_SUMMARY_CONTRACT = "m6.campaign-run-summary.v1"
@@ -77,6 +80,9 @@ _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9 _./:\\-]+$")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
 _SSH_OVERHEAD_SECONDS = 90.0
+# The launcher's own ExitWaitExtraSeconds (passed explicitly) and its post-exit drain/record allowance.
+_LAUNCHER_EXIT_WAIT_EXTRA_SECONDS = 180
+_LAUNCHER_DRAIN_SECONDS = 15.0
 _PREPARE_TIMEOUT_SECONDS = 180.0
 _STAGE_TIMEOUT_SECONDS = 180.0
 _CANCEL_TIMEOUT_SECONDS = 120.0
@@ -615,6 +621,8 @@ class M6CampaignAssembly:
         self._run: M6RunDirectory | None = None
         self._controller: M6OwnerClient | None = None
         self._spawned_local_ns: int | None = None
+        self._launcher_deadline_ns: int | None = None
+        self._launch_budget: LaunchTransportBudget | None = None
 
     # --- remote helpers ----------------------------------------------------------
 
@@ -726,6 +734,17 @@ class M6CampaignAssembly:
             raise CampaignOutcomeUnknown(f"staging the private deployment failed with sftp exit {result.exit_code}")
         return staged_name
 
+    def _transport_budget(self) -> LaunchTransportBudget:
+        """The launcher transport budget is a pure function of the frozen intent and the launcher's own bounds."""
+        if self._launch_budget is None:
+            intent = self._intent
+            self._launch_budget = launch_transport_budget(
+                planned_seconds=intent.run.planned_seconds, close_grace_seconds=intent.close_grace_seconds,
+                ready_wait_seconds=intent.ready_wait_seconds, ssh_overhead_seconds=_SSH_OVERHEAD_SECONDS,
+                exit_wait_extra_seconds=_LAUNCHER_EXIT_WAIT_EXTRA_SECONDS, launcher_drain_seconds=_LAUNCHER_DRAIN_SECONDS,
+            )
+        return self._launch_budget
+
     def _expected_external_start(self, deployment_sha256: str | None) -> dict[str, Any]:
         windows, intent = self._binding.windows, self._intent
         return {
@@ -745,16 +764,24 @@ class M6CampaignAssembly:
             "ExpectedConfigurationSha256": deployment_sha256, "ExpectedRunId": intent.run.run_id,
             "PlannedSeconds": str(intent.run.planned_seconds), "CloseGraceSeconds": str(intent.close_grace_seconds),
             "MemoryBytes": str(intent.memory_bytes), "ReadyWaitSeconds": str(intent.ready_wait_seconds),
+            "ExitWaitExtraSeconds": str(_LAUNCHER_EXIT_WAIT_EXTRA_SECONDS),
         })
         argv = self._ssh_argv(script)
-        timeout = min(7200.0, intent.run.planned_seconds + intent.close_grace_seconds + 180.0 + _SSH_OVERHEAD_SECONDS)
+        # One fixed transport deadline from the local spawn: the bounded pre-T0 delay (READY wait plus transport
+        # overhead, the same bound _await_ready enforces) + the owner's full planned+grace window + the launcher's
+        # own post-close exit/drain allowance + ssh teardown. Only this transport may use the extended ceiling.
+        budget = self._transport_budget()
+        timeout = budget.timeout_seconds
         write_new_exact(self._output / "launcher-command.json", canonical_bytes({
-            "argv": argv, "timeout_seconds": timeout, "started_utc": _utc(),
+            "argv": argv, "timeout_seconds": timeout, "lifetime_ceiling_seconds": budget.lifetime_ceiling_seconds,
+            "launch_budget": budget.as_dict(), "started_utc": _utc(),
             "intent_sha256": self._inputs.intent_sha256,
             "expected_start": self._expected_external_start(deployment_sha256),
         }) + b"\n")
         self._spawned_local_ns = self._now_ns()
-        self._launcher = self._launch(argv, timeout_seconds=timeout, maximum_bytes=_LAUNCHER_CAPTURE_BYTES, retention="head_tail")
+        self._launcher_deadline_ns = self._spawned_local_ns + int(timeout * 1_000_000_000)
+        self._launcher = self._launch(argv, timeout_seconds=timeout, maximum_bytes=_LAUNCHER_CAPTURE_BYTES,
+                                      retention="head_tail", lifetime_ceiling_seconds=budget.lifetime_ceiling_seconds)
 
     def _await_ready(self) -> ReadyObservation:
         assert self._launcher is not None and self._spawned_local_ns is not None
@@ -825,10 +852,27 @@ class M6CampaignAssembly:
         child_lifetime = min(7200.0, remaining_close)
         if runner_max < 1 or verifier_deadline < 1 or child_lifetime <= 0:
             raise CampaignOutcomeUnknown("no admission or verification budget remains after bind/open")
+        # Now that T0 is known, the fixed launcher transport deadline must still hold the owner's legal close
+        # plus the launcher's own exit tail; otherwise no admission may start (a truncated transport is never
+        # taken as a business close).
+        budget = self._transport_budget()
+        transport_headroom: float | None = None
+        if self._launcher_deadline_ns is not None:
+            transport_headroom = transport_headroom_seconds(
+                launcher_deadline_ns=self._launcher_deadline_ns, now_ns=self._now_ns(),
+                remaining_close_seconds=max(0.0, remaining_close), post_close_seconds=budget.post_close_seconds,
+            )
+            if transport_headroom < 0:
+                raise CampaignOutcomeUnknown(
+                    f"launcher transport deadline cannot cover the owner's close bound ({transport_headroom:.1f}s short)")
         self._summary.values["budgets"] = {
             "planned_seconds": intent.run.planned_seconds, "remaining_at_runner_start_seconds": remaining_admission,
             "remaining_to_max_close_seconds": remaining_close, "child_lifetime_seconds": child_lifetime,
             "runner_max_seconds": runner_max, "verifier_deadline_seconds": verifier_deadline,
+            # None only when this composition root did not spawn the transport itself (never in a real run).
+            "launcher_transport_headroom_seconds": transport_headroom,
+            "launcher_post_close_allowance_seconds": budget.post_close_seconds,
+            "launcher_transport_timeout_seconds": budget.timeout_seconds,
         }
         runner_dir, verifier_dir = self._output / "runner", self._output / "verifier"
         runner_dir.mkdir(mode=0o700)
@@ -1336,7 +1380,11 @@ class M6CampaignAssembly:
 
             def finish_launcher() -> None:
                 if self._launcher is not None:
-                    self._finish_launcher(wait_seconds=intent.close_grace_seconds + 240.0)
+                    # Wait for the launcher's natural end until its own absolute deadline (which already holds the
+                    # post-close tail); a transport not spawned here only gets that post-close tail.
+                    wait = (finish_wait_seconds(launcher_deadline_ns=self._launcher_deadline_ns, now_ns=self._now_ns())
+                            if self._launcher_deadline_ns is not None else self._transport_budget().post_close_seconds)
+                    self._finish_launcher(wait_seconds=wait)
 
             def read_external_proof() -> None:
                 if self._launcher is not None:

@@ -12,7 +12,14 @@ from disclosure_anchor.adapters.runtime.windows_resident_telemetry import (
     build_windows_resident_telemetry_sampler,
     windows_resident_collector_spec,
 )
-from disclosure_anchor.application.contracts.windows_resident_telemetry import ResidentIdentity
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    decode_mineru_capacity_config,
+)
+from disclosure_anchor.application.contracts.windows_resident_telemetry import (
+    HostQueueBinding, ResidentIdentity,
+)
+from tests._mineru_capacity_config_fixture import CAPACITY_BYTES
+from tests._mineru_capacity_health_fixture import capacity_health_payload
 from disclosure_anchor.application.ports.synchronized_telemetry import (
     TelemetrySnapshotDeadline,
     TelemetrySnapshotContinuityLost,
@@ -21,6 +28,37 @@ from disclosure_anchor.application.ports.synchronized_telemetry import (
 
 HASHES = ["sha256:" + character * 64 for character in "abcdef0"]
 OBSERVER_CLOCK = "sha256:" + "1" * 64
+# The host lane is judged against the release's frozen capacity and the API process the
+# Linux sampler measured; both come from the shared capacity fixtures, never from a host.
+CAPACITY = decode_mineru_capacity_config(CAPACITY_BYTES)
+
+
+def _host_binding() -> HostQueueBinding:
+    owner = capacity_health_payload()["capacity_observation"]["owner"]
+    return HostQueueBinding(
+        expected_capacity=CAPACITY, serving_namespace_pid=owner["process_id"],
+        api_boot_id=owner["boot_id"], api_start_ticks=owner["process_start_ticks"],
+        task_retention_seconds=600, task_cleanup_interval_seconds=30,
+    )
+
+
+def _queue_wire() -> dict[str, object]:
+    """One supported host observation: the producer's own bytes, forwarded verbatim."""
+    health = capacity_health_payload()
+    owner = health["capacity_observation"]["owner"]
+    return {
+        "reason": None,
+        "status": "supported",
+        "values": {
+            "api_health": json.dumps(health, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "api_http": json.dumps({
+                "contract_version": "mineru.api-http-request-snapshot.v1",
+                "process_id": owner["process_id"], "active_requests": 4, "pending_requests": 5,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            "vllm": {"vllm_requests_running": 1, "vllm_requests_waiting": 0,
+                     "vllm_kv_cache_usage_ratio": 0.5, "vllm_preemptions_total": 7},
+        },
+    }
 
 
 def _identity() -> dict[str, str]:
@@ -36,10 +74,10 @@ def _identity() -> dict[str, str]:
     return dict(zip(names, HASHES, strict=True))
 
 
-def _payload(sequence: int, *, lane: str = "gpu_fast") -> bytes:
+def _payload(sequence: int, *, lane: str = "gpu_fast", queue: dict[str, object] | None = None) -> bytes:
     interval = 1000 if lane == "host_slow" else 250
     value: dict[str, object] = {
-        "contract_version": "mineru.windows-resident-telemetry.v1",
+        "contract_version": "mineru.windows-resident-telemetry.v2",
         "identity": _identity(),
         "lane": lane,
         "observed_at_utc": (
@@ -59,7 +97,7 @@ def _payload(sequence: int, *, lane: str = "gpu_fast") -> bytes:
         value.update(
             api_process=unsupported,
             host_cgroup=unsupported,
-            queue_vllm=unsupported,
+            queue_vllm=unsupported if queue is None else queue,
         )
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
@@ -120,6 +158,7 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
                 "collector_identity_sha256": HASHES[0],
                 "observer_clock_domain_identity_sha256": OBSERVER_CLOCK,
                 "expected_identity": _identity(),
+                **({"host_binding": _host_binding().as_config()} if lane == "host_slow" else {}),
             }
         )
 
@@ -185,6 +224,38 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             self._sampler().snapshot(
                 deadline=TelemetrySnapshotDeadline(time.monotonic_ns() + 500_000_000)
+            )
+
+    def test_forwarded_host_bytes_become_frame_values_only_under_the_frozen_capacity(self) -> None:
+        # The decisive host-lane boundary: the sampler forwards the producer's raw reply and
+        # the frame values come from validating it against the release's frozen capacity and
+        # the sampled API process - never from anything the Windows side decided.
+        _Handler.payloads = [_payload(1, lane="host_slow", queue=_queue_wire())]
+        host = self._sampler(lane="host_slow").snapshot(
+            deadline=TelemetrySnapshotDeadline(time.monotonic_ns() + 2_000_000_000)
+        )
+        self.assertEqual(host.queue_vllm.status, "supported")
+        values = host.queue_vllm.values
+        assert values is not None
+        self.assertEqual(values.api_max_pending_tasks, CAPACITY.total_nonterminal_limit)
+        self.assertEqual(values.api_nonterminal_tasks,
+                         values.api_queued_tasks + values.api_processing_tasks)
+        # The HTTP counts are the snapshot's own, and the vLLM digest is the exporter's.
+        self.assertEqual((values.api_http_active_requests, values.api_http_pending_requests), (4, 5))
+        self.assertEqual(values.vllm_preemptions_total, 7)
+
+        # A reply that is internally consistent but names another capacity is not a sample.
+        foreign = _queue_wire()
+        health = json.loads(foreign["values"]["api_health"])
+        forged = "sha256:" + "9" * 64
+        health["task_protocol_runtime"]["capacity_config_sha256"] = forged
+        health["capacity_observation"]["capacity_config_sha256"] = forged
+        foreign["values"]["api_health"] = json.dumps(
+            health, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        _Handler.payloads = [_payload(1, lane="host_slow", queue=foreign)]
+        with self.assertRaises(ValueError):
+            self._sampler(lane="host_slow").snapshot(
+                deadline=TelemetrySnapshotDeadline(time.monotonic_ns() + 2_000_000_000)
             )
 
     def test_sequence_checkpoint_loss_is_terminal_without_third_get(self) -> None:
@@ -281,6 +352,7 @@ class WindowsResidentTelemetryTests(unittest.TestCase):
                 "start_mineru_resident_telemetry.ps1",
                 "load_mineru_resident_session.ps1",
                 "test_mineru_resident_session.ps1",
+                "test_mineru_resident_bootstrap.ps1",
                 "windows_resident_telemetry.py",
                 "resident_session_evidence.py",
                 "resident_telemetry_owner.py",
