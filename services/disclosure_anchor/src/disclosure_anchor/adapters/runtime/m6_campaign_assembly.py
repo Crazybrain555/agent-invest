@@ -32,6 +32,7 @@ from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import (
     CampaignBindingError, CampaignPrivateBinding, assert_known_hosts_pins_address, load_campaign_private_binding,
 )
 from disclosure_anchor.adapters.runtime.m6_continuous_clock import diagnostic_continuous_clock
+from disclosure_anchor.adapters.runtime.m6_e2e_assembly import SPOOL_FILENAME
 from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.adapters.runtime.m6_e2e_run import (
     M6RunDirectory, M6RunnerClosureFailed, M6VerifierAssembly, RunnerClosureReceipts, close_verifier_assembly,
@@ -967,8 +968,10 @@ class M6CampaignAssembly:
             "--max-seconds", str(runner_max), "--activation-role", "candidate", "--receipt-out", str(receipt),
             "--stop-file", str(stop_file), "--observation-out", str(observation), "--m6-run-dir", str(self._run.path),
         ])
+        # The verifier tails the runner's spool *file*: the runner creates
+        # <observation>/m6-assembly/<SPOOL_FILENAME> (staged_campaign + M6LifecycleSpool).
         verifier_argv = self._child_argv("disclosure_anchor.cli.m6_verifier_supervisor", [
-            "--m6-run-dir", str(self._run.path), "--runner-spool", str(observation / "m6-assembly"),
+            "--m6-run-dir", str(self._run.path), "--runner-spool", str(observation / "m6-assembly" / SPOOL_FILENAME),
             "--runner-receipt", str(receipt), "--output-dir", str(verifier_dir), "--verifier-identity", intent.verifier_identity,
             "--plan", str(inputs.quality_plan_path), "--deadline-seconds", str(verifier_deadline),
         ])

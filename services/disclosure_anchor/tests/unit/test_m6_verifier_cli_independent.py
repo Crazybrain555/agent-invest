@@ -74,7 +74,7 @@ class VerifierCliIndependentTests(unittest.TestCase):
         self.run.anchor.canonical_sha256.return_value = m6.digest("anchor")
         self.receipt.write_text(json.dumps(self.receipt_value() if value is None else value))
 
-    def invoke(self, *, read_receipt=None, precreate_parents=False, fail_manifest=False):
+    def invoke(self, *, read_receipt=None, precreate_parents=False, fail_manifest=False, runner_spool=None):
         self.counter += 1
         out = self.root / f"supervisor-{self.counter}"
         observed_error = None
@@ -130,7 +130,8 @@ class VerifierCliIndependentTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(cli, "_write_new", side_effect=write))
             try:
                 code = cli.main([
-                    "--m6-run-dir", str(self.root), "--runner-spool", str(self.path),
+                    "--m6-run-dir", str(self.root),
+                    "--runner-spool", str(self.path if runner_spool is None else runner_spool),
                     "--runner-receipt", str(self.receipt), "--output-dir", str(out),
                     "--verifier-identity", "independent", "--plan", str(self.plan),
                     "--deadline-seconds", "2", "--poll-seconds", "0.001",
@@ -140,6 +141,49 @@ class VerifierCliIndependentTests(unittest.TestCase):
         summary_path = out / "run-summary.json"
         summary = json.loads(summary_path.read_bytes()) if summary_path.exists() else {}
         return code, observed_error, summary
+
+    def test_the_spool_directory_is_refused_before_the_run_or_the_output_exists(self):
+        """G4 r4 arrived with the spool's directory; the entry must say so and touch nothing.
+
+        A spool file the runner has not written yet stays legitimate - the tail waits for it - so
+        this refusal is about a path that is a directory now, named as the reason, before the run
+        directory is loaded and before the output directory is created.
+        """
+        self.add_published_attempt()
+        self.write_receipt()
+        directory = self.path.parent
+        self.assertTrue(directory.is_dir())
+        code, error, summary = self.invoke(runner_spool=directory)
+        self.assertIsNotNone(error, "a directory must not be read as the runner's spool")
+        self.assertIn("runner-spool", str(error))
+        self.assertIn(str(directory), str(error))
+        self.assertIsNone(code)
+        self.assertEqual(summary, {}, "nothing is written before the refusal")
+        self.assertFalse((self.root / "supervisor-1").exists(), "the output directory is not created")
+        self.run.require_spec.assert_not_called()
+        self.public.start.assert_not_called()
+        self.quality.start.assert_not_called()
+
+    def test_a_spool_file_the_runner_has_not_written_yet_is_still_waited_for(self):
+        """The refusal is about a directory, never about a file that does not exist yet.
+
+        The runner creates its spool after the verifier starts, so an absent path must pass the
+        preflight and be waited for. Here the runner's receipt is already present and its spool
+        never appears, so the run ends on the spool's own closed-tail rule - having got well past
+        the preflight, with its output directory created.
+        """
+        self.write_receipt()
+        missing = self.path.parent / "not-written-yet.jsonl"
+        self.assertFalse(missing.exists())
+        self.assertTrue(missing.parent.is_dir())
+        code, error, summary = self.invoke(runner_spool=missing)
+        reported = str(error) + json.dumps(summary)
+        self.assertNotIn("expects the runner's spool file", reported,
+                         "an absent spool is not the directory refusal")
+        self.assertTrue((self.root / "supervisor-1").is_dir(),
+                        "the run proceeded past the preflight")
+        self.assertIn("spool", reported.lower())
+        self.assertNotEqual(code, 0)
 
     def test_complete_attempt_writes_both_phases_before_single_terminal_drain(self):
         self.add_published_attempt()

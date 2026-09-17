@@ -409,8 +409,10 @@
    "tests": 6
   },
   "tests/unit/test_m6_campaign_assembly_independent.py": {
-   "private_imports": [],
-   "tests": 18
+   "private_imports": [
+    "_parser"
+   ],
+   "tests": 20
   },
   "tests/unit/test_m6_delivery_report_independent.py": {
    "private_imports": [],
@@ -534,7 +536,7 @@
   },
   "tests/unit/test_m6_verifier_cli_independent.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 7
   },
   "tests/unit/test_m6_verifier_completion_independent.py": {
    "private_imports": [],

@@ -158,6 +158,10 @@ def main(argv: list[str] | None = None) -> int:
                                               maximum_bytes=_MAX_PLAN_BYTES)
     if plan.mode != "e2e_publication":
         raise ValueError("supervisor requires the e2e_publication quality plan")
+    if args.runner_spool.is_dir():
+        # The spool may not exist yet (the runner creates it), but a directory here
+        # is a composition error, refused before any run or output is touched.
+        raise ValueError(f"--runner-spool expects the runner's spool file, not its directory: {args.runner_spool}")
     run = load_m6_run_directory(args.m6_run_dir.absolute())
     spec = run.require_spec()
     if spec.mode != "e2e_publication":

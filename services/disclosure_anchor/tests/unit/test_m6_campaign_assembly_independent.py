@@ -18,9 +18,13 @@ from disclosure_anchor.adapters.runtime.m6_campaign_assembly import (
 from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import (
     CampaignPrivateBinding, CampaignWindowsTarget,
 )
+from disclosure_anchor.adapters.runtime.m6_e2e_assembly import M6LifecycleSpool
 from disclosure_anchor.adapters.runtime.m6_e2e_run import load_m6_run_directory
 from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6LeasePolicy
+from disclosure_anchor.adapters.runtime.m6_verifier_supervisor import RunnerSpoolTail
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig
+from disclosure_anchor.application.ports.staged_lifecycle_facts import AttemptAdmittedFact
+from disclosure_anchor.cli.m6_verifier_supervisor import _parser as verifier_parser
 from disclosure_anchor.application.contracts.m6_owner import M6OwnerReply
 from disclosure_anchor.adapters.runtime.resident_owner_control import BoundedOwnerCommand, OwnerCommandResult
 from disclosure_anchor.application.services.m6_launch_budget import finish_wait_seconds
@@ -576,3 +580,132 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 assembly._bind_and_open(ready)
             self.assertEqual((run_dir / "transport.json").read_bytes(), original)
+
+    # --- the argv the entry hands its two children ---------------------------------------
+
+    def child_argv(self, root):
+        """The exact argv `_supervise_children` builds, captured at the one spawn seam."""
+        children = [Mock(captured_output=(b"", b""), poll=Mock(return_value=None)) for _ in range(2)]
+        for child in children:
+            child.abort.side_effect = lambda child=child: setattr(
+                child.poll, "return_value", OwnerCommandResult(-15, b"", b""))
+        captured = []
+
+        def spawn(argv, **kwargs):
+            captured.append(list(argv))
+            return children[len(captured) - 1]
+
+        assembly = self.assembly(root, launch=Mock(side_effect=spawn))
+        status = self.attach_owner(assembly, root)
+        # By supervision the run directory exists: bind and open loaded it. `attach_owner` only
+        # names it, so it is created here, with nothing else of the real bind sequence.
+        assembly._run.path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Supervision itself is not under test here; this ends it as soon as both argv exist.
+        assembly._launcher.poll.side_effect = OSError("declared supervision stop")
+        with self.assertRaises((OSError, CampaignOutcomeUnknown)):
+            assembly._supervise_children(self.spec, status, 1_000_000_000)
+        self.assertEqual(len(captured), 2, "one runner and one verifier were launched")
+        return assembly, captured[0], captured[1]
+
+    @staticmethod
+    def argv_value(argv, name):
+        return argv[argv.index(name) + 1]
+
+    @staticmethod
+    def cli_argv(argv, module):
+        """What the child's own argparse sees: everything after `-m <module>`."""
+        return argv[argv.index(module) + 1:]
+
+    def test_the_verifier_argv_the_entry_builds_reaches_the_runners_actual_spool(self):
+        """The G4 r4 stop: `--runner-spool` must name the file the runner's spool writes.
+
+        The entry builds the argv, the runner's own `M6LifecycleSpool` writes its records at
+        `<observation-out>/m6-assembly/spool.jsonl`, and the verifier's real parser hands that
+        argument to the real `RunnerSpoolTail`. Nothing here is asserted as a string: the tail
+        has to read the records the spool actually emitted.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _assembly, runner_argv, verifier_argv = self.child_argv(root)
+            fixture = m6.make_fixture("e2e_publication", {"a": (7, "replay")})
+            self.assertEqual(fixture.spec, self.spec, "the same frozen fixture the entry was built on")
+
+            # The runner creates its observation directory and spools one real fact, exactly as
+            # `cli/staged_campaign.py` does with `observation_dir / "m6-assembly"`.
+            observation = Path(self.argv_value(runner_argv, "--observation-out"))
+            observation.mkdir(mode=0o700, parents=False, exist_ok=False)
+            spool = M6LifecycleSpool(
+                observation / "m6-assembly", run_id=self.spec.run_id,
+                spec_sha256=self.spec.canonical_sha256(), producer_epoch_sha256=m6.RUNNER_EPOCH, max_facts=8,
+            )
+            self.addCleanup(spool.close)
+            member = fixture.entries["a"]
+            spool.attempt_admitted(AttemptAdmittedFact(
+                attempt_id="att-a", fence_identity="fence-1", document_id=member.document_id,
+                processing_run_id="prun-1", source_pdf_sha256=member.source_pdf_sha256,
+                source_byte_count=member.source_byte_count, source_page_count=7,
+                process_profile_sha256=self.spec.runtime.process_profile_sha256))
+
+            # The verifier's own parser, over the argv its process would receive.
+            args = verifier_parser().parse_args(
+                self.cli_argv(verifier_argv, "disclosure_anchor.cli.m6_verifier_supervisor"))
+            self.assertEqual(args.runner_spool.absolute(), Path(spool.status()["path"]),
+                             "the argument must name the spool file the runner actually wrote")
+
+            # And the real tail must be able to read those records through it.
+            tail = RunnerSpoolTail(args.runner_spool.absolute(), run_id=self.spec.run_id,
+                                   spec_sha256=self.spec.canonical_sha256())
+            tail.poll()
+            self.assertIsNone(tail.failed)
+            status = tail.status()
+            self.assertEqual(status["records"], 2, "the spool_start record and the admitted fact")
+            self.assertEqual(status["facts"], 1)
+            self.assertEqual(status["admitted"], 1)
+
+    def test_every_other_child_path_argument_still_matches_its_consumer(self):
+        """The same argv, read against what each consumer requires of its paths.
+
+        One shape mismatch is a run-ending failure, so the neighbours are checked here rather
+        than left to the next live run: a directory the child creates must not exist yet, a
+        file it writes must not exist yet, and a path it reads must be there already.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assembly, runner_argv, verifier_argv = self.child_argv(root)
+            runner = {"--observation-out": "new_directory", "--receipt-out": "new_file",
+                      "--stop-file": "new_file", "--m6-run-dir": "existing_directory",
+                      "--manifest": "declared_input", "--scope": "declared_input"}
+            verifier = {"--output-dir": "new_directory", "--m6-run-dir": "existing_directory",
+                        "--runner-receipt": "new_file", "--plan": "declared_input",
+                        "--runner-spool": "runner_spool_file"}
+            for argv, expected in ((runner_argv, runner), (verifier_argv, verifier)):
+                for name, shape in expected.items():
+                    with self.subTest(argument=name, shape=shape):
+                        path = Path(self.argv_value(argv, name))
+                        self.assertTrue(path.is_absolute())
+                        if shape == "new_directory":
+                            # The child creates it with exist_ok=False; the parent must be there.
+                            self.assertFalse(path.exists())
+                            self.assertTrue(path.parent.is_dir())
+                        elif shape == "new_file":
+                            self.assertFalse(path.exists())
+                            self.assertTrue(path.parent.is_dir())
+                        elif shape == "existing_directory":
+                            self.assertTrue(path.is_dir())
+                        elif shape == "runner_spool_file":
+                            # Named by its own producer's layout, not by the directory above it.
+                            self.assertEqual(path.name, "spool.jsonl")
+                            self.assertEqual(path.parent.name, "m6-assembly")
+            # The two children must agree on the files they hand over between them.
+            self.assertEqual(self.argv_value(runner_argv, "--receipt-out"),
+                             self.argv_value(verifier_argv, "--runner-receipt"))
+            self.assertEqual(self.argv_value(runner_argv, "--m6-run-dir"),
+                             self.argv_value(verifier_argv, "--m6-run-dir"))
+            self.assertEqual(Path(self.argv_value(verifier_argv, "--runner-spool")).parent.parent,
+                             Path(self.argv_value(runner_argv, "--observation-out")))
+            self.assertEqual(Path(self.argv_value(verifier_argv, "--output-dir")),
+                             assembly._output / "verifier")
+
+
+if __name__ == "__main__":
+    unittest.main()
