@@ -361,7 +361,8 @@ def pin_sampling_plan(*, observer_run, request, evidence_directory, local_clock_
     plan document is the product's closed model, its intent hash is the hash of the owner's
     own retained intent bytes whose *contents* name this run and duration, and its clock
     domain is the independently read local observer identity - which is what makes
-    `plan.end - monotonic_ns()` a subtraction inside one domain rather than across two.
+    `plan.planned_end_monotonic_ns - monotonic_ns()` a subtraction inside one domain
+    rather than across two.
     """
     model = SynchronizedSamplingPlanV1
     raw = read_bounded(Path(observer_run) / "sampling-plan.v1.json", maximum=maximum)
@@ -1247,9 +1248,12 @@ def main(argv=None):
             evidence_directory=request.evidence_directory,
             local_clock_domain_sha256=check_mac_observer_identity(
                 local_clock_domain).clock_domain_identity_sha256)
+        # The frozen plan's own field names; the evidence keys below are this driver's, and the
+        # cleanup phase in `finally` reads `planned_end_ns` back out of them.
         evidence["sampling_plan"] = {
-            "sha256": plan_sha256, "run_id": plan.run_id, "start_ns": plan.start_ns,
-            "planned_end_ns": plan.end_ns, "duration_ns": plan.duration_ns,
+            "sha256": plan_sha256, "run_id": plan.run_id,
+            "start_ns": plan.started_monotonic_ns,
+            "planned_end_ns": plan.planned_end_monotonic_ns, "duration_ns": plan.duration_ns,
             "problems": list(plan_problems),
         }
         save(output / "sampling-plan-pin.json", evidence["sampling_plan"])
@@ -1258,7 +1262,7 @@ def main(argv=None):
         # The pre-GO reserve is local and causal: this driver spawned the earliest starter it
         # owns, so both instants are its own monotonic clock.
         require_start_headroom(earliest_starter_spawn_ns=telemetry_spawn_ns,
-                               sampling_start_ns=plan.start_ns)
+                               sampling_start_ns=plan.started_monotonic_ns)
         save(output / "first-frames.json", {lane: frame_identity(frame) for lane, frame in sorted(first.items())})
         evidence["first_frames"] = {lane: frame_identity(frame) for lane, frame in sorted(first.items())}
         evidence["rejected_frames_before_launch"] = dict(sorted(rejected.items())[:16])
@@ -1278,7 +1282,7 @@ def main(argv=None):
 
         # What is left of the frozen window, in the same clock the plan was written in. No UTC
         # difference and no frame timestamp takes part in this.
-        remaining = (plan.end_ns - time.monotonic_ns()) / NS
+        remaining = (plan.planned_end_monotonic_ns - time.monotonic_ns()) / NS
         evidence["remaining_sampling_seconds_at_launch"] = remaining
         require(remaining >= budget["required_after_first_frame_seconds"],
                 f"only {remaining}s of sampling remain; the campaign needs "
@@ -1324,7 +1328,7 @@ def main(argv=None):
                 f"campaign entry exited {evidence['campaign_exit_code']}; original evidence retained")
 
         # The sampling window closes on its own finite deadline; it is never cut short here.
-        remaining_close = max(60.0, (plan.end_ns - time.monotonic_ns()) / NS
+        remaining_close = max(60.0, (plan.planned_end_monotonic_ns - time.monotonic_ns()) / NS
                               + allowances["telemetry_close_allowance_seconds"])
         evidence["telemetry_close_wait_seconds"] = remaining_close
         code = telemetry.wait(remaining_close)

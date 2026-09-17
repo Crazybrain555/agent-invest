@@ -426,7 +426,7 @@
   },
   "tests/unit/test_m6_measured_driver_independent.py": {
    "private_imports": [],
-   "tests": 28
+   "tests": 29
   },
   "tests/unit/test_m6_measurement_independent.py": {
    "private_imports": [],

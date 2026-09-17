@@ -28,10 +28,12 @@ import signal
 import sys
 from types import SimpleNamespace
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 from disclosure_anchor.adapters.runtime import m6_campaign_assembly as assembly
+from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     verify_synchronized_telemetry_observer,
 )
@@ -39,10 +41,10 @@ from disclosure_anchor.application.contracts.m6_delivery_report import (
     M6_DELIVERY_REPORT_MAX_BYTES, M6DeliveryReport,
 )
 from disclosure_anchor.application.contracts.resident_session_evidence import (
-    artifact_sha256, canonical_bytes,
+    artifact_sha256, canonical_bytes, check_mac_observer_identity,
 )
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
-    SynchronizedTelemetryFrameV2, SynchronizedTelemetryFrameV3,
+    SynchronizedSamplingPlanV1, SynchronizedTelemetryFrameV2, SynchronizedTelemetryFrameV3,
 )
 from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import (
     CAMPAIGN_PRIVATE_BINDING_CONTRACT,
@@ -918,14 +920,92 @@ class MeasuredDriverPlanTests(unittest.TestCase):
 
 
 class MeasuredDriverPreflightTests(unittest.TestCase):
-    """The main path itself: what it refuses before it constructs its first child.
+    """The main path itself: what it refuses, and what it does with the frozen plan.
 
-    Both cases run the real `main` over a complete set of frozen inputs composed
+    Every case runs the real `main` over a complete set of frozen inputs composed
     from the product's own fixtures, with the one spawn primitive replaced. The
     negative proves no child is constructed; the positive proves that primitive
     does fire when the declaration matches the composition root's own rule, so
-    the negative is not vacuous.
+    the negative is not vacuous. The third case lets both children be constructed
+    - as stand-ins that never run anything - so the orchestration reaches the plan
+    it pinned and is judged on what it does with it.
     """
+
+    def _retained_plan(self, root, *, frozen, clock_domain, duration_seconds):
+        """The plan and frame stream a live telemetry child would have retained by now.
+
+        Real current types only: the frozen plan is `SynchronizedSamplingPlanV1` and every
+        record is a v3 frame carrying this run's own identities. The retained intent is the
+        two fields `pin_sampling_plan` reads from it; the owner's full intent document has
+        its own cases over a real owner session.
+        """
+        observer_run = root / "observer" / RUN_ID
+        observer_run.mkdir(parents=True, mode=0o700)
+        evidence_directory = root / "owner"
+        evidence_directory.mkdir(mode=0o700)
+        intent = canonical_bytes({"run_id": RUN_ID, "duration_seconds": duration_seconds})
+        (evidence_directory / "owner-intent.json").write_bytes(intent)
+        started = time.monotonic_ns()
+        duration_ns = duration_seconds * 1_000_000_000
+        plan = SynchronizedSamplingPlanV1(
+            run_id=RUN_ID, owner_intent_sha256=driver.digest(intent),
+            observer_clock_domain_identity_sha256=clock_domain,
+            started_monotonic_ns=started, duration_ns=duration_ns,
+            planned_end_monotonic_ns=started + duration_ns,
+            gpu_nominal_interval_ms=250, host_nominal_interval_ms=1000)
+        (observer_run / "sampling-plan.v1.json").write_bytes(
+            canonical_bytes(plan.model_dump(mode="json")))
+        owner, profile = frozen["gpu"]["owner_identity"], frozen["profile"]
+        identity = (
+            (("runtime_bundle_identity_sha256",), profile.runtime_bundle_identity_sha256),
+            (("process_profile_sha256",), profile.sha256),
+            (("clock", "clock_domain_identity_sha256"), clock_domain),
+            (("resident_exporter_provenance", "boot_identity_sha256"),
+             owner["boot_identity_sha256"]),
+            (("resident_exporter_provenance", "host_assignment_identity_sha256"),
+             owner["host_assignment_identity_sha256"]),
+        )
+        records = [canonical_bytes(frame(lane=lane, sequence=index, first=True,
+                                         started_ns=(index + 1) * 250_000_000,
+                                         changes=identity).model_dump(mode="json"))
+                   for index, lane in enumerate(("gpu_fast", "host_slow"))]
+        (observer_run / driver.FRAME_V3_FILENAME).write_bytes(
+            b"".join(record + b"\n" for record in records))
+        return plan
+
+    @staticmethod
+    def _stand_in_children(on_telemetry):
+        """The exact `subprocess.Popen` surface this driver's `Child` uses, and nothing else.
+
+        The telemetry stand-in is sampling until it is waited for; the campaign stand-in has
+        already ended on its own. No command is executed, so no remote session, no GPU and no
+        PDF admission happens in this case.
+        """
+        spawns = []
+
+        class StandIn:
+            def __init__(self, exit_code):
+                # Past this platform's pid range on purpose: no stop path runs here, and one
+                # that did would find no process rather than signal a live one.
+                self.pid = 999_999
+                self._exit_code = exit_code
+
+            def poll(self):
+                return self._exit_code
+
+            def wait(self, timeout=None):
+                if self._exit_code is None:
+                    self._exit_code = 0
+                return self._exit_code
+
+        def popen(command, **keywords):
+            spawns.append(list(command))
+            if "telemetry-child" in command:
+                on_telemetry()
+                return StandIn(None)
+            return StandIn(0)
+
+        return popen, spawns
 
     def _telemetry_lanes(self):
         """The two frozen lane configurations this driver's pre-flight has to read.
@@ -1087,13 +1167,14 @@ class MeasuredDriverPreflightTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def _main(self, argv):
+    def _main(self, argv, popen=None, spawns=None):
         """Run the real entry with the one spawn primitive replaced; nothing else is faked."""
-        spawns = []
+        if popen is None:
+            spawns = []
 
-        def popen(command, **keywords):
-            spawns.append(list(command))
-            raise SpawnBlocked("the spawn primitive was reached")
+            def popen(command, **keywords):
+                spawns.append(list(command))
+                raise SpawnBlocked("the spawn primitive was reached")
 
         handlers = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
         try:
@@ -1104,6 +1185,68 @@ class MeasuredDriverPreflightTests(unittest.TestCase):
             signal.signal(signal.SIGTERM, handlers[0])
             signal.signal(signal.SIGHUP, handlers[1])
         return code, spawns
+
+    def test_the_pinned_plan_carries_the_orchestration_through_launch_and_close(self):
+        # The actual first G4 orchestration stopped here with
+        # `AttributeError: 'SynchronizedSamplingPlanV1' object has no attribute 'start_ns'`,
+        # after both lanes were trusted and before the campaign child existed. The frozen plan
+        # names its window `started_monotonic_ns`/`planned_end_monotonic_ns`; `start_ns`/`end_ns`
+        # belong to the pure policy projection, which is where this driver took them from.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv, output = self._frozen(
+                root, declared_transport=SHORT["launcher_transport_timeout_seconds"])
+            clock_domain = check_mac_observer_identity(
+                MacObserverIdentityReader().observe()).clock_domain_identity_sha256
+            frozen = self._telemetry_lanes()
+            plan = None
+
+            def retain():
+                nonlocal plan
+                plan = self._retained_plan(root, frozen=frozen, clock_domain=clock_domain,
+                                           duration_seconds=SHORT_DURATION)
+
+            popen, spawns = self._stand_in_children(retain)
+            code, spawned = self._main(argv, popen=popen, spawns=spawns)
+
+            self.assertEqual(code, 1)
+            self.assertFalse(hasattr(plan, "start_ns"), "the frozen plan carries no policy names")
+            self.assertFalse(hasattr(plan, "end_ns"), "the frozen plan carries no policy names")
+            self.assertEqual(plan.policy().start_ns, plan.started_monotonic_ns)
+            self.assertEqual(plan.policy().end_ns, plan.planned_end_monotonic_ns)
+            # Two children were constructed and neither ran anything: the telemetry child and
+            # the campaign entry, in that order. No remote session and no PDF admission.
+            self.assertEqual([command[1:4] for command in spawned],
+                             [["-m", "tests.integration.m6_measured_campaign_independent",
+                               "telemetry-child"],
+                              ["-m", "disclosure_anchor.cli.m6_campaign", "run"]])
+            evidence = json.loads((output / "independent-evidence.json").read_bytes())
+            # It stopped where this case ends it - reading a campaign summary no campaign wrote -
+            # so everything between the plan pin and that read actually ran.
+            self.assertEqual(evidence["failure"],
+                             "AssertionError: expected an existing regular file: campaign-summary.json")
+            self.assertEqual(evidence["sampling_plan"]["problems"], [])
+            self.assertEqual(evidence["sampling_plan"]["start_ns"], plan.started_monotonic_ns)
+            self.assertEqual(evidence["sampling_plan"]["planned_end_ns"], plan.planned_end_monotonic_ns)
+            self.assertEqual(evidence["sampling_plan"]["duration_ns"], plan.duration_ns)
+            self.assertEqual(sorted(evidence["first_frames"]), ["gpu_fast", "host_slow"])
+            self.assertEqual(evidence["rejected_frames_before_launch"], {})
+            self.assertEqual(evidence["supervision_outcome"], "campaign_exited")
+            self.assertEqual(evidence["campaign_exit_code"], 0)
+            self.assertEqual(evidence["telemetry_exit_code"], 0)
+            # The launch and close uses of the plan's end, in the plan's own clock domain. Both
+            # are still nearly the whole window, because this case reaches them in well under a
+            # second; a close wait pinned at its 60 s floor would mean the end never took part.
+            remaining = evidence["remaining_sampling_seconds_at_launch"]
+            self.assertGreater(remaining, SHORT_DURATION - 60)
+            self.assertLessEqual(remaining, SHORT_DURATION)
+            close_wait = evidence["telemetry_close_wait_seconds"]
+            self.assertGreater(close_wait, 60.0)
+            self.assertAlmostEqual(close_wait, remaining + 30, delta=60)
+            # The cleanup phase reads the same end back out of the evidence; the window has not
+            # expired yet, so this run finished that far ahead of it.
+            self.assertLess(evidence["phase_seconds"]["cleanup"], 0)
+            self.assertGreater(evidence["phase_seconds"]["cleanup"], -SHORT_DURATION)
 
     def test_a_misdeclared_transport_is_refused_before_any_child_exists(self):
         with tempfile.TemporaryDirectory() as directory:
