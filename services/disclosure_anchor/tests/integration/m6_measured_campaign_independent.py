@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import inspect
 import json
 import math
 import os
@@ -31,6 +33,7 @@ import traceback
 
 from disclosure_anchor.adapters.runtime import m6_campaign_assembly as assembly
 from disclosure_anchor.adapters.runtime import resident_telemetry_owner as owner_module
+from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import load_campaign_private_binding
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig
 from disclosure_anchor.adapters.runtime.resident_telemetry_owner import (
@@ -47,29 +50,40 @@ from disclosure_anchor.application.contracts.mineru_capacity_config import (
     decode_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.mineru_process_profile import decode_mineru_process_profile
-from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu
+from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu_v4
 from disclosure_anchor.application.contracts.resident_session_evidence import (
-    artifact_sha256, canonical_bytes, check_external_windows_observation, check_resident_closure,
-    check_resident_observer_mapping, check_resident_ready,
+    artifact_sha256, canonical_bytes, check_external_windows_observation, check_mac_observer_identity,
+    check_resident_closure, check_resident_observer_mapping_v4, check_resident_ready,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
-    SynchronizedTelemetryFrameV2, parse_canonical_jsonl_artifact,
+    SynchronizedSamplingPlanV1, SynchronizedTelemetryFrameV2, parse_canonical_jsonl_artifact,
 )
+from disclosure_anchor.application.services import m6_launch_budget as assembly_budget
 from disclosure_anchor.application.services.m6_launch_budget import (
-    SamplingCoverageTerms, launch_transport_budget,
+    SamplingCoverageTerms, finish_wait_seconds, launch_transport_budget,
+)
+from disclosure_anchor.application.services.resident_measurement_policy import (
+    CoverageBudget, require_start_headroom,
 )
 from tests.integration.m6_fresh_workspace_independent import digest, require, save
 
 
-DRIVER_CONTRACT = "m6.measured-campaign-driver.v1"
-REQUEST_CONTRACT = "m6.measured-telemetry-request.v1"
-BUDGET_CONTRACT = "m6.measured-campaign-budget.v1"
+DRIVER_CONTRACT = "m6.measured-campaign-driver.v2"
+REQUEST_CONTRACT = "m6.measured-telemetry-request.v2"
+BUDGET_CONTRACT = "m6.measured-campaign-budget.v2"
 # What this driver records about its own window: the whole campaign, entry to the
 # post-owner read-back. The product rule has one coverage definition and takes no
 # policy argument, so this is a label on the driver's evidence, never a choice
 # offered to it; a narrower window would not cover the campaign it scores.
 COVERAGE_POLICY = "full_campaign"
+NS = 1_000_000_000
+# Reserved at each end of the sampling window so a source capture interval can sit wholly
+# outside the campaign envelope; one period was not enough to prove an edge.
+EDGE_RESERVE_SECONDS = 2.0
+# The replay protocol this driver scores; the superseded ones stay readable but never
+# certify a new run.
+RECEIPT_VERSION = 4
 
 # The one composition-root wait that is a literal at its call site rather than a
 # named constant, pinned here with the exact call it belongs to. Every other
@@ -122,6 +136,29 @@ def absolute(value, label):
 
 def _finite(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def _finish_poll_allowance_seconds():
+    """How long the composition root polls its finished launcher, from the product itself.
+
+    The named constant is preferred; while it is being promoted, the same authority is the
+    declared default of the composition rule's own `finish_wait_seconds`. This driver never
+    writes the number down: a second literal would stop tracking the composition rule.
+    """
+    named = getattr(assembly_budget, "FINISH_POLL_ALLOWANCE_SECONDS", None)
+    if _finite(named):
+        return float(named)
+    declared = inspect.signature(finish_wait_seconds).parameters["allowance_seconds"].default
+    require(_finite(declared), "the composition rule declares no finish-poll allowance")
+    return float(declared)
+
+
+def _exact_ns(seconds, label):
+    """Seconds to exact integer nanoseconds; a value that cannot be represented is refused."""
+    require(_finite(seconds) and seconds >= 0, "budget term " + label + " must be finite and non-negative")
+    scaled = Decimal(str(seconds)) * NS
+    require(scaled == scaled.to_integral_value(), "budget term " + label + " is not a whole nanosecond")
+    return int(scaled)
 
 
 def _constant(name):
@@ -209,22 +246,42 @@ def freeze_budget(
         post_transport_seconds=OWNER_IDENTITY_FETCH_SECONDS + fetch + fetch,
         host_period_seconds=host_cadence_ms / 1000.0,
     )
+    # The finite vector is the product's own: the existing phase bounds go in, the required
+    # window comes out. The driver adds no arithmetic of its own, so a term Fable moves moves
+    # here too. The edge reserve is a fixed two seconds at each end, not one lane period: a
+    # source capture interval has to sit wholly outside the campaign envelope to prove an edge.
+    vector = CoverageBudget(
+        entry_to_spawn_ns=_exact_ns(terms.entry_to_spawn_seconds, "entry_to_spawn"),
+        launcher_transport_ns=_exact_ns(transport, "launcher_transport"),
+        finish_poll_allowance_ns=_exact_ns(_finish_poll_allowance_seconds(), "finish_poll"),
+        retrieval_ns=_exact_ns(terms.post_transport_seconds, "retrieval"),
+        driver_start_ns=_exact_ns(sampling_start_allowance_seconds, "sampling_start_allowance"),
+        driver_launch_ns=_exact_ns(campaign_launch_allowance_seconds, "campaign_launch_allowance"),
+        driver_cleanup_ns=_exact_ns(cleanup_allowance_seconds, "cleanup_allowance"),
+        edge_reserve_each_ns=_exact_ns(EDGE_RESERVE_SECONDS, "edge_reserve"),
+    )
     allowance = (float(sampling_start_allowance_seconds) + float(campaign_launch_allowance_seconds)
                  + float(cleanup_allowance_seconds))
-    allowed = terms.prelude_allowed(sampling_seconds=float(duration_seconds))
+    duration_ns = _exact_ns(duration_seconds, "duration")
     headroom = transport - ready - business
     retrieval = terms.post_transport_seconds + float(cleanup_allowance_seconds)
-    span = float(campaign_launch_allowance_seconds) + terms.entry_to_spawn_seconds + transport + retrieval
-    host_edge = 2.0 * terms.host_period_seconds
-    required_total = terms.required_seconds + allowance
+    span = (float(campaign_launch_allowance_seconds) + terms.entry_to_spawn_seconds + transport
+            + _finish_poll_allowance_seconds() + retrieval)
+    host_edge = 2.0 * EDGE_RESERVE_SECONDS
+    required_total = vector.required_ns / NS
+    # The product rule decides whether the window holds; the arithmetic margin is recorded
+    # either way, because a negative one is the number root and Pro need to see.
+    margin_ns = duration_ns - vector.required_ns
     problems = []
+    try:
+        vector.require_fits(duration_ns)
+    except ValueError:
+        problems.append("sampling_window_shorter_than_the_required_span")
     if transport != float(product.timeout_seconds):
         problems.append("declared_launcher_transport_differs_from_the_composition_root_rule:"
                         f"{transport}!={float(product.timeout_seconds)}")
     if headroom < 0:
         problems.append("launcher_transport_cannot_cover_a_delayed_t0_and_the_business_close")
-    if allowance > allowed:
-        problems.append("sampling_window_shorter_than_the_required_span")
     return {
         "contract_version": BUDGET_CONTRACT,
         "coverage_policy": COVERAGE_POLICY,
@@ -232,6 +289,7 @@ def freeze_budget(
             "prepare_timeout_seconds": prepare, "stage_timeout_seconds": stage,
             "ssh_overhead_seconds": ssh_overhead, "fetch_timeout_seconds": fetch,
             "owner_identity_fetch_seconds": OWNER_IDENTITY_FETCH_SECONDS,
+            "finish_poll_allowance_seconds": _finish_poll_allowance_seconds(),
         },
         "intent_terms": {
             "planned_seconds": planned, "close_grace_seconds": grace,
@@ -244,14 +302,16 @@ def freeze_budget(
             "sampling_start_allowance_seconds": float(sampling_start_allowance_seconds),
             "campaign_launch_allowance_seconds": float(campaign_launch_allowance_seconds),
             "cleanup_allowance_seconds": float(cleanup_allowance_seconds),
-            "total_seconds": allowance, "allowed_seconds": allowed,
+            "total_seconds": allowance,
+            "allowed_seconds": float(duration_seconds) - required_total,
         },
+        "finite_vector_ns": {name: getattr(vector, name) for name in vector.__dataclass_fields__},
         "business_seconds": business, "launcher_transport_headroom_seconds": headroom,
         "retrieval_seconds": retrieval, "host_edge_seconds": host_edge,
         "campaign_span_requirement_seconds": span,
         "required_after_first_frame_seconds": span + host_edge,
         "required_total_seconds": required_total, "duration_seconds": float(duration_seconds),
-        "margin_seconds": float(duration_seconds) - required_total,
+        "margin_seconds": margin_ns / NS,
         "satisfied": not problems, "problems": sorted(problems),
     }
 
@@ -290,6 +350,44 @@ def identity_problems(*, intent, binding, request, profile, release_binding):
         if backend.get("nvml_dll_sha256") != binding.windows.nvml_dll_sha256:
             problems.append("campaign_nvml_library_differs_from_the_telemetry_gpu_lane")
     return tuple(problems)
+
+
+def pin_sampling_plan(*, observer_run, request, evidence_directory, local_clock_domain_sha256,
+                      maximum=MAX_LANE_BYTES):
+    """Read back the observer's frozen plan through the product's own closed decoder.
+
+    The plan is the owner's retained `duration_seconds` projected once, before the first
+    collector call. Three things are checked here and nowhere else in this driver: the
+    plan document is the product's closed model, its intent hash is the hash of the owner's
+    own retained intent bytes whose *contents* name this run and duration, and its clock
+    domain is the independently read local observer identity - which is what makes
+    `plan.end - monotonic_ns()` a subtraction inside one domain rather than across two.
+    """
+    model = SynchronizedSamplingPlanV1
+    raw = read_bounded(Path(observer_run) / "sampling-plan.v1.json", maximum=maximum)
+    document = strict_json_loads(raw)
+    require(type(document) is dict, "sampling plan is not a JSON object")
+    plan = model.model_validate(document)
+    intent_raw = read_bounded(Path(evidence_directory) / "owner-intent.json",
+                              maximum=MAX_OWNER_RESULT_BYTES)
+    intent = strict_json_loads(intent_raw)
+    require(type(intent) is dict, "retained owner intent is not a JSON object")
+    problems = []
+    if plan.run_id != request.run_id:
+        problems.append("sampling_plan_names_another_run")
+    if intent.get("run_id") != request.run_id:
+        problems.append("owner_intent_names_another_run")
+    if intent.get("duration_seconds") != request.duration_seconds:
+        problems.append("owner_intent_duration_differs_from_the_approved_request")
+    if plan.owner_intent_sha256 != digest(intent_raw):
+        problems.append("sampling_plan_is_not_the_retained_owner_intent")
+    if plan.duration_ns != _exact_ns(request.duration_seconds, "request duration"):
+        problems.append("sampling_plan_duration_differs_from_the_approved_request")
+    if plan.host_nominal_interval_ms != host_cadence_ms(request):
+        problems.append("sampling_plan_host_cadence_differs_from_the_frozen_lane")
+    if plan.observer_clock_domain_identity_sha256 != local_clock_domain_sha256:
+        problems.append("sampling_plan_clock_domain_is_not_this_observer")
+    return plan, digest(raw), tuple(problems)
 
 
 def launcher_transport_state(campaign_dir, *, declared):
@@ -784,7 +882,7 @@ def _pinned(directory, index, name, *, maximum):
     return raw
 
 
-def resident_evidence_problems(request, *, frames, receipt, seal, result_document):
+def resident_evidence_problems(request, *, frames, receipt, seal, sampling_plan, result_document):
     """Re-run the owner's own pure checks over the bytes it retained.
 
     The owner made these checks while the session was alive; repeating them here
@@ -852,8 +950,11 @@ def resident_evidence_problems(request, *, frames, receipt, seal, result_documen
                 ready=ready, closed_bytes=closed_bytes, job_bytes=job_bytes,
                 linux_closed_bytes=external["linux_closed_raw"].encode() if lane == "host_slow" else None,
             )
-            check_resident_observer_mapping(
+            # A v4 run is mapped against its own frozen plan; the superseded mapping stays for
+            # historical evidence and never scores a new run.
+            check_resident_observer_mapping_v4(
                 ready=ready, closed_bytes=closed_bytes, frames=frames, receipt=receipt,
+                plan=sampling_plan,
             )
         except (AssertionError, ValueError, TypeError, AttributeError, KeyError, OSError) as exc:
             problems.append("resident_evidence_rejected:" + lane + ":" + _reason(exc))
@@ -863,7 +964,7 @@ def resident_evidence_problems(request, *, frames, receipt, seal, result_documen
                        "closed_sha256": digest(closed_bytes), "job_sha256": digest(job_bytes)}
     if len(readies) == len(_LANES):
         try:
-            cpu = check_combined_resident_cpu(
+            cpu = check_combined_resident_cpu_v4(
                 gpu_ready=readies["gpu_fast"], host_ready=readies["host_slow"],
                 gpu_closure=closures["gpu_fast"], host_closure=closures["host_slow"],
                 receipt=receipt, seal=seal,
@@ -880,7 +981,7 @@ def resident_evidence_problems(request, *, frames, receipt, seal, result_documen
     return tuple(sorted(set(problems))), facts
 
 
-def owner_evidence_problems(request, *, frames, receipt, seal, receipt_sha256, seal_sha256):
+def owner_evidence_problems(request, *, frames, receipt, seal, sampling_plan, receipt_sha256, seal_sha256):
     """The owner's result document and the original bytes behind every claim in it."""
     document = load_bounded(request.evidence_directory / "owner-result.json", maximum=MAX_OWNER_RESULT_BYTES)
     problems = []
@@ -891,18 +992,27 @@ def owner_evidence_problems(request, *, frames, receipt, seal, receipt_sha256, s
         if document.get(key) != expected or type(document.get(key)) is not type(expected):
             problems.append("owner_result_differs:" + key)
     evidence, facts = resident_evidence_problems(
-        request, frames=frames, receipt=receipt, seal=seal, result_document=document,
+        request, frames=frames, receipt=receipt, seal=seal, sampling_plan=sampling_plan,
+        result_document=document,
     )
     return tuple(sorted(set(problems + list(evidence)))), facts
 
 
 def run_summary(*, python_executable, service_root, output, campaign_dir, evaluation_plan, request,
                 environment):
-    """Call the existing summary entry; its exit code is only 'the report was written'."""
+    """Call the existing summary entry; its exit code is only 'the report was written'.
+
+    The owner's retained evidence directory is passed explicitly so the product's own
+    reader re-checks the original READY/start/closed/Job records through the same
+    validators this driver replays, instead of scoring the observer seal alone.
+    """
     command = [str(python_executable), "-m", "disclosure_anchor.cli.m6_campaign", "summary",
                "--run-dir", str(campaign_dir), "--evaluation-plan", str(evaluation_plan),
                "--telemetry-artifact-root", str(request.observer_artifact_root),
-               "--telemetry-run-id", request.run_id, "--output", str(output / "report")]
+               "--telemetry-run-id", request.run_id,
+               "--telemetry-receipt-version", str(RECEIPT_VERSION),
+               "--resident-owner-evidence-dir", str(request.evidence_directory),
+               "--output", str(output / "report")]
     save(output / "summary-command.json", command)
     with (output / "summary.stdout").open("xb") as out, (output / "summary.stderr").open("xb") as err:
         completed = subprocess.run(command, cwd=str(service_root), env=environment, stdout=out,
@@ -913,7 +1023,8 @@ def run_summary(*, python_executable, service_root, output, campaign_dir, evalua
 def verify(*, request, campaign_dir, campaign_summary, mode, transport_timeout_seconds, evidence):
     """Independent replay and gate; the campaign's own summary supplies the window to cover."""
     result = verify_synchronized_telemetry_observer(
-        artifact_root=request.observer_artifact_root, run_id=request.run_id, receipt_version=3,
+        artifact_root=request.observer_artifact_root, run_id=request.run_id,
+        receipt_version=RECEIPT_VERSION,
     )
     receipt, seal = result.receipt, result.seal
     # The owner's own serialisation, so its result document and this replay compare byte for byte.
@@ -934,7 +1045,7 @@ def verify(*, request, campaign_dir, campaign_summary, mode, transport_timeout_s
     coverage = coverage_problems(frames=trusted, receipt=receipt, started_utc=started, finished_utc=finished,
                                  host_cadence_ms=host_cadence_ms(request))
     owner_problems, owner_facts = owner_evidence_problems(
-        request, frames=result.frames, receipt=receipt, seal=seal,
+        request, frames=result.frames, receipt=receipt, seal=seal, sampling_plan=result.plan,
         receipt_sha256=receipt_sha256, seal_sha256=seal_sha256,
     )
     edges = [frame for frame in trusted
@@ -1013,7 +1124,11 @@ def main(argv=None):
     require(not output.exists(), "measured driver output must be new")
     output.mkdir(mode=0o700)
     evidence = {"contract_version": DRIVER_CONTRACT, "status": "incomplete", "mode": args.mode,
-                "started_utc": utc_now(), "failure": None}
+                "started_utc": utc_now(), "failure": None,
+                # This driver's own monotonic instants are orchestration evidence only. The
+                # measured window is the product's: the observer's plan and the campaign
+                # summary's own entry/finish in the same domain.
+                "orchestration_monotonic_ns": {"started": time.monotonic_ns()}}
     campaign = telemetry = None
     # Whatever ends this run - a named stop, a failed check or a signal - the children get the
     # same frozen grace. These are set before either child can exist, so the cleanup below
@@ -1093,6 +1208,8 @@ def main(argv=None):
                              "tests.integration.m6_measured_campaign_independent", "telemetry-child",
                              "--request", str(args.telemetry_request.absolute())]
         save(output / "telemetry-command.json", telemetry_command)
+        telemetry_spawn_ns = time.monotonic_ns()
+        evidence["orchestration_monotonic_ns"]["telemetry_spawn"] = telemetry_spawn_ns
         telemetry = Child(telemetry_command, output=output, label="telemetry",
                           environment=environment, cwd=str(service_root))
         evidence["telemetry_pid"] = telemetry.pid
@@ -1106,15 +1223,47 @@ def main(argv=None):
             runtime_bundle_sha256=profile.runtime_bundle_identity_sha256,
             process_profile_sha256=profile.sha256, lane_identity=lane_identities(request),
         )
+        # The observer's own frozen plan, read back and bound to the approved input. Until it
+        # is pinned this driver has no window it can prove, so nothing is launched.
+        # The observer's clock domain is read independently here, not taken from the plan.
+        local_clock_domain = MacObserverIdentityReader().observe()
+        plan, plan_sha256, plan_problems = pin_sampling_plan(
+            observer_run=observer_run, request=request,
+            evidence_directory=request.evidence_directory,
+            local_clock_domain_sha256=check_mac_observer_identity(
+                local_clock_domain).clock_domain_identity_sha256)
+        evidence["sampling_plan"] = {
+            "sha256": plan_sha256, "run_id": plan.run_id, "start_ns": plan.start_ns,
+            "planned_end_ns": plan.end_ns, "duration_ns": plan.duration_ns,
+            "problems": list(plan_problems),
+        }
+        save(output / "sampling-plan-pin.json", evidence["sampling_plan"])
+        require(not plan_problems, "the observer plan does not match the frozen inputs: "
+                + "; ".join(plan_problems))
+        # The pre-GO reserve is local and causal: this driver spawned the earliest starter it
+        # owns, so both instants are its own monotonic clock.
+        require_start_headroom(earliest_starter_spawn_ns=telemetry_spawn_ns,
+                               sampling_start_ns=plan.start_ns)
         save(output / "first-frames.json", {lane: frame_identity(frame) for lane, frame in sorted(first.items())})
         evidence["first_frames"] = {lane: frame_identity(frame) for lane, frame in sorted(first.items())}
         evidence["rejected_frames_before_launch"] = dict(sorted(rejected.items())[:16])
         evidence["session_first_frame_utc"] = session_first.isoformat()
 
-        # Elapsed sampling is measured from the session's own first record plus one host period of
-        # scheduling slack, so the campaign never starts inside a window it cannot finish in.
-        elapsed = (datetime.now(timezone.utc) - session_first).total_seconds() + host_cadence_ms(request) / 1000.0
-        remaining = request.duration_seconds - elapsed
+        # Each frozen reserve is enforced against its own absolute deadline in this same clock,
+        # so a phase that overruns stops the run instead of quietly eating the next one.
+        started_phase_ns = time.monotonic_ns()
+        evidence["phase_seconds"] = {"sampling_start": (started_phase_ns - telemetry_spawn_ns) / NS}
+        require(evidence["phase_seconds"]["sampling_start"]
+                <= allowances["sampling_start_allowance_seconds"],
+                "the sampling-start phase overran its frozen reserve: "
+                f"{evidence['phase_seconds']['sampling_start']}s > "
+                f"{allowances['sampling_start_allowance_seconds']}s")
+        launch_allowance_ns = _exact_ns(allowances["campaign_launch_allowance_seconds"],
+                                        "campaign launch allowance")
+
+        # What is left of the frozen window, in the same clock the plan was written in. No UTC
+        # difference and no frame timestamp takes part in this.
+        remaining = (plan.end_ns - time.monotonic_ns()) / NS
         evidence["remaining_sampling_seconds_at_launch"] = remaining
         require(remaining >= budget["required_after_first_frame_seconds"],
                 f"only {remaining}s of sampling remain; the campaign needs "
@@ -1129,11 +1278,17 @@ def main(argv=None):
         if args.attempt_id is not None:
             campaign_command += ["--attempt-id", args.attempt_id]
         save(output / "campaign-command.json", campaign_command)
+        evidence["orchestration_monotonic_ns"]["campaign_spawn"] = time.monotonic_ns()
         campaign = Child(campaign_command, output=output, label="campaign", environment=environment,
                          cwd=str(service_root))
         evidence["campaign_pid"] = campaign.pid
         save(output / "campaign-start.json", {"pid": campaign.pid, "mode": args.mode,
                                               "maximum_span_seconds": budget["campaign_span_requirement_seconds"]})
+        evidence["phase_seconds"]["campaign_launch"] = (time.monotonic_ns() - started_phase_ns) / NS
+        require(time.monotonic_ns() - started_phase_ns <= launch_allowance_ns,
+                "the campaign-launch phase overran its frozen reserve: "
+                f"{evidence['phase_seconds']['campaign_launch']}s > "
+                f"{allowances['campaign_launch_allowance_seconds']}s")
         declared_transport = allowances["launcher_transport_timeout_seconds"]
 
         def transport_check():
@@ -1154,8 +1309,7 @@ def main(argv=None):
                 f"campaign entry exited {evidence['campaign_exit_code']}; original evidence retained")
 
         # The sampling window closes on its own finite deadline; it is never cut short here.
-        spent = (datetime.now(timezone.utc) - session_first).total_seconds()
-        remaining_close = max(60.0, request.duration_seconds - spent
+        remaining_close = max(60.0, (plan.end_ns - time.monotonic_ns()) / NS
                               + allowances["telemetry_close_allowance_seconds"])
         evidence["telemetry_close_wait_seconds"] = remaining_close
         code = telemetry.wait(remaining_close)
@@ -1219,6 +1373,11 @@ def main(argv=None):
             evidence[child.label + "_output"] = child.output_head()
             child.close_files()
         evidence["finished_utc"] = utc_now()
+        evidence["orchestration_monotonic_ns"]["finished"] = time.monotonic_ns()
+        if "sampling_plan" in evidence and not evidence["sampling_plan"]["problems"]:
+            evidence.setdefault("phase_seconds", {})["cleanup"] = (
+                evidence["orchestration_monotonic_ns"]["finished"]
+                - evidence["sampling_plan"]["planned_end_ns"]) / NS
         save(output / "independent-evidence.json", evidence)
     print(json.dumps({key: evidence[key] for key in
                       ("status", "measurement_valid", "failure", "measurement_problems", "delivery_problems",

@@ -32,7 +32,7 @@ from disclosure_anchor.adapters.runtime import m6_campaign_assembly as assembly
 from disclosure_anchor.application.contracts.m6_delivery_report import (
     M6_DELIVERY_REPORT_MAX_BYTES, M6DeliveryReport,
 )
-from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu
+from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu_v4
 from disclosure_anchor.application.contracts.resident_session_evidence import (
     artifact_sha256, canonical_bytes, check_resident_closure, check_resident_ready,
 )
@@ -73,15 +73,17 @@ def campaign_intent(*, planned_seconds, close_grace_seconds):
 # change moves these fixtures instead of silently disagreeing with them.
 G3_INTENT = campaign_intent(planned_seconds=4800, close_grace_seconds=2400)
 SHORT_INTENT = campaign_intent(planned_seconds=600, close_grace_seconds=120)
+# R22 froze the driver's own three phase reserves at 30 s each and the window at 8500 s.
 G3 = {"host_cadence_ms": 1000,
       "launcher_transport_timeout_seconds": driver.composition_root_transport_budget(G3_INTENT).timeout_seconds,
-      "sampling_start_allowance_seconds": 0, "campaign_launch_allowance_seconds": 0,
-      "cleanup_allowance_seconds": 0}
+      "sampling_start_allowance_seconds": 30, "campaign_launch_allowance_seconds": 30,
+      "cleanup_allowance_seconds": 30}
+G3_DURATION = 8500
 SHORT = {"host_cadence_ms": 1000,
          "launcher_transport_timeout_seconds": driver.composition_root_transport_budget(SHORT_INTENT).timeout_seconds,
          "sampling_start_allowance_seconds": 30, "campaign_launch_allowance_seconds": 30,
          "cleanup_allowance_seconds": 0}
-SHORT_DURATION = 2000
+SHORT_DURATION = 2100
 # The intent's runtime binding fields, so a test can move exactly one of them apart.
 _RUNTIME_FIELDS = ("source_commit", "source_manifest_sha256", "runtime_bundle_identity_sha256",
                    "process_profile_sha256", "worker_profile_sha256", "deployment_qualification_sha256")
@@ -170,7 +172,7 @@ def owner_journal(request, external, result, *, drop=(), rewrite=(), reindex=Tru
             ready=readies[lane], closed_bytes=last["closed_raw"].encode(),
             job_bytes=last["job_raw"].encode(),
             linux_closed_bytes=last["linux_closed_raw"].encode() if lane == "host_slow" else None)
-    cpu = check_combined_resident_cpu(gpu_ready=readies["gpu_fast"], host_ready=readies["host_slow"],
+    cpu = check_combined_resident_cpu_v4(gpu_ready=readies["gpu_fast"], host_ready=readies["host_slow"],
                                       gpu_closure=closures["gpu_fast"], host_closure=closures["host_slow"],
                                       receipt=result.receipt, seal=result.seal)
     for name, payload in rewrite:
@@ -276,7 +278,7 @@ class MeasuredDriverBudgetTests(unittest.TestCase):
     def test_budget_blocks_a_transport_that_cannot_reach_the_business_close(self):
         # Root's counterexample: a 7200 s transport cannot hold a 30 s delayed READY plus 7200 s of
         # business. It is now refused twice - as a misdeclaration, and on the driver's own headroom.
-        blocked = driver.freeze_budget(intent=G3_INTENT, duration_seconds=8300,
+        blocked = driver.freeze_budget(intent=G3_INTENT, duration_seconds=G3_DURATION,
                                        **{**G3, "launcher_transport_timeout_seconds": 7200})
         self.assertFalse(blocked["satisfied"])
         self.assertEqual(blocked["launcher_transport_headroom_seconds"], -120.0)
@@ -288,26 +290,35 @@ class MeasuredDriverBudgetTests(unittest.TestCase):
         self.assertLess(blocked["required_total_seconds"], 8300)
         short = driver.freeze_budget(intent=SHORT_INTENT, duration_seconds=SHORT_DURATION, **SHORT)
         self.assertTrue(short["satisfied"])
-        self.assertEqual(short["margin_seconds"], 33.0)
-        self.assertEqual(short["required_total_seconds"], SHORT_DURATION - 33.0)
+        self.assertEqual(short["required_total_seconds"], 1974.0)
+        self.assertEqual(short["margin_seconds"], SHORT_DURATION - 1974.0)
         self.assertGreater(short["launcher_transport_headroom_seconds"], 0)
         # One second less window than the frozen plan needs is one second too few.
-        self.assertFalse(driver.freeze_budget(intent=SHORT_INTENT, duration_seconds=SHORT_DURATION - 34,
+        self.assertFalse(driver.freeze_budget(intent=SHORT_INTENT, duration_seconds=1973,
                                               **SHORT)["satisfied"])
-        self.assertTrue(driver.freeze_budget(intent=SHORT_INTENT, duration_seconds=SHORT_DURATION - 33,
+        self.assertTrue(driver.freeze_budget(intent=SHORT_INTENT, duration_seconds=1974,
                                              **SHORT)["satisfied"])
 
-    def test_the_g3_window_does_not_fit_under_the_finite_sampling_ceiling(self):
-        # With the composition root's own transport for G3 and every driver allowance at zero, the
-        # full-campaign coverage still needs more sampling than F10 permits. The driver stays blocked
-        # and keeps its coverage; narrowing it is root's and Pro's decision, not this file's.
-        g3 = driver.freeze_budget(intent=G3_INTENT, duration_seconds=8300, **G3)
-        self.assertEqual(g3["problems"], ["sampling_window_shorter_than_the_required_span"])
-        self.assertEqual(g3["driver_allowances"]["total_seconds"], 0.0)
-        self.assertGreater(g3["required_total_seconds"], 8300)
-        self.assertEqual(g3["margin_seconds"], 8300 - g3["required_total_seconds"])
-        self.assertLess(g3["driver_allowances"]["allowed_seconds"], 0)
+    def test_the_g3_vector_fits_the_r22_window_with_sixteen_seconds_to_spare(self):
+        # The R21 finding was that G3 needed more window than the old 8300 s ceiling allowed.
+        # R22 resolves it by widening the finite window to 8500 s, not by covering less: the
+        # required span still holds the whole campaign plus both edges and all three reserves.
+        g3 = driver.freeze_budget(intent=G3_INTENT, duration_seconds=G3_DURATION, **G3)
+        self.assertEqual(g3["problems"], [])
+        self.assertTrue(g3["satisfied"])
+        self.assertEqual(g3["required_total_seconds"], 8484.0)
+        self.assertEqual(g3["margin_seconds"], 16.0)
+        self.assertEqual(g3["driver_allowances"]["total_seconds"], 90.0)
         self.assertEqual(g3["coverage_policy"], "full_campaign")
+        # The same vector against the superseded window is still short, by the same arithmetic.
+        old = driver.freeze_budget(intent=G3_INTENT, duration_seconds=8300, **G3)
+        self.assertEqual(old["problems"], ["sampling_window_shorter_than_the_required_span"])
+        self.assertEqual(old["margin_seconds"], 8300 - 8484.0)
+        # One second short of the frozen requirement is one second too few.
+        self.assertFalse(driver.freeze_budget(intent=G3_INTENT, duration_seconds=8483,
+                                              **G3)["satisfied"])
+        self.assertTrue(driver.freeze_budget(intent=G3_INTENT, duration_seconds=8484,
+                                             **G3)["satisfied"])
 
     def test_launcher_record_detects_a_divergence_it_cannot_authorize(self):
         # The entry writes this record before it spawns the launcher, but the driver polls it on its
@@ -448,7 +459,7 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
     def _problems(self, request, result, document):
         return driver.resident_evidence_problems(
             request, frames=result.frames, receipt=result.receipt, seal=result.seal,
-            result_document=document,
+            sampling_plan=result.plan, result_document=document,
         )
 
     def test_retained_resident_evidence_passes_the_owner_s_own_checks(self):
@@ -463,7 +474,7 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
             self.assertNotEqual(facts["gpu_fast"]["session"], facts["host_slow"]["session"])
             whole, _ = driver.owner_evidence_problems(
                 request, frames=result.frames, receipt=result.receipt, seal=result.seal,
-                receipt_sha256=document["observer_receipt_sha256"],
+                sampling_plan=result.plan, receipt_sha256=document["observer_receipt_sha256"],
                 seal_sha256=document["observer_seal_sha256"])
             self.assertEqual(whole, ())
 
@@ -529,7 +540,7 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
                 {**document, "observer_receipt_sha256": HASH, "within_two_percent": False}))
             whole, _ = driver.owner_evidence_problems(
                 request, frames=result.frames, receipt=result.receipt, seal=result.seal,
-                receipt_sha256=document["observer_receipt_sha256"],
+                sampling_plan=result.plan, receipt_sha256=document["observer_receipt_sha256"],
                 seal_sha256=document["observer_seal_sha256"])
             self.assertEqual([problem for problem in whole if problem.startswith("owner_result_differs")],
                              ["owner_result_differs:observer_receipt_sha256",
@@ -538,7 +549,7 @@ class MeasuredDriverResidentEvidenceTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 driver.owner_evidence_problems(
                     request, frames=result.frames, receipt=result.receipt, seal=result.seal,
-                    receipt_sha256=HASH, seal_sha256=HASH_B)
+                    sampling_plan=result.plan, receipt_sha256=HASH, seal_sha256=HASH_B)
 
 
 class MeasuredDriverSupervisionTests(unittest.TestCase):
@@ -659,6 +670,105 @@ class MeasuredDriverGateTests(unittest.TestCase):
 
 class SpawnBlocked(Exception):
     """Raised in place of a real spawn so a physical child never exists in a unit test."""
+
+
+class MeasuredDriverPlanTests(unittest.TestCase):
+    """The frozen plan is read back through the product's closed decoder and bound to the inputs."""
+
+    PLAN_RUN = "3f2b6c31-0000-4000-8000-00000000d1d1"
+    CLOCK_SHA = "sha256:" + "2" * 64
+
+    def _plan_document(self, **changes):
+        document = {
+            "contract_version": "mineru.synchronized-sampling-plan.v1",
+            "run_id": self.PLAN_RUN, "owner_intent_sha256": None,
+            "observer_clock_domain_identity_sha256": self.CLOCK_SHA,
+            "started_monotonic_ns": 5_000_000_000, "duration_ns": 120_000_000_000,
+            "planned_end_monotonic_ns": 125_000_000_000,
+            "gpu_nominal_interval_ms": 250, "host_nominal_interval_ms": 1000,
+        }
+        document.update(changes)
+        return document
+
+    def _request(self, **changes):
+        fields = {"run_id": self.PLAN_RUN, "duration_seconds": 120,
+                  "host": SimpleNamespace(config_bytes=canonical_bytes(
+                      {"lane": "host_slow", "cadence_ms": 1000}))}
+        fields.update(changes)
+        return SimpleNamespace(**fields)
+
+    def _pin(self, root, document=None, *, request=None, intent=None, clock=None):
+        """Write the observer plan and the owner's retained intent, then pin them together."""
+        base = Path(root)
+        observer, evidence = base / "observer-run", base / "owner-evidence"
+        observer.mkdir(parents=True, exist_ok=True)
+        evidence.mkdir(parents=True, exist_ok=True)
+        request = request or self._request()
+        intent_document = intent if intent is not None else {
+            "run_id": request.run_id, "duration_seconds": request.duration_seconds}
+        intent_bytes = canonical_bytes(intent_document)
+        (evidence / "owner-intent.json").write_bytes(intent_bytes)
+        document = self._plan_document() if document is None else document
+        if document.get("owner_intent_sha256") is None:
+            document = {**document, "owner_intent_sha256": driver.digest(intent_bytes)}
+        (observer / "sampling-plan.v1.json").write_bytes(canonical_bytes(document))
+        return driver.pin_sampling_plan(
+            observer_run=observer, request=request, evidence_directory=evidence,
+            local_clock_domain_sha256=self.CLOCK_SHA if clock is None else clock)
+
+    def test_the_frozen_plan_binds_to_the_retained_intent_and_this_observer(self):
+        with tempfile.TemporaryDirectory() as root:
+            plan, sha256, problems = self._pin(root)
+            self.assertEqual(problems, ())
+            self.assertEqual(plan.run_id, self.PLAN_RUN)
+            self.assertEqual(plan.duration_ns, 120_000_000_000)
+            self.assertEqual(plan.planned_end_monotonic_ns,
+                             plan.started_monotonic_ns + plan.duration_ns)
+            self.assertEqual(sha256, driver.digest(
+                (Path(root) / "observer-run" / "sampling-plan.v1.json").read_bytes()))
+
+    def test_every_frozen_input_the_plan_must_agree_with_is_checked(self):
+        cases = (
+            ({"run_id": "00000000-0000-4000-8000-000000000999"}, {},
+             "sampling_plan_names_another_run"),
+            ({}, {"intent": {"run_id": "00000000-0000-4000-8000-000000000999",
+                             "duration_seconds": 120}},
+             "owner_intent_names_another_run"),
+            ({}, {"intent": {"run_id": "3f2b6c31-0000-4000-8000-00000000d1d1",
+                             "duration_seconds": 119}},
+             "owner_intent_duration_differs_from_the_approved_request"),
+            ({"duration_ns": 119_000_000_000, "planned_end_monotonic_ns": 124_000_000_000}, {},
+             "sampling_plan_duration_differs_from_the_approved_request"),
+            ({}, {"clock": "sha256:" + "9" * 64},
+             "sampling_plan_clock_domain_is_not_this_observer"),
+        )
+        for changes, keywords, problem in cases:
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as root:
+                document = self._plan_document(**changes)
+                _, _, problems = self._pin(root, document, **keywords)
+                self.assertIn(problem, problems)
+
+    def test_a_plan_the_product_decoder_refuses_never_becomes_a_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            observer = Path(root) / "observer-run"
+            observer.mkdir(parents=True)
+            (Path(root) / "owner-evidence").mkdir()
+            with self.assertRaises(AssertionError):
+                driver.pin_sampling_plan(
+                    observer_run=observer, request=self._request(),
+                    evidence_directory=Path(root) / "owner-evidence",
+                    local_clock_domain_sha256=self.CLOCK_SHA)
+        for name, changes in (
+            ("superseded_contract", {"contract_version": "mineru.synchronized-sampling-plan.v0"}),
+            ("end_is_not_start_plus_duration", {"planned_end_monotonic_ns": 125_000_000_001}),
+            ("unsupported_cadence", {"gpu_nominal_interval_ms": 300}),
+            ("over_the_finite_ceiling", {"duration_ns": 8501 * 1_000_000_000,
+                                         "planned_end_monotonic_ns": 5_000_000_000
+                                         + 8501 * 1_000_000_000}),
+        ):
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as root:
+                with self.assertRaises(ValueError):
+                    self._pin(root, self._plan_document(**changes))
 
 
 class MeasuredDriverPreflightTests(unittest.TestCase):
@@ -949,7 +1059,8 @@ class MeasuredDriverPreflightTests(unittest.TestCase):
     def test_a_window_shorter_than_the_frozen_plan_is_refused_before_any_child(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            argv, output = self._frozen(root, duration_seconds=SHORT_DURATION - 34,
+            # One second under the frozen requirement for this shape.
+            argv, output = self._frozen(root, duration_seconds=1973,
                                         declared_transport=SHORT["launcher_transport_timeout_seconds"])
             code, spawns = self._main(argv)
             self.assertEqual(code, 1)

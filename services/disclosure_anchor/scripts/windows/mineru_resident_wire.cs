@@ -197,7 +197,7 @@ public static class MineruResidentWire {
         }
     }
     public static long Deadline(int milliseconds) {
-        if(milliseconds<1 || milliseconds>8400000) throw new ArgumentException("finite deadline required");
+        if(milliseconds<1 || milliseconds>8600000) throw new ArgumentException("finite deadline required");
         return checked(Stopwatch.GetTimestamp()+(long)Math.Ceiling(milliseconds*(decimal)Stopwatch.Frequency/1000));
     }
     public static int Remaining(long deadline) {
@@ -547,11 +547,12 @@ public static class MineruDiagnosticProcess {
     }
 }
 
-// One owner thread, one outstanding accept or retained request, latest-only
-// samples, and an immutable session path. Native hangs remain bounded by Job.
+// One owner thread, one outstanding accept or retained request, one fresh
+// sample per accepted request, and an immutable session path. Native hangs
+// remain bounded by Job.
 public sealed class MineruResidentEndpoint : IDisposable {
     readonly HttpListener listener=new HttpListener();
-    readonly int owner=Thread.CurrentThread.ManagedThreadId, cadence, lease, responseTimeout;
+    readonly int owner=Thread.CurrentThread.ManagedThreadId, lease, responseTimeout;
     readonly long hardEnd;
     readonly string path, lane, identity;
     Task<HttpListenerContext> accepting;
@@ -566,7 +567,7 @@ public sealed class MineruResidentEndpoint : IDisposable {
            !((requestedLane=="gpu_fast" && (cadenceMilliseconds==250 || cadenceMilliseconds==500)) ||
              (requestedLane=="host_slow" && cadenceMilliseconds==1000)) ||
            leaseMilliseconds<2000 || leaseMilliseconds>30000 || lifetimeMilliseconds<leaseMilliseconds ||
-           lifetimeMilliseconds>8390000 || responseMilliseconds<1 || responseMilliseconds>1000)
+           lifetimeMilliseconds>8590000 || responseMilliseconds<1 || responseMilliseconds>1000)
             throw new ArgumentException("invalid finite resident endpoint configuration");
         MineruJsonValue id=MineruResidentWire.Parse(identityJson,4096);
         id.Keys("exporter_source_sha256","host_assignment_identity_sha256","boot_identity_sha256",
@@ -574,7 +575,7 @@ public sealed class MineruResidentEndpoint : IDisposable {
         foreach(string key in new string[]{"exporter_source_sha256","host_assignment_identity_sha256","boot_identity_sha256",
             "runtime_bundle_identity_sha256","process_profile_sha256","clock_domain_identity_sha256","exporter_process_epoch_sha256"})
             if(!Regex.IsMatch(id.Get(key).String(),@"\Asha256:[0-9a-f]{64}\z")) throw new FormatException("resident identity SHA");
-        cadence=cadenceMilliseconds; lease=leaseMilliseconds; responseTimeout=responseMilliseconds;
+        lease=leaseMilliseconds; responseTimeout=responseMilliseconds;
         hardEnd=MineruResidentWire.Deadline(lifetimeMilliseconds);
         path="/v1/"+session+"/"+requestedLane; lane=requestedLane; identity=identityJson;
         listener.Prefixes.Add("http://127.0.0.1:"+port.ToString(CultureInfo.InvariantCulture)+"/");
@@ -630,43 +631,12 @@ public sealed class MineruResidentEndpoint : IDisposable {
     public void Run(Action ready,Func<long,string> sample,Func<long,string> close) {
         Check(); if(running || closing) throw new InvalidOperationException("endpoint cannot be restarted"); running=true;
         long leaseEnd=Math.Min(hardEnd,MineruResidentWire.Deadline(lease));
-        long next=0, sequence=0, samples=0, skippedSlots=0, firstStamp=0, lastStamp=0;
-        string latest=null, firstUtc=null, lastUtc=null;
+        long sequence=0, samples=0, skippedSlots=0, firstStamp=0, lastStamp=0;
+        string firstUtc=null, lastUtc=null;
         listener.Start(); ready(); accepting=listener.GetContextAsync();
         while(!closing) {
             long boundary=Math.Min(hardEnd,leaseEnd); MineruResidentWire.Remaining(boundary);
-            long now=Stopwatch.GetTimestamp();
-            if(next!=0 && now>=next) {
-                // Preserve cadence slots in the sequence; missed slots are not
-                // hidden by renumbering or filled with a catch-up burst.
-                long slotTicks=Advance(0,cadence), skipped=(now-next)/slotTicks;
-                sequence=checked(sequence+skipped+1); next=checked(next+(skipped+1)*slotTicks);
-                skippedSlots=checked(skippedSlots+skipped);
-                long stamp=MonotonicNanoseconds();
-                string utc=DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'",CultureInfo.InvariantCulture);
-                string observation=sample(boundary);
-                MineruResidentWire.Remaining(boundary);
-                MineruJsonValue value=MineruResidentWire.Parse(observation,65536);
-                List<string> pairs=new List<string>(new string[]{"contract_version","\"mineru.windows-resident-telemetry.v2\"",
-                    "identity",identity,"lane",MineruResidentWire.Quote(lane),"sequence",MineruResidentWire.Integer(sequence),
-                    "observed_at_utc",MineruResidentWire.Quote(utc),"sampled_monotonic_ns",MineruResidentWire.Integer(stamp)});
-                string[] sections=lane=="gpu_fast"?new string[]{"gpu"}:new string[]{"api_process","host_cgroup","queue_vllm"};
-                value.Keys(sections); foreach(string section in sections) { pairs.Add(section); pairs.Add(value.Get(section).Raw); }
-                latest=MineruResidentWire.Object(pairs.ToArray());
-                samples=checked(samples+1); lastStamp=stamp; lastUtc=utc;
-                if(samples==1) { firstStamp=stamp; firstUtc=utc; }
-                if(held!=null) {
-                    HttpListenerContext response=held; held=null;
-                    Reply(response,200,latest,boundary); accepting=listener.GetContextAsync();
-                }
-                continue;
-            }
-            if(held!=null) {
-                int untilNext=Math.Max(1,(int)Math.Ceiling((next-Stopwatch.GetTimestamp())*1000.0/Stopwatch.Frequency));
-                Thread.Sleep(Math.Min(MineruResidentWire.Remaining(boundary),untilNext)); continue;
-            }
-            long wake=next==0?boundary:Math.Min(boundary,next);
-            int untilWake=Math.Max(1,(int)Math.Ceiling((wake-Stopwatch.GetTimestamp())*1000.0/Stopwatch.Frequency));
+            int untilWake=Math.Max(1,(int)Math.Ceiling((boundary-Stopwatch.GetTimestamp())*1000.0/Stopwatch.Frequency));
             if(!accepting.Wait(untilWake)) continue;
             HttpListenerContext context=accepting.GetAwaiter().GetResult(); accepting=null;
             held=context;
@@ -688,21 +658,51 @@ public sealed class MineruResidentEndpoint : IDisposable {
                 CloseArtifact=close(boundary); MineruResidentWire.Parse(CloseArtifact,65536);
                 CloseReplyDelivered=Reply(context,200,CloseArtifact,boundary); return;
             }
+            // One closed canonical pull path per cursor and nonce. There is no
+            // legacy path, no latest cache and no source-initiated sampling.
             string prefix=path+"/after/";
+            string tail=validMethod && request!=null && request.StartsWith(prefix,StringComparison.Ordinal) ?
+                request.Substring(prefix.Length) : null;
+            Match pull=tail==null ? null : Regex.Match(tail,@"\A(0|[1-9][0-9]{0,18})/request/([0-9a-f]{32})\z");
             long after;
-            if(!validMethod || request==null || !request.StartsWith(prefix,StringComparison.Ordinal) ||
-               !Regex.IsMatch(request.Substring(prefix.Length),@"\A(?:0|[1-9][0-9]{0,18})\z") ||
-               !Int64.TryParse(request.Substring(prefix.Length),NumberStyles.None,CultureInfo.InvariantCulture,out after)) {
+            if(pull==null || !pull.Success ||
+               !Int64.TryParse(pull.Groups[1].Value,NumberStyles.None,CultureInfo.InvariantCulture,out after)) {
                 Reply(context,404,null,boundary); accepting=listener.GetContextAsync(); continue;
             }
-            if(after>sequence || after<sequence-1) {
+            // A replayed or future cursor neither samples nor renews the lease,
+            // and never returns an earlier reply.
+            if(after!=sequence) {
                 Reply(context,409,null,boundary); accepting=listener.GetContextAsync(); continue;
             }
+            long received=MonotonicNanoseconds();
             leaseEnd=Math.Min(hardEnd,MineruResidentWire.Deadline(lease)); boundary=Math.Min(hardEnd,leaseEnd);
-            if(next==0) next=Stopwatch.GetTimestamp(); // first after/0 starts the clock
-            if(latest!=null && after==sequence-1) {
-                Reply(context,200,latest,boundary); accepting=listener.GetContextAsync();
-            } else { held=context; }
+            string utc=DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'",CultureInfo.InvariantCulture);
+            long stamp=MonotonicNanoseconds();
+            string observation=sample(boundary);
+            long captured=MonotonicNanoseconds();
+            MineruResidentWire.Remaining(boundary);
+            MineruJsonValue value=MineruResidentWire.Parse(observation,65536);
+            sequence=checked(sequence+1);
+            List<string> pairs=new List<string>(new string[]{"contract_version","\"mineru.windows-resident-telemetry.v2\"",
+                "identity",identity,"lane",MineruResidentWire.Quote(lane),"sequence",MineruResidentWire.Integer(sequence),
+                "observed_at_utc",MineruResidentWire.Quote(utc),"sampled_monotonic_ns",MineruResidentWire.Integer(stamp)});
+            string[] sections=lane=="gpu_fast"?new string[]{"gpu"}:new string[]{"api_process","host_cgroup","queue_vllm"};
+            value.Keys(sections); foreach(string section in sections) { pairs.Add(section); pairs.Add(value.Get(section).Raw); }
+            string inner=MineruResidentWire.Object(pairs.ToArray());
+            samples=checked(samples+1); lastStamp=stamp; lastUtc=utc;
+            if(samples==1) { firstStamp=stamp; firstUtc=utc; }
+            // received<=stamp<=captured<=replied is this thread's real order for
+            // this request; no timestamp is back-dated to imitate a fresh sample.
+            long replied=MonotonicNanoseconds();
+            string pulled=MineruResidentWire.Object(
+                "after_sequence",MineruResidentWire.Integer(after),
+                "contract_version","\"mineru.windows-resident-pull.v1\"",
+                "reply_started_monotonic_ns",MineruResidentWire.Integer(replied),
+                "request_nonce",MineruResidentWire.Quote(pull.Groups[2].Value),
+                "request_received_monotonic_ns",MineruResidentWire.Integer(received),
+                "sample",inner,
+                "sample_capture_finished_monotonic_ns",MineruResidentWire.Integer(captured));
+            Reply(context,200,pulled,boundary); accepting=listener.GetContextAsync();
         }
     }
     public void Dispose() {

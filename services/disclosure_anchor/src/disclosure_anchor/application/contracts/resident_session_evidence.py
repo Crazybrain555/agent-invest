@@ -20,13 +20,19 @@ from typing import cast
 import uuid
 
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
+    SynchronizedSamplingPlanV1,
     SynchronizedTelemetryFrameV2,
+    SynchronizedTelemetryFrameV3,
     SynchronizedTelemetryReceiptV3,
+    SynchronizedTelemetryReceiptV4,
     TelemetryObserverIdentity,
     parse_canonical_json_artifact,
 )
 from disclosure_anchor.application.contracts.windows_resident_telemetry import ResidentIdentity
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+from disclosure_anchor.application.services.resident_measurement_policy import (
+    WIRE_MAX_SECONDS, PullTiming, pull_capture_bounds, slot_coverage,
+)
 
 
 _PS_SOURCES = (
@@ -43,8 +49,9 @@ _OWNER_FIELDS = (
     "host_assignment_identity_sha256", "boot_identity_sha256",
     "runtime_bundle_identity_sha256", "process_profile_sha256",
 )
-# Wire/config lane lifetime bound; the Windows loader and endpoint mirror it.
-RESIDENT_WIRE_LIFETIME_CEILING_MS = 8_390_000
+# Wire/config lane lifetime bound (R22 vector: sampling 8500 + 20 pre-GO + 60 tail
+# + 10 wire margin); the Windows loader and endpoint mirror it.
+RESIDENT_WIRE_LIFETIME_CEILING_MS = WIRE_MAX_SECONDS * 1000
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -715,3 +722,108 @@ monotonic. The explicit owner artifact must retain both original clock objects.
     _clock_delta(last_source, sampling.integer("closing_monotonic_ns"), last_wall, closing_wall)
     if _elapsed_ns(receipt.finished_at_utc, closing_wall) < -tolerance_ns:
         raise ValueError("resident source closed before observer finished")
+
+
+def check_resident_observer_mapping_v4(
+    *, ready: CheckedResidentReady, closed_bytes: bytes,
+    frames: tuple[SynchronizedTelemetryFrameV3, ...], receipt: SynchronizedTelemetryReceiptV4,
+    plan: SynchronizedSamplingPlanV1,
+) -> None:
+    """Bind fresh-per-request frames to their source without any cross-host clock arithmetic.
+
+    Identity, epochs and counts are the same original evidence the v3 mapping
+    binds. Time is handled per domain: the Mac request bracket encloses the
+    native capture by construction of the pinned endpoint, the native QPC chain
+    is ordered within itself, and coverage is the frozen plan's slot grid. No
+    UTC boundary, no collection bracket in UTC, no native cadence tolerance,
+    no source tail allowance: the source count must equal the consumed frames.
+    """
+    closed = _decode(closed_bytes, "config_sha256 contract_version identity linux_closed_sha256 sampling session")
+    closed.expect("contract_version", "mineru.windows-resident-closed.v2")
+    closed.expect("config_sha256", artifact_sha256(ready.config_bytes))
+    closed.expect("identity", ready.identity.model_dump(mode="json"))
+    closed.expect("session", ready.session)
+    sampling = _Object(closed.get("sampling"), "first_sampled_monotonic_ns first_observed_at_utc last_sampled_monotonic_ns last_observed_at_utc last_sequence sample_count skipped_slots closing_monotonic_ns closing_at_utc")
+    sampling.expect("skipped_slots", 0)
+    plan_sha256 = artifact_sha256(canonical_bytes(plan.model_dump(mode="json")))
+    if receipt.sampling_plan_sha256 != plan_sha256 or receipt.run_id != plan.run_id:
+        raise ValueError("resident observer receipt is not bound to this sampling plan")
+    if (receipt.started_monotonic_ns != plan.started_monotonic_ns or receipt.duration_ns != plan.duration_ns
+            or receipt.planned_end_monotonic_ns != plan.planned_end_monotonic_ns
+            or receipt.clock_domain_identity_sha256 != plan.observer_clock_domain_identity_sha256):
+        raise ValueError("resident observer receipt window differs from the sampling plan")
+    lane_frames = tuple(frame for frame in frames if frame.lane == ready.lane)
+    if not lane_frames:
+        raise ValueError("resident observer source lane missing")
+    ready_value = cast(dict[str, object], json.loads(ready.ready_bytes))
+    backend = cast(dict[str, object], ready_value["backend"])
+    api_epoch: str | None = None
+    cgroup_epoch: str | None = None
+    if ready.lane == "host_slow":
+        linux = cast(dict[str, object], backend["linux_ready"])
+        sampler = cast(dict[str, object], linux["sampler_ready"])
+        child = cast(dict[str, object], sampler["identity"])
+        members = cast(dict[str, object], child["members"])
+        api_epoch = artifact_sha256(canonical_bytes({
+            "boot_id": child["boot_id"], **cast(dict[str, object], members["api"]),
+        }))
+        cgroup_epoch = artifact_sha256(canonical_bytes({
+            name: child[name] for name in ("boot_id", "members", "parent_path", "parent_device", "parent_inode")
+        }))
+        if receipt.process_profile.process_epoch_sha256 != api_epoch:
+            raise ValueError("resident observer receipt API epoch differs")
+    expected_cadence = plan.gpu_nominal_interval_ms if ready.lane == "gpu_fast" else plan.host_nominal_interval_ms
+    if ready.cadence_ms != expected_cadence:
+        raise ValueError("resident source cadence differs from the sampling plan")
+    previous_wire_ns: int | None = None
+    previous_reply_ns: int | None = None
+    for sequence, frame in enumerate(lane_frames, 1):
+        provenance = frame.resident_exporter_provenance
+        for name in ("exporter_source_sha256", "host_assignment_identity_sha256", "boot_identity_sha256", "exporter_process_epoch_sha256"):
+            if getattr(provenance, name) != getattr(ready.identity, name):
+                raise ValueError(f"resident observer source identity drift: {name}")
+        if frame.runtime_bundle_identity_sha256 != ready.identity.runtime_bundle_identity_sha256 or frame.process_profile_sha256 != ready.identity.process_profile_sha256:
+            raise ValueError("resident observer source runtime/profile differs")
+        if frame.run_id != plan.run_id or frame.clock.clock_domain_identity_sha256 != receipt.clock_domain_identity_sha256:
+            raise ValueError("resident observer local clock/run differs")
+        if ready.lane == "gpu_fast":
+            if frame.gpu.status != "supported" or frame.gpu.values is None or frame.gpu.values.device_identity_sha256 != backend["device_identity_sha256"]:
+                raise ValueError("resident observer GPU device binding differs")
+        else:
+            if frame.api_process.status != "supported" or frame.api_process.values is None or frame.api_process.values.process_epoch_sha256 != api_epoch:
+                raise ValueError("resident observer API epoch binding differs")
+            if frame.host_cgroup.status != "supported" or frame.host_cgroup.values is None or frame.host_cgroup.values.parent_cgroup_epoch_sha256 != cgroup_epoch:
+                raise ValueError("resident observer parent cgroup binding differs")
+        if provenance.wire_sequence != sequence or provenance.after_sequence != sequence - 1 or frame.quality.nominal_interval_ms != expected_cadence:
+            raise ValueError("resident observer source sequence/cadence differs")
+        pull_capture_bounds(
+            PullTiming(
+                request_nonce=provenance.request_nonce, after_sequence=provenance.after_sequence,
+                sample_sequence=provenance.wire_sequence,
+                local_request_ns=provenance.local_request_monotonic_ns, local_response_ns=provenance.local_response_monotonic_ns,
+                q_request_ns=provenance.native_request_received_monotonic_ns, q_capture_start_ns=provenance.wire_sampled_monotonic_ns,
+                q_capture_end_ns=provenance.native_capture_finished_monotonic_ns, q_reply_ns=provenance.native_reply_started_monotonic_ns,
+            ),
+            expected_nonce=provenance.request_nonce, expected_after_sequence=sequence - 1,
+        )
+        if previous_wire_ns is not None and provenance.wire_sampled_monotonic_ns <= previous_wire_ns:
+            raise ValueError("resident observer source clock did not advance")
+        if previous_reply_ns is not None and provenance.native_request_received_monotonic_ns < previous_reply_ns:
+            raise ValueError("resident observer source received a request before its previous reply")
+        if sequence == 1:
+            sampling.expect("first_sampled_monotonic_ns", provenance.wire_sampled_monotonic_ns)
+            if _utc(sampling.get("first_observed_at_utc")) != provenance.wire_observed_at_utc:
+                raise ValueError("resident observer first source wall differs")
+        previous_wire_ns, previous_reply_ns = provenance.wire_sampled_monotonic_ns, provenance.native_reply_started_monotonic_ns
+    coverage = slot_coverage(plan.policy(), ready.lane, [frame.clock.scheduled_monotonic_ns for frame in lane_frames])
+    recorded = next(item for item in receipt.slot_coverage if item.lane == ready.lane)
+    if (recorded.expected_slots, recorded.observed_slots, recorded.missing_slots) != (coverage.expected, coverage.observed, coverage.missing):
+        raise ValueError("resident observer receipt slot coverage differs from the frames")
+    assert previous_wire_ns is not None and previous_reply_ns is not None
+    count = sampling.integer("sample_count", len(lane_frames), len(lane_frames))
+    sampling.expect("last_sequence", count)
+    sampling.expect("last_sampled_monotonic_ns", previous_wire_ns)
+    if _utc(sampling.get("last_observed_at_utc")) != lane_frames[-1].resident_exporter_provenance.wire_observed_at_utc:
+        raise ValueError("resident observer last source wall differs")
+    if sampling.integer("closing_monotonic_ns", previous_reply_ns) < previous_reply_ns:
+        raise ValueError("resident source closed before its last reply")

@@ -6,6 +6,7 @@ import io
 import hashlib
 from dataclasses import replace
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -290,6 +291,21 @@ class DeliveryProofIndependentTests(unittest.TestCase):
 class DeliveryEvidenceIndependentTests(unittest.TestCase):
     """Exercise the public CLI from physical evidence, without substituting the reader."""
 
+    # This run's own physical host identities. The native owner-identity record written below
+    # is the singleton the product reads them from, so a variant that must agree with other
+    # physical evidence - a resident telemetry run on the same host - rebinds these before
+    # setUp and every derived hash follows.
+    windows_node_identity_sha256 = m6.digest("windows-node")
+    windows_boot_utc = "2026-09-15T03:04:05.1234567Z"
+    windows_boot_counter = 7
+    host_assignment_identity_sha256 = None
+    runtime_identity_overrides: dict = {}
+
+    @staticmethod
+    def evaluation_plan_for_test():
+        """The frozen plan this campaign is built around; a subclass may demand more of it."""
+        return evaluation_plan()
+
     def setUp(self):
         from disclosure_anchor.application.contracts.m6_owner import M6OwnerAnchor
         from disclosure_anchor.application.contracts.m6_run_events import M6PublicConfirmation, M6VerifierDrained
@@ -299,8 +315,16 @@ class DeliveryEvidenceIndependentTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.run = self.root / "campaign"
         self.owner_pid, self.owner_birth = 123, 133700000012345678
-        self.case = publication_case(threshold=True, physical_owner=(self.owner_pid, self.owner_birth))
-        self.plan = evaluation_plan()
+        self.case = publication_case(
+            threshold=True, physical_owner=(self.owner_pid, self.owner_birth),
+            clock=m6.clock_domain(
+                boot_identity_sha256=m6.windows_boot_identity(
+                    node_sha256=self.windows_node_identity_sha256,
+                    boot_counter=self.windows_boot_counter),
+                host_assignment_identity_sha256=self.host_assignment_identity_sha256),
+            runtime=m6.runtime_identity("e2e_publication").model_copy(
+                update=dict(self.runtime_identity_overrides)))
+        self.plan = self.evaluation_plan_for_test()
         self.intent = campaign_intent(self.case, self.plan)
         spec = self.case.fixture.spec
         self.write("intent.json", self.intent.canonical_bytes())
@@ -317,6 +341,25 @@ class DeliveryEvidenceIndependentTests(unittest.TestCase):
             "gpu_device_identity_sha256": spec.runtime.gpu_device_identity_sha256,
         })
         self.write("run/anchor.json", anchor.canonical_bytes())
+        # The singleton native owner-identity diagnostic this physical run left behind. The
+        # owner epoch above was computed from exactly these PID/birth/boot facts, and this
+        # pair is where the campaign reads the Windows node and the resident boot encoding.
+        identity_body = canonical({
+            "boot_counter": self.windows_boot_counter,
+            "boot_identity_version": "m6.windows-boot-counter.v1",
+            "clock": spec.clock.model_dump(mode="json"),
+            "contract_version": "m6.physical-owner-identity.v2",
+            "creation_filetime_100ns": self.owner_birth,
+            "gpu_device_identity_sha256": spec.runtime.gpu_device_identity_sha256,
+            "pid": self.owner_pid,
+            "windows_boot_utc": self.windows_boot_utc,
+            "windows_node_identity_sha256": self.windows_node_identity_sha256,
+        })
+        diagnostic = "native/diagnostic-" + m6.hex_digest("owner-identity")[:32]
+        self.write(diagnostic + ".json", {"body_sha256": self.sha(identity_body),
+                                          "code": "owner_identity",
+                                          "contract_version": "m6.transport-diagnostic.v1"})
+        self.write(diagnostic + ".bin", identity_body)
         self.write("campaign-inputs.json", {
             "contract_version": "m6.campaign-inputs.v2", "intent_sha256": self.intent.canonical_sha256(),
             "attempt_id": "independent-launch-1",
@@ -642,3 +685,277 @@ class DeliveryEvidenceIndependentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResidentOwnerEvidenceCliTests(unittest.TestCase):
+    """The physical summary entry consuming one original v4 owner evidence directory.
+
+    The owner session is the product's own: it runs for real with only its transport, its
+    observer child and its lane close scripted, and it retains the evidence directory this
+    entry then re-reads. The telemetry artifacts are that same session's sealed v4 output, so
+    the plan the owner recorded and the plan the receipt names are the same bytes.
+
+    This campaign declares resource gates, because a plan that declares none never consults
+    the owner proof at all. Its runtime identities belong to a different fixture family, so
+    the report also carries the campaign's own identity problems; what these cases decide is
+    the `resident_owner` family - whether the original owner proof is replayed, bound to this
+    run's plan, and refused when it is wrong.
+    """
+
+    OMIT = object()
+    # The synthetic framebuffer headroom this resident fixture reports, in bytes.
+    GPU_FREE_BYTES = 6
+
+    def setUp(self):
+        from tests.unit.test_resident_external_observation import BOOT
+        from tests.unit.test_resident_telemetry_owner import _fixture, run_owner_session
+
+        # The resident run comes first: its Windows node, boot, host assignment, runtime
+        # bundle, process profile and GPU are the physical facts of one machine. The campaign
+        # is then frozen on exactly those identities, which is the only configuration in which
+        # the two evidence families can describe the same host at all.
+        resident = tempfile.TemporaryDirectory()
+        self.addCleanup(resident.cleanup)
+        request, external, result = _fixture(Path(resident.name).resolve())
+        run_owner_session(request, external, result)
+        self.request, self.result = request, result
+        gpu = next(frame.gpu.values for frame in result.frames if frame.gpu.status == "supported")
+        headroom = sorted({frame.gpu.values.framebuffer_free_bytes for frame in result.frames
+                           if frame.gpu.status == "supported" and frame.gpu.values is not None})
+        self.assertEqual(headroom, [self.GPU_FREE_BYTES],
+                         "this campaign's GPU floor is pinned to the reading the fixture makes")
+        provenance = result.frames[0].resident_exporter_provenance
+        # The resident exporter records the LastBootUpTime encoding of the boot the native
+        # owner identity records by counter; the campaign must bind the two, not conflate them.
+        self.assertEqual(provenance.boot_identity_sha256, m6.resident_boot_identity(
+            node_sha256=request.windows_node_identity_sha256, boot_utc=BOOT))
+
+        # The established physical campaign, rebuilt on this host's identities and with an
+        # evaluation plan that actually declares resource gates; its tests are not inherited.
+        campaign = DeliveryEvidenceIndependentTests(methodName="setUp")
+        campaign.windows_node_identity_sha256 = request.windows_node_identity_sha256
+        campaign.windows_boot_utc = BOOT
+        campaign.host_assignment_identity_sha256 = provenance.host_assignment_identity_sha256
+        campaign.runtime_identity_overrides = {
+            "runtime_bundle_identity_sha256": result.receipt.runtime_bundle_identity_sha256,
+            "process_profile_sha256": result.receipt.process_profile.process_profile_sha256,
+            "gpu_device_identity_sha256": gpu.device_identity_sha256,
+        }
+        # Resource gates must be declared, or the owner proof is never consulted. The GPU floor
+        # is this fixture's own headroom reading, so the comparison is a real boundary rather
+        # than a floor nothing could fail; a realistic margin belongs to the measured campaign,
+        # not to a synthetic frame. The OOM/preemption gates stay at the plan's own zero.
+        campaign.evaluation_plan_for_test = lambda: evaluation_plan(required_safety=True).model_copy(
+            update={"resource_gates": evaluation_plan(required_safety=True).resource_gates.model_copy(
+                update={"gpu_free_min_bytes": self.GPU_FREE_BYTES})})
+        campaign.setUp()
+        self.addCleanup(campaign.doCleanups)
+        self.root, self.run, self.write = campaign.root.resolve(), campaign.run, campaign.write
+        self.evidence = request.evidence_directory
+        self.artifacts = self.root / "observer-artifacts"
+        self.artifacts.mkdir(mode=0o700)
+        self.run_directory = self.artifacts / request.run_id
+        self.run_directory.mkdir(mode=0o700)
+        self.retain("sampling-plan.v1.json", canonical(result.plan.model_dump(mode="json")))
+        self.retain("frames.v3.jsonl", b"".join(
+            canonical(frame.model_dump(mode="json")) + b"\n" for frame in result.frames))
+        self.retain("receipt.v4.json", canonical(result.receipt.model_dump(mode="json")))
+        self.retain("seal.v4.json", canonical(result.seal.model_dump(mode="json")))
+        plan = result.plan
+        # A business interval genuinely INSIDE the telemetry: the first host counter reading
+        # had already completed when it started, and the last one had not been requested when
+        # it finished. Both counter edges are therefore proved outside the interval they bound,
+        # which is what the resource gate requires before it credits a zero delta.
+        host = sorted((frame for frame in result.frames if frame.lane == "host_slow"),
+                      key=lambda frame: frame.resident_exporter_provenance.wire_sequence)
+        started, finished = host[0].clock.finished_monotonic_ns, host[-1].clock.started_monotonic_ns
+        self.assertLess(started, finished, "the host lane must bracket a non-empty interval")
+        self.assertLessEqual(plan.started_monotonic_ns, started)
+        self.assertLessEqual(finished, plan.planned_end_monotonic_ns)
+        summary = json.loads((self.run / "campaign-summary.json").read_bytes())
+        summary["telemetry_window"] = {
+            "contract_version": "m6.local-measurement-window.v1",
+            "clock_domain_identity_sha256": plan.observer_clock_domain_identity_sha256,
+            "started_monotonic_ns": started, "finished_monotonic_ns": finished,
+        }
+        self.write("campaign-summary.json", summary)
+        self.last_error = ""
+
+    def retain(self, name, payload):
+        path = self.run_directory / name
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        return path
+
+    def owner_report(self, label, *, evidence_dir=OMIT):
+        """Run the real summary entry over this campaign and return its delivery report."""
+        from disclosure_anchor.cli.m6_campaign import main
+
+        output = self.root / label
+        argv = ["summary", "--run-dir", str(self.run), "--evaluation-plan",
+                str(self.run / "evaluation-plan.json"), "--output", str(output),
+                "--telemetry-artifact-root", str(self.artifacts),
+                "--telemetry-run-id", str(self.request.run_id),
+                "--telemetry-receipt-version", "4"]
+        directory = self.evidence if evidence_dir is self.OMIT else evidence_dir
+        if directory is not None:
+            argv += ["--resident-owner-evidence-dir", str(directory)]
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            code = main(argv)
+        self.last_error = errors.getvalue().strip()
+        path = output / "delivery-report.json"
+        return code, (json.loads(path.read_bytes()) if path.exists() else None)
+
+    @staticmethod
+    def sha(raw):
+        return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def owner_problems(report):
+        return sorted(item for item in report["unknowns"] if item.startswith("resident_owner"))
+
+    def replay(self, directory, *, run_id=None):
+        """The product's own owner reader, with the node identity this campaign records."""
+        from disclosure_anchor.adapters.runtime.resident_owner_evidence import (
+            replay_resident_owner_evidence,
+        )
+
+        return replay_resident_owner_evidence(
+            directory, run_id=self.request.run_id if run_id is None else run_id,
+            windows_node_identity_sha256=self.request.windows_node_identity_sha256)
+
+    @staticmethod
+    def falsify_starter_exit(directory):
+        """Rewrite the owner's own original starter record to claim a different child exit."""
+        for path in sorted(directory.glob("*-start.stdout")):
+            path.write_bytes(path.read_bytes().replace(b'"child_exit_code":0', b'"child_exit_code":1', 1))
+
+    def test_the_entry_consumes_this_owner_s_own_retained_evidence(self):
+        # The real summary entry, given this run's original owner directory and its sealed v4
+        # artifacts, PASSES the resource gate. Exit 0 and a present evidence hash are produced
+        # by a refusal too, so only a passing gate makes the adjacent negatives below mean
+        # anything: an always-unknown gate cannot tell a good proof from a broken one.
+        code, report = self.owner_report("owner-positive")
+        self.assertIsNotNone(report, f"exit {code}: {self.last_error}")
+        self.assertEqual(code, 0, self.last_error)
+        safety = report["resource_safety"]
+        self.assertEqual(safety["status"], "pass", safety["reason"])
+        self.assertIsNotNone(safety["evidence_sha256"])
+        self.assertEqual([item for item in report["unknowns"]
+                          if item.startswith("resource_safety") or item.startswith("physical_owner")], [])
+        # And the same directory replays through the product's own owner reader.
+        evidence = self.replay(self.evidence)
+        self.assertIsNotNone(evidence.plan_bytes, "the v4 owner retains its frozen plan")
+        self.assertEqual(list(evidence.problems), [])
+        # Every owner file the entry indexed carries the digest of the ORIGINAL bytes still on
+        # disk, never a second hash of the digest text the owner reader already computed.
+        indexed = {item["path"]: item["sha256"] for item in json.loads(
+            (self.root / "owner-positive" / "delivery-report-inputs.json").read_bytes())["inputs"]
+            if item["path"].startswith(self.evidence.as_posix() + "/")}
+        self.assertEqual(sorted(Path(path).name for path in indexed), sorted(evidence.files))
+        for name in ("owner-intent.json", "gpu_fast-config.json", "host_slow-closed.stdout"):
+            self.assertIn((self.evidence / name).as_posix(), indexed, "a representative original")
+        for path, digest in sorted(indexed.items()):
+            self.assertEqual(digest, self.sha(Path(path).read_bytes()), path)
+
+        # The same gate, the same run, one falsified record inside the owner's own original
+        # proof: the gate that just passed must stop passing.
+        damaged = self.root / "damaged-owner-proof"
+        shutil.copytree(self.evidence, damaged)
+        self.falsify_starter_exit(damaged)
+        code, refused = self.owner_report("owner-damaged", evidence_dir=damaged)
+        self.assertIsNotNone(refused, f"exit {code}: {self.last_error}")
+        self.assertNotEqual(refused["resource_safety"]["status"], "pass")
+        self.assertTrue(refused["resource_safety"]["reason"].startswith("resident_owner"),
+                        refused["resource_safety"]["reason"])
+        self.assertFalse(refused["delivery_pass"])
+
+    def test_absent_owner_evidence_is_named_rather_than_silently_passed(self):
+        code, report = self.owner_report("owner-absent", evidence_dir=None)
+        self.assertIsNotNone(report, f"exit {code}: {self.last_error}")
+        self.assertFalse(report["delivery_pass"])
+        self.assertNotEqual(report["resource_safety"]["status"], "pass")
+
+    def test_a_foreign_run_directory_is_refused_by_the_entry_itself(self):
+        # An owner directory whose own retained result names another run is the wrong directory,
+        # and the entry refuses it outright rather than scoring this run from it.
+        foreign = self.root / "foreign-run"
+        shutil.copytree(self.evidence, foreign)
+        for name in ("owner-result.json", "owner-intent.json"):
+            document = json.loads((foreign / name).read_bytes())
+            document["run_id"] = "00000000-0000-4000-8000-000000000999"
+            (foreign / name).write_bytes(canonical(document))
+        code, report = self.owner_report("owner-foreign-run", evidence_dir=foreign)
+        self.assertNotEqual(code, 0, "another run's owner directory cannot score this run")
+        self.assertIn("another run", self.last_error)
+        self.assertIsNone(report)
+
+    def test_a_foreign_plan_or_a_false_exit_is_named_by_the_owner_reader(self):
+        # These two are decided one layer below the entry, because the report surfaces only its
+        # first problem and cannot show which family refused. The files are the original ones.
+        cases = {
+            "foreign_plan": ("owner_result_plan_mismatch", lambda directory: (
+                directory / "sampling-plan.v1.json").write_bytes(canonical({
+                    **json.loads((directory / "sampling-plan.v1.json").read_bytes()),
+                    "duration_ns": 3_000_000_000}))),
+            "false_exit": ("owner_check_failed:gpu_fast:starter_stdout_differs_from_job",
+                           self.falsify_starter_exit),
+        }
+        for label, (expected, mutate) in cases.items():
+            with self.subTest(case=label):
+                target = self.root / label
+                shutil.copytree(self.evidence, target)
+                mutate(target)
+                problems = list(self.replay(target).problems)
+                self.assertIn(expected, problems)
+                self.assertTrue(any(item.startswith("owner_evidence_hash_mismatch") for item in problems),
+                                f"the changed original bytes must be named: {problems}")
+
+    def test_an_owner_intent_that_declares_another_duration_cannot_grant_credit(self):
+        # The owner's retained intent is the duration authority. This packet is rewritten
+        # until it is internally consistent: the intent declares another duration, the owner's
+        # own result re-points at that intent, its retained plan copy names the new intent
+        # hash, and every index entry is recomputed. The reader therefore has nothing left to
+        # refuse, and only the binding to the FROZEN plan the sealed receipt names can catch
+        # it - on the duration itself, which is what the campaign reports first.
+        forged = self.root / "forged-intent"
+        shutil.copytree(self.evidence, forged)
+        intent = json.loads((forged / "owner-intent.json").read_bytes())
+        self.assertNotEqual(intent["duration_seconds"], 99)
+        intent["duration_seconds"] = 99
+        intent_bytes = canonical(intent)
+        (forged / "owner-intent.json").write_bytes(intent_bytes)
+        plan = json.loads((forged / "sampling-plan.v1.json").read_bytes())
+        plan["owner_intent_sha256"] = self.sha(intent_bytes)
+        plan_bytes = canonical(plan)
+        (forged / "sampling-plan.v1.json").write_bytes(plan_bytes)
+        result = json.loads((forged / "owner-result.json").read_bytes())
+        result["owner_intent_sha256"] = self.sha(intent_bytes)
+        result["sampling_plan_sha256"] = self.sha(plan_bytes)
+        result["evidence_sha256"]["owner-intent.json"] = self.sha(intent_bytes)
+        result["evidence_sha256"]["sampling-plan.v1.json"] = self.sha(plan_bytes)
+        (forged / "owner-result.json").write_bytes(canonical(result))
+        self.assertNotEqual(
+            plan["duration_ns"], intent["duration_seconds"] * 1_000_000_000,
+            "the plan and the rewritten intent must disagree for this case to mean anything")
+        replayed = self.replay(forged)
+        self.assertEqual(list(replayed.problems), [],
+                         "this packet is internally consistent by construction")
+        self.assertEqual(replayed.intent_duration_ns, 99_000_000_000,
+                         "the reader still reports the duration the forged intent declares")
+        code, report = self.owner_report("owner-forged-intent", evidence_dir=forged)
+        self.assertIsNotNone(report, f"exit {code}: {self.last_error}")
+        # The gate that passes on the original evidence now names the duration binding. The
+        # rewritten plan copy and intent hash are refused as well; this is the first of the
+        # three, and the only one that decides the duration. A packet that isolates the
+        # duration guard alone cannot exist: the owner refuses to freeze a plan whose duration
+        # differs from its own intent (resident_telemetry_owner.py, run_resident_telemetry_session).
+        self.assertEqual(report["resource_safety"]["reason"], "resident_owner_intent_duration_mismatch")
+        self.assertNotEqual(report["resource_safety"]["status"], "pass")
+        self.assertFalse(report["delivery_pass"])
+
+    def test_another_runs_directory_is_refused_by_the_owner_reader(self):
+        with self.assertRaises(ValueError) as refusal:
+            self.replay(self.evidence, run_id="00000000-0000-4000-8000-000000000999")
+        self.assertIn("another run", str(refusal.exception))

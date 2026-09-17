@@ -27,6 +27,9 @@ public static class MineruEndpointProbe {
     sealed class Fixture : IDisposable {
         public int Samples, Closes; public bool Delivered; public string CloseBoundary;
         public readonly int Port; public readonly string Path;
+        // The counting backend lives in this fixture, outside the measured assembly: the
+        // product has no test hook, callback registry or mock path of its own.
+        public readonly List<long> SampleOrder=new List<long>();
         public readonly ManualResetEventSlim Ready=new ManualResetEventSlim();
         public readonly ManualResetEventSlim CloseEntered=new ManualResetEventSlim();
         public readonly ManualResetEventSlim AllowClose=new ManualResetEventSlim();
@@ -43,6 +46,7 @@ public static class MineruEndpointProbe {
                 using(MineruResidentEndpoint endpoint=new MineruResidentEndpoint(Port,session,"gpu_fast",250,2000,2000,150,identity)) {
                     endpoint.Run(()=>Ready.Set(),deadline=> {
                         int count=Interlocked.Increment(ref Samples);
+                        lock(SampleOrder) SampleOrder.Add(Stopwatch.GetTimestamp());
                         if(sampleDelay>0 && count==1) Thread.Sleep(sampleDelay);
                         return "{\"gpu\":{\"reason\":\"collector_unsupported\",\"status\":\"unsupported\",\"values\":null}}";
                     },deadline=> {
@@ -66,6 +70,14 @@ public static class MineruEndpointProbe {
                 status=(int)response.StatusCode; return reader.ReadToEnd();
             }
         }
+        public string Pull(long after,out int status) {
+            return Get(Path+"/after/"+after+"/request/"+Nonce(after),out status);
+        }
+        public static string Nonce(long salt) {
+            // Deterministic 32 lowercase hex, distinct per request; no machine identity.
+            return (salt+1).ToString("x8",System.Globalization.CultureInfo.InvariantCulture).PadLeft(8,'0')
+                 + new string('0',16) + "abcd1234";
+        }
         public bool Expired() {
             try { if(!Server.Wait(3500)) throw new TimeoutException("fixture server did not stop"); }
             catch(AggregateException error) {
@@ -87,17 +99,47 @@ public static class MineruEndpointProbe {
     public static string Run() {
         List<string> checks=new List<string>(); int status;
         using(Fixture f=new Fixture(0,false)) {
+            // The only sampling tick is the caller's. Waiting several nominal periods with no
+            // request must leave the real backend untouched; there is no periodic sampler.
             Thread.Sleep(50); Check(f.Samples==0,"READY_does_not_sample",checks);
-            f.Get("/v1/"+new string('0',32)+"/gpu_fast/after/0",out status);
+            Thread.Sleep(900); Check(f.Samples==0,"idle_endpoint_never_samples_on_its_own",checks);
+            f.Get("/v1/"+new string('0',32)+"/gpu_fast/after/0/request/"+Fixture.Nonce(0),out status);
             Check(status==404 && f.Samples==0,"old_session_cannot_start",checks);
-            f.Get(f.Path+"/after/1",out status); Check(status==409 && f.Samples==0,"future_sequence_cannot_start",checks);
-            string first=f.Get(f.Path+"/after/0",out status);
-            Check(status==200 && MineruResidentWire.Parse(first,65536).Get("sequence").Integer()==1,"first_request_exact_sequence_one",checks);
-            string duplicate=f.Get(f.Path+"/after/0",out status); Check(status==200 && duplicate==first,"lost_response_exact_retry",checks);
-            string second=f.Get(f.Path+"/after/1",out status);
-            Check(status==200 && MineruResidentWire.Parse(second,65536).Get("sequence").Integer()==2,"held_request_next_sample",checks);
-            f.Get(f.Path+"/after/0",out status); Check(status==409,"old_gap_not_rebased",checks);
-            f.Get(f.Path+"/after/02",out status); Check(status==404,"noncanonical_sequence_rejected",checks);
+            f.Pull(1,out status); Check(status==409 && f.Samples==0,"future_sequence_cannot_start",checks);
+            string first=f.Pull(0,out status);
+            MineruJsonValue pull=MineruResidentWire.Parse(first,65536);
+            Check(status==200 && f.Samples==1,"first_valid_request_samples_exactly_once",checks);
+            pull.Keys("contract_version","request_nonce","after_sequence","request_received_monotonic_ns",
+                "sample_capture_finished_monotonic_ns","reply_started_monotonic_ns","sample");
+            Check(pull.Get("contract_version").String()=="mineru.windows-resident-pull.v1" &&
+                pull.Get("request_nonce").String()==Fixture.Nonce(0) &&
+                pull.Get("after_sequence").Integer()==0 &&
+                pull.Get("sample").Get("sequence").Integer()==1,"pull_envelope_binds_this_request",checks);
+            long requestNs=pull.Get("request_received_monotonic_ns").Integer();
+            long captureNs=pull.Get("sample").Get("sampled_monotonic_ns").Integer();
+            long finishedNs=pull.Get("sample_capture_finished_monotonic_ns").Integer();
+            long replyNs=pull.Get("reply_started_monotonic_ns").Integer();
+            // a <= c <= d <= b: the capture the reply carries happened inside this request.
+            Check(requestNs<=captureNs && captureNs<=finishedNs && finishedNs<=replyNs,
+                "request_precedes_capture_precedes_reply",checks);
+            // A replayed cursor must not resample and must not hand back the previous reply.
+            f.Pull(0,out status); Check(status==409 && f.Samples==1,"replayed_cursor_neither_samples_nor_caches",checks);
+            for(long after=1;after<=4;after++) {
+                string body=f.Pull(after,out status);
+                Check(status==200 && MineruResidentWire.Parse(body,65536).Get("sample").Get("sequence").Integer()==after+1,
+                    "each_valid_request_advances_one_sample",checks);
+            }
+            Check(f.Samples==5,"real_backend_called_once_per_valid_request",checks);
+            f.Pull(0,out status); Check(status==409 && f.Samples==5,"old_gap_not_rebased",checks);
+            f.Get(f.Path+"/after/02/request/"+Fixture.Nonce(2),out status); Check(status==404,"noncanonical_sequence_rejected",checks);
+            f.Get(f.Path+"/after/5/request/"+Fixture.Nonce(5).ToUpperInvariant(),out status);
+            Check(status==404 && f.Samples==5,"noncanonical_nonce_rejected",checks);
+            f.Get(f.Path+"/after/5",out status);
+            Check(status==404 && f.Samples==5,"superseded_path_has_no_fallback",checks);
+            f.Get(f.Path+"/after/5/request/"+Fixture.Nonce(5)+"/extra",out status);
+            Check(status==404 && f.Samples==5,"extra_path_segment_rejected",checks);
+            f.Get(f.Path+"/after/5/request/"+Fixture.Nonce(5)+"?cached=1",out status);
+            Check(status==404 && f.Samples==5,"query_string_rejected",checks);
             f.Get(f.Path+"/close",out status); Check(status==200 && f.Server.Wait(1000) && f.Closes==1 && f.Delivered,"normal_close",checks);
             MineruJsonValue boundary=MineruResidentWire.Parse(f.CloseBoundary,4096);
             Check(boundary.Get("sample_count").Integer()==f.Samples && boundary.Get("last_sequence").Integer()==f.Samples &&
@@ -112,16 +154,24 @@ public static class MineruEndpointProbe {
             long sequence=0;
             while(!f.Server.IsCompleted) {
                 try {
-                    string body=f.Get(f.Path+"/after/"+sequence,out status);
-                    if(status==200) sequence=MineruResidentWire.Parse(body,65536).Get("sequence").Integer();
+                    string body=f.Pull(sequence,out status);
+                    if(status==200) sequence=MineruResidentWire.Parse(body,65536).Get("sample").Get("sequence").Integer();
                 } catch(WebException) { break; }
             }
-            Check(f.Expired() && f.Samples>1 && f.Closes==0,"renewal_cannot_extend_hard_lifetime",checks);
+            // A hard expiry can land inside the last backend call or its reply, so the source
+            // may legitimately hold one sample this caller never consumed. What must hold is
+            // that nothing is credited and the count never runs ahead by more than that one.
+            Check(f.Expired() && f.Samples>1 && f.Closes==0 &&
+                (f.Samples==sequence || f.Samples==sequence+1),
+                "renewal_cannot_extend_hard_lifetime",checks);
         }
         using(Fixture f=new Fixture(800,false)) {
-            f.Get(f.Path+"/after/0",out status);
-            string body=f.Get(f.Path+"/after/1",out status);
-            Check(status==409 || (status==200 && MineruResidentWire.Parse(body,65536).Get("sequence").Integer()>2),"missed_slots_expose_gap",checks);
+            f.Pull(0,out status);
+            // A slow backend delays this caller; it never makes the source skip a slot on its
+            // own, so the next accepted cursor is still exactly one ahead.
+            string body=f.Pull(1,out status);
+            Check(status==409 || (status==200 && MineruResidentWire.Parse(body,65536).Get("sample").Get("sequence").Integer()==2),
+                "slow_backend_never_skips_a_source_slot",checks);
             // Long sample may run into hard lifetime before a close can arrive;
             // this fixture intentionally requires failure, not cleanup success.
             Check(f.Expired(),"slow_callback_hits_finite_lifetime",checks);
@@ -140,6 +190,10 @@ public static class MineruEndpointProbe {
             Check(boundary.Get("sample_count").Integer()==0 && boundary.Get("last_sequence").Integer()==0 &&
                 boundary.Get("first_sampled_monotonic_ns").Raw=="null" && boundary.Get("last_observed_at_utc").Raw=="null", "unstarted_close_no_synthetic_sample",checks);
         }
+        bool overCeiling=false;
+        try { MineruResidentWire.Deadline(8600001); } catch(ArgumentException) { overCeiling=true; }
+        MineruResidentWire.Deadline(8600000);
+        Check(overCeiling,"finite_command_ceiling_is_8600000ms",checks);
         return "{\"checks\":["+String.Join(",",checks.ConvertAll(MineruResidentWire.Quote).ToArray())+"],\"count\":"+checks.Count+"}";
     }
 }

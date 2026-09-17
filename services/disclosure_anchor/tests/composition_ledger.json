@@ -414,7 +414,7 @@
   },
   "tests/unit/test_m6_delivery_report_independent.py": {
    "private_imports": [],
-   "tests": 23
+   "tests": 29
   },
   "tests/unit/test_m6_e2e_assembly_independent.py": {
    "private_imports": [],
@@ -426,7 +426,7 @@
   },
   "tests/unit/test_m6_measured_driver_independent.py": {
    "private_imports": [],
-   "tests": 23
+   "tests": 26
   },
   "tests/unit/test_m6_measurement_independent.py": {
    "private_imports": [],
@@ -993,6 +993,10 @@
   "tests/unit/test_published_parser_output_verifier_v4.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_r22_measurement_integration_independent.py": {
+   "private_imports": [],
+   "tests": 36
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],

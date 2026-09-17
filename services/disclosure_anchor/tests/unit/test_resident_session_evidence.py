@@ -11,7 +11,8 @@ from disclosure_anchor.application.contracts.resident_session_evidence import (
     check_resident_observer_mapping,
 )
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
-    SynchronizedTelemetryFrameV2, SynchronizedTelemetryReceiptV3,
+    SynchronizedSamplingPlanV1, SynchronizedTelemetryFrameV2, SynchronizedTelemetryFrameV3,
+    SynchronizedTelemetryReceiptV3,
 )
 from tests.unit.test_synchronized_telemetry_contract import (
     START, HASH_C, _complete_frames, _receipt,
@@ -129,6 +130,46 @@ def _fixture(host: bool = False) -> dict:
     return {"config": config, "ready": ready, "manifest": manifest, "closed": closed,
             "job": {"config_sha256": config_hash, "contract_version": "mineru.windows-resident-job-receipt.v1", "job": job, "session": session, "supervisor_process": parent},
             "linux": linux, "hashes": hashes}
+
+
+def _pull_frame_v3(frame: SynchronizedTelemetryFrameV2) -> SynchronizedTelemetryFrameV3:
+    """The same measured frame as a fresh-per-request v3 frame.
+
+    The Mac bracket is this frame's own collection interval and the native capture sits
+    inside it; the cursor is the lane's own wire sequence minus one, which is exactly what
+    the request asked for. Nothing about the measurement changes.
+    """
+    value = frame.model_dump(mode="json")
+    provenance = value["resident_exporter_provenance"]
+    capture = provenance["wire_sampled_monotonic_ns"]
+    cursor = provenance["wire_sequence"] - 1
+    provenance.update(
+        request_nonce=f"{cursor:032x}", after_sequence=cursor,
+        local_request_monotonic_ns=value["clock"]["started_monotonic_ns"],
+        local_response_monotonic_ns=value["clock"]["finished_monotonic_ns"],
+        native_request_received_monotonic_ns=capture - 1000,
+        native_capture_finished_monotonic_ns=capture + 1000,
+        native_reply_started_monotonic_ns=capture + 2000,
+    )
+    # A lane answers only its own observations; the other lane's were simply not due at this
+    # tick, which is the reason the v4 replay requires rather than a collector failure.
+    not_due = {"status": "unsupported", "reason": "not_due_at_this_tick", "values": None}
+    for name in (("api_process", "host_cgroup", "queue_vllm") if frame.lane == "gpu_fast" else ("gpu",)):
+        value[name] = dict(not_due)
+    value["contract_version"] = "mineru.synchronized-telemetry-frame.v3"
+    return SynchronizedTelemetryFrameV3.model_validate(value)
+
+
+def _sampling_plan(*, run_id: str, owner_intent_sha256: str, clock_domain_sha256: str,
+                   started_monotonic_ns: int, duration_ns: int) -> SynchronizedSamplingPlanV1:
+    """The frozen window these fixtures sample, projected exactly once."""
+    return SynchronizedSamplingPlanV1(
+        run_id=run_id, owner_intent_sha256=owner_intent_sha256,
+        observer_clock_domain_identity_sha256=clock_domain_sha256,
+        started_monotonic_ns=started_monotonic_ns, duration_ns=duration_ns,
+        planned_end_monotonic_ns=started_monotonic_ns + duration_ns,
+        gpu_nominal_interval_ms=250, host_nominal_interval_ms=1000,
+    )
 
 
 def _check_ready(fixture: dict):

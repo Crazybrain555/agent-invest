@@ -99,7 +99,30 @@ Linux sampler 度量的那个 API 进程，drain/关闭准入视为漂移。帧�
 规则、与 09-14 起的 capacity v3 producer 漂移且本地 Python-only gate 覆盖不到的结果。HTTP PID 由 owner 从已固定 host PID 的
 实际 NSpid 映射取得并绑定 boot/starttime，禁止猜测 PID 1。exporter/start 入口在 rethrow 前把嵌套异常链
 （`Exception.ToString()`）回显到 stderr 并持久化为 `exporter-failure.txt` / `supervisor-failure.txt`：PowerShell 只打印外层
-AggregateException 消息；该写入整体受保护，失败只报告、绝不替换原始 throw。两个入口自带的 bootstrap 函数
+AggregateException 消息；该写入整体受保护，失败只报告、绝不替换原始 throw。
+
+**R22 测量协议（v4）——单一 Mac 节拍、按请求新采集、冻结计划。** 三种时间各自成域：业务时间是 owner QPC（主窗/ready/
+义务不变）；采样/装配时间是 Mac `time.monotonic_ns`（plan、frame schedule、campaign 本地窗 `telemetry_window`）；source 时间是
+Windows QPC/Linux 自身；UTC 只做人类日志与 wall-step 标记，v4 不以跨机 UTC 差判 coverage/freshness，也不估 ppm/offset。
+native `MineruResidentEndpoint` 不再维持自己的周期与 latest cache：只有 `/v1/{session}/{lane}/after/{after}/request/{nonce}`
+（32 hex nonce），`after==sequence` 才续 lease、真实 backend 恰好一次，回复 `mineru.windows-resident-pull.v1`
+（`a=request_received`, `c=sample.sampled_monotonic_ns`, `d=sample_capture_finished`, `b=reply_started`，同域 a≤c≤d≤b）；
+`after!=sequence` 409 且不采样不续期，其他路径 404。Mac collector 每槽发一次带 nonce 的 GET，记本机 s/f，
+`pull_capture_bounds` 证明采集操作在 [s,f] 内、年龄上界 f−s≤1 s；删除 wall age、跨机 UTC 映射与 native ±10% cadence 门，
+保留 sequence 连续、QPC 单调、上一次 native reply≤本次 native request；同域 wall/QPC 只记录、不设任何容差门（源 wall 步进或 ±120 ppm 速率差都接受，`50 ms + 50 ppm` 仅留在旧 `/after/{n}` 路径）。observer `receipt_version=4`：首采样前从 `owner-intent.json` hash 冻结
+`sampling-plan.v1.json`（start=首个 clock pair、D=整数 ns、end=start+D），半开槽 `start+k·p<end`，`slot_coverage` 按 plan
+逐 lane 记 expected/observed/missing（头/中/尾），`finished_monotonic_ns` 只记实际收尾不定义终点；receipt.v4 绑定 plan hash，
+seal.v4 正常 run 分母=D、另记 lifecycle_elapsed 与原始 records/bytes。控制通道在 GO 后依次送 `plan_recorded`、
+`sampling_drained`（JSONL fsync 之后、完整回放之前）、最终 identity；控制记录为定长前缀的封闭形状（每 kind 精确键与标量类型），
+parent 逐条恰好消费一次：跨空闲 poll 保留半条记录并按首字节起算 2 s 记录截止，超时一次性失败、不重解析已消费字节。owner 收到
+`plan_recorded` 即有界读取 child 原始 `sampling-plan.v1.json`：hash 须等于事件所报，内容须等于 owner intent、时长、run、独立读取的
+observer clock-domain identity 与两条 lane cadence，之后 start/end 只取自该 plan；再校验 plan.start−最早 starter spawn≤20 s，收到 drained
+即并行关闭两条 native lane，再等 child 退出、再回放，全部收尾在 plan.end+60 s 内，每一步取 min(自身上限, 剩余)，回放每 64 行检查截止。
+`derive_frame_evidence_v4` 的 late 按实际 finished>min(scheduled+period, plan.end) 推导，不采信 collector 自报状态：迟到的槽算已覆盖但 run 不 complete。离线 `check_resident_observer_mapping_v4`
+逐帧重跑同一 `pull_capture_bounds` 与槽覆盖，要求 source count==last_sequence==该 lane frames、closing QPC≥最后 reply；
+`derive_resource_aggregates_v4` 在 campaign 的本地 monotonic 窗内用 per-lane wire sequence 与 `counter_envelope`
+（前边缘 U≤start、后边缘 L≥end，缺边缘 unknown）和 `possibly_overlaps` 取 gauge。物理 summary 的 owner 证据回放只读接受 v1（历史）与 v2（R22）owner-result，
+v4 路径要求 v2/receipt 4，并把 plan hash、原始 intent hash 与 intent 时长逐一钉到 receipt 与 plan 上；starter 原始 stdout 与 closed 观测的 job_raw 的交叉校验离线重跑。旧 v2/v3 合同、导出 schema 与历史记录只读不变。两个入口自带的 bootstrap 函数
 （`Get-MineruBootstrapSha`/`Read-MineruBootstrap`，dot-source 的 load 脚本也依赖前者）是入口不可删的前置；Mac owner 在
 READY 等待中并发轮询 starter，starter 提前结束即命名失败并保留原始 exit/stdout/stderr，abort 前先有界 drain。vLLM 只接受四个精确 metric 名称，各唯一
 `engine="0"`/固定 `model_name` series，无 alias/sum/stale fallback；计数使用精确十进制数位处理，

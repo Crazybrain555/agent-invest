@@ -1,0 +1,66 @@
+{
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-sampling-plan.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Immutable projection of the owner's retained intent, frozen before the first collect.\n\n``planned_end_monotonic_ns`` is derived from the integer duration, never\nfrom the last available frame; a cancelled run keeps the same plan.",
+  "properties": {
+    "contract_version": {
+      "const": "mineru.synchronized-sampling-plan.v1",
+      "default": "mineru.synchronized-sampling-plan.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "duration_ns": {
+      "minimum": 1,
+      "title": "Duration Ns",
+      "type": "integer"
+    },
+    "gpu_nominal_interval_ms": {
+      "enum": [
+        250,
+        500
+      ],
+      "title": "Gpu Nominal Interval Ms",
+      "type": "integer"
+    },
+    "host_nominal_interval_ms": {
+      "const": 1000,
+      "default": 1000,
+      "title": "Host Nominal Interval Ms",
+      "type": "integer"
+    },
+    "observer_clock_domain_identity_sha256": {
+      "title": "Observer Clock Domain Identity Sha256",
+      "type": "string"
+    },
+    "owner_intent_sha256": {
+      "title": "Owner Intent Sha256",
+      "type": "string"
+    },
+    "planned_end_monotonic_ns": {
+      "minimum": 2,
+      "title": "Planned End Monotonic Ns",
+      "type": "integer"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "started_monotonic_ns": {
+      "minimum": 1,
+      "title": "Started Monotonic Ns",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "run_id",
+    "owner_intent_sha256",
+    "observer_clock_domain_identity_sha256",
+    "started_monotonic_ns",
+    "duration_ns",
+    "planned_end_monotonic_ns",
+    "gpu_nominal_interval_ms"
+  ],
+  "title": "SynchronizedSamplingPlanV1",
+  "type": "object"
+}

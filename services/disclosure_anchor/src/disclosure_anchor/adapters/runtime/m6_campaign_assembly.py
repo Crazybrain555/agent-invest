@@ -24,6 +24,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import secrets
+import time
 from typing import Any, Literal
 
 from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
@@ -31,6 +32,7 @@ from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import (
     CampaignBindingError, CampaignPrivateBinding, assert_known_hosts_pins_address, load_campaign_private_binding,
 )
 from disclosure_anchor.adapters.runtime.m6_continuous_clock import diagnostic_continuous_clock
+from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.adapters.runtime.m6_e2e_run import (
     M6RunDirectory, M6RunnerClosureFailed, M6VerifierAssembly, RunnerClosureReceipts, close_verifier_assembly,
     execute_runner_closure, load_m6_run_directory, m6_owner_client_factory,
@@ -54,6 +56,7 @@ from disclosure_anchor.application.contracts.m6_owner import (
     M6CloseOwner, M6OwnerAnchor, M6OwnerControl, M6OwnerStatus, bind_physical_owner_boot, physical_owner_epoch_sha256,
 )
 from disclosure_anchor.application.contracts.m6_run import M6RunSpec
+from disclosure_anchor.application.contracts.resident_session_evidence import check_mac_observer_identity
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.services.m6_launch_budget import (
     LaunchTransportBudget, finish_wait_seconds, launch_transport_budget, transport_headroom_seconds,
@@ -61,6 +64,7 @@ from disclosure_anchor.application.services.m6_launch_budget import (
 from disclosure_anchor.application.services.m6_run_spec_factory import build_run_spec
 
 CAMPAIGN_SUMMARY_CONTRACT = "m6.campaign-run-summary.v1"
+LOCAL_MEASUREMENT_WINDOW_CONTRACT = "m6.local-measurement-window.v1"
 OWNER_DEPLOYMENT_CONTRACT = "m6.owner-deployment.v2"
 LAUNCHER_RESULT_CONTRACT = "m6.owner-launcher-result.v1"
 PREPARE_RECEIPT_CONTRACT = "m6.owner-workspace-prepare.v1"
@@ -1308,11 +1312,40 @@ class M6CampaignAssembly:
 
     # --- entry ---------------------------------------------------------------------
 
+    def _measurement_clock(self) -> tuple[bytes, str, int]:
+        """This process's kernel identity, its monotonic clock domain and one monotonic instant.
+
+        The campaign's local measurement window lives in the same Mac monotonic
+        domain the dedicated observer plans in; the identity is read again at
+        the end so a changed domain can never be spliced into one window.
+        """
+        identity_bytes = MacObserverIdentityReader().observe()
+        domain = check_mac_observer_identity(identity_bytes).clock_domain_identity_sha256
+        return identity_bytes, domain, time.monotonic_ns()
+
+    def _telemetry_window(self, entry_identity: bytes, entry_domain: str, entry_monotonic_ns: int) -> dict[str, Any]:
+        """The private local measurement window a v4 telemetry reader scores resources in."""
+        try:
+            finish_identity, finish_domain, finish_monotonic_ns = self._measurement_clock()
+        except (OSError, ValueError) as exc:
+            return {"contract_version": LOCAL_MEASUREMENT_WINDOW_CONTRACT, "clock_domain_identity_sha256": entry_domain,
+                    "started_monotonic_ns": entry_monotonic_ns, "finished_monotonic_ns": None,
+                    "problem": f"finish clock identity unavailable: {type(exc).__name__}: {exc}"[:300]}
+        window: dict[str, Any] = {
+            "contract_version": LOCAL_MEASUREMENT_WINDOW_CONTRACT, "clock_domain_identity_sha256": entry_domain,
+            "started_monotonic_ns": entry_monotonic_ns, "finished_monotonic_ns": finish_monotonic_ns,
+        }
+        if finish_identity != entry_identity or finish_domain != entry_domain or finish_monotonic_ns <= entry_monotonic_ns:
+            window["finished_monotonic_ns"] = None
+            window["problem"] = "measurement clock identity changed during the campaign"
+        return window
+
     def execute(self) -> dict[str, Any]:
         intent, binding, summary = self._intent, self._binding, self._summary
         self._output.mkdir(mode=0o700)
         (self._output / "private").mkdir(mode=0o700)
         started = _utc()
+        entry_identity, entry_domain, entry_monotonic_ns = self._measurement_clock()
         # The intent and the evaluation plan are frozen into the run output before Prepare, i.e. before
         # any admission can exist; the summary reads these exact bytes back against the recorded hashes.
         write_new_exact(self._output / "campaign-intent.json", self._inputs.intent_raw)
@@ -1440,6 +1473,7 @@ class M6CampaignAssembly:
             "first_error": summary.first_error, "stages": summary.stages,
             "files": {"output": str(self._output), "run_dir": str(self._output / "run")},
             "started_utc": started, "finished_utc": _utc(),
+            "telemetry_window": self._telemetry_window(entry_identity, entry_domain, entry_monotonic_ns),
         }
         try:
             write_new_exact(self._output / "campaign-summary.json", canonical_bytes(document) + b"\n")
@@ -1450,7 +1484,7 @@ class M6CampaignAssembly:
 
 
 __all__ = [
-    "CAMPAIGN_SUMMARY_CONTRACT", "OWNER_DEPLOYMENT_CONTRACT", "CampaignIdentityError", "CampaignInputError",
+    "CAMPAIGN_SUMMARY_CONTRACT", "LOCAL_MEASUREMENT_WINDOW_CONTRACT", "OWNER_DEPLOYMENT_CONTRACT", "CampaignIdentityError", "CampaignInputError",
     "CampaignInputs", "CampaignMode", "CampaignOutcomeUnknown", "M6CampaignAssembly", "ReadyObservation",
     "deployment_document", "external_exit_problems", "generate_roles", "launcher_lines", "load_campaign_inputs", "parse_ready_line",
     "remaining_budget_seconds", "sourced_child_argv", "write_run_directory", "zero_admission_receipts",

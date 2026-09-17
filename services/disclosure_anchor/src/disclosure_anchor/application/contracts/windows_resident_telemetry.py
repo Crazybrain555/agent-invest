@@ -40,6 +40,8 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
 WIRE_VERSION: Literal["mineru.windows-resident-telemetry.v2"] = (
     "mineru.windows-resident-telemetry.v2"
 )
+PULL_VERSION: Literal["mineru.windows-resident-pull.v1"] = "mineru.windows-resident-pull.v1"
+_NONCE = re.compile(r"[0-9a-f]{32}")
 API_HTTP_SNAPSHOT_CONTRACT = "mineru.api-http-request-snapshot.v1"
 _MAX_HEALTH_BYTES = 8192
 _MAX_HTTP_BYTES = 1024
@@ -154,6 +156,49 @@ def decode_windows_resident_sample(
     model = WindowsGpuResidentSample if lane == "gpu_fast" else WindowsHostResidentSample
     sample = model.model_validate(value)
     return sample
+
+
+class WindowsResidentPullV1(_Closed):
+    """One fresh-per-request reply: the exporter's own QPC instants around exactly one backend call.
+
+    ``request_received`` (a) is taken after the request was validated,
+    ``sample.sampled_monotonic_ns`` (c) immediately before the single backend
+    call, ``sample_capture_finished`` (d) after it returned and
+    ``reply_started`` (b) before the bounded reply. A cached sample would
+    violate a <= c and is rejected here, on the wire, before any projection.
+    """
+
+    contract_version: Literal["mineru.windows-resident-pull.v1"] = PULL_VERSION
+    request_nonce: str
+    after_sequence: int = Field(ge=0)
+    request_received_monotonic_ns: int = Field(ge=1)
+    sample_capture_finished_monotonic_ns: int = Field(ge=1)
+    reply_started_monotonic_ns: int = Field(ge=1)
+    sample: WindowsGpuResidentSample | WindowsHostResidentSample
+
+    @model_validator(mode="after")
+    def _fresh(self) -> "WindowsResidentPullV1":
+        if _NONCE.fullmatch(self.request_nonce) is None:
+            raise ValueError("pull request nonce must be 32 lowercase hex characters")
+        if self.sample.sequence != self.after_sequence + 1:
+            raise ValueError("pull sample sequence must follow the requested cursor")
+        if not (self.request_received_monotonic_ns <= self.sample.sampled_monotonic_ns
+                <= self.sample_capture_finished_monotonic_ns <= self.reply_started_monotonic_ns):
+            raise ValueError("pull reply carries a sample captured outside this request")
+        return self
+
+
+def decode_windows_resident_pull(
+    payload: bytes, *, lane: Literal["gpu_fast", "host_slow"], maximum_bytes: int = 64 * 1024,
+) -> WindowsResidentPullV1:
+    """Decode exact canonical pull bytes; the inner sample must be this lane's closed sample."""
+
+    value = parse_canonical_json_artifact(payload, label="Windows resident pull", maximum_bytes=maximum_bytes)
+    if not isinstance(value, dict) or not isinstance(value.get("sample"), dict):
+        raise ValueError("Windows resident pull must be an object carrying one sample object")
+    sample_model = WindowsGpuResidentSample if lane == "gpu_fast" else WindowsHostResidentSample
+    sample = sample_model.model_validate(value["sample"])
+    return WindowsResidentPullV1.model_validate({**value, "sample": sample})
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +333,7 @@ def project_queue_vllm(wire: QueueVllmWireObservation, *, binding: HostQueueBind
 __all__ = [
     "API_HTTP_SNAPSHOT_CONTRACT",
     "HostQueueBinding",
+    "PULL_VERSION",
     "QueueVllmWireObservation",
     "QueueVllmWireValues",
     "ResidentIdentity",
@@ -295,6 +341,8 @@ __all__ = [
     "WIRE_VERSION",
     "WindowsGpuResidentSample",
     "WindowsHostResidentSample",
+    "WindowsResidentPullV1",
+    "decode_windows_resident_pull",
     "decode_windows_resident_sample",
     "project_queue_vllm",
 ]

@@ -10,9 +10,14 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     GpuObservation,
     HostCgroupObservation,
     QueueVllmObservation,
+    ResidentExporterPullProvenance,
     ResidentExporterSampleProvenance,
     parse_canonical_json_artifact,
 )
+
+# Historical v2/v3 frames carry the plain sample provenance; the R22 fresh-pull
+# path carries the request-bound witness. The union keeps old layouts readable.
+ResidentProvenance = ResidentExporterSampleProvenance | ResidentExporterPullProvenance
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +33,7 @@ class TelemetrySampleIdentity:
 class GpuLaneSnapshot:
     identity: TelemetrySampleIdentity
     gpu: GpuObservation
-    resident_exporter_provenance: ResidentExporterSampleProvenance | None = None
+    resident_exporter_provenance: ResidentProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +42,7 @@ class HostLaneSnapshot:
     api_process: ApiProcessObservation
     host_cgroup: HostCgroupObservation
     queue_vllm: QueueVllmObservation
-    resident_exporter_provenance: ResidentExporterSampleProvenance | None = None
+    resident_exporter_provenance: ResidentProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +106,7 @@ __all__ = [
     "GpuTelemetrySamplerPort",
     "HostLaneSnapshot",
     "HostTelemetrySamplerPort",
+    "ResidentProvenance",
     "ResidentTelemetryCollectorSpec",
     "TelemetrySampleIdentity",
     "TelemetrySnapshotContinuityLost",

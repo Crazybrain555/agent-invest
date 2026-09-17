@@ -86,10 +86,30 @@ def lines_of(records: Iterable[M6RunEvent]) -> tuple[bytes, ...]:
 
 # --- identities -------------------------------------------------------------
 
-def clock_domain(boot_label: str = "boot-a", *, frequency_hz: int = QPC_HZ) -> M6ClockDomain:
-    boot = digest("boot:" + boot_label)
+def windows_boot_identity(*, node_sha256: str, boot_counter: int) -> str:
+    """The native `m6.windows-boot-counter.v1` boot identity, recomputed here from the formula.
+
+    A campaign that carries a physical owner-identity record must use this encoding: the
+    product binds the record's own boot counter back to the frozen clock.
+    """
+    return canonical_json_sha256({"contract_version": "m6.windows-boot-counter.v1",
+                                  "windows_node_identity_sha256": node_sha256,
+                                  "boot_counter": boot_counter})
+
+
+def resident_boot_identity(*, node_sha256: str, boot_utc: str) -> str:
+    """The resident LastBootUpTime encoding of the same physical boot; not interchangeable."""
+    return canonical_json_sha256({"windows_node_identity_sha256": node_sha256, "boot_utc": boot_utc})
+
+
+def clock_domain(boot_label: str = "boot-a", *, frequency_hz: int = QPC_HZ,
+                 boot_identity_sha256: str | None = None,
+                 host_assignment_identity_sha256: str | None = None) -> M6ClockDomain:
+    boot = digest("boot:" + boot_label) if boot_identity_sha256 is None else boot_identity_sha256
     return M6ClockDomain(
-        host_assignment_identity_sha256=digest("host-assignment"),
+        host_assignment_identity_sha256=(digest("host-assignment")
+                                         if host_assignment_identity_sha256 is None
+                                         else host_assignment_identity_sha256),
         boot_identity_sha256=boot,
         qpc_frequency_hz=frequency_hz,
         clock_domain_identity_sha256=canonical_json_sha256({
@@ -157,8 +177,11 @@ def run_spec(
     boot_label: str = "boot-a", resources: M6ResourceEnvelope | None = None,
     run_id: str = "run-1", close_grace_seconds: int = CLOSE_GRACE_SECONDS,
     start_condition: str = "cold", profile_label: str = "profile-1",
+    clock: M6ClockDomain | None = None, runtime: M6RuntimeIdentity | None = None,
 ) -> M6RunSpec:
-    clock = clock_domain(boot_label)
+    # A caller that must agree with other physical evidence - a resident telemetry run, a
+    # native owner-identity record - supplies the exact clock/runtime identities it observed.
+    clock = clock_domain(boot_label) if clock is None else clock
     deadline = t0 + planned_seconds * clock.qpc_frequency_hz
     scope = (
         M6CampaignScope.from_manifest(manifest).canonical_sha256()
@@ -167,7 +190,8 @@ def run_spec(
     return M6RunSpec(
         run_id=run_id, campaign_id=manifest.campaign_id, mode=manifest.mode,
         phase=phase, start_condition=start_condition,  # type: ignore[arg-type]
-        clock=clock, runtime=runtime_identity(manifest.mode, profile_label=profile_label),
+        clock=clock,
+        runtime=runtime_identity(manifest.mode, profile_label=profile_label) if runtime is None else runtime,
         manifest_sha256=manifest.canonical_sha256(), scope_sha256=scope,
         quality_plan_sha256=plan.canonical_sha256(), t0_ticks=t0,
         planned_seconds=planned_seconds, deadline_ticks=deadline,

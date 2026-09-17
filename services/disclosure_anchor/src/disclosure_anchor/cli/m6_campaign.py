@@ -44,6 +44,8 @@ def _summary(args: argparse.Namespace) -> int:
             telemetry_run_id=args.telemetry_run_id,
             manifest=None if args.manifest is None else args.manifest.absolute(),
             quality_plan=None if args.quality_plan is None else args.quality_plan.absolute(),
+            telemetry_receipt_version=args.telemetry_receipt_version,
+            resident_owner_evidence_dir=None if args.resident_owner_evidence_dir is None else args.resident_owner_evidence_dir.absolute(),
         )
         report = build_delivery_report(
             plan=plan, intent=evidence.intent, spec=evidence.spec, receipt=evidence.receipt,
@@ -94,6 +96,10 @@ def main(argv: list[str] | None = None) -> int:
     summary_parser.add_argument("--telemetry-artifact-root", type=Path, default=None,
                                 help="private synchronized telemetry observer root holding <run-id>/{frames.jsonl,receipt.v3.json,seal.v3.json}")
     summary_parser.add_argument("--telemetry-run-id", default=None, help="observer run id under --telemetry-artifact-root")
+    summary_parser.add_argument("--telemetry-receipt-version", type=int, choices=(3, 4), default=3,
+                                help="observer protocol of the sealed run: 3 (historical) or 4 (R22 frozen plan, fresh pull, local monotonic window)")
+    summary_parser.add_argument("--resident-owner-evidence-dir", type=Path, default=None,
+                                help="v4 only: the resident owner's original evidence directory, replayed read-only (READY/start/closed/Job/mapping/CPU)")
     args = parser.parse_args(argv)
     if args.command == "summary":
         return _summary(args)

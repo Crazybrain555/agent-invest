@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 import hashlib
 import importlib
@@ -37,18 +38,29 @@ from disclosure_anchor.application.contracts.synchronized_telemetry import (
     QueueVllmObservationV2,
     SampleClock,
     SampleQuality,
+    ResidentExporterPullProvenance,
+    SynchronizedSamplingPlanV1,
     SynchronizedTelemetryFrameV2,
+    SynchronizedTelemetryFrameV3,
     SynchronizedTelemetryReceiptV2,
     SynchronizedTelemetryReceiptV3,
+    SynchronizedTelemetryReceiptV4,
     SynchronizedTelemetrySealV2,
     SynchronizedTelemetrySealV3,
+    SynchronizedTelemetrySealV4,
     FrozenApiProcessProfile,
     TelemetryObserverIdentity,
     TelemetryArtifactsV2,
     canonical_jsonl_artifact_sha256,
     derive_frame_evidence,
+    derive_frame_evidence_v4,
     parse_canonical_json_artifact,
     parse_canonical_jsonl_artifact,
+    sampling_seal_denominator_ns,
+)
+from disclosure_anchor.application.services.resident_measurement_policy import (
+    NS as _POLICY_NS,
+    SAMPLE_MAX_SECONDS as _POLICY_SAMPLE_MAX_SECONDS,
 )
 from disclosure_anchor.application.ports.synchronized_telemetry import (
     GpuLaneSnapshot,
@@ -69,11 +81,14 @@ MAX_RECEIPT_BYTES = 1024 * 1024
 FRAME_FILENAME = "frames.v2.jsonl"
 RECEIPT_FILENAME = "receipt.v2.json"
 SEAL_FILENAME = "seal.v2.json"
+FRAME_V3_FILENAME = "frames.v3.jsonl"
+PLAN_FILENAME = "sampling-plan.v1.json"
 _CLOCK_PAIR_ATTEMPTS = 3
 _MAX_CLOCK_PAIR_BRACKET_NS = 10_000_000
 
-TelemetryReceipt = SynchronizedTelemetryReceiptV2 | SynchronizedTelemetryReceiptV3
-TelemetrySeal = SynchronizedTelemetrySealV2 | SynchronizedTelemetrySealV3
+TelemetryReceipt = SynchronizedTelemetryReceiptV2 | SynchronizedTelemetryReceiptV3 | SynchronizedTelemetryReceiptV4
+TelemetrySeal = SynchronizedTelemetrySealV2 | SynchronizedTelemetrySealV3 | SynchronizedTelemetrySealV4
+TelemetryFrame = SynchronizedTelemetryFrameV2 | SynchronizedTelemetryFrameV3
 ApiProfile = contract_module.ProcessProfileLifecycle | FrozenApiProcessProfile
 
 
@@ -81,18 +96,26 @@ ApiProfile = contract_module.ProcessProfileLifecycle | FrozenApiProcessProfile
 class _ArtifactProtocol:
     receipt_filename: str
     seal_filename: str
-    receipt_model: type[SynchronizedTelemetryReceiptV2] | type[SynchronizedTelemetryReceiptV3]
-    seal_model: type[SynchronizedTelemetrySealV2] | type[SynchronizedTelemetrySealV3]
+    receipt_model: type[SynchronizedTelemetryReceiptV2] | type[SynchronizedTelemetryReceiptV3] | type[SynchronizedTelemetryReceiptV4]
+    seal_model: type[SynchronizedTelemetrySealV2] | type[SynchronizedTelemetrySealV3] | type[SynchronizedTelemetrySealV4]
+    frames_filename: str = FRAME_FILENAME
+    frame_model: type[SynchronizedTelemetryFrameV2] | type[SynchronizedTelemetryFrameV3] = SynchronizedTelemetryFrameV2
+    # Only the R22 protocol freezes a sampling plan file before the first collect.
+    plan_filename: str | None = None
 
 
 _V2 = _ArtifactProtocol(RECEIPT_FILENAME, SEAL_FILENAME, SynchronizedTelemetryReceiptV2, SynchronizedTelemetrySealV2)
 _V3 = _ArtifactProtocol("receipt.v3.json", "seal.v3.json", SynchronizedTelemetryReceiptV3, SynchronizedTelemetrySealV3)
+_V4 = _ArtifactProtocol(
+    "receipt.v4.json", "seal.v4.json", SynchronizedTelemetryReceiptV4, SynchronizedTelemetrySealV4,
+    frames_filename=FRAME_V3_FILENAME, frame_model=SynchronizedTelemetryFrameV3, plan_filename=PLAN_FILENAME,
+)
 
 
-def _artifact_protocol(version: Literal[2, 3]) -> _ArtifactProtocol:
-    if type(version) is not int or version not in (2, 3):
+def _artifact_protocol(version: Literal[2, 3, 4]) -> _ArtifactProtocol:
+    if type(version) is not int or version not in (2, 3, 4):
         raise ValueError("explicit supported observer receipt version required")
-    return _V3 if version == 3 else _V2
+    return {2: _V2, 3: _V3, 4: _V4}[version]
 
 
 class ObserverState(str, Enum):
@@ -136,7 +159,8 @@ class SynchronizedObserverResult:
     run_directory: Path
     receipt: TelemetryReceipt
     seal: TelemetrySeal
-    frames: tuple[SynchronizedTelemetryFrameV2, ...]
+    frames: tuple[TelemetryFrame, ...]
+    plan: SynchronizedSamplingPlanV1 | None = None
 
     @property
     def evidence_status(self) -> contract_module.RunStatus:
@@ -209,7 +233,8 @@ def _is_receipt_clock_divergence_validation_error(exc: ValidationError) -> bool:
 def _receipt_clock_diagnostic_note(
     *,
     receipt_model: type[SynchronizedTelemetryReceiptV2]
-    | type[SynchronizedTelemetryReceiptV3],
+    | type[SynchronizedTelemetryReceiptV3]
+    | type[SynchronizedTelemetryReceiptV4],
     start_clock: _ClockPair,
     finish_clock: _ClockPair,
 ) -> str | None:
@@ -265,7 +290,7 @@ class _PendingSample:
     started_monotonic_ns: int
     finished_monotonic_ns: int
     observed_at_utc: datetime
-    resident_exporter_provenance: contract_module.ResidentExporterSampleProvenance | None
+    resident_exporter_provenance: port_module.ResidentProvenance | None
     gpu: GpuObservationV2
     api_process: ApiProcessObservationV2
     host_cgroup: HostCgroupObservationV2
@@ -654,7 +679,7 @@ class _FrameWriter:
             _validate_private_directory_fd(self._run_fd, label="telemetry run")
             self._run_stat = _directory_stat_fd(self._run_fd)
             self._frames_fd: int | None = _open_new_private_at(
-                self._run_fd, FRAME_FILENAME
+                self._run_fd, protocol.frames_filename
             )
         except Exception:
             _close_descriptor(self._run_fd)
@@ -670,9 +695,44 @@ class _FrameWriter:
         self._frames_closed = False
         self._closed = False
         self._artifact_stats: dict[str, _ArtifactStat] = {}
-        self._artifact_fds: dict[str, int] = {FRAME_FILENAME: self._frames_fd}
+        self._artifact_fds: dict[str, int] = {protocol.frames_filename: self._frames_fd}
 
-    def append(self, frame: SynchronizedTelemetryFrameV2) -> None:
+    @property
+    def frame_count(self) -> int:
+        return self._frame_count
+
+    @property
+    def frame_bytes(self) -> int:
+        return self._frame_bytes
+
+    @property
+    def frames_sha256(self) -> str:
+        return "sha256:" + self._frame_hash.hexdigest()
+
+    def write_plan(self, plan: SynchronizedSamplingPlanV1) -> tuple[bytes, str]:
+        """Freeze the sampling plan as a new-only private file before any collect."""
+        if self._protocol.plan_filename is None:
+            raise SynchronizedTelemetryEvidenceError("this observer protocol has no sampling plan file")
+        if self._frame_count or self._frames_closed or self._run_fd is None or self._root_fd is None:
+            raise SynchronizedTelemetryEvidenceError("sampling plan must be frozen before the first frame")
+        payload = _canonical_json_bytes(plan.model_dump(mode="json"))
+        if len(payload) > self._limits.maximum_receipt_bytes:
+            raise _ArtifactBoundExceeded("sampling plan exceeds its bound")
+        descriptor = _open_new_private_at(self._run_fd, self._protocol.plan_filename)
+        self._artifact_fds[self._protocol.plan_filename] = descriptor
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.fsync(self._run_fd)
+        os.fsync(self._root_fd)
+        observed, metadata = self._bind_written_descriptor(
+            self._protocol.plan_filename, descriptor, maximum_bytes=self._limits.maximum_receipt_bytes,
+        )
+        if observed != payload:
+            raise SynchronizedTelemetryEvidenceError("sampling plan write bytes drifted")
+        self._artifact_stats[self._protocol.plan_filename] = metadata
+        return payload, "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    def append(self, frame: TelemetryFrame) -> None:
         if self._frames_closed:
             raise SynchronizedTelemetryEvidenceError("telemetry frame stream is closed")
         if self._frames_fd is None:
@@ -703,13 +763,13 @@ class _FrameWriter:
         self._frames_closed = True
         os.fsync(self._run_fd)
         payload, metadata = self._bind_written_descriptor(
-            FRAME_FILENAME,
+            self._protocol.frames_filename,
             self._frames_fd,
             maximum_bytes=self._limits.maximum_frame_file_bytes,
         )
         if "sha256:" + hashlib.sha256(payload).hexdigest() != "sha256:" + self._frame_hash.hexdigest():
             raise SynchronizedTelemetryEvidenceError("telemetry frame write bytes drifted")
-        self._artifact_stats[FRAME_FILENAME] = metadata
+        self._artifact_stats[self._protocol.frames_filename] = metadata
         return "sha256:" + self._frame_hash.hexdigest()
 
     def write_receipt(self, receipt: TelemetryReceipt) -> bytes:
@@ -742,7 +802,7 @@ class _FrameWriter:
 
     def replay_unsealed(
         self,
-    ) -> tuple[tuple[SynchronizedTelemetryFrameV2, ...], TelemetryReceipt]:
+    ) -> tuple[tuple[TelemetryFrame, ...], TelemetryReceipt]:
         if self._run_fd is None:
             raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
         self._validate_anchors()
@@ -778,7 +838,7 @@ class _FrameWriter:
         if self._run_fd is None:
             raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
         self._validate_anchors()
-        frames, receipt, seal = self._replay_open_descriptors(expect_seal=True)
+        frames, receipt, seal, plan = self._replay_open_descriptors(expect_seal=True)
         self._validate_anchors()
         if seal is None:
             raise SynchronizedTelemetryEvidenceError("telemetry seal is missing")
@@ -792,6 +852,7 @@ class _FrameWriter:
             receipt=receipt,
             seal=seal,
             frames=frames,
+            plan=plan,
         )
         self._close_success()
         return result
@@ -816,13 +877,16 @@ class _FrameWriter:
     def _replay_open_descriptors(
         self, *, expect_seal: bool
     ) -> tuple[
-        tuple[SynchronizedTelemetryFrameV2, ...],
+        tuple[TelemetryFrame, ...],
         TelemetryReceipt,
         TelemetrySeal | None,
+        SynchronizedSamplingPlanV1 | None,
     ]:
         if self._run_fd is None:
             raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
-        expected_names = [FRAME_FILENAME, self._protocol.receipt_filename]
+        expected_names = [self._protocol.frames_filename, self._protocol.receipt_filename]
+        if self._protocol.plan_filename is not None:
+            expected_names.append(self._protocol.plan_filename)
         if expect_seal:
             expected_names.append(self._protocol.seal_filename)
         names_before = sorted(os.listdir(self._run_fd))
@@ -833,7 +897,7 @@ class _FrameWriter:
             descriptor = self._artifact_fds[filename]
             maximum = (
                 self._limits.maximum_frame_file_bytes
-                if filename == FRAME_FILENAME
+                if filename == self._protocol.frames_filename
                 else self._limits.maximum_receipt_bytes
             )
             payload, metadata = _read_private_descriptor(
@@ -854,10 +918,11 @@ class _FrameWriter:
                 "telemetry run directory changed during descriptor replay"
             )
         return _parse_replay_payloads(
-            payloads[FRAME_FILENAME],
+            payloads[self._protocol.frames_filename],
             payloads[self._protocol.receipt_filename],
             payloads.get(self._protocol.seal_filename),
             protocol=self._protocol,
+            plan_payload=None if self._protocol.plan_filename is None else payloads[self._protocol.plan_filename],
         )
 
     def _validate_anchors(self) -> None:
@@ -930,6 +995,22 @@ def synchronized_observer_source_sha256() -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def sampling_duration_ns(duration_seconds: float) -> int:
+    """Exact integer nanoseconds from the owner's declared seconds; no float accumulation."""
+    if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, (int, float)) or not math.isfinite(duration_seconds):
+        raise ValueError("telemetry duration must be a finite number")
+    try:
+        scaled = Decimal(str(duration_seconds)) * _POLICY_NS
+    except InvalidOperation as exc:
+        raise ValueError("telemetry duration is not representable") from exc
+    if scaled != scaled.to_integral_value() or scaled <= 0:
+        raise ValueError("telemetry duration must be a positive whole number of nanoseconds")
+    duration_ns = int(scaled)
+    if duration_ns > _POLICY_SAMPLE_MAX_SECONDS * _POLICY_NS:
+        raise ValueError("telemetry duration exceeds the finite measurement ceiling")
+    return duration_ns
+
+
 def _observer_process_tree_cpu_ns() -> int:
     """Cumulative parent plus reaped collector CPU for the pre-seal interval."""
 
@@ -957,16 +1038,28 @@ def run_synchronized_telemetry_observer(
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
     process_cpu_ns: Callable[[], int] = lambda: _observer_process_tree_cpu_ns(),
+    receipt_version: Literal[3, 4] | None = None,
+    owner_intent_sha256: str | None = None,
+    on_plan_recorded: Callable[[SynchronizedSamplingPlanV1, bytes, str], None] | None = None,
+    on_sampling_drained: Callable[[dict[str, object]], None] | None = None,
 ) -> SynchronizedObserverResult:
     """Run independent lanes; explicit separate identities select receipt v3.
 
     Legacy v2 keeps its original model and interpretation for deterministic
     replay. A real cross-host owner must provide both a FrozenApiProcessProfile
     and an independently bound TelemetryObserverIdentity; no mixed fallback.
+    ``receipt_version=4`` (R22) additionally freezes the sampling plan from the
+    owner intent before the first collect, writes frame v3 with fresh-pull
+    witnesses, scores slots against the plan and announces ``sampling_drained``
+    before the expensive replay; it is never selected implicitly.
     """
 
     state = ObserverState.INIT
+    if receipt_version not in (None, 3, 4):
+        raise ValueError("explicit supported observer receipt version required")
     if observer_identity is None:
+        if receipt_version is not None:
+            raise ValueError("an explicit receipt version requires a separate observer identity")
         if not isinstance(process_profile, contract_module.ProcessProfileLifecycle):
             raise ValueError("v3 API profile requires a separate observer identity")
         protocol = _V2
@@ -974,12 +1067,21 @@ def run_synchronized_telemetry_observer(
     else:
         if not isinstance(process_profile, FrozenApiProcessProfile):
             raise ValueError("v3 observer identity requires a clock-free API profile")
-        protocol = _V3
+        protocol = _V4 if receipt_version == 4 else _V3
         observer_clock_domain = observer_identity.clock_domain_identity_sha256
     if not 250 <= gpu_interval_ms <= 500:
         raise ValueError("GPU telemetry cadence must be 250-500ms")
     if not math.isfinite(duration_seconds) or not duration_seconds > 0:
         raise ValueError("telemetry duration must be positive")
+    duration_ns: int | None = None
+    if protocol is _V4:
+        if owner_intent_sha256 is None or not contract_module._SHA256_RE.fullmatch(owner_intent_sha256):
+            raise ValueError("the v4 observer requires the owner intent identity")
+        if gpu_interval_ms not in (250, 500):
+            raise ValueError("the v4 plan freezes a 250 or 500 ms GPU cadence")
+        duration_ns = sampling_duration_ns(duration_seconds)
+    elif owner_intent_sha256 is not None or on_plan_recorded is not None or on_sampling_drained is not None:
+        raise ValueError("plan/drain callbacks belong to the v4 observer only")
     resolved_run_id = str(uuid.UUID(run_id)) if run_id is not None else str(uuid.uuid4())
     if resolved_run_id != (run_id or resolved_run_id):
         raise ValueError("run_id is not canonical")
@@ -1035,7 +1137,23 @@ def run_synchronized_telemetry_observer(
         start_wall = start_clock.wall
         start_monotonic = start_clock.monotonic_ns
         process_cpu_started = process_cpu_ns()
-        end_deadline = start_monotonic + int(duration_seconds * 1_000_000_000)
+        plan: SynchronizedSamplingPlanV1 | None = None
+        plan_sha256: str | None = None
+        if duration_ns is not None:
+            assert owner_intent_sha256 is not None
+            plan = SynchronizedSamplingPlanV1(
+                run_id=resolved_run_id, owner_intent_sha256=owner_intent_sha256,
+                observer_clock_domain_identity_sha256=observer_clock_domain,
+                started_monotonic_ns=start_monotonic, duration_ns=duration_ns,
+                planned_end_monotonic_ns=start_monotonic + duration_ns,
+                gpu_nominal_interval_ms=cast(Literal[250, 500], gpu_interval_ms),
+            )
+            plan_bytes, plan_sha256 = writer.write_plan(plan)
+            if on_plan_recorded is not None:
+                on_plan_recorded(plan, plan_bytes, plan_sha256)
+            end_deadline = plan.planned_end_monotonic_ns
+        else:
+            end_deadline = start_monotonic + int(duration_seconds * 1_000_000_000)
         observer_source = synchronized_observer_source_sha256()
     except BaseException as exc:
         for invocation in invocations:
@@ -1110,7 +1228,7 @@ def run_synchronized_telemetry_observer(
             daemon=False,
         ),
     ]
-    frames: list[SynchronizedTelemetryFrameV2] = []
+    frames: list[TelemetryFrame] = []
     state = ObserverState.RUNNING
     started_threads: list[threading.Thread] = []
     try:
@@ -1129,6 +1247,7 @@ def run_synchronized_telemetry_observer(
             termination=termination,
             internal_stop=internal_stop,
             gpu_interval_ms=gpu_interval_ms,
+            protocol=protocol,
         )
         state = ObserverState.DRAINING
         for thread in started_threads:
@@ -1149,11 +1268,25 @@ def run_synchronized_telemetry_observer(
         finish_wall = finish_clock.wall
         frame_digest = writer.close_frames()
         frame_tuple = tuple(frames)
-        lane_quality, unsupported_count = derive_frame_evidence(
-            cast(tuple[contract_module.SynchronizedTelemetryFrame, ...], frame_tuple),
-            started_monotonic_ns=start_monotonic,
-            finished_monotonic_ns=finish_monotonic,
-        )
+        if plan is not None and on_sampling_drained is not None:
+            # Collectors are joined, closed and the JSONL is fsynced: the owner
+            # may now close the native sources; the replay below is not waited for.
+            on_sampling_drained({
+                "kind": "sampling_drained", "run_id": resolved_run_id, "sampling_plan_sha256": plan_sha256,
+                "drained_monotonic_ns": monotonic_ns(), "frames_jsonl_sha256": frame_digest,
+                "frames_bytes": writer.frame_bytes, "frames_records": writer.frame_count,
+            })
+        slot_coverage_v4: tuple[contract_module.LaneSlotCoverageV4, contract_module.LaneSlotCoverageV4] | None = None
+        if plan is not None:
+            lane_quality, slot_coverage_v4, unsupported_count = derive_frame_evidence_v4(
+                cast(tuple[SynchronizedTelemetryFrameV3, ...], frame_tuple), plan=plan,
+            )
+        else:
+            lane_quality, unsupported_count = derive_frame_evidence(
+                cast(tuple[contract_module.SynchronizedTelemetryFrame, ...], frame_tuple),
+                started_monotonic_ns=start_monotonic,
+                finished_monotonic_ns=finish_monotonic,
+            )
         wall_ns = int((finish_wall - start_wall).total_seconds() * 1_000_000_000)
         monotonic_elapsed_ns = finish_monotonic - start_monotonic
         clock_divergence_ns = abs(wall_ns - monotonic_elapsed_ns)
@@ -1182,6 +1315,7 @@ def run_synchronized_telemetry_observer(
                     or quality.supported_frame_count == 0
                     for quality in lane_quality
                 )
+                or (slot_coverage_v4 is not None and any(item.missing_slots > 0 for item in slot_coverage_v4))
                 else "complete"
             ),
             "lane_quality": lane_quality,
@@ -1196,6 +1330,11 @@ def run_synchronized_telemetry_observer(
         }
         if observer_identity is not None:
             receipt_payload["observer_identity"] = observer_identity
+        if plan is not None:
+            receipt_payload.update({
+                "sampling_plan_sha256": plan_sha256, "duration_ns": plan.duration_ns,
+                "planned_end_monotonic_ns": plan.planned_end_monotonic_ns, "slot_coverage": slot_coverage_v4,
+            })
         try:
             receipt = protocol.receipt_model.model_validate(receipt_payload)
         except ValidationError as exc:
@@ -1208,28 +1347,40 @@ def run_synchronized_telemetry_observer(
                 if diagnostic_note is not None:
                     exc.add_note(diagnostic_note)
             raise
-        validate_synchronized_telemetry_v2(frame_tuple, receipt=receipt)
+        if isinstance(receipt, SynchronizedTelemetryReceiptV4):
+            assert plan is not None
+            validate_synchronized_telemetry_v4(cast(tuple[SynchronizedTelemetryFrameV3, ...], frame_tuple), receipt=receipt, plan=plan)
+            denominator_ns = sampling_seal_denominator_ns(receipt)
+        else:
+            validate_synchronized_telemetry_v2(cast(tuple[SynchronizedTelemetryFrameV2, ...], frame_tuple), receipt=receipt)
+            denominator_ns = monotonic_elapsed_ns
         receipt_bytes = writer.write_receipt(receipt)
         replay_frames, replay_receipt = writer.replay_unsealed()
         if replay_frames != frame_tuple or replay_receipt != receipt:
             raise SynchronizedTelemetryEvidenceError("mandatory pre-seal replay drifted")
         process_cpu_finished = process_cpu_ns()
-        seal = protocol.seal_model(
-            run_id=resolved_run_id,
-            receipt_sha256="sha256:" + hashlib.sha256(receipt_bytes).hexdigest(),
-            frames_jsonl_sha256=frame_digest,
-            preseal_observer_process_cpu_started_ns=process_cpu_started,
-            preseal_observer_process_cpu_finished_ns=process_cpu_finished,
-            preseal_observer_cpu_ns=process_cpu_finished - process_cpu_started,
-            sampling_elapsed_ns_denominator=monotonic_elapsed_ns,
-            receipt_status=receipt.status,
-            status=(
+        seal_payload: dict[str, object] = {
+            "run_id": resolved_run_id,
+            "receipt_sha256": "sha256:" + hashlib.sha256(receipt_bytes).hexdigest(),
+            "frames_jsonl_sha256": frame_digest,
+            "preseal_observer_process_cpu_started_ns": process_cpu_started,
+            "preseal_observer_process_cpu_finished_ns": process_cpu_finished,
+            "preseal_observer_cpu_ns": process_cpu_finished - process_cpu_started,
+            "sampling_elapsed_ns_denominator": denominator_ns,
+            "receipt_status": receipt.status,
+            "status": (
                 "unsafe"
                 if receipt.status == "unsafe"
-                or (process_cpu_finished - process_cpu_started) / monotonic_elapsed_ns > 0.02
+                or (process_cpu_finished - process_cpu_started) / denominator_ns > 0.02
                 else receipt.status
             ),
-        )
+        }
+        if plan is not None:
+            seal_payload.update({
+                "sampling_plan_sha256": plan_sha256, "lifecycle_elapsed_ns": monotonic_elapsed_ns,
+                "frames_records": writer.frame_count, "frames_bytes": writer.frame_bytes,
+            })
+        seal = protocol.seal_model.model_validate(seal_payload)
         writer.write_seal(seal)
         replay = writer.replay_sealed()
         state = ObserverState.SEALED
@@ -1251,9 +1402,15 @@ def run_synchronized_telemetry_observer(
 
 
 def verify_synchronized_telemetry_observer(
-    *, artifact_root: Path, run_id: str, receipt_version: Literal[2, 3] = 2,
+    *, artifact_root: Path, run_id: str, receipt_version: Literal[2, 3, 4] = 2,
+    deadline_monotonic_ns: int | None = None,
 ) -> SynchronizedObserverResult:
-    """Replay exact private files and recompute hashes, clocks, CPU and lanes."""
+    """Replay exact private files and recompute hashes, clocks, CPU and lanes.
+
+    ``deadline_monotonic_ns`` is the caller's absolute local deadline for this
+    expensive step; the frame parse checks it every 64 rows rather than only
+    after unbounded work.
+    """
 
     canonical_run_id = str(uuid.UUID(run_id))
     protocol = _artifact_protocol(receipt_version)
@@ -1268,7 +1425,9 @@ def verify_synchronized_telemetry_observer(
         )
         try:
             _validate_private_directory_fd(run_fd, label="telemetry run")
-            frames, receipt, seal = _replay_artifacts_at(run_fd, expect_seal=True, protocol=protocol)
+            frames, receipt, seal, plan = _replay_artifacts_at(
+                run_fd, expect_seal=True, protocol=protocol, deadline_monotonic_ns=deadline_monotonic_ns,
+            )
         finally:
             os.close(run_fd)
     finally:
@@ -1284,6 +1443,7 @@ def verify_synchronized_telemetry_observer(
         receipt=receipt,
         seal=seal,
         frames=frames,
+        plan=plan,
     )
 
 
@@ -1293,12 +1453,16 @@ def _replay_artifacts_at(
     expect_seal: bool,
     expected_stats: dict[str, _ArtifactStat] | None = None,
     protocol: _ArtifactProtocol = _V2,
+    deadline_monotonic_ns: int | None = None,
 ) -> tuple[
-    tuple[SynchronizedTelemetryFrameV2, ...],
+    tuple[TelemetryFrame, ...],
     TelemetryReceipt,
     TelemetrySeal | None,
+    SynchronizedSamplingPlanV1 | None,
 ]:
-    expected = [FRAME_FILENAME, protocol.receipt_filename]
+    expected = [protocol.frames_filename, protocol.receipt_filename]
+    if protocol.plan_filename is not None:
+        expected.append(protocol.plan_filename)
     if expect_seal:
         expected.append(protocol.seal_filename)
     names_before = sorted(os.listdir(run_fd))
@@ -1306,10 +1470,18 @@ def _replay_artifacts_at(
         raise ValueError("telemetry run artifacts are incomplete or unexpected")
     frames_payload = _read_private_file_at(
         run_fd,
-        FRAME_FILENAME,
+        protocol.frames_filename,
         maximum_bytes=MAX_FRAME_FILE_BYTES,
-        expected_stat=(expected_stats or {}).get(FRAME_FILENAME),
+        expected_stat=(expected_stats or {}).get(protocol.frames_filename),
     )
+    plan_payload = None
+    if protocol.plan_filename is not None:
+        plan_payload = _read_private_file_at(
+            run_fd,
+            protocol.plan_filename,
+            maximum_bytes=MAX_RECEIPT_BYTES,
+            expected_stat=(expected_stats or {}).get(protocol.plan_filename),
+        )
     receipt_payload = _read_private_file_at(
         run_fd,
         protocol.receipt_filename,
@@ -1324,7 +1496,10 @@ def _replay_artifacts_at(
             maximum_bytes=MAX_RECEIPT_BYTES,
             expected_stat=(expected_stats or {}).get(protocol.seal_filename),
         )
-    result = _parse_replay_payloads(frames_payload, receipt_payload, seal_payload, protocol=protocol)
+    result = _parse_replay_payloads(
+        frames_payload, receipt_payload, seal_payload, protocol=protocol, plan_payload=plan_payload,
+        deadline_monotonic_ns=deadline_monotonic_ns,
+    )
     if sorted(os.listdir(run_fd)) != names_before:
         raise ValueError("telemetry run directory changed during replay")
     return result
@@ -1335,10 +1510,13 @@ def _parse_replay_payloads(
     receipt_payload: bytes,
     seal_payload: bytes | None,
     *, protocol: _ArtifactProtocol = _V2,
+    plan_payload: bytes | None = None,
+    deadline_monotonic_ns: int | None = None,
 ) -> tuple[
-    tuple[SynchronizedTelemetryFrameV2, ...],
+    tuple[TelemetryFrame, ...],
     TelemetryReceipt,
     TelemetrySeal | None,
+    SynchronizedSamplingPlanV1 | None,
 ]:
     frame_values = parse_canonical_jsonl_artifact(
         frames_payload,
@@ -1347,14 +1525,33 @@ def _parse_replay_payloads(
         maximum_record_bytes=MAX_FRAME_RECORD_BYTES,
         maximum_records=MAX_FRAME_RECORDS,
     )
-    frames = tuple(SynchronizedTelemetryFrameV2.model_validate(value) for value in frame_values)
+    parsed: list[TelemetryFrame] = []
+    for index, value in enumerate(frame_values):
+        if deadline_monotonic_ns is not None and index % 64 == 0 and time.monotonic_ns() >= deadline_monotonic_ns:
+            raise TimeoutError("telemetry replay deadline passed while parsing frames")
+        parsed.append(protocol.frame_model.model_validate(value))
+    frames: tuple[TelemetryFrame, ...] = tuple(parsed)
     receipt = protocol.receipt_model.model_validate(
         parse_canonical_json_artifact(receipt_payload, label="receipt", maximum_bytes=MAX_RECEIPT_BYTES)
     )
     frames_hash = canonical_jsonl_artifact_sha256(frames_payload, label="frames")
     if frames_hash != receipt.artifacts.frames_jsonl_sha256:
         raise ValueError("telemetry frames artifact hash drifted")
-    validate_synchronized_telemetry_v2(frames, receipt=receipt)
+    plan: SynchronizedSamplingPlanV1 | None = None
+    if (plan_payload is None) != (protocol.plan_filename is None):
+        raise ValueError("telemetry sampling plan presence disagrees with the protocol")
+    if isinstance(receipt, SynchronizedTelemetryReceiptV4):
+        assert plan_payload is not None
+        plan = SynchronizedSamplingPlanV1.model_validate(
+            parse_canonical_json_artifact(plan_payload, label="sampling plan", maximum_bytes=MAX_RECEIPT_BYTES)
+        )
+        if receipt.sampling_plan_sha256 != "sha256:" + hashlib.sha256(plan_payload).hexdigest():
+            raise ValueError("telemetry receipt is not bound to its sampling plan bytes")
+        validate_synchronized_telemetry_v4(
+            cast(tuple[SynchronizedTelemetryFrameV3, ...], frames), receipt=receipt, plan=plan,
+        )
+    else:
+        validate_synchronized_telemetry_v2(cast(tuple[SynchronizedTelemetryFrameV2, ...], frames), receipt=receipt)
     seal: TelemetrySeal | None = None
     if seal_payload is not None:
         seal = protocol.seal_model.model_validate(
@@ -1363,12 +1560,19 @@ def _parse_replay_payloads(
         receipt_hash = "sha256:" + hashlib.sha256(receipt_payload).hexdigest()
         if seal.run_id != receipt.run_id or seal.receipt_sha256 != receipt_hash or seal.frames_jsonl_sha256 != frames_hash:
             raise ValueError("telemetry seal artifact identity drifted")
-        if seal.sampling_elapsed_ns_denominator != receipt.finished_monotonic_ns - receipt.started_monotonic_ns:
+        if isinstance(seal, SynchronizedTelemetrySealV4):
+            assert isinstance(receipt, SynchronizedTelemetryReceiptV4)
+            if (seal.sampling_elapsed_ns_denominator != sampling_seal_denominator_ns(receipt)
+                    or seal.lifecycle_elapsed_ns != receipt.finished_monotonic_ns - receipt.started_monotonic_ns
+                    or seal.sampling_plan_sha256 != receipt.sampling_plan_sha256
+                    or seal.frames_records != len(frames) or seal.frames_bytes != len(frames_payload)):
+                raise ValueError("telemetry seal v4 plan/denominator/raw counts drifted")
+        elif seal.sampling_elapsed_ns_denominator != receipt.finished_monotonic_ns - receipt.started_monotonic_ns:
             raise ValueError("telemetry seal elapsed interval drifted")
         expected_status = "unsafe" if receipt.status == "unsafe" or seal.preseal_observer_cpu_ns / seal.sampling_elapsed_ns_denominator > 0.02 else receipt.status
         if seal.receipt_status != receipt.status or seal.status != expected_status:
             raise ValueError("telemetry seal status drifted")
-    return frames, receipt, seal
+    return frames, receipt, seal, plan
 
 
 def validate_synchronized_telemetry_v2(
@@ -1453,6 +1657,74 @@ def validate_synchronized_telemetry_v2(
             if frame.lane == "gpu_fast"
             else (frame.api_process, frame.host_cgroup, frame.queue_vllm)
         )
+        if observation.status == "unsupported"
+    }
+    if not set(receipt.safety_drift_reasons).issubset(required_reasons):
+        raise ValueError("telemetry safety drift lacks required unsupported evidence")
+
+
+def validate_synchronized_telemetry_v4(
+    frames: tuple[SynchronizedTelemetryFrameV3, ...],
+    *,
+    receipt: SynchronizedTelemetryReceiptV4,
+    plan: SynchronizedSamplingPlanV1,
+) -> None:
+    """Frame v3 identity/continuity binding and plan-bounded evidence recomputation."""
+    if not frames:
+        raise ValueError("telemetry frame sequence is empty")
+    if (receipt.run_id != plan.run_id or receipt.started_monotonic_ns != plan.started_monotonic_ns
+            or receipt.duration_ns != plan.duration_ns or receipt.planned_end_monotonic_ns != plan.planned_end_monotonic_ns
+            or receipt.clock_domain_identity_sha256 != plan.observer_clock_domain_identity_sha256):
+        raise ValueError("telemetry receipt window differs from its sampling plan")
+    resident_previous: dict[str, contract_module.ResidentExporterPullProvenance] = {}
+    resident_host_identity: tuple[str, str] | None = None
+    for sequence, frame in enumerate(frames):
+        if frame.sequence != sequence or frame.run_id != receipt.run_id:
+            raise ValueError("telemetry frame sequence or run identity drifted")
+        if (
+            frame.runtime_bundle_identity_sha256 != receipt.runtime_bundle_identity_sha256
+            or frame.process_profile_sha256 != receipt.process_profile.process_profile_sha256
+            or frame.observer_source_sha256 != receipt.observer_source_sha256
+            or frame.clock.clock_domain_identity_sha256 != receipt.clock_domain_identity_sha256
+        ):
+            raise ValueError("telemetry frame identity drifted")
+        if frame.lane == "gpu_fast":
+            if any(
+                observation.status != "unsupported" or observation.reason != "not_due_at_this_tick"
+                for observation in (frame.api_process, frame.host_cgroup, frame.queue_vllm)
+            ):
+                raise ValueError("GPU lane carries observations owned by the host lane")
+        elif frame.gpu.status != "unsupported" or frame.gpu.reason != "not_due_at_this_tick":
+            raise ValueError("host lane carries an observation owned by the GPU lane")
+        if frame.api_process.values is not None and frame.api_process.values.process_epoch_sha256 != receipt.process_profile.process_epoch_sha256:
+            raise ValueError("v4 API process epoch differs from the observed profile")
+        if frame.queue_vllm.values is not None and frame.queue_vllm.values.api_max_pending_tasks != receipt.process_profile.parameters.api_max_pending_tasks:
+            raise ValueError("v4 queue admission limit differs from the observed profile")
+        provenance = frame.resident_exporter_provenance
+        host_identity = (provenance.host_assignment_identity_sha256, provenance.boot_identity_sha256)
+        if resident_host_identity is None:
+            resident_host_identity = host_identity
+        elif resident_host_identity != host_identity:
+            raise ValueError("resident exporter host or boot identity drifted")
+        previous = resident_previous.get(frame.lane)
+        if previous is not None and (
+            provenance.exporter_source_sha256 != previous.exporter_source_sha256
+            or provenance.exporter_process_epoch_sha256 != previous.exporter_process_epoch_sha256
+            or provenance.wire_sequence != previous.wire_sequence + 1
+            or provenance.wire_sampled_monotonic_ns <= previous.wire_sampled_monotonic_ns
+            or provenance.native_request_received_monotonic_ns < previous.native_reply_started_monotonic_ns
+        ):
+            raise ValueError("resident exporter sequence or identity drifted")
+        resident_previous[frame.lane] = provenance
+    if set(resident_previous) != {"gpu_fast", "host_slow"}:
+        raise ValueError("resident exporter provenance is missing one lane")
+    lane_quality, slot_coverage, unsupported = derive_frame_evidence_v4(frames, plan=plan)
+    if lane_quality != receipt.lane_quality or slot_coverage != receipt.slot_coverage or unsupported != receipt.unsupported_observation_count:
+        raise ValueError("telemetry receipt evidence drifted")
+    required_reasons = {
+        observation.reason
+        for frame in frames
+        for observation in ((frame.gpu,) if frame.lane == "gpu_fast" else (frame.api_process, frame.host_cgroup, frame.queue_vllm))
         if observation.status == "unsupported"
     }
     if not set(receipt.safety_drift_reasons).issubset(required_reasons):
@@ -1635,7 +1907,7 @@ def _merge_lane_mailboxes(
     mailboxes: dict[str, _Mailbox],
     condition: threading.Condition,
     writer: _FrameWriter,
-    frames: list[SynchronizedTelemetryFrameV2],
+    frames: list[TelemetryFrame],
     run_id: str,
     process_profile: ApiProfile,
     observer_clock_domain: str,
@@ -1643,6 +1915,7 @@ def _merge_lane_mailboxes(
     termination: _Termination,
     internal_stop: threading.Event,
     gpu_interval_ms: int,
+    protocol: _ArtifactProtocol = _V2,
 ) -> None:
     heads: dict[str, _PendingSample | None] = {
         "gpu_fast": None,
@@ -1716,7 +1989,13 @@ def _merge_lane_mailboxes(
             missed = scheduled_ns // nominal_ns - 1
             status = "late" if missed else "on_time"
             observed_interval_ms = observed_ns / 1_000_000
-        frame = SynchronizedTelemetryFrameV2(
+        if protocol.frame_model is SynchronizedTelemetryFrameV3 and not isinstance(
+            pending.resident_exporter_provenance, ResidentExporterPullProvenance
+        ):
+            raise SynchronizedTelemetryEvidenceError(
+                "fresh-per-request witness missing; the v4 observer accepts only pull provenance"
+            )
+        frame: TelemetryFrame = protocol.frame_model.model_validate(dict(
             run_id=run_id,
             sequence=len(frames),
             lane=pending.lane,
@@ -1749,7 +2028,7 @@ def _merge_lane_mailboxes(
             api_process=pending.api_process,
             host_cgroup=pending.host_cgroup,
             queue_vllm=pending.queue_vllm,
-        )
+        ))
         try:
             writer.append(frame)
         except _ArtifactBoundExceeded:
@@ -2190,6 +2469,7 @@ def _close_descriptor(descriptor: int | None) -> None:
 
 
 __all__ = [
+    "sampling_duration_ns",
     "ObserverState",
     "SynchronizedObserverLimits",
     "SynchronizedObserverResult",

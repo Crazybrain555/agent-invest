@@ -471,12 +471,24 @@ Windows 上对已 stage 的入口跑一次不存在 config 的负向调用：Mac
 两个入口丢失 `Get-MineruBootstrapSha`/`Read-MineruBootstrap` 正是这样漏到实机的。resident owner 在等 READY 控制时同步
 轮询两个 starter：starter 先于 READY/observer 结束即按 lane 命名失败并立即保留其 exit/stdout/stderr；失败路径先做有界
 drain（poll ≤0.25 s）再 abort，`failure-command-N.state.json` 记录 exit/是否先于 abort 结束/保留统计。
+R22 测量协议（v4）：owner 显式选 `receipt_version=4`；observer 首次采集前把 `owner-intent.json` 的时长投影为不可变
+`sampling-plan.v1.json`，帧为 `frames.v3.jsonl`（每帧带 nonce/after/s/f/a/d/b 的 fresh-pull 见证），`receipt.v4.json`/`seal.v4.json`
+绑定 plan hash，CPU 分母为固定 D；native 端点只在 `/after/{n}/request/{nonce}` 上按请求新采集（无自主定时/缓存）。关闭顺序：
+`sampling_drained` 控制事件后先并行关 native lane，再等 child 退出、再做完整回放；plan.end+10 s 无 drained 记
+`telemetry_drain_timeout`，plan.end+60 s 为全部收尾步骤（关 lane、starter/closed 控制收尾、child 退出、回放）的绝对截止，
+每步取 min(自身上限, 剩余)，回放每 64 行检查一次。owner 在 `plan_recorded` 时即有界读取 child 原始 plan 文件、校验 hash/intent/时长/run/
+observer identity/cadence 后才写入证据目录 `sampling-plan.v1.json` 并推导截止；不符即在采样前结束。summary 用 `--telemetry-receipt-version 4` 读 v4，
+`--resident-owner-evidence-dir` 只读回放 owner 原始 READY/start/closed/Job/mapping/CPU；缺失记 named unknown。v4 summary 要求
+owner-result 为 `mineru.resident-owner-diagnostic.v2`/receipt 4，plan 字节 hash 等于 receipt 所绑 plan，plan 的 owner_intent_sha256 与
+duration_ns 分别等于原始 owner-intent 字节与其 duration_seconds；starter 原始 stdout 与 closed 观测的 job_raw 逐字节一致（与在线 owner 同一校验）。
+旧 v2/v3 记录只读保留，不补字段升级。
 任何 live session/负载之前，先把最近一次真实捕获的 `/health`+HTTP snapshot+metrics 离线推过当前产品路径
 （`decode_windows_resident_sample` → `project_queue_vllm`，绑定 exact capacity/profile/READY 身份）：hash 一致只证明跑的是哪份代码，
 不证明它与当前 serving API 兼容。
-有限诊断链的寿命上限（R21 F10，仅此链）：Mac observer/resident 采样 ≤8300 s，resident-owner lane lifetime ≤8380 s，
-wire/config lane lifetime ≤8390 s，底层 finite deadline/Job 上限 8400 s；60 s 采样收尾、20 s 控制余量与 30 s lease 不变。
-`BoundedOwnerCommand` 默认上限仍 7200 s，只有 resident start 传输与 M6 campaign 的 launcher 传输（预算超过 7200 s 时，G3 为 7605 s）显式选 8400 s；生产 worker 循环不经 `BoundedOwnerCommand`，无总运行时限；安装器 7200000 ms 与 M6 业务
+有限诊断链的寿命上限（R22 向量，仅此链；来源 `resident_measurement_policy.py`）：Mac observer/resident 采样 ≤8500 s，
+resident-owner lane lifetime ≤8580 s（= 采样 + 20 s pre-GO + 60 s 收尾），wire/config lane lifetime ≤8590 s，底层 finite
+deadline/Job/有限命令上限 8600 s；30 s lease 不变。lane 实际 lifetime 按各自 D 取 D+80 s，短测不跑满 8580。
+`BoundedOwnerCommand` 默认上限仍 7200 s，只有 resident start 传输与 M6 campaign 的 launcher 传输（预算超过 7200 s 时，G3 为 7605 s）显式选 8600 s；生产 worker 循环不经 `BoundedOwnerCommand`，无总运行时限；安装器 7200000 ms 与 M6 业务
 planned/grace/max_close（4800/2400/7200）不变。跨语言常量由独立上限向量核验，改动 telemetry assembly 源后须重建其
 manifest/DLL 并刷新 release inventory，不重装 API。
 跨主机运行显式选择 observer receipt/seal v3：API profile 不携带本机启动时钟，Mac observer

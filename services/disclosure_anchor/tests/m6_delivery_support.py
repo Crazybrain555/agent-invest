@@ -68,7 +68,8 @@ def campaign_intent_for_spec(spec, plan, **overrides) -> M6CampaignIntent:
 
 
 def publication_case(*, threshold: bool = False, omit_final: str | None = None,
-                     physical_owner: tuple[int, int] | None = None) -> DeliveryCase:
+                     physical_owner: tuple[int, int] | None = None,
+                     **spec_kwargs: object) -> DeliveryCase:
     """Boundary vector: seven fresh + replay/carry-in/prior-publication sources.
 
     a is one tick before 600; b is on 600; c/d straddle 1800 by one
@@ -98,6 +99,7 @@ def publication_case(*, threshold: bool = False, omit_final: str | None = None,
         "e2e_publication", entries, planned_seconds=4800, close_grace_seconds=2400,
         phase="hour_baseline", carry_in=carry_in,
         resources=m6.envelope(max_attempts=100, max_events=1000, max_log_bytes=8_000_000),
+        **spec_kwargs,
     )
     # Independent native ProcessEpoch formula, bound before any journal event
     # exists. Do not splice one real owner's exit into another synthetic run.

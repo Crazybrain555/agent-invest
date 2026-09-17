@@ -11,6 +11,13 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
+from disclosure_anchor.application.services.resident_measurement_policy import (
+    NS as _POLICY_NS,
+    SAMPLE_MAX_SECONDS as _POLICY_SAMPLE_MAX_SECONDS,
+    SamplingPlan,
+    slot_coverage as _policy_slot_coverage,
+)
+
 
 TELEMETRY_FRAME_VERSION: Literal["mineru.synchronized-telemetry-frame.v1"] = (
     "mineru.synchronized-telemetry-frame.v1"
@@ -38,6 +45,18 @@ PHASE_SUMMARY_VERSION: Literal["mineru.synchronized-phase-summary.v1"] = (
 )
 PHASE_CLOCK_BINDING_VERSION: Literal["mineru.phase-clock-binding.v1"] = (
     "mineru.phase-clock-binding.v1"
+)
+SAMPLING_PLAN_V1_VERSION: Literal["mineru.synchronized-sampling-plan.v1"] = (
+    "mineru.synchronized-sampling-plan.v1"
+)
+TELEMETRY_FRAME_V3_VERSION: Literal["mineru.synchronized-telemetry-frame.v3"] = (
+    "mineru.synchronized-telemetry-frame.v3"
+)
+TELEMETRY_RECEIPT_V4_VERSION: Literal["mineru.synchronized-telemetry-receipt.v4"] = (
+    "mineru.synchronized-telemetry-receipt.v4"
+)
+TELEMETRY_SEAL_V4_VERSION: Literal["mineru.synchronized-telemetry-seal.v4"] = (
+    "mineru.synchronized-telemetry-seal.v4"
 )
 
 _SCHEMA_ROOT = "https://agent-invest.local/contracts/operational/"
@@ -1226,6 +1245,325 @@ class PhaseClockBinding(_FrozenModel):
         return self
 
 
+# --- R22 measured protocol: frozen plan, fresh-per-request provenance, frame v3, receipt v4, seal v4 ---
+# The v2/v3 contracts above are historical read-only formats; nothing below is
+# selected by a missing field. The live owner chooses receipt_version 4 explicitly.
+
+
+class SynchronizedSamplingPlanV1(_FrozenModel):
+    """Immutable projection of the owner's retained intent, frozen before the first collect.
+
+    ``planned_end_monotonic_ns`` is derived from the integer duration, never
+    from the last available frame; a cancelled run keeps the same plan.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-sampling-plan.v1.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-sampling-plan.v1"] = SAMPLING_PLAN_V1_VERSION
+    run_id: str
+    owner_intent_sha256: str
+    observer_clock_domain_identity_sha256: str
+    started_monotonic_ns: int = Field(ge=1)
+    duration_ns: int = Field(ge=1)
+    planned_end_monotonic_ns: int = Field(ge=2)
+    gpu_nominal_interval_ms: Literal[250, 500]
+    host_nominal_interval_ms: Literal[1000] = 1000
+
+    @model_validator(mode="after")
+    def _check_plan(self) -> "SynchronizedSamplingPlanV1":
+        _run_id(self.run_id)
+        _sha256(self.owner_intent_sha256, label="owner_intent_sha256")
+        _sha256(self.observer_clock_domain_identity_sha256, label="observer_clock_domain_identity_sha256")
+        if self.duration_ns > _POLICY_SAMPLE_MAX_SECONDS * _POLICY_NS:
+            raise ValueError("sampling plan duration exceeds the finite measurement ceiling")
+        if self.planned_end_monotonic_ns != self.started_monotonic_ns + self.duration_ns:
+            raise ValueError("sampling plan end must equal start plus duration")
+        return self
+
+    def policy(self) -> SamplingPlan:
+        return SamplingPlan(
+            run_id=self.run_id, owner_intent_sha256=self.owner_intent_sha256,
+            observer_clock_domain_sha256=self.observer_clock_domain_identity_sha256,
+            start_ns=self.started_monotonic_ns, duration_ns=self.duration_ns,
+            gpu_period_ns=self.gpu_nominal_interval_ms * 1_000_000,
+            host_period_ns=self.host_nominal_interval_ms * 1_000_000,
+        )
+
+
+class ResidentExporterPullProvenance(ResidentExporterSampleProvenance):
+    """Fresh-per-request witness: one Mac request bracket, one native capture inside it.
+
+    ``local_*`` are the collector's own monotonic instants around the request;
+    ``native_*`` are the exporter's QPC instants around the single backend call
+    that produced ``wire_sampled_monotonic_ns``. Domains are never subtracted
+    from each other; each ordering is checked inside its own domain.
+    """
+
+    request_nonce: str
+    after_sequence: int = Field(ge=0)
+    local_request_monotonic_ns: int = Field(ge=1)
+    local_response_monotonic_ns: int = Field(ge=1)
+    native_request_received_monotonic_ns: int = Field(ge=1)
+    native_capture_finished_monotonic_ns: int = Field(ge=1)
+    native_reply_started_monotonic_ns: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _pull_order(self) -> "ResidentExporterPullProvenance":
+        if re.fullmatch(r"[0-9a-f]{32}", self.request_nonce) is None:
+            raise ValueError("request nonce must be 32 lowercase hex characters")
+        if self.wire_sequence != self.after_sequence + 1:
+            raise ValueError("pull sample sequence must follow the requested cursor")
+        if self.local_request_monotonic_ns > self.local_response_monotonic_ns:
+            raise ValueError("pull request instant follows its response instant")
+        if not (self.native_request_received_monotonic_ns <= self.wire_sampled_monotonic_ns
+                <= self.native_capture_finished_monotonic_ns <= self.native_reply_started_monotonic_ns):
+            raise ValueError("native capture is not inside the request it answers")
+        return self
+
+
+class SynchronizedTelemetryFrameV3(_FrozenModel):
+    """Frame v2 measurements and identities with a required fresh-per-request witness."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-frame.v3.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-frame.v3"] = TELEMETRY_FRAME_V3_VERSION
+    run_id: str
+    sequence: int = Field(ge=0)
+    lane: TelemetryLane
+    runtime_bundle_identity_sha256: str
+    process_profile_sha256: str
+    observer_source_sha256: str
+    resident_exporter_provenance: ResidentExporterPullProvenance
+    clock: SampleClock
+    quality: SampleQuality
+    gpu: GpuObservationV2
+    api_process: ApiProcessObservationV2
+    host_cgroup: HostCgroupObservationV2
+    queue_vllm: QueueVllmObservationV2
+
+    @model_validator(mode="after")
+    def _check_frame(self) -> "SynchronizedTelemetryFrameV3":
+        _run_id(self.run_id)
+        for label, value in (
+            ("runtime_bundle_identity_sha256", self.runtime_bundle_identity_sha256),
+            ("process_profile_sha256", self.process_profile_sha256),
+            ("observer_source_sha256", self.observer_source_sha256),
+        ):
+            _sha256(value, label=label)
+        if self.lane == "gpu_fast":
+            if not 250 <= self.quality.nominal_interval_ms <= 500:
+                raise ValueError("GPU telemetry cadence must be 250-500ms")
+        elif self.quality.nominal_interval_ms != 1000:
+            raise ValueError("host telemetry cadence must be 1s")
+        duration_ms = (self.clock.finished_monotonic_ns - self.clock.started_monotonic_ns) / 1_000_000
+        if abs(duration_ms - self.quality.collection_duration_ms) > 0.001:
+            raise ValueError("sample duration differs from monotonic clock")
+        provenance = self.resident_exporter_provenance
+        if not (self.clock.started_monotonic_ns <= provenance.local_request_monotonic_ns
+                and provenance.local_response_monotonic_ns <= self.clock.finished_monotonic_ns):
+            raise ValueError("pull request bracket is not inside the frame collection bracket")
+        return self
+
+
+class LaneSlotCoverageV4(_FrozenModel):
+    """Exact half-open slot accounting of one lane against the frozen plan."""
+
+    lane: TelemetryLane
+    expected_slots: int = Field(ge=1)
+    observed_slots: int = Field(ge=0)
+    missing_slots: int = Field(ge=0)
+    leading_missing: int = Field(ge=0)
+    trailing_missing: int = Field(ge=0)
+    interior_missing: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _check_coverage(self) -> "LaneSlotCoverageV4":
+        if self.observed_slots + self.missing_slots != self.expected_slots:
+            raise ValueError("slot coverage does not sum to the expected slots")
+        if self.leading_missing + self.trailing_missing + self.interior_missing != self.missing_slots:
+            raise ValueError("slot coverage components do not sum to the missing slots")
+        return self
+
+
+class SynchronizedTelemetryReceiptV4(_FrozenModel):
+    """Receipt bound to the frozen sampling plan; wall divergence is recorded, not a gate."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-receipt.v4.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-receipt.v4"] = TELEMETRY_RECEIPT_V4_VERSION
+    run_id: str
+    runtime_bundle_identity_sha256: str
+    process_profile: FrozenApiProcessProfile
+    observer_identity: TelemetryObserverIdentity
+    observer_source_sha256: str
+    clock_domain_identity_sha256: str
+    sampling_plan_sha256: str
+    duration_ns: int = Field(ge=1)
+    planned_end_monotonic_ns: int = Field(ge=2)
+    started_at_utc: datetime
+    finished_at_utc: datetime
+    started_monotonic_ns: int = Field(ge=1)
+    finished_monotonic_ns: int = Field(ge=1)
+    status: RunStatus
+    lane_quality: tuple[LaneQualitySummary, LaneQualitySummary]
+    slot_coverage: tuple[LaneSlotCoverageV4, LaneSlotCoverageV4]
+    termination_reason: ObserverTerminationReason
+    observed_clock_divergence_ns: int = Field(ge=0)
+    epoch_changed: bool
+    safety_drift_reasons: tuple[SafetyDriftReason, ...]
+    unsupported_observation_count: int = Field(ge=0)
+    artifacts: TelemetryArtifactsV2
+    activation_authorized: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _check_receipt(self) -> "SynchronizedTelemetryReceiptV4":
+        _run_id(self.run_id)
+        _utc(self.started_at_utc, label="started_at_utc")
+        _utc(self.finished_at_utc, label="finished_at_utc")
+        for label, value in (
+            ("runtime_bundle_identity_sha256", self.runtime_bundle_identity_sha256),
+            ("observer_source_sha256", self.observer_source_sha256),
+            ("clock_domain_identity_sha256", self.clock_domain_identity_sha256),
+            ("sampling_plan_sha256", self.sampling_plan_sha256),
+        ):
+            _sha256(value, label=label)
+        if self.process_profile.runtime_bundle_identity_sha256 != self.runtime_bundle_identity_sha256:
+            raise ValueError("API process profile runtime identity drifted")
+        if self.observer_identity.clock_domain_identity_sha256 != self.clock_domain_identity_sha256:
+            raise ValueError("observer clock domain drifted")
+        if self.planned_end_monotonic_ns != self.started_monotonic_ns + self.duration_ns:
+            raise ValueError("receipt planned end must equal start plus duration")
+        if self.finished_monotonic_ns <= self.started_monotonic_ns:
+            raise ValueError("telemetry receipt interval is invalid")
+        if self.termination_reason == "duration_elapsed" and self.finished_monotonic_ns < self.planned_end_monotonic_ns:
+            raise ValueError("a duration-elapsed receipt cannot finish before its planned end")
+        elapsed = self.finished_monotonic_ns - self.started_monotonic_ns
+        wall = int((self.finished_at_utc - self.started_at_utc).total_seconds() * 1_000_000_000)
+        if abs(wall - elapsed) != self.observed_clock_divergence_ns:
+            raise ValueError("recorded clock divergence disagrees with clocks")
+        if {item.lane for item in self.lane_quality} != {"gpu_fast", "host_slow"}:
+            raise ValueError("receipt requires one quality summary per lane")
+        if {item.lane for item in self.slot_coverage} != {"gpu_fast", "host_slow"}:
+            raise ValueError("receipt requires one slot coverage per lane")
+        for quality in self.lane_quality:
+            coverage = next(item for item in self.slot_coverage if item.lane == quality.lane)
+            if quality.sample_count != coverage.observed_slots or quality.missed_deadline_count != coverage.missing_slots:
+                raise ValueError("lane quality disagrees with slot coverage")
+        if len(set(self.safety_drift_reasons)) != len(self.safety_drift_reasons):
+            raise ValueError("safety drift reasons are duplicated")
+        if self.epoch_changed != ("epoch_drift" in self.safety_drift_reasons):
+            raise ValueError("epoch_changed must describe only epoch drift")
+        if bool(self.safety_drift_reasons) != (self.termination_reason == "identity_drift"):
+            raise ValueError("safety drift and termination reason disagree")
+        unsafe = bool(self.safety_drift_reasons)
+        incomplete = self.termination_reason != "duration_elapsed" or self.unsupported_observation_count > 0 or any(
+            item.late_sample_count > 0 or item.missed_deadline_count > 0 or item.supported_frame_count == 0
+            for item in self.lane_quality
+        ) or any(item.missing_slots > 0 for item in self.slot_coverage)
+        expected: RunStatus = "unsafe" if unsafe else "incomplete" if incomplete else "complete"
+        if self.status != expected:
+            raise ValueError("receipt status disagrees with quality evidence")
+        return self
+
+
+class SynchronizedTelemetrySealV4(_ResidentSealFields):
+    """Pre-seal CPU attestation over the frozen sampling duration, not the cleanup-inflated elapsed time."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-seal.v4.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-seal.v4"] = TELEMETRY_SEAL_V4_VERSION
+    sampling_plan_sha256: str
+    lifecycle_elapsed_ns: int = Field(ge=1)
+    frames_records: int = Field(ge=1)
+    frames_bytes: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _check_seal_v4(self) -> "SynchronizedTelemetrySealV4":
+        _sha256(self.sampling_plan_sha256, label="sampling_plan_sha256")
+        if self.sampling_elapsed_ns_denominator > self.lifecycle_elapsed_ns:
+            raise ValueError("seal denominator cannot exceed the lifecycle elapsed time")
+        return self
+
+
+def sampling_seal_denominator_ns(receipt: SynchronizedTelemetryReceiptV4) -> int:
+    """A normal run is scored over its frozen duration; a partial run over what actually elapsed."""
+    if receipt.termination_reason == "duration_elapsed":
+        return receipt.duration_ns
+    return receipt.finished_monotonic_ns - receipt.started_monotonic_ns
+
+
+def derive_frame_evidence_v4(
+    frames: tuple[SynchronizedTelemetryFrameV3, ...], *, plan: SynchronizedSamplingPlanV1,
+) -> tuple[tuple[LaneQualitySummary, LaneQualitySummary], tuple[LaneSlotCoverageV4, LaneSlotCoverageV4], int]:
+    """Lane quality and exact slot coverage against the frozen plan, never the finish clock pair."""
+
+    if not frames:
+        raise ValueError("telemetry frame sequence is empty")
+    lane_frames = _validated_lane_frames(
+        cast_frames(frames), started_monotonic_ns=plan.started_monotonic_ns, finished_monotonic_ns=None,
+    )
+    policy = plan.policy()
+    unsupported_observation_count = 0
+    summaries: list[LaneQualitySummary] = []
+    coverages: list[LaneSlotCoverageV4] = []
+    for lane in ("gpu_fast", "host_slow"):
+        frames_in_lane = lane_frames[lane]
+        if not frames_in_lane:
+            raise ValueError(f"telemetry {lane} lane is empty")
+        nominal_ms = plan.gpu_nominal_interval_ms if lane == "gpu_fast" else plan.host_nominal_interval_ms
+        if any(frame.quality.nominal_interval_ms != nominal_ms for frame in frames_in_lane):
+            raise ValueError("telemetry lane cadence differs from the frozen plan")
+        for frame in frames_in_lane:
+            if frame.clock.started_monotonic_ns < plan.started_monotonic_ns or frame.clock.scheduled_monotonic_ns >= plan.planned_end_monotonic_ns:
+                raise ValueError("telemetry frame scheduled outside the frozen plan")
+        coverage = _policy_slot_coverage(policy, lane, [frame.clock.scheduled_monotonic_ns for frame in frames_in_lane])
+        required_statuses = (
+            [(frame.gpu.status,) for frame in frames_in_lane]
+            if lane == "gpu_fast"
+            else [(frame.api_process.status, frame.host_cgroup.status, frame.queue_vllm.status) for frame in frames_in_lane]
+        )
+        unsupported_observation_count += sum(status == "unsupported" for statuses in required_statuses for status in statuses)
+        supported_frame_count = sum(all(status == "supported" for status in statuses) for statuses in required_statuses)
+        starts = [frame.clock.started_monotonic_ns for frame in frames_in_lane]
+        gaps_ns = [starts[0] - plan.started_monotonic_ns]
+        gaps_ns.extend(right - left for left, right in zip(starts, starts[1:]))
+        gaps_ns.append(plan.planned_end_monotonic_ns - starts[-1])
+        # A late response is derived from the capture's actual finish against its own
+        # frozen deadline, min(scheduled + period, planned end); the collector's claimed
+        # status only adds to it. A slot answered late is present, yet the run is not complete.
+        period_ns = nominal_ms * 1_000_000
+        late_sample_count = sum(
+            frame.clock.finished_monotonic_ns > min(frame.clock.scheduled_monotonic_ns + period_ns, plan.planned_end_monotonic_ns)
+            or frame.quality.status == "late"
+            for frame in frames_in_lane
+        )
+        summaries.append(LaneQualitySummary(
+            lane=lane, nominal_interval_ms=nominal_ms, sample_count=len(frames_in_lane),
+            maximum_gap_ms=max(gaps_ns) / 1_000_000,
+            late_sample_count=late_sample_count,
+            missed_deadline_count=coverage.missing, supported_frame_count=supported_frame_count,
+        ))
+        coverages.append(LaneSlotCoverageV4(
+            lane=lane, expected_slots=coverage.expected, observed_slots=coverage.observed,
+            missing_slots=coverage.missing, leading_missing=coverage.leading_missing,
+            trailing_missing=coverage.trailing_missing, interior_missing=coverage.interior_missing,
+        ))
+    return (summaries[0], summaries[1]), (coverages[0], coverages[1]), unsupported_observation_count
+
+
+def cast_frames(frames: tuple[SynchronizedTelemetryFrameV3, ...]) -> tuple[SynchronizedTelemetryFrame, ...]:
+    """Frame v3 shares every field the stream validator reads; typing only, no conversion."""
+    return frames  # type: ignore[return-value]
+
+
 OPERATIONAL_TELEMETRY_SCHEMAS: dict[str, type[BaseModel]] = {
     "capacity-progress-event.v1.schema.json": CapacityProgressEventEnvelope,
     "capacity-vector-credit-event.v1.schema.json": CapacityVectorCreditEvent,
@@ -1238,6 +1576,10 @@ OPERATIONAL_TELEMETRY_SCHEMAS: dict[str, type[BaseModel]] = {
     "synchronized-telemetry-seal.v3.schema.json": SynchronizedTelemetrySealV3,
     "synchronized-phase-summary.v1.schema.json": SynchronizedPhaseSummary,
     "phase-clock-binding.v1.schema.json": PhaseClockBinding,
+    "synchronized-sampling-plan.v1.schema.json": SynchronizedSamplingPlanV1,
+    "synchronized-telemetry-frame.v3.schema.json": SynchronizedTelemetryFrameV3,
+    "synchronized-telemetry-receipt.v4.schema.json": SynchronizedTelemetryReceiptV4,
+    "synchronized-telemetry-seal.v4.schema.json": SynchronizedTelemetrySealV4,
 }
 
 
@@ -1464,18 +1806,10 @@ def validate_frame_sequence(
         raise ValueError("telemetry unsupported observation count drifted")
 
 
-def derive_frame_evidence(
-    frames: tuple[SynchronizedTelemetryFrame, ...],
-    *,
-    started_monotonic_ns: int,
-    finished_monotonic_ns: int,
-) -> tuple[tuple[LaneQualitySummary, LaneQualitySummary], int]:
-    """Mechanically derive receipt lane quality and required missing evidence."""
-
-    if not frames:
-        raise ValueError("telemetry frame sequence is empty")
-    if finished_monotonic_ns <= started_monotonic_ns:
-        raise ValueError("telemetry evidence interval is invalid")
+def _validated_lane_frames(
+    frames: tuple[SynchronizedTelemetryFrame, ...], *, started_monotonic_ns: int, finished_monotonic_ns: int | None,
+) -> dict[TelemetryLane, list[SynchronizedTelemetryFrame]]:
+    """Per-frame stream checks shared by the finish-bounded (v2/v3) and plan-bounded (v4) derivations."""
     lane_previous: dict[TelemetryLane, SynchronizedTelemetryFrame] = {}
     lane_frames: dict[TelemetryLane, list[SynchronizedTelemetryFrame]] = {
         "gpu_fast": [],
@@ -1489,8 +1823,7 @@ def derive_frame_evidence(
             started_monotonic_ns
             <= frame.clock.started_monotonic_ns
             <= frame.clock.finished_monotonic_ns
-            <= finished_monotonic_ns
-        ):
+        ) or (finished_monotonic_ns is not None and frame.clock.finished_monotonic_ns > finished_monotonic_ns):
             raise ValueError("telemetry frame lies outside evidence bounds")
         if frame.clock.started_monotonic_ns < previous_started:
             raise ValueError("telemetry frames are not monotonic")
@@ -1533,6 +1866,24 @@ def derive_frame_evidence(
         lane_frames[frame.lane].append(frame)
         previous_started = frame.clock.started_monotonic_ns
 
+    return lane_frames
+
+
+def derive_frame_evidence(
+    frames: tuple[SynchronizedTelemetryFrame, ...],
+    *,
+    started_monotonic_ns: int,
+    finished_monotonic_ns: int,
+) -> tuple[tuple[LaneQualitySummary, LaneQualitySummary], int]:
+    """Mechanically derive receipt lane quality and required missing evidence."""
+
+    if not frames:
+        raise ValueError("telemetry frame sequence is empty")
+    if finished_monotonic_ns <= started_monotonic_ns:
+        raise ValueError("telemetry evidence interval is invalid")
+    lane_frames = _validated_lane_frames(
+        frames, started_monotonic_ns=started_monotonic_ns, finished_monotonic_ns=finished_monotonic_ns,
+    )
     unsupported_observation_count = 0
     summaries: list[LaneQualitySummary] = []
     for lane in ("gpu_fast", "host_slow"):
@@ -1593,6 +1944,18 @@ def derive_frame_evidence(
 
 
 __all__ = [
+    "LaneSlotCoverageV4",
+    "ResidentExporterPullProvenance",
+    "SAMPLING_PLAN_V1_VERSION",
+    "SynchronizedSamplingPlanV1",
+    "SynchronizedTelemetryFrameV3",
+    "SynchronizedTelemetryReceiptV4",
+    "SynchronizedTelemetrySealV4",
+    "TELEMETRY_FRAME_V3_VERSION",
+    "TELEMETRY_RECEIPT_V4_VERSION",
+    "TELEMETRY_SEAL_V4_VERSION",
+    "derive_frame_evidence_v4",
+    "sampling_seal_denominator_ns",
     "ApiProcessObservation",
     "ApiProcessTelemetryValues",
     "BlockedProgressEvent",

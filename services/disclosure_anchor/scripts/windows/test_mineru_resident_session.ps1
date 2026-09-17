@@ -87,11 +87,28 @@ try {
             } finally { $memory.Dispose(); $stream.Dispose() }
         } finally { $response.Dispose() }
     }
+    # Fresh-per-request: every sample is collected inside the request that asked for it, so
+    # each GET carries its own nonce and the exporter echoes back that nonce and cursor. The
+    # retained frames stay the exact outer replies, witness included.
     $sequence=[long]0; $frames=[Collections.Generic.List[string]]::new()
+    $nonces=[Collections.Generic.HashSet[string]]::new()
     for($index=0;$index -lt $SampleCount;$index++) {
-        $raw=Get-DiagnosticHttp ('/after/'+[string]$sequence)
-        $sample=$raw|ConvertFrom-Json
+        $nonce=[Guid]::NewGuid().ToString('N')
+        if(-not $nonces.Add($nonce)){throw 'diagnostic request nonce repeated'}
+        $raw=Get-DiagnosticHttp ('/after/'+[string]$sequence+'/request/'+$nonce)
+        $pull=$raw|ConvertFrom-Json
+        if($pull.contract_version -cne 'mineru.windows-resident-pull.v1'){throw 'diagnostic pull contract version'}
+        if($pull.request_nonce -cne $nonce -or [long]$pull.after_sequence -ne $sequence){
+            throw 'diagnostic exporter answered another request'}
+        $sample=$pull.sample
+        if($sample.contract_version -cne 'mineru.windows-resident-telemetry.v2'){throw 'diagnostic sample contract version'}
         if($sample.sequence -ne $sequence+1){throw 'diagnostic resident sequence gap'}
+        # a <= c <= d <= b within the exporter's own clock: the capture happened inside this
+        # request, so no cached value can be presented as fresh.
+        if([long]$pull.request_received_monotonic_ns -gt [long]$sample.sampled_monotonic_ns -or
+           [long]$sample.sampled_monotonic_ns -gt [long]$pull.sample_capture_finished_monotonic_ns -or
+           [long]$pull.sample_capture_finished_monotonic_ns -gt [long]$pull.reply_started_monotonic_ns){
+            throw 'diagnostic capture is not inside the request it answers'}
         $sequence=$sample.sequence; $frames.Add($raw)
     }
     $closeRaw=Get-DiagnosticHttp '/close'
@@ -114,7 +131,7 @@ try {
         $containerAbsence=[ordered]@{id=$containerEvidence.id;exit_code=$absenceCode;raw_output=$absenceText}
         $linuxClosedRaw=[IO.File]::ReadAllText([IO.Path]::Combine($run,'linux-closed.json'))
     }
-    $diagnosticJson = [ordered]@{contract_version='mineru.resident-session-diagnostic.v1';config_sha256=$ExpectedConfigSha256;ready_raw=$readyRaw;frames_raw=$frames.ToArray();closed_raw=$closedRaw;job_raw=$jobRaw;linux_closed_raw=$linuxClosedRaw;container=$containerEvidence;container_absence=$containerAbsence;supervisor_exit_code=$process.ExitCode;sample_count=$frames.Count;qualification='mechanism-only; external identity, canonical replay, combined CPU and full hour are separate gates'} | ConvertTo-Json -Depth 8 -Compress
+    $diagnosticJson = [ordered]@{contract_version='mineru.resident-session-diagnostic.v2';config_sha256=$ExpectedConfigSha256;ready_raw=$readyRaw;frames_raw=$frames.ToArray();closed_raw=$closedRaw;job_raw=$jobRaw;linux_closed_raw=$linuxClosedRaw;container=$containerEvidence;container_absence=$containerAbsence;supervisor_exit_code=$process.ExitCode;sample_count=$frames.Count;qualification='mechanism-only; external identity, canonical replay, combined CPU and full hour are separate gates'} | ConvertTo-Json -Depth 8 -Compress
     # Preserve exact raw frames independently of terminal output truncation or
     # stdout/stderr interleaving. Diagnostic-only, outside the measured Job.
     $diagnosticBytes=[Text.UTF8Encoding]::new($false,$true).GetBytes($diagnosticJson)

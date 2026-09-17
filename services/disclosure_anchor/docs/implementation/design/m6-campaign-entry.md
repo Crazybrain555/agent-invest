@@ -149,17 +149,15 @@ admission_reconciliation / ownership_closure 收据并 ACK，quality/public veri
   （`CampaignOutcomeUnknown`），记入 `budgets`。收尾时 `_finish_launcher` 只等到 launcher 自身绝对期限（+5 s），
   不再额外叠加 `close_grace + 240`。业务 planned/grace/max_close、30 s lease、stop/admission、publication/ACK 语义不变；
   children 仍按 owner 时钟 `max_close` 逐次重算寿命。
-- **采样窗口覆盖（供独立驱动复用，单一策略）**：`SamplingCoverageTerms(entry_to_spawn=prepare 180+stage 180,
-  owner_transport=timeout, post_transport=fetch 180+identity 60+native 180, host_period)`，`required_seconds` 只定义整个
-  campaign（入口→summary，含 owner 退出后的 Mac 侧只读取回）加两端各一个 host 周期；没有更短的“owner 区间”策略。
-  G3 最坏上界 8387 s > 8300 s 采样 ceiling（差 87 s），G0 为 1907 s。F10 的向量 8300/8380/8390/8400 是在传输期限仍被
-  7200 s 封顶时推导的；R21 传输裁决（7605 s）之后它对 G3 全覆盖不再充分。这是 F10 数值本身的变更，属于 Pro 决定：
-  按同一推导重新给出有限向量 `S ≥ 360 + 7605 + 420 + 2 + 前置余量`（telemetry 启动→首个可信帧→campaign 入口），
-  例如 S=8500 → lane 8580（+60 s 采样收尾 +20 s 控制）→ wire 8590 → primitive 8600（Job/Deadline/Linux supervisor/
-  `BoundedOwnerCommand` 扩展 ceiling），业务 4800/2400/7200、30 s lease、60 s/20 s 关系全部不变；Python 侧向量已收敛为
-  `resident_telemetry_owner.py` 的一组派生常量，C#/PS/Linux 镜像 primitive 与 wire 值并由独立上限向量测试钉住。
-  在 Pro 裁决前 G3 不启动；G0 与 ≤8300 s 的短测不受影响。备选（不改向量）是组合根在 spawn launcher 前的覆盖门
-  `spawn + timeout + post_transport + host_period ≤ 采样结束`（G3/8300 下前置至多 273 s），未实现、未裁决。
+- **采样窗口覆盖（R22 定案，单一策略）**：`SamplingCoverageTerms(entry_to_spawn=prepare 180+stage 180,
+  owner_transport=timeout, finish_poll=5, post_transport=fetch 180+identity 60+native 180, host_period, edge_periods=2)`，
+  `required_seconds` 只定义整个 campaign（入口→summary）加两端各 2 个 host 周期；G3 产品项 8394 s，独立 driver 再加自己的
+  sampling-start/campaign-launch/cleanup 各 30 s（driver 自身在相应阶段强制）= 8484 s ≤ 采样 8500 s，余量 16 s。
+  有限向量（`resident_measurement_policy` 为唯一来源）：采样 8500 → native lane 8580（+20 s pre-GO +60 s 收尾）→ wire 8590 →
+  primitive Job/有限命令 8600；`EXTENDED_COMMAND_CEILING_SECONDS` 由此导入，默认 7200 与业务 4800/2400/7200 不变。最早 native
+  starter 的本地 spawn 到 observer 计划起点 ≤20 s（同一 Mac monotonic），超出在任何 PDF 准入前关闭。
+- **本地测量窗（C4）**：`campaign-summary.json` 记录 `telemetry_window`（`m6.local-measurement-window.v1`：Mac clock domain、入口
+  与收尾的 monotonic ns，前后身份必须一致），v4 reader 只在该窗内用 frame 的因果采集区间做资源包络，不再用 UTC 括号。
 - **生产路径不设总时限**：`scripts/run_worker_once.sh loop` 是 `while true` 外循环；`cli/worker.py::run_resident_worker`
   以 `should_stop` 循环、wedge watchdog 只看各执行面 liveness（"bounds nothing — liveness does"），
   `SYNC_COOLDOWN_MAX_SECONDS=7200` 是同步冷却上限；`BoundedOwnerCommand` 仅用于安装/资格/resident telemetry owner 与本

@@ -18,16 +18,24 @@ from pathlib import Path
 import re
 import stat
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from disclosure_anchor.adapters.runtime.m6_campaign_assembly import (
     CampaignIdentityError, CampaignInputError, external_exit_problems, launcher_lines,
 )
 from disclosure_anchor.adapters.runtime.m6_public_consumer_verifier import _audit
+from disclosure_anchor.adapters.runtime.resident_owner_evidence import (
+    OWNER_RESULT_CONTRACT_VERSION, replay_resident_owner_evidence,
+)
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     verify_synchronized_telemetry_observer,
 )
 from disclosure_anchor.application.contracts.closed_document import sha256_of
+from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu_v4
+from disclosure_anchor.application.contracts.resident_session_evidence import check_resident_observer_mapping_v4
+from disclosure_anchor.application.contracts.synchronized_telemetry import (
+    SynchronizedTelemetryFrameV2, SynchronizedTelemetryFrameV3, SynchronizedTelemetryReceiptV4, SynchronizedTelemetrySealV4,
+)
 from disclosure_anchor.application.contracts.m6_campaign import M6CorpusManifest
 from disclosure_anchor.application.contracts.m6_campaign_intent import (
     M6_CAMPAIGN_INTENT_MAX_BYTES, M6CampaignIntent, M6CampaignIntentV1, decode_campaign_intent,
@@ -48,7 +56,9 @@ from disclosure_anchor.application.services.m6_delivery_report import (
 )
 from disclosure_anchor.application.services.m6_run_accounting import reduce_m6_run
 from disclosure_anchor.application.services.m6_run_spec_factory import build_run_spec
-from disclosure_anchor.application.services.telemetry_resource_aggregates import derive_resource_aggregates
+from disclosure_anchor.application.services.telemetry_resource_aggregates import (
+    derive_resource_aggregates, derive_resource_aggregates_v4,
+)
 
 _MAX_RUN_FILE_BYTES = 65536
 _MAX_INPUT_BYTES = 8 * 1024 * 1024
@@ -74,6 +84,11 @@ _TELEMETRY_ARTIFACTS: tuple[tuple[str, int], ...] = (
     ("frames.v2.jsonl", _MAX_TELEMETRY_FRAMES_BYTES), ("receipt.v3.json", _MAX_INPUT_BYTES),
     ("seal.v3.json", _MAX_INPUT_BYTES),
 )
+_TELEMETRY_ARTIFACTS_V4: tuple[tuple[str, int], ...] = (
+    ("frames.v3.jsonl", _MAX_TELEMETRY_FRAMES_BYTES), ("receipt.v4.json", _MAX_INPUT_BYTES),
+    ("seal.v4.json", _MAX_INPUT_BYTES), ("sampling-plan.v1.json", _MAX_INPUT_BYTES),
+)
+LOCAL_MEASUREMENT_WINDOW_CONTRACT = "m6.local-measurement-window.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +107,9 @@ class CampaignEvidence:
     stage_timing: StageTimingFacts
     inputs: tuple[tuple[str, str], ...]
     unknowns: tuple[str, ...]
+
+
+_DIGEST_TEXT = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class _Reader:
@@ -117,6 +135,17 @@ class _Reader:
 
     def record(self, path: Path, raw: bytes) -> str:
         digest = sha256_of(raw)
+        self._inputs[self.label(path)] = digest
+        return digest
+
+    def record_digest(self, path: Path, digest: str) -> str:
+        """Index a digest another bounded reader already computed over the original bytes.
+
+        The bytes are not reread (a second read could see a changed file) and the
+        digest text is never hashed again; only its canonical form is checked.
+        """
+        if _DIGEST_TEXT.fullmatch(digest) is None:
+            raise CampaignIdentityError(f"evidence digest for {self.label(path)} is not a canonical SHA-256")
         self._inputs[self.label(path)] = digest
         return digest
 
@@ -497,6 +526,35 @@ def _external_facts(
 
 def _resident_boot_alias(reader: _Reader, anchor: M6OwnerAnchor) -> str | None:
     """One copied original native metadata/body pair, not a caller-supplied alias."""
+    records = _physical_owner_records(reader)
+    if records is None:
+        return None
+    metadata_raw, body_raw, start = records
+    try:
+        return bind_physical_owner_boot(
+            metadata_raw=metadata_raw, body_raw=body_raw, anchor=anchor,
+            pid=start.get("pid"), creation_filetime_100ns=start.get("creation_filetime_100ns"),
+        )
+    except (ValueError, TypeError) as exc:
+        reader.note("physical_owner_identity_binding_invalid:" + type(exc).__name__)
+        return None
+
+
+def _physical_owner_node_identity(reader: _Reader) -> str | None:
+    """The Windows node identity the original physical owner identity body recorded, if readable."""
+    records = _physical_owner_records(reader)
+    if records is None:
+        return None
+    try:
+        body = strict_json_loads(records[1])
+    except ValueError:
+        return None
+    node = body.get("windows_node_identity_sha256") if type(body) is dict else None
+    return node if type(node) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", node) else None
+
+
+def _physical_owner_records(reader: _Reader) -> tuple[bytes, bytes, dict[str, Any]] | None:
+    """The singleton owner-identity metadata, its body and the external start record."""
     native = reader.run_dir / "native"
     if not native.is_dir() or native.is_symlink():
         reader.note("physical_owner_identity_absent")
@@ -535,14 +593,7 @@ def _resident_boot_alias(reader: _Reader, anchor: M6OwnerAnchor) -> str | None:
                             absent="physical_owner_external_start_absent", maximum=_MAX_RECORD_BYTES)
     if body_raw is None or start is None:
         return None
-    try:
-        return bind_physical_owner_boot(
-            metadata_raw=metadata_raw, body_raw=body_raw, anchor=anchor,
-            pid=start.get("pid"), creation_filetime_100ns=start.get("creation_filetime_100ns"),
-        )
-    except (ValueError, TypeError) as exc:
-        reader.note("physical_owner_identity_binding_invalid:" + type(exc).__name__)
-        return None
+    return metadata_raw, body_raw, start
 
 
 def _clock_binding(value: object) -> ClockBinding | None:
@@ -732,9 +783,132 @@ def _coverage_window(summary: dict[str, Any] | None) -> tuple[datetime, datetime
     return started, finished
 
 
+def _measurement_window(summary: dict[str, Any] | None) -> tuple[str, int, int] | None:
+    """The assembly's own local monotonic window (domain, start, finish); never a cross-host difference."""
+    if summary is None:
+        return None
+    window = summary.get("telemetry_window")
+    if type(window) is not dict or window.get("contract_version") != LOCAL_MEASUREMENT_WINDOW_CONTRACT:
+        return None
+    domain, started, finished = window.get("clock_domain_identity_sha256"), window.get("started_monotonic_ns"), window.get("finished_monotonic_ns")
+    if (type(domain) is not str or re.fullmatch(r"sha256:[0-9a-f]{64}", domain) is None
+            or type(started) is not int or type(finished) is not int or finished <= started or "problem" in window):
+        return None
+    return domain, started, finished
+
+
+def _telemetry_facts_v4(
+    reader: _Reader, *, artifact_root: Path, run_id: str, spec: M6RunSpec,
+    summary: dict[str, Any] | None, anchor: M6OwnerAnchor, resident_owner_evidence_dir: Path | None,
+) -> TelemetryFacts:
+    """Replay a v4 (R22) observer run: frozen plan, fresh-pull frames, local monotonic window, owner evidence."""
+    try:
+        result = verify_synchronized_telemetry_observer(artifact_root=artifact_root, run_id=run_id, receipt_version=4)
+    except ValueError as exc:
+        raise CampaignIdentityError(f"synchronized telemetry evidence failed its own replay: {exc}") from exc
+    run_directory = artifact_root / run_id
+    for name, bound in _TELEMETRY_ARTIFACTS_V4:
+        reader.read(run_directory / name, absent="telemetry_artifact_absent:" + name, maximum=bound)
+    receipt, seal, plan = result.receipt, result.seal, result.plan
+    if not isinstance(receipt, SynchronizedTelemetryReceiptV4) or not isinstance(seal, SynchronizedTelemetrySealV4) or plan is None:
+        raise CampaignIdentityError("telemetry evidence is not a v4 observer run")
+    frames = tuple(frame for frame in result.frames if isinstance(frame, SynchronizedTelemetryFrameV3))
+    if len(frames) != len(result.frames):
+        raise CampaignIdentityError("v4 telemetry evidence carries non-v3 frames")
+    problems: list[str] = []
+    if receipt.runtime_bundle_identity_sha256 != spec.runtime.runtime_bundle_identity_sha256:
+        problems.append("telemetry_runtime_bundle_mismatch")
+    if receipt.process_profile.process_profile_sha256 != spec.runtime.process_profile_sha256:
+        problems.append("telemetry_process_profile_mismatch")
+    if receipt.status != "complete":
+        problems.append("telemetry_receipt_not_complete")
+    if seal.status != "complete":
+        problems.append("telemetry_seal_not_complete")
+    boots = {frame.resident_exporter_provenance.boot_identity_sha256 for frame in frames}
+    boot_alias = None
+    if boots - {spec.clock.boot_identity_sha256}:
+        boot_alias = _resident_boot_alias(reader, anchor)
+        if boot_alias is None:
+            problems.append("telemetry_native_resident_boot_binding_unproven")
+    for frame in frames:
+        values = frame.gpu.values
+        if (frame.gpu.status == "supported" and values is not None
+                and values.device_identity_sha256 != spec.runtime.gpu_device_identity_sha256):
+            problems.append("telemetry_gpu_device_mismatch")
+        provenance = frame.resident_exporter_provenance
+        if (provenance.host_assignment_identity_sha256 != spec.clock.host_assignment_identity_sha256
+                or provenance.boot_identity_sha256 not in {spec.clock.boot_identity_sha256, boot_alias}):
+            problems.append("telemetry_host_identity_mismatch")
+    window = _measurement_window(summary)
+    aggregates = None
+    if window is None:
+        problems.append("telemetry_coverage_window_absent")
+    else:
+        domain, started, finished = window
+        if domain != receipt.clock_domain_identity_sha256 or domain != plan.observer_clock_domain_identity_sha256:
+            problems.append("telemetry_window_domain_mismatch")
+        else:
+            if receipt.started_monotonic_ns > started:
+                problems.append("telemetry_coverage_incomplete:receipt_start")
+            if receipt.planned_end_monotonic_ns < finished:
+                problems.append("telemetry_coverage_incomplete:planned_end")
+            aggregates = derive_resource_aggregates_v4(
+                frames, plan=plan, window_started_monotonic_ns=started, window_finished_monotonic_ns=finished,
+            )
+    if resident_owner_evidence_dir is None:
+        problems.append("resident_owner_evidence_not_supplied")
+    else:
+        owner = replay_resident_owner_evidence(
+            resident_owner_evidence_dir, run_id=run_id, windows_node_identity_sha256=_physical_owner_node_identity(reader),
+        )
+        # The owner reader hashed the original bytes it read once, bounded and without
+        # following symlinks; those digests enter the input index as they are.
+        for name, digest in sorted(owner.files.items()):
+            reader.record_digest(resident_owner_evidence_dir / name, digest)
+        problems.extend("resident_owner:" + problem for problem in owner.problems)
+        # A v4 summary needs the R22 owner: its v2 result, its plan bytes equal to the
+        # receipt's plan, and its original intent pinned by the plan the child froze.
+        if owner.result_contract_version != OWNER_RESULT_CONTRACT_VERSION or owner.receipt_version != 4:
+            problems.append("resident_owner_result_not_v4")
+        if owner.plan_bytes is None or sha256_of(owner.plan_bytes) != receipt.sampling_plan_sha256:
+            problems.append("resident_owner_plan_mismatch")
+        if owner.owner_intent_sha256 != plan.owner_intent_sha256:
+            problems.append("resident_owner_intent_mismatch")
+        if owner.intent_duration_ns != plan.duration_ns:
+            problems.append("resident_owner_intent_duration_mismatch")
+        for lane, ready in sorted(owner.readies.items()):
+            closed = owner.closed_payloads.get(lane)
+            if closed is None:
+                problems.append("resident_owner_closed_absent:" + lane)
+                continue
+            try:
+                check_resident_observer_mapping_v4(ready=ready, closed_bytes=closed, frames=frames, receipt=receipt, plan=plan)
+            except ValueError as exc:
+                problems.append(f"resident_owner_mapping_failed:{lane}:{exc}"[:300])
+        if {"gpu_fast", "host_slow"} <= set(owner.readies) and {"gpu_fast", "host_slow"} <= set(owner.closures):
+            try:
+                cpu = check_combined_resident_cpu_v4(
+                    gpu_ready=owner.readies["gpu_fast"], host_ready=owner.readies["host_slow"],
+                    gpu_closure=owner.closures["gpu_fast"], host_closure=owner.closures["host_slow"], receipt=receipt, seal=seal,
+                )
+            except ValueError as exc:
+                problems.append(f"resident_owner_cpu_failed:{exc}"[:300])
+            else:
+                if not cpu.within_two_percent:
+                    problems.append("resident_owner_cpu_over_two_percent")
+        else:
+            problems.append("resident_owner_lanes_incomplete")
+    return TelemetryFacts(
+        receipt_sha256=seal.receipt_sha256, seal_sha256=reader.digest(run_directory / "seal.v4.json"),
+        contract_version=receipt.contract_version, status=receipt.status, seal_status=seal.status,
+        aggregates=aggregates, problems=tuple(sorted(set(problems))),
+    )
+
+
 def _telemetry_facts(
     reader: _Reader, *, artifact_root: Path | None, run_id: str | None, spec: M6RunSpec,
-    summary: dict[str, Any] | None, anchor: M6OwnerAnchor,
+    summary: dict[str, Any] | None, anchor: M6OwnerAnchor, receipt_version: Literal[3, 4] = 3,
+    resident_owner_evidence_dir: Path | None = None,
 ) -> TelemetryFacts | None:
     """Replay one sealed observer run and bind it to this campaign.
 
@@ -750,6 +924,13 @@ def _telemetry_facts(
         raise CampaignInputError(
             "a telemetry artifact root and its observer run id must be supplied together",
         )
+    if receipt_version == 4:
+        return _telemetry_facts_v4(
+            reader, artifact_root=artifact_root, run_id=run_id, spec=spec, summary=summary, anchor=anchor,
+            resident_owner_evidence_dir=resident_owner_evidence_dir,
+        )
+    if resident_owner_evidence_dir is not None:
+        raise CampaignInputError("resident owner evidence replay requires the v4 telemetry protocol")
     try:
         result = verify_synchronized_telemetry_observer(
             artifact_root=artifact_root, run_id=run_id, receipt_version=3,
@@ -798,7 +979,7 @@ def _telemetry_facts(
         if receipt.finished_at_utc < finished:
             problems.append("telemetry_coverage_incomplete:receipt_finish")
         aggregates = derive_resource_aggregates(
-            frames, window_start_utc=started, window_end_utc=finished,
+            cast(tuple[SynchronizedTelemetryFrameV2, ...], frames), window_start_utc=started, window_end_utc=finished,
         )
         for lane, first, last, interval in (
             ("gpu_fast", aggregates.gpu_first_utc, aggregates.gpu_last_utc,
@@ -869,6 +1050,7 @@ def load_campaign_evidence(
     run_dir: Path, *, evaluation_plan: M6EvaluationPlan, native_journal: Path | None = None,
     telemetry_artifact_root: Path | None = None, telemetry_run_id: str | None = None,
     manifest: Path | None = None, quality_plan: Path | None = None,
+    telemetry_receipt_version: Literal[3, 4] = 3, resident_owner_evidence_dir: Path | None = None,
 ) -> CampaignEvidence:
     """Load one campaign output directory read-only and reduce its owner journal.
 
@@ -932,7 +1114,8 @@ def load_campaign_evidence(
         closure=_closure_facts(reader, run_dir, events, verifier),
         external=_external_facts(reader, run_dir, summary, intent=intent, anchor=anchor, inputs=inputs),
         telemetry=_telemetry_facts(reader, artifact_root=telemetry_artifact_root, run_id=telemetry_run_id,
-                                   spec=spec, summary=summary, anchor=anchor),
+                                   spec=spec, summary=summary, anchor=anchor, receipt_version=telemetry_receipt_version,
+                                   resident_owner_evidence_dir=resident_owner_evidence_dir),
         stage_timing=_stage_timing_facts(reader, run_dir, verifier, spec=spec),
         inputs=reader.inputs, unknowns=reader.unknowns,
     )

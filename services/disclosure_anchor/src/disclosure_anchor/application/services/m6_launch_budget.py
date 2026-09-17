@@ -17,9 +17,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+from disclosure_anchor.application.services.resident_measurement_policy import FINITE_COMMAND_MAX_SECONDS
+
 DEFAULT_COMMAND_CEILING_SECONDS = 7200
-EXTENDED_COMMAND_CEILING_SECONDS = 8400
+# The one finite-diagnostic ceiling (R22 vector 8500/8580/8590/8600); the
+# measurement policy is its source, this name is the launcher/owner consumer.
+EXTENDED_COMMAND_CEILING_SECONDS = FINITE_COMMAND_MAX_SECONDS
 OWNER_HOST_CEILING_SECONDS = 7200
+# The composition root polls the launcher this long past its own deadline.
+FINISH_POLL_ALLOWANCE_SECONDS = 5.0
 
 
 def _finite_nonnegative(value: float, *, label: str) -> float:
@@ -122,7 +128,7 @@ def transport_headroom_seconds(
         - _finite_nonnegative(post_close_seconds, label="post_close_seconds")
 
 
-def finish_wait_seconds(*, launcher_deadline_ns: int, now_ns: int, allowance_seconds: float = 5.0) -> float:
+def finish_wait_seconds(*, launcher_deadline_ns: int, now_ns: int, allowance_seconds: float = FINISH_POLL_ALLOWANCE_SECONDS) -> float:
     """How long to keep polling the launcher for its natural end: its own absolute deadline plus a small allowance.
 
     The transport deadline already contains the post-close tail, so no grace or
@@ -148,15 +154,24 @@ class SamplingCoverageTerms:
     owner_transport_seconds: float         # the launcher transport deadline (pre-T0 + business + post-close)
     post_transport_seconds: float          # bounded evidence read-back after the launcher ended (Mac-only sftp/ssh)
     host_period_seconds: float             # one host_slow nominal period
+    finish_poll_seconds: float = FINISH_POLL_ALLOWANCE_SECONDS   # launcher finish poll past its own deadline
+    edge_periods: int = 2                  # source edge reserve on each side, in host periods (R22: two)
 
     def __post_init__(self) -> None:
-        for label in ("entry_to_spawn_seconds", "owner_transport_seconds", "post_transport_seconds", "host_period_seconds"):
+        for label in ("entry_to_spawn_seconds", "owner_transport_seconds", "post_transport_seconds", "host_period_seconds", "finish_poll_seconds"):
             _finite_nonnegative(getattr(self, label), label=label)
+        if type(self.edge_periods) is not int or self.edge_periods < 1:
+            raise ValueError("edge_periods must be a positive integer")
+
+    @property
+    def edge_reserve_seconds(self) -> float:
+        return self.edge_periods * self.host_period_seconds
 
     @property
     def required_seconds(self) -> float:
-        return (self.entry_to_spawn_seconds + self.owner_transport_seconds + self.post_transport_seconds
-                + 2 * self.host_period_seconds)
+        """Entry → summary: prepare/stage, transport, finish poll, read-back, plus the edge reserve on each side."""
+        return (self.entry_to_spawn_seconds + self.owner_transport_seconds + self.finish_poll_seconds
+                + self.post_transport_seconds + 2 * self.edge_reserve_seconds)
 
     def prelude_allowed(self, *, sampling_seconds: float) -> float:
         """Seconds left for telemetry start → first trusted frames → campaign entry; negative means no fit."""
@@ -164,7 +179,7 @@ class SamplingCoverageTerms:
 
 
 __all__ = [
-    "DEFAULT_COMMAND_CEILING_SECONDS", "EXTENDED_COMMAND_CEILING_SECONDS", "OWNER_HOST_CEILING_SECONDS",
+    "DEFAULT_COMMAND_CEILING_SECONDS", "EXTENDED_COMMAND_CEILING_SECONDS", "FINISH_POLL_ALLOWANCE_SECONDS", "OWNER_HOST_CEILING_SECONDS",
     "LaunchTransportBudget", "SamplingCoverageTerms", "finish_wait_seconds", "launch_transport_budget",
     "transport_headroom_seconds",
 ]

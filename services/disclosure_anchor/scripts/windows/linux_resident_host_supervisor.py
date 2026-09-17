@@ -106,7 +106,7 @@ def ensure_single_thread(sampler: ModuleType) -> None:
 def run(config: dict[str, Any], sampler: ModuleType, sampler_sha256: str, supervisor_sha256: str) -> None:
     lease = sampler.integer(config["lease_ms"], minimum=1000) / 1000
     lifetime = sampler.integer(config["lifetime_ms"], minimum=1000) / 1000
-    if lease > 30 or lifetime > 8400 or lease > lifetime:
+    if lease > 30 or lifetime > 8600 or lease > lifetime:
         raise ValueError("lease/lifetime exceeds bound")
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
     started = time.monotonic()

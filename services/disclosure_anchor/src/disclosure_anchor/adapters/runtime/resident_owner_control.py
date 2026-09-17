@@ -21,6 +21,7 @@ import time
 from typing import Any, Literal, Mapping
 
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig
+from disclosure_anchor.application.services.resident_measurement_policy import FINITE_COMMAND_MAX_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +82,7 @@ class BoundedOwnerCommand:
         environment: Mapping[str, str] | None = None, cwd: str | None = None,
         retention: OwnerCommandRetention = "strict", lifetime_ceiling_seconds: int = 7200,
     ) -> None:
-        if type(lifetime_ceiling_seconds) is not int or not 1 <= lifetime_ceiling_seconds <= 8400:
+        if type(lifetime_ceiling_seconds) is not int or not 1 <= lifetime_ceiling_seconds <= FINITE_COMMAND_MAX_SECONDS:
             raise ValueError("owner command lifetime ceiling invalid")
         if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
                 or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= lifetime_ceiling_seconds):

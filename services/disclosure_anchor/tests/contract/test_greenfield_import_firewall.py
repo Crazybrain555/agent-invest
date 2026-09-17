@@ -28,6 +28,9 @@ _GREENFIELD_CORE_FILES = (
     _SOURCE_ROOT / "application" / "services" / "m6_run_accounting.py",
     _SOURCE_ROOT / "application" / "services" / "m6_delivery_report.py",
     _SOURCE_ROOT / "application" / "services" / "telemetry_resource_aggregates.py",
+    # The finite measurement rules are pure and IO-free by design, so the seam holds this
+    # file to the same import rule rather than merely permitting it to be imported.
+    _SOURCE_ROOT / "application" / "services" / "resident_measurement_policy.py",
     _SOURCE_ROOT / "application" / "contracts" / "closed_document.py",
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_config.py",
     _SOURCE_ROOT / "application" / "contracts" / "mineru_diagnostic_quality_input.py",
@@ -80,6 +83,7 @@ _ALLOWED_DISCLOSURE_IMPORTS = (
     "disclosure_anchor.application.services.m6_run_accounting",
     "disclosure_anchor.application.services.m6_delivery_report",
     "disclosure_anchor.application.services.telemetry_resource_aggregates",
+    "disclosure_anchor.application.services.resident_measurement_policy",
     "disclosure_anchor.application.contracts.closed_document",
     "disclosure_anchor.application.contracts.m6_service_quality",
     "disclosure_anchor.application.contracts.mineru_diagnostic_quality_config",

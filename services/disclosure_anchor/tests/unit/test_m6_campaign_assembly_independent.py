@@ -17,6 +17,9 @@ from disclosure_anchor.adapters.runtime.m6_campaign_assembly import (
 from disclosure_anchor.adapters.runtime.resident_owner_control import BoundedOwnerCommand, OwnerCommandResult
 from disclosure_anchor.application.services.m6_launch_budget import finish_wait_seconds
 from tests import m6_owner_support as owner
+from disclosure_anchor.application.services.resident_measurement_policy import (
+    FINITE_COMMAND_MAX_SECONDS,
+)
 from tests import m6_support as m6
 from tests.m6_delivery_support import campaign_intent_for_spec, evaluation_plan
 
@@ -119,7 +122,9 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                 # shorten the 4800+2400 business deadline or force an unknown close.
                 self.assertGreaterEqual(options["timeout_seconds"], planned + grace + ready_wait)
                 self.assertLessEqual(options["timeout_seconds"], options.get("lifetime_ceiling_seconds", 7200))
-                self.assertLessEqual(options.get("lifetime_ceiling_seconds", 7200), 8400)
+                # Only this transport may use the extended finite ceiling; the default stays 7200.
+                self.assertLessEqual(options.get("lifetime_ceiling_seconds", 7200),
+                                     FINITE_COMMAND_MAX_SECONDS)
                 projection = json.loads((assembly._output / "launcher-command.json").read_text())
                 self.assertEqual(projection["timeout_seconds"], options["timeout_seconds"])
                 self.assertEqual(projection["expected_start"]["planned_seconds"], planned)
