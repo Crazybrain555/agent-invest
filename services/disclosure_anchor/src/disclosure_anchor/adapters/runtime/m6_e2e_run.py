@@ -30,7 +30,7 @@ from disclosure_anchor.adapters.runtime.m6_e2e_assembly import M6E2EAssemblyWork
 from disclosure_anchor.adapters.runtime.m6_owner_protocol import (
     M6CallerRole, M6LeasePolicy, M6OwnerClient, M6OwnerProtocolError, M6OwnerRejected,
 )
-from disclosure_anchor.adapters.runtime.m6_owner_ssh import m6_ssh_owner_transport
+from disclosure_anchor.adapters.runtime.m6_owner_ssh import m6_ssh_owner_transport, validate_pinned_executable
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig, _read_private_config
 
 _RUN_ROLES = ("controller", "e2e_runner", "public_verifier", "quality_verifier")
@@ -62,6 +62,8 @@ class M6RunDirectory:
     remote_port: int
     lease: M6LeasePolicy
     pins: dict[str, str]
+    ssh_executable: Path | None = None
+    ssh_executable_sha256: str | None = None
 
     def epoch(self, role: str) -> str:
         return self.roles[role].epoch_sha256
@@ -112,8 +114,27 @@ def load_m6_run_directory(path: Path, *, require_spec: bool = True) -> M6RunDire
     if type(transport) is not dict or set(transport) != {"ssh", "remote_port", "lease"}:
         raise ValueError("M6 transport file fields are not closed")
     ssh = transport["ssh"]
-    if type(ssh) is not dict or set(ssh) != {"address", "port", "username", "private_key_path", "known_hosts_path"}:
+    legacy_ssh_fields = {"address", "port", "username", "private_key_path", "known_hosts_path"}
+    current_ssh_fields = legacy_ssh_fields | {"executable_path", "executable_sha256"}
+    if type(ssh) is not dict or set(ssh) not in (legacy_ssh_fields, current_ssh_fields):
         raise ValueError("M6 transport ssh fields are not closed")
+    ssh_executable: Path | None = None
+    ssh_executable_sha256: str | None = None
+    if set(ssh) == current_ssh_fields:
+        executable_value, digest_value = ssh["executable_path"], ssh["executable_sha256"]
+        if type(executable_value) is not str or type(digest_value) is not str:
+            raise ValueError("M6 transport SSH executable path/hash differs")
+        ssh_executable = Path(executable_value)
+        ssh_executable_sha256 = digest_value
+        # The record stays readable on any host; the live factory verifies the pinned bytes.
+        digest_hex = ssh_executable_sha256.removeprefix("sha256:")
+        if (
+            not ssh_executable.is_absolute()
+            or not ssh_executable_sha256.startswith("sha256:")
+            or len(digest_hex) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest_hex)
+        ):
+            raise ValueError("M6 transport SSH executable identity is not closed")
     lease = transport["lease"]
     if type(lease) is not dict or not {"stop_propagation_reserve_ns"} <= set(lease) <= {
         "stop_propagation_reserve_ns", "maximum_lease_ns", "uncertainty_margin_ns", "maximum_clock_drift_ppm",
@@ -121,9 +142,11 @@ def load_m6_run_directory(path: Path, *, require_spec: bool = True) -> M6RunDire
         raise ValueError("M6 transport lease policy must be explicit integers")
     if isinstance(transport["remote_port"], bool) or type(transport["remote_port"]) is not int:
         raise ValueError("M6 transport port is invalid")
+    ssh_config = {name: ssh[name] for name in legacy_ssh_fields}
     return M6RunDirectory(
-        path=path, anchor=anchor, spec=spec, roles=roles, ssh=ResidentSSHConfig(**ssh),
+        path=path, anchor=anchor, spec=spec, roles=roles, ssh=ResidentSSHConfig(**ssh_config),
         remote_port=transport["remote_port"], lease=M6LeasePolicy(**lease), pins=pins,
+        ssh_executable=ssh_executable, ssh_executable_sha256=ssh_executable_sha256,
     )
 
 
@@ -135,10 +158,16 @@ def m6_owner_client_factory(
         raise ValueError("M6 role is not one of the run's principals")
     spec = run.require_spec()
     epoch, token_path = run.epoch(role), run.token_path(role)
+    ssh_executable, ssh_executable_sha256 = run.ssh_executable, run.ssh_executable_sha256
+    if ssh_executable is None or ssh_executable_sha256 is None:
+        raise ValueError("historical M6 transport lacks the pinned OpenSSH executable and is not live-usable")
+    validate_pinned_executable(ssh_executable, ssh_executable_sha256)
 
     def factory() -> M6OwnerClient:
         transport = m6_ssh_owner_transport(
-            config=run.ssh, token_path=token_path, remote_port=run.remote_port, continuous_ns=continuous_ns,
+            config=run.ssh, token_path=token_path, remote_port=run.remote_port,
+            ssh_executable=ssh_executable, ssh_executable_sha256=ssh_executable_sha256,
+            continuous_ns=continuous_ns,
         )
         return M6OwnerClient(
             anchor=run.anchor, spec=spec, transport=transport, caller_role=role, producer_epoch_sha256=epoch,

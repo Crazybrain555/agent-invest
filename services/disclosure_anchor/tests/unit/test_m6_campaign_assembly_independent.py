@@ -395,7 +395,8 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
         return CampaignPrivateBinding(
             env_dir=root, service_root=root, python_executable=Path(sys.executable), runtime_root=root,
             ssh=ResidentSSHConfig("192.0.2.1", 22, "frozen", str(root / "key"), str(root / "known-hosts")),
-            ssh_executable=Path(sys.executable), ssh_executable_sha256=m6.digest("ssh"),
+            ssh_executable=Path(sys.executable),
+            ssh_executable_sha256="sha256:" + hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
             sftp_executable=Path(sys.executable), sftp_executable_sha256=m6.digest("sftp"),
             windows=windows, mac_exclusive_lock_path=root / "campaign.lock",
         )
@@ -448,6 +449,11 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                     "stop_propagation_reserve_ns", "maximum_lease_ns", "uncertainty_margin_ns",
                     "maximum_clock_drift_ppm"}, "all four lease fields are explicit on disk")
                 self.assertEqual(document["remote_port"], self.OWNER_PORT)
+                self.assertEqual(document["ssh"]["executable_path"], sys.executable)
+                self.assertEqual(
+                    document["ssh"]["executable_sha256"],
+                    "sha256:" + hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest(),
+                )
                 with self.assertRaises(FileExistsError):
                     write_run_transport(run_dir, binding=binding, intent=intent, qpc_frequency_hz=hz)
                 (run_dir / "anchor.json").write_bytes(anchor.canonical_bytes())
@@ -455,6 +461,8 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                 run = load_m6_run_directory(run_dir)
                 self.assertEqual(run.lease, policy, "the loader takes no default for any field")
                 self.assertEqual(run.remote_port, self.OWNER_PORT)
+                self.assertEqual(run.ssh_executable, Path(sys.executable))
+                self.assertEqual(run.ssh_executable_sha256, document["ssh"]["executable_sha256"])
 
     def test_a_lease_the_owner_could_not_honour_is_refused_before_bind_open_or_admission(self):
         """Every conversion, reserve, policy and budget refusal is a CampaignInputError here."""

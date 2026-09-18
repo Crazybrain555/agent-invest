@@ -440,6 +440,10 @@
    "private_imports": [],
    "tests": 17
   },
+  "tests/unit/test_m6_openssh_transport_independent.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/unit/test_m6_owner_deposit_independent.py": {
    "private_imports": [],
    "tests": 6

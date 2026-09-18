@@ -139,10 +139,19 @@ campaign receipt alone.
 
 ## Authentication, transport and retry
 
-One pinned SSH session opens one persistent `direct-tcpip` channel to a configured
-Windows loopback port. Use an explicitly qualified native management account;
-the existing business forwarding-only account intentionally forbids exec. Preserve
-the existing GPU exporter port. No new SSH/firewall permissions are implied.
+One hash-pinned native OpenSSH process opens one persistent stdio direct-tcpip
+forward (-W 127.0.0.1:<owner-port>) to the configured Windows loopback owner.
+Python owns only a local Unix socketpair; OpenSSH owns the LAN socket. The run's
+private transport.json freezes the exact OpenSSH executable path/hash together
+with the account, key and known-hosts references. The run record stays readable
+on any host; the live owner-client factory verifies the pinned bytes before every
+spawn (path-based, so a swap between hash and exec is an accepted residual), and
+historical transports without that executable identity are refused for live owner
+control. A child that closes the channel is reaped at once; its exit status and a
+bounded stderr prefix travel in the reconciliation error, never a second ledger.
+Use an explicitly qualified native management account; the existing
+business forwarding-only account intentionally forbids exec. Preserve the existing
+GPU exporter port. No new SSH/firewall/OS-network permissions are implied.
 
 Each request sends `M6-AUTH/1 <64 lowercase hex characters>` plus LF, then complete
 canonical `m6.owner-request.v2` bytes plus LF. A response is one canonical

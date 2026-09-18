@@ -9,6 +9,7 @@ never receipt-anchored), not by reproducing the client's formula.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -599,8 +600,11 @@ class ControlStateTests(ClientCase):
         reply = owner_support.synthetic_reply_line()
 
         class FakeSession:
-            def __init__(self, config: object, *, remote_port: int, timeout: float) -> None:
-                self.config, self.remote_port, self.timeout = config, remote_port, timeout
+            def __init__(
+                self, config: object, *, executable: Path, executable_sha256: str, remote_port: int,
+            ) -> None:
+                self.config, self.executable = config, executable
+                self.executable_sha256, self.remote_port = executable_sha256, remote_port
                 self.channels: list[FakeChannel] = []
                 self.close_calls = 0
                 sessions.append(self)
@@ -618,28 +622,40 @@ class ControlStateTests(ClientCase):
             token_path.write_text(SYNTHETIC_TOKEN + "\n")
             bad_token = Path(root) / "bad-token"
             bad_token.write_text("not-a-token\n")
+            ssh_path = Path(root) / "ssh"
+            ssh_path.write_bytes(b"synthetic-openssh")
+            ssh_sha = "sha256:" + hashlib.sha256(ssh_path.read_bytes()).hexdigest()
             config = object()
-            with mock.patch.object(m6_owner_ssh, "_Session", FakeSession), mock.patch.object(
+            with mock.patch.object(m6_owner_ssh, "_OpenSSHDirectSession", FakeSession), mock.patch.object(
                 m6_owner_ssh, "_read_private_config", lambda path, secret=False: Path(path).read_text()
             ):
                 with self.assertRaises(ValueError):
-                    m6_owner_ssh.m6_ssh_owner_transport(config=config, token_path="relative/token", remote_port=4444,  # type: ignore[arg-type]
-                                                        continuous_ns=self.clock)
+                    m6_owner_ssh.m6_ssh_owner_transport(
+                        config=config, token_path="relative/token", remote_port=4444,  # type: ignore[arg-type]
+                        ssh_executable=ssh_path, ssh_executable_sha256=ssh_sha, continuous_ns=self.clock,
+                    )
                 with self.assertRaises(ValueError):
-                    m6_owner_ssh.m6_ssh_owner_transport(config=config, token_path=str(bad_token), remote_port=4444,  # type: ignore[arg-type]
-                                                        continuous_ns=self.clock)
+                    m6_owner_ssh.m6_ssh_owner_transport(
+                        config=config, token_path=str(bad_token), remote_port=4444,  # type: ignore[arg-type]
+                        ssh_executable=ssh_path, ssh_executable_sha256=ssh_sha, continuous_ns=self.clock,
+                    )
                 for port in (0, 1023, 65536):
                     with self.assertRaises(ValueError, msg=str(port)):
-                        m6_owner_ssh.m6_ssh_owner_transport(config=config, token_path=str(token_path), remote_port=port,  # type: ignore[arg-type]
-                                                            continuous_ns=self.clock)
-                transport = m6_owner_ssh.m6_ssh_owner_transport(config=config, token_path=str(token_path),  # type: ignore[arg-type]
-                                                                remote_port=4444, continuous_ns=self.clock)
+                        m6_owner_ssh.m6_ssh_owner_transport(
+                            config=config, token_path=str(token_path), remote_port=port,  # type: ignore[arg-type]
+                            ssh_executable=ssh_path, ssh_executable_sha256=ssh_sha, continuous_ns=self.clock,
+                        )
+                transport = m6_owner_ssh.m6_ssh_owner_transport(
+                    config=config, token_path=str(token_path), remote_port=4444,  # type: ignore[arg-type]
+                    ssh_executable=ssh_path, ssh_executable_sha256=ssh_sha, continuous_ns=self.clock,
+                )
                 self.assertEqual(sessions, [], "no SSH session before the first exchange")
                 request = b'{"synthetic":"request"}'
                 self.assertEqual(transport.exchange(request), reply)
                 self.assertEqual(len(sessions), 1)
                 session = sessions[0]
                 self.assertEqual((session.config, session.remote_port), (config, 4444))  # type: ignore[attr-defined]
+                self.assertEqual((session.executable, session.executable_sha256), (ssh_path, ssh_sha))  # type: ignore[attr-defined]
                 self.assertEqual(len(session.channels), 1)  # type: ignore[attr-defined]
                 self.assertEqual(session.channels[0].sent, [b"M6-AUTH/1 " + SYNTHETIC_TOKEN.encode() + b"\n" + request + b"\n"])  # type: ignore[attr-defined]
                 self.assertEqual(transport.exchange(request), reply)

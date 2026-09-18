@@ -617,6 +617,8 @@ def write_run_transport(
         "ssh": {
             "address": ssh.address, "port": ssh.port, "username": ssh.username,
             "private_key_path": ssh.private_key_path, "known_hosts_path": ssh.known_hosts_path,
+            "executable_path": str(binding.ssh_executable),
+            "executable_sha256": binding.ssh_executable_sha256,
         },
         "remote_port": binding.windows.port,
         "lease": {
@@ -1041,7 +1043,7 @@ class M6CampaignAssembly:
             self._summary.fail("supervision", "; ".join(f"{k}: {v}" for k, v in failures.items()))
             try:
                 controller.request(M6OwnerControl(kind="stop"))
-            except (M6OwnerRejected, M6OwnerProtocolError, OSError) as exc:
+            except (M6OwnerRejected, M6OwnerProtocolError, EOFError, RuntimeError, OSError) as exc:
                 self._summary.stage("stop_request_failed", message=str(exc)[:500])
 
         # No business child has been spawned: reuse the existing zero-admission
@@ -1108,14 +1110,14 @@ class M6CampaignAssembly:
                         pass  # the external requester and controller may race to request STOP
                     try:
                         self._controller.request(M6OwnerControl(kind="stop"))
-                    except (M6OwnerRejected, M6OwnerProtocolError, OSError) as exc:
+                    except (M6OwnerRejected, M6OwnerProtocolError, EOFError, RuntimeError, OSError) as exc:
                         self._summary.stage("stop_request_failed", message=str(exc)[:500])
                 now = self._now_ns()
                 if now - last_status_ns >= int(_STATUS_POLL_SECONDS * 1_000_000_000):
                     last_status_ns = now
                     try:
                         owner_state = self._controller.request(M6OwnerControl(kind="status")).status.state
-                    except (M6OwnerRejected, M6OwnerProtocolError, OSError) as exc:
+                    except (M6OwnerRejected, M6OwnerProtocolError, EOFError, RuntimeError, OSError) as exc:
                         failures.setdefault("owner_status", str(exc)[:500])
                         owner_state = "unreachable"
                     if owner_state in ("failed", "closed") and results["runner"] is None:
@@ -1150,7 +1152,7 @@ class M6CampaignAssembly:
             ))
             record["close"] = {"outcome": closed.outcome, "owner_state": closed.status.state}
             self._summary.stage("close", reason=reason, owner_state=closed.status.state)
-        except (M6OwnerRejected, M6OwnerProtocolError, OSError) as exc:
+        except (M6OwnerRejected, M6OwnerProtocolError, EOFError, RuntimeError, OSError) as exc:
             self._summary.fail("close", str(exc))
         record["admitted_count"] = closure.get("admitted_attempt_count") if type(closure) is dict else None
         return record
@@ -1547,7 +1549,7 @@ class M6CampaignAssembly:
             else:
                 closure = self._bootstrap_closure(spec)
         except (CampaignInputError, CampaignIdentityError, CampaignOutcomeUnknown, M6RunnerClosureFailed,
-                M6OwnerRejected, M6OwnerProtocolError, ValueError, OSError) as exc:
+                M6OwnerRejected, M6OwnerProtocolError, EOFError, RuntimeError, ValueError, OSError) as exc:
             summary.fail("campaign", f"{type(exc).__name__}: {exc}")
         except BaseException as exc:
             # An interrupt still closes ownership below and is re-raised after the summary is persisted.
