@@ -46,8 +46,8 @@
   cross-vendor second opinion, never auto-assigned.
 - An implementation author never owns its own acceptance verdict: it runs the acceptance commands it was given
   and reports the exact output, which is evidence, not a verdict. Where AGENTS.md requires an independent
-  read-only review, it goes to a read-only agent that wrote neither the change nor its spec — never an
-  executor; the main agent's own diff read is verification, not that review. Findings are claims to verify
-  and the verdict stays with the main agent. Subagent results are unverified claims until the main agent
-  inspects the diff and reruns the relevant gates — confirm the touched files exist, read `git diff`, rerun
-  the gate.
+  read-only review, it goes to `independent-reviewer` or another read-only agent that wrote neither the
+  change nor its spec — never an executor; the main agent's own diff read is verification, not that review.
+  Findings are claims to verify and the verdict stays with the main agent. Subagent results are unverified
+  claims until the main agent inspects the diff and reruns the relevant gates — confirm the touched files
+  exist, read `git diff`, rerun the gate.
