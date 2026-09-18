@@ -28,6 +28,7 @@ from disclosure_anchor.application.contracts.mineru_local_worker_profile import 
 CURRENT_RUNTIME_PROCESSING_WINDOW_SIZE = 16
 API_FIXED_ARGV = ("--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client")
 API_CONTAINER_OUTPUT_ROOT = "/var/lib/mineru-api-output"
+API_STOP_GRACE_SECONDS = 10
 PROXY_PROGRAM = (
     "import asyncio\n"
     "\n"
@@ -126,6 +127,7 @@ def compose_document(profile: MineruDeploymentProfile, capacity: MineruCapacityC
         "image": profile.api_image_reference,
         "pull_policy": "never",
         "container_name": "mineru-api",
+        "stop_grace_period": f"{API_STOP_GRACE_SECONDS}s",
         "restart": "always",
     }
     if profile.api_memory_limit_bytes is not None:

@@ -92,6 +92,8 @@ class RetainedFixture:
             "_write_retained_zip_from_fds",
             "_hash_file",
             "build_retained_task_result",
+            "_build_retained_artifact_owned",
+            "_commit_retained_result",
             "cleanup_file",
         }
         load_definitions(sources["api"], names, self.namespace)

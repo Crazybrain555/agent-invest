@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import anyio
 import hashlib
 import logging
 import os
@@ -98,6 +99,8 @@ class ResultCapacityApiFixture:
             "AsyncParseTask",
             "AsyncTaskManager",
             "TaskWaitAbortedError",
+            "_settle_service_operation",
+            "_registry_view",
             "utc_now_iso",
             "get_int_env",
             "get_max_concurrent_requests",
@@ -108,12 +111,14 @@ class ResultCapacityApiFixture:
             "cleanup_file",
             "build_upload_destination",
             "is_task_terminal",
+            "_write_upload_chunk",
+            "_prepare_ingress_tree",
             "save_upload_files",
             "create_task_output_dir",
             "create_async_parse_task",
             "ack_async_task_result",
             "_hash_file", "_retained_result_sources", "_verify_and_close_result_sources",
-            "_write_retained_zip_from_fds", "build_retained_task_result",
+            "_write_retained_zip_from_fds", "_commit_retained_result", "_build_retained_artifact_owned", "build_retained_task_result",
             "get_parse_dir", "get_images_dir_image_paths", "build_zip_arcname",
         }
         constants = {
@@ -183,6 +188,9 @@ class ResultCapacityApiFixture:
                 "SplitTaskExecutor": protocol.SplitTaskExecutor,
                 "TaskProtocolConflict": protocol.TaskProtocolConflict,
                 "TaskRegistryPersistenceError": protocol.TaskRegistryPersistenceError,
+                "TaskRegistryObservationBusy": protocol.TaskRegistryObservationBusy,
+                "RegistryServiceIO": protocol.RegistryServiceIO,
+                "anyio": anyio,
                 "TaskAdmissionFull": protocol.TaskAdmissionFull,
                 "TaskResultCapacityRecoveryRequired": protocol.TaskResultCapacityRecoveryRequired,
                 "TaskExecutionStopped": protocol.TaskExecutionStopped,
@@ -336,3 +344,4 @@ class ResultCapacityApiFixture:
             task.cancel()
         if live:
             await asyncio.wait_for(asyncio.gather(*live, return_exceptions=True), 2)
+        await asyncio.wait_for(self.manager.service_io.close(), 2)

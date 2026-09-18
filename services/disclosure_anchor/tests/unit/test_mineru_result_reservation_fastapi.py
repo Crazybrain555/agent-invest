@@ -42,6 +42,7 @@ class ResultReservationFastApiTests(unittest.IsolatedAsyncioTestCase):
         self.retained(fixture)
         pending = [fixture.seed_legacy_pending(name) for name in names]
         seen, all_waiting = set(), asyncio.Event()
+        loop = asyncio.get_running_loop()
         registry = fixture.manager.task_protocol_v2
         original = registry.reserve_result_for_parse
         def reserve(key, **kwargs):
@@ -50,7 +51,7 @@ class ResultReservationFastApiTests(unittest.IsolatedAsyncioTestCase):
             except protocol.TaskResultCapacityFull:
                 seen.add(key)
                 if len(seen) == len(pending):
-                    all_waiting.set()
+                    loop.call_soon_threadsafe(all_waiting.set)
                 raise
         observer = patch.object(registry, 'reserve_result_for_parse', side_effect=reserve)
         observer.start()
@@ -198,6 +199,7 @@ class ResultReservationFastApiTests(unittest.IsolatedAsyncioTestCase):
         )
         calls = []
         third_attempts = 0
+        loop = asyncio.get_running_loop()
         original = registry.reserve_result_for_parse
         def reserve(key, **kwargs):
             nonlocal third_attempts
@@ -207,10 +209,10 @@ class ResultReservationFastApiTests(unittest.IsolatedAsyncioTestCase):
                 result = original(key, **kwargs)
             except protocol.TaskResultCapacityFull:
                 if key == tasks[2].agent_idempotency_key:
-                    third_full.set()
+                    loop.call_soon_threadsafe(third_full.set)
                 raise
             if key == tasks[1].agent_idempotency_key:
-                second_reserved.set()
+                loop.call_soon_threadsafe(second_reserved.set)
             return result
         async def parser_boundary(**kwargs):
             task = kwargs['request_options']

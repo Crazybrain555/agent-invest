@@ -1456,14 +1456,29 @@ class RealPreimageTests(unittest.TestCase):
         )
         allocation_source = ast.get_source_segment(generated, allocation) or ""
         self.assertNotIn("with suppress(TaskProtocolConflict):", allocation_source)
-        calls = {
-            name: [node.lineno for node in ast.walk(allocation)
-                   if isinstance(node, ast.Call)
-                   and ((isinstance(node.func, ast.Name) and node.func.id == name)
-                        or (isinstance(node.func, ast.Attribute) and node.func.attr == name))]
-            for name in ("begin_submission", "create_task_output_dir", "save_upload_files",
-                         "bind_task_payload", "submit", "abort_ingress")
-        }
+        definitions = {node.name: node for node in tree.body
+                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        expected_calls = ("begin_submission", "create_task_output_dir", "save_upload_files",
+                          "bind_task_payload", "submit", "abort_ingress")
+        calls = {name: [] for name in expected_calls}
+        for node in ast.walk(allocation):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (node.func.id if isinstance(node.func, ast.Name)
+                    else node.func.attr if isinstance(node.func, ast.Attribute) else None)
+            if name == "call" and node.args:
+                target = node.args[0]
+                name = (target.id if isinstance(target, ast.Name)
+                        else target.attr if isinstance(target, ast.Attribute) else None)
+            if name in calls:
+                calls[name].append(node.lineno)
+            if name == "_prepare_ingress_tree":
+                helper = definitions[name]
+                direct = [item for item in ast.walk(helper) if isinstance(item, ast.Call)
+                          and isinstance(item.func, ast.Name) and item.func.id == "create_task_output_dir"]
+                self.assertEqual(len(direct), 1)
+                self.assertNotIn("cleanup_file", ast.get_source_segment(generated, helper))
+                calls["create_task_output_dir"].append(node.lineno)
         for name, lines in calls.items():
             self.assertEqual(len(lines), 1, name)
         ordered = ("begin_submission", "create_task_output_dir", "save_upload_files",

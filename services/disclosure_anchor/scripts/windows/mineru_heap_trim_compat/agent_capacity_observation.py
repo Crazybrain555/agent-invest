@@ -140,13 +140,34 @@ class CapacityServingObservation:
         self.boot_id = str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
         if self.process_start_ticks <= 0:
             raise RuntimeError("serving process birth is invalid")
-        self._pressure_cgroup_identity = None
+        self._pressure_cgroup_identity: str | None = None
 
-    def pressure_snapshot(self) -> dict:
+    def _assert_process_config(self) -> None:
+        from mineru.cli.agent_capacity_bootstrap import get_process_capacity
+        if os.getpid() != self.process_id or get_process_capacity() is not self.config:
+            raise RuntimeError("capacity observation process or config changed")
+
+    def pressure_begin(self) -> tuple[int, dict]:
+        """Capture all serving-loop-owned state before blocking kernel IO."""
         started = time.monotonic_ns()
-        observation = self.snapshot()
-        memory = _linux_pressure_memory()
-        identity = memory["cgroup_identity_sha256"]
+        self._assert_process_config()
+        return started, self.snapshot()
+
+    @staticmethod
+    def pressure_kernel_memory() -> dict:
+        """Only blocking proc/cgroup reads. Safe to run on the owned IO executor."""
+        return _linux_pressure_memory()
+
+    def pressure_finish(self, started: int, observation: dict, memory: dict) -> dict:
+        """Revalidate owner/config on the serving loop and bind one fresh kernel read."""
+        if type(started) is not int or started < 0 or type(observation) is not dict or type(memory) is not dict:
+            raise ValueError("pressure observation components are invalid")
+        self._assert_process_config()
+        if observation.get("owner") != self.snapshot().get("owner"):
+            raise RuntimeError("pressure serving owner changed during kernel read")
+        identity = memory.get("cgroup_identity_sha256")
+        if not isinstance(identity, str):
+            raise RuntimeError("pressure cgroup identity is absent")
         if self._pressure_cgroup_identity is not None and self._pressure_cgroup_identity != identity:
             raise RuntimeError("pressure cgroup identity changed during serving lifetime")
         self._pressure_cgroup_identity = identity
@@ -155,6 +176,11 @@ class CapacityServingObservation:
                 "owner": observation["owner"], "memory": memory,
                 "observed_at": {"clock": "python.monotonic_ns", "started_ns": started,
                                 "completed_ns": time.monotonic_ns()}}
+
+    def pressure_snapshot(self) -> dict:
+        """Synchronous compatibility path for offline/unit callers only."""
+        started, observation = self.pressure_begin()
+        return self.pressure_finish(started, observation, self.pressure_kernel_memory())
 
     def snapshot(self) -> dict:
         from mineru.cli.agent_capacity_bootstrap import get_process_capacity

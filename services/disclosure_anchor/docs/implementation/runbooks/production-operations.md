@@ -212,6 +212,11 @@ compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurren
 `-ApiDeviceProfile cpu|cuda0` 的设备变化分别遵循
 [显式容量部署约束](../design/mineru-explicit-capacity.md#installation-and-observation)：
 每次只放行选定轴，保留其他配置和推理服务/代理进程。设备配置通过不代表解析质量已通过。
+显式容量投影同时把 `services.mineru-api.stop_grace_period` 固定为 `10s`：API-only 升级允许该键
+从缺省引入或保持 `10s`，现场取其他值视为漂移并拒绝；安装后与每次 collector 运行都断言 API 容器
+实际 `Config.StopTimeout` 等于 10；该断言只针对已部署的候选，回滚与 `-ReuseCurrentPublishedImage`
+的变更前校验面对的是旧 compose，不要求该键。该期限只界定停止信号之后的强制收尾上限，不替代
+发信号前的业务软排空、900ms freshness 或 M6 `max_close`。
 `scripts/windows/test_mineru_api_only_installer.ps1 -InstallerPath <reviewed-installer.ps1>`
 在 Windows PowerShell 5.1 中抽取并执行真实安装器函数，使用独立临时文件和模拟 Docker
 验证配置保护、旧 tag/文件恢复顺序以及健康/镜像不符的失败路径；不调用真实 Docker。

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import anyio
 import hashlib
 import logging
 import os
@@ -26,6 +27,7 @@ from scripts.windows.mineru_heap_trim_compat import agent_task_protocol_v2 as pr
 from scripts.windows.mineru_heap_trim_compat.patch_mineru_344 import patch_source
 
 PREIMAGE_SHA256 = "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
+MODEL_PREIMAGE_SHA256 = "7662656c5c406ab704065b8a3a6e662b662b0bb877b76b08c7d8a8a7eaf9c109"
 UPLOAD_BYTES = b"synthetic-unparsed-admission-ownership-fixture\n"
 
 
@@ -93,6 +95,8 @@ class AdmissionFixture:
             "AsyncParseTask",
             "AsyncTaskManager",
             "TaskWaitAbortedError",
+            "_settle_service_operation",
+            "_registry_view",
             "utc_now_iso",
             "get_int_env",
             "get_max_concurrent_requests",
@@ -103,6 +107,8 @@ class AdmissionFixture:
             "cleanup_file",
             "build_upload_destination",
             "is_task_terminal",
+            "_write_upload_chunk",
+            "_prepare_ingress_tree",
             "save_upload_files",
             "create_task_output_dir",
             "create_async_parse_task",
@@ -166,6 +172,9 @@ class AdmissionFixture:
                 "SplitTaskExecutor": protocol.SplitTaskExecutor,
                 "TaskProtocolConflict": protocol.TaskProtocolConflict,
                 "TaskRegistryPersistenceError": protocol.TaskRegistryPersistenceError,
+                "TaskRegistryObservationBusy": protocol.TaskRegistryObservationBusy,
+                "RegistryServiceIO": protocol.RegistryServiceIO,
+                "anyio": anyio,
                 "TaskAdmissionFull": protocol.TaskAdmissionFull,
                 "TaskResultCapacityRecoveryRequired": protocol.TaskResultCapacityRecoveryRequired,
                 "TaskExecutionStopped": protocol.TaskExecutionStopped,
@@ -180,6 +189,19 @@ class AdmissionFixture:
             ),
             namespace,
         )
+        model_preimage = service / "tests/fixtures/mineru_344_preimages/mineru/utils/model_utils.py"
+        model_raw = model_preimage.read_bytes()
+        if hashlib.sha256(model_raw).hexdigest() != MODEL_PREIMAGE_SHA256:
+            raise AssertionError("official model_utils preimage changed")
+        generated_model = patch_source("mineru/utils/model_utils.py", model_raw.decode())
+        helper_names = {"OwnedOperation", "drain_owned_awaitable"}
+        helper_nodes = [node for node in ast.parse(generated_model).body
+                        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                        and node.name in helper_names]
+        if {node.name for node in helper_nodes} != helper_names:
+            raise AssertionError("actual generated owned-thread helpers changed")
+        exec(compile(ast.fix_missing_locations(ast.Module(body=helper_nodes, type_ignores=[])),
+                     "<actual-generated-owned-operation>", "exec"), namespace)
         self.manager = module.AsyncTaskManager(
             types.SimpleNamespace(state=types.SimpleNamespace(config={}))
         )
@@ -288,3 +310,4 @@ class AdmissionFixture:
             task.cancel()
         if live:
             await asyncio.wait_for(asyncio.gather(*live, return_exceptions=True), 2)
+        await asyncio.wait_for(self.manager.service_io.close(), 2)

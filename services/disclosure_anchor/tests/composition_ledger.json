@@ -856,6 +856,10 @@
    "private_imports": [],
    "tests": 0
   },
+  "tests/unit/test_mineru_service_io_execution.py": {
+   "private_imports": [],
+   "tests": 1
+  },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
    "tests": 9

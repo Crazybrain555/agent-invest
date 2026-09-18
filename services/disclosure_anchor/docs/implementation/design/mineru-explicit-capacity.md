@@ -47,6 +47,16 @@ proxy/inference service epochs. It uses the existing API-only recreation and
 fresh output/registry rollback witness. A failed or changed witness still blocks
 rollback over newly acquired task responsibility.
 
+The explicit-capacity projection also pins `services.mineru-api.stop_grace_period`
+to `10s`. An API-only upgrade on either axis may introduce that key from an unset
+live value or keep it at `10s`; any other live value is drift and is rejected
+before mutation. After installation, and on every collector run, the API
+container's actual `Config.StopTimeout` must equal 10. The installer asserts it only
+in its post-deployment validation; rollback and the pre-mutation published-image
+reuse check validate the previous compose and do not require the key. The budget
+bounds only the forced teardown after the stop signal; it does not replace business
+soft-drain before signalling, the 900 ms freshness rule or the M6 `max_close`.
+
 The optional `-ApiDeviceProfile cpu|cuda0` selects a separate device-change axis
 and requires an explicit-capacity API-only upgrade. The supplied candidate
 Compose must select that profile: CPU has no GPU reservation; `cuda0` uses

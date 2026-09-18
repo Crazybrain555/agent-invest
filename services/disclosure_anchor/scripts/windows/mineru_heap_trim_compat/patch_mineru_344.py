@@ -1054,6 +1054,719 @@ def _patch_table_image_conservation(source: str) -> str:
     )
 
 
+
+def _patch_service_io_manager(source: str) -> str:
+    """Bind the durable registry to an application-owned blocking IO plane."""
+    if "async def create_async_parse_task(" not in source:
+        return source
+    source = _replace_exact(
+        source, "import click\nimport uvicorn\n", "import anyio\nimport click\nimport uvicorn\n",
+        count=1, label="service IO anyio import",
+    )
+    source = _replace_exact(
+        source,
+        "    TaskRegistryPersistenceError,\n    evict_consumed_routes, task_protocol_runtime_status,\n",
+        "    TaskRegistryPersistenceError, TaskRegistryObservationBusy, RegistryServiceIO,\n"
+        "    evict_consumed_routes, task_protocol_runtime_status,\n",
+        count=1, label="service IO registry imports",
+    )
+    source = _replace_exact(
+        source,
+        "from mineru.utils.model_utils import strict_processing_window_size, to_thread_owned\n",
+        "from mineru.utils.model_utils import drain_owned_awaitable, strict_processing_window_size, to_thread_owned\n",
+        count=1, label="service IO drain import",
+    )
+    task_wait = (
+        'class TaskWaitAbortedError(RuntimeError):\n'
+        '    """Raised when a synchronous file_parse request cannot keep waiting safely."""\n\n\n'
+    )
+    helpers = task_wait + (
+        'async def _settle_service_operation(awaitable):\n'
+        '    with anyio.CancelScope(shield=True):\n'
+        '        return await drain_owned_awaitable(awaitable)\n\n\n'
+        'async def _registry_view(manager, reader):\n'
+        '    try:\n'
+        '        return await manager.task_protocol_v2.observe(reader)\n'
+        '    except TaskRegistryObservationBusy as exc:\n'
+        '        raise HTTPException(status_code=503, detail={"code": "registry_observation_busy"}) from exc\n'
+        '    except TaskRegistryPersistenceError as exc:\n'
+        '        raise HTTPException(status_code=503, detail={"code": "registry_persistence_unavailable"}) from exc\n\n\n'
+    )
+    source = _replace_exact(source, task_wait, helpers, count=1, label="service IO helpers")
+    owner = (
+        '        self.task_protocol_executor = SplitTaskExecutor(\n'
+        '            parse_slots=get_max_concurrent_requests(),\n'
+        '            finalizer_slots=(1 if self.capacity_config is None\n'
+        '                             else self.capacity_config.finalizer_active_limit),\n'
+        '            result_reservation_bytes=result_budget,\n'
+        '        )\n'
+    )
+    source = _replace_exact(
+        source, owner,
+        owner + '        self.service_io = RegistryServiceIO(\n'
+        '            drain=_settle_service_operation, max_pending=self.max_nonterminal_tasks + 8\n'
+        '        )\n', count=1, label="service IO owner",
+    )
+    source = _replace_exact(
+        source,
+        '        self.task_protocol_v2.cleanup_consumed()\n'
+        '        for payload in self.task_protocol_v2.recoverable_payloads():\n',
+        '        cleaned = await self.service_io.call(\n'
+        '            self.task_protocol_v2.cleanup_consumed, lane="bulk", required=True\n'
+        '        )\n'
+        '        if cleaned:\n'
+        '            self.task_protocol_executor.notify_result_capacity_changed()\n'
+        '        for payload in await self.service_io.call(\n'
+        '            self.task_protocol_v2.recoverable_payloads, lane="bulk", required=True\n'
+        '        ):\n', count=1, label="service IO startup",
+    )
+    begin_start=source.index('    def begin_submission(self, options):\n', source.index('class AsyncTaskManager:'))
+    begin_end=source.index('    def finish_submission(', begin_start)
+    begin="""    async def begin_submission(self, options):\n        key = options.agent_idempotency_key\n        existing = await self.task_protocol_v2.observe(lambda: self.task_protocol_v2.get(key))\n        allow_create = existing is None\n        if allow_create and self.is_shutting_down:\n            raise HTTPException(status_code=503, detail="Task manager is shutting down")\n        if allow_create:\n            reason = (await self.task_protocol_v2.observe(self.admission_snapshot))["blocked_reason"]\n            if reason not in {None, "capacity_full"}:\n                raise HTTPException(status_code=503, detail=reason)\n        task_id = str(uuid.uuid4())\n        if allow_create:\n            self._ingress_in_flight.add(task_id)\n            self._ingress_drained.clear()\n        try:\n            record, created = await self.service_io.call(\n                self.task_protocol_v2.reconcile_or_create,\n                idempotency_key=key, task_id=task_id,\n                attempt_identity=options.agent_attempt_identity,\n                fence_identity=options.agent_fence_identity,\n                max_nonterminal_tasks=self.max_nonterminal_tasks,\n                allow_create=allow_create, lane="metadata",\n            )\n        except BaseException:\n            if allow_create:\n                self._ingress_in_flight.discard(task_id)\n                if not self._ingress_in_flight:\n                    self._ingress_drained.set()\n            raise\n        if created and record.task_id != task_id:\n            raise RuntimeError("created task identity drifted")\n        if not created and allow_create:\n            self._ingress_in_flight.discard(task_id)\n            if not self._ingress_in_flight:\n                self._ingress_drained.set()\n        return record, created\n\n"""
+    source=source[:begin_start]+begin+source[begin_end:]
+    source = _replace_exact(
+        source, 'record, created = task_manager.begin_submission(request_options)',
+        'record, created = await task_manager.begin_submission(request_options)',
+        count=1, label="service IO admission caller",
+    )
+    source = _replace_exact(
+        source,
+        '            if (task.status == TASK_PENDING\n'
+        '                    and task.task_id not in self._scheduled_task_ids\n'
+        '                    and task.task_id not in self._stopped_pending_task_ids):\n',
+        '            if (task.status == TASK_PENDING\n'
+        '                    and task.task_id not in self._scheduled_task_ids\n'
+        '                    and task.task_id not in self._stopped_pending_task_ids\n'
+        '                    and task.task_id not in self._ingress_in_flight):\n',
+        count=1, label="service IO ingress queue fence",
+    )
+    source = _replace_exact(
+        source,
+        '                parse=parse_stage, finalize=finalizer_stage,\n            )\n',
+        '                parse=parse_stage, finalize=finalizer_stage, registry_io=self.service_io,\n            )\n',
+        count=1, label="service IO executor bridge",
+    )
+    source = _replace_exact(
+        source, '                self.cleanup_expired_tasks()\n',
+        '                await self.cleanup_expired_tasks()\n',
+        count=1, label="service IO periodic cleanup await",
+    )
+    cleanup_start=source.index('    def cleanup_expired_tasks(self) -> int:\n', source.index('class AsyncTaskManager:'))
+    cleanup_end=source.index('    def _is_task_expired(', cleanup_start)
+    cleanup="""    async def cleanup_expired_tasks(self) -> int:\n        cleaned = await self.service_io.call(\n            self.task_protocol_v2.cleanup_consumed, lane="bulk", required=True\n        )\n        if cleaned:\n            self.task_protocol_executor.notify_result_capacity_changed()\n        self._evict_consumed_protocol_tasks()\n        return cleaned\n\n"""
+    source=source[:cleanup_start]+cleanup+source[cleanup_end:]
+    source = _replace_exact(
+        source,
+        '        self.active_tasks.clear()\n        self.task_protocol_v2.cleanup_consumed()\n',
+        '        self.active_tasks.clear()\n'
+        '        cleaned = await self.service_io.call(\n'
+        '            self.task_protocol_v2.cleanup_consumed, lane="bulk", required=True\n'
+        '        )\n'
+        '        if cleaned:\n'
+        '            self.task_protocol_executor.notify_result_capacity_changed()\n',
+        count=1, label="service IO shutdown cleanup",
+    )
+    return source
+
+
+def _patch_service_io_ack_health(source: str) -> str:
+    if "async def ack_async_task_result(" not in source:
+        return source
+    start = source.index("async def ack_async_task_result(task_id: str):\n")
+    end = source.index("\n\n@app.get(path=\"/tasks/{task_id}/result\"", start)
+    ack = (
+        "async def ack_async_task_result(task_id: str):\n"
+        "    task_manager = get_task_manager()\n"
+        "    record = await _registry_view(task_manager, lambda: task_manager.task_protocol_v2.get_by_task_id(task_id))\n"
+        "    if record is None:\n"
+        "        raise HTTPException(status_code=404, detail=\"Task not found\")\n"
+        "    key = record.idempotency_key\n"
+        "    try:\n"
+        "        await task_manager.service_io.call(\n"
+        "            task_manager.task_protocol_v2.acknowledge_terminal_intent, key, lane=\"metadata\"\n"
+        "        )\n"
+        "        await task_manager.service_io.call(\n"
+        "            task_manager.task_protocol_v2.cleanup_consumed,\n"
+        "            idempotency_key=key, lane=\"bulk\", required=True,\n"
+        "        )\n"
+        "        def confirm():\n"
+        "            current = task_manager.task_protocol_v2.get(key)\n"
+        "            if current is None or current.task_id != task_id or current.state != \"consumed\":\n"
+        "                raise TaskProtocolConflict(\"ACK cleanup did not reach consumed\")\n"
+        "            task_manager._evict_consumed_protocol_tasks()\n"
+        "            return {\"schema\": \"mineru-task-protocol.v2\", \"task_id\": task_id, \"status\": \"consumed\"}\n"
+        "        result = await _registry_view(task_manager, confirm)\n"
+        "        task_manager.task_protocol_executor.notify_result_capacity_changed()\n"
+        "        return result\n"
+        "    except TaskRegistryPersistenceError as exc:\n"
+        "        raise HTTPException(status_code=503, detail=str(exc)) from exc\n"
+        "    except TaskProtocolConflict as exc:\n"
+        "        raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+    )
+    source = source[:start] + ack + source[end:]
+
+    status_start = source.index("async def get_async_task_status(task_id: str, request: Request):\n")
+    status_end = source.index("\n\n@app.get(path=\"/tasks/by-idempotency/", status_start)
+    status = (
+        "async def get_async_task_status(task_id: str, request: Request):\n"
+        "    task_manager = get_task_manager()\n"
+        "    def view():\n"
+        "        task = task_manager.get(task_id)\n"
+        "        return None if task is None else task_manager.build_status_payload(task, request)\n"
+        "    payload = await _registry_view(task_manager, view)\n"
+        "    if payload is None:\n"
+        "        raise HTTPException(status_code=404, detail=\"Task not found\")\n"
+        "    return payload\n"
+    )
+    source = source[:status_start] + status + source[status_end:]
+
+    reconcile_start = source.index("async def reconcile_async_task(idempotency_key: str, request: Request):\n")
+    reconcile_end = source.index("\n\n@app.post(path=\"/tasks/{task_id}/lease\"", reconcile_start)
+    reconcile = (
+        "async def reconcile_async_task(idempotency_key: str, request: Request):\n"
+        "    task_manager = get_task_manager()\n"
+        "    def view():\n"
+        "        record = task_manager.task_protocol_v2.get(idempotency_key)\n"
+        "        task = None if record is None or record.state == \"consumed\" else task_manager.reconcile_submission(record)\n"
+        "        return None if task is None else task_manager.build_status_payload(task, request)\n"
+        "    payload = await _registry_view(task_manager, view)\n"
+        "    if payload is None:\n"
+        "        raise HTTPException(status_code=404, detail=\"Task not found\")\n"
+        "    return payload\n"
+    )
+    source = source[:reconcile_start] + reconcile + source[reconcile_end:]
+
+    lease_start = source.index("async def lease_async_task_result(task_id: str, seconds: int = 300):\n")
+    lease_end = source.index("\n\n@app.post(path=\"/tasks/{task_id}/ack\"", lease_start)
+    lease = (
+        "async def lease_async_task_result(task_id: str, seconds: int = 300):\n"
+        "    task_manager = get_task_manager()\n"
+        "    if not 1 <= seconds <= 3600:\n"
+        "        raise HTTPException(status_code=400, detail=\"Task protocol lease is invalid\")\n"
+        "    record = await _registry_view(task_manager, lambda: task_manager.task_protocol_v2.get_by_task_id(task_id))\n"
+        "    if record is None:\n"
+        "        raise HTTPException(status_code=404, detail=\"Task not found\")\n"
+        "    try:\n"
+        "        lease_until = await task_manager.service_io.call(\n"
+        "            task_manager.task_protocol_v2.lease, record.idempotency_key,\n"
+        "            seconds=seconds, lane=\"metadata\"\n"
+        "        )\n"
+        "    except TaskRegistryPersistenceError as exc:\n"
+        "        raise HTTPException(status_code=503, detail=str(exc)) from exc\n"
+        "    except TaskProtocolConflict as exc:\n"
+        "        raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+        "    return {\"schema\": \"mineru-task-protocol.v2\", \"task_id\": task_id, \"lease_until_unix\": lease_until}\n"
+    )
+    source = source[:lease_start] + lease + source[lease_end:]
+
+    old = (
+        "    stats = task_manager.get_stats()\n"
+        "    admission = task_manager.admission_snapshot()\n"
+        "    capacity_extra = {}\n"
+        "    if getattr(task_manager, 'capacity_config', None) is None:\n"
+        "        protocol_runtime = task_protocol_runtime_status(\n"
+        "            task_manager.task_protocol_v2, task_manager.task_protocol_executor\n"
+        "        )\n"
+        "    else:\n"
+        "        protocol_runtime = task_protocol_runtime_status(\n"
+        "            task_manager.task_protocol_v2, task_manager.task_protocol_executor,\n"
+        "            capacity_config_sha256=task_manager.capacity_config.sha256,\n"
+        "        )\n"
+        "        capacity_extra['capacity_observation'] = task_manager.capacity_observer.snapshot()\n"
+    )
+    new = (
+        "    def view():\n"
+        "        if not task_manager.is_healthy():\n"
+        "            raise RuntimeError(\"task manager became unhealthy during health observation\")\n"
+        "        stats = task_manager.get_stats()\n"
+        "        admission = task_manager.admission_snapshot()\n"
+        "        if getattr(task_manager, 'capacity_config', None) is None:\n"
+        "            protocol_runtime = task_protocol_runtime_status(\n"
+        "                task_manager.task_protocol_v2, task_manager.task_protocol_executor\n"
+        "            )\n"
+        "            capacity_extra = {}\n"
+        "        else:\n"
+        "            protocol_runtime = task_protocol_runtime_status(\n"
+        "                task_manager.task_protocol_v2, task_manager.task_protocol_executor,\n"
+        "                capacity_config_sha256=task_manager.capacity_config.sha256,\n"
+        "            )\n"
+        "            capacity_extra = {'capacity_observation': task_manager.capacity_observer.snapshot()}\n"
+        "        return stats, admission, protocol_runtime, capacity_extra\n"
+        "    try:\n"
+        "        stats, admission, protocol_runtime, capacity_extra = await _registry_view(task_manager, view)\n"
+        "    except HTTPException as exc:\n"
+        "        code = exc.detail.get(\"code\", \"registry_observation_failed\") if isinstance(exc.detail, dict) else \"registry_observation_failed\"\n"
+        "        return JSONResponse(status_code=503, content={\"status\": \"unhealthy\", \"version\": __version__, \"error\": code})\n"
+        "    except RuntimeError as exc:\n"
+        "        return JSONResponse(status_code=503, content={\"status\": \"unhealthy\", \"version\": __version__, \"error\": str(exc)[:256]})\n"
+    )
+    source = _replace_exact(source, old, new, count=1, label="service IO fresh health")
+
+    temp_response_class = (
+        "class TemporaryFileResponse(FileResponse):\n"
+        "    async def __call__(self, scope, receive, send):\n"
+        "        primary = None\n"
+        "        if scope.get(\"type\") == \"http\" and \"http.response.pathsend\" in scope.get(\"extensions\", {}):\n"
+        "            scope = dict(scope)\n"
+        "            extensions = dict(scope.get(\"extensions\", {}))\n"
+        "            extensions.pop(\"http.response.pathsend\", None)\n"
+        "            scope[\"extensions\"] = extensions\n"
+        "        try:\n"
+        "            await super().__call__(scope, receive, send)\n"
+        "        except BaseException as exc:\n"
+        "            primary = exc\n"
+        "        cleanup_error = None\n"
+        "        try:\n"
+        "            await _settle_service_operation(to_thread_owned(cleanup_file, self.path))\n"
+        "        except BaseException as exc:\n"
+        "            cleanup_error = exc\n"
+        "        if primary is not None:\n"
+        "            if cleanup_error is not None:\n"
+        "                primary.add_note(\"temporary result cleanup failed: \" + type(cleanup_error).__name__)\n"
+        "                raise primary from cleanup_error\n"
+        "            raise primary\n"
+        "        if cleanup_error is not None:\n"
+        "            raise cleanup_error\n"
+    )
+    response_class = (
+        "class OwnedFileResponse(FileResponse):\n"
+        "    def __init__(self, *, manager, idempotency_key, **kwargs):\n"
+        "        super().__init__(**kwargs)\n"
+        "        self._owner_manager = manager\n"
+        "        self._owner_key = idempotency_key\n"
+        "    async def __call__(self, scope, receive, send):\n"
+        "        primary = None\n"
+        "        if scope.get(\"type\") == \"http\" and \"http.response.pathsend\" in scope.get(\"extensions\", {}):\n"
+        "            scope = dict(scope)\n"
+        "            extensions = dict(scope.get(\"extensions\", {}))\n"
+        "            extensions.pop(\"http.response.pathsend\", None)\n"
+        "            scope[\"extensions\"] = extensions\n"
+        "        try:\n"
+        "            await super().__call__(scope, receive, send)\n"
+        "        except BaseException as exc:\n"
+        "            primary = exc\n"
+        "        cleanup_error = None\n"
+        "        try:\n"
+        "            await _settle_service_operation(self._owner_manager.service_io.call(\n"
+        "                self._owner_manager.task_protocol_v2.release_result, self._owner_key,\n"
+        "                lane=\"metadata\", required=True,\n"
+        "            ))\n"
+        "        except BaseException as exc:\n"
+        "            cleanup_error = exc\n"
+        "        if primary is not None:\n"
+        "            if cleanup_error is not None:\n"
+        "                primary.add_note(\"result reader release failed: \" + type(cleanup_error).__name__)\n"
+        "                raise primary from cleanup_error\n"
+        "            raise primary\n"
+        "        if cleanup_error is not None:\n"
+        "            raise cleanup_error\n"
+    )
+    source = _replace_exact(
+        source, "\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n",
+        "\n" + temp_response_class + "\n\n" + response_class + "\n\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n",
+        count=1, label="service IO owned file response",
+    )
+
+    result_start = source.index("async def get_async_task_result(\n")
+    result_end = source.index("\n\n@app.get(path=\"/agent/telemetry/http-requests/v1\"", result_start)
+    result_route = (
+        "async def get_async_task_result(\n"
+        "    task_id: str,\n"
+        "    request: Request,\n"
+        "    background_tasks: BackgroundTasks,\n"
+        "):\n"
+        "    del background_tasks\n"
+        "    task_manager = get_task_manager()\n"
+        "    task = await _registry_view(task_manager, lambda: task_manager.get(task_id))\n"
+        "    if task is None:\n"
+        "        raise HTTPException(status_code=404, detail=\"Task not found\")\n"
+        "    if task.status in (TASK_PENDING, TASK_PROCESSING):\n"
+        "        return JSONResponse(status_code=202, content={**task.to_status_payload(request), \"message\": \"Task result is not ready yet\"})\n"
+        "    if task.status == TASK_FAILED:\n"
+        "        return JSONResponse(status_code=409, content={**task.to_status_payload(request), \"message\": \"Task execution failed\"})\n"
+        "    if not task.result_artifact_path or not task.result_artifact_sha256 or not task.result_artifact_owner:\n"
+        "        raise HTTPException(status_code=410, detail=\"Retained task result is unavailable\")\n"
+        "    if not task.agent_idempotency_key:\n"
+        "        raise HTTPException(status_code=410, detail=\"Task protocol result owner is absent\")\n"
+        "    key = task.agent_idempotency_key\n"
+        "    try:\n"
+        "        result_path = await task_manager.service_io.call(\n"
+        "            task_manager.task_protocol_v2.acquire_result, key, lane=\"metadata\",\n"
+        "            on_cancel_result=lambda _path: task_manager.task_protocol_v2.release_result(key),\n"
+        "        )\n"
+        "    except TaskRegistryPersistenceError as exc:\n"
+        "        raise HTTPException(status_code=503, detail=str(exc)) from exc\n"
+        "    except TaskProtocolConflict as exc:\n"
+        "        raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+        "    return OwnedFileResponse(\n"
+        "        manager=task_manager, idempotency_key=key, path=str(result_path),\n"
+        "        media_type=\"application/zip\", filename=f\"{task.task_id}.zip\", status_code=200,\n"
+        "        headers={\"X-MinerU-Result-SHA256\": task.result_artifact_sha256, \"X-MinerU-Result-Owner\": task.result_artifact_owner},\n"
+        "    )\n"
+    )
+    source = source[:result_start] + result_route + source[result_end:]
+
+    retained_marker = "async def build_retained_task_result(task: AsyncParseTask, *, byte_budget: int) -> None:\n"
+    retained_helper = (
+        "def _commit_retained_result(part_path: str, final_path: str, output_dir: str) -> None:\n"
+        "    os.replace(part_path, final_path)\n"
+        "    directory_fd = os.open(output_dir, os.O_RDONLY)\n"
+        "    try:\n"
+        "        os.fsync(directory_fd)\n"
+        "    finally:\n"
+        "        os.close(directory_fd)\n\n\n"
+    )
+    source = _replace_exact(
+        source, retained_marker, retained_helper + retained_marker,
+        count=1, label="service IO retained result commit helper",
+    )
+    source = _replace_exact(
+        source,
+        "        os.replace(retained_part, retained)\n"
+        "        directory_fd = os.open(task.output_dir, os.O_RDONLY)\n"
+        "        try:\n"
+        "            os.fsync(directory_fd)\n"
+        "        finally:\n"
+        "            os.close(directory_fd)\n",
+        "        await to_thread_owned(_commit_retained_result, retained_part, retained, task.output_dir)\n",
+        count=1, label="service IO retained result commit",
+    )
+    source = _replace_exact(
+        source, "        cleanup_file(retained)\n        raise\n",
+        "        await to_thread_owned(cleanup_file, retained)\n        raise\n",
+        count=1, label="service IO retained failure cleanup",
+    )
+    source = _replace_exact(
+        source, "        cleanup_file(retained_part)\n        if close_failure is not None:\n",
+        "        await to_thread_owned(cleanup_file, retained_part)\n        if close_failure is not None:\n",
+        count=1, label="service IO retained part cleanup",
+    )
+
+    # Temporary ZIP creation is owned and its response cleans the copy in finally.
+    zip_old = (
+        "        zip_task = asyncio.create_task(\n"
+        "            asyncio.to_thread(\n"
+        "                create_result_zip,\n"
+    )
+    zip_new = (
+        "        zip_task = asyncio.create_task(\n"
+        "            to_thread_owned(\n"
+        "                create_result_zip,\n"
+    )
+    source = _replace_exact(source, zip_old, zip_new, count=1, label="service IO temporary ZIP creation")
+    source = _replace_exact(
+        source,
+        "        background_tasks.add_task(cleanup_file, zip_path)\n"
+        "        return FileResponse(\n",
+        "        return TemporaryFileResponse(\n",
+        count=1, label="service IO temporary ZIP response cleanup",
+    )
+
+    parse_start = source.index("async def parse_pdf(\n")
+    parse_end = source.index("\n\n@app.post(\n    path=\"/tasks\"", parse_start)
+    parse_block = source[parse_start:parse_end]
+    old_return = (
+        "    return await build_sync_file_parse_response(\n"
+        "        background_tasks=background_tasks,\n"
+        "        task=task,\n"
+        "        request=http_request,\n"
+        "    )\n"
+    )
+    new_return = (
+        "    if not task.agent_idempotency_key:\n"
+        "        raise HTTPException(status_code=410, detail=\"Task protocol result owner is absent\")\n"
+        "    key = task.agent_idempotency_key\n"
+        "    try:\n"
+        "        await task_manager.service_io.call(\n"
+        "            task_manager.task_protocol_v2.acquire_inline_result, key, lane=\"metadata\",\n"
+        "            on_cancel_result=lambda _path: task_manager.task_protocol_v2.release_result(key),\n"
+        "        )\n"
+        "        try:\n"
+        "            return await build_sync_file_parse_response(\n"
+        "                background_tasks=background_tasks, task=task, request=http_request,\n"
+        "            )\n"
+        "        finally:\n"
+        "            await _settle_service_operation(task_manager.service_io.call(\n"
+        "                task_manager.task_protocol_v2.release_result, key, lane=\"metadata\", required=True,\n"
+        "            ))\n"
+        "    except TaskRegistryPersistenceError as exc:\n"
+        "        raise HTTPException(status_code=503, detail=str(exc)) from exc\n"
+        "    except TaskProtocolConflict as exc:\n"
+        "        raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+    )
+    if parse_block.count(old_return) != 1:
+        raise AssertionError("sync file_parse return drift")
+    parse_block = parse_block.replace(old_return, new_return, 1)
+    source = source[:parse_start] + parse_block + source[parse_end:]
+    return source
+
+
+
+
+def _patch_service_io_ingress(source: str) -> str:
+    if "async def create_async_parse_task(" not in source:
+        return source
+
+    # One local helper owns directory creation and initial namespace binding.
+    source = _replace_exact(
+        source,
+        "def create_task_output_dir(task_id: str) -> str:\n",
+        "def _prepare_ingress_tree(task_manager, task_id: str, key: str) -> tuple[str, str]:\n"
+        "    task_output_dir = create_task_output_dir(task_id)\n"
+        "    uploads_dir = os.path.join(task_output_dir, \"uploads\")\n"
+        "    try:\n"
+        "        os.mkdir(uploads_dir)\n"
+        "        task_manager.task_protocol_v2.bind_ingress_root(key)\n"
+        "        return task_output_dir, uploads_dir\n"
+        "    except BaseException:\n"
+        "        cleanup_file(task_output_dir)\n"
+        "        raise\n\n\n"
+        "def create_task_output_dir(task_id: str) -> str:\n",
+        count=1, label="service IO ingress tree helper",
+    )
+
+    source = _replace_exact(
+        source,
+        "async def save_upload_files(upload_dir: str, files: list[UploadFile]) -> list[StoredUpload]:\n"
+        "    os.makedirs(upload_dir, exist_ok=True)\n",
+        "def _write_upload_chunk(destination: Path, chunk: bytes, first: bool) -> None:\n"
+        "    mode = \"xb\" if first else \"ab\"\n"
+        "    with open(destination, mode) as handle:\n"
+        "        handle.write(chunk)\n\n\n"
+        "async def save_upload_files(upload_dir: str, files: list[UploadFile], service_io=None) -> list[StoredUpload]:\n"
+        "    if service_io is None:\n"
+        "        os.makedirs(upload_dir, exist_ok=True)\n"
+        "    else:\n"
+        "        await service_io.call(os.makedirs, upload_dir, exist_ok=True, lane=\"bulk\", required=True)\n",
+        count=1, label="service IO upload helper",
+    )
+    source = _replace_exact(
+        source,
+        "        destination = build_upload_destination(upload_dir, filename)\n",
+        "        destination = (build_upload_destination(upload_dir, filename) if service_io is None\n"
+        "                       else await service_io.call(build_upload_destination, upload_dir, filename, lane=\"bulk\", required=True))\n",
+        count=1, label="service IO upload destination",
+    )
+    source = _replace_exact(
+        source,
+        "        try:\n"
+        "            with open(destination, \"wb\") as handle:\n"
+        "                while True:\n"
+        "                    chunk = await upload.read(1 << 20)\n"
+        "                    if not chunk:\n"
+        "                        break\n"
+        "                    handle.write(chunk)\n\n"
+        "            file_suffix = guess_suffix_by_path(destination)\n",
+        "        first_chunk = True\n"
+        "        try:\n"
+        "            while True:\n"
+        "                chunk = await upload.read(1 << 20)\n"
+        "                if not chunk:\n"
+        "                    break\n"
+        "                if service_io is None:\n"
+        "                    _write_upload_chunk(destination, chunk, first_chunk)\n"
+        "                else:\n"
+        "                    await service_io.call(_write_upload_chunk, destination, chunk, first_chunk, lane=\"bulk\", required=True)\n"
+        "                first_chunk = False\n\n"
+        "            file_suffix = guess_suffix_by_path(destination)\n",
+        count=1, label="service IO upload writes",
+    )
+    source = _replace_exact(
+        source,
+        "            if file_suffix not in SUPPORTED_UPLOAD_SUFFIXES:\n"
+        "                cleanup_file(str(destination))\n",
+        "            if file_suffix not in SUPPORTED_UPLOAD_SUFFIXES:\n"
+        "                if service_io is None:\n"
+        "                    cleanup_file(str(destination))\n"
+        "                else:\n"
+        "                    await service_io.call(cleanup_file, str(destination), lane=\"bulk\", required=True)\n",
+        count=1, label="service IO upload suffix cleanup",
+    )
+    source = _replace_exact(
+        source,
+        "        except Exception:\n"
+        "            cleanup_file(str(destination))\n"
+        "            raise\n",
+        "        except BaseException:\n"
+        "            if service_io is None:\n"
+        "                cleanup_file(str(destination))\n"
+        "            else:\n"
+        "                await _settle_service_operation(service_io.call(cleanup_file, str(destination), lane=\"bulk\", required=True))\n"
+        "            raise\n",
+        count=1, label="service IO upload failure cleanup",
+    )
+
+    # Loop owns route adoption; durable pending is never routeless.
+    finish_start = source.index("    def finish_submission(self, task_id: str) -> None:\n", source.index("class AsyncTaskManager:"))
+    finish_end = source.index("    def reconcile_submission(", finish_start)
+    ingress_helpers = """    def _adopt_ingress_task(self, task: AsyncParseTask) -> None:\n        if task.task_id not in self.tasks:\n            task.submit_order = self._next_submit_order\n            self._next_submit_order += 1\n            self.tasks[task.task_id] = task\n            self.task_events[task.task_id] = asyncio.Event()\n\n    def _discard_ingress_task(self, task_id: str) -> None:\n        if task_id in self._scheduled_task_ids:\n            raise RuntimeError(\"scheduled task cannot be discarded as ingress\")\n        self.tasks.pop(task_id, None)\n        self.task_events.pop(task_id, None)\n        self.task_wait_failures.pop(task_id, None)\n\n    def finish_submission(self, task_id: str) -> None:\n        self._ingress_in_flight.discard(task_id)\n        if not self._ingress_in_flight:\n            self._ingress_drained.set()\n        self._refill_pending_queue()\n\n"""
+    source = source[:finish_start] + ingress_helpers + source[finish_end:]
+
+    submit_start = source.index("    async def submit(self, task: AsyncParseTask) -> None:\n", source.index("class AsyncTaskManager:"))
+    submit_end = source.index("    def get(self, task_id:", submit_start)
+    submit = """    async def submit(self, task: AsyncParseTask) -> None:\n        record = await self.task_protocol_v2.observe(lambda: self.task_protocol_v2.get(task.agent_idempotency_key))\n        if record is None or record.task_id != task.task_id or record.task_payload is None:\n            raise TaskProtocolConflict(\"Task was not durably accepted\")\n        self._adopt_ingress_task(task)\n        self._refill_pending_queue()\n\n"""
+    source = source[:submit_start] + submit + source[submit_end:]
+
+    source = _replace_exact(
+        source,
+        "        task_output_dir = create_task_output_dir(task_id)\n"
+        "        uploads_dir = os.path.join(task_output_dir, \"uploads\")\n"
+        "        os.mkdir(uploads_dir)\n"
+        "        task_manager.task_protocol_v2.bind_ingress_root(record.idempotency_key)\n"
+        "        uploads = await save_upload_files(uploads_dir, request_options.files)\n",
+        "        task_output_dir, uploads_dir = await task_manager.service_io.call(\n"
+        "            _prepare_ingress_tree, task_manager, task_id, record.idempotency_key, lane=\"bulk\", required=True\n"
+        "        )\n"
+        "        uploads = await save_upload_files(uploads_dir, request_options.files, task_manager.service_io)\n",
+        count=1, label="service IO ingress prepare",
+    )
+    source = _replace_exact(
+        source,
+        "        task_manager.task_protocol_v2.bind_task_payload(task.agent_idempotency_key, asdict(task))\n"
+        "        await task_manager.submit(task)\n",
+        "        task_manager._adopt_ingress_task(task)\n"
+        "        await task_manager.service_io.call(\n"
+        "            task_manager.task_protocol_v2.bind_task_payload, task.agent_idempotency_key, asdict(task), lane=\"bulk\", required=True\n"
+        "        )\n"
+        "        await task_manager.submit(task)\n",
+        count=1, label="service IO payload bind",
+    )
+    source = _replace_exact(
+        source,
+        "            current = task_manager.task_protocol_v2.get(record.idempotency_key)\n"
+        "            if current is not None and current.state in {\"ingress\", \"ingress_cleanup\"}:\n"
+        "                task_manager.task_protocol_v2.abort_ingress(record.idempotency_key)\n",
+        "            current = await task_manager.task_protocol_v2.observe(lambda: task_manager.task_protocol_v2.get(record.idempotency_key))\n"
+        "            if current is not None and current.state in {\"ingress\", \"ingress_cleanup\"}:\n"
+        "                await _settle_service_operation(task_manager.service_io.call(\n"
+        "                    task_manager.task_protocol_v2.abort_ingress, record.idempotency_key, lane=\"bulk\", required=True\n"
+        "                ))\n"
+        "                task_manager._discard_ingress_task(task_id)\n"
+        "            elif task is not None and task_id not in task_manager._scheduled_task_ids:\n"
+        "                task_manager._discard_ingress_task(task_id)\n",
+        count=1, label="service IO ingress abort",
+    )
+    source = _replace_exact(
+        source, "task = await create_async_parse_task(request_options)",
+        "task = await _settle_service_operation(create_async_parse_task(request_options))",
+        count=2, label="service IO request-owned ingress",
+    )
+    return source
+
+
+
+
+def _patch_service_io_shutdown(source: str) -> str:
+    if "async def shutdown_app_state(app: FastAPI)" not in source:
+        return source
+    source = _replace_exact(
+        source,
+        '        status = self.task_protocol_v2.admission_status(set(self.tasks))\n',
+        '        status = await self.task_protocol_v2.observe(\n'
+        '            lambda: self.task_protocol_v2.admission_status(set(self.tasks))\n'
+        '        )\n',
+        count=1, label="service IO shutdown fresh status",
+    )
+    old = (
+        'async def shutdown_app_state(app: FastAPI) -> None:\n'
+        '    current_task_manager = getattr(app.state, "task_manager", None)\n'
+        '    if current_task_manager is not None:\n'
+        '        await current_task_manager.shutdown()\n'
+        '    app.state.task_manager = None\n'
+        '    shutdown_runtime_resources()\n'
+    )
+    new = (
+        'async def shutdown_app_state(app: FastAPI) -> None:\n'
+        '    current_task_manager = getattr(app.state, "task_manager", None)\n'
+        '    primary_error = None\n'
+        '    close_error = None\n'
+        '    if current_task_manager is not None:\n'
+        '        try:\n'
+        '            await current_task_manager.shutdown()\n'
+        '        except BaseException as exc:\n'
+        '            primary_error = exc\n'
+        '        try:\n'
+        '            await _settle_service_operation(current_task_manager.service_io.close())\n'
+        '        except BaseException as exc:\n'
+        '            close_error = exc\n'
+        '    app.state.task_manager = None\n'
+        '    shutdown_runtime_resources()\n'
+        '    if primary_error is not None:\n'
+        '        if close_error is not None:\n'
+        '            primary_error.add_note("service IO close failed: " + type(close_error).__name__)\n'
+        '            raise primary_error from close_error\n'
+        '        raise primary_error\n'
+        '    if close_error is not None:\n'
+        '        raise close_error\n'
+    )
+    return _replace_exact(source, old, new, count=1, label="service IO lifespan close")
+
+
+
+
+def _patch_service_io_pressure(source: str) -> str:
+    if "async def agent_process_pressure_telemetry():" not in source:
+        return source
+    old = (
+        "async def agent_process_pressure_telemetry():\n"
+        "    manager = get_task_manager()\n"
+        "    observer = getattr(manager, 'capacity_observer', None)\n"
+        "    if observer is None:\n"
+        "        raise HTTPException(status_code=503, detail='explicit capacity pressure unavailable')\n"
+        "    return JSONResponse(content=observer.pressure_snapshot(),\n"
+        "                        headers={\"Cache-Control\": \"no-store\"})\n"
+    )
+    new = (
+        "async def agent_process_pressure_telemetry():\n"
+        "    manager = get_task_manager()\n"
+        "    observer = getattr(manager, 'capacity_observer', None)\n"
+        "    if observer is None:\n"
+        "        raise HTTPException(status_code=503, detail='explicit capacity pressure unavailable')\n"
+        "    try:\n"
+        "        started, serving = observer.pressure_begin()\n"
+        "        memory = await manager.service_io.call(observer.pressure_kernel_memory, lane=\"bulk\")\n"
+        "        payload = observer.pressure_finish(started, serving, memory)\n"
+        "    except TaskRegistryObservationBusy as exc:\n"
+        "        raise HTTPException(status_code=503, detail={\"code\": \"pressure_io_busy\"}) from exc\n"
+        "    except RuntimeError as exc:\n"
+        "        raise HTTPException(status_code=503, detail={\"code\": \"pressure_observation_invalid\", \"reason\": str(exc)[:256]}) from exc\n"
+        "    return JSONResponse(content=payload, headers={\"Cache-Control\": \"no-store\"})\n"
+    )
+    return _replace_exact(source, old, new, count=1, label="service IO pressure kernel split")
+
+
+
+
+def _patch_service_scope_completion(source: str) -> str:
+    """Complete the request/response ownership boundary of the exact API overlay."""
+    if "async def create_async_parse_task(" not in source:
+        return source
+    import ast
+    replacements = {'build_retained_task_result': "async def build_retained_task_result(task: AsyncParseTask, *, byte_budget: int, service_io=None) -> None:\n    try:\n        if service_io is None:\n            result = await to_thread_owned(_build_retained_artifact_owned, task, byte_budget)\n        else:\n            result = await service_io.call(_build_retained_artifact_owned, task, byte_budget, lane='bulk', required=True)\n    except BaseException as primary:\n        # A cancelled caller can own a successful but unreturned ZIP. The worker\n        # has settled at this point; compensate it before publishing any task result.\n        try:\n            retained = os.path.join(task.output_dir, '.retained-result.zip')\n            if service_io is None:\n                await to_thread_owned(cleanup_file, retained)\n            else:\n                await service_io.call(cleanup_file, retained, lane='bulk', required=True)\n        except BaseException as cleanup_error:\n            primary.add_note('unreturned retained result cleanup failed: ' + repr(cleanup_error))\n            raise primary from cleanup_error\n        raise\n    retained, digest, size = result\n    task.result_artifact_path = retained\n    task.result_artifact_sha256 = digest\n    task.result_artifact_bytes = size\n    task.result_artifact_owner = hashlib.sha256(f'{task.task_id}\\0{digest}\\0{size}'.encode()).hexdigest()\n", 'build_result_response': "async def build_result_response(\n    background_tasks: BackgroundTasks, status_code: int, output_dir: str, pdf_file_names: list[str],\n    backend: str, parse_method: str, return_md: bool, return_middle_json: bool,\n    return_model_output: bool, return_content_list: bool, return_images: bool,\n    response_format_zip: bool, return_original_file: bool, zip_filename: str = 'results.zip',\n) -> Response:\n    resources = _request_resources()\n    io = resources.owner\n    parameters = dict(output_dir=output_dir, pdf_file_names=pdf_file_names, backend=backend,\n        parse_method=parse_method, return_md=return_md, return_middle_json=return_middle_json,\n        return_model_output=return_model_output, return_content_list=return_content_list,\n        return_images=return_images)\n    if response_format_zip:\n        path = await io.call(create_result_zip, **parameters, return_original_file=return_original_file,\n                             lane='bulk', required=True, on_cancel_result=cleanup_file)\n        resources.defer(cleanup_file, path, lane='bulk')\n        return FileResponse(path=path, media_type='application/zip', filename=zip_filename, status_code=status_code)\n    result = await io.call(build_result_dict, **parameters, lane='bulk', required=True)\n    return JSONResponse(status_code=status_code, content={'backend':backend, 'version':__version__, 'results':result})\n", 'get_async_task_result': "async def get_async_task_result(task_id: str, request: Request, background_tasks: BackgroundTasks):\n    manager = get_task_manager()\n    task = await _registry_view(manager, lambda: manager.get(task_id))\n    if task is None:\n        raise HTTPException(status_code=404, detail='Task not found')\n    if task.status in (TASK_PENDING, TASK_PROCESSING):\n        return JSONResponse(status_code=202, content={**task.to_status_payload(request), 'message':'Task result is not ready yet'})\n    if task.status == TASK_FAILED:\n        return JSONResponse(status_code=409, content={**task.to_status_payload(request), 'message':'Task execution failed'})\n    if not task.agent_idempotency_key or not task.result_artifact_sha256 or not task.result_artifact_owner:\n        raise HTTPException(status_code=410, detail='Task protocol result owner is absent')\n    try:\n        if not task.result_artifact_path or not await manager.service_io.call(os.path.isfile, task.result_artifact_path, lane='bulk'):\n            raise HTTPException(status_code=410, detail='Retained task result is unavailable')\n        path = await _pin_response_result(manager, task.agent_idempotency_key)\n        return FileResponse(path=str(path), media_type='application/zip', filename=f'{task.task_id}.zip',\n            headers={'X-MinerU-Result-SHA256':task.result_artifact_sha256, 'X-MinerU-Result-Owner':task.result_artifact_owner})\n    except TaskRegistryObservationBusy as exc:\n        raise HTTPException(status_code=503, detail={'code':'result_reader_busy'}) from exc\n    except TaskRegistryPersistenceError as exc:\n        raise HTTPException(status_code=503, detail=str(exc)) from exc\n    except TaskProtocolConflict as exc:\n        raise HTTPException(status_code=409, detail=str(exc)) from exc\n", 'ack_async_task_result': "async def ack_async_task_result(task_id: str):\n    manager = get_task_manager()\n    async def owned():\n        record = await _registry_view(manager, lambda: manager.task_protocol_v2.get_by_task_id(task_id))\n        if record is None:\n            raise HTTPException(status_code=404, detail='Task not found')\n        key = record.idempotency_key\n        try:\n            await manager.service_io.call(manager.task_protocol_v2.acknowledge_terminal_intent, key)\n            await manager.service_io.call(manager.task_protocol_v2.cleanup_consumed,\n                idempotency_key=key, lane='bulk', required=True)\n            def confirm():\n                actual = manager.task_protocol_v2.get(key)\n                if actual is None or actual.task_id != task_id or actual.state != 'consumed':\n                    raise TaskProtocolConflict('ACK cleanup did not reach consumed')\n                manager._evict_consumed_protocol_tasks()\n                return {'schema':'mineru-task-protocol.v2','task_id':task_id,'status':'consumed'}\n            result = await _registry_view(manager, confirm)\n            manager.task_protocol_executor.notify_result_capacity_changed()\n            return result\n        except TaskRegistryObservationBusy as exc:\n            raise HTTPException(status_code=503, detail={'code':'registry_io_busy'}) from exc\n        except TaskRegistryPersistenceError as exc:\n            raise HTTPException(status_code=503, detail=str(exc)) from exc\n        except TaskProtocolConflict as exc:\n            raise HTTPException(status_code=409, detail=str(exc)) from exc\n    return await _settle_service_operation(owned())\n", 'shutdown_app_state': "async def shutdown_app_state(app: FastAPI) -> None:\n    manager = getattr(app.state, 'task_manager', None)\n    primary = None\n    cleanup_error = None\n    if manager is not None:\n        try:\n            await _settle_service_operation(manager.shutdown())\n        except BaseException as exc:\n            primary = exc\n        try:\n            # Do not tear down the executor under a still-owned parser/cleanup task.\n            for task in (manager.dispatcher_task, manager.cleanup_task):\n                if task is not None and not task.done():\n                    task.cancel()\n            waiting = [task for task in (manager.dispatcher_task, manager.cleanup_task) if task is not None]\n            if waiting:\n                await _settle_service_operation(asyncio.gather(*waiting, return_exceptions=True))\n            live = tuple(manager.active_tasks)\n            if live:\n                results = await _settle_service_operation(asyncio.gather(*live, return_exceptions=True))\n                for result in results:\n                    if isinstance(result, BaseException) and primary is None:\n                        primary = result\n            await _settle_service_operation(manager.service_io.close())\n        except BaseException as exc:\n            cleanup_error = exc\n    app.state.task_manager = None\n    try:\n        await _settle_service_operation(to_thread_owned(shutdown_runtime_resources))\n    except BaseException as exc:\n        if cleanup_error is None:\n            cleanup_error = exc\n        else:\n            cleanup_error.add_note('runtime close also failed: ' + repr(exc))\n    if primary is not None:\n        if cleanup_error is not None:\n            primary.add_note('service shutdown cleanup failed: ' + repr(cleanup_error))\n            raise primary from cleanup_error\n        raise primary\n    if cleanup_error is not None:\n        raise cleanup_error\n", 'OwnedFileResponse': '', 'TemporaryFileResponse': '', '_cleanup_generated_zip_task': '', 'parse_pdf': 'async def parse_pdf(\n    http_request: Request,\n    background_tasks: BackgroundTasks,\n    request_options: Annotated[\n        ParseRequestOptions, Depends(parse_request_form)\n    ],\n):\n    task = await _settle_service_operation(create_async_parse_task(request_options))\n    request_options = None\n    task_manager = get_task_manager()\n\n    try:\n        task = await task_manager.wait_for_terminal_state(task.task_id)\n    except TaskWaitAbortedError as exc:\n        return JSONResponse(\n            status_code=503,\n            content={\n                **task.to_status_payload(http_request),\n                "message": "Task manager became unavailable while waiting for result",\n                "error": str(exc),\n            },\n        )\n    except TaskRegistryObservationBusy as exc:\n        raise HTTPException(status_code=503, detail={"code": "task_wait_busy"}) from exc\n\n    if task.status == TASK_FAILED:\n        return JSONResponse(\n            status_code=409,\n            content={\n                **task.to_status_payload(http_request),\n                "message": "Task execution failed",\n            },\n        )\n\n    if not task.agent_idempotency_key:\n        raise HTTPException(status_code=410, detail="Task protocol result owner is absent")\n    try:\n        await _pin_response_result(task_manager, task.agent_idempotency_key, inline=True)\n        return await build_sync_file_parse_response(background_tasks=background_tasks, task=task, request=http_request)\n    except TaskRegistryObservationBusy as exc:\n        raise HTTPException(status_code=503, detail={"code":"result_reader_busy"}) from exc\n    except TaskRegistryPersistenceError as exc:\n        raise HTTPException(status_code=503, detail=str(exc)) from exc\n    except TaskProtocolConflict as exc:\n        raise HTTPException(status_code=409, detail=str(exc)) from exc\n', 'build_sync_file_parse_response': 'async def build_sync_file_parse_response(\n    background_tasks: BackgroundTasks,\n    task: AsyncParseTask,\n    request: Request,\n) -> Response:\n    task_payload = task.to_status_payload(request)\n    if task.response_format_zip:\n        response = await build_result_response(\n            background_tasks=background_tasks,\n            status_code=200,\n            output_dir=task.output_dir,\n            pdf_file_names=task.file_names,\n            backend=task.backend,\n            parse_method=task.parse_method,\n            return_md=task.return_md,\n            return_middle_json=task.return_middle_json,\n            return_model_output=task.return_model_output,\n            return_content_list=task.return_content_list,\n            return_images=task.return_images,\n            response_format_zip=task.response_format_zip,\n            return_original_file=task.return_original_file,\n            zip_filename=f"{task.task_id}.zip",\n        )\n        response.headers[FILE_PARSE_TASK_ID_HEADER] = task.task_id\n        response.headers[FILE_PARSE_TASK_STATUS_HEADER] = task.status\n        response.headers[FILE_PARSE_TASK_STATUS_URL_HEADER] = task_payload["status_url"]\n        response.headers[FILE_PARSE_TASK_RESULT_URL_HEADER] = task_payload["result_url"]\n        return response\n\n    result_dict = await _request_resources().owner.call(\n        build_result_dict, lane="bulk", required=True,\n        output_dir=task.output_dir,\n        pdf_file_names=task.file_names,\n        backend=task.backend,\n        parse_method=task.parse_method,\n        return_md=task.return_md,\n        return_middle_json=task.return_middle_json,\n        return_model_output=task.return_model_output,\n        return_content_list=task.return_content_list,\n        return_images=task.return_images,\n    )\n    return JSONResponse(\n        status_code=200,\n        content={\n            **task_payload,\n            "backend": task.backend,\n            "version": __version__,\n            "results": result_dict,\n        },\n    )\n', 'build_task_submission_response': 'async def build_task_submission_response(\n    task: AsyncParseTask,\n    request: Request,\n    task_manager: "AsyncTaskManager",\n) -> JSONResponse:\n    payload = await _registry_view(task_manager, lambda: task_manager.build_status_payload(task, request))\n    payload["message"] = "Task submitted successfully"\n    return JSONResponse(status_code=202, content=payload)\n', 'submit_parse_task': 'async def submit_parse_task(\n    http_request: Request,\n    request_options: Annotated[\n        ParseRequestOptions, Depends(parse_request_form)\n    ],\n):\n    task_manager = get_task_manager()\n    task = await _settle_service_operation(create_async_parse_task(request_options))\n    return await build_task_submission_response(task, http_request, task_manager)\n', 'AsyncTaskManager.begin_submission': '    async def begin_submission(self, options):\n        key = options.agent_idempotency_key\n        existing = await self.task_protocol_v2.observe(lambda: self.task_protocol_v2.get(key))\n        allow_create = existing is None\n        if allow_create and self.is_shutting_down:\n            raise HTTPException(status_code=503, detail="Task manager is shutting down")\n        if allow_create:\n            reason = (await self.task_protocol_v2.observe(self.admission_snapshot))["blocked_reason"]\n            if reason not in {None, "capacity_full"}:\n                raise HTTPException(status_code=503, detail=reason)\n        # No await between the final stop check and the ingress ticket.\n        if allow_create and self.is_shutting_down:\n            raise HTTPException(status_code=503, detail="Task manager is shutting down")\n        task_id = str(uuid.uuid4())\n        if allow_create:\n            self._ingress_in_flight.add(task_id)\n            self._ingress_drained.clear()\n        try:\n            record, created = await self.service_io.call(\n                self.task_protocol_v2.reconcile_or_create,\n                idempotency_key=key, task_id=task_id,\n                attempt_identity=options.agent_attempt_identity,\n                fence_identity=options.agent_fence_identity,\n                max_nonterminal_tasks=self.max_nonterminal_tasks,\n                allow_create=allow_create, lane="metadata",\n            )\n        except BaseException:\n            if allow_create:\n                self._ingress_in_flight.discard(task_id)\n                if not self._ingress_in_flight:\n                    self._ingress_drained.set()\n            raise\n        if created and record.task_id != task_id:\n            raise RuntimeError("created task identity drifted")\n        if not created and allow_create:\n            self._ingress_in_flight.discard(task_id)\n            if not self._ingress_in_flight:\n                self._ingress_drained.set()\n        return record, created\n', 'AsyncTaskManager.wait_for_terminal_state': '    async def wait_for_terminal_state(self, task_id: str) -> AsyncParseTask:\n        task = self.tasks.get(task_id)\n        if task is None:\n            raise TaskWaitAbortedError("Task not found")\n        if is_task_terminal(task.status):\n            return task\n        await self.task_protocol_v2.observe(lambda: self._raise_task_wait_failure(task_id))\n\n        task_event = self.task_events.get(task_id)\n        if task_event is None:\n            raise TaskWaitAbortedError("Task wait handle is unavailable")\n\n        event_wait_task = asyncio.create_task(task_event.wait())\n        manager_wait_task = asyncio.create_task(self.manager_wakeup.wait())\n        wait_helpers = (event_wait_task, manager_wait_task)\n        done: set[asyncio.Task[Any]] = set()\n        try:\n            done, _ = await asyncio.wait(\n                wait_helpers,\n                return_when=asyncio.FIRST_COMPLETED,\n            )\n        finally:\n            for waiter in wait_helpers:\n                waiter.cancel()\n            await asyncio.gather(*wait_helpers, return_exceptions=True)\n        for waiter in done:\n            with suppress(asyncio.CancelledError):\n                waiter.result()\n\n        task = self.tasks.get(task_id)\n        if task is None:\n            if self.is_shutting_down:\n                raise TaskWaitAbortedError("Task manager is shutting down")\n            raise TaskWaitAbortedError("Task was removed before completion")\n        if is_task_terminal(task.status):\n            return task\n        await self.task_protocol_v2.observe(lambda: self._raise_task_wait_failure(task_id))\n        if self.is_shutting_down:\n            raise TaskWaitAbortedError("Task manager is shutting down")\n        raise TaskWaitAbortedError(\n            self.last_worker_error or "Task manager became unavailable while waiting"\n        )\n', 'AsyncTaskManager.cleanup_expired_tasks': '    async def cleanup_expired_tasks(self) -> int:\n        cleaned = await self.service_io.call(\n            self.task_protocol_v2.cleanup_consumed, lane="bulk", required=True\n        )\n        if cleaned:\n            self.task_protocol_executor.notify_result_capacity_changed()\n        try:\n            await self.task_protocol_v2.observe(self._evict_consumed_protocol_tasks)\n        except TaskRegistryObservationBusy:\n            # Route eviction is idempotent and retried next interval; a busy\n            # data lock is not a cleanup-loop failure.\n            logger.info("route eviction deferred: registry observation busy")\n        return cleaned\n', 'AsyncTaskManager.shutdown': '    async def shutdown(self) -> None:\n        self.begin_soft_drain()\n        await self.service_io.quiesce_requests()\n        await self._ingress_drained.wait()\n        self._refill_pending_queue()\n        while self._scheduled_task_ids:\n            if self.last_worker_error is not None:\n                raise RuntimeError("Task shutdown is incomplete: " + self.last_worker_error)\n            if self.dispatcher_task is None or self.dispatcher_task.done():\n                raise RuntimeError("Task dispatcher stopped with retained responsibility")\n            self._schedule_changed.clear()\n            await self._schedule_changed.wait()\n        status = await self.task_protocol_v2.observe(\n            lambda: self.task_protocol_v2.admission_status(set(self.tasks))\n        )\n        if status["durable_nonterminal_tasks"]:\n            raise RuntimeError("durable task responsibilities remain during shutdown")\n        if self.dispatcher_task is not None:\n            self.dispatcher_task.cancel()\n            with suppress(asyncio.CancelledError):\n                await self.dispatcher_task\n            self.dispatcher_task = None\n        if self.cleanup_task is not None:\n            self.cleanup_task.cancel()\n            with suppress(asyncio.CancelledError):\n                await self.cleanup_task\n            self.cleanup_task = None\n        self.active_tasks.clear()\n        cleaned = await self.service_io.call(\n            self.task_protocol_v2.cleanup_consumed, lane="bulk", required=True\n        )\n        if cleaned:\n            self.task_protocol_executor.notify_result_capacity_changed()\n', 'AsyncTaskManager._process_task': '    async def _process_task(self, task_id: str) -> None:\n        task = self.tasks.get(task_id)\n        if task is None:\n            return\n\n        try:\n            if not task.agent_idempotency_key:\n                raise RuntimeError("Task protocol route identity is absent")\n            async def parse_stage():\n                await self._run_parse_stage(task)\n            async def finalizer_stage():\n                await build_retained_task_result(\n                    task, byte_budget=self.task_protocol_executor.result_reservation_bytes, service_io=self.service_io\n                )\n                return (Path(task.result_artifact_path), task.result_artifact_sha256, task.result_artifact_bytes, task.result_artifact_owner)\n            await self.task_protocol_executor.run(\n                registry=self.task_protocol_v2, key=task.agent_idempotency_key,\n                parse=parse_stage, finalize=finalizer_stage, registry_io=self.service_io,\n            )\n            task.status = TASK_COMPLETED\n            task.completed_at = utc_now_iso()\n            self._signal_task_event(task.task_id)\n        except TaskExecutionStopped as exc:\n            if (exc.capacity_wait and self.is_shutting_down\n                    and self.last_worker_error is None):\n                self._stopped_pending_task_ids.add(task_id)\n                self._signal_task_event(task_id)\n                return\n            self._signal_task_event(task_id)\n            raise\n        except asyncio.CancelledError:\n            if task.status == TASK_PENDING:\n                self._signal_task_event(task_id)\n                raise\n            task.status = TASK_FAILED\n            task.error = "Task processor was cancelled"\n            task.completed_at = utc_now_iso()\n            self._signal_task_event(task_id)\n            raise\n        except (TaskRegistryPersistenceError, TaskResultCapacityRecoveryRequired) as exc:\n            self.task_wait_failures[task_id] = exc\n            self._signal_task_event(task_id)\n            logger.exception("Task registry persistence failed; task status remains nonterminal")\n            raise\n        except Exception as exc:\n            task.status = TASK_FAILED\n            task.error = str(exc)\n            task.completed_at = utc_now_iso()\n            self._signal_task_event(task_id)\n            logger.exception(f"Async task failed: {task_id}")\n        finally:\n            self.queue.task_done()\n', 'create_async_parse_task': 'async def create_async_parse_task(\n    request_options: ParseRequestOptions,\n) -> AsyncParseTask:\n    task_manager = get_task_manager()\n    identities = (request_options.agent_idempotency_key, request_options.agent_attempt_identity, request_options.agent_fence_identity)\n    if not all(isinstance(item, str) and item for item in identities):\n        raise HTTPException(status_code=400, detail="Task protocol v2 identities are required")\n    try:\n        record, created = await task_manager.begin_submission(request_options)\n    except TaskAdmissionFull as exc:\n        raise HTTPException(status_code=429, detail=str(exc)) from exc\n    except TaskRegistryPersistenceError as exc:\n        raise HTTPException(status_code=503, detail=str(exc)) from exc\n    except TaskRegistryObservationBusy as exc:\n        raise HTTPException(status_code=503, detail={"code": "registry_observation_busy"}) from exc\n    except TaskProtocolConflict as exc:\n        raise HTTPException(status_code=409, detail=str(exc)) from exc\n    if not created:\n        return await _registry_view(task_manager, lambda: task_manager.reconcile_submission(\n            task_manager.task_protocol_v2.get(record.idempotency_key)))\n    task_id = record.task_id\n    task = None\n    try:\n        task_output_dir, uploads_dir = await task_manager.service_io.call(\n            _prepare_ingress_tree, task_manager, task_id, record.idempotency_key, lane="bulk", required=True\n        )\n        uploads = await save_upload_files(uploads_dir, request_options.files, task_manager.service_io)\n        request_options.files.clear()\n        file_names = [upload.stem for upload in uploads]\n        task = AsyncParseTask(\n            task_id=task_id,\n            status=TASK_PENDING,\n            backend=request_options.backend,\n            file_names=file_names,\n            created_at=utc_now_iso(),\n            output_dir=task_output_dir,\n            effort=request_options.effort,\n            parse_method=request_options.parse_method,\n            lang_list=request_options.lang_list,\n            formula_enable=request_options.formula_enable,\n            table_enable=request_options.table_enable,\n            image_analysis=request_options.image_analysis,\n            server_url=request_options.server_url,\n            return_md=request_options.return_md,\n            return_middle_json=request_options.return_middle_json,\n            return_model_output=request_options.return_model_output,\n            return_content_list=request_options.return_content_list,\n            return_images=request_options.return_images,\n            response_format_zip=request_options.response_format_zip,\n            return_original_file=request_options.return_original_file,\n            client_side_output_generation=request_options.client_side_output_generation,\n            start_page_id=request_options.start_page_id,\n            end_page_id=request_options.end_page_id,\n            upload_names=[upload.original_name for upload in uploads],\n            uploads=[upload.path for upload in uploads],\n            agent_idempotency_key=request_options.agent_idempotency_key,\n            agent_attempt_identity=request_options.agent_attempt_identity,\n            agent_fence_identity=request_options.agent_fence_identity,\n        )\n        task_manager._adopt_ingress_task(task)\n        await task_manager.service_io.call(\n            task_manager.task_protocol_v2.bind_task_payload, task.agent_idempotency_key, asdict(task), lane="bulk", required=True\n        )\n        await task_manager.submit(task)\n        return task\n    except BaseException as exc:\n        try:\n            current = await task_manager.service_io.call(task_manager.task_protocol_v2.get, record.idempotency_key, lane="metadata", required=True)\n            if current is not None and current.state in {"ingress", "ingress_cleanup"}:\n                await _settle_service_operation(task_manager.service_io.call(\n                    task_manager.task_protocol_v2.abort_ingress, record.idempotency_key, lane="bulk", required=True\n                ))\n                task_manager._discard_ingress_task(task_id)\n            elif current is not None and current.state in {"pending", "processing", "finalizing", "completed", "failed"}:\n                # Accepted responsibility survives response/observation failure.\n                # Its already-adopted route is not an ingress cleanup target.\n                if task is None:\n                    raise RuntimeError("accepted ingress route was never constructed") from exc\n                if current.state == "pending" and task_id not in task_manager._scheduled_task_ids:\n                    # Failed route adoption is rehydratable from the accepted payload.\n                    # Never remove an executing route or delete its durable input.\n                    task_manager._discard_ingress_task(task_id)\n            elif current is None:\n                task_manager._discard_ingress_task(task_id)\n        except BaseException as cleanup_exc:\n            task_manager.last_worker_error = "ingress_reconciliation_failed:" + type(cleanup_exc).__name__\n            task_manager._stopped_pending_task_ids.add(task_id)\n            task_manager.begin_soft_drain()\n            exc.add_note("ingress cleanup/reconciliation failed: " + repr(cleanup_exc))\n            raise exc from cleanup_exc\n        if isinstance(exc, TaskRegistryPersistenceError):\n            raise HTTPException(status_code=503, detail=str(exc)) from exc\n        if isinstance(exc, TaskRegistryObservationBusy):\n            raise HTTPException(status_code=503, detail={"code": "registry_observation_busy"}) from exc\n        if isinstance(exc, TaskProtocolConflict):\n            raise HTTPException(status_code=409, detail=str(exc)) from exc\n        raise\n    finally:\n        task_manager.finish_submission(task_id)\n', '_prepare_ingress_tree': 'def _prepare_ingress_tree(task_manager, task_id: str, key: str) -> tuple[str, str]:\n    task_output_dir = create_task_output_dir(task_id)\n    uploads_dir = os.path.join(task_output_dir, "uploads")\n    os.mkdir(uploads_dir)\n    task_manager.task_protocol_v2.bind_ingress_root(key)\n    return task_output_dir, uploads_dir\n', 'save_upload_files': 'async def save_upload_files(upload_dir: str, files: list[UploadFile], service_io=None) -> list[StoredUpload]:\n    if service_io is None:\n        os.makedirs(upload_dir, exist_ok=True)\n    else:\n        await service_io.call(os.makedirs, upload_dir, exist_ok=True, lane="bulk", required=True)\n    uploads: list[StoredUpload] = []\n\n    for upload in files:\n        original_name = upload.filename or f"upload-{uuid.uuid4()}"\n        filename = normalize_upload_filename(original_name)\n        normalized_stem = normalize_task_stem(Path(filename).stem)\n        destination = (build_upload_destination(upload_dir, filename) if service_io is None\n                       else await service_io.call(build_upload_destination, upload_dir, filename, lane="bulk", required=True))\n        handle = None\n        primary = None\n        try:\n            if service_io is None:\n                handle = open(destination, "xb")\n            else:\n                handle = await service_io.call(open, destination, "xb", lane="bulk", required=True,\n                                               on_cancel_result=lambda stream: stream.close())\n            while True:\n                chunk = await _settle_service_operation(upload.read(1 << 20))\n                if not chunk:\n                    break\n                if service_io is None:\n                    handle.write(chunk)\n                else:\n                    await service_io.call(handle.write, chunk, lane="bulk", required=True)\n            closing = handle\n            handle = None\n            if service_io is None:\n                closing.close()\n            else:\n                await service_io.call(closing.close, lane="bulk", required=True)\n            file_suffix = (guess_suffix_by_path(destination) if service_io is None else\n                           await service_io.call(guess_suffix_by_path, destination, lane="bulk", required=True))\n            if file_suffix not in SUPPORTED_UPLOAD_SUFFIXES:\n                if service_io is None:\n                    cleanup_file(str(destination))\n                else:\n                    await service_io.call(cleanup_file, str(destination), lane="bulk", required=True)\n                raise HTTPException(\n                    status_code=400,\n                    detail=f"Unsupported file type: {file_suffix}",\n                )\n\n            uploads.append(\n                StoredUpload(\n                    original_name=original_name,\n                    stem=normalized_stem,\n                    path=str(destination),\n                )\n            )\n        except BaseException as exc:\n            primary = exc\n            try:\n                if handle is not None:\n                    closing = handle\n                    handle = None\n                    if service_io is None:\n                        closing.close()\n                    else:\n                        await _settle_service_operation(service_io.call(closing.close, lane="bulk", required=True))\n                if service_io is None:\n                    cleanup_file(str(destination))\n                else:\n                    await _settle_service_operation(service_io.call(cleanup_file, str(destination), lane="bulk", required=True))\n            except BaseException as cleanup_exc:\n                exc.add_note("upload cleanup failed: " + repr(cleanup_exc))\n                raise exc from cleanup_exc\n            raise\n        finally:\n            try:\n                await _settle_service_operation(upload.close())\n            except BaseException as close_exc:\n                if primary is not None:\n                    primary.add_note("upload source close failed: " + repr(close_exc))\n                    raise primary from close_exc\n                raise\n\n    normalized_stems, renamed_stems = uniquify_task_stems(\n        [upload.stem for upload in uploads]\n    )\n    if renamed_stems:\n        rename_details = ", ".join(\n            f"{Path(upload.original_name).name} -> {effective_stem}"\n            for upload, effective_stem in zip(uploads, normalized_stems)\n            if upload.stem != effective_stem\n        )\n        logger.warning(\n            f"Normalized duplicate upload stems within request: {rename_details}"\n        )\n        uploads = [\n            StoredUpload(\n                original_name=upload.original_name,\n                stem=effective_stem,\n                path=upload.path,\n            )\n            for upload, effective_stem in zip(uploads, normalized_stems)\n        ]\n    return uploads\n', 'run_parse_job': 'async def run_parse_job(\n    output_dir: str,\n    uploads: list[StoredUpload],\n    request_options: ParseRequestOptions | AsyncParseTask,\n    config: dict[str, Any],\n) -> list[str]:\n    pdf_file_names, pdf_bytes_list = await to_thread_owned(load_parse_inputs, uploads)\n    actual_lang_list = normalize_lang_list(request_options.lang_list, len(pdf_file_names))\n    response_file_names = list(pdf_file_names)\n\n    parse_kwargs = dict(\n        output_dir=output_dir,\n        pdf_file_names=list(pdf_file_names),\n        pdf_bytes_list=list(pdf_bytes_list),\n        p_lang_list=list(actual_lang_list),\n        backend=request_options.backend,\n        parse_method=request_options.parse_method,\n        effort=getattr(request_options, "effort", DEFAULT_HYBRID_EFFORT),\n        formula_enable=request_options.formula_enable,\n        table_enable=request_options.table_enable,\n        image_analysis=request_options.image_analysis,\n        server_url=request_options.server_url,\n        f_draw_layout_bbox=False,\n        f_draw_span_bbox=False,\n        f_dump_md=request_options.return_md,\n        f_dump_middle_json=request_options.return_middle_json,\n        f_dump_model_output=request_options.return_model_output,\n        f_dump_orig_pdf=(\n            request_options.return_original_file and request_options.response_format_zip\n        ),\n        f_dump_content_list=request_options.return_content_list,\n        start_page_id=request_options.start_page_id,\n        end_page_id=request_options.end_page_id,\n        client_side_output_generation=getattr(\n            request_options,\n            "client_side_output_generation",\n            False,\n        ),\n        **config,\n    )\n\n    if request_options.backend == "pipeline":\n        await to_thread_owned(do_parse, **parse_kwargs)\n    else:\n        await aio_do_parse(**parse_kwargs)\n    return response_file_names\n'}
+    lines = source.splitlines(keepends=True)
+    nodes = []
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in replacements:
+            nodes.append((node, node.name))
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                key = node.name + "." + getattr(child, "name", "")
+                if key in replacements and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    nodes.append((child, key))
+    if {key for _, key in nodes} != set(replacements) or len(nodes) != len(replacements):
+        raise RuntimeError("service resource scope generation anchors drifted")
+    for node, key in sorted(nodes, key=lambda item: item[0].lineno, reverse=True):
+        lines[node.lineno - 1:node.end_lineno] = [replacements[key]]
+    source = "".join(lines)
+    source = _replace_exact(source, "\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n",
+                            "\n" + 'from contextvars import ContextVar\n\n_request_resource_context = ContextVar(\'mineru_request_resources\', default=None)\n\n\ndef _request_resources():\n    resources = _request_resource_context.get()\n    if resources is None:\n        raise RuntimeError(\'result access requires the real ASGI request resource scope\')\n    return resources\n\n\nclass _ServiceRequestMiddleware:\n    """Keep the entire ASGI response and its resource release in one owned scope."""\n\n    def __init__(self, app):\n        self.app = app\n\n    async def __call__(self, scope, receive, send):\n        path = scope.get(\'path\', \'\')\n        method = scope.get(\'method\', \'\')\n        mutation = method == \'POST\' and (path == \'/file_parse\' or path == \'/tasks\' or path.startswith(\'/tasks/\'))\n        reader = method in {\'GET\', \'HEAD\'} and path.startswith(\'/tasks/\') and path.endswith(\'/result\')\n        if scope.get(\'type\') != \'http\' or not (mutation or reader):\n            return await self.app(scope, receive, send)\n        manager = getattr(app.state, \'task_manager\', None)\n        if manager is None:\n            response = JSONResponse(status_code=503, content={\'detail\': \'Task manager is not initialized\'})\n            return await response(scope, receive, send)\n        try:\n            resources = manager.service_io.open_request(\'mutation\' if mutation else \'reader\')\n        except TaskRegistryObservationBusy:\n            response = JSONResponse(status_code=503, content={\'detail\': {\'code\': \'request_resources_busy\'}})\n            return await response(scope, receive, send)\n        adjusted = dict(scope)\n        extensions = dict(scope.get(\'extensions\', {}))\n        extensions.pop(\'http.response.pathsend\', None)\n        adjusted[\'extensions\'] = extensions\n        token = _request_resource_context.set(resources)\n        primary = None\n        cleanup_error = None\n        try:\n            await _settle_service_operation(self.app(adjusted, receive, send))\n        except BaseException as exc:\n            primary = exc\n        finally:\n            try:\n                await _settle_service_operation(resources.close())\n            except BaseException as exc:\n                cleanup_error = exc\n                manager.last_worker_error = \'response_resource_release_failed:\' + type(exc).__name__\n                manager.begin_soft_drain()\n            finally:\n                _request_resource_context.reset(token)\n        if primary is not None:\n            if cleanup_error is not None:\n                primary.add_note(\'response resource release failed: \' + repr(cleanup_error))\n                raise primary from cleanup_error\n            raise primary\n        if cleanup_error is not None:\n            raise cleanup_error\n\n\nasync def _pin_response_result(manager, key, *, inline=False):\n    resources = _request_resources()\n    resources.reserve_reader()\n    acquire = manager.task_protocol_v2.acquire_inline_result if inline else manager.task_protocol_v2.acquire_result\n    path = await manager.service_io.call(\n        acquire, key, required=True,\n        on_cancel_result=lambda _path: manager.task_protocol_v2.release_result(key),\n    )\n    # Same task, no await between acquiring a returned pin and registering its finally.\n    resources.defer(manager.task_protocol_v2.release_result, key)\n    return path\n\n\ndef _build_retained_artifact_owned(task, byte_budget):\n    """Same retained ZIP algorithm; all descriptors and namespace IO stay on one worker."""\n    observations = []\n    retained = os.path.join(task.output_dir, \'.retained-result.zip\')\n    part = retained + \'.part\'\n    primary = None\n    result = None\n    try:\n        budget, observations = _retained_result_sources(task, byte_budget=byte_budget)\n        _write_retained_zip_from_fds(observations, part, budget)\n        closing = observations\n        observations = []\n        _verify_and_close_result_sources(closing)\n        _commit_retained_result(part, retained, task.output_dir)\n        digest, size = _hash_file(retained)\n        if size <= 0:\n            raise RuntimeError(\'retained result ZIP is empty\')\n        result = retained, digest, size\n    except BaseException as exc:\n        primary = exc\n    cleanup_error = None\n    for _path, _name, descriptor, _identity in observations:\n        try:\n            os.close(descriptor)\n        except BaseException as exc:\n            if cleanup_error is None:\n                cleanup_error = exc\n            else:\n                cleanup_error.add_note(\'additional source close failed: \' + repr(exc))\n    for path in (part, retained) if primary is not None else (part,):\n        try:\n            cleanup_file(path)\n        except BaseException as exc:\n            if cleanup_error is None:\n                cleanup_error = exc\n            else:\n                cleanup_error.add_note(\'additional retained cleanup failed: \' + repr(exc))\n    if primary is not None:\n        if cleanup_error is not None:\n            primary.add_note(\'retained resource cleanup failed: \' + repr(cleanup_error))\n            raise primary from cleanup_error\n        raise primary\n    if cleanup_error is not None:\n        raise cleanup_error\n    return result\n' + "\n@asynccontextmanager\nasync def lifespan(app: FastAPI):\n",
+                            count=1, label="ASGI resource scope helpers")
+    source = _replace_exact(source, "    app.add_middleware(GZipMiddleware, minimum_size=1000)\n",
+                            "    app.add_middleware(GZipMiddleware, minimum_size=1000)\n    app.add_middleware(_ServiceRequestMiddleware)\n",
+                            count=1, label="ASGI resource scope registration")
+    compile(source, "<owned-service-api>", "exec")
+    return source
+
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
 
@@ -2088,7 +2801,8 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         )
         source = _patch_registry_persistence_behavior(source)
         source = _patch_admission_responsibility(source)
-        return _patch_explicit_capacity(_patch_result_capacity_before_parse(source))
+        source = _patch_explicit_capacity(_patch_result_capacity_before_parse(source))
+        return _patch_service_scope_completion(_patch_service_io_pressure(_patch_service_io_shutdown(_patch_service_io_ingress(_patch_service_io_ack_health(_patch_service_io_manager(source))))))
 
     if relative_path == "mineru/utils/model_utils.py":
         source = _replace_exact(

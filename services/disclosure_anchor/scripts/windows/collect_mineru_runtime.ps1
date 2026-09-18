@@ -448,6 +448,21 @@ function Convert-EnvironmentToMap {
 }
 
 # BEGIN MINERU API DEVICE PROFILE V1
+function Assert-ApiStopBudget {
+    param([Parameter(Mandatory=$true)][object]$Container, [Parameter(Mandatory=$true)][object]$Compose)
+    $apiService = $Compose.services."mineru-api"
+    $declared = $apiService.PSObject.Properties['stop_grace_period']
+    if ($null -eq $declared -or $declared.Value -isnot [string] -or $declared.Value -cne '10s') {
+        throw 'explicit-capacity API stop_grace_period must be the pinned 10s policy'
+    }
+    $observed = $Container.Config.PSObject.Properties['StopTimeout']
+    if ($null -eq $observed -or ($observed.Value -isnot [int] -and $observed.Value -isnot [long])) {
+        throw 'API actual StopTimeout is absent or not an integer; cannot attest the stop bound'
+    }
+    $expected = [int]$declared.Value.Substring(0, $declared.Value.Length - 1)
+    if ([long]$observed.Value -ne $expected) { throw 'API actual StopTimeout differs from the pinned Compose' }
+}
+
 function Get-ApiDeviceProfile {
     param([Parameter(Mandatory=$true)][object]$Api)
     $entry = $Api.environment.PSObject.Properties['MINERU_DEVICE_MODE']
@@ -756,6 +771,7 @@ $vllm = $inspect | Where-Object { $_.Name -eq "/mineru-openai-server" }
 if ($null -eq $api -or $null -eq $proxy -or $null -eq $vllm) {
     throw "MinerU container identities drifted"
 }
+if ($ExplicitCapacity) { Assert-ApiStopBudget -Container $api -Compose $configObject }
 $apiImageInspect = Invoke-Docker -Arguments @(
     "image", "inspect", [string]$api.Config.Image
 ) | ConvertFrom-Json

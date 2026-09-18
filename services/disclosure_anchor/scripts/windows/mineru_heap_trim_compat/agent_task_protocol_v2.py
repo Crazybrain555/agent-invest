@@ -34,6 +34,10 @@ class TaskProtocolConflict(RuntimeError):
     pass
 
 
+class TaskRegistryObservationBusy(TaskProtocolConflict):
+    """A fresh consistent read could not obtain the data lock within its budget."""
+
+
 class TaskAdmissionFull(TaskProtocolConflict):
     """A new key was rejected before it acquired ingress responsibility."""
 
@@ -261,6 +265,10 @@ class DurableTaskRegistry:
         finally:
             os.close(root_fd)
         self._lock = RLock()
+        # Process-local exclusion only. Durable cleanup_pending/ingress_cleanup
+        # remains the sole replay authority; no second cleanup ledger.
+        # Lock order is always cleanup_lock -> _lock, never the reverse.
+        self._cleanup_lock = RLock()
         self._active_operation = "initial_load"
         self._last_persistence_event: dict[str, Any] | None = None
         self._last_persistence_cause: BaseException | None = None
@@ -288,6 +296,7 @@ class DurableTaskRegistry:
         attempt_identity: str,
         fence_identity: str,
         max_nonterminal_tasks: int | None = None,
+        allow_create: bool = True,
     ) -> tuple[DurableTaskRecord, bool]:
         values = (idempotency_key, task_id, attempt_identity, fence_identity)
         if not all(value.strip() for value in values):
@@ -315,6 +324,10 @@ class DurableTaskRegistry:
                         proposed_records, proposed_watermark
                     )
                 return existing, False
+            if type(allow_create) is not bool:
+                raise ValueError("allow_create must be boolean")
+            if not allow_create:
+                raise TaskProtocolConflict("new task admission is closed")
             if max_nonterminal_tasks is not None:
                 if type(max_nonterminal_tasks) is not int or not 1 <= max_nonterminal_tasks <= _MAX_RECORDS:
                     raise ValueError("task admission limit is invalid")
@@ -327,6 +340,8 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict("active task registry capacity exhausted")
             if sum(record.state == "consumed" for record in proposed_records.values()) >= _MAX_TOMBSTONES:
                 raise TaskProtocolConflict("task tombstone retention capacity exhausted")
+            if any(item.task_id == task_id for item in proposed_records.values()):
+                raise TaskProtocolConflict("task id is already owned by another key")
             record = DurableTaskRecord(
                 idempotency_key=idempotency_key,
                 task_id=task_id,
@@ -359,8 +374,10 @@ class DurableTaskRegistry:
 
     def bind_ingress_root(self, idempotency_key: str) -> None:
         """Pin empty owned directories before any asynchronous upload writes."""
-        with self._lock:
-            record = self._required(idempotency_key)
+        with self._cleanup_lock:
+            with self._lock:
+                self._ensure_mutation_allowed("bind_ingress_root")
+                record = copy.deepcopy(self._required(idempotency_key))
             if record.state != "ingress" or record.ingress_owner is not None:
                 raise TaskProtocolConflict("ingress directory ownership already resolved")
             root_fd, task_fd = self._open_task_dir(record.task_id)
@@ -386,8 +403,7 @@ class DurableTaskRegistry:
                 }
                 for descriptor in (upload_fd, task_fd, root_fd):
                     self._fsync_namespace_directory(descriptor)
-                record.ingress_owner = owner
-                self._persist()
+                self._commit_ingress_root(idempotency_key, record, owner)
             except BaseException as exc:
                 primary_error = exc
                 raise
@@ -396,6 +412,13 @@ class DurableTaskRegistry:
                     ((upload_fd, "ingress uploads"), (task_fd, "ingress task"),
                      (root_fd, "ingress output root")), primary_error,
                 )
+
+    def _commit_ingress_root(self, key: str, expected: DurableTaskRecord, owner: dict[str, Any]) -> None:
+        record = self._required(key)
+        if record != expected or record.state != "ingress" or record.ingress_owner is not None:
+            raise TaskProtocolConflict("ingress ownership changed during directory IO")
+        record.ingress_owner = owner
+        self._persist()
 
     def _confirm_unowned_task_absent(self, record: DurableTaskRecord) -> None:
         """A crash before the owner receipt must never authorize path-only deletion."""
@@ -421,20 +444,31 @@ class DurableTaskRegistry:
             self._close_namespace_descriptors(((root_fd, "ingress output root"),), primary_error)
 
     def abort_ingress(self, idempotency_key: str) -> None:
-        """Persist non-executable cleanup intent; release credit only after durable absence."""
-        with self._lock:
-            record = self._required(idempotency_key)
-            if record.state not in {"ingress", "ingress_cleanup"}:
-                raise TaskProtocolConflict("accepted task cannot be abandoned as ingress")
-            if record.state == "ingress":
-                record.state = "ingress_cleanup"
-                self._persist()
-            if record.ingress_owner is None:
-                self._confirm_unowned_task_absent(record)
+        """Persist intent, remove owned bytes without the data lock, commit absence."""
+        with self._cleanup_lock:
+            self._mark_ingress_cleanup(idempotency_key)
+            with self._lock:
+                self._ensure_mutation_allowed("abort_ingress")
+                expected = copy.deepcopy(self._required(idempotency_key))
+            if expected.ingress_owner is None:
+                self._confirm_unowned_task_absent(expected)
             else:
-                self._unlink_owned_result(record, before_unlink=None)
-            del self._records[idempotency_key]
+                self._unlink_owned_result(expected, before_unlink=None)
+            self._finish_ingress_cleanup(idempotency_key, expected)
+
+    def _mark_ingress_cleanup(self, idempotency_key: str) -> None:
+        record = self._required(idempotency_key)
+        if record.state not in {"ingress", "ingress_cleanup"}:
+            raise TaskProtocolConflict("accepted task cannot be abandoned as ingress")
+        if record.state == "ingress":
+            record.state = "ingress_cleanup"
             self._persist()
+
+    def _finish_ingress_cleanup(self, key: str, expected: DurableTaskRecord) -> None:
+        if self._required(key) != expected or expected.state != "ingress_cleanup":
+            raise TaskProtocolConflict("ingress cleanup responsibility changed")
+        del self._records[key]
+        self._persist()
 
     def task_payload_for_route(self, idempotency_key: str) -> dict[str, Any] | None:
         """Project one accepted task without replay, cleanup or generation changes."""
@@ -495,8 +529,10 @@ class DurableTaskRegistry:
         normalized = json.loads(json.dumps(payload, sort_keys=True))
         if not isinstance(normalized, dict):
             raise TypeError("task payload must be one JSON object")
-        with self._lock:
-            record = self._required(idempotency_key)
+        with self._cleanup_lock:
+            with self._lock:
+                self._ensure_mutation_allowed("bind_task_payload")
+                record = copy.deepcopy(self._required(idempotency_key))
             if record.state not in {"ingress", "pending"}:
                 raise TaskProtocolConflict("task payload cannot bind in this state")
             if record.state == "ingress" and record.ingress_owner is None:
@@ -567,13 +603,23 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict("task payload exceeds the closed envelope")
             if record.task_payload is not None and record.task_payload != normalized:
                 raise TaskProtocolConflict("task payload drifted after allocation")
-            record.task_payload = normalized
-            record.state = "pending"
-            record.ingress_owner = None
-            self._persist()
+            self._commit_task_payload(idempotency_key, record, normalized)
 
+
+    def _commit_task_payload(self, key: str, expected: DurableTaskRecord, payload: dict[str, Any]) -> None:
+        record = self._required(key)
+        if record != expected or record.state not in {"ingress", "pending"}:
+            raise TaskProtocolConflict("task ownership changed during upload verification")
+        record.task_payload = payload
+        record.state = "pending"
+        record.ingress_owner = None
+        self._persist()
 
     def recoverable_payloads(self) -> tuple[dict[str, Any], ...]:
+        with self._cleanup_lock:
+            return self._recoverable_payloads_transaction()
+
+    def _recoverable_payloads_transaction(self) -> tuple[dict[str, Any], ...]:
         """Hydrate routes and durably prepare interrupted work for replay.
 
         Live reader counts are process-local barriers.  A cold constructor may
@@ -921,16 +967,20 @@ class DurableTaskRegistry:
             raise
 
     def abandon_unbound(self, idempotency_key: str) -> None:
-        """Remove only a reservation that never acquired durable task ownership."""
-        with self._lock:
-            record = self._required(idempotency_key)
-            if record.state != "pending" or record.task_payload is not None:
-                raise TaskProtocolConflict(
-                    "only an unbound pending task may be abandoned"
-                )
-            self._confirm_unowned_task_absent(record)
-            del self._records[idempotency_key]
-            self._persist()
+        with self._cleanup_lock:
+            with self._lock:
+                self._ensure_mutation_allowed("abandon_unbound")
+                expected = copy.deepcopy(self._required(idempotency_key))
+                if expected.state != "pending" or expected.task_payload is not None:
+                    raise TaskProtocolConflict("only an unbound pending task may be abandoned")
+            self._confirm_unowned_task_absent(expected)
+            self._finish_abandon_unbound(idempotency_key, expected)
+
+    def _finish_abandon_unbound(self, key: str, expected: DurableTaskRecord) -> None:
+        if self._required(key) != expected:
+            raise TaskProtocolConflict("unbound responsibility changed during absence check")
+        del self._records[key]
+        self._persist()
 
     def fail(self, idempotency_key: str, *, error: str) -> None:
         if not error.strip():
@@ -943,32 +993,52 @@ class DurableTaskRegistry:
             record.error = error
             self._persist()
 
-    def acknowledge_failed(self, idempotency_key: str) -> None:
-        """Compact one observed failed terminal without losing idempotency history."""
-        with self._lock:
-            record = self._required(idempotency_key)
-            if record.state == "consumed":
-                return
-            if record.state != "failed":
-                raise TaskProtocolConflict("only failed tasks can use failed ACK")
+    def acknowledge_terminal_intent(self, idempotency_key: str) -> str:
+        """Persist the exact terminal cleanup intent in one short transaction."""
+        record = self._required(idempotency_key)
+        if record.state == "consumed":
+            return "consumed"
+        if record.state == "cleanup_pending":
+            if record.cleanup_kind not in {"result", "task_tree"}:
+                raise TaskProtocolConflict("cleanup intent is invalid")
+            return "cleanup_pending"
+        if record.state == "completed":
+            if record.active_readers:
+                raise TaskProtocolConflict("result cannot be ACKed while in use")
+            record.state = "cleanup_pending"
+            record.cleanup_kind = "result"
+        elif record.state == "failed":
             record.state = "cleanup_pending"
             record.cleanup_kind = "task_tree"
-            try:
-                self._persist()
-            except BaseException:
-                record.state = "failed"
-                record.cleanup_kind = None
-                raise
-            self.cleanup_consumed()
+        else:
+            raise TaskProtocolConflict("only terminal tasks can be ACKed")
+        self._persist()
+        return "cleanup_pending"
+
+    def acknowledge_failed(self, idempotency_key: str) -> None:
+        self._acknowledge_failed_intent(idempotency_key)
+        self.cleanup_consumed(idempotency_key=idempotency_key)
+
+    def _acknowledge_failed_intent(self, idempotency_key: str) -> None:
+        record = self._required(idempotency_key)
+        if record.state == "consumed":
+            return
+        if record.state == "cleanup_pending" and record.cleanup_kind == "task_tree":
+            return
+        if record.state != "failed":
+            raise TaskProtocolConflict("only failed tasks can use failed ACK")
+        record.state = "cleanup_pending"
+        record.cleanup_kind = "task_tree"
+        self._persist()
 
     def transition(self, idempotency_key: str, target: TaskState) -> None:
         allowed: dict[TaskState, frozenset[TaskState]] = {
             "pending": frozenset({"processing", "failed"}),
             "processing": frozenset({"finalizing", "failed"}),
             "finalizing": frozenset({"completed", "failed"}),
-            "completed": frozenset({"cleanup_pending"}),
+            "completed": frozenset(),
             "failed": frozenset(),
-            "cleanup_pending": frozenset({"consumed"}),
+            "cleanup_pending": frozenset(),
             "consumed": frozenset(),
         }
         with self._lock:
@@ -1153,6 +1223,20 @@ class DurableTaskRegistry:
             self._persist()
             return Path(record.result_path)
 
+    def acquire_inline_result(self, idempotency_key: str) -> Path:
+        """Pin one completed tree for the service's own synchronous response.
+
+        This is not an external lease bypass: no HTTP route exposes it directly.
+        It uses the same reader count, ACK exclusion and durable release as leases.
+        """
+        with self._lock:
+            record = self._required(idempotency_key)
+            if record.state != "completed" or not record.result_path:
+                raise TaskProtocolConflict("inline result is unavailable")
+            record.active_readers += 1
+            self._persist()
+            return Path(record.result_path)
+
     def release_result(self, idempotency_key: str) -> None:
         with self._lock:
             current = self._required(idempotency_key)
@@ -1180,52 +1264,63 @@ class DurableTaskRegistry:
                 raise
 
     def cleanup_consumed(
-        self, unlink: Callable[[Path], None] | None = None
+        self, unlink: Callable[[Path], None] | None = None,
+        *, idempotency_key: str | None = None,
     ) -> int:
-        with self._lock:
-            removable = [
-                key
-                for key, record in self._records.items()
-                if record.state == "cleanup_pending" and record.active_readers == 0
-            ]
+        with self._cleanup_lock:
+            with self._lock:
+                self._ensure_mutation_allowed("cleanup_consumed")
+                removable = [key for key, record in self._records.items()
+                             if record.state == "cleanup_pending" and record.active_readers == 0
+                             and (idempotency_key is None or key == idempotency_key)]
             cleaned = 0
             for key in removable:
-                record = self._records[key]
-                previous = (
-                    record.result_path,
-                    record.task_payload,
-                    record.lease_until_unix,
-                    record.error,
-                    record.reserved_result_bytes,
-                    record.state,
-                    record.consumed_at_unix,
-                    record.cleanup_kind,
-                )
-                self._unlink_owned_result(record, before_unlink=unlink)
-                record.result_path = None
-                record.task_payload = None
-                record.lease_until_unix = None
-                record.error = None
-                record.reserved_result_bytes = 0
-                record.state = "consumed"
-                record.consumed_at_unix = self._clock()
-                record.cleanup_kind = None
-                try:
-                    self._persist()
-                except BaseException:
-                    (
-                        record.result_path,
-                        record.task_payload,
-                        record.lease_until_unix,
-                        record.error,
-                        record.reserved_result_bytes,
-                        record.state,
-                        record.consumed_at_unix,
-                        record.cleanup_kind,
-                    ) = previous
-                    raise
+                with self._lock:
+                    self._ensure_mutation_allowed("cleanup_consumed")
+                    current = self._required(key)
+                    if current.state != "cleanup_pending" or current.active_readers:
+                        raise TaskProtocolConflict("cleanup responsibility changed before IO")
+                    expected = copy.deepcopy(current)
+                self._unlink_owned_result(expected, before_unlink=unlink)
+                self._finish_cleanup(key, expected)
                 cleaned += 1
             return cleaned
+
+    def _finish_cleanup(self, key: str, expected: DurableTaskRecord) -> None:
+        record = self._required(key)
+        if record != expected or record.state != "cleanup_pending" or record.active_readers:
+            raise TaskProtocolConflict("cleanup responsibility changed during IO")
+        record.result_path = None
+        record.task_payload = None
+        record.lease_until_unix = None
+        record.error = None
+        record.reserved_result_bytes = 0
+        record.state = "consumed"
+        record.consumed_at_unix = self._clock()
+        record.cleanup_kind = None
+        self._persist()
+
+    async def observe(self, reader: Callable[[], Any], *, timeout_seconds: float = 0.7) -> Any:
+        if not 0 < timeout_seconds <= 0.7:
+            raise ValueError("registry observation budget is invalid")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TaskRegistryObservationBusy("task registry observation is busy")
+            if self._lock.acquire(blocking=False):
+                break
+            await asyncio.sleep(min(0.002, remaining))
+        try:
+            self.assert_observation_safe()
+            result = reader()
+            if hasattr(result, "__await__"):
+                if asyncio.iscoroutine(result):
+                    result.close()
+                raise TypeError("registry observation callback must not await")
+            return result
+        finally:
+            self._lock.release()
 
     def _unlink_owned_result(
         self,
@@ -1642,6 +1737,10 @@ class DurableTaskRegistry:
             }
 
     def recover_persistence_uncertainty(self) -> dict[str, Any]:
+        with self._cleanup_lock:
+            return self._recover_persistence_uncertainty_locked()
+
+    def _recover_persistence_uncertainty_locked(self) -> dict[str, Any]:
         """Durably reconcile an ambiguous replace without cold-decoding readers.
 
         Exact saved snapshots are selected only after a successful parent fsync
@@ -2314,19 +2413,22 @@ def inspect_quiescent_output_root(
 
 
 _REGISTRY_MUTATOR_NAMES = (
-    "abort_ingress",
-    "abandon_unbound",
+    "_mark_ingress_cleanup",
+    "_finish_ingress_cleanup",
+    "_finish_abandon_unbound",
     "acknowledge",
-    "acknowledge_failed",
+    "_acknowledge_failed_intent",
+    "acknowledge_terminal_intent",
     "acquire_result",
-    "bind_task_payload",
-    "bind_ingress_root",
-    "cleanup_consumed",
+    "acquire_inline_result",
+    "_commit_task_payload",
+    "_commit_ingress_root",
+    "_finish_cleanup",
     "complete",
     "fail",
     "lease",
     "reconcile_or_create",
-    "recoverable_payloads",
+    "_recoverable_payloads_transaction",
     "release_result",
     "reserve_finalizer",
     "reserve_result_for_parse",
@@ -2338,7 +2440,16 @@ def _transactional_registry_mutator(method: Callable[..., Any]) -> Callable[...,
     @wraps(method)
     def wrapped(self: DurableTaskRegistry, *args: Any, **kwargs: Any) -> Any:
         with self._lock:
-            operation = method.__name__
+            operation = {
+                "_finish_cleanup": "cleanup_consumed",
+                "_finish_abandon_unbound": "abandon_unbound",
+                "_commit_task_payload": "bind_task_payload",
+                "_commit_ingress_root": "bind_ingress_root",
+                "_mark_ingress_cleanup": "abort_ingress",
+                "_finish_ingress_cleanup": "abort_ingress",
+                "_acknowledge_failed_intent": "acknowledge_failed",
+                "_recoverable_payloads_transaction": "recoverable_payloads",
+            }.get(method.__name__, method.__name__)
             self._ensure_mutation_allowed(operation)
             previous_operation = self._active_operation
             starting_generation = self._persistence_generation
@@ -2467,8 +2578,26 @@ class SplitTaskExecutor:
         key: str,
         parse: Callable[[], Awaitable[None]],
         finalize: Callable[[], Awaitable[tuple[Path, str, int, str]]],
+        registry_io: "RegistryServiceIO | None" = None,
     ) -> None:
-        record = registry.get(key)
+        """Run accepted work without blocking the serving loop on registry IO.
+
+        The None fallback exists for direct protocol unit tests only. Production
+        generated API code must pass the lifespan-owned RegistryServiceIO.
+        """
+        async def read_record() -> DurableTaskRecord | None:
+            if registry_io is None:
+                return registry.get(key)
+            return await registry.observe(lambda: registry.get(key))
+
+        async def write(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+            if registry_io is None:
+                return function(*args, **kwargs)
+            return await registry_io.call(
+                function, *args, required=True, lane="metadata", **kwargs
+            )
+
+        record = await read_record()
         if record is None or record.state != "pending":
             raise TaskProtocolConflict("only pending work may enter the parser")
         while True:
@@ -2476,7 +2605,11 @@ class SplitTaskExecutor:
                 raise TaskExecutionStopped("result capacity wait stopped with pending responsibility")
             self._capacity_changed.clear()
             try:
-                registry.reserve_result_for_parse(key, byte_budget=self._result_reservation_bytes)
+                await write(
+                    registry.reserve_result_for_parse,
+                    key,
+                    byte_budget=self._result_reservation_bytes,
+                )
             except TaskResultCapacityFull:
                 if self._stopping:
                     raise TaskExecutionStopped(
@@ -2494,12 +2627,13 @@ class SplitTaskExecutor:
             async with self._stage_slot(self._parse, "parse"):
                 if self._abort_pending:
                     raise TaskExecutionStopped("parse slot wait stopped with pending responsibility")
-                registry.transition(key, "processing")
+                await write(registry.transition, key, "processing")
                 await parse()
-            registry.transition(key, "finalizing")
+            await write(registry.transition, key, "finalizing")
             async with self._stage_slot(self._finalize, "finalizer"):
                 path, digest, byte_count, owner = await finalize()
-            registry.complete(
+            await write(
+                registry.complete,
                 key,
                 result_path=path,
                 result_sha256=digest,
@@ -2510,7 +2644,7 @@ class SplitTaskExecutor:
         except TaskRegistryPersistenceError:
             raise
         except BaseException as exc:
-            record = registry.get(key)
+            record = await read_record()
             if record is not None and record.state in {"processing", "finalizing"}:
                 failure = json.dumps(
                     {
@@ -2521,7 +2655,13 @@ class SplitTaskExecutor:
                     sort_keys=True,
                     separators=(",", ":"),
                 )
-                registry.fail(key, error=failure)
+                try:
+                    await write(registry.fail, key, error=failure)
+                except BaseException as persistence_error:
+                    persistence_error.add_note(
+                        "original parse/finalize failure: " + type(exc).__name__[:64]
+                    )
+                    raise persistence_error from exc
             raise
 
 
@@ -2634,6 +2774,8 @@ def evict_consumed_routes(
 
 __all__ = [
     "TaskAdmissionFull",
+    "TaskRegistryObservationBusy",
+    "RegistryServiceIO",
     "TaskRegistryPersistenceError",
     "DurableTaskRecord",
     "DurableTaskRegistry",
@@ -2643,3 +2785,180 @@ __all__ = [
     "inspect_quiescent_output_root",
     "task_protocol_runtime_status",
 ]
+
+
+class RegistryServiceIO:
+    """Lifespan-owned bounded bridge
+    durable registry remains the sole authority."""
+
+    def __init__(self, *, drain: Callable[..., Awaitable[Any]], max_pending: int) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        if not callable(drain) or type(max_pending) is not int or not 1 <= max_pending <= 256:
+            raise ValueError("registry IO ownership/bound is invalid")
+        self._drain = drain
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._accepting = True
+        self._closing = False
+        self._request_counts = {"mutation": 0, "reader": 0}
+        self._requests_accepting = True
+        self._requests_idle = asyncio.Event()
+        self._requests_idle.set()
+        self._max_pending = max_pending
+        self._pools = {
+            "metadata": ThreadPoolExecutor(max_workers=1, thread_name_prefix="mineru-registry"),
+            "bulk": ThreadPoolExecutor(max_workers=2, thread_name_prefix="mineru-owned-files"),
+        }
+        self._slots = {"metadata": asyncio.Semaphore(1), "bulk": asyncio.Semaphore(2)}
+        self._counts = {"metadata": 0, "bulk": 0}
+        self._required_counts = {"metadata": 0, "bulk": 0}
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._close_task: asyncio.Task[None] | None = None
+
+    def _serving_loop(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif self._loop is not loop:
+            raise RuntimeError("registry IO serving loop changed")
+        return loop
+
+    async def call(
+        self, function: Callable[..., Any], /, *args: Any, lane: str = "metadata",
+        required: bool = False, on_cancel_result: Callable[[Any], Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        import contextvars
+        from functools import partial
+        loop = self._serving_loop()
+        if lane not in self._pools:
+            raise ValueError("unknown registry IO lane")
+        if not self._accepting or (self._closing and not required):
+            raise TaskRegistryObservationBusy("registry IO is closing")
+        if type(required) is not bool:
+            raise ValueError("required ownership flag must be boolean")
+        normal_count = self._counts[lane] - self._required_counts[lane]
+        if not required and normal_count >= self._max_pending:
+            raise TaskRegistryObservationBusy("registry IO is at its bounded admission limit")
+        if required and self._required_counts[lane] >= 4 * self._max_pending:
+            raise RuntimeError("registry IO continuation ownership bound drifted")
+        self._counts[lane] += 1
+        self._required_counts[lane] += int(required)
+        self._idle.clear()
+        acquired = False
+        future: asyncio.Future[Any] | None = None
+        try:
+            await self._slots[lane].acquire()
+            acquired = True
+            context = contextvars.copy_context()
+            future = loop.run_in_executor(
+                self._pools[lane], partial(context.run, function, *args, **kwargs)
+            )
+            try:
+                return await self._drain(future)
+            except asyncio.CancelledError as cancellation:
+                if (on_cancel_result is not None and future.done()
+                        and not future.cancelled() and future.exception() is None):
+                    compensation = loop.run_in_executor(
+                        self._pools[lane], on_cancel_result, future.result()
+                    )
+                    try:
+                        await self._drain(compensation)
+                    except BaseException as cleanup_error:
+                        cancellation.add_note("owned IO cancellation compensation failed")
+                        raise cancellation from cleanup_error
+                raise
+        finally:
+            if acquired:
+                self._slots[lane].release()
+            self._counts[lane] -= 1
+            self._required_counts[lane] -= int(required)
+            if not any(self._counts.values()):
+                self._idle.set()
+
+    async def wait_idle(self) -> None:
+        self._serving_loop()
+        await self._idle.wait()
+
+    def open_request(self, kind: str) -> "RegistryRequestResources":
+        self._serving_loop()
+        if kind not in self._request_counts:
+            raise ValueError("unknown request resource category")
+        if not self._requests_accepting or self._request_counts[kind] >= self._max_pending:
+            raise TaskRegistryObservationBusy("request resources are closing or at capacity")
+        self._request_counts[kind] += 1
+        self._requests_idle.clear()
+        return RegistryRequestResources(self, kind)
+
+    async def quiesce_requests(self) -> None:
+        self._serving_loop()
+        self._requests_accepting = False
+        await self._requests_idle.wait()
+
+    async def _close(self) -> None:
+        await self.quiesce_requests()
+        await self.wait_idle()
+        self._accepting = False
+        for pool in self._pools.values():
+            await self._drain(asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=False))
+
+    async def close(self) -> None:
+        self._serving_loop()
+        self._closing = True
+        self._requests_accepting = False
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close(), name="mineru-registry-io-close")
+        await self._drain(self._close_task)
+
+
+class RegistryRequestResources:
+    """Finite transient request ownership; it never changes durable task truth."""
+
+    def __init__(self, owner: RegistryServiceIO, kind: str) -> None:
+        self.owner = owner
+        self._kind = kind
+        self._extra_reader = False
+        self._cleanups: list[tuple[Callable[..., Any], tuple[Any, ...], str]] = []
+        self._close_task: asyncio.Task[None] | None = None
+
+    def reserve_reader(self) -> None:
+        self.owner._serving_loop()
+        if self._kind == "reader" or self._extra_reader:
+            return
+        if self.owner._request_counts["reader"] >= self.owner._max_pending:
+            raise TaskRegistryObservationBusy("result reader scopes are at capacity")
+        self.owner._request_counts["reader"] += 1
+        self._extra_reader = True
+
+    def defer(self, function: Callable[..., Any], /, *args: Any, lane: str = "metadata") -> None:
+        self.owner._serving_loop()
+        if self._close_task is not None or lane not in self.owner._pools:
+            raise RuntimeError("resource registration after close or unknown IO lane")
+        self._cleanups.append((function, args, lane))
+
+    async def _close(self) -> None:
+        primary: BaseException | None = None
+        try:
+            while self._cleanups:
+                function, args, lane = self._cleanups.pop()
+                try:
+                    await self.owner.call(function, *args, lane=lane, required=True)
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+                    else:
+                        primary.add_note("additional owned resource cleanup failure: " + repr(exc))
+        finally:
+            self.owner._request_counts[self._kind] -= 1
+            if self._extra_reader:
+                self.owner._request_counts["reader"] -= 1
+            if not any(self.owner._request_counts.values()):
+                self.owner._requests_idle.set()
+        if primary is not None:
+            raise primary
+
+    async def close(self) -> None:
+        self.owner._serving_loop()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close(), name="mineru-request-resource-close")
+        await self.owner._drain(self._close_task)

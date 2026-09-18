@@ -599,9 +599,45 @@ function Get-ResolvedCompose {
     return (($raw -join "`n") | ConvertFrom-Json)
 }
 
+function Assert-ApiStopBudget {
+    param([Parameter(Mandatory=$true)][object]$Container, [Parameter(Mandatory=$true)][object]$Compose)
+    $apiService = $Compose.services."mineru-api"
+    $declared = $apiService.PSObject.Properties['stop_grace_period']
+    if ($null -eq $declared -or $declared.Value -isnot [string] -or $declared.Value -cne '10s') {
+        throw 'explicit-capacity API stop_grace_period must be the pinned 10s policy'
+    }
+    $observed = $Container.Config.PSObject.Properties['StopTimeout']
+    if ($null -eq $observed -or ($observed.Value -isnot [int] -and $observed.Value -isnot [long])) {
+        throw 'API actual StopTimeout is absent or not an integer; cannot attest the stop bound'
+    }
+    $expected = [int]$declared.Value.Substring(0, $declared.Value.Length - 1)
+    if ([long]$observed.Value -ne $expected) { throw 'API actual StopTimeout differs from the pinned Compose' }
+}
+
+function Assert-ApiStopBudgetTransition {
+    param([Parameter(Mandatory=$true)][object]$Next, [Parameter(Mandatory=$true)][object]$Previous)
+    $declared = $Next.services."mineru-api".PSObject.Properties['stop_grace_period']
+    if ($null -eq $declared -or [string]$declared.Value -cne '10s') {
+        throw 'candidate API stop budget projection must be the pinned 10s policy'
+    }
+    $existing = $Previous.services."mineru-api".PSObject.Properties['stop_grace_period']
+    if ($null -ne $existing -and [string]$existing.Value -cne '10s') {
+        throw 'deployed API stop_grace_period differs from the pinned policy; resolve that drift explicitly'
+    }
+}
+
+function Remove-ApiStopBudgetProjection {
+    param([Parameter(Mandatory=$true)][object]$Compose)
+    $api = $Compose.services."mineru-api"
+    if ($null -ne $api.PSObject.Properties['stop_grace_period']) {
+        $api.PSObject.Properties.Remove('stop_grace_period')
+    }
+}
+
 function Assert-CapacityCompose {
     param([Parameter(Mandatory=$true)][object]$Compose)
     $api = $Compose.services."mineru-api"
+    if ($api.PSObject.Properties["stop_grace_period"] -eq $null -or [string]$api.stop_grace_period -cne "10s") { throw "API stop budget projection is absent or changed" }
     foreach ($name in $CapacityInputs.environment.Keys) {
         if ([string]$api.environment.$name -cne $CapacityInputs.environment[$name]) {
             throw "compose capacity projection differs: $name"
@@ -688,6 +724,9 @@ function Assert-ApiDeviceTransition {
     $normalized = @($Next, $Previous | ForEach-Object { $_ | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json })
     foreach ($item in $normalized) {
         $api = $item.services.'mineru-api'
+        # The pinned API stop budget is asserted by Assert-ApiStopBudgetTransition;
+        # it is the one declared non-device field an API-only upgrade may introduce.
+        Remove-ApiStopBudgetProjection -Compose $item
         $api.environment.PSObject.Properties.Remove('MINERU_DEVICE_MODE')
         if ($null -ne $api.deploy.resources.reservations) {
             $api.deploy.resources.reservations.PSObject.Properties.Remove('devices')
@@ -721,6 +760,7 @@ function Assert-ApiOnlyUpgradeInputs {
         $next = Get-ResolvedCompose $ComposeSource
         $previous = Get-ResolvedCompose $ComposeTarget
         Assert-CapacityCompose $next
+        Assert-ApiStopBudgetTransition -Next $next -Previous $previous
         if ($ApiDeviceProfile -ne "") {
             Assert-ApiDeviceTransition -Next $next -Previous $previous -Profile $ApiDeviceProfile
             $script:PreviousApiDeviceProfile = Get-ApiDeviceProfile -Api $previous.services."mineru-api"
@@ -729,6 +769,7 @@ function Assert-ApiOnlyUpgradeInputs {
         # Only the selected API capacity fields may differ. Inference/proxy,
         # networks, mounts, image name and every other setting remain exact.
         foreach ($item in @($next, $previous)) {
+            Remove-ApiStopBudgetProjection -Compose $item
             foreach ($name in $CapacityInputs.environment.Keys) {
                 $item.services."mineru-api".environment.PSObject.Properties.Remove($name)
             }
@@ -1942,6 +1983,13 @@ try {
         ) -TimeoutMilliseconds 900000 | Out-Null
     }
     $runtime = Get-ValidatedRuntime
+    if ($ExplicitCapacity) {
+        # Post-deployment only: the candidate compose is now the target. Rollback and the
+        # pre-mutation published-image check validate the previous compose and must not assert it.
+        $deployedApi = @((Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json)
+        if ($deployedApi.Count -ne 1) { throw "deployed API container was not inspectable" }
+        Assert-ApiStopBudget -Container $deployedApi[0] -Compose (Get-ResolvedCompose -Path $ComposeTarget)
+    }
     if ($ApiOnlyOperation) { Assert-StableServiceEpochs -Expected $StableServiceEpochs }
     if ($ReuseCurrentPublishedImage) {
         Assert-StableServiceEpochs -Expected $StableServiceEpochs

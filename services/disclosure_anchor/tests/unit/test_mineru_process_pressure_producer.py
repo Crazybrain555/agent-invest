@@ -4,7 +4,7 @@ Kernel files are synthetic and local. No MinerU/framework startup or live HTTP.
 """
 
 import ast
-from contextlib import ExitStack
+from contextlib import ExitStack, asynccontextmanager
 import importlib.util
 import os
 from pathlib import Path
@@ -16,8 +16,7 @@ from unittest.mock import patch
 from tests._mineru_capacity_bootstrap_fixture import CapacityBootstrapFixture
 from tests._mineru_capacity_config_fixture import capacity_payload
 from tests.unit.test_linux_resident_host_sampler import _stat
-from tests.unit.test_mineru_heap_trim_compat import _fast_api_fixture
-from scripts.windows.mineru_heap_trim_compat.patch_mineru_344 import patch_source
+from tests._mineru_owned_drain_fixture import generated_sources, load_definitions, load_owned
 
 
 class ThinPressureProducerTests(unittest.TestCase):
@@ -277,23 +276,53 @@ class ThinPressureProducerTests(unittest.TestCase):
         from fastapi.testclient import TestClient
         from starlette.responses import JSONResponse
 
-        patched = patch_source("mineru/cli/fast_api.py", _fast_api_fixture())
+        import anyio
+        from scripts.windows.mineru_heap_trim_compat import agent_task_protocol_v2 as protocol
+
+        # Load the real full-preimage output and imported owned-operation helpers.
+        # The fixture supplies lifecycle wiring, never a synchronous IO substitute.
+        sources = generated_sources()
+        patched = sources["api"]
+        imported = {
+            alias.name
+            for node in ast.parse(patched).body
+            if isinstance(node, ast.ImportFrom)
+            and (node.module or "").endswith("agent_task_protocol_v2")
+            for alias in node.names
+        }
+        self.assertTrue({"RegistryServiceIO", "TaskRegistryObservationBusy"} <= imported)
         handler = next(
             node
             for node in ast.parse(patched).body
             if isinstance(node, ast.AsyncFunctionDef)
             and node.name == "agent_process_pressure_telemetry"
         )
-        app = FastAPI()
+        namespace = load_owned(sources["model"], patched)
+        namespace["anyio"] = anyio
+        load_definitions(patched, {"_settle_service_operation"}, namespace)
+
+        @asynccontextmanager
+        async def lifespan(_app):
+            self.manager.service_io = protocol.RegistryServiceIO(
+                drain=namespace["_settle_service_operation"],
+                max_pending=self.config.total_nonterminal_limit + 8,
+            )
+            try:
+                yield
+            finally:
+                await self.manager.service_io.close()
+
+        app = FastAPI(lifespan=lifespan)
         observer = self.module.CapacityServingObservation(self.config, self.manager)
         self.manager.capacity_observer = observer
         app.state.task_manager = self.manager
-        namespace = {
+        namespace.update({
             "app": app,
             "JSONResponse": JSONResponse,
             "HTTPException": HTTPException,
+            "TaskRegistryObservationBusy": protocol.TaskRegistryObservationBusy,
             "get_task_manager": lambda: self.manager,
-        }
+        })
         exec(
             compile(
                 ast.Module(body=[handler], type_ignores=[]),

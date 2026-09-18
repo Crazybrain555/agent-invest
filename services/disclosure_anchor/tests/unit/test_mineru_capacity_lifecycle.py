@@ -160,7 +160,8 @@ class MineruCapacityLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(fx.module, '_write_retained_zip_from_fds', zip_boundary):
             tasks = [await fx.create(fx.options('nf-'+str(i))) for i in range(3)]
             try:
-                await until(lambda: entered.qsize() == 2)
+                await until(lambda: entered.qsize() == 2
+                            and fx.manager.task_protocol_executor.stage_snapshot()["parse_waiting"] == 1)
                 self.assertEqual(fx.manager.task_protocol_executor.stage_snapshot(),
                     {**EMPTY_STAGES, 'parse_active':2, 'parse_waiting':1})
                 self.assertEqual(fx.manager.task_protocol_v2.reserved_result_bytes, BUDGET*3)
