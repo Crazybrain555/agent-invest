@@ -831,6 +831,122 @@ class ResidentOwnerEvidenceCliTests(unittest.TestCase):
         for path in sorted(directory.glob("*-start.stdout")):
             path.write_bytes(path.read_bytes().replace(b'"child_exit_code":0', b'"child_exit_code":1', 1))
 
+    def negative_terminal(self, *, complete_records):
+        """Swap this run's sealed terminal for a negative one over its own real bytes.
+
+        Nothing synthetic enters: the plan, the identities and the frames are the ones this
+        owner session actually produced; only the tail of the frame file is cut, as a killed
+        writer would leave it, and the terminal that describes it is the negative contract.
+        """
+        from disclosure_anchor.application.contracts.synchronized_telemetry import (
+            CollectionFailureV1, SynchronizedTelemetryFailureReceiptV1,
+            SynchronizedTelemetryFailureSealV1, SynchronizedTelemetryFrameV3,
+        )
+
+        plan = self.result.plan
+        plan_bytes = (self.run_directory / "sampling-plan.v1.json").read_bytes()
+        original = (self.run_directory / "frames.v3.jsonl").read_bytes()
+        lines = original.splitlines(keepends=True)
+        self.assertGreater(len(lines), complete_records, "this run must have more frames than the prefix keeps")
+        prefix = b"".join(lines[:complete_records])
+        # The record that was being written when the collection stopped: a real line, cut.
+        raw = prefix + lines[complete_records][:32]
+        receipt_v4 = json.loads((self.run_directory / "receipt.v4.json").read_bytes())
+        kept = [SynchronizedTelemetryFrameV3.model_validate(json.loads(line)) for line in lines[:complete_records]]
+        coverage = []
+        for lane in ("gpu_fast", "host_slow"):
+            period_ns = (plan.gpu_nominal_interval_ms if lane == "gpu_fast"
+                         else plan.host_nominal_interval_ms) * 1_000_000
+            planned = (plan.duration_ns + period_ns - 1) // period_ns
+            slots = sorted((frame.clock.scheduled_monotonic_ns - plan.started_monotonic_ns) // period_ns
+                           for frame in kept if frame.lane == lane)
+            coverage.append({"lane": lane, "planned_slots": planned, "complete_records": len(slots),
+                             "usable_slots": len(slots), "missing_slots": planned - len(slots),
+                             "first_slot": slots[0] if slots else None,
+                             "last_slot": slots[-1] if slots else None})
+        failure = CollectionFailureV1(
+            lane="host_slow", category="deadline",
+            scheduled_monotonic_ns=plan.started_monotonic_ns,
+            started_monotonic_ns=plan.started_monotonic_ns,
+            finished_monotonic_ns=plan.planned_end_monotonic_ns,
+            observer_clock_domain_identity_sha256=plan.observer_clock_domain_identity_sha256,
+            exception_type="TelemetrySnapshotDeadlineExceeded", message="resident snapshot deadline",
+            error_bytes_sha256=self.sha(b"declared"), original_error_bytes=8,
+            retained_error_bytes=8, dropped_error_bytes=0, error_text="declared")
+        receipt = SynchronizedTelemetryFailureReceiptV1.model_validate({
+            "run_id": plan.run_id, "reason": "lane_collection_failure",
+            "runtime_bundle_identity_sha256": receipt_v4["runtime_bundle_identity_sha256"],
+            "process_profile_sha256": receipt_v4["process_profile"]["process_profile_sha256"],
+            "observer_source_sha256": receipt_v4["observer_source_sha256"],
+            "observer_identity": receipt_v4["observer_identity"],
+            "clock_domain_identity_sha256": plan.observer_clock_domain_identity_sha256,
+            "sampling_plan_sha256": self.sha(plan_bytes),
+            "planned_start_monotonic_ns": plan.started_monotonic_ns,
+            "planned_end_monotonic_ns": plan.planned_end_monotonic_ns,
+            "collectors_quiesced": True,
+            "raw_frames": {"name": "frames.v3.jsonl", "sha256": self.sha(raw), "physical_bytes": len(raw),
+                           "complete_prefix_bytes": len(prefix), "complete_records": len(kept),
+                           "trailing_bytes": len(raw) - len(prefix)},
+            "lane_coverage": coverage, "failures": [failure.model_dump(mode="json")],
+        })
+        receipt_bytes = canonical(receipt.model_dump(mode="json"))
+        self.retain("frames.v3.jsonl", raw)
+        self.retain("receipt.failure.v1.json", receipt_bytes)
+        self.retain("seal.failure.v1.json", canonical(SynchronizedTelemetryFailureSealV1(
+            run_id=plan.run_id, receipt_sha256=self.sha(receipt_bytes),
+            sampling_plan_sha256=self.sha(plan_bytes), raw_frames_sha256=self.sha(raw),
+            physical_bytes=len(raw), complete_prefix_bytes=len(prefix), complete_records=len(kept),
+            collectors_quiesced=True, sealed_monotonic_ns=plan.planned_end_monotonic_ns,
+        ).model_dump(mode="json")))
+        for name in ("receipt.v4.json", "seal.v4.json"):
+            (self.run_directory / name).unlink()
+        return receipt
+
+    def test_a_failed_collection_fails_the_measurement_without_unmaking_the_business(self):
+        """D6 - the physical entry over a real partial: business closed, resource unknown, no pass."""
+        code, passing = self.owner_report("terminal-positive")
+        self.assertEqual(code, 0, self.last_error)
+        self.assertEqual(passing["resource_safety"]["status"], "pass")
+        business = passing["business_obligations_closed"]
+        publication = passing["publication_qualified"]
+
+        receipt = self.negative_terminal(complete_records=2)
+        code, report = self.owner_report("terminal-negative")
+
+        self.assertIsNotNone(report, f"a failed measurement still produces a report: {self.last_error}")
+        # This entry is a read-only reporter: producing a report is exit 0 either way, so the
+        # verdict is the report's own. The run-level exit 1 belongs to the measured-campaign
+        # driver, which fails the run unless this verdict is a pass.
+        self.assertEqual(code, 0, self.last_error)
+        self.assertFalse(report["delivery_pass"], "a negative terminal can never read as a pass")
+        # The measurement is unknown, and it credits nothing.
+        safety = report["resource_safety"]
+        self.assertEqual(safety["status"], "unknown", safety["reason"])
+        self.assertTrue(safety["reason"], "an unknown gate must name why")
+        self.assertIn("resource_safety_unproven:" + safety["reason"], set(report["unknowns"]))
+        self.assertEqual(receipt.measurement_credit, "none")
+        # Only the negative terminal was consumed; no normal receipt or seal took part.
+        inputs = {item["path"] for item in report["evidence"]["inputs"]}
+        self.assertNotIn(str(self.run_directory / "receipt.v4.json"), inputs)
+        self.assertNotIn(str(self.run_directory / "seal.v4.json"), inputs)
+        # The business facts of the same run are unchanged: both statements are true at once.
+        self.assertEqual(report["business_obligations_closed"], business)
+        self.assertEqual(report["publication_qualified"], publication)
+        # And the partial bytes themselves are part of the evidence index, not discarded.
+        self.assertIn(str(self.run_directory / "receipt.failure.v1.json"), inputs)
+        self.assertIn(str(self.run_directory / "frames.v3.jsonl"), inputs)
+
+    def test_a_failure_terminal_from_another_run_is_refused_rather_than_reported(self):
+        """A negative terminal is still identity-bound; a foreign one earns no report at all."""
+        self.negative_terminal(complete_records=2)
+        document = json.loads((self.run_directory / "receipt.failure.v1.json").read_bytes())
+        document["runtime_bundle_identity_sha256"] = self.sha(b"another runtime bundle")
+        self.retain("receipt.failure.v1.json", canonical(document))
+        code, report = self.owner_report("terminal-foreign")
+        self.assertIsNone(report, "a terminal whose seal no longer binds it must not be reported")
+        self.assertNotEqual(code, 0)
+        self.assertIn("m6_campaign_error", self.last_error)
+
     def test_the_entry_consumes_this_owner_s_own_retained_evidence(self):
         # The real summary entry, given this run's original owner directory and its sealed v4
         # artifacts, PASSES the resource gate. Exit 0 and a present evidence hash are produced

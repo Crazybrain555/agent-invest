@@ -1,0 +1,497 @@
+{
+  "$defs": {
+    "BoundedObserverErrorV1": {
+      "additionalProperties": false,
+      "description": "One local exception, bounded: full text up to 8 KiB, else head and tail with the whole-input hash.",
+      "properties": {
+        "dropped_error_bytes": {
+          "minimum": 0,
+          "title": "Dropped Error Bytes",
+          "type": "integer"
+        },
+        "error_bytes_sha256": {
+          "title": "Error Bytes Sha256",
+          "type": "string"
+        },
+        "error_text": {
+          "maxLength": 8256,
+          "title": "Error Text",
+          "type": "string"
+        },
+        "exception_type": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Exception Type",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 2000,
+          "title": "Message",
+          "type": "string"
+        },
+        "original_error_bytes": {
+          "minimum": 0,
+          "title": "Original Error Bytes",
+          "type": "integer"
+        },
+        "retained_error_bytes": {
+          "maximum": 8192,
+          "minimum": 0,
+          "title": "Retained Error Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "exception_type",
+        "message",
+        "error_bytes_sha256",
+        "original_error_bytes",
+        "retained_error_bytes",
+        "dropped_error_bytes",
+        "error_text"
+      ],
+      "title": "BoundedObserverErrorV1",
+      "type": "object"
+    },
+    "CollectionFailureV1": {
+      "additionalProperties": false,
+      "description": "The first failure that stopped one lane, in the observer's own monotonic domain.\n\n``local_request_nonce``/``local_after_sequence`` are the collector's own request\nparameters when it knew them; they are never a remote witness and never advance\nany wire cursor.",
+      "properties": {
+        "category": {
+          "enum": [
+            "deadline",
+            "transport",
+            "continuity",
+            "local_io",
+            "internal"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "dropped_error_bytes": {
+          "minimum": 0,
+          "title": "Dropped Error Bytes",
+          "type": "integer"
+        },
+        "error_bytes_sha256": {
+          "title": "Error Bytes Sha256",
+          "type": "string"
+        },
+        "error_text": {
+          "maxLength": 8256,
+          "title": "Error Text",
+          "type": "string"
+        },
+        "exception_type": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Exception Type",
+          "type": "string"
+        },
+        "finished_monotonic_ns": {
+          "minimum": 0,
+          "title": "Finished Monotonic Ns",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "collection_failure",
+          "default": "collection_failure",
+          "title": "Kind",
+          "type": "string"
+        },
+        "lane": {
+          "enum": [
+            "gpu_fast",
+            "host_slow"
+          ],
+          "title": "Lane",
+          "type": "string"
+        },
+        "local_after_sequence": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local After Sequence"
+        },
+        "local_request_nonce": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Request Nonce"
+        },
+        "message": {
+          "maxLength": 2000,
+          "title": "Message",
+          "type": "string"
+        },
+        "observer_clock_domain_identity_sha256": {
+          "title": "Observer Clock Domain Identity Sha256",
+          "type": "string"
+        },
+        "original_error_bytes": {
+          "minimum": 0,
+          "title": "Original Error Bytes",
+          "type": "integer"
+        },
+        "retained_error_bytes": {
+          "maximum": 8192,
+          "minimum": 0,
+          "title": "Retained Error Bytes",
+          "type": "integer"
+        },
+        "scheduled_monotonic_ns": {
+          "minimum": 0,
+          "title": "Scheduled Monotonic Ns",
+          "type": "integer"
+        },
+        "started_monotonic_ns": {
+          "minimum": 0,
+          "title": "Started Monotonic Ns",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "exception_type",
+        "message",
+        "error_bytes_sha256",
+        "original_error_bytes",
+        "retained_error_bytes",
+        "dropped_error_bytes",
+        "error_text",
+        "lane",
+        "category",
+        "scheduled_monotonic_ns",
+        "started_monotonic_ns",
+        "finished_monotonic_ns",
+        "observer_clock_domain_identity_sha256"
+      ],
+      "title": "CollectionFailureV1",
+      "type": "object"
+    },
+    "LanePrefixCoverageV1": {
+      "additionalProperties": false,
+      "description": "Slot accounting of the complete prefix against the frozen plan; an empty lane is allowed.",
+      "properties": {
+        "complete_records": {
+          "minimum": 0,
+          "title": "Complete Records",
+          "type": "integer"
+        },
+        "first_slot": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "First Slot"
+        },
+        "lane": {
+          "enum": [
+            "gpu_fast",
+            "host_slow"
+          ],
+          "title": "Lane",
+          "type": "string"
+        },
+        "last_slot": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Slot"
+        },
+        "missing_slots": {
+          "minimum": 0,
+          "title": "Missing Slots",
+          "type": "integer"
+        },
+        "planned_slots": {
+          "minimum": 1,
+          "title": "Planned Slots",
+          "type": "integer"
+        },
+        "usable_slots": {
+          "minimum": 0,
+          "title": "Usable Slots",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "lane",
+        "planned_slots",
+        "complete_records",
+        "usable_slots",
+        "missing_slots"
+      ],
+      "title": "LanePrefixCoverageV1",
+      "type": "object"
+    },
+    "RawFramesPrefixV1": {
+      "additionalProperties": false,
+      "description": "The physical raw frame file and the complete, validated prefix inside it.",
+      "properties": {
+        "complete_prefix_bytes": {
+          "minimum": 0,
+          "title": "Complete Prefix Bytes",
+          "type": "integer"
+        },
+        "complete_records": {
+          "minimum": 0,
+          "title": "Complete Records",
+          "type": "integer"
+        },
+        "name": {
+          "const": "frames.v3.jsonl",
+          "default": "frames.v3.jsonl",
+          "title": "Name",
+          "type": "string"
+        },
+        "physical_bytes": {
+          "minimum": 0,
+          "title": "Physical Bytes",
+          "type": "integer"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "trailing_bytes": {
+          "minimum": 0,
+          "title": "Trailing Bytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "physical_bytes",
+        "complete_prefix_bytes",
+        "complete_records",
+        "trailing_bytes"
+      ],
+      "title": "RawFramesPrefixV1",
+      "type": "object"
+    },
+    "TelemetryObserverIdentity": {
+      "additionalProperties": false,
+      "description": "Observer process instance and its actual local monotonic clock domain.",
+      "properties": {
+        "clock_domain_identity_sha256": {
+          "title": "Clock Domain Identity Sha256",
+          "type": "string"
+        },
+        "process_epoch_sha256": {
+          "title": "Process Epoch Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "process_epoch_sha256",
+        "clock_domain_identity_sha256"
+      ],
+      "title": "TelemetryObserverIdentity",
+      "type": "object"
+    }
+  },
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-telemetry-failure-receipt.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Negative-only terminal of a v4 run: original errors, raw prefix, plan; no credit.",
+  "properties": {
+    "activation_authorized": {
+      "const": false,
+      "default": false,
+      "title": "Activation Authorized",
+      "type": "boolean"
+    },
+    "clock_domain_identity_sha256": {
+      "title": "Clock Domain Identity Sha256",
+      "type": "string"
+    },
+    "collectors_quiesced": {
+      "title": "Collectors Quiesced",
+      "type": "boolean"
+    },
+    "contract_version": {
+      "const": "mineru.synchronized-telemetry-failure-receipt.v1",
+      "default": "mineru.synchronized-telemetry-failure-receipt.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "drained_monotonic_ns": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Drained Monotonic Ns"
+    },
+    "failures": {
+      "items": {
+        "$ref": "#/$defs/CollectionFailureV1"
+      },
+      "maxItems": 2,
+      "title": "Failures",
+      "type": "array"
+    },
+    "lane_coverage": {
+      "maxItems": 2,
+      "minItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/LanePrefixCoverageV1"
+        },
+        {
+          "$ref": "#/$defs/LanePrefixCoverageV1"
+        }
+      ],
+      "title": "Lane Coverage",
+      "type": "array"
+    },
+    "measurement_credit": {
+      "const": "none",
+      "default": "none",
+      "title": "Measurement Credit",
+      "type": "string"
+    },
+    "observer_error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BoundedObserverErrorV1"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "observer_identity": {
+      "$ref": "#/$defs/TelemetryObserverIdentity"
+    },
+    "observer_source_sha256": {
+      "title": "Observer Source Sha256",
+      "type": "string"
+    },
+    "planned_end_monotonic_ns": {
+      "minimum": 2,
+      "title": "Planned End Monotonic Ns",
+      "type": "integer"
+    },
+    "planned_start_monotonic_ns": {
+      "minimum": 1,
+      "title": "Planned Start Monotonic Ns",
+      "type": "integer"
+    },
+    "process_profile_sha256": {
+      "title": "Process Profile Sha256",
+      "type": "string"
+    },
+    "raw_frames": {
+      "$ref": "#/$defs/RawFramesPrefixV1"
+    },
+    "reason": {
+      "enum": [
+        "lane_collection_failure",
+        "observer_error",
+        "no_sample_before_stop"
+      ],
+      "title": "Reason",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "runtime_bundle_identity_sha256": {
+      "title": "Runtime Bundle Identity Sha256",
+      "type": "string"
+    },
+    "sampling_plan_sha256": {
+      "title": "Sampling Plan Sha256",
+      "type": "string"
+    },
+    "status": {
+      "const": "failed",
+      "default": "failed",
+      "title": "Status",
+      "type": "string"
+    },
+    "stopped_monotonic_ns": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stopped Monotonic Ns"
+    },
+    "unsealed_positive_artifacts": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Unsealed Positive Artifacts",
+      "type": "object"
+    },
+    "writer_problem": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BoundedObserverErrorV1"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "run_id",
+    "reason",
+    "runtime_bundle_identity_sha256",
+    "process_profile_sha256",
+    "observer_source_sha256",
+    "observer_identity",
+    "clock_domain_identity_sha256",
+    "sampling_plan_sha256",
+    "planned_start_monotonic_ns",
+    "planned_end_monotonic_ns",
+    "collectors_quiesced",
+    "raw_frames",
+    "lane_coverage",
+    "failures"
+  ],
+  "title": "SynchronizedTelemetryFailureReceiptV1",
+  "type": "object"
+}

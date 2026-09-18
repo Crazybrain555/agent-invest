@@ -1,0 +1,73 @@
+{
+  "$id": "https://agent-invest.local/contracts/operational/synchronized-telemetry-failure-seal.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Binds the negative evidence bytes to each other; proves neither native exit nor resource safety.",
+  "properties": {
+    "collectors_quiesced": {
+      "title": "Collectors Quiesced",
+      "type": "boolean"
+    },
+    "complete_prefix_bytes": {
+      "minimum": 0,
+      "title": "Complete Prefix Bytes",
+      "type": "integer"
+    },
+    "complete_records": {
+      "minimum": 0,
+      "title": "Complete Records",
+      "type": "integer"
+    },
+    "contract_version": {
+      "const": "mineru.synchronized-telemetry-failure-seal.v1",
+      "default": "mineru.synchronized-telemetry-failure-seal.v1",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "physical_bytes": {
+      "minimum": 0,
+      "title": "Physical Bytes",
+      "type": "integer"
+    },
+    "raw_frames_sha256": {
+      "title": "Raw Frames Sha256",
+      "type": "string"
+    },
+    "receipt_sha256": {
+      "title": "Receipt Sha256",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "sampling_plan_sha256": {
+      "title": "Sampling Plan Sha256",
+      "type": "string"
+    },
+    "sealed_monotonic_ns": {
+      "minimum": 1,
+      "title": "Sealed Monotonic Ns",
+      "type": "integer"
+    },
+    "status": {
+      "const": "failed",
+      "default": "failed",
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "run_id",
+    "receipt_sha256",
+    "sampling_plan_sha256",
+    "raw_frames_sha256",
+    "physical_bytes",
+    "complete_prefix_bytes",
+    "complete_records",
+    "collectors_quiesced",
+    "sealed_monotonic_ns"
+  ],
+  "title": "SynchronizedTelemetryFailureSealV1",
+  "type": "object"
+}

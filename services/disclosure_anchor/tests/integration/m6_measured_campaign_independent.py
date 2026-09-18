@@ -32,6 +32,7 @@ import time
 import traceback
 
 from disclosure_anchor.adapters.runtime import m6_campaign_assembly as assembly
+from disclosure_anchor.adapters.runtime.exact_file_write import publish_new_exact
 from disclosure_anchor.adapters.runtime import resident_telemetry_owner as owner_module
 from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import load_campaign_private_binding
@@ -40,7 +41,7 @@ from disclosure_anchor.adapters.runtime.resident_telemetry_owner import (
     ResidentLaneLaunch, ResidentTelemetryOwnerRequest, run_resident_telemetry_session,
 )
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
-    FRAME_V3_FILENAME, verify_synchronized_telemetry_observer,
+    FRAME_V3_FILENAME, SynchronizedTelemetryFailureResult, read_synchronized_telemetry_terminal,
 )
 from disclosure_anchor.application.contracts.m6_campaign_intent import M6CampaignIntent, decode_campaign_intent
 from disclosure_anchor.application.contracts.m6_delivery_report import (
@@ -69,7 +70,7 @@ from disclosure_anchor.application.services.resident_measurement_policy import (
 from tests.integration.m6_fresh_workspace_independent import digest, require, save
 
 
-DRIVER_CONTRACT = "m6.measured-campaign-driver.v2"
+DRIVER_CONTRACT = "m6.measured-campaign-driver.v3"
 REQUEST_CONTRACT = "m6.measured-telemetry-request.v2"
 BUDGET_CONTRACT = "m6.measured-campaign-budget.v2"
 # What this driver records about its own window: the whole campaign, entry to the
@@ -542,6 +543,15 @@ def gate_problems(report, *, mode):
     return tuple(sorted(set(problems)))
 
 
+def attempt(steps, name, step):
+    """Run one report step; its failure is named under ``name`` and never replaces an earlier one."""
+    try:
+        return step()
+    except Exception as exc:  # noqa: BLE001 - the report must name every failed step, not stop at the first
+        steps[name] = f"{type(exc).__name__}: {str(exc)[:500]}"
+        return None
+
+
 def driver_status(*, measurement_problems, delivery_problems):
     """One explicit verdict: a valid measurement is not by itself a business acceptance."""
     if measurement_problems:
@@ -671,7 +681,7 @@ def await_trusted_frames(*, telemetry, frames_path, wait_seconds, run_id, runtim
 
 
 def supervise(*, campaign, telemetry, deadline_seconds, evidence, transport_check=None,
-              now=time.monotonic, sleep=time.sleep, poll_seconds=0.5):
+              now=time.monotonic, sleep=time.sleep, poll_seconds=0.5, deadline_monotonic=None):
     """Watch both finite children until the campaign ends, one fails, or the frozen span is spent.
 
     ``transport_check`` returns a problem name once the entry's own launch record
@@ -680,7 +690,7 @@ def supervise(*, campaign, telemetry, deadline_seconds, evidence, transport_chec
     record after READY or after admission, so what it buys is an early stop and a
     named cause, never the authorization the pre-flight already gave.
     """
-    deadline = now() + deadline_seconds
+    deadline = now() + deadline_seconds if deadline_monotonic is None else deadline_monotonic
     while True:
         code = campaign.poll()
         if code is not None:
@@ -702,15 +712,38 @@ def supervise(*, campaign, telemetry, deadline_seconds, evidence, transport_chec
         sleep(poll_seconds)
 
 
-def stop_campaign(campaign, *, grace_seconds, evidence):
-    """Stop new admission through the entry's own interrupt path; never claim the remote owner exited."""
-    campaign.interrupt()
-    code = campaign.wait(grace_seconds)
+def drain_campaign(campaign, *, admission_stop_file, deadline_monotonic, evidence, now=time.monotonic):
+    """Request one-way STOP and wait only to the original spawn-derived outer deadline.
+
+    The entry keeps leases, runner and verifier alive within their original owner
+    max_close. A measurement failure stays a failure even if this drain succeeds.
+    No local exit code is treated as proof of the Windows owner's exit.
+    """
+    require(_finite(deadline_monotonic), "missing original campaign deadline")
+    evidence["campaign_drain_deadline_monotonic"] = deadline_monotonic
+    code = campaign.poll()
     if code is None:
+        try:
+            publish_new_exact(Path(admission_stop_file), b"stop\n")
+        except FileExistsError:
+            pass  # one-way idempotent request; the product validates the exact control file
+        except OSError as exc:
+            evidence["admission_stop_write_failure"] = f"{type(exc).__name__}: {exc}"
+            # Control capability is lost. Fail closed; this is not the normal monitoring-failure path.
+            code = campaign.kill_group()
+            evidence["campaign_forced"] = True
+        else:
+            evidence["admission_stop_requested"] = True
+        if code is None and not evidence.get("campaign_forced"):
+            evidence["admission_stop_requested"] = True
+            code = campaign.wait(max(0.0, deadline_monotonic - now()))
+    if code is None:
+        evidence["campaign_drain_deadline_exhausted"] = True
         code = campaign.kill_group()
         evidence["campaign_forced"] = True
     evidence["campaign_exit_code"] = code
-    evidence["owner_outcome"] = _UNKNOWN_REMOTE
+    evidence["owner_outcome"] = ("unverified: read the original campaign external-exit and closure records; "
+                                 "a local process exit is not remote exit proof")
     return code
 
 
@@ -1034,12 +1067,62 @@ def run_summary(*, python_executable, service_root, output, campaign_dir, evalua
     return completed.returncode
 
 
+def owner_failure_problems(request):
+    """The owner's own failure record, when it wrote one: named by its first error, never a pass."""
+    path = request.evidence_directory / "owner-failure.json"
+    if path.is_symlink() or not path.is_file():
+        return (), None
+    document = load_bounded(path, maximum=MAX_OWNER_RESULT_BYTES)
+    first = document.get("first_error")
+    name = "owner_failed"
+    if type(first) is dict and type(first.get("type")) is str:
+        name += ":" + first["type"][:80]
+    facts = {"first_error": first, "error_count": len(document.get("errors") or []),
+             "observer_terminal": document.get("observer_terminal")}
+    return (name,), facts
+
+
+def verify_failure_terminal(*, request, result, campaign_dir, campaign_summary, mode, transport_timeout_seconds, evidence):
+    """A run that ended on its negative terminal: every failure named, no coverage or resource credit derived."""
+    receipt, seal = result.receipt, result.seal
+    seal_sha256 = artifact_sha256(canonical_bytes(seal.model_dump(mode="json")))
+    owner_problems, owner_facts = owner_failure_problems(request)
+    evidence["telemetry"] = {
+        "receipt_sha256": seal.receipt_sha256, "seal_sha256": seal_sha256,
+        "observer_status": result.evidence_status, "receipt_status": receipt.status, "reason": receipt.reason,
+        "collection_failures": [{"lane": item.lane, "category": item.category, "exception_type": item.exception_type,
+                                 "message": item.message[:300]} for item in receipt.failures],
+        "observer_error": None if receipt.observer_error is None else receipt.observer_error.exception_type,
+        "raw_frames": receipt.raw_frames.model_dump(mode="json"),
+        "lane_coverage": [item.model_dump(mode="json") for item in receipt.lane_coverage],
+        "collectors_quiesced": receipt.collectors_quiesced,
+        "frames_total": len(result.prefix_frames), "coverage_problems": ["negative_terminal"],
+        "resident_evidence_problems": list(owner_problems), "resident_evidence": owner_facts,
+    }
+    problems = ["observer_terminal_failed:" + receipt.reason, "observer_status_failed"]
+    problems.extend(f"telemetry_collection_failed:{item.lane}:{item.category}" for item in receipt.failures)
+    if receipt.observer_error is not None:
+        problems.append("telemetry_observer_error:" + receipt.observer_error.exception_type[:80])
+    problems.extend(owner_problems)
+    problems.extend(campaign_problems(campaign_dir=campaign_dir, campaign_summary=campaign_summary, mode=mode,
+                                      transport_timeout_seconds=transport_timeout_seconds, evidence=evidence))
+    return tuple(sorted(set(problems)))
+
+
 def verify(*, request, campaign_dir, campaign_summary, mode, transport_timeout_seconds, evidence):
-    """Independent replay and gate; the campaign's own summary supplies the window to cover."""
-    result = verify_synchronized_telemetry_observer(
+    """Independent replay and gate; the campaign's own summary supplies the window to cover.
+
+    The run directory holds exactly one terminal. A negative one is verified by
+    its own contract and reported as a failed measurement beside whatever the
+    business closed; it never enters the coverage or resource replay below.
+    """
+    result = read_synchronized_telemetry_terminal(
         artifact_root=request.observer_artifact_root, run_id=request.run_id,
-        receipt_version=RECEIPT_VERSION,
     )
+    if isinstance(result, SynchronizedTelemetryFailureResult):
+        return verify_failure_terminal(request=request, result=result, campaign_dir=campaign_dir,
+                                       campaign_summary=campaign_summary, mode=mode,
+                                       transport_timeout_seconds=transport_timeout_seconds, evidence=evidence)
     receipt, seal = result.receipt, result.seal
     # The owner's own serialisation, so its result document and this replay compare byte for byte.
     receipt_sha256 = artifact_sha256(canonical_bytes(receipt.model_dump(mode="json")))
@@ -1081,6 +1164,14 @@ def verify(*, request, campaign_dir, campaign_summary, mode, transport_timeout_s
         problems.append("observer_status_" + str(result.evidence_status))
     if len(trusted) != len(result.frames):
         problems.append("untrusted_frames_in_sealed_window")
+    problems.extend(campaign_problems(campaign_dir=campaign_dir, campaign_summary=campaign_summary, mode=mode,
+                                      transport_timeout_seconds=transport_timeout_seconds, evidence=evidence))
+    return tuple(sorted(set(problems)))
+
+
+def campaign_problems(*, campaign_dir, campaign_summary, mode, transport_timeout_seconds, evidence):
+    """The campaign entry's own closure facts, scored the same way for a normal and a failed measurement."""
+    problems = []
     # Final agreement: the entry's own launch record must still match the transport the
     # pre-flight adjudicated against the composition root's rule before any child existed.
     recorded, transport_problem = launcher_transport_state(campaign_dir, declared=transport_timeout_seconds)
@@ -1144,14 +1235,15 @@ def main(argv=None):
                 # summary's own entry/finish in the same domain.
                 "orchestration_monotonic_ns": {"started": time.monotonic_ns()}}
     campaign = telemetry = None
-    # Whatever ends this run - a named stop, a failed check or a signal - the children get the
-    # same frozen grace. These are set before either child can exist, so the cleanup below
-    # always finds them; they only widen as the frozen terms become known.
+    campaign_deadline_monotonic = None
+    admission_stop_file = output / "campaign-admission.STOP"
+    # Only the telemetry child retains a cancel grace. Campaign failure handling
+    # uses its original absolute deadline below; no second campaign grace exists.
     stop_grace = {}
     evidence["stop_grace"] = stop_grace
     install_stop_handlers()
     try:
-        stop_grace["campaign"] = stop_grace["telemetry"] = _constant("_CANCEL_TIMEOUT_SECONDS")
+        stop_grace["telemetry"] = _constant("_CANCEL_TIMEOUT_SECONDS")
         intent_raw = read_bounded(args.intent, maximum=MAX_SUMMARY_BYTES)
         require(digest(intent_raw) == args.intent_sha256, "intent changed")
         intent = decode_campaign_intent(intent_raw)
@@ -1202,9 +1294,6 @@ def main(argv=None):
             campaign_launch_allowance_seconds=allowances["campaign_launch_allowance_seconds"],
             cleanup_allowance_seconds=allowances["cleanup_allowance_seconds"],
         )
-        # Once the budget is frozen the entry's own failure path is bounded: its cancel plus
-        # the fetches it still has to make.
-        stop_grace["campaign"] = _constant("_CANCEL_TIMEOUT_SECONDS") + budget["retrieval_seconds"]
         save(output / "budget.json", budget)
         evidence["budget"] = budget
         require(budget["satisfied"], "frozen finite budget is refused before any child: "
@@ -1293,11 +1382,16 @@ def main(argv=None):
         for key in ("intent", "intent-sha256", "private-binding", "binding", "manifest", "scope", "quality-plan",
                     "evaluation-plan"):
             campaign_command.extend(["--" + key, str(getattr(args, key.replace("-", "_")))])
-        campaign_command += ["--release-manifest", str(release_manifest), "--output", str(campaign_dir)]
+        campaign_command += ["--release-manifest", str(release_manifest), "--output", str(campaign_dir),
+                             "--admission-stop-file", str(admission_stop_file)]
         if args.attempt_id is not None:
             campaign_command += ["--attempt-id", args.attempt_id]
         save(output / "campaign-command.json", campaign_command)
         evidence["orchestration_monotonic_ns"]["campaign_spawn"] = time.monotonic_ns()
+        # One absolute deadline, frozen before spawn. Failure handling never renews it.
+        campaign_deadline_monotonic = (evidence["orchestration_monotonic_ns"]["campaign_spawn"] / NS
+                                       + budget["campaign_span_requirement_seconds"])
+        evidence["campaign_deadline_monotonic"] = campaign_deadline_monotonic
         campaign = Child(campaign_command, output=output, label="campaign", environment=environment,
                          cwd=str(service_root))
         evidence["campaign_pid"] = campaign.pid
@@ -1316,16 +1410,20 @@ def main(argv=None):
             return launcher_transport_state(campaign_dir, declared=declared_transport)[1]
 
         outcome = supervise(campaign=campaign, telemetry=telemetry, transport_check=transport_check,
-                            deadline_seconds=budget["campaign_span_requirement_seconds"], evidence=evidence)
+                            deadline_seconds=budget["campaign_span_requirement_seconds"], evidence=evidence,
+                            deadline_monotonic=campaign_deadline_monotonic)
         evidence["supervision_outcome"] = outcome
+        # From here on nothing short-circuits the report. The first failure is fixed once; the
+        # business drain, the telemetry close, the terminal replay and the read-only summary are
+        # each attempted and each failure is named beside it. Exit 1 still means the run failed.
+        measurement = []
         if outcome != "campaign_exited":
-            # A launcher still inside its own absolute deadline makes this a forced stop, which is
-            # recorded as an unknown remote outcome rather than waited out for the rest of the
-            # transport lifetime.
-            stop_campaign(campaign, evidence=evidence, grace_seconds=stop_grace["campaign"])
-        require(outcome == "campaign_exited", "the measured campaign did not finish on its own: " + outcome)
-        require(evidence["campaign_exit_code"] == 0,
-                f"campaign entry exited {evidence['campaign_exit_code']}; original evidence retained")
+            evidence.setdefault("first_failure", "supervision: " + str(evidence.get("stop_reason", outcome)))
+            drain_campaign(campaign, admission_stop_file=admission_stop_file,
+                           deadline_monotonic=campaign_deadline_monotonic, evidence=evidence)
+            measurement.append("campaign_not_finished_on_its_own:" + outcome)
+        if evidence.get("campaign_exit_code") != 0:
+            measurement.append(f"campaign_entry_exit_{evidence.get('campaign_exit_code')}")
 
         # The sampling window closes on its own finite deadline; it is never cut short here.
         remaining_close = max(60.0, (plan.planned_end_monotonic_ns - time.monotonic_ns()) / NS
@@ -1335,58 +1433,91 @@ def main(argv=None):
         if code is None:
             code = stop_telemetry(telemetry, grace_seconds=stop_grace["telemetry"], evidence=evidence)
         evidence["telemetry_exit_code"] = code
-        require(code == 0, f"telemetry owner exited {code}; its original failure evidence is retained")
+        if code != 0:
+            evidence.setdefault("first_failure", f"telemetry owner exited {code}")
+            measurement.append(f"telemetry_owner_exit_{code}")
 
-        campaign_summary = load_bounded(campaign_dir / "campaign-summary.json", maximum=MAX_SUMMARY_BYTES)
-        evidence["campaign_summary"] = {
-            key: campaign_summary.get(key) for key in
-            ("status", "admitted_count", "owner_external_exit_verified", "local_children_reaped",
-             "cleanup_failures", "first_error", "spec_sha256", "started_utc", "finished_utc")
-        }
-        measurement = list(verify(request=request, campaign_dir=campaign_dir,
-                                  campaign_summary=campaign_summary, mode=args.mode,
-                                  transport_timeout_seconds=declared_transport, evidence=evidence))
+        steps = evidence.setdefault("step_errors", {})
+        campaign_summary = attempt(steps, "campaign_summary",
+                                   lambda: load_bounded(campaign_dir / "campaign-summary.json", maximum=MAX_SUMMARY_BYTES))
+        if campaign_summary is None:
+            measurement.append("campaign_summary_unavailable")
+            evidence["campaign_summary"] = None
+        else:
+            evidence["campaign_summary"] = {
+                key: campaign_summary.get(key) for key in
+                ("status", "admitted_count", "owner_external_exit_verified", "local_children_reaped",
+                 "cleanup_failures", "first_error", "spec_sha256", "started_utc", "finished_utc")
+            }
+            verified = attempt(steps, "verify", lambda: list(verify(
+                request=request, campaign_dir=campaign_dir, campaign_summary=campaign_summary, mode=args.mode,
+                transport_timeout_seconds=declared_transport, evidence=evidence)))
+            measurement.extend(verified if verified is not None else ["verify_failed:" + steps["verify"][:120]])
 
-        summary_exit = run_summary(python_executable=python_executable, service_root=service_root,
-                                   output=output, campaign_dir=campaign_dir,
-                                   evaluation_plan=args.evaluation_plan, request=request,
-                                   environment=environment)
-        evidence["summary_exit_code"] = summary_exit
-        require(summary_exit == 0, f"delivery summary exited {summary_exit}")
-        report = M6DeliveryReport.from_canonical_bytes(
-            read_bounded(output / "report" / "delivery-report.json",
-                         maximum=M6_DELIVERY_REPORT_MAX_BYTES).rstrip(b"\n"),
-            maximum_bytes=M6_DELIVERY_REPORT_MAX_BYTES,
-        )
-        # Exit 0 only means a report exists; the verdict is read from the report itself.
-        evidence["delivery"] = {
-            "delivery_pass": report.delivery_pass, "run_validity": report.run_validity.status,
-            "resource_safety": report.resource_safety.status, "resource_reason": report.resource_safety.reason,
-            "obligations_closed": report.business_obligations_closed.all_closed,
-            "unknowns": list(report.unknowns)[:64], "unknown_count": len(report.unknowns),
-            "report_sha256": report.canonical_sha256(),
-        }
-        measurement.extend(gate_problems(report, mode=args.mode))
+        report = None
+        if (campaign_dir / "run" / "run-spec.json").is_file():
+            summary_exit = attempt(steps, "summary", lambda: run_summary(
+                python_executable=python_executable, service_root=service_root, output=output, campaign_dir=campaign_dir,
+                evaluation_plan=args.evaluation_plan, request=request, environment=environment))
+            evidence["summary_exit_code"] = summary_exit
+            if summary_exit == 0:
+                report = attempt(steps, "report", lambda: M6DeliveryReport.from_canonical_bytes(
+                    read_bounded(output / "report" / "delivery-report.json",
+                                 maximum=M6_DELIVERY_REPORT_MAX_BYTES).rstrip(b"\n"),
+                    maximum_bytes=M6_DELIVERY_REPORT_MAX_BYTES))
+                if report is None:
+                    measurement.append("report_unavailable:" + steps["report"][:120])
+            else:
+                measurement.append(f"delivery_summary_exit_{summary_exit}")
+                evidence["report_unavailable"] = {"reason": f"summary_exit_{summary_exit}",
+                                                  "stderr": str(output / "summary.stderr")}
+        else:
+            measurement.append("report_unavailable:run_spec_absent")
+            evidence["report_unavailable"] = {"reason": "run_spec_absent", "campaign_dir": str(campaign_dir)}
+        if report is not None:
+            # Exit 0 only means a report exists; the verdict is read from the report itself.
+            evidence["delivery"] = {
+                "delivery_pass": report.delivery_pass, "run_validity": report.run_validity.status,
+                "resource_safety": report.resource_safety.status, "resource_reason": report.resource_safety.reason,
+                "obligations_closed": report.business_obligations_closed.all_closed,
+                "unknowns": list(report.unknowns)[:64], "unknown_count": len(report.unknowns),
+                "report_sha256": report.canonical_sha256(),
+            }
+            measurement.extend(gate_problems(report, mode=args.mode))
         # Re-read every direct and indirect frozen input, including the ones only the child opened.
         final_request = build_owner_request(load_bounded(args.telemetry_request, maximum=MAX_REQUEST_BYTES))
         if pin_inputs(files, final_request) != pins:
             measurement.append("frozen_input_changed_during_execution")
         evidence["measurement_problems"] = sorted(set(measurement))
         evidence["measurement_valid"] = not evidence["measurement_problems"]
-        evidence["delivery_problems"] = sorted(delivery_problems(report, mode=args.mode))
+        evidence["measurement_failed"] = not evidence["measurement_valid"]
+        if evidence["measurement_failed"] and "first_failure" not in evidence:
+            # A run that failed only in a collected report step still names what failed first.
+            first_step = next(iter(steps.items()), None)
+            evidence["first_failure"] = (f"{first_step[0]}: {first_step[1]}" if first_step is not None
+                                         else "measurement: " + evidence["measurement_problems"][0])
+        evidence["delivery_problems"] = (sorted(delivery_problems(report, mode=args.mode)) if report is not None
+                                         else (["report_unavailable"] if args.mode == "run" else []))
+        # Business closure is the report's own verdict; it is stated beside a failed measurement, never
+        # folded into one bit with it.
+        evidence["business_closed"] = (report is not None and report.business_obligations_closed.all_closed is True
+                                       and evidence["campaign_summary"] is not None
+                                       and evidence["campaign_summary"].get("status") == "complete")
         evidence["problems"] = sorted(set(evidence["measurement_problems"] + evidence["delivery_problems"]))
         # A valid measurement of a failed delivery is a named failure, not a pass and not a crash.
         evidence["status"] = driver_status(measurement_problems=evidence["measurement_problems"],
                                            delivery_problems=evidence["delivery_problems"])
     except (Exception, KeyboardInterrupt) as exc:
         evidence["failure"] = f"{type(exc).__name__}: {str(exc)[:2000]}"
+        evidence.setdefault("first_failure", evidence["failure"])
     finally:
         for child in (campaign, telemetry):
             if child is None:
                 continue
             if child.poll() is None:
                 if child is campaign:
-                    stop_campaign(child, grace_seconds=stop_grace["campaign"], evidence=evidence)
+                    drain_campaign(child, admission_stop_file=admission_stop_file,
+                                   deadline_monotonic=campaign_deadline_monotonic, evidence=evidence)
                 else:
                     stop_telemetry(child, grace_seconds=stop_grace["telemetry"], evidence=evidence)
             evidence[child.label + "_output"] = child.output_head()
@@ -1399,8 +1530,8 @@ def main(argv=None):
                 - evidence["sampling_plan"]["planned_end_ns"]) / NS
         save(output / "independent-evidence.json", evidence)
     print(json.dumps({key: evidence[key] for key in
-                      ("status", "measurement_valid", "failure", "measurement_problems", "delivery_problems",
-                       "delivery", "supervision_outcome")
+                      ("status", "measurement_valid", "measurement_failed", "business_closed", "failure", "first_failure",
+                       "measurement_problems", "delivery_problems", "delivery", "supervision_outcome", "step_errors")
                       if key in evidence}, ensure_ascii=False))
     return 0 if evidence["status"] == "pass" else 1
 

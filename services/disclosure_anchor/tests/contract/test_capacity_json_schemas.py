@@ -72,6 +72,11 @@ class CapacityJsonSchemaTests(unittest.TestCase):
                 "synchronized-telemetry-frame.v3.schema.json",
                 "synchronized-telemetry-receipt.v4.schema.json",
                 "synchronized-telemetry-seal.v4.schema.json",
+                # R23: the negative-only terminal of a v4 run. It is a separate pair, never a
+                # variant of the v4 receipt/seal, so the registry must name both or a failure
+                # terminal could be exported without a tracked, closed schema of its own.
+                "synchronized-telemetry-failure-receipt.v1.schema.json",
+                "synchronized-telemetry-failure-seal.v1.schema.json",
             },
         )
         for filename, generated in generated_documents.items():

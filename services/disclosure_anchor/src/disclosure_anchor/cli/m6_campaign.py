@@ -86,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
                           help="canonical m6.evaluation-plan.v1 bytes whose sha256 the intent pins; frozen before Prepare")
         item.add_argument("--output", type=Path, required=True, help="new directory under the runtime root")
         item.add_argument("--attempt-id", default=None, help="owner attempt identifier; default: a fresh UUID")
+        item.add_argument("--admission-stop-file", type=Path, default=None,
+                          help="optional shared STOP under the private output parent; stop admission and drain, never SIGINT")
     summary_parser = sub.add_parser("summary", help="read-only delivery report from an existing campaign output directory")
     summary_parser.add_argument("--run-dir", type=Path, required=True, help="campaign output directory of a finished run")
     summary_parser.add_argument("--evaluation-plan", type=Path, required=True)
@@ -114,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         assembly = M6CampaignAssembly(
             inputs, output=args.output.absolute(), mode=args.command,
             attempt_id=args.attempt_id or ("attempt-" + uuid.uuid4().hex[:16]),
+            admission_stop_file=None if args.admission_stop_file is None else args.admission_stop_file.absolute(),
         )
     except CampaignIdentityError as exc:
         print(json.dumps({"m6_campaign_error": "identity", "message": str(exc)}), file=sys.stderr, flush=True)

@@ -1564,6 +1564,269 @@ def cast_frames(frames: tuple[SynchronizedTelemetryFrameV3, ...]) -> tuple[Synch
     return frames  # type: ignore[return-value]
 
 
+# --- R23 negative-only terminal: a local collection failure is an error record, never a frame ---
+# A v4 run that could not keep collecting ends with a failure receipt/seal pair instead of a
+# normal receipt. The pair binds the frozen plan, the physical raw bytes and the complete
+# frame prefix to the exact first error per lane. It carries no measurement value, no
+# invented witness and no resource credit; the planned window is never shortened.
+
+TELEMETRY_FAILURE_RECEIPT_V1_VERSION: Literal["mineru.synchronized-telemetry-failure-receipt.v1"] = (
+    "mineru.synchronized-telemetry-failure-receipt.v1"
+)
+TELEMETRY_FAILURE_SEAL_V1_VERSION: Literal["mineru.synchronized-telemetry-failure-seal.v1"] = (
+    "mineru.synchronized-telemetry-failure-seal.v1"
+)
+CollectionFailureCategory = Literal["deadline", "transport", "continuity", "local_io", "internal"]
+FailureReceiptReason = Literal["lane_collection_failure", "observer_error", "no_sample_before_stop"]
+MAX_RETAINED_ERROR_BYTES = 8192
+
+
+class BoundedObserverErrorV1(_FrozenModel):
+    """One local exception, bounded: full text up to 8 KiB, else head and tail with the whole-input hash."""
+
+    exception_type: str = Field(min_length=1, max_length=120)
+    message: str = Field(max_length=2000)
+    error_bytes_sha256: str
+    original_error_bytes: int = Field(ge=0)
+    retained_error_bytes: int = Field(ge=0, le=MAX_RETAINED_ERROR_BYTES)
+    dropped_error_bytes: int = Field(ge=0)
+    error_text: str = Field(max_length=MAX_RETAINED_ERROR_BYTES + 64)
+
+    @model_validator(mode="after")
+    def _check_error(self) -> "BoundedObserverErrorV1":
+        _sha256(self.error_bytes_sha256, label="error_bytes_sha256")
+        if self.retained_error_bytes + self.dropped_error_bytes != self.original_error_bytes:
+            raise ValueError("retained plus dropped error bytes must equal the original error bytes")
+        if len(self.error_text.encode("utf-8")) > self.retained_error_bytes + 64:
+            raise ValueError("error text exceeds the bytes it claims to retain")
+        return self
+
+
+class CollectionFailureV1(BoundedObserverErrorV1):
+    """The first failure that stopped one lane, in the observer's own monotonic domain.
+
+    ``local_request_nonce``/``local_after_sequence`` are the collector's own request
+    parameters when it knew them; they are never a remote witness and never advance
+    any wire cursor.
+    """
+
+    kind: Literal["collection_failure"] = "collection_failure"
+    lane: TelemetryLane
+    category: CollectionFailureCategory
+    scheduled_monotonic_ns: int = Field(ge=0)
+    started_monotonic_ns: int = Field(ge=0)
+    finished_monotonic_ns: int = Field(ge=0)
+    observer_clock_domain_identity_sha256: str
+    local_request_nonce: str | None = None
+    local_after_sequence: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _check_failure(self) -> "CollectionFailureV1":
+        _sha256(self.observer_clock_domain_identity_sha256, label="observer_clock_domain_identity_sha256")
+        if not self.scheduled_monotonic_ns <= self.started_monotonic_ns <= self.finished_monotonic_ns:
+            raise ValueError("collection failure instants are not ordered")
+        if self.local_request_nonce is not None and re.fullmatch(r"[0-9a-f]{32}", self.local_request_nonce) is None:
+            raise ValueError("local request nonce must be 32 lowercase hex characters")
+        return self
+
+
+class RawFramesPrefixV1(_FrozenModel):
+    """The physical raw frame file and the complete, validated prefix inside it."""
+
+    name: Literal["frames.v3.jsonl"] = "frames.v3.jsonl"
+    sha256: str
+    physical_bytes: int = Field(ge=0)
+    complete_prefix_bytes: int = Field(ge=0)
+    complete_records: int = Field(ge=0)
+    trailing_bytes: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _check_prefix(self) -> "RawFramesPrefixV1":
+        _sha256(self.sha256, label="raw_frames.sha256")
+        if self.complete_prefix_bytes + self.trailing_bytes != self.physical_bytes:
+            raise ValueError("raw frames prefix plus trailing bytes must equal the physical bytes")
+        if (self.complete_records == 0) != (self.complete_prefix_bytes == 0):
+            raise ValueError("an empty prefix has no records and a non-empty prefix has at least one")
+        return self
+
+
+class LanePrefixCoverageV1(_FrozenModel):
+    """Slot accounting of the complete prefix against the frozen plan; an empty lane is allowed."""
+
+    lane: TelemetryLane
+    planned_slots: int = Field(ge=1)
+    complete_records: int = Field(ge=0)
+    usable_slots: int = Field(ge=0)
+    missing_slots: int = Field(ge=0)
+    first_slot: int | None = Field(default=None, ge=0)
+    last_slot: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _check_coverage(self) -> "LanePrefixCoverageV1":
+        if self.usable_slots + self.missing_slots != self.planned_slots:
+            raise ValueError("usable plus missing slots must equal the planned slots")
+        if self.usable_slots != self.complete_records:
+            raise ValueError("every complete prefix record occupies exactly one plan slot")
+        if (self.first_slot is None) != (self.usable_slots == 0) or (self.last_slot is None) != (self.usable_slots == 0):
+            raise ValueError("first/last slot are present exactly when the lane has usable slots")
+        if self.first_slot is not None and self.last_slot is not None:
+            if not self.first_slot <= self.last_slot < self.planned_slots or self.last_slot - self.first_slot + 1 < self.usable_slots:
+                raise ValueError("lane slot span disagrees with its usable slots")
+        return self
+
+
+class SynchronizedTelemetryFailureReceiptV1(_FrozenModel):
+    """Negative-only terminal of a v4 run: original errors, raw prefix, plan; no credit."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-failure-receipt.v1.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-failure-receipt.v1"] = TELEMETRY_FAILURE_RECEIPT_V1_VERSION
+    run_id: str
+    status: Literal["failed"] = "failed"
+    reason: FailureReceiptReason
+    runtime_bundle_identity_sha256: str
+    process_profile_sha256: str
+    observer_source_sha256: str
+    observer_identity: TelemetryObserverIdentity
+    clock_domain_identity_sha256: str
+    sampling_plan_sha256: str
+    planned_start_monotonic_ns: int = Field(ge=1)
+    planned_end_monotonic_ns: int = Field(ge=2)
+    stopped_monotonic_ns: int | None = Field(default=None, ge=0)
+    drained_monotonic_ns: int | None = Field(default=None, ge=0)
+    collectors_quiesced: bool
+    raw_frames: RawFramesPrefixV1
+    lane_coverage: tuple[LanePrefixCoverageV1, LanePrefixCoverageV1]
+    failures: tuple[CollectionFailureV1, ...] = Field(max_length=2)
+    observer_error: BoundedObserverErrorV1 | None = None
+    writer_problem: BoundedObserverErrorV1 | None = None
+    unsealed_positive_artifacts: dict[str, str] = Field(default_factory=dict)
+    measurement_credit: Literal["none"] = "none"
+    activation_authorized: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _check_failure_receipt(self) -> "SynchronizedTelemetryFailureReceiptV1":
+        _run_id(self.run_id)
+        for label, value in (
+            ("runtime_bundle_identity_sha256", self.runtime_bundle_identity_sha256),
+            ("process_profile_sha256", self.process_profile_sha256),
+            ("observer_source_sha256", self.observer_source_sha256),
+            ("clock_domain_identity_sha256", self.clock_domain_identity_sha256),
+            ("sampling_plan_sha256", self.sampling_plan_sha256),
+        ):
+            _sha256(value, label=label)
+        if self.observer_identity.clock_domain_identity_sha256 != self.clock_domain_identity_sha256:
+            raise ValueError("observer clock domain drifted")
+        if self.planned_end_monotonic_ns <= self.planned_start_monotonic_ns:
+            raise ValueError("failure receipt planned window is empty or inverted")
+        if {item.lane for item in self.lane_coverage} != {"gpu_fast", "host_slow"}:
+            raise ValueError("failure receipt requires one prefix coverage per lane")
+        if sum(item.complete_records for item in self.lane_coverage) != self.raw_frames.complete_records:
+            raise ValueError("lane prefix records do not sum to the complete prefix records")
+        lanes = [item.lane for item in self.failures]
+        if len(set(lanes)) != len(lanes):
+            raise ValueError("at most one stopping failure per lane")
+        for failure in self.failures:
+            if failure.observer_clock_domain_identity_sha256 != self.clock_domain_identity_sha256:
+                raise ValueError("collection failure clock domain drifted")
+        if not self.failures and self.observer_error is None:
+            raise ValueError("a failure receipt names at least one collection failure or observer error")
+        if self.reason == "lane_collection_failure" and not self.failures:
+            raise ValueError("lane_collection_failure requires a collection failure")
+        if self.reason == "observer_error" and self.observer_error is None:
+            raise ValueError("observer_error requires the observer error")
+        if self.drained_monotonic_ns is not None and not self.collectors_quiesced:
+            raise ValueError("a drain instant is recorded only when the collectors quiesced")
+        for name, digest in self.unsealed_positive_artifacts.items():
+            if name != "receipt.v4.json":
+                raise ValueError("only an unsealed positive receipt may be retained beside a failure terminal")
+            _sha256(digest, label="unsealed_positive_artifacts." + name)
+        return self
+
+
+class SynchronizedTelemetryFailureSealV1(_FrozenModel):
+    """Binds the negative evidence bytes to each other; proves neither native exit nor resource safety."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False,
+        json_schema_extra={"$id": _SCHEMA_ROOT + "synchronized-telemetry-failure-seal.v1.schema.json"},
+    )
+    contract_version: Literal["mineru.synchronized-telemetry-failure-seal.v1"] = TELEMETRY_FAILURE_SEAL_V1_VERSION
+    run_id: str
+    status: Literal["failed"] = "failed"
+    receipt_sha256: str
+    sampling_plan_sha256: str
+    raw_frames_sha256: str
+    physical_bytes: int = Field(ge=0)
+    complete_prefix_bytes: int = Field(ge=0)
+    complete_records: int = Field(ge=0)
+    collectors_quiesced: bool
+    sealed_monotonic_ns: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _check_failure_seal(self) -> "SynchronizedTelemetryFailureSealV1":
+        _run_id(self.run_id)
+        for label, value in (
+            ("receipt_sha256", self.receipt_sha256), ("sampling_plan_sha256", self.sampling_plan_sha256),
+            ("raw_frames_sha256", self.raw_frames_sha256),
+        ):
+            _sha256(value, label=label)
+        if self.complete_prefix_bytes > self.physical_bytes:
+            raise ValueError("complete prefix cannot exceed the physical bytes")
+        return self
+
+
+def bounded_observer_error(exc: BaseException, *, text: str | None = None) -> BoundedObserverErrorV1:
+    """Bound one local exception: whole text when it fits, else head and tail with the whole-input hash."""
+    payload = (text if text is not None else f"{type(exc).__name__}: {exc}").encode("utf-8", "replace")
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    if len(payload) <= MAX_RETAINED_ERROR_BYTES:
+        retained = payload
+    else:
+        half = MAX_RETAINED_ERROR_BYTES // 2
+        retained = payload[:half] + payload[-half:]
+    retained_text = retained.decode("utf-8", "replace")
+    if len(payload) > MAX_RETAINED_ERROR_BYTES:
+        retained_text = retained[:half].decode("utf-8", "replace") + "\n...[dropped]...\n" + retained[-half:].decode("utf-8", "replace")
+    return BoundedObserverErrorV1(
+        exception_type=type(exc).__name__[:120], message=str(exc)[:2000], error_bytes_sha256=digest,
+        original_error_bytes=len(payload), retained_error_bytes=len(retained),
+        dropped_error_bytes=len(payload) - len(retained), error_text=retained_text,
+    )
+
+
+def derive_prefix_coverage_v1(
+    frames: tuple[SynchronizedTelemetryFrameV3, ...], *, plan: SynchronizedSamplingPlanV1,
+) -> tuple[LanePrefixCoverageV1, LanePrefixCoverageV1]:
+    """Slot accounting of a complete frame prefix (possibly empty) against the frozen plan.
+
+    The same half-open slot algorithm as the normal receipt; nothing about the
+    prefix is interpolated and no slot outside the plan is counted.
+    """
+    policy = plan.policy()
+    lane_scheduled: dict[str, list[int]] = {"gpu_fast": [], "host_slow": []}
+    for frame in frames:
+        if frame.run_id != plan.run_id or frame.clock.clock_domain_identity_sha256 != plan.observer_clock_domain_identity_sha256:
+            raise ValueError("prefix frame belongs to another run or clock domain than the plan")
+        if frame.clock.scheduled_monotonic_ns < plan.started_monotonic_ns or frame.clock.scheduled_monotonic_ns >= plan.planned_end_monotonic_ns:
+            raise ValueError("prefix frame scheduled outside the frozen plan")
+        lane_scheduled[frame.lane].append(frame.clock.scheduled_monotonic_ns)
+    coverages: list[LanePrefixCoverageV1] = []
+    for lane in ("gpu_fast", "host_slow"):
+        scheduled = lane_scheduled[lane]
+        coverage = _policy_slot_coverage(policy, lane, scheduled)
+        period = policy.period_ns(lane)
+        first = (scheduled[0] - plan.started_monotonic_ns) // period if scheduled else None
+        last = (scheduled[-1] - plan.started_monotonic_ns) // period if scheduled else None
+        coverages.append(LanePrefixCoverageV1(
+            lane=lane, planned_slots=coverage.expected, complete_records=len(scheduled), usable_slots=coverage.observed,
+            missing_slots=coverage.missing, first_slot=first, last_slot=last,
+        ))
+    return coverages[0], coverages[1]
+
+
 OPERATIONAL_TELEMETRY_SCHEMAS: dict[str, type[BaseModel]] = {
     "capacity-progress-event.v1.schema.json": CapacityProgressEventEnvelope,
     "capacity-vector-credit-event.v1.schema.json": CapacityVectorCreditEvent,
@@ -1580,6 +1843,8 @@ OPERATIONAL_TELEMETRY_SCHEMAS: dict[str, type[BaseModel]] = {
     "synchronized-telemetry-frame.v3.schema.json": SynchronizedTelemetryFrameV3,
     "synchronized-telemetry-receipt.v4.schema.json": SynchronizedTelemetryReceiptV4,
     "synchronized-telemetry-seal.v4.schema.json": SynchronizedTelemetrySealV4,
+    "synchronized-telemetry-failure-receipt.v1.schema.json": SynchronizedTelemetryFailureReceiptV1,
+    "synchronized-telemetry-failure-seal.v1.schema.json": SynchronizedTelemetryFailureSealV1,
 }
 
 

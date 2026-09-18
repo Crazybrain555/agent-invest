@@ -130,6 +130,37 @@ READY 等待中并发轮询 starter，starter 提前结束即命名失败并保�
 `test_mineru_resident_wire.ps1` 和 `test_mineru_bounded_http.ps1` 是显式独立机制测试；其中 test-only
 Add-Type/loopback server 不得进入 measured exporter，也不替代正常退出/联合 CPU/hour 门禁。
 
+**R23 负面终态（v4 only）——错误是错误，不是没有 witness 的伪样本。** 正常 FrameV3 仍必填真实 pull witness、
+receipt.v4/seal.v4 不变。v4 lane 遇 deadline/transport/continuity/safety-drift 不再投影成 `unsupported` 样本，而是
+内部 `_CollectionFailure`（lane、category ∈ deadline|transport|continuity|local_io|internal、同域三个瞬时、原始异常与
+有界 traceback）并停止该 lane；merger 对它不写 frame、不推进 sequence、不给正信用；正常返回却无 pull provenance 记为
+`internal/missing_pull_witness` 负面事实后关闭。负面路径顺序固定：internal_stop → 有界 join（5 s，超时即
+`collectors_quiesced=false`）→ 关闭 collector → fsync 物理 raw → **`sampling_drained` 每 run 至多一次**（正常路径已发则复用；
+只在 quiesce 与 durable 已证明时发，payload 沿用原封闭形状，`frames_records` 取 writer 已完成 append 数）→ 校验完整前缀
+（首个不完整/非 canonical/失序/身份不符的行起全部为物理尾部，绝不跳行拼接）→ 写 `receipt.failure.v1.json`
+（`mineru.synchronized-telemetry-failure-receipt.v1`：run/plan/身份、计划起止不缩尾、stopped/drained 瞬时、
+`raw_frames{sha256,physical_bytes,complete_prefix_bytes,complete_records,trailing_bytes}`、逐 lane
+`lane_coverage{planned,usable,missing,first/last slot}`（同一 SamplingPlan 槽算法，允许空集）、每 lane 首个失败 `failures`、
+observer 级 `observer_error`、`writer_problem`、`unsealed_positive_artifacts`（仅可能是已写未封的 receipt.v4）、
+`measurement_credit=none`）与 `seal.failure.v1.json`（绑定 receipt/plan/raw hash 与字节/记录数/quiesce）→ 经自身
+描述符回放 → 抛 `SynchronizedTelemetryCollectionFailed`（child exit 1，仍发送最终 identity）。终态集合唯一：正常
+`{plan, frames, receipt.v4, seal.v4}` 或失败 `{plan, frames, receipt.failure.v1, seal.failure.v1[, receipt.v4]}`；
+`read_synchronized_telemetry_terminal` 读取其一，两套完整终态一律拒绝，都不完整为 `SynchronizedTelemetryTerminalAbsent`；
+正常 verifier 永不接受负面终态，负面终态不生成任何 aggregate。owner（`resident_telemetry_owner`）在 sampling 阶段首错
+（starter 提前退出、control 通道失败、drain 超时）立即落 `sampling-first-failure.json`，对 child 发 cooperative EOF 而不 close，
+收尾上界缩为 `min(plan.end+10 s, 首错+10 s)` / `min(plan.end+60 s, 首错+60 s)`，仍并发关闭两条 native lane、保留
+close/job/readback，等待 child 真实退出并读取 terminal（`observer-terminal.json`：kind/exit_code/receipt/seal hash），
+`owner-failure.json` 保留 `first_error`、全部次级错误与 `observer_terminal`；ENOTCONN 等次级清理错误从不替换首错。
+离线 `_telemetry_facts_v4` 走同一 terminal facade：失败终态给出 `status=failed`、`aggregates=None`、
+`telemetry_receipt_failed:<reason>`、`telemetry_collection_failed:<lane>:<category>`、`telemetry_prefix_only` 等命名问题，
+owner 无 `owner-result.json` 时记 `resident_owner:evidence_unreplayable:*` 与 `resident_owner_failed:<type>`，
+报告其余业务栏照常生成、资源门 unknown；篡改/伪造仍是 `CampaignIdentityError`。**探针**：exporter `$sampleAction`
+内加有界阶段耗时环（同一 `$deadline`，host 五阶段 linux_sample/api_health/api_http/vllm_metrics/queue_projection，
+GPU 单阶段 gpu_read；每阶段 entered/finished/remaining_at_enter QPC ticks、outcome ok|failed|not_entered、异常类型；
+保留最近 16 次成功调用加正在失败的一次），只在脚本 finally 写一次 `sampling-phase-tail.json`
+（`mineru.sampling-phase-tail.v1`），写失败为次级错误、不替换原 throw；不增请求/线程/deadline，不逐帧 fsync。
+探针只能定位预算花在哪一阶段，不能证明 API event loop 与 Windows 线程停顿之别；文件目前需从 Windows run 目录人工取回。
+
 两个 PS session 入口只接受私有 `ConfigJsonPath` 与其 exact SHA。配置闭合绑定新 session GUID、
 lane/cadence/loopback port、有限 lease/不可续期 lifetime、prepared manifest、六份 bootstrap/backend
 脚本源码及 PowerShell executable SHA；config/源码/DLL 全程固定文件 handle，运行期无编译。

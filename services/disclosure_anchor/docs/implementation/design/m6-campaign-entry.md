@@ -47,6 +47,19 @@ admission_reconciliation / ownership_closure 收据并 ACK，quality/public veri
 `drain-receipt.json` 发出唯一 `verifier_drained`，controller close；摘要钉住 `admitted_count=0`、
 `database_access=none`、`hidden_setup=false`。
 
+**共享准入 STOP（R23 A）。** `--admission-stop-file <绝对路径>` 可选；路径必须是 `--output` 同父目录的直属文件、
+非 symlink。同一路径直接传给 runner `--stop-file`，controller 每轮监督也读它：`O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 打开
+（FIFO 不阻塞）、`fstat` 后要求 regular/当前 uid/0600/恰好 5 字节 `stop\n`。有效 STOP 只做一次 owner `stop`
+（停止新准入），runner/verifier 继续跑到各自原 closure/原 max_close，绝不 SIGINT/abort；child 失败分支写同一文件
+（已存在则忽略）。任何 child spawn 前已有有效 STOP → 复用零准入 `_bootstrap_closure`，摘要 failed
+（`external_admission_stop: before business spawn`）。控制文件身份/字节无效（FIFO、目录、错误 mode、错误字节）：
+spawn 前 → `CampaignInputError`（无业务）；spawn 后 → fail closed：记录 `external_admission_stop_invalid`，
+仍只请求 owner stop、不销毁在途工作（runner 侧对该路径只做存在性判断，因此本来就已停止准入）。
+测量驱动（`tests/integration/m6_measured_campaign_independent.py`，`m6.measured-campaign-driver.v3`）在
+telemetry 退出/传输失配时发布 `<driver output>/campaign-admission.STOP` 并只等到 campaign spawn 时冻结的唯一
+绝对期限（`campaign_spawn + campaign_span_requirement`，不续期）；期限耗尽或控制写入失败才强制收尾，且本地退出
+不证明远端 owner 退出。测量失败与业务闭合分别陈述（`measurement_failed` / `business_closed`），驱动 exit 1。
+
 ## 3a. WP3：冻结评估计划与派生交付报告（Pro R20 §4）
 
 - **一个冻结计划**：`m6.evaluation-plan.v1`（`application/contracts/m6_evaluation_plan.py`）固定主窗口

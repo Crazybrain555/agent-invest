@@ -22,8 +22,10 @@ import queue
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
+import traceback
 from typing import Callable, Literal, cast
 import uuid
 
@@ -33,6 +35,13 @@ import disclosure_anchor.application.contracts.synchronized_telemetry as contrac
 import disclosure_anchor.application.ports.synchronized_telemetry as port_module
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
     ApiProcessObservationV2,
+    BoundedObserverErrorV1,
+    CollectionFailureV1,
+    RawFramesPrefixV1,
+    SynchronizedTelemetryFailureReceiptV1,
+    SynchronizedTelemetryFailureSealV1,
+    bounded_observer_error,
+    derive_prefix_coverage_v1,
     GpuObservationV2,
     HostCgroupObservationV2,
     QueueVllmObservationV2,
@@ -83,6 +92,12 @@ RECEIPT_FILENAME = "receipt.v2.json"
 SEAL_FILENAME = "seal.v2.json"
 FRAME_V3_FILENAME = "frames.v3.jsonl"
 PLAN_FILENAME = "sampling-plan.v1.json"
+# R23 negative-only terminal of a v4 run (never selected for v2/v3).
+FAILURE_RECEIPT_FILENAME = "receipt.failure.v1.json"
+FAILURE_SEAL_FILENAME = "seal.failure.v1.json"
+# Lane threads react to internal_stop within one poll (50 ms) or one bounded snapshot
+# (at most one nominal interval); a longer join means the run cannot prove quiesce.
+_LANE_JOIN_SECONDS = 5.0
 _CLOCK_PAIR_ATTEMPTS = 3
 _MAX_CLOCK_PAIR_BRACKET_NS = 10_000_000
 
@@ -127,6 +142,10 @@ class ObserverState(str, Enum):
     FAILED_EVIDENCE = "FAILED_EVIDENCE"
 
 
+class SynchronizedTelemetryTerminalAbsent(ValueError):
+    """Neither a complete normal nor a complete failure terminal exists for the run."""
+
+
 class SynchronizedTelemetryEvidenceError(RuntimeError):
     """Raised when exact observer evidence cannot be durably sealed."""
 
@@ -167,6 +186,45 @@ class SynchronizedObserverResult:
         """Authoritative final status, including observer-overhead attestation."""
 
         return self.seal.status
+
+
+@dataclass(frozen=True, slots=True)
+class SynchronizedTelemetryFailureResult:
+    """A verified negative-only terminal: no measurement, no credit, original errors retained."""
+
+    run_directory: Path
+    receipt: SynchronizedTelemetryFailureReceiptV1
+    seal: SynchronizedTelemetryFailureSealV1
+    plan: SynchronizedSamplingPlanV1
+    prefix_frames: tuple[SynchronizedTelemetryFrameV3, ...]
+
+    @property
+    def evidence_status(self) -> Literal["failed"]:
+        return "failed"
+
+
+class SynchronizedTelemetryCollectionFailed(SynchronizedTelemetryEvidenceError):
+    """The v4 run ended on its negative terminal; the failure receipt/seal are written and replayed."""
+
+    def __init__(self, result: SynchronizedTelemetryFailureResult) -> None:
+        super().__init__(f"synchronized telemetry collection failed: {result.receipt.reason}")
+        self.result = result
+
+    @property
+    def receipt(self) -> SynchronizedTelemetryFailureReceiptV1:
+        return self.result.receipt
+
+    @property
+    def seal(self) -> SynchronizedTelemetryFailureSealV1:
+        return self.result.seal
+
+    @property
+    def run_directory(self) -> Path:
+        return self.result.run_directory
+
+
+class _NegativeTerminal(Exception):
+    """Internal: the merge ended with recorded collection failures; take the negative path."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,11 +355,27 @@ class _PendingSample:
     queue_vllm: QueueVllmObservationV2
 
 
+@dataclass(frozen=True, slots=True)
+class _CollectionFailure:
+    """A local, witness-less failure that stopped one lane (v4 only); never a sample."""
+
+    lane: Literal["gpu_fast", "host_slow"]
+    category: contract_module.CollectionFailureCategory
+    scheduled_monotonic_ns: int
+    started_monotonic_ns: int
+    finished_monotonic_ns: int
+    exception: BaseException
+    traceback_text: str
+
+
+_MailboxItem = _PendingSample | _CollectionFailure
+
+
 @dataclass(slots=True)
 class _Mailbox:
-    values: queue.Queue[_PendingSample]
+    values: queue.Queue[_MailboxItem]
     done: threading.Event
-    fallback: _PendingSample | None = None
+    fallback: _MailboxItem | None = None
     started: threading.Event = field(default_factory=threading.Event)
     watermark_monotonic_ns: int = -1
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -808,6 +882,102 @@ class _FrameWriter:
         self._validate_anchors()
         return self._replay_open_descriptors(expect_seal=False)[:2]
 
+    # --- R23 negative terminal ---------------------------------------------------
+
+    def close_frames_physical(self) -> bytes:
+        """Fsync and read back whatever bytes the frame stream physically holds.
+
+        Unlike ``close_frames`` this does not require the bytes to equal the
+        running hash: a failed run keeps its physical file, including any
+        partial trailing record, and the caller accounts for the complete prefix.
+        """
+        if self._frames_fd is None or self._run_fd is None:
+            raise SynchronizedTelemetryEvidenceError("telemetry frame descriptors are unavailable")
+        if not self._frames_closed:
+            os.fsync(self._frames_fd)
+            self._frames_closed = True
+            os.fsync(self._run_fd)
+        payload, metadata = self._bind_written_descriptor(
+            self._protocol.frames_filename, self._frames_fd, maximum_bytes=self._limits.maximum_frame_file_bytes,
+        )
+        self._artifact_stats[self._protocol.frames_filename] = metadata
+        return payload
+
+    def unsealed_positive_artifacts(self) -> dict[str, str]:
+        """A positive receipt written before the run turned negative, by exact digest; never a seal."""
+        retained: dict[str, str] = {}
+        if self._protocol.seal_filename in self._artifact_fds:
+            raise SynchronizedTelemetryEvidenceError("a sealed positive terminal cannot be joined by a failure terminal")
+        descriptor = self._artifact_fds.get(self._protocol.receipt_filename)
+        if descriptor is not None:
+            payload, _metadata = _read_private_descriptor(descriptor, maximum_bytes=self._limits.maximum_receipt_bytes)
+            retained[self._protocol.receipt_filename] = "sha256:" + hashlib.sha256(payload).hexdigest()
+        return retained
+
+    def write_failure_receipt(self, receipt: SynchronizedTelemetryFailureReceiptV1) -> bytes:
+        if not self._frames_closed:
+            raise SynchronizedTelemetryEvidenceError("telemetry failure receipt cannot precede the physical frame close")
+        return self._write_named(FAILURE_RECEIPT_FILENAME, _canonical_json_bytes(receipt.model_dump(mode="json")))
+
+    def write_failure_seal(self, seal: SynchronizedTelemetryFailureSealV1) -> None:
+        if FAILURE_RECEIPT_FILENAME not in self._artifact_fds:
+            raise SynchronizedTelemetryEvidenceError("telemetry failure seal cannot precede its receipt")
+        observed = self._write_named(FAILURE_SEAL_FILENAME, _canonical_json_bytes(seal.model_dump(mode="json")))
+        parsed = SynchronizedTelemetryFailureSealV1.model_validate(
+            parse_canonical_json_artifact(observed, label="failure seal", maximum_bytes=MAX_RECEIPT_BYTES)
+        )
+        if parsed != seal:
+            raise SynchronizedTelemetryEvidenceError("telemetry failure seal parsed bytes drifted")
+
+    def replay_failure_terminal(self) -> SynchronizedTelemetryFailureResult:
+        """Read every negative-terminal file back through its own write descriptor and re-verify."""
+        if self._run_fd is None or self._protocol.plan_filename is None:
+            raise SynchronizedTelemetryEvidenceError("telemetry run descriptor is unavailable")
+        self._validate_anchors()
+        expected = [self._protocol.frames_filename, self._protocol.plan_filename, FAILURE_RECEIPT_FILENAME, FAILURE_SEAL_FILENAME]
+        if self._protocol.receipt_filename in self._artifact_fds:
+            expected.append(self._protocol.receipt_filename)
+        names_before = sorted(os.listdir(self._run_fd))
+        if names_before != sorted(expected):
+            raise SynchronizedTelemetryEvidenceError("telemetry failure terminal artifact set drifted")
+        payloads: dict[str, bytes] = {}
+        for filename in expected:
+            maximum = self._limits.maximum_frame_file_bytes if filename == self._protocol.frames_filename else self._limits.maximum_receipt_bytes
+            payload, metadata = _read_private_descriptor(
+                self._artifact_fds[filename], maximum_bytes=maximum, expected_stat=self._artifact_stats[filename],
+            )
+            if _private_file_stat_at(self._run_fd, filename, maximum_bytes=maximum) != metadata:
+                raise SynchronizedTelemetryEvidenceError("telemetry artifact name drifted from its write descriptor")
+            payloads[filename] = payload
+        if sorted(os.listdir(self._run_fd)) != names_before:
+            raise SynchronizedTelemetryEvidenceError("telemetry run directory changed during descriptor replay")
+        result = _parse_failure_payloads(
+            frames_payload=payloads[self._protocol.frames_filename], plan_payload=payloads[self._protocol.plan_filename],
+            receipt_payload=payloads[FAILURE_RECEIPT_FILENAME], seal_payload=payloads[FAILURE_SEAL_FILENAME],
+            unsealed={name: payloads[name] for name in expected if name == self._protocol.receipt_filename},
+            run_directory=self.run_directory,
+        )
+        self._validate_anchors()
+        self._close_success()
+        return result
+
+    def _write_named(self, filename: str, payload: bytes) -> bytes:
+        if self._run_fd is None or self._root_fd is None:
+            raise SynchronizedTelemetryEvidenceError("telemetry artifact descriptors are unavailable")
+        if len(payload) > self._limits.maximum_receipt_bytes:
+            raise _ArtifactBoundExceeded(f"{filename} exceeds its bound")
+        descriptor = _open_new_private_at(self._run_fd, filename)
+        self._artifact_fds[filename] = descriptor
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.fsync(self._run_fd)
+        os.fsync(self._root_fd)
+        observed, metadata = self._bind_written_descriptor(filename, descriptor, maximum_bytes=self._limits.maximum_receipt_bytes)
+        if observed != payload:
+            raise SynchronizedTelemetryEvidenceError(f"{filename} write bytes drifted")
+        self._artifact_stats[filename] = metadata
+        return observed
+
     def write_seal(self, seal: TelemetrySeal) -> None:
         if self._run_fd is None or self._root_fd is None:
             raise SynchronizedTelemetryEvidenceError("telemetry seal descriptors are unavailable")
@@ -1197,6 +1367,7 @@ def run_synchronized_telemetry_observer(
                 "counter_tracker": counter_tracker,
                 "monotonic_ns": monotonic_ns,
                 "utc_now": utc_now,
+                "negative_outcomes": protocol is _V4,
             },
             name="synchronized-telemetry-gpu-fast",
             daemon=False,
@@ -1223,14 +1394,18 @@ def run_synchronized_telemetry_observer(
                 "counter_tracker": counter_tracker,
                 "monotonic_ns": monotonic_ns,
                 "utc_now": utc_now,
+                "negative_outcomes": protocol is _V4,
             },
             name="synchronized-telemetry-host-slow",
             daemon=False,
         ),
     ]
     frames: list[TelemetryFrame] = []
+    collection_failures: list[_CollectionFailure] = []
     state = ObserverState.RUNNING
     started_threads: list[threading.Thread] = []
+    negative = protocol is _V4
+    drained_sent_ns: int | None = None
     try:
         for thread in threads:
             thread.start()
@@ -1248,12 +1423,19 @@ def run_synchronized_telemetry_observer(
             internal_stop=internal_stop,
             gpu_interval_ms=gpu_interval_ms,
             protocol=protocol,
+            collection_failures=collection_failures if negative else None,
         )
         state = ObserverState.DRAINING
         for thread in started_threads:
-            thread.join()
+            # Lanes leave within one poll or one bounded snapshot; a v4 lane that does not is a
+            # quiesce failure the negative terminal records, never an open-ended wait here.
+            thread.join(timeout=_LANE_JOIN_SECONDS if negative else None)
+            if thread.is_alive():
+                raise SynchronizedTelemetryEvidenceError(f"{thread.name} did not stop within {_LANE_JOIN_SECONDS}s")
         for invocation in invocations:
             invocation.close()
+        if collection_failures:
+            raise _NegativeTerminal
         finish_clock = _capture_clock_pair(
             monotonic_ns=monotonic_ns,
             utc_now=utc_now,
@@ -1271,11 +1453,13 @@ def run_synchronized_telemetry_observer(
         if plan is not None and on_sampling_drained is not None:
             # Collectors are joined, closed and the JSONL is fsynced: the owner
             # may now close the native sources; the replay below is not waited for.
+            # Sent at most once per run: a later failure of this normal path reuses it.
             on_sampling_drained({
                 "kind": "sampling_drained", "run_id": resolved_run_id, "sampling_plan_sha256": plan_sha256,
                 "drained_monotonic_ns": monotonic_ns(), "frames_jsonl_sha256": frame_digest,
                 "frames_bytes": writer.frame_bytes, "frames_records": writer.frame_count,
             })
+            drained_sent_ns = monotonic_ns()
         slot_coverage_v4: tuple[contract_module.LaneSlotCoverageV4, contract_module.LaneSlotCoverageV4] | None = None
         if plan is not None:
             lane_quality, slot_coverage_v4, unsupported_count = derive_frame_evidence_v4(
@@ -1386,19 +1570,197 @@ def run_synchronized_telemetry_observer(
         state = ObserverState.SEALED
         return replay
     except BaseException as exc:
-        state = ObserverState.FAILED_EVIDENCE
         internal_stop.set()
-        for thread in started_threads:
-            thread.join()
-        writer.abort()
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            raise
-        raise SynchronizedTelemetryEvidenceError(
-            f"synchronized telemetry evidence failed in {state.value}"
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)) or not negative:
+            state = ObserverState.FAILED_EVIDENCE
+            for thread in started_threads:
+                thread.join()
+            writer.abort()
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise SynchronizedTelemetryEvidenceError(
+                f"synchronized telemetry evidence failed in {state.value}"
+            ) from exc
+        assert plan is not None and plan_sha256 is not None and observer_identity is not None
+        raise _negative_terminal(
+            primary=None if isinstance(exc, _NegativeTerminal) else exc,
+            collection_failures=collection_failures, started_threads=started_threads, invocations=invocations,
+            writer=writer, plan=plan, plan_sha256=plan_sha256, process_profile=process_profile,
+            observer_identity=observer_identity, observer_source=observer_source,
+            observer_clock_domain=observer_clock_domain, run_id=resolved_run_id,
+            monotonic_ns=monotonic_ns, on_sampling_drained=on_sampling_drained, drained_sent_ns=drained_sent_ns,
         ) from exc
     finally:
         for invocation in invocations:
+            try:
+                invocation.close()
+            except BaseException as close_error:  # noqa: BLE001 - a repeated close never replaces the terminal error
+                if isinstance(close_error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                in_flight = sys.exception()
+                if in_flight is None:
+                    raise
+                in_flight.add_note(f"collector close after the terminal: {type(close_error).__name__}: {close_error}")
+
+
+def _negative_terminal(
+    *, primary: BaseException | None, collection_failures: list[_CollectionFailure],
+    started_threads: list[threading.Thread], invocations: list[_ResidentSamplerProcess], writer: _FrameWriter,
+    plan: SynchronizedSamplingPlanV1, plan_sha256: str, process_profile: ApiProfile,
+    observer_identity: TelemetryObserverIdentity, observer_source: str, observer_clock_domain: str, run_id: str,
+    monotonic_ns: Callable[[], int], on_sampling_drained: Callable[[dict[str, object]], None] | None,
+    drained_sent_ns: int | None = None,
+) -> SynchronizedTelemetryEvidenceError:
+    """Close a failed v4 run on its negative terminal; return the exception the caller raises.
+
+    Order: request lane stop → bounded join → close collectors → fsync the physical
+    raw file → announce ``sampling_drained`` (at most once per run, only when
+    quiesce and durability are proven, from the writer's own durable byte/record
+    facts) → validate the complete prefix → write the failure receipt and seal →
+    replay them through their own descriptors. The native close may therefore
+    begin before the prefix parse. The planned window is never shortened and
+    nothing is invented. If the terminal itself cannot be written, the writer is
+    aborted and the original error is reported as FAILED_EVIDENCE.
+    """
+    secondary: list[BaseException] = []
+    quiesced = True
+    for thread in started_threads:
+        thread.join(timeout=_LANE_JOIN_SECONDS)
+        if thread.is_alive():
+            quiesced = False
+            secondary.append(RuntimeError(f"{thread.name} did not stop within {_LANE_JOIN_SECONDS}s"))
+    for invocation in invocations:
+        try:
             invocation.close()
+        except BaseException as exc:  # noqa: BLE001 - every cleanup outcome is retained beside the primary
+            quiesced = False
+            secondary.append(exc)
+    stopped_ns = monotonic_ns()
+    try:
+        physical = writer.close_frames_physical()
+        physical_sha256 = "sha256:" + hashlib.sha256(physical).hexdigest()
+        drained_ns: int | None = drained_sent_ns
+        if drained_ns is None and quiesced and on_sampling_drained is not None:
+            # The writer's completed-append count is a durable fact, not a guess; the prefix
+            # parse below confirms it and any disagreement is recorded as a writer problem.
+            on_sampling_drained({
+                "kind": "sampling_drained", "run_id": run_id, "sampling_plan_sha256": plan_sha256,
+                "drained_monotonic_ns": monotonic_ns(), "frames_jsonl_sha256": physical_sha256,
+                "frames_bytes": len(physical), "frames_records": writer.frame_count,
+            })
+            drained_ns = monotonic_ns()
+        prefix_frames, prefix_bytes = _complete_frame_prefix(
+            physical, frame_model=SynchronizedTelemetryFrameV3, run_id=run_id,
+            runtime_bundle_identity_sha256=process_profile.runtime_bundle_identity_sha256,
+            process_profile_sha256=process_profile.process_profile_sha256,
+            observer_source_sha256=observer_source, clock_domain_identity_sha256=observer_clock_domain,
+        )
+        if len(prefix_frames) != writer.frame_count:
+            secondary.append(SynchronizedTelemetryEvidenceError(
+                f"complete prefix holds {len(prefix_frames)} records but the writer completed {writer.frame_count} appends"
+            ))
+        failures: list[CollectionFailureV1] = []
+        for lane in ("gpu_fast", "host_slow"):
+            first = next((item for item in collection_failures if item.lane == lane), None)
+            if first is None:
+                continue
+            bounded = bounded_observer_error(first.exception, text=first.traceback_text)
+            failures.append(CollectionFailureV1(
+                **bounded.model_dump(), lane=lane, category=first.category,
+                scheduled_monotonic_ns=first.scheduled_monotonic_ns, started_monotonic_ns=first.started_monotonic_ns,
+                finished_monotonic_ns=first.finished_monotonic_ns, observer_clock_domain_identity_sha256=observer_clock_domain,
+            ))
+        observer_error = None
+        if primary is not None:
+            observer_error = bounded_observer_error(primary, text="".join(traceback.format_exception(primary, limit=20)))
+        writer_problem: BoundedObserverErrorV1 | None = None
+        if secondary:
+            writer_problem = bounded_observer_error(
+                secondary[0], text="\n".join(f"{type(item).__name__}: {item}" for item in secondary),
+            )
+        reason: contract_module.FailureReceiptReason
+        if failures and all(item.exception_type == _LaneWithoutSample.__name__ for item in failures):
+            reason = "no_sample_before_stop"
+        elif failures:
+            reason = "lane_collection_failure"
+        else:
+            reason = "observer_error"
+        receipt = SynchronizedTelemetryFailureReceiptV1(
+            run_id=run_id, reason=reason,
+            runtime_bundle_identity_sha256=process_profile.runtime_bundle_identity_sha256,
+            process_profile_sha256=process_profile.process_profile_sha256, observer_source_sha256=observer_source,
+            observer_identity=observer_identity, clock_domain_identity_sha256=observer_clock_domain,
+            sampling_plan_sha256=plan_sha256, planned_start_monotonic_ns=plan.started_monotonic_ns,
+            planned_end_monotonic_ns=plan.planned_end_monotonic_ns, stopped_monotonic_ns=stopped_ns,
+            drained_monotonic_ns=drained_ns, collectors_quiesced=quiesced,
+            raw_frames=RawFramesPrefixV1(
+                sha256=physical_sha256, physical_bytes=len(physical), complete_prefix_bytes=prefix_bytes,
+                complete_records=len(prefix_frames), trailing_bytes=len(physical) - prefix_bytes,
+            ),
+            lane_coverage=derive_prefix_coverage_v1(prefix_frames, plan=plan),
+            failures=tuple(failures), observer_error=observer_error, writer_problem=writer_problem,
+            unsealed_positive_artifacts=writer.unsealed_positive_artifacts(),
+        )
+        receipt_bytes = writer.write_failure_receipt(receipt)
+        seal = SynchronizedTelemetryFailureSealV1(
+            run_id=run_id, receipt_sha256="sha256:" + hashlib.sha256(receipt_bytes).hexdigest(),
+            sampling_plan_sha256=plan_sha256, raw_frames_sha256=physical_sha256, physical_bytes=len(physical),
+            complete_prefix_bytes=prefix_bytes, complete_records=len(prefix_frames), collectors_quiesced=quiesced,
+            sealed_monotonic_ns=monotonic_ns(),
+        )
+        writer.write_failure_seal(seal)
+        result = writer.replay_failure_terminal()
+    except BaseException as terminal_error:
+        writer.abort()
+        if isinstance(terminal_error, (KeyboardInterrupt, SystemExit)):
+            raise
+        failed = SynchronizedTelemetryEvidenceError(
+            f"synchronized telemetry evidence failed in {ObserverState.FAILED_EVIDENCE.value}: negative terminal could not be written"
+        )
+        failed.__cause__ = terminal_error
+        if primary is not None:
+            failed.add_note(f"original error: {type(primary).__name__}: {primary}")
+        for item in collection_failures:
+            failed.add_note(f"{item.lane} {item.category}: {type(item.exception).__name__}: {item.exception}")
+        return failed
+    return SynchronizedTelemetryCollectionFailed(result)
+
+
+def _complete_frame_prefix(
+    payload: bytes, *, frame_model: type[SynchronizedTelemetryFrameV3], run_id: str,
+    runtime_bundle_identity_sha256: str, process_profile_sha256: str, observer_source_sha256: str,
+    clock_domain_identity_sha256: str, deadline_monotonic_ns: int | None = None,
+) -> tuple[tuple[SynchronizedTelemetryFrameV3, ...], int]:
+    """The longest prefix of complete, canonical, sequential, identity-bound frame lines.
+
+    Parsing stops at the first line that is incomplete, non-canonical, invalid or
+    out of sequence; that line and everything after it are the physical tail and
+    are never skipped over to reach later frames.
+    """
+    frames: list[SynchronizedTelemetryFrameV3] = []
+    offset = 0
+    while True:
+        if deadline_monotonic_ns is not None and len(frames) % 64 == 0 and time.monotonic_ns() >= deadline_monotonic_ns:
+            raise TimeoutError("telemetry prefix replay deadline passed while parsing frames")
+        newline = payload.find(b"\n", offset)
+        if newline < 0 or len(frames) >= MAX_FRAME_RECORDS:
+            break
+        line = payload[offset:newline]
+        try:
+            frame = frame_model.model_validate(
+                parse_canonical_json_artifact(line, label="frame", maximum_bytes=MAX_FRAME_RECORD_BYTES)
+            )
+        except (ValueError, ValidationError):
+            break
+        if (frame.sequence != len(frames) or frame.run_id != run_id
+                or frame.runtime_bundle_identity_sha256 != runtime_bundle_identity_sha256
+                or frame.process_profile_sha256 != process_profile_sha256
+                or frame.observer_source_sha256 != observer_source_sha256
+                or frame.clock.clock_domain_identity_sha256 != clock_domain_identity_sha256):
+            break
+        frames.append(frame)
+        offset = newline + 1
+    return tuple(frames), offset
 
 
 def verify_synchronized_telemetry_observer(
@@ -1444,6 +1806,124 @@ def verify_synchronized_telemetry_observer(
         seal=seal,
         frames=frames,
         plan=plan,
+    )
+
+
+def read_synchronized_telemetry_terminal(
+    *, artifact_root: Path, run_id: str, deadline_monotonic_ns: int | None = None,
+) -> SynchronizedObserverResult | SynchronizedTelemetryFailureResult:
+    """Read the one terminal a v4 run directory holds: normal or negative, never both.
+
+    The normal branch is exactly ``verify_synchronized_telemetry_observer`` for
+    receipt version 4. The failure branch verifies only the negative contract:
+    plan bytes, physical raw bytes, complete prefix re-parse and coverage, and
+    the seal's bindings. A normal verifier never accepts a failure terminal as
+    success, and a directory holding two complete terminals is refused.
+    """
+    canonical_run_id = str(uuid.UUID(run_id))
+    if canonical_run_id != run_id:
+        raise ValueError("run_id is not canonical")
+    protocol = _V4
+    assert protocol.plan_filename is not None
+    root_fd = _open_existing_private_directory(artifact_root, label="telemetry root")
+    try:
+        run_fd = os.open(run_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            _validate_private_directory_fd(run_fd, label="telemetry run")
+            names = set(os.listdir(run_fd))
+            base = {protocol.frames_filename, protocol.plan_filename}
+            normal = base | {protocol.receipt_filename, protocol.seal_filename}
+            failure = base | {FAILURE_RECEIPT_FILENAME, FAILURE_SEAL_FILENAME}
+            normal_complete = normal <= names
+            failure_complete = failure <= names
+            if normal_complete and failure_complete:
+                raise ValueError("telemetry run holds two complete terminals; neither is trusted")
+            if not normal_complete and not failure_complete:
+                raise SynchronizedTelemetryTerminalAbsent(
+                    "telemetry run holds no complete terminal: " + ", ".join(sorted(names)) if names else "telemetry run is empty"
+                )
+            if normal_complete:
+                frames, receipt, seal, plan = _replay_artifacts_at(
+                    run_fd, expect_seal=True, protocol=protocol, deadline_monotonic_ns=deadline_monotonic_ns,
+                )
+                if receipt.run_id != run_id:
+                    raise ValueError("telemetry receipt run identity drifted")
+                if receipt.observer_source_sha256 != synchronized_observer_source_sha256():
+                    raise ValueError("telemetry observer source identity drifted")
+                assert seal is not None
+                return SynchronizedObserverResult(
+                    state=ObserverState.SEALED, run_directory=artifact_root / run_id, receipt=receipt, seal=seal,
+                    frames=frames, plan=plan,
+                )
+            expected = sorted(failure | ({protocol.receipt_filename} if protocol.receipt_filename in names else set()))
+            if sorted(names) != expected:
+                raise ValueError("telemetry failure terminal artifact set is unexpected")
+            payloads: dict[str, bytes] = {}
+            for filename in expected:
+                maximum = MAX_FRAME_FILE_BYTES if filename == protocol.frames_filename else MAX_RECEIPT_BYTES
+                payloads[filename] = _read_private_file_at(run_fd, filename, maximum_bytes=maximum)
+            if sorted(os.listdir(run_fd)) != expected:
+                raise ValueError("telemetry run directory changed during replay")
+            result = _parse_failure_payloads(
+                frames_payload=payloads[protocol.frames_filename], plan_payload=payloads[protocol.plan_filename],
+                receipt_payload=payloads[FAILURE_RECEIPT_FILENAME], seal_payload=payloads[FAILURE_SEAL_FILENAME],
+                unsealed={name: payloads[name] for name in expected if name == protocol.receipt_filename},
+                run_directory=artifact_root / run_id, deadline_monotonic_ns=deadline_monotonic_ns,
+            )
+            if result.receipt.run_id != run_id:
+                raise ValueError("telemetry failure receipt run identity drifted")
+            if result.receipt.observer_source_sha256 != synchronized_observer_source_sha256():
+                raise ValueError("telemetry observer source identity drifted")
+            return result
+        finally:
+            os.close(run_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _parse_failure_payloads(
+    *, frames_payload: bytes, plan_payload: bytes, receipt_payload: bytes, seal_payload: bytes,
+    unsealed: dict[str, bytes], run_directory: Path, deadline_monotonic_ns: int | None = None,
+) -> SynchronizedTelemetryFailureResult:
+    """Verify the negative contract from exact bytes; no measurement is derived and nothing is credited."""
+    plan = SynchronizedSamplingPlanV1.model_validate(
+        parse_canonical_json_artifact(plan_payload, label="sampling plan", maximum_bytes=MAX_RECEIPT_BYTES)
+    )
+    receipt = SynchronizedTelemetryFailureReceiptV1.model_validate(
+        parse_canonical_json_artifact(receipt_payload, label="failure receipt", maximum_bytes=MAX_RECEIPT_BYTES)
+    )
+    plan_sha256 = "sha256:" + hashlib.sha256(plan_payload).hexdigest()
+    if (receipt.sampling_plan_sha256 != plan_sha256 or receipt.run_id != plan.run_id
+            or receipt.planned_start_monotonic_ns != plan.started_monotonic_ns
+            or receipt.planned_end_monotonic_ns != plan.planned_end_monotonic_ns
+            or receipt.clock_domain_identity_sha256 != plan.observer_clock_domain_identity_sha256):
+        raise ValueError("telemetry failure receipt is not bound to its sampling plan")
+    physical_sha256 = "sha256:" + hashlib.sha256(frames_payload).hexdigest()
+    if receipt.raw_frames.sha256 != physical_sha256 or receipt.raw_frames.physical_bytes != len(frames_payload):
+        raise ValueError("telemetry failure receipt raw frames hash or size drifted")
+    prefix_frames, prefix_bytes = _complete_frame_prefix(
+        frames_payload, frame_model=SynchronizedTelemetryFrameV3, run_id=receipt.run_id,
+        runtime_bundle_identity_sha256=receipt.runtime_bundle_identity_sha256,
+        process_profile_sha256=receipt.process_profile_sha256, observer_source_sha256=receipt.observer_source_sha256,
+        clock_domain_identity_sha256=receipt.clock_domain_identity_sha256, deadline_monotonic_ns=deadline_monotonic_ns,
+    )
+    if receipt.raw_frames.complete_prefix_bytes != prefix_bytes or receipt.raw_frames.complete_records != len(prefix_frames):
+        raise ValueError("telemetry failure receipt complete prefix drifted from the raw bytes")
+    if derive_prefix_coverage_v1(prefix_frames, plan=plan) != receipt.lane_coverage:
+        raise ValueError("telemetry failure receipt lane coverage drifted")
+    seal = SynchronizedTelemetryFailureSealV1.model_validate(
+        parse_canonical_json_artifact(seal_payload, label="failure seal", maximum_bytes=MAX_RECEIPT_BYTES)
+    )
+    receipt_sha256 = "sha256:" + hashlib.sha256(receipt_payload).hexdigest()
+    if (seal.run_id != receipt.run_id or seal.receipt_sha256 != receipt_sha256 or seal.sampling_plan_sha256 != plan_sha256
+            or seal.raw_frames_sha256 != physical_sha256 or seal.physical_bytes != len(frames_payload)
+            or seal.complete_prefix_bytes != prefix_bytes or seal.complete_records != len(prefix_frames)
+            or seal.collectors_quiesced != receipt.collectors_quiesced):
+        raise ValueError("telemetry failure seal identity drifted")
+    if {name: "sha256:" + hashlib.sha256(payload).hexdigest() for name, payload in unsealed.items()} != dict(receipt.unsealed_positive_artifacts):
+        raise ValueError("telemetry failure receipt unsealed positive artifacts drifted")
+    return SynchronizedTelemetryFailureResult(
+        run_directory=run_directory, receipt=receipt, seal=seal, plan=plan, prefix_frames=prefix_frames,
     )
 
 
@@ -1752,9 +2232,28 @@ def _run_lane(
     counter_tracker: _CounterTracker,
     monotonic_ns: Callable[[], int],
     utc_now: Callable[[], datetime],
+    negative_outcomes: bool = False,
 ) -> None:
+    """One lane's schedule loop.
+
+    ``negative_outcomes`` (the v4 protocol) turns a deadline, transport, continuity
+    or safety-drift failure into a ``_CollectionFailure`` record that stops the
+    lane: no witness-less sample is published. Legacy protocols keep projecting
+    such failures into unsupported samples for deterministic replay of old data.
+    """
     scheduled = start_monotonic
     emitted = False
+    pending: _MailboxItem
+
+    def failure(category: contract_module.CollectionFailureCategory, exc: BaseException,
+                *, scheduled_ns: int, started_ns: int) -> _CollectionFailure:
+        finished_ns = monotonic_ns()
+        return _CollectionFailure(
+            lane=lane, category=category, scheduled_monotonic_ns=min(scheduled_ns, started_ns),
+            started_monotonic_ns=started_ns, finished_monotonic_ns=max(started_ns, finished_ns),
+            exception=exc, traceback_text="".join(traceback.format_exception(exc, limit=20)),
+        )
+
     try:
         while scheduled < end_deadline and not internal_stop.is_set():
             if external_cancel.is_set():
@@ -1802,55 +2301,51 @@ def _run_lane(
                 termination.mark("cancelled")
                 break
             except _SafetyDrift as exc:
-                finished = monotonic_ns()
-                pending = _unsupported_pending(
-                    lane=lane,
-                    scheduled=scheduled,
-                    started=started,
-                    finished=finished,
-                    observed_at=observed_at,
-                    reason=exc.reason,
-                )
                 safety_drifts.add(exc.reason)
                 termination.mark("identity_drift")
                 internal_stop.set()
-            except TelemetrySnapshotDeadlineExceeded:
-                finished = monotonic_ns()
-                pending = _unsupported_pending(
-                    lane=lane,
-                    scheduled=scheduled,
-                    started=started,
-                    finished=finished,
-                    observed_at=observed_at,
-                    reason="deadline_exceeded",
-                )
+                if negative_outcomes:
+                    pending = failure("continuity", exc, scheduled_ns=scheduled, started_ns=started)
+                else:
+                    finished = monotonic_ns()
+                    pending = _unsupported_pending(
+                        lane=lane, scheduled=scheduled, started=started, finished=finished,
+                        observed_at=observed_at, reason=exc.reason,
+                    )
+            except TelemetrySnapshotDeadlineExceeded as exc:
                 termination.mark("sampler_or_transport_shutdown")
                 internal_stop.set()
-            except TelemetrySnapshotTransportUnavailable:
-                finished = monotonic_ns()
-                pending = _unsupported_pending(
-                    lane=lane,
-                    scheduled=scheduled,
-                    started=started,
-                    finished=finished,
-                    observed_at=observed_at,
-                    reason="endpoint_unreachable",
-                )
+                if negative_outcomes:
+                    pending = failure("deadline", exc, scheduled_ns=scheduled, started_ns=started)
+                else:
+                    finished = monotonic_ns()
+                    pending = _unsupported_pending(
+                        lane=lane, scheduled=scheduled, started=started, finished=finished,
+                        observed_at=observed_at, reason="deadline_exceeded",
+                    )
+            except TelemetrySnapshotTransportUnavailable as exc:
                 termination.mark("sampler_or_transport_shutdown")
                 internal_stop.set()
-            except TelemetrySnapshotContinuityLost:
-                finished = monotonic_ns()
-                pending = _unsupported_pending(
-                    lane=lane,
-                    scheduled=scheduled,
-                    started=started,
-                    finished=finished,
-                    observed_at=observed_at,
-                    reason="identity_drift",
-                )
+                if negative_outcomes:
+                    pending = failure("transport", exc, scheduled_ns=scheduled, started_ns=started)
+                else:
+                    finished = monotonic_ns()
+                    pending = _unsupported_pending(
+                        lane=lane, scheduled=scheduled, started=started, finished=finished,
+                        observed_at=observed_at, reason="endpoint_unreachable",
+                    )
+            except TelemetrySnapshotContinuityLost as exc:
                 safety_drifts.add("identity_drift")
                 termination.mark("identity_drift")
                 internal_stop.set()
+                if negative_outcomes:
+                    pending = failure("continuity", exc, scheduled_ns=scheduled, started_ns=started)
+                else:
+                    finished = monotonic_ns()
+                    pending = _unsupported_pending(
+                        lane=lane, scheduled=scheduled, started=started, finished=finished,
+                        observed_at=observed_at, reason="identity_drift",
+                    )
             if not _publish_pending(
                 mailbox=mailbox,
                 pending=pending,
@@ -1884,15 +2379,22 @@ def _run_lane(
             termination.mark("cancelled")
         if not emitted:
             now = monotonic_ns()
-            fallback = _unsupported_pending(
-                lane=lane,
-                scheduled=start_monotonic,
-                started=now,
-                finished=now,
-                observed_at=utc_now(),
-                reason=(safety_drifts.values()[0] if safety_drifts.values() else "collector_disabled"),
-            )
-            mailbox.fallback = fallback
+            if negative_outcomes:
+                # A lane that never produced a sample or a failure record before it stopped is
+                # a negative fact of its own, not an unsupported frame without a witness.
+                mailbox.fallback = failure(
+                    "internal", _LaneWithoutSample(f"{lane} lane stopped ({termination.value()}) before its first sample"),
+                    scheduled_ns=start_monotonic, started_ns=now,
+                )
+            else:
+                mailbox.fallback = _unsupported_pending(
+                    lane=lane,
+                    scheduled=start_monotonic,
+                    started=now,
+                    finished=now,
+                    observed_at=utc_now(),
+                    reason=(safety_drifts.values()[0] if safety_drifts.values() else "collector_disabled"),
+                )
     except BaseException as exc:
         mailbox.failure = exc
         internal_stop.set()
@@ -1916,8 +2418,16 @@ def _merge_lane_mailboxes(
     internal_stop: threading.Event,
     gpu_interval_ms: int,
     protocol: _ArtifactProtocol = _V2,
+    collection_failures: list[_CollectionFailure] | None = None,
 ) -> None:
-    heads: dict[str, _PendingSample | None] = {
+    """Merge both lanes in start order into frames.
+
+    A ``_CollectionFailure`` item (v4) is appended to ``collection_failures`` and
+    writes no frame, advances no sequence and credits nothing; a v4 sample without
+    its fresh-pull witness is recorded the same way as an internal failure. Lane
+    thread exceptions are re-raised as before.
+    """
+    heads: dict[str, _MailboxItem | None] = {
         "gpu_fast": None,
         "host_slow": None,
     }
@@ -1966,6 +2476,31 @@ def _merge_lane_mailboxes(
             with condition:
                 condition.wait(timeout=0.05)
             continue
+        if isinstance(candidate, _CollectionFailure):
+            if collection_failures is None:
+                raise SynchronizedTelemetryEvidenceError("collection failure records belong to the v4 observer only")
+            collection_failures.append(candidate)
+            heads[candidate.lane] = None
+            continue
+        if protocol.frame_model is SynchronizedTelemetryFrameV3 and not isinstance(
+            candidate.resident_exporter_provenance, ResidentExporterPullProvenance
+        ):
+            # A normally returned sample without its fresh-per-request witness is a bug, and a
+            # bug is a negative fact: it closes the run without ever becoming a frame.
+            if collection_failures is None:
+                raise SynchronizedTelemetryEvidenceError("collection failure records belong to the v4 observer only")
+            witness_error = SynchronizedTelemetryEvidenceError(
+                "missing_pull_witness: fresh-per-request witness missing; the v4 observer accepts only pull provenance"
+            )
+            collection_failures.append(_CollectionFailure(
+                lane=candidate.lane, category="internal", scheduled_monotonic_ns=candidate.scheduled_monotonic_ns,
+                started_monotonic_ns=candidate.started_monotonic_ns, finished_monotonic_ns=candidate.finished_monotonic_ns,
+                exception=witness_error, traceback_text=f"{type(witness_error).__name__}: {witness_error}",
+            ))
+            termination.mark("sampler_or_transport_shutdown")
+            internal_stop.set()
+            heads[candidate.lane] = None
+            continue
         pending = candidate
         previous = previous_by_lane.get(pending.lane)
         if previous is None:
@@ -1989,12 +2524,6 @@ def _merge_lane_mailboxes(
             missed = scheduled_ns // nominal_ns - 1
             status = "late" if missed else "on_time"
             observed_interval_ms = observed_ns / 1_000_000
-        if protocol.frame_model is SynchronizedTelemetryFrameV3 and not isinstance(
-            pending.resident_exporter_provenance, ResidentExporterPullProvenance
-        ):
-            raise SynchronizedTelemetryEvidenceError(
-                "fresh-per-request witness missing; the v4 observer accepts only pull provenance"
-            )
         frame: TelemetryFrame = protocol.frame_model.model_validate(dict(
             run_id=run_id,
             sequence=len(frames),
@@ -2120,6 +2649,10 @@ class _SafetyDrift(ValueError):
         self.reason = reason
 
 
+class _LaneWithoutSample(RuntimeError):
+    """A v4 lane stopped before publishing any sample or failure record."""
+
+
 def _check_cumulative_counters(
     snapshot: HostLaneSnapshot, tracker: _CounterTracker
 ) -> None:
@@ -2220,7 +2753,7 @@ def _unsupported_queue(
 
 
 def _publish_pending(
-    *, mailbox: _Mailbox, pending: _PendingSample, condition: threading.Condition
+    *, mailbox: _Mailbox, pending: _MailboxItem, condition: threading.Condition
 ) -> bool:
     try:
         mailbox.values.put_nowait(pending)

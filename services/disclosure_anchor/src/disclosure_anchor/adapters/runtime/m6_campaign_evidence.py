@@ -25,10 +25,11 @@ from disclosure_anchor.adapters.runtime.m6_campaign_assembly import (
 )
 from disclosure_anchor.adapters.runtime.m6_public_consumer_verifier import _audit
 from disclosure_anchor.adapters.runtime.resident_owner_evidence import (
-    OWNER_RESULT_CONTRACT_VERSION, replay_resident_owner_evidence,
+    OWNER_RESULT_CONTRACT_VERSION, ResidentOwnerEvidence, replay_resident_owner_evidence,
 )
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
-    verify_synchronized_telemetry_observer,
+    FAILURE_RECEIPT_FILENAME, FAILURE_SEAL_FILENAME, SynchronizedTelemetryFailureResult,
+    SynchronizedTelemetryTerminalAbsent, read_synchronized_telemetry_terminal, verify_synchronized_telemetry_observer,
 )
 from disclosure_anchor.application.contracts.closed_document import sha256_of
 from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu_v4
@@ -88,6 +89,12 @@ _TELEMETRY_ARTIFACTS_V4: tuple[tuple[str, int], ...] = (
     ("frames.v3.jsonl", _MAX_TELEMETRY_FRAMES_BYTES), ("receipt.v4.json", _MAX_INPUT_BYTES),
     ("seal.v4.json", _MAX_INPUT_BYTES), ("sampling-plan.v1.json", _MAX_INPUT_BYTES),
 )
+# The negative terminal of a v4 run (R23): plan, physical frames, failure receipt and failure seal.
+_TELEMETRY_FAILURE_ARTIFACTS_V4: tuple[tuple[str, int], ...] = (
+    ("frames.v3.jsonl", _MAX_TELEMETRY_FRAMES_BYTES), (FAILURE_RECEIPT_FILENAME, _MAX_INPUT_BYTES),
+    (FAILURE_SEAL_FILENAME, _MAX_INPUT_BYTES), ("sampling-plan.v1.json", _MAX_INPUT_BYTES),
+)
+_OWNER_FAILURE_FILENAME = "owner-failure.json"
 LOCAL_MEASUREMENT_WINDOW_CONTRACT = "m6.local-measurement-window.v1"
 
 
@@ -800,13 +807,30 @@ def _measurement_window(summary: dict[str, Any] | None) -> tuple[str, int, int] 
 def _telemetry_facts_v4(
     reader: _Reader, *, artifact_root: Path, run_id: str, spec: M6RunSpec,
     summary: dict[str, Any] | None, anchor: M6OwnerAnchor, resident_owner_evidence_dir: Path | None,
-) -> TelemetryFacts:
-    """Replay a v4 (R22) observer run: frozen plan, fresh-pull frames, local monotonic window, owner evidence."""
+) -> TelemetryFacts | None:
+    """Replay a v4 (R22) observer run: frozen plan, fresh-pull frames, local monotonic window, owner evidence.
+
+    A run that ended on its negative terminal (R23) is read through the same
+    facade: its failure receipt/seal are verified, its bytes enter the input
+    index, and the facts say ``failed`` with every problem named. It never yields
+    aggregates. A directory with no complete terminal is an unknown, not a crash;
+    a forged or tampered terminal of either kind stays an identity error.
+    """
+    run_directory = artifact_root / run_id
     try:
-        result = verify_synchronized_telemetry_observer(artifact_root=artifact_root, run_id=run_id, receipt_version=4)
+        result = read_synchronized_telemetry_terminal(artifact_root=artifact_root, run_id=run_id)
+    except SynchronizedTelemetryTerminalAbsent as exc:
+        reader.note(f"telemetry_terminal_absent:{str(exc)[:200]}")
+        for name, bound in (("frames.v3.jsonl", _MAX_TELEMETRY_FRAMES_BYTES), ("sampling-plan.v1.json", _MAX_INPUT_BYTES)):
+            reader.read(run_directory / name, absent="telemetry_artifact_absent:" + name, maximum=bound)
+        _owner_failure_facts(reader, resident_owner_evidence_dir, problems=None)
+        return None
     except ValueError as exc:
         raise CampaignIdentityError(f"synchronized telemetry evidence failed its own replay: {exc}") from exc
-    run_directory = artifact_root / run_id
+    if isinstance(result, SynchronizedTelemetryFailureResult):
+        return _telemetry_failure_facts_v4(
+            reader, result, run_directory=run_directory, spec=spec, resident_owner_evidence_dir=resident_owner_evidence_dir,
+        )
     for name, bound in _TELEMETRY_ARTIFACTS_V4:
         reader.read(run_directory / name, absent="telemetry_artifact_absent:" + name, maximum=bound)
     receipt, seal, plan = result.receipt, result.seal, result.plan
@@ -858,14 +882,8 @@ def _telemetry_facts_v4(
     if resident_owner_evidence_dir is None:
         problems.append("resident_owner_evidence_not_supplied")
     else:
-        owner = replay_resident_owner_evidence(
-            resident_owner_evidence_dir, run_id=run_id, windows_node_identity_sha256=_physical_owner_node_identity(reader),
-        )
-        # The owner reader hashed the original bytes it read once, bounded and without
-        # following symlinks; those digests enter the input index as they are.
-        for name, digest in sorted(owner.files.items()):
-            reader.record_digest(resident_owner_evidence_dir / name, digest)
-        problems.extend("resident_owner:" + problem for problem in owner.problems)
+        owner = _replay_owner(reader, resident_owner_evidence_dir, run_id=run_id, problems=problems)
+    if resident_owner_evidence_dir is not None and owner is not None:
         # A v4 summary needs the R22 owner: its v2 result, its plan bytes equal to the
         # receipt's plan, and its original intent pinned by the plan the child froze.
         if owner.result_contract_version != OWNER_RESULT_CONTRACT_VERSION or owner.receipt_version != 4:
@@ -902,6 +920,77 @@ def _telemetry_facts_v4(
         receipt_sha256=seal.receipt_sha256, seal_sha256=reader.digest(run_directory / "seal.v4.json"),
         contract_version=receipt.contract_version, status=receipt.status, seal_status=seal.status,
         aggregates=aggregates, problems=tuple(sorted(set(problems))),
+    )
+
+
+def _replay_owner(reader: _Reader, directory: Path, *, run_id: str, problems: list[str]) -> ResidentOwnerEvidence | None:
+    """Replay the owner's retained evidence; an owner that never wrote its result is a named problem, not a crash."""
+    try:
+        owner = replay_resident_owner_evidence(
+            directory, run_id=run_id, windows_node_identity_sha256=_physical_owner_node_identity(reader),
+        )
+    except ValueError as exc:
+        problems.append(f"resident_owner:evidence_unreplayable:{str(exc)[:200]}")
+        _owner_failure_facts(reader, directory, problems=problems)
+        return None
+    # The owner reader hashed the original bytes it read once, bounded and without
+    # following symlinks; those digests enter the input index as they are.
+    for name, digest in sorted(owner.files.items()):
+        reader.record_digest(directory / name, digest)
+    problems.extend("resident_owner:" + problem for problem in owner.problems)
+    _owner_failure_facts(reader, directory, problems=problems)
+    return owner
+
+
+def _owner_failure_facts(reader: _Reader, directory: Path | None, *, problems: list[str] | None) -> None:
+    """Index the owner's failure record when it wrote one; its first error is named, never interpreted as a pass."""
+    if directory is None:
+        return
+    path = directory / _OWNER_FAILURE_FILENAME
+    if path.is_symlink() or not path.is_file():
+        return
+    document = reader.document(path, absent="resident_owner_failure_absent", maximum=_MAX_INPUT_BYTES)
+    if document is None:
+        return
+    first = document.get("first_error")
+    name = "resident_owner_failed"
+    if type(first) is dict and type(first.get("type")) is str:
+        name += ":" + re.sub(r"[^A-Za-z0-9_]", "_", cast(str, first["type"]))[:80]
+    if problems is not None:
+        problems.append(name)
+    else:
+        reader.note(name)
+
+
+def _telemetry_failure_facts_v4(
+    reader: _Reader, result: SynchronizedTelemetryFailureResult, *, run_directory: Path, spec: M6RunSpec,
+    resident_owner_evidence_dir: Path | None,
+) -> TelemetryFacts:
+    """Facts of a negative terminal: identities bound, every failure named, no aggregate, no credit."""
+    for name, bound in _TELEMETRY_FAILURE_ARTIFACTS_V4:
+        reader.read(run_directory / name, absent="telemetry_artifact_absent:" + name, maximum=bound)
+    receipt, seal = result.receipt, result.seal
+    for name in receipt.unsealed_positive_artifacts:
+        reader.read(run_directory / name, absent="telemetry_artifact_absent:" + name, maximum=_MAX_INPUT_BYTES)
+    problems: list[str] = [f"telemetry_receipt_failed:{receipt.reason}", "telemetry_prefix_only", "telemetry_seal_failed"]
+    if receipt.runtime_bundle_identity_sha256 != spec.runtime.runtime_bundle_identity_sha256:
+        problems.append("telemetry_runtime_bundle_mismatch")
+    if receipt.process_profile_sha256 != spec.runtime.process_profile_sha256:
+        problems.append("telemetry_process_profile_mismatch")
+    for failure in receipt.failures:
+        problems.append(f"telemetry_collection_failed:{failure.lane}:{failure.category}")
+    if receipt.observer_error is not None:
+        problems.append("telemetry_observer_error:" + re.sub(r"[^A-Za-z0-9_]", "_", receipt.observer_error.exception_type)[:80])
+    if not receipt.collectors_quiesced:
+        problems.append("telemetry_collectors_not_quiesced")
+    if resident_owner_evidence_dir is None:
+        problems.append("resident_owner_evidence_not_supplied")
+    else:
+        _replay_owner(reader, resident_owner_evidence_dir, run_id=receipt.run_id, problems=problems)
+    return TelemetryFacts(
+        receipt_sha256=seal.receipt_sha256, seal_sha256=reader.digest(run_directory / FAILURE_SEAL_FILENAME),
+        contract_version=receipt.contract_version, status=receipt.status, seal_status=seal.status,
+        aggregates=None, problems=tuple(sorted(set(problems))),
     )
 
 

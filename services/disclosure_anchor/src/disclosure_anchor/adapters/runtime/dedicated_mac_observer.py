@@ -23,7 +23,8 @@ import uuid
 
 from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
-    SynchronizedObserverResult, run_synchronized_telemetry_observer,
+    SynchronizedObserverResult, SynchronizedTelemetryCollectionFailed, SynchronizedTelemetryFailureResult,
+    read_synchronized_telemetry_terminal, run_synchronized_telemetry_observer,
     verify_synchronized_telemetry_observer,
 )
 from disclosure_anchor.application.contracts.resident_session_evidence import check_mac_observer_identity
@@ -256,13 +257,19 @@ def _observer_child(
                 "receipt_version": 4, "owner_intent_sha256": request.owner_intent_sha256,
                 "on_plan_recorded": plan_recorded, "on_sampling_drained": lambda event: _send_event(channel, event),
             }
-        run_synchronized_telemetry_observer(
-            artifact_root=request.artifact_root, process_profile=request.process_profile,
-            observer_identity=identity, gpu_collector=request.gpu_collector,
-            host_collector=request.host_collector, duration_seconds=request.duration_seconds,
-            gpu_interval_ms=request.gpu_interval_ms, run_id=request.run_id, cancel_event=cancel,
-            **callbacks,  # type: ignore[arg-type]
-        )
+        negative: SynchronizedTelemetryCollectionFailed | None = None
+        try:
+            run_synchronized_telemetry_observer(
+                artifact_root=request.artifact_root, process_profile=request.process_profile,
+                observer_identity=identity, gpu_collector=request.gpu_collector,
+                host_collector=request.host_collector, duration_seconds=request.duration_seconds,
+                gpu_interval_ms=request.gpu_interval_ms, run_id=request.run_id, cancel_event=cancel,
+                **callbacks,  # type: ignore[arg-type]
+            )
+        except SynchronizedTelemetryCollectionFailed as exc:
+            # The negative terminal is written and replayed; this child still exits non-zero.
+            # Its final identity is sent so the owner can bind the failure to the same process.
+            negative = exc
         stop.set()
         watcher.join(timeout=1)
         if watcher.is_alive():
@@ -272,6 +279,8 @@ def _observer_child(
         if reader() != initial:
             raise ValueError("Mac observer kernel identity changed after sampling")
         _send_identity(channel, initial)
+        if negative is not None:
+            raise negative
     finally:
         stop.set()
         cancel.set()
@@ -307,6 +316,8 @@ class DedicatedMacObserver:
         self._events: list[dict[str, object]] = []
         self._control = _ControlRecordReader()
         self._exit_verified = False
+        self._exit_code: int | None = None
+        self._terminal: SynchronizedObserverResult | SynchronizedTelemetryFailureResult | None = None
         try:
             self._process.start()
             self._launched = True
@@ -405,8 +416,20 @@ class DedicatedMacObserver:
         self._events.append(event)
         return event
 
+    @property
+    def exit_code(self) -> int | None:
+        """The child's real exit code once it has been reaped; None while it runs."""
+        return self._exit_code
+
     def wait_exit(self, *, timeout: float) -> bool:
-        """Bounded wait for the real child exit and its final identity (v4); no replay."""
+        """Bounded wait for the real child exit and its final identity (v4); no replay.
+
+        A non-zero exit is recorded, not raised: the child keeps exit 1 on its
+        negative terminal and still sends its final identity, so the terminal
+        reader (``replay_terminal``) decides what the run directory proves.
+        Exiting before the drain announcement, an unconsumed partial control
+        record or a differing final identity remain protocol errors.
+        """
         if not math.isfinite(timeout) or not 0 <= timeout <= 60:
             raise ValueError("Mac observer poll bound is invalid")
         if self.request.receipt_version != 4 or self._closed:
@@ -415,11 +438,12 @@ class DedicatedMacObserver:
         if self._process.is_alive():
             return False
         exit_code = self._process.exitcode
+        self._exit_code = exit_code
         try:
-            if exit_code != 0 or not self._started:
-                raise RuntimeError(f"Mac observer exited without normal completion: {exit_code}")
+            if not self._started:
+                raise RuntimeError(f"Mac observer exited before GO: {exit_code}")
             if len(self._events) != len(_EVENT_KINDS):
-                raise RuntimeError("Mac observer exited before announcing its sampling drain")
+                raise RuntimeError(f"Mac observer exited ({exit_code}) before announcing its sampling drain")
             if self._control.partial:
                 raise ValueError("Mac observer exited with an unconsumed partial control record")
             if _read_identity(self._channel, timeout=2) != self.identity_bytes:
@@ -431,6 +455,42 @@ class DedicatedMacObserver:
             self._process.close()
             self._closed = True
 
+    def replay_terminal(self, *, deadline_ns: int | None = None) -> SynchronizedObserverResult | SynchronizedTelemetryFailureResult:
+        """The one terminal the run directory holds, bound to this child's exit and drain.
+
+        Exit 0 must pair with the normal sealed terminal and a non-zero exit with
+        the negative one; either other combination is a contradiction, never a
+        pass. The normal branch is exactly ``replay_result``.
+        """
+        if self.request.receipt_version != 4 or not self._exit_verified:
+            raise RuntimeError("Mac observer replay requires a verified v4 exit")
+        if self._terminal is not None:
+            return self._terminal
+        if self._exit_code == 0:
+            self._terminal = self.replay_result(deadline_ns=deadline_ns)
+            return self._terminal
+        result = read_synchronized_telemetry_terminal(
+            artifact_root=self.request.artifact_root, run_id=self.request.run_id, deadline_monotonic_ns=deadline_ns,
+        )
+        if not isinstance(result, SynchronizedTelemetryFailureResult):
+            raise ValueError(f"Mac observer exited {self._exit_code} but its run directory holds a sealed normal terminal")
+        if result.receipt.observer_identity != check_mac_observer_identity(self.identity_bytes):
+            raise ValueError("Mac observer failure terminal identity differs")
+        drained = self._events[1]
+        # The drain named the physical bytes at the time of the announcement. A run whose
+        # normal path drained first and then failed keeps that first announcement, so its
+        # frame hash describes the same physical file only when no bytes were appended after
+        # it (the writer had already closed the stream); a negative drain names the physical
+        # file directly. Either way the physical hash and byte count must agree.
+        if (result.receipt.sampling_plan_sha256 != self._events[0]["sampling_plan_sha256"]
+                or result.receipt.raw_frames.sha256 != drained["frames_jsonl_sha256"]
+                or result.receipt.raw_frames.physical_bytes != drained["frames_bytes"]):
+            raise ValueError("Mac observer failure terminal differs from its announced drain")
+        if result.receipt.raw_frames.complete_records != drained["frames_records"] and result.receipt.writer_problem is None:
+            raise ValueError("Mac observer failure terminal record count differs from its announced drain without a recorded writer problem")
+        self._terminal = result
+        return result
+
     def replay_result(self, *, deadline_ns: int | None = None) -> SynchronizedObserverResult:
         """The expensive anchored replay, after the native sources were closed.
 
@@ -439,6 +499,8 @@ class DedicatedMacObserver:
         """
         if self.request.receipt_version != 4 or not self._exit_verified:
             raise RuntimeError("Mac observer replay requires a verified v4 exit")
+        if self._exit_code != 0:
+            raise RuntimeError(f"Mac observer exited {self._exit_code}; only replay_terminal may read its negative terminal")
         if self._result is not None:
             return self._result
         result = verify_synchronized_telemetry_observer(
@@ -475,6 +537,7 @@ class DedicatedMacObserver:
             alive = self._process.is_alive()
             if not alive:
                 exit_code = self._process.exitcode
+                self._exit_code = exit_code
                 self._channel.close()
                 self._process.close()
                 self._closed = True

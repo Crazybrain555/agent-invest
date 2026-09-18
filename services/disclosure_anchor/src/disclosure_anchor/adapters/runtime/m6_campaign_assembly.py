@@ -24,6 +24,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import secrets
+import stat
 import time
 from typing import Any, Literal
 
@@ -662,6 +663,7 @@ class M6CampaignAssembly:
     def __init__(
         self, inputs: CampaignInputs, *, output: Path, mode: CampaignMode, attempt_id: str,
         launch: LaunchFactory = BoundedOwnerCommand, continuous_ns: Callable[[], int] | None = None,
+        admission_stop_file: Path | None = None,
     ) -> None:
         if mode not in ("run", "bootstrap-check"):
             raise ValueError("campaign mode must be run or bootstrap-check")
@@ -672,6 +674,12 @@ class M6CampaignAssembly:
         runtime_root = inputs.binding.runtime_root.resolve()
         if not output.parent.resolve().is_relative_to(runtime_root):
             raise CampaignInputError("campaign output must live under the runtime root")
+        if admission_stop_file is not None:
+            if (not admission_stop_file.is_absolute()
+                    or admission_stop_file.parent.resolve() != output.parent.resolve()
+                    or admission_stop_file.is_symlink()):
+                raise CampaignInputError("admission stop file must be a direct child of the private campaign parent")
+        self._admission_stop_file = admission_stop_file
         self._inputs = inputs
         self._intent = inputs.intent
         self._binding = inputs.binding
@@ -694,6 +702,34 @@ class M6CampaignAssembly:
         self._spawned_local_ns: int | None = None
         self._launcher_deadline_ns: int | None = None
         self._launch_budget: LaunchTransportBudget | None = None
+
+    def _external_stop_requested(self) -> bool:
+        """A one-way admission stop, never a process-cancellation or closure receipt.
+
+        The driver and runner share this exact file. The private, fresh parent is
+        already bound by the entry; a pre-created valid stop prevents admission.
+        Invalid control bytes are a control-integrity failure, not a silent resume.
+        """
+        path = self._admission_stop_file
+        if path is None:
+            return False
+        try:
+            # O_NONBLOCK: a FIFO planted at this path must not park the supervisor in open(2);
+            # it opens immediately and is then rejected below as a non-regular file.
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise CampaignInputError(f"admission stop control is not readable: {type(exc).__name__}: {exc}") from exc
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size != 5
+                    or os.read(fd, 6) != b"stop\n"):
+                raise CampaignInputError("admission stop control identity or bytes changed")
+        finally:
+            os.close(fd)
+        return True
 
     # --- remote helpers ----------------------------------------------------------
 
@@ -960,7 +996,7 @@ class M6CampaignAssembly:
         runner_dir, verifier_dir = self._output / "runner", self._output / "verifier"
         runner_dir.mkdir(mode=0o700)
         receipt = runner_dir / "campaign-receipt.json"
-        stop_file = runner_dir / "STOP"
+        stop_file = self._admission_stop_file or (runner_dir / "STOP")
         observation = runner_dir / "observation"
         runner_argv = self._child_argv("disclosure_anchor.cli.staged_campaign", [
             "--manifest", str(inputs.manifest_path), "--manifest-sha256", intent.run.manifest_sha256,
@@ -983,6 +1019,40 @@ class M6CampaignAssembly:
         children: dict[str, BoundedOwnerCommand] = {}
         results: dict[str, OwnerCommandResult | None] = {"runner": None, "verifier": None}
         failures: dict[str, str] = {}
+        stop_requested = False
+        controller = self._controller
+
+        def stop_admission_if_requested() -> None:
+            nonlocal stop_requested
+            if stop_requested:
+                return
+            try:
+                requested = self._external_stop_requested()
+            except CampaignInputError as exc:
+                # An invalid control at the shared path fails closed: admission stops (the runner already
+                # treats the path's existence as STOP), the owner is asked to stop, and the integrity
+                # failure is named. Business children are never aborted for it.
+                requested = True
+                failures["external_admission_stop_invalid"] = str(exc)[:500]
+            if not requested:
+                return
+            stop_requested = True
+            failures.setdefault("external_admission_stop", "external admission stop; original close deadline unchanged")
+            self._summary.fail("supervision", "; ".join(f"{k}: {v}" for k, v in failures.items()))
+            try:
+                controller.request(M6OwnerControl(kind="stop"))
+            except (M6OwnerRejected, M6OwnerProtocolError, OSError) as exc:
+                self._summary.stage("stop_request_failed", message=str(exc)[:500])
+
+        # No business child has been spawned: reuse the existing zero-admission
+        # closure instead of withholding the runner's first lease and then
+        # inventing a runner receipt. This branch is forbidden after any spawn.
+        if self._external_stop_requested():
+            self._summary.fail("supervision", "external admission stop before business spawn")
+            self._children_reaped = True
+            record = self._bootstrap_closure(spec)
+            record["failures"] = {"external_admission_stop": "before business spawn"}
+            return record
         launches = (("runner", runner_argv), ("verifier", verifier_argv))
         try:
             for label, argv in launches:
@@ -1002,9 +1072,9 @@ class M6CampaignAssembly:
             raise CampaignOutcomeUnknown(f"child spawn failed: {type(spawn_error).__name__}: {spawn_error}") from spawn_error
         last_status_ns = self._now_ns()
         owner_state: str = status.state
-        stop_requested = False
         try:
             while any(result is None for result in results.values()):
+                stop_admission_if_requested()
                 for label, child in children.items():
                     if results[label] is not None:
                         continue
@@ -1032,8 +1102,10 @@ class M6CampaignAssembly:
                 if failures and not stop_requested:
                     stop_requested = True
                     self._summary.fail("supervision", "; ".join(f"{k}: {v}" for k, v in failures.items()))
-                    if not stop_file.exists():
+                    try:
                         write_new_exact(stop_file, b"stop\n")
+                    except FileExistsError:
+                        pass  # the external requester and controller may race to request STOP
                     try:
                         self._controller.request(M6OwnerControl(kind="stop"))
                     except (M6OwnerRejected, M6OwnerProtocolError, OSError) as exc:

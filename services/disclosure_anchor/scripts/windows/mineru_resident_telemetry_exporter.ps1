@@ -83,6 +83,104 @@ function Read-MineruLinuxResponse([string]$Kind,[long]$Deadline) {
     } else { $frame.Get('values').Keys([string[]]@('api_process','host_cgroup')) }
     return $frame
 }
+# Bounded diagnostic phase ring. It only records where each sampling call spent
+# the deadline that call already computed: no extra HTTP request, thread, timer
+# or deadline, and no per-call file write. The last 16 successful records plus
+# the in-progress failing record, if any, are serialized once from the outer
+# finally at close or failure; a probe failure is secondary evidence and never
+# replaces the original terminal throw. The marked region depends only on the
+# loaded wire assembly (New-MineruJson/Quote-MineruJson) so an independent
+# mechanism test can extract and drive it without a session.
+# BEGIN MINERU SAMPLING PHASE RING V1
+$script:phaseRingCapacity = 16
+$script:phaseRing = [Collections.Generic.List[object]]::new()
+$script:phaseFailing = $null
+$script:phaseCallsTotal = [long]0
+function New-MineruPhaseCall([long]$Deadline,[long]$Boundary,[string[]]$Names) {
+    $script:phaseCallsTotal += 1
+    $phases = [Collections.Generic.List[object]]::new()
+    foreach ($name in $Names) {
+        $phases.Add([pscustomobject]@{ Phase=$name; Entered=[long]0; Finished=[long]0; Remaining=[long]0; HasEntered=$false; HasFinished=$false; Outcome='not_entered'; ExceptionType=$null })
+    }
+    return [pscustomobject]@{ Ordinal=$script:phaseCallsTotal; Deadline=$Deadline; Boundary=$Boundary; Phases=$phases }
+}
+function Enter-MineruPhase($Call,[int]$Index) {
+    # The remaining budget is computed here and never through
+    # [MineruResidentWire]::Remaining, which throws once the deadline is gone
+    # and would replace the operation's own exception.
+    $record = $Call.Phases[$Index]
+    $now = [Diagnostics.Stopwatch]::GetTimestamp()
+    $record.Entered = $now
+    $record.Remaining = [Math]::Max([long]0,$Call.Deadline - $now)
+    $record.HasEntered = $true
+}
+function Exit-MineruPhase($Call,[int]$Index) {
+    $record = $Call.Phases[$Index]
+    $record.Finished = [Diagnostics.Stopwatch]::GetTimestamp()
+    $record.HasFinished = $true
+    $record.Outcome = 'ok'
+}
+function Trace-MineruPhaseFailure($Call,[int]$Index,$ErrorRecord) {
+    $record = $Call.Phases[$Index]
+    $record.Outcome = 'failed'
+    if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.Exception) {
+        # A .NET method throw reaches PowerShell wrapped in MethodInvocationException;
+        # the operative type is the inner one. The full chain stays in exporter-failure.txt.
+        $thrown = $ErrorRecord.Exception
+        if ($thrown -is [Management.Automation.MethodInvocationException] -and $null -ne $thrown.InnerException) { $thrown = $thrown.InnerException }
+        $record.ExceptionType = $thrown.GetType().FullName
+    }
+    $script:phaseFailing = $Call
+}
+function Complete-MineruPhaseCall($Call) {
+    $script:phaseRing.Add($Call)
+    if ($script:phaseRing.Count -gt $script:phaseRingCapacity) { $script:phaseRing.RemoveAt(0) }
+}
+function Invoke-MineruPhase($Call,[int]$Index,[scriptblock]$Action) {
+    # One phase: enter, run the original operation unchanged, exit; on failure the
+    # record is marked and the ORIGINAL error is rethrown untouched.
+    Enter-MineruPhase $Call $Index
+    try { $result = & $Action } catch { Trace-MineruPhaseFailure $Call $Index $_; throw }
+    Exit-MineruPhase $Call $Index
+    return $result
+}
+function ConvertTo-MineruPhaseJson($Record) {
+    $entered = 'null'; $remaining = 'null'; $finished = 'null'; $exceptionType = 'null'
+    if ($Record.HasEntered) { $entered = [string]$Record.Entered; $remaining = [string]$Record.Remaining }
+    if ($Record.HasFinished) { $finished = [string]$Record.Finished }
+    if ($null -ne $Record.ExceptionType) { $exceptionType = Quote-MineruJson ([string]$Record.ExceptionType) }
+    return New-MineruJson @('phase',(Quote-MineruJson $Record.Phase),'entered_ticks',$entered,'finished_ticks',$finished,'remaining_at_enter_ticks',$remaining,'outcome',(Quote-MineruJson $Record.Outcome),'exception_type',$exceptionType)
+}
+function ConvertTo-MineruPhaseCallJson($Call) {
+    $items = [Collections.Generic.List[string]]::new()
+    $exhausted = 'false'; $budget = 'false'
+    foreach ($record in $Call.Phases) {
+        $items.Add((ConvertTo-MineruPhaseJson $record))
+        if ($record.Outcome -ceq 'failed' -and $record.HasEntered) {
+            if ($record.Remaining -gt 0) { $budget = 'true' } else { $exhausted = 'true' }
+        }
+    }
+    return New-MineruJson @('ordinal',[string]$Call.Ordinal,'deadline_ticks',[string]$Call.Deadline,'qpc_frequency',[string][Diagnostics.Stopwatch]::Frequency,'boundary_ticks',[string]$Call.Boundary,'deadline_exhausted_before_enter',$exhausted,'operation_failed_with_budget_remaining',$budget,'phases',('[' + ($items -join ',') + ']'))
+}
+function Get-MineruPhaseTailJson([string]$Session,[string]$Lane) {
+    # The v1 document text from the ring alone; no file is touched here.
+    $records = [Collections.Generic.List[string]]::new()
+    foreach ($call in $script:phaseRing) { $records.Add((ConvertTo-MineruPhaseCallJson $call)) }
+    $failing = 'null'
+    if ($null -ne $script:phaseFailing) { $failing = ConvertTo-MineruPhaseCallJson $script:phaseFailing }
+    return New-MineruJson @('contract_version','"mineru.sampling-phase-tail.v1"','session',(Quote-MineruJson $Session),'lane',(Quote-MineruJson $Lane),'qpc_frequency',[string][Diagnostics.Stopwatch]::Frequency,'ring_capacity',[string]$script:phaseRingCapacity,'calls_total',[string]$script:phaseCallsTotal,'successful_records_retained',[string]$script:phaseRing.Count,'failing_record',$failing,'records',('[' + ($records -join ',') + ']'))
+}
+# END MINERU SAMPLING PHASE RING V1
+function Write-MineruPhaseTail {
+    # One write per process, once the owner-created run directory exists. A
+    # failure here is recorded as a secondary failure, exactly like the
+    # cleanup failures around it.
+    try {
+        $directory = Get-Variable -Name runDirectory -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -eq $directory) { return }
+        Write-MineruSessionArtifact 'sampling-phase-tail.json' (Get-MineruPhaseTailJson $state.Session $state.Lane)
+    } catch { $failures.Add($_.Exception) }
+}
 try {
     # Owner must validate canonical config/preparation and current runtime first.
     $configBytes = Read-MineruBootstrap $ConfigJsonPath $ExpectedConfigSha256 32768
@@ -152,14 +250,19 @@ try {
         param([long]$Boundary)
         $deadline = [Math]::Min($Boundary,[MineruResidentWire]::Deadline([int]$state.SamplingTimeout))
         if ($state.Lane -ceq 'gpu_fast') {
-            $value = New-MineruJson @('gpu',$gpu.ReadJson())
+            $call = New-MineruPhaseCall $deadline $Boundary @('gpu_read')
+            $value = Invoke-MineruPhase $call 0 { New-MineruJson @('gpu',$gpu.ReadJson()) }
         } else {
-            $frame = Read-MineruLinuxResponse 'sample' $deadline
-            $health = $apiHttp.Get('/health',8192,$deadline)
-            $http = $apiHttp.Get('/agent/telemetry/http-requests/v1',1024,$deadline)
-            $metrics = $vllmHttp.Get('/metrics',196608,$deadline)
-            $value = New-MineruJson @('api_process',$frame.Get('values').Get('api_process').Raw,'host_cgroup',$frame.Get('values').Get('host_cgroup').Raw,'queue_vllm',$queue.Observe($health,$http,$metrics))
+            $call = New-MineruPhaseCall $deadline $Boundary @('linux_sample','api_health','api_http','vllm_metrics','queue_projection')
+            $frame = Invoke-MineruPhase $call 0 { Read-MineruLinuxResponse 'sample' $deadline }
+            $health = Invoke-MineruPhase $call 1 { $apiHttp.Get('/health',8192,$deadline) }
+            $http = Invoke-MineruPhase $call 2 { $apiHttp.Get('/agent/telemetry/http-requests/v1',1024,$deadline) }
+            $metrics = Invoke-MineruPhase $call 3 { $vllmHttp.Get('/metrics',196608,$deadline) }
+            $value = Invoke-MineruPhase $call 4 { New-MineruJson @('api_process',$frame.Get('values').Get('api_process').Raw,'host_cgroup',$frame.Get('values').Get('host_cgroup').Raw,'queue_vllm',$queue.Observe($health,$http,$metrics)) }
         }
+        # Retained before the freshness check so an expiry there still shows the
+        # complete phase timeline of the call that consumed the deadline.
+        Complete-MineruPhaseCall $call
         $null = [MineruResidentWire]::Remaining($deadline)
         return $value
     }
@@ -199,6 +302,7 @@ finally {
             try { $resource.Dispose() } catch { $failures.Add($_.Exception) }
         }
     }
+    Write-MineruPhaseTail
     foreach ($pin in $pins) {
         try { $pin.Dispose() } catch { $failures.Add($_.Exception) }
     }

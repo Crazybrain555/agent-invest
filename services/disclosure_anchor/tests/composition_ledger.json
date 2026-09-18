@@ -404,6 +404,10 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_m6_admission_stop_independent.py": {
+   "private_imports": [],
+   "tests": 15
+  },
   "tests/unit/test_m6_bootstrap_wire_v2_independent.py": {
    "private_imports": [],
    "tests": 6
@@ -416,7 +420,7 @@
   },
   "tests/unit/test_m6_delivery_report_independent.py": {
    "private_imports": [],
-   "tests": 29
+   "tests": 31
   },
   "tests/unit/test_m6_e2e_assembly_independent.py": {
    "private_imports": [
@@ -1000,7 +1004,7 @@
   },
   "tests/unit/test_r22_measurement_integration_independent.py": {
    "private_imports": [],
-   "tests": 36
+   "tests": 48
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],

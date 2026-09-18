@@ -33,6 +33,7 @@ import unittest
 from unittest import mock
 
 from disclosure_anchor.adapters.runtime import m6_campaign_assembly as assembly
+from disclosure_anchor.cli import m6_campaign
 from disclosure_anchor.adapters.runtime.mac_observer_identity import MacObserverIdentityReader
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     verify_synchronized_telemetry_observer,
@@ -52,6 +53,7 @@ from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import (
 from disclosure_anchor.application.services.m6_launch_budget import launch_transport_budget
 from tests import m6_support as m6
 from tests.integration import m6_measured_campaign_independent as driver
+from tests.m6_cli_support import parse_cli_args
 from tests._mineru_capacity_config_fixture import CAPACITY_BYTES
 from tests.m6_delivery_support import campaign_intent_for_spec, empty_report_wire, evaluation_plan
 from tests.unit.test_resident_session_evidence import (
@@ -726,20 +728,14 @@ class MeasuredDriverSupervisionTests(unittest.TestCase):
         self.assertEqual((outcome, evidence["stop_reason"]), ("deadline", "campaign_span_budget_exceeded"))
         self.assertEqual(slept, [0.25])
 
-    def test_forced_stops_record_an_unknown_remote_outcome(self):
-        cooperative, evidence = FakeChild(exit_on_interrupt=0), {}
-        driver.stop_campaign(cooperative, grace_seconds=5.0, evidence=evidence)
-        self.assertTrue(cooperative.interrupted)
-        self.assertFalse(cooperative.killed)
-        self.assertEqual(evidence["campaign_exit_code"], 0)
-        # Even a clean local stop never asserts that the remote owner is gone.
-        self.assertTrue(evidence["owner_outcome"].startswith("unknown:"))
-        self.assertNotIn("campaign_forced", evidence)
-
-        stubborn, evidence = FakeChild(), {}
-        driver.stop_campaign(stubborn, grace_seconds=5.0, evidence=evidence)
-        self.assertTrue(stubborn.killed and evidence["campaign_forced"])
-        self.assertEqual(evidence["campaign_exit_code"], -9)
+    def test_a_stopped_telemetry_owner_never_claims_the_remote_session_ended(self):
+        # The campaign is no longer stopped this way at all: a measurement failure publishes
+        # the shared admission STOP and waits out the original deadline. That whole path,
+        # including the only case that may still force a close, is asserted against the real
+        # control file in tests/unit/test_m6_admission_stop_independent.py; what this pins
+        # here is that the interrupt-the-campaign primitive has not come back.
+        self.assertFalse(hasattr(driver, "stop_campaign"),
+                         "a measurement failure must not interrupt work the owner already admitted")
 
         owner, evidence = FakeChild(exit_on_interrupt=1), {}
         driver.stop_telemetry(owner, grace_seconds=5.0, evidence=evidence)
@@ -1220,11 +1216,33 @@ class MeasuredDriverPreflightTests(unittest.TestCase):
                              [["-m", "tests.integration.m6_measured_campaign_independent",
                                "telemetry-child"],
                               ["-m", "disclosure_anchor.cli.m6_campaign", "run"]])
+            # The shared admission control this driver hands the campaign entry, read back
+            # with the entry's own parser rather than as a string. Its one structural rule -
+            # an absolute path directly beside the campaign's output directory - is what the
+            # entry's constructor enforces, and a control it refuses would leave a measurement
+            # failure with no way to stop admission except the interrupt A removed.
+            entry = "disclosure_anchor.cli.m6_campaign"
+            campaign_args = parse_cli_args(m6_campaign, spawned[1][spawned[1].index(entry) + 1:])
+            control = campaign_args.admission_stop_file.absolute()
+            self.assertEqual(control, output / "campaign-admission.STOP")
+            self.assertEqual(campaign_args.output.absolute(), output / "campaign")
+            self.assertEqual(control.parent, campaign_args.output.absolute().parent)
+            self.assertFalse(control.is_symlink())
+            self.assertFalse(control.exists(),
+                             "the control is a request the driver makes later, not a file it pre-creates")
             evidence = json.loads((output / "independent-evidence.json").read_bytes())
-            # It stopped where this case ends it - reading a campaign summary no campaign wrote -
-            # so everything between the plan pin and that read actually ran.
-            self.assertEqual(evidence["failure"],
-                             "AssertionError: expected an existing regular file: campaign-summary.json")
+            # Where this case ends it - reading a campaign summary no campaign wrote - is now a
+            # collected problem rather than a short circuit, so everything between the plan pin
+            # and that read ran, the evidence was still written, and the run is still failed.
+            self.assertIsNone(evidence["failure"], "a missing summary is a named problem, not a crash")
+            self.assertIn("campaign-summary.json", evidence["step_errors"]["campaign_summary"])
+            self.assertIn("campaign_summary_unavailable", evidence["measurement_problems"])
+            self.assertTrue(evidence["measurement_failed"])
+            self.assertFalse(evidence["measurement_valid"])
+            # No report exists, so no business closure may be claimed from its absence.
+            self.assertFalse(evidence["business_closed"])
+            self.assertNotEqual(evidence["status"], "pass")
+            self.assertIn("campaign_summary_unavailable", evidence["problems"])
             self.assertEqual(evidence["sampling_plan"]["problems"], [])
             self.assertEqual(evidence["sampling_plan"]["start_ns"], plan.started_monotonic_ns)
             self.assertEqual(evidence["sampling_plan"]["planned_end_ns"], plan.planned_end_monotonic_ns)
@@ -1295,11 +1313,11 @@ class MeasuredDriverPreflightTests(unittest.TestCase):
             evidence = json.loads((output / "independent-evidence.json").read_bytes())
             self.assertTrue(evidence["failure"].startswith("SpawnBlocked:"))
             self.assertEqual(evidence["status"], "incomplete")
-            # Whatever ends the run from here on, the children get the frozen graces, not a
-            # smaller literal: the entry's own cancel plus its fetches, and the frozen stop grace.
-            self.assertEqual(evidence["stop_grace"], {
-                "campaign": assembly._CANCEL_TIMEOUT_SECONDS + budget["retrieval_seconds"],
-                "telemetry": 30})
+            # Only the telemetry owner has a cancel grace, and it is the frozen one rather than
+            # a smaller literal. The campaign has no grace of its own to hold: its bound is the
+            # spawn-derived absolute deadline, which cannot exist before it was spawned.
+            self.assertEqual(evidence["stop_grace"], {"telemetry": 30})
+            self.assertNotIn("campaign_deadline_monotonic", evidence)
             # The frozen inputs were pinned by path and by role before the first child.
             pins = json.loads((output / "input-hashes.json").read_bytes())
             self.assertEqual(sorted(name for name in pins if name.startswith("telemetry:")),
@@ -1340,10 +1358,10 @@ class MeasuredDriverPreflightTests(unittest.TestCase):
                 evidence = json.loads((output / "independent-evidence.json").read_bytes())
                 self.assertIn("name different runtimes", evidence["failure"])
                 self.assertNotIn("telemetry_pid", evidence)
-                # Refused before the budget existed, so the campaign grace is still the
-                # composition root's own cancel bound rather than an ad-hoc literal.
-                self.assertEqual(evidence["stop_grace"],
-                                 {"campaign": assembly._CANCEL_TIMEOUT_SECONDS, "telemetry": 30})
+                # Refused before any child, so the only grace recorded is the telemetry
+                # owner's, and no campaign deadline was ever frozen.
+                self.assertEqual(evidence["stop_grace"], {"telemetry": 30})
+                self.assertNotIn("campaign_deadline_monotonic", evidence)
 
     def test_a_window_shorter_than_the_frozen_plan_is_refused_before_any_child(self):
         with tempfile.TemporaryDirectory() as directory:

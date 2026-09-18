@@ -243,6 +243,20 @@ def run_owner_session(request, external, result, *, close_error=None, early_exit
                 events.append(("observer-exit", "once"))
                 return True
 
+            @property
+            def exit_code(self):
+                # This scripted child completes; the parent pairs exit 0 with the normal
+                # terminal, which is the branch this positive session is about.
+                return 0
+
+            def cancel(self):
+                # The parent's cooperative EOF. It must not destroy the receiving end, so
+                # this records the request and leaves the pending events readable.
+                events.append(("observer-cancel", "once"))
+
+            def replay_terminal(self, *, deadline_ns=None):
+                return self.replay_result(deadline_ns=deadline_ns)
+
             def replay_result(self, *, deadline_ns=None):
                 if observer_error:
                     raise RuntimeError("synthetic observer failure")

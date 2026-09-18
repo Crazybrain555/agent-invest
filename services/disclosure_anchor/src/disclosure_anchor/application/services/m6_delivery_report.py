@@ -661,8 +661,13 @@ def _resource_safety(
         )
     problems = list(telemetry.problems) + ([] if aggregates is None else list(aggregates.problems)) + unproven
     if problems:
+        # The named reason prefers what the evidence itself says (a failed terminal, a lane
+        # collection failure, a binding mismatch) over the generic "no aggregate" marker that
+        # every such run also carries; the report stays unknown either way.
+        generic = set(unproven)
         return M6ResourceSafety(
-            status="unknown", gates=gates, evidence_sha256=evidence, reason=sorted(set(problems))[0],
+            status="unknown", gates=gates, evidence_sha256=evidence,
+            reason=sorted(set(problems), key=lambda name: (name in generic, name))[0],
         )
     return M6ResourceSafety(
         status="pass", gates=gates, evidence_sha256=evidence,

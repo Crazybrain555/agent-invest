@@ -33,7 +33,8 @@ from disclosure_anchor.adapters.runtime.resident_owner_control import (
 )
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig, ResidentSSHHTTPClient
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
-    MAX_RECEIPT_BYTES, PLAN_FILENAME, SynchronizedObserverResult, sampling_duration_ns,
+    MAX_RECEIPT_BYTES, PLAN_FILENAME, SynchronizedObserverResult, SynchronizedTelemetryFailureResult,
+    sampling_duration_ns,
 )
 from disclosure_anchor.adapters.runtime.windows_resident_telemetry import windows_resident_collector_spec
 from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu_v4
@@ -364,6 +365,82 @@ def _read_recorded_plan(artifact_root: Path, run_id: str) -> bytes:
     return payload
 
 
+class _OwnerSettled(RuntimeError):
+    """Internal: the sampling phase settled on a failure; every retained error is in the settlement."""
+
+
+class _Settlement:
+    """First-error-first accounting of the sampling and closing phases.
+
+    The first failure fixes the shortened closing bounds
+    (``drain = min(plan.end + 10 s, first + 10 s)``, ``post = min(plan.end + 60 s,
+    first + 60 s)``); later cleanup errors are retained beside it and never
+    replace it. Nothing here renews a deadline or invents a closure.
+    """
+
+    def __init__(self, journal: _Journal, *, run_id: str, planned_end_ns: int) -> None:
+        self._journal = journal
+        self._run_id = run_id
+        self.errors: list[BaseException] = []
+        self.first_observed_ns: int | None = None
+        self.drain_deadline_ns = planned_end_ns + RESIDENT_DRAIN_GRACE_SECONDS * 1_000_000_000
+        self.post_deadline_ns = planned_end_ns + RESIDENT_SAMPLING_TAIL_SECONDS * 1_000_000_000
+
+    @property
+    def first(self) -> BaseException | None:
+        return self.errors[0] if self.errors else None
+
+    def record(self, exc: BaseException, *, observer: DedicatedMacObserver | None = None) -> None:
+        self.errors.append(exc)
+        if len(self.errors) != 1:
+            return
+        now = time.monotonic_ns()
+        self.first_observed_ns = now
+        self.drain_deadline_ns = min(self.drain_deadline_ns, now + RESIDENT_DRAIN_GRACE_SECONDS * 1_000_000_000)
+        self.post_deadline_ns = min(self.post_deadline_ns, now + RESIDENT_SAMPLING_TAIL_SECONDS * 1_000_000_000)
+        self._journal.put("sampling-first-failure.json", canonical_bytes({
+            "run_id": self._run_id, "error_type": type(exc).__name__, "message": str(exc)[:2000],
+            "observed_monotonic_ns": now, "drain_deadline_monotonic_ns": self.drain_deadline_ns,
+            "post_deadline_monotonic_ns": self.post_deadline_ns,
+        }))
+        if observer is not None:
+            # Cooperative EOF: the child stops sampling, quiesces its collectors and writes
+            # its terminal; it is never destroyed before its drain/terminal could be read.
+            try:
+                observer.cancel()
+            except OSError as cancel_error:
+                self.errors.append(cancel_error)
+
+    def guard(self, step: Callable[[], object]) -> object | None:
+        try:
+            return step()
+        except BaseException as exc:  # noqa: BLE001 - every settlement step is retained, none replaces the first
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            self.record(exc)
+            return None
+
+
+def _await_observer_exit(observer: DedicatedMacObserver, *, deadline_ns: int) -> bool:
+    while not observer.wait_exit(timeout=min(60.0, max(0.0, (deadline_ns - time.monotonic_ns()) / 1_000_000_000))):
+        if time.monotonic_ns() >= deadline_ns:
+            return False
+    return True
+
+
+def _terminal_record(terminal: object, *, exit_code: int | None, error: BaseException | None) -> dict[str, object]:
+    record: dict[str, object] = {"exit_code": exit_code, "kind": None, "receipt_sha256": None, "seal_sha256": None,
+                                 "error": None if error is None else {"type": type(error).__name__, "message": str(error)[:2000]}}
+    if isinstance(terminal, SynchronizedObserverResult):
+        record.update(kind="normal", receipt_sha256=artifact_sha256(canonical_bytes(terminal.receipt.model_dump(mode="json"))),
+                      seal_sha256=artifact_sha256(canonical_bytes(terminal.seal.model_dump(mode="json"))), status=terminal.evidence_status)
+    elif isinstance(terminal, SynchronizedTelemetryFailureResult):
+        record.update(kind="failure", receipt_sha256=terminal.seal.receipt_sha256,
+                      seal_sha256=artifact_sha256(canonical_bytes(terminal.seal.model_dump(mode="json"))),
+                      status="failed", reason=terminal.receipt.reason)
+    return record
+
+
 def _local_sources() -> dict[str, bytes]:
     """Snapshot the concrete local composition, not a caller-selected label."""
     modules = (
@@ -400,6 +477,8 @@ def run_resident_telemetry_session(
     ready_pairs: list[tuple[CheckedResidentReady, CheckedExternalWindowsObservation]] = []
     observer: DedicatedMacObserver | None = None
     close_attempted = False
+    settlement: _Settlement | None = None
+    terminal_record: dict[str, object] | None = None
     notify = progress if progress is not None else lambda _: None
     try:
         plans = (request.gpu, request.host)
@@ -502,19 +581,35 @@ def run_resident_telemetry_session(
         # Pre-GO reserve: native starters spawned at most 20 s before sampling started,
         # in the same Mac monotonic domain. Exceeding it ends the session before any admission.
         require_start_headroom(earliest_starter_spawn_ns=earliest_starter_spawn_ns, sampling_start_ns=planned_start_ns)
-        # SAMPLING → SAMPLING_DRAINED, watched with the starters; no replay yet.
-        drain_deadline_ns = planned_end_ns + RESIDENT_DRAIN_GRACE_SECONDS * 1_000_000_000
-        post_deadline_ns = planned_end_ns + RESIDENT_SAMPLING_TAIL_SECONDS * 1_000_000_000
+        # SAMPLING → SAMPLING_DRAINED, watched with the starters; no replay yet. A starter that
+        # ends here is recorded at once as the first error, the child is asked to stop
+        # cooperatively, and its drain is still awaited within the shortened bound: the
+        # receiver is never destroyed while the child may still announce or write its terminal.
+        settlement = _Settlement(journal, run_id=request.run_id, planned_end_ns=planned_end_ns)
         drained_event: dict[str, object] | None = None
         while drained_event is None:
-            _starter_ended(journal, starters, starter_labels, retained_starters, phase="sampling")
-            if time.monotonic_ns() >= drain_deadline_ns:
+            try:
+                _starter_ended(journal, starters, starter_labels, retained_starters, phase="sampling")
+            except RuntimeError as starter_error:
+                if settlement.first is None:
+                    settlement.record(starter_error, observer=observer)
+            if time.monotonic_ns() >= settlement.drain_deadline_ns:
                 journal.put("telemetry-drain-timeout.json", canonical_bytes({"run_id": request.run_id, "planned_end_monotonic_ns": planned_end_ns, "observed_monotonic_ns": time.monotonic_ns()}))
-                raise TimeoutError("telemetry_drain_timeout: the observer did not announce its sampling drain by the planned end plus grace")
-            drained_event = observer.poll_event(timeout=0.2)
-        journal.put("observer-sampling-drained.json", canonical_bytes(drained_event))
-        notify("sampling drained; closing both remote sessions before the observer replay")
+                settlement.record(TimeoutError("telemetry_drain_timeout: the observer did not announce its sampling drain by the planned end plus grace"), observer=observer)
+                break
+            try:
+                drained_event = observer.poll_event(timeout=0.2)
+            except (RuntimeError, ValueError, OSError, EOFError, TimeoutError) as poll_error:
+                # The child exited or broke its control channel before announcing its drain;
+                # its exit code and terminal are still read below, never assumed.
+                settlement.record(poll_error, observer=observer)
+                break
+        if drained_event is not None:
+            journal.put("observer-sampling-drained.json", canonical_bytes(drained_event))
+        notify("sampling drained; closing both remote sessions before the observer replay"
+               if settlement.first is None else "sampling failed; closing both remote sessions within the shortened bound")
         close_attempted = True
+        post_deadline_ns = settlement.post_deadline_ns
         close_payloads: dict[str, bytes] = {}
         close_errors: list[Exception] = []
         # Loss of the close reply is not repeated; the independent on-disk
@@ -531,23 +626,46 @@ def run_resident_telemetry_session(
                 else:
                     journal.put(ready.lane + "-close-response.json", payload)
                     close_payloads[ready.lane] = payload
-        starter_results = _finish_controls(starters, journal, starter_labels, deadline_ns=post_deadline_ns)
+        starter_results = cast(
+            list[OwnerCommandResult] | None,
+            settlement.guard(lambda: _finish_controls(starters, journal, starter_labels, deadline_ns=post_deadline_ns)),
+        )
         controls = []
         for plan, (_, previous) in zip(plans, ready_pairs, strict=True):
             command = _launch_command(request, plan, phase="closed", journal=journal, container_id=previous.container_id)
             controls.append(command)
             commands.append(command)
-        closed_results = _finish_controls(controls, journal, ["gpu_fast-closed", "host_slow-closed"], deadline_ns=post_deadline_ns)
-        # NATIVE_CLOSING done: now the child's real exit, then the expensive replay, all
-        # inside the absolute post-sampling deadline (plan end + 60 s).
-        while not observer.wait_exit(timeout=min(60.0, max(0.0, (post_deadline_ns - time.monotonic_ns()) / 1_000_000_000))):
+        closed_results = cast(
+            list[OwnerCommandResult] | None,
+            settlement.guard(lambda: _finish_controls(controls, journal, ["gpu_fast-closed", "host_slow-closed"], deadline_ns=post_deadline_ns)),
+        )
+        # NATIVE_CLOSING done: now the child's real exit, then its terminal (normal or negative),
+        # all inside the absolute post-sampling deadline (plan end + 60 s, or shorter after a failure).
+        exited = settlement.guard(lambda: _await_observer_exit(observer, deadline_ns=post_deadline_ns)) is True
+        terminal: object | None = None
+        terminal_error: BaseException | None = None
+        if exited:
             if time.monotonic_ns() >= post_deadline_ns:
-                raise TimeoutError("telemetry_post_sampling_deadline: the observer child did not exit by the planned end plus tail")
-        if time.monotonic_ns() >= post_deadline_ns:
-            raise TimeoutError("telemetry_post_sampling_deadline: no time left for the observer replay")
-        result = observer.replay_result(deadline_ns=post_deadline_ns)
-        if time.monotonic_ns() > post_deadline_ns:
-            raise TimeoutError("telemetry_post_sampling_deadline: the observer replay ended past the planned end plus tail")
+                settlement.record(TimeoutError("telemetry_post_sampling_deadline: no time left for the observer replay"))
+            else:
+                before = len(settlement.errors)
+                terminal = settlement.guard(lambda: observer.replay_terminal(deadline_ns=post_deadline_ns))
+                if terminal is None and len(settlement.errors) > before:
+                    terminal_error = settlement.errors[before]
+                if time.monotonic_ns() > post_deadline_ns:
+                    settlement.record(TimeoutError("telemetry_post_sampling_deadline: the observer replay ended past the planned end plus tail"))
+        else:
+            settlement.record(TimeoutError("telemetry_post_sampling_deadline: the observer child did not exit by the planned end plus tail"))
+            # Bounded, never a lone kill: an unresolved child is reported as an ownership error.
+            settlement.guard(observer.close)
+        terminal_record = _terminal_record(terminal, exit_code=observer.exit_code, error=terminal_error)
+        journal.put("observer-terminal.json", canonical_bytes(terminal_record))
+        if isinstance(terminal, SynchronizedTelemetryFailureResult):
+            settlement.record(ValueError(f"resident observer ended on its negative terminal: {terminal.receipt.reason}"))
+        if settlement.first is not None:
+            raise _OwnerSettled("resident telemetry owner sampling settled on a failure")
+        assert starter_results is not None and closed_results is not None
+        result = cast(SynchronizedObserverResult, terminal)
         if not isinstance(result.receipt, SynchronizedTelemetryReceiptV4) or not isinstance(result.seal, SynchronizedTelemetrySealV4) or result.plan is None:
             raise ValueError("resident owner requires exact v4 observer replay")
         # The replay binds the receipt to the plan file bytes; those must be the exact
@@ -582,7 +700,9 @@ def run_resident_telemetry_session(
         notify("exact closure, source mapping and seven-role CPU replay completed")
         return ResidentTelemetryOwnerResult(result, cpu, request.evidence_directory)
     except BaseException as exc:
-        failures: list[BaseException] = [exc]
+        # A settled sampling failure already holds its ordered errors (first error first);
+        # anything else is the first error of an earlier or later phase.
+        failures: list[BaseException] = list(settlement.errors) if isinstance(exc, _OwnerSettled) and settlement is not None else [exc]
         if observer is not None:
             try:
                 observer.close()
@@ -621,7 +741,13 @@ def run_resident_telemetry_session(
                 }))
             except BaseException as cleanup_error:
                 failures.append(cleanup_error)
-        journal.put("owner-failure.json", canonical_bytes({"run_id": request.run_id, "errors": [{"type": type(error).__name__, "message": str(error)} for error in failures], "remote_outcome": "requires exact session reconciliation; never automatically relaunched"}))
+        journal.put("owner-failure.json", canonical_bytes({
+            "run_id": request.run_id,
+            "first_error": {"type": type(failures[0]).__name__, "message": str(failures[0])[:2000]},
+            "errors": [{"type": type(error).__name__, "message": str(error)} for error in failures],
+            "observer_terminal": terminal_record,
+            "remote_outcome": "requires exact session reconciliation; never automatically relaunched",
+        }))
         raise BaseExceptionGroup("resident telemetry owner failed; original evidence retained", failures)
     finally:
         journal.close()

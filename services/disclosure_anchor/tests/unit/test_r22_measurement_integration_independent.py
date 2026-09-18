@@ -19,13 +19,16 @@ endpoint, and lives in `scripts/windows/test_mineru_resident_endpoint.ps1`.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import timedelta
 from fractions import Fraction
 import importlib
 import json
 from pathlib import Path
+import os
 import socket
 import threading
+import time
 import unittest
 
 from disclosure_anchor.application.contracts.resident_session_evidence import (
@@ -37,6 +40,7 @@ from tests.unit.test_synchronized_telemetry_contract import HASH, HASH_B, HASH_C
 
 
 NS = 1_000_000_000
+OWNER = "disclosure_anchor.adapters.runtime.resident_telemetry_owner"
 POLICY = "disclosure_anchor.application.services.resident_measurement_policy"
 WIRE = "disclosure_anchor.application.contracts.windows_resident_telemetry"
 TELEMETRY = "disclosure_anchor.application.contracts.synchronized_telemetry"
@@ -750,7 +754,8 @@ class R22LifecycleTests(unittest.TestCase):
     """
 
     def _session(self, *, drained=True, replay_gate=True, starter_exits_early=False,
-                 child_fails=False):
+                 child_fails=False, starter_exits_during_sampling=False, poll_error=None,
+                 cancel_error=None, close_failure_lane=None, observer_close_error=None):
         import tempfile
         from pathlib import Path as _Path
         from unittest.mock import patch
@@ -769,6 +774,8 @@ class R22LifecycleTests(unittest.TestCase):
             # A starter ends when its own remote session closes, which is what lets the owner
             # reap it before the replay; nothing here ends it early on its own.
             closed_lanes = set()
+            # Set once the owner has consumed plan_recorded, i.e. once sampling has begun.
+            sampling = threading.Event()
             replay_released = threading.Event()
             if not replay_gate:
                 replay_released.set()
@@ -779,7 +786,8 @@ class R22LifecycleTests(unittest.TestCase):
 
                 def poll(self, *, timeout=0):
                     if (self.phase == "start" and self.lane not in closed_lanes
-                            and not starter_exits_early):
+                            and not starter_exits_early
+                            and not (starter_exits_during_sampling and sampling.is_set())):
                         return None
                     value = external[self.lane][0 if self.phase == "ready" else 1]
                     stdout = (value["job_raw"].encode() + b"\r\n" if self.phase == "start"
@@ -833,8 +841,13 @@ class R22LifecycleTests(unittest.TestCase):
                 def poll_event(self, *, timeout):
                     if not self._pending:
                         return None
+                    if poll_error is not None and self._pending[0]["kind"] == "sampling_drained":
+                        events.append(("poll-failed", "once"))
+                        raise poll_error
                     message = self._pending.pop(0)
                     events.append((message["kind"], "once"))
+                    if message["kind"] == "plan_recorded":
+                        sampling.set()
                     return message
 
                 def wait_exit(self, *, timeout):
@@ -842,6 +855,24 @@ class R22LifecycleTests(unittest.TestCase):
                         raise RuntimeError("synthetic child failure")
                     events.append(("child-exit", "once"))
                     return True
+
+                @property
+                def exit_code(self):
+                    # This scripted child completes; the parent pairs exit 0 with the
+                    # normal terminal, which is the branch this positive session is about.
+                    return 0
+
+                def cancel(self):
+                    # The product's cooperative EOF: it must not destroy the receiving end,
+                    # so this records the request and leaves the pending events readable.
+                    events.append(("observer-cancel", "once"))
+                    if cancel_error is not None:
+                        raise cancel_error
+
+                def replay_terminal(self, *, deadline_ns=None):
+                    # The parent reads whichever terminal the child left; this session is the
+                    # positive one, so the normal result is what a real child would hand back.
+                    return self.replay_result(deadline_ns=deadline_ns)
 
                 def replay_result(self, *, deadline_ns=None):
                     events.append(("replay-entered", "once"))
@@ -856,11 +887,18 @@ class R22LifecycleTests(unittest.TestCase):
 
                 def close(self):
                     events.append(("observer-close", "once"))
+                    if observer_close_error is not None:
+                        raise observer_close_error
 
             def close_lane(ssh, ready, *, deadline_ns=None):
                 events.append(("close", ready.lane))
+                # The starter of a lane ends when that lane's remote session closes, whether
+                # or not the close reply itself arrives; the two are separate facts.
                 closed_lanes.add(ready.lane)
                 replay_released.set()
+                if ready.lane == close_failure_lane:
+                    events.append(("close-failed", ready.lane))
+                    raise RuntimeError("scripted close failure on " + ready.lane)
                 return external[ready.lane][1]["closed_raw"].encode()
 
             outcome = {}
@@ -886,6 +924,11 @@ class R22LifecycleTests(unittest.TestCase):
                     worker.join(SCRIPTED_SESSION_TIMEOUT_SECONDS)
                     self.fail("the scripted owner session did not return; last events: "
                               + repr(events[-8:]))
+            # The journal the owner actually retained, read before the fixture root goes away.
+            self.planned_end_ns = result.plan.planned_end_monotonic_ns
+            self.retained = {path.name: path.read_bytes()
+                             for path in sorted(request.evidence_directory.iterdir())
+                             if path.is_file()}
             return events, outcome.get("failure")
 
     def _reasons(self, failure):
@@ -933,6 +976,113 @@ class R22LifecycleTests(unittest.TestCase):
                 self.assertNotIn(("replay-returned", "once"), events,
                                  "a failed session never claims a completed replay")
 
+    # --- D5: the owner's own ordering, in both directions -------------------------------
+
+    def _journal(self, name):
+        self.assertIn(name, self.retained, f"the owner retained {sorted(self.retained)}")
+        return json.loads(self.retained[name])
+
+    def _errors(self, document):
+        return [(item["type"], item["message"]) for item in document["errors"]]
+
+    def test_a_native_starter_that_ends_first_keeps_the_receiver_until_the_drain_arrives(self):
+        """Native-exit-first: cooperative EOF, then the child's drain is still read and kept.
+
+        Closing the receiving end on the first failure would destroy the one announcement
+        that says the collectors quiesced and the raw file is durable, which is the fact the
+        native close is allowed to start from.
+        """
+        events, failure = self._session(starter_exits_during_sampling=True, replay_gate=False)
+        self.assertIsNotNone(failure, "a starter that ends during sampling is a failure")
+        order = {kind: self._order(events, kind) for kind in
+                 ("observer-cancel", "sampling_drained", "observer-close")}
+        self.assertIsNotNone(order["observer-cancel"], f"no cooperative EOF was sent: {events}")
+        self.assertIsNotNone(order["sampling_drained"], f"the drain was never read: {events}")
+        self.assertLess(order["observer-cancel"], order["sampling_drained"],
+                        "the EOF must precede the drain it still waits for")
+        self.assertLess(order["sampling_drained"], order["observer-close"],
+                        "the receiver must not be closed before the drain is read")
+        drained = self._journal("observer-sampling-drained.json")
+        self.assertEqual(drained["kind"], "sampling_drained")
+        first = self._journal("sampling-first-failure.json")
+        self.assertEqual(first["error_type"], "RuntimeError")
+        self.assertIn("starter ended before sampling", first["message"])
+        self.assertEqual([item for item in events if item[0] == "close"].__len__(), 2,
+                         f"both remote lanes still close within the shortened bound: {events}")
+
+    def test_an_observer_that_faults_first_stops_polling_and_claims_no_drain(self):
+        """Observer-fault-first: the poll failure is the first cause and no drain is invented."""
+        events, failure = self._session(poll_error=EOFError("Mac observer control channel closed"),
+                                        replay_gate=False)
+        self.assertIsNotNone(failure)
+        self.assertIsNone(self._order(events, "sampling_drained"), f"no drain was announced: {events}")
+        self.assertNotIn("observer-sampling-drained.json", self.retained,
+                         "a drain that never arrived must not be journaled")
+        first = self._journal("sampling-first-failure.json")
+        self.assertEqual(first["error_type"], "EOFError")
+        owner = self._journal("owner-failure.json")
+        self.assertEqual(owner["first_error"]["type"], "EOFError")
+        self.assertIsNotNone(self._order(events, "observer-cancel"),
+                             "a faulted receiver is still asked to stop cooperatively")
+        self.assertEqual([item for item in events if item[0] == "close"].__len__(), 2,
+                         f"both remote lanes still close: {events}")
+
+    def test_the_first_failure_alone_shortens_the_bounds_and_no_later_one_renews_them(self):
+        """The shortened closing bounds are the first failure's, written once and never moved."""
+        grace = _interface(OWNER, "RESIDENT_DRAIN_GRACE_SECONDS")
+        tail = _interface(OWNER, "RESIDENT_SAMPLING_TAIL_SECONDS")
+        events, failure = self._session(starter_exits_during_sampling=True,
+                                        cancel_error=OSError(57, "Socket is not connected"),
+                                        replay_gate=False)
+        self.assertIsNotNone(failure)
+        first = self._journal("sampling-first-failure.json")
+        observed = first["observed_monotonic_ns"]
+        self.assertEqual(first["drain_deadline_monotonic_ns"],
+                         min(self.planned_end_ns + grace * NS, observed + grace * NS))
+        self.assertEqual(first["post_deadline_monotonic_ns"],
+                         min(self.planned_end_ns + tail * NS, observed + tail * NS))
+        owner = self._journal("owner-failure.json")
+        self.assertGreater(len(owner["errors"]), 1, "this case needs a later failure to exist")
+        # The journal refuses to write a name twice, so a second shortening would appear here
+        # as a retained FileExistsError naming this exact artifact.
+        self.assertFalse([message for _type, message in self._errors(owner)
+                          if "sampling-first-failure.json" in message],
+                         "the shortened bounds were written more than once")
+
+    def test_a_cancel_that_cannot_reach_the_child_stays_secondary_to_the_original_cause(self):
+        """ENOTCONN on the cooperative EOF is retained beside the first cause, never instead of it."""
+        events, failure = self._session(starter_exits_during_sampling=True,
+                                        cancel_error=OSError(57, "Socket is not connected"),
+                                        replay_gate=False)
+        self.assertIsNotNone(failure)
+        owner = self._journal("owner-failure.json")
+        self.assertEqual(owner["first_error"]["type"], "RuntimeError")
+        self.assertIn("starter ended before sampling", owner["first_error"]["message"])
+        types = [kind for kind, _message in self._errors(owner)]
+        self.assertIn("OSError", types, owner["errors"])
+        self.assertGreater(types.index("OSError"), 0, "a cleanup error must never be the first cause")
+        self.assertEqual(types[0], "RuntimeError")
+        # The refused EOF does not stop the drain from being read, nor the lanes from closing.
+        self.assertIn("observer-sampling-drained.json", self.retained)
+        self.assertEqual([item for item in events if item[0] == "close"].__len__(), 2)
+
+    def test_one_lane_that_cannot_close_leaves_the_other_lane_s_own_close_intact(self):
+        """A failed lane is unknown by name; the healthy lane keeps its real close bytes."""
+        events, failure = self._session(starter_exits_during_sampling=True,
+                                        close_failure_lane="gpu_fast", replay_gate=False)
+        self.assertIsNotNone(failure)
+        self.assertNotIn("gpu_fast-close-response.json", self.retained,
+                         "a lane whose close never answered must not carry a close payload")
+        failed = self._journal("gpu_fast-close-response-error.json")
+        self.assertEqual(failed["error_type"], "RuntimeError")
+        self.assertIn("gpu_fast", failed["message"])
+        self.assertIn("host_slow-close-response.json", self.retained,
+                      "the healthy lane's own close reply is kept")
+        self.assertTrue(self.retained["host_slow-close-response.json"],
+                        "the healthy lane's close payload is its real bytes, not a placeholder")
+        self.assertNotIn("host_slow-close-response-error.json", self.retained)
+        self.assertEqual([item for item in events if item[0] == "close"].__len__(), 2,
+                         f"both lanes are still attempted: {events}")
 
 class R22OriginalEvidenceTests(unittest.TestCase):
     """D5 - a complete original v4 artifact set, replayed by the product, then tampered.
@@ -1185,6 +1335,448 @@ class R22EntryAndPackageTests(unittest.TestCase):
                             "decode_mineru_capacity_config")
         config = decode(CAPACITY_BYTES)
         self.assertEqual(config.exact_bytes, CAPACITY_BYTES)
+
+
+
+OBSERVER = "disclosure_anchor.adapters.runtime.synchronized_telemetry_observer"
+# One collector spawn plus a short window: long enough for a lane to reach its own failure,
+# short enough that five of these stay a unit test.
+NEGATIVE_RUN_SECONDS = 0.4
+
+
+class R23NegativeTerminalTests(unittest.TestCase):
+    """D3 - a v4 run that cannot collect seals its own failure and credits nothing.
+
+    These drive the real observer with the product's own collector fixtures, so the lane
+    thread, the mailbox merge, the raw writer and the terminal writer all run. What is
+    decided here is the rule R23 exists for: a collection that failed must leave the
+    original error on disk, must not become a frame, and must never be readable as a pass.
+    """
+
+    def _observer_arguments(self, root, *, gpu_mode, host_mode="normal"):
+        from tests.unit.test_synchronized_telemetry_observer import (
+            HASH_D, _collector_spec, _profile,
+        )
+
+        profile = _interface(TELEMETRY, "FrozenApiProcessProfile").model_validate(
+            _profile().model_dump(exclude={"started_at_utc", "started_monotonic_ns",
+                                           "clock_domain_identity_sha256"}))
+        identity = _interface(TELEMETRY, "TelemetryObserverIdentity")(
+            process_epoch_sha256="sha256:" + "f" * 64, clock_domain_identity_sha256=HASH_D)
+        return {"artifact_root": root, "process_profile": profile, "observer_identity": identity,
+                "gpu_collector": _collector_spec(lane="gpu", mode=gpu_mode),
+                "host_collector": _collector_spec(lane="host", mode=host_mode),
+                "duration_seconds": NEGATIVE_RUN_SECONDS, "process_cpu_ns": lambda: 0,
+                "receipt_version": 4, "owner_intent_sha256": INTENT_SHA,
+                "on_sampling_drained": self.drained.append}
+
+    def setUp(self):
+        self.drained = []
+
+    def _failed_run(self, root, *, gpu_mode, host_mode="normal"):
+        """Run the real v4 observer and return the negative terminal it raised."""
+        # Every announcement this one run makes. A drain may be announced at most once,
+        # whichever path ends the run, or an owner would close its native lanes twice on
+        # a single proof.
+        self.drained = []
+        run = _interface(OBSERVER, "run_synchronized_telemetry_observer")
+        failed = _interface(OBSERVER, "SynchronizedTelemetryCollectionFailed")
+        with self.assertRaises(failed) as caught:
+            run(**self._observer_arguments(root, gpu_mode=gpu_mode, host_mode=host_mode))
+        return caught.exception
+
+    def _assert_negative_terminal(self, root, outcome):
+        """Every rule that must hold of any negative terminal, whatever ended the run."""
+        receipt, seal, run = outcome.receipt, outcome.seal, outcome.run_directory
+        plan_bytes = (run / "sampling-plan.v1.json").read_bytes()
+        plan = _interface(TELEMETRY, "SynchronizedSamplingPlanV1").model_validate(json.loads(plan_bytes))
+        frames_bytes = (run / "frames.v3.jsonl").read_bytes()
+        receipt_bytes = (run / "receipt.failure.v1.json").read_bytes()
+
+        self.assertEqual({path.name for path in run.iterdir()},
+                         {"sampling-plan.v1.json", "frames.v3.jsonl",
+                          "receipt.failure.v1.json", "seal.failure.v1.json"},
+                         "a failure terminal is the only terminal in its run directory")
+        self.assertEqual(receipt.measurement_credit, "none")
+        self.assertFalse(receipt.activation_authorized)
+        # The frozen window is reported as planned, never shortened to what was collected.
+        self.assertEqual(receipt.planned_start_monotonic_ns, plan.started_monotonic_ns)
+        self.assertEqual(receipt.planned_end_monotonic_ns, plan.planned_end_monotonic_ns)
+        self.assertEqual(receipt.planned_end_monotonic_ns - receipt.planned_start_monotonic_ns,
+                         plan.duration_ns)
+        # The physical bytes are described as they are, and the prefix is inside them.
+        self.assertEqual(receipt.raw_frames.physical_bytes, len(frames_bytes))
+        self.assertEqual(receipt.raw_frames.sha256, artifact_sha256(frames_bytes))
+        self.assertEqual(receipt.raw_frames.complete_prefix_bytes + receipt.raw_frames.trailing_bytes,
+                         len(frames_bytes))
+        for coverage in receipt.lane_coverage:
+            self.assertEqual(coverage.usable_slots + coverage.missing_slots, coverage.planned_slots)
+            self.assertEqual(coverage.usable_slots, coverage.complete_records)
+        self.assertEqual(sum(item.complete_records for item in receipt.lane_coverage),
+                         receipt.raw_frames.complete_records)
+        # The seal binds the negative bytes to each other and to nothing else.
+        self.assertEqual(seal.receipt_sha256, artifact_sha256(receipt_bytes))
+        self.assertEqual(seal.sampling_plan_sha256, artifact_sha256(plan_bytes))
+        self.assertEqual(seal.raw_frames_sha256, artifact_sha256(frames_bytes))
+        self.assertEqual(seal.complete_records, receipt.raw_frames.complete_records)
+        # The normal verifier must not read a negative terminal as a sealed run.
+        verify = _interface(OBSERVER, "verify_synchronized_telemetry_observer")
+        with self.assertRaises(ValueError):
+            verify(artifact_root=root, run_id=receipt.run_id, receipt_version=4)
+        # The facade returns the negative result, and it is not a normal one.
+        terminal = _interface(OBSERVER, "read_synchronized_telemetry_terminal")(
+            artifact_root=root, run_id=receipt.run_id)
+        self.assertIsInstance(terminal, _interface(OBSERVER, "SynchronizedTelemetryFailureResult"))
+        self.assertEqual(terminal.receipt, receipt)
+        self.assertEqual(len(terminal.prefix_frames), receipt.raw_frames.complete_records)
+        # One drain announcement for the run, carrying the writer's own durable facts about
+        # the file that exists - not the plan's, and not a second notification from the
+        # negative path after the normal one already went out.
+        self.assertEqual(len(self.drained), 1, self.drained)
+        announced = self.drained[0]
+        self.assertEqual(announced["kind"], "sampling_drained")
+        self.assertEqual(announced["run_id"], receipt.run_id)
+        self.assertEqual(announced["sampling_plan_sha256"], receipt.sampling_plan_sha256)
+        self.assertEqual(announced["frames_jsonl_sha256"], receipt.raw_frames.sha256)
+        self.assertEqual(announced["frames_bytes"], receipt.raw_frames.physical_bytes)
+        self.assertEqual(announced["frames_records"], receipt.raw_frames.complete_records)
+        return plan
+
+    def test_a_failing_lane_seals_its_own_original_error_and_credits_nothing(self):
+        import tempfile
+
+        for mode, category, exception_type in (
+            ("deadline", "deadline", "TelemetrySnapshotDeadlineExceeded"),
+            ("transport_failure", "transport", "TelemetrySnapshotTransportUnavailable"),
+            ("continuity_lost", "continuity", "TelemetrySnapshotContinuityLost"),
+        ):
+            with self.subTest(lane_failure=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "telemetry"
+                outcome = self._failed_run(root, gpu_mode=mode)
+                receipt = outcome.receipt
+                self.assertEqual(receipt.reason, "lane_collection_failure")
+                self._assert_negative_terminal(root, outcome)
+                gpu = next(item for item in receipt.failures if item.lane == "gpu_fast")
+                # The original exception, not a substituted "missing witness".
+                self.assertEqual((gpu.category, gpu.exception_type), (category, exception_type))
+                self.assertIn(exception_type, gpu.error_text)
+                self.assertEqual(gpu.retained_error_bytes + gpu.dropped_error_bytes,
+                                 gpu.original_error_bytes)
+                self.assertGreater(gpu.original_error_bytes, 0)
+                self.assertLessEqual(gpu.scheduled_monotonic_ns, gpu.started_monotonic_ns)
+                self.assertLessEqual(gpu.started_monotonic_ns, gpu.finished_monotonic_ns)
+                # A lane that failed contributed no frame and no slot.
+                self.assertEqual(receipt.raw_frames.complete_records, 0)
+                gpu_coverage = next(item for item in receipt.lane_coverage if item.lane == "gpu_fast")
+                self.assertEqual((gpu_coverage.usable_slots, gpu_coverage.first_slot), (0, None))
+                self.assertEqual(gpu_coverage.missing_slots, gpu_coverage.planned_slots)
+                # And it never advanced a wire cursor by claiming a local request as a witness.
+                self.assertIsNone(gpu.local_request_nonce)
+
+    def test_a_sample_without_a_fresh_pull_witness_never_becomes_a_frame(self):
+        """The bug Pro named: a lane that returns but carries no witness is a failure, not a frame."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "telemetry"
+            # Both collectors answer normally; neither carries the v4 fresh-pull witness.
+            outcome = self._failed_run(root, gpu_mode="normal")
+            self._assert_negative_terminal(root, outcome)
+            self.assertEqual({item.lane for item in outcome.receipt.failures},
+                             {"gpu_fast", "host_slow"})
+            for failure in outcome.receipt.failures:
+                self.assertEqual(failure.category, "internal")
+                self.assertIn("missing_pull_witness", failure.message)
+            # Nothing was written as a frame and nothing was credited as an unsupported value.
+            self.assertEqual((root / outcome.receipt.run_id / "frames.v3.jsonl").read_bytes(), b"")
+            self.assertEqual(outcome.receipt.raw_frames.complete_records, 0)
+            self.assertEqual(outcome.receipt.measurement_credit, "none")
+
+    def test_an_error_in_the_observer_itself_is_not_reported_as_a_lane_failure(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "telemetry"
+            outcome = self._failed_run(root, gpu_mode="programming_error")
+            self._assert_negative_terminal(root, outcome)
+            self.assertEqual(outcome.receipt.reason, "observer_error")
+            self.assertEqual(outcome.receipt.failures, ())
+            self.assertIsNotNone(outcome.receipt.observer_error)
+            self.assertGreater(outcome.receipt.observer_error.original_error_bytes, 0)
+
+
+class R23FailurePrefixConservationTests(unittest.TestCase):
+    """D4 - the negative terminal conserves the bytes that exist and claims no others.
+
+    The prefix is built from real frames and a real plan, written as the observer writes
+    them, and read back by the product's own terminal reader. A truncated final line is the
+    case the reader must get exactly right: the complete prefix stops before it, and the
+    line plus everything after it is physical tail that is never re-spliced away.
+    """
+
+    def _terminal(self, directory, *, complete_frames=3, tail=b"", **receipt_changes):
+        """Write a failure terminal whose prefix is `complete_frames` real frames."""
+        plan = _wire_plan(duration_ns=3 * NS)
+        frames = _pull_frames(plan)[:complete_frames]
+        plan_bytes = canonical_bytes(plan.model_dump(mode="json"))
+        prefix = b"".join(canonical_bytes(frame.model_dump(mode="json")) + b"\n" for frame in frames)
+        raw = prefix + tail
+        run = Path(directory) / plan.run_id
+        run.mkdir(parents=True, mode=0o700)
+
+        def retain(name, payload):
+            path = run / name
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            return path
+
+        retain("sampling-plan.v1.json", plan_bytes)
+        retain("frames.v3.jsonl", raw)
+        source = _shared_receipt()
+        failure = _interface(TELEMETRY, "CollectionFailureV1")(
+            lane="gpu_fast", category="deadline",
+            scheduled_monotonic_ns=plan.started_monotonic_ns,
+            started_monotonic_ns=plan.started_monotonic_ns,
+            finished_monotonic_ns=plan.started_monotonic_ns + 1,
+            observer_clock_domain_identity_sha256=plan.observer_clock_domain_identity_sha256,
+            exception_type="TelemetrySnapshotDeadlineExceeded", message="resident snapshot deadline",
+            error_bytes_sha256=artifact_sha256(b"declared"), original_error_bytes=8,
+            retained_error_bytes=8, dropped_error_bytes=0, error_text="declared",
+        )
+        document = {
+            "run_id": plan.run_id, "reason": "lane_collection_failure",
+            "runtime_bundle_identity_sha256": source.runtime_bundle_identity_sha256,
+            "process_profile_sha256": source.process_profile.process_profile_sha256,
+            "observer_source_sha256": _observer_source_sha256(),
+            "observer_identity": source.observer_identity.model_dump(mode="json"),
+            "clock_domain_identity_sha256": plan.observer_clock_domain_identity_sha256,
+            "sampling_plan_sha256": artifact_sha256(plan_bytes),
+            "planned_start_monotonic_ns": plan.started_monotonic_ns,
+            "planned_end_monotonic_ns": plan.planned_end_monotonic_ns,
+            "collectors_quiesced": True,
+            "raw_frames": {"name": "frames.v3.jsonl", "sha256": artifact_sha256(raw),
+                           "physical_bytes": len(raw), "complete_prefix_bytes": len(prefix),
+                           "complete_records": len(frames), "trailing_bytes": len(raw) - len(prefix)},
+            "lane_coverage": self._coverage(plan, frames),
+            "failures": [failure.model_dump(mode="json")],
+        }
+        document.update(receipt_changes)
+        receipt = _interface(TELEMETRY, "SynchronizedTelemetryFailureReceiptV1").model_validate(document)
+        receipt_bytes = canonical_bytes(receipt.model_dump(mode="json"))
+        retain("receipt.failure.v1.json", receipt_bytes)
+        seal = _interface(TELEMETRY, "SynchronizedTelemetryFailureSealV1")(
+            run_id=plan.run_id, receipt_sha256=artifact_sha256(receipt_bytes),
+            sampling_plan_sha256=artifact_sha256(plan_bytes), raw_frames_sha256=artifact_sha256(raw),
+            physical_bytes=len(raw), complete_prefix_bytes=receipt.raw_frames.complete_prefix_bytes,
+            complete_records=receipt.raw_frames.complete_records, collectors_quiesced=True,
+            sealed_monotonic_ns=plan.planned_end_monotonic_ns,
+        )
+        retain("seal.failure.v1.json", canonical_bytes(seal.model_dump(mode="json")))
+        self.retain = retain
+        return plan, run, prefix, raw
+
+    @staticmethod
+    def _coverage(plan, frames):
+        """Slot accounting derived here from the plan, not read back from the product."""
+        coverage = []
+        for lane in ("gpu_fast", "host_slow"):
+            period_ns = (plan.gpu_nominal_interval_ms if lane == "gpu_fast"
+                         else plan.host_nominal_interval_ms) * 1_000_000
+            planned = (plan.duration_ns + period_ns - 1) // period_ns
+            slots = sorted((frame.clock.scheduled_monotonic_ns - plan.started_monotonic_ns) // period_ns
+                           for frame in frames if frame.lane == lane)
+            coverage.append({"lane": lane, "planned_slots": planned, "complete_records": len(slots),
+                             "usable_slots": len(slots), "missing_slots": planned - len(slots),
+                             "first_slot": slots[0] if slots else None,
+                             "last_slot": slots[-1] if slots else None})
+        return coverage
+
+    def _read(self, root, run_id):
+        return _interface(OBSERVER, "read_synchronized_telemetry_terminal")(
+            artifact_root=Path(root), run_id=run_id)
+
+    def test_a_half_written_final_line_is_physical_tail_and_is_never_re_spliced(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            # The fourth frame stopped mid-line, exactly as a killed writer leaves it.
+            plan = _wire_plan(duration_ns=3 * NS)
+            interrupted = canonical_bytes(_pull_frames(plan)[3].model_dump(mode="json"))[:40]
+            _plan_value, run, prefix, raw = self._terminal(root, complete_frames=3, tail=interrupted)
+            self.assertGreater(len(raw), len(prefix))
+
+            result = self._read(root, plan.run_id)
+            self.assertEqual(len(result.prefix_frames), 3)
+            self.assertEqual(result.receipt.raw_frames.complete_prefix_bytes, len(prefix))
+            self.assertEqual(result.receipt.raw_frames.trailing_bytes, len(raw) - len(prefix))
+            self.assertEqual((run / "frames.v3.jsonl").read_bytes(), raw,
+                             "the reader must not rewrite the bytes it reports")
+
+            # One claim at a time, each refused: more records than the bytes hold, a prefix
+            # that swallows the broken line, and a window shortened to what was collected.
+            for name, changes in (
+                ("more_records", {"raw_frames": dict(result.receipt.raw_frames.model_dump(mode="json"),
+                                                     complete_records=4)}),
+                ("prefix_over_the_broken_line", {"raw_frames": dict(
+                    result.receipt.raw_frames.model_dump(mode="json"),
+                    complete_prefix_bytes=len(raw), trailing_bytes=0)}),
+                ("shortened_window", {"planned_end_monotonic_ns": plan.started_monotonic_ns + NS}),
+            ):
+                with self.subTest(claim=name):
+                    document = json.loads((run / "receipt.failure.v1.json").read_bytes())
+                    document.update(changes)
+                    self.retain("receipt.failure.v1.json", canonical_bytes(document))
+                    with self.assertRaises(ValueError):
+                        self._read(root, plan.run_id)
+
+    def test_a_run_that_collected_nothing_still_seals_its_own_empty_prefix(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            plan, run, prefix, raw = self._terminal(root, complete_frames=0)
+            self.assertEqual((prefix, raw), (b"", b""))
+            result = self._read(root, plan.run_id)
+            self.assertEqual(result.prefix_frames, ())
+            self.assertEqual(result.receipt.raw_frames.sha256, artifact_sha256(b""))
+            self.assertEqual(result.receipt.planned_end_monotonic_ns, plan.planned_end_monotonic_ns)
+            # An empty negative terminal is still not a pass.
+            verify = _interface(OBSERVER, "verify_synchronized_telemetry_observer")
+            with self.assertRaises(ValueError):
+                verify(artifact_root=Path(root), run_id=plan.run_id, receipt_version=4)
+
+    def test_two_complete_terminals_are_refused_rather_than_one_of_them_chosen(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as root:
+            plan, run, _prefix, _raw = self._terminal(root, complete_frames=3)
+            self.retain("receipt.v4.json", b"{}")
+            self.retain("seal.v4.json", b"{}")
+            with self.assertRaisesRegex(ValueError, "two complete terminals"):
+                self._read(root, plan.run_id)
+
+
+
+class R23DedicatedChildTerminalTests(unittest.TestCase):
+    """D5 - a real observer child that could not collect: exit 1, drained, negative terminal only.
+
+    This is the seam a stand-in cannot decide. The child is an actual process with its own
+    collectors; the parent learns the outcome from a real exit status and a real control
+    channel. What is pinned is that a non-zero exit is recorded rather than raised, that the
+    drain announcement still describes the bytes that exist, and that the negative terminal
+    is readable only as itself.
+    """
+
+    CHILD_BOUND_SECONDS = 30.0
+
+    def _child(self):
+        from dataclasses import replace as _replace
+        import tempfile
+        from disclosure_anchor.adapters.runtime.mac_observer_identity import (
+            MacObserverIdentityReader, check_mac_observer_identity,
+        )
+        from tests.unit import test_dedicated_mac_observer as dedicated
+        from tests.unit.test_synchronized_telemetry_observer import _collector_spec
+        from tests.unit.test_synchronized_telemetry_observer_v3 import _api_profile
+
+        request_type = _interface("disclosure_anchor.adapters.runtime.dedicated_mac_observer",
+                                  "DedicatedMacObserverRequest")
+        observer_type = _interface("disclosure_anchor.adapters.runtime.dedicated_mac_observer",
+                                   "DedicatedMacObserver")
+        clock = check_mac_observer_identity(
+            MacObserverIdentityReader().observe()).clock_domain_identity_sha256
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        # The GPU lane cannot answer; the host lane is the product's own clocked fixture, so
+        # the child is refused by its own collector, not by an invalid request.
+        request = request_type(
+            Path(directory.name).resolve() / "telemetry", _api_profile(),
+            _collector_spec(lane="gpu", mode="deadline", observer_clock_domain_identity_sha256=clock),
+            _replace(_collector_spec(lane="host", observer_clock_domain_identity_sha256=clock),
+                     factory_module=dedicated.__name__,
+                     factory_qualname="_clocked_test_collector_factory"),
+            1.0, RUN_ID, receipt_version=4, owner_intent_sha256=INTENT_SHA,
+        )
+        child = observer_type(request)
+
+        def reap():
+            try:
+                child.close()
+            except BaseException:  # noqa: BLE001 - cleanup only; the case asserts the real close
+                pass
+
+        self.addCleanup(reap)
+        return request, child
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _captured_child_stderr():
+        """Hold the child's own descriptor 2, so its failure is evidence and not suite noise."""
+        import tempfile
+
+        with tempfile.TemporaryFile() as sink:
+            saved = os.dup(2)
+            os.dup2(sink.fileno(), 2)
+            try:
+                yield sink
+            finally:
+                os.dup2(saved, 2)
+                os.close(saved)
+                sink.seek(0)
+
+    def test_a_child_that_could_not_collect_exits_one_and_hands_back_only_its_terminal(self):
+        events = []
+        # The child inherits descriptor 2 when it is created, so the capture is held from
+        # before that moment; otherwise its traceback lands in the suite's own output.
+        with self._captured_child_stderr() as sink:
+            request, child = self._child()
+            self.assertNotEqual(child.pid, os.getpid(), "the observer runs in its own process")
+            child.start()
+            deadline = time.monotonic() + self.CHILD_BOUND_SECONDS
+            while len(events) < 2 and time.monotonic() < deadline:
+                event = child.poll_event(timeout=1.0)
+                if event is None:
+                    continue
+                events.append(event)
+            self.assertEqual([event["kind"] for event in events], ["plan_recorded", "sampling_drained"],
+                             "a failing run still announces its plan and its drain, in that order")
+            with self.assertRaises(RuntimeError):
+                child.poll_event(timeout=0.5)
+            exited = child.wait_exit(timeout=self.CHILD_BOUND_SECONDS)
+            # The child has exited, so the shared descriptor is quiet; rewind and read it.
+            sink.seek(0)
+            child_stderr = sink.read().decode("utf-8", "replace")
+        self.assertTrue(exited)
+        # The child ends on the collection failure itself, not on a generic crash; the
+        # lane's own original exception is carried by the receipt, asserted below.
+        self.assertIn("SynchronizedTelemetryCollectionFailed", child_stderr)
+        self.assertIn("lane_collection_failure", child_stderr)
+        self.assertEqual(child.exit_code, 1,
+                         "a failed collection keeps its non-zero exit; it is recorded, not raised")
+
+        terminal = child.replay_terminal()
+        failure_result = _interface(OBSERVER, "SynchronizedTelemetryFailureResult")
+        self.assertIsInstance(terminal, failure_result)
+        self.assertEqual(terminal.receipt.measurement_credit, "none")
+        self.assertEqual(terminal.receipt.reason, "lane_collection_failure")
+        gpu = next(item for item in terminal.receipt.failures if item.lane == "gpu_fast")
+        self.assertEqual((gpu.category, gpu.exception_type), ("deadline", "TelemetrySnapshotDeadlineExceeded"))
+        self.assertIn("TelemetrySnapshotDeadlineExceeded", gpu.error_text)
+        # The same terminal, however often it is read; and never as a normal one.
+        self.assertEqual(child.replay_terminal(), terminal)
+        with self.assertRaisesRegex(RuntimeError, "replay_terminal"):
+            child.replay_result()
+
+        run = request.artifact_root / request.run_id
+        self.assertEqual({path.name for path in run.iterdir()},
+                         {"sampling-plan.v1.json", "frames.v3.jsonl",
+                          "receipt.failure.v1.json", "seal.failure.v1.json"})
+        # The drain announcement describes the bytes that exist, not the ones planned.
+        raw = (run / "frames.v3.jsonl").read_bytes()
+        drained = events[1]
+        self.assertEqual(drained["frames_jsonl_sha256"], artifact_sha256(raw))
+        self.assertEqual(drained["frames_bytes"], len(raw))
+        self.assertEqual(drained["frames_records"], terminal.receipt.raw_frames.complete_records)
+        self.assertEqual(terminal.receipt.raw_frames.physical_bytes, len(raw))
 
 
 if __name__ == "__main__":
