@@ -11,6 +11,7 @@ agree (spec, intent, evaluation plan, manifest, quality plan) raises.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import os
@@ -25,7 +26,7 @@ from disclosure_anchor.adapters.runtime.m6_campaign_assembly import (
 )
 from disclosure_anchor.adapters.runtime.m6_public_consumer_verifier import _audit
 from disclosure_anchor.adapters.runtime.resident_owner_evidence import (
-    OWNER_RESULT_CONTRACT_VERSION, ResidentOwnerEvidence, replay_resident_owner_evidence,
+    OWNER_RESULT_CONTRACT_VERSION, ResidentOwnerEvidence, ResidentOwnerEvidenceForeign, replay_resident_owner_evidence,
 )
 from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
     FAILURE_RECEIPT_FILENAME, FAILURE_SEAL_FILENAME, SynchronizedTelemetryFailureResult,
@@ -119,6 +120,30 @@ class CampaignEvidence:
 _DIGEST_TEXT = re.compile(r"sha256:[0-9a-f]{64}")
 
 
+_PROBLEM_NAME_MAX_CHARS = 200
+_PROBLEM_NAME_UNSAFE = re.compile(r"[\x00-\x20\x7f]+")
+
+
+def problem_name(prefix: str, detail: object) -> str:
+    """One report-shaped problem name: ``prefix`` plus ``detail`` with every space or control
+    character folded to ``_`` and the whole bounded.
+
+    The delivery report validates every reason and unknown as an ``M6Reason`` (no
+    ``[\\x00-\\x20\\x7f]``, at most 256 characters even after the report prefixes it), so a
+    sentence-shaped error from a reader or a checker must arrive here as a token that still
+    says the same thing; a report that refuses to exist because of the failure it should name
+    reads downstream like a run that was never scored. The original text stays in the evidence
+    the sentence came from (``owner-failure.json``, ``sampling-first-failure.json``, the
+    observer terminal), which the report indexes by its bytes.
+    """
+    text = _PROBLEM_NAME_UNSAFE.sub("_", str(detail)).strip("_")
+    return (prefix + (text or "unspecified"))[:_PROBLEM_NAME_MAX_CHARS]
+
+
+def _problem_names(problems: Iterable[str]) -> tuple[str, ...]:
+    return tuple(sorted({problem_name("", name) for name in problems}))
+
+
 class _Reader:
     """Reads existing files only, hashing each one and naming every proof it could not read."""
 
@@ -132,7 +157,7 @@ class _Reader:
         return self._run_dir
 
     def note(self, name: str) -> None:
-        self._unknowns.add(name)
+        self._unknowns.add(problem_name("", name))
 
     def label(self, path: Path) -> str:
         try:
@@ -190,10 +215,10 @@ class _Reader:
         try:
             value = strict_json_loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-            self._unknowns.add(f"{self.label(path)}_unreadable:{type(exc).__name__}")
+            self.note(f"{self.label(path)}_unreadable:{type(exc).__name__}")
             return None
         if type(value) is not dict:
-            self._unknowns.add(f"{self.label(path)}_is_not_an_object")
+            self.note(f"{self.label(path)}_is_not_an_object")
             return None
         return value
 
@@ -770,7 +795,7 @@ def _stage_timing_facts(
     return StageTimingFacts(
         observation_status=status, observation_counts=MappingProxyType(counts),
         runner_clock=runner_clock, verifier_clock=verifier_clock, notes=notes,
-        verifier_attempts=attempts, problems=tuple(sorted(set(problems))),
+        verifier_attempts=attempts, problems=_problem_names(problems),
     )
 
 
@@ -820,7 +845,7 @@ def _telemetry_facts_v4(
     try:
         result = read_synchronized_telemetry_terminal(artifact_root=artifact_root, run_id=run_id)
     except SynchronizedTelemetryTerminalAbsent as exc:
-        reader.note(f"telemetry_terminal_absent:{str(exc)[:200]}")
+        reader.note(problem_name("telemetry_terminal_absent:", exc))
         for name, bound in (("frames.v3.jsonl", _MAX_TELEMETRY_FRAMES_BYTES), ("sampling-plan.v1.json", _MAX_INPUT_BYTES)):
             reader.read(run_directory / name, absent="telemetry_artifact_absent:" + name, maximum=bound)
         _owner_failure_facts(reader, resident_owner_evidence_dir, problems=None)
@@ -902,7 +927,7 @@ def _telemetry_facts_v4(
             try:
                 check_resident_observer_mapping_v4(ready=ready, closed_bytes=closed, frames=frames, receipt=receipt, plan=plan)
             except ValueError as exc:
-                problems.append(f"resident_owner_mapping_failed:{lane}:{exc}"[:300])
+                problems.append(problem_name(f"resident_owner_mapping_failed:{lane}:", exc))
         if {"gpu_fast", "host_slow"} <= set(owner.readies) and {"gpu_fast", "host_slow"} <= set(owner.closures):
             try:
                 cpu = check_combined_resident_cpu_v4(
@@ -910,7 +935,7 @@ def _telemetry_facts_v4(
                     gpu_closure=owner.closures["gpu_fast"], host_closure=owner.closures["host_slow"], receipt=receipt, seal=seal,
                 )
             except ValueError as exc:
-                problems.append(f"resident_owner_cpu_failed:{exc}"[:300])
+                problems.append(problem_name("resident_owner_cpu_failed:", exc))
             else:
                 if not cpu.within_two_percent:
                     problems.append("resident_owner_cpu_over_two_percent")
@@ -919,7 +944,7 @@ def _telemetry_facts_v4(
     return TelemetryFacts(
         receipt_sha256=seal.receipt_sha256, seal_sha256=reader.digest(run_directory / "seal.v4.json"),
         contract_version=receipt.contract_version, status=receipt.status, seal_status=seal.status,
-        aggregates=aggregates, problems=tuple(sorted(set(problems))),
+        aggregates=aggregates, problems=_problem_names(problems),
     )
 
 
@@ -929,15 +954,18 @@ def _replay_owner(reader: _Reader, directory: Path, *, run_id: str, problems: li
         owner = replay_resident_owner_evidence(
             directory, run_id=run_id, windows_node_identity_sha256=_physical_owner_node_identity(reader),
         )
+    except ResidentOwnerEvidenceForeign as exc:
+        # Another run's owner directory is the wrong input, refused outright; it never scores this run.
+        raise CampaignIdentityError(str(exc)) from exc
     except ValueError as exc:
-        problems.append(f"resident_owner:evidence_unreplayable:{str(exc)[:200]}")
+        problems.append(problem_name("resident_owner:evidence_unreplayable:", exc))
         _owner_failure_facts(reader, directory, problems=problems)
         return None
     # The owner reader hashed the original bytes it read once, bounded and without
     # following symlinks; those digests enter the input index as they are.
     for name, digest in sorted(owner.files.items()):
         reader.record_digest(directory / name, digest)
-    problems.extend("resident_owner:" + problem for problem in owner.problems)
+    problems.extend(problem_name("resident_owner:", problem) for problem in owner.problems)
     _owner_failure_facts(reader, directory, problems=problems)
     return owner
 
@@ -990,7 +1018,7 @@ def _telemetry_failure_facts_v4(
     return TelemetryFacts(
         receipt_sha256=seal.receipt_sha256, seal_sha256=reader.digest(run_directory / FAILURE_SEAL_FILENAME),
         contract_version=receipt.contract_version, status=receipt.status, seal_status=seal.status,
-        aggregates=None, problems=tuple(sorted(set(problems))),
+        aggregates=None, problems=_problem_names(problems),
     )
 
 
@@ -1084,7 +1112,7 @@ def _telemetry_facts(
     return TelemetryFacts(
         receipt_sha256=seal.receipt_sha256, seal_sha256=reader.digest(run_directory / "seal.v3.json"),
         contract_version=receipt.contract_version, status=receipt.status, seal_status=seal.status,
-        aggregates=aggregates, problems=tuple(sorted(set(problems))),
+        aggregates=aggregates, problems=_problem_names(problems),
     )
 
 

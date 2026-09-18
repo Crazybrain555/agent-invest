@@ -1,9 +1,11 @@
 """Independent durability/transport tests; scripted owner is not Windows evidence."""
 
 from dataclasses import replace
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import unittest
@@ -12,11 +14,17 @@ from unittest import mock
 from disclosure_anchor.adapters.runtime.m6_e2e_assembly import (
     M6E2EAssemblyWorker, M6LeaseStartupError, M6LifecycleSpool,
 )
+from disclosure_anchor.application.contracts.staged_resource_paths import (
+    staged_materialization_relpaths, staged_retained_relpaths, staged_snapshot_relpaths,
+)
 from disclosure_anchor.application.ports.staged_lifecycle_facts import AttemptAdmittedFact
 from disclosure_anchor.application.services.staged_campaign_runner import (
     CampaignStopState, campaign_stop_predicate,
 )
-from disclosure_anchor.cli.staged_campaign import _await_first_owner_lease
+from disclosure_anchor.cli.staged_campaign import (
+    SCRATCH_RESIDUAL_LIST_BOUND, _await_first_owner_lease, scratch_residual_audit,
+)
+from disclosure_anchor.settings import Settings
 from tests import m6_owner_support as owner_support
 from tests import m6_support as m6
 
@@ -580,6 +588,255 @@ class AssemblyIndependentTests(unittest.TestCase):
             worker.close(3)
         self.assertFalse(worker._thread.is_alive())
 
+
+class ScratchResidualIndependentTests(unittest.TestCase):
+    """What the shared v4 scratch root proves about one campaign's own closure.
+
+    The measured campaign finished with every admitted attempt ACKed, no credit in use and a
+    clean coordinator result, and its native close was still refused: the runner receipt
+    recorded `residual_count: 2` and the owner answered `resource_closure_pending`. The two
+    counted entries were the namespaces themselves. `spool/` and `materialization/` are created
+    once and kept, their own timestamps move whenever anything inside them is created or
+    removed, and every v4 attempt takes at least one resource lock inside `spool/`.
+
+    The paths here are the product's own (`staged_resource_paths`), so a payload left in this
+    fixture sits exactly where the adapter would have left it, and the lock records are the
+    ones `_locked` writes and never unlinks. Every entry is stamped explicitly, so what these
+    cases vary is what the scratch holds, never when the suite happened to run.
+    """
+
+    # The measured campaign's own start instant; the fixture is stamped around it.
+    STARTED = datetime(2026, 9, 18, 1, 38, 4, tzinfo=UTC)
+    ATTEMPT, FENCE = "rpa_independent_attempt_1", "fence_independent_attempt_1"
+    OTHER_ATTEMPT, OTHER_FENCE = "rpa_independent_attempt_2", "fence_independent_attempt_2"
+    ARTIFACT = "sha256:" + "a" * 64
+    OUTPUT = "doc-0001"
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name).resolve()
+        self.scratch = root / "runtime" / "staged_v4" / "scratch"
+        self.kept = {self.scratch, self.scratch / "spool", self.scratch / "materialization",
+                     self.scratch / "spool" / ".materialization-locks"}
+        (self.scratch / "spool" / ".materialization-locks").mkdir(parents=True, mode=0o700)
+        (self.scratch / "materialization").mkdir(mode=0o700)
+        self.settings = Settings(
+            disclosure_data_root=root / "data", disclosure_shared_root=root / "shared",
+            disclosure_runtime_root=root / "runtime", mineru_model_cache=root / "models",
+            hf_home=root / "hf", modelscope_cache=root / "modelscope")
+        self.snapshot = staged_snapshot_relpaths(
+            attempt_id=self.ATTEMPT, fence_identity=self.FENCE, source_pdf_sha256=self.ARTIFACT)
+        self.retained = staged_retained_relpaths(
+            attempt_id=self.ATTEMPT, fence_identity=self.FENCE,
+            artifact_owner_identity="staged-v4-owner", artifact_sha256=self.ARTIFACT)
+        self.materialization = staged_materialization_relpaths(
+            output_dir_name=self.OUTPUT, attempt_id=self.ATTEMPT, fence_identity=self.FENCE,
+            artifact_sha256=self.ARTIFACT)
+        binding = {"attempt_id": self.ATTEMPT, "fence_identity": self.FENCE}
+        # One sentinel of every kind this run took, and one an earlier run left: a resource lock
+        # is opened, flocked and kept, so the spool accumulates them and never loses one.
+        for relpath, kind in ((self.snapshot["snapshot_lock"], "snapshot"),
+                              (self.retained["spool_lock"], "spool"),
+                              (self.materialization["staging_lock"], "staging")):
+            self.write(relpath, self.lock_record(kind, binding), seconds=100)
+        self.write(staged_snapshot_relpaths(
+            attempt_id=self.OTHER_ATTEMPT, fence_identity=self.OTHER_FENCE,
+            source_pdf_sha256=self.ARTIFACT)["snapshot_lock"],
+            self.lock_record("snapshot", {"attempt_id": self.OTHER_ATTEMPT,
+                                          "fence_identity": self.OTHER_FENCE}), seconds=-86_400)
+        self.settle()
+
+    @staticmethod
+    def lock_record(kind, binding):
+        return json.dumps({"binding": binding, "kind": kind, "schema": "mineru-v4-resource-lock.v1"},
+                          separators=(",", ":"), sort_keys=True).encode()
+
+    def stamp(self, path, seconds):
+        moment = self.STARTED.timestamp() + seconds
+        os.utime(path, (moment, moment), follow_symlinks=False)
+
+    def write(self, relpath, payload, *, seconds):
+        path = self.scratch / relpath
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        self.stamp(path, seconds)
+        return path
+
+    def remove(self, relpath):
+        """Take one entry back out, and the directories that only existed to hold it."""
+        path = self.scratch / relpath
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        parent = path.parent
+        while parent not in self.kept and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+
+    def settle(self, seconds=120):
+        """Stamp the kept directories inside the run, which is what creating anything does."""
+        for path in sorted(self.kept):
+            self.stamp(path, seconds)
+
+    def audit(self):
+        """The audit the owner-bound campaign runs over the shared scratch at closure."""
+        return scratch_residual_audit(self.scratch, self.STARTED)
+
+    def residuals(self):
+        return self.audit().count
+
+    def named(self, relpaths):
+        """Every counted residual is named, each name is one of the entries just left, and
+        auditing left them all exactly where they were: what is counted is never consumed."""
+        before = self.tree()
+        audit = self.audit()
+        self.assertEqual(self.tree(), before, "the audit reads the scratch and removes nothing")
+        self.assertEqual(len(audit.entries), min(audit.count, SCRATCH_RESIDUAL_LIST_BOUND),
+                         f"unnamed residuals: {audit}")
+        for name in audit.entries:
+            self.assertTrue(any(left == name or left.startswith(name + "/") for left in relpaths),
+                            f"{name} is not one of {sorted(relpaths)}")
+        return audit
+
+    def tree(self):
+        observed = {}
+        for path in sorted(self.scratch.rglob("*")):
+            name = str(path.relative_to(self.scratch))
+            if path.is_symlink():
+                observed[name] = ("symlink", os.readlink(path))
+            elif path.is_dir():
+                observed[name] = ("directory", None)
+            else:
+                observed[name] = ("file", path.read_bytes())
+        return observed
+
+    def test_the_kept_namespaces_and_their_lock_sentinels_are_not_residual_work(self):
+        """The measured counterexample: a run that left nothing behind must still close.
+
+        Both namespaces were touched during the run, every lock kind is represented, and the
+        sentinels include ones this run took as well as one an earlier run left. None of it is
+        work this run failed to finish, so none of it may hold the native close open.
+        """
+        before = self.tree()
+        self.assertEqual(sorted(entry.name for entry in self.scratch.iterdir()),
+                         ["materialization", "spool"], "the shared scratch keeps two namespaces")
+        self.assertEqual([name for name, (kind, _value) in before.items() if kind == "file"
+                          and not name.endswith(".lock")], [],
+                         "this fixture leaves no payload at all: only kept locks")
+        audit = self.audit()
+        self.assertEqual((audit.count, audit.entries), (0, ()),
+                         "kept namespaces and lock sentinels are not residual jobs")
+        self.assertEqual(self.tree(), before, "the residual check only reads the shared scratch")
+
+    def test_each_kind_of_left_payload_is_counted_and_stops_counting_once_it_is_gone(self):
+        """Real work left behind must refuse the close, and only while it is actually there.
+
+        Each case is the clean scratch plus one leftover at the path the adapter derives for it.
+        Removing the leftover leaves both namespaces stamped inside the run exactly as the
+        counterexample above has them, so a count that tracks entries returns to zero while a
+        count that tracks the namespaces cannot.
+        """
+        staging = self.materialization["staging"]
+        cases = {
+            "an unconsumed source snapshot": ((self.snapshot["snapshot"], b"%PDF-1.7 unconsumed"),),
+            "a partial upload and its owner record": (
+                (self.snapshot["snapshot_part"], b"%PDF-1.7 partial"),
+                (self.snapshot["snapshot_part_owner"], b'{"owner":"attempt"}'),
+            ),
+            "a retained provider archive": ((self.retained["spool"], b"PK\x03\x04 retained"),),
+            "an interrupted materialization working directory": (
+                (self.materialization["staging_marker"], b'{"inflight":true}'),
+                (staging + "/document.md", b"# half written"),
+            ),
+            "an output directory still inside the scratch": (
+                (self.materialization["output"] + "/document.md", b"# promoted nowhere"),
+            ),
+        }
+        for label, entries in cases.items():
+            with self.subTest(left=label):
+                for relpath, payload in entries:
+                    self.write(relpath, payload, seconds=140)
+                self.settle()
+                self.assertGreaterEqual(self.residuals(), 1, f"{label} is this run's unfinished work")
+                # A close the owner refuses has to say what held it open, so what the audit
+                # counted it also names, and it names this leftover rather than anything kept.
+                self.named([relpath for relpath, _payload in entries])
+                for relpath, _payload in entries:
+                    self.remove(relpath)
+                self.settle()
+                self.assertEqual(self.residuals(), 0, f"{label} is gone; nothing else was ever residual")
+
+    def test_two_attempts_that_left_work_behind_are_not_one_residual(self):
+        """`residual_count` is a count, and the measured receipt reported 2 for an empty scratch.
+
+        Two attempts' leftovers are two pieces of unfinished work; a number that cannot tell
+        them apart cannot be read as the quantity the closure receipt publishes.
+        """
+        other = staged_snapshot_relpaths(attempt_id=self.OTHER_ATTEMPT, fence_identity=self.OTHER_FENCE,
+                                         source_pdf_sha256=self.ARTIFACT)
+        self.write(self.snapshot["snapshot"], b"%PDF-1.7 first", seconds=140)
+        self.write(other["snapshot"], b"%PDF-1.7 second", seconds=150)
+        self.settle()
+        self.assertGreaterEqual(self.residuals(), 2, "each attempt's leftover is its own residual")
+
+    def test_a_payload_from_an_earlier_run_stays_outside_this_run_s_closure(self):
+        """The documented scope this receipt claims: what THIS run left, by this run's own clock.
+
+        An earlier run's leftover is real operational state and somebody's problem, but counting
+        it here would turn every later close into a failure for work this campaign never started.
+        It is not excluded for being unrecognised - an unknown entry this run touched still counts
+        - but for being outside the window `started_utc` fixes. What it may never do is mask this
+        run's own leftover, so the count stays a count of this run's work.
+        """
+        self.write(self.snapshot["snapshot"], b"%PDF-1.7 left by an earlier run", seconds=-86_400)
+        self.settle()
+        self.assertEqual((self.audit().count, self.audit().entries), (0, ()),
+                         "an earlier run's payload is not this run's residual")
+        self.write(self.snapshot["snapshot_part"], b"%PDF-1.7 left by this one", seconds=140)
+        self.settle()
+        self.assertEqual(self.residuals(), 1, "and it neither hides nor doubles what this run left")
+        self.named([self.snapshot["snapshot_part"]])
+
+    def test_an_entry_the_path_contract_cannot_produce_is_still_a_residual(self):
+        """An unknown or unsafe entry is not proof of closure; it is the reason to look.
+
+        A rule that knows the namespaces and their sentinels has to know them by what they are,
+        not by ignoring whatever it cannot name, or the one entry nobody expected becomes the
+        one entry nobody counts.
+        """
+        cases = {
+            "a stray file in the spool": ("spool/stray-payload.bin", b"unknown owned bytes"),
+            "a stray file in the materialization namespace": ("materialization/stray.md", b"# stray"),
+            "a stray namespace at the top of the scratch": ("stray-namespace/held.bin", b"unknown bytes"),
+        }
+        for label, (relpath, payload) in cases.items():
+            with self.subTest(stranger=label):
+                self.write(relpath, payload, seconds=160)
+                self.settle()
+                self.assertGreaterEqual(self.residuals(), 1, f"{label} is unaccounted owned state")
+                self.remove(relpath)
+                self.settle()
+                self.assertEqual(self.residuals(), 0, f"{label} is gone; the kept scratch is closed")
+        # A symlink wearing a payload's own name is the unsafe case: every v4 open refuses to
+        # follow one, so nothing under this root may quietly stand for somewhere else.
+        link = self.scratch / self.snapshot["snapshot"]
+        link.symlink_to(self.scratch / "materialization")
+        self.stamp(link, 170)
+        self.settle()
+        self.assertGreaterEqual(self.residuals(), 1, "a symlink in the scratch is not a closed resource")
+        self.remove(self.snapshot["snapshot"])
+        # And one wearing a sentinel's name is the case that decides whether the audit looked or
+        # followed: the link resolves to a kept lock, so anything that resolves it sees a
+        # sentinel and stops counting, while reading the entry itself still sees a stranger.
+        disguised = self.scratch / "spool" / (".upload-" + "f" * 64 + ".lock")
+        self.assertFalse(disguised.exists(), "this sentinel name belongs to no attempt in the fixture")
+        disguised.symlink_to(self.scratch / self.snapshot["snapshot_lock"])
+        self.stamp(disguised, 180)
+        self.settle()
+        self.assertGreaterEqual(self.residuals(), 1, "a sentinel's name on a symlink is not a sentinel")
 
 
 if __name__ == "__main__":

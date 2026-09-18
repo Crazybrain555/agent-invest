@@ -947,6 +947,157 @@ class ResidentOwnerEvidenceCliTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("m6_campaign_error", self.last_error)
 
+    def wire_report(self, label):
+        """Re-read the written report the way the measured driver does, through its own decoder."""
+        from disclosure_anchor.application.contracts.m6_delivery_report import (
+            M6_DELIVERY_REPORT_MAX_BYTES, M6DeliveryReport,
+        )
+
+        raw = (self.root / label / "delivery-report.json").read_bytes()
+        return M6DeliveryReport.from_canonical_bytes(
+            raw.rstrip(b"\n"), maximum_bytes=M6_DELIVERY_REPORT_MAX_BYTES)
+
+    def failed_owner_evidence(self):
+        """One real owner session of this same run that failed before it could write a result.
+
+        The owner runtime is the product's own; only its transport, observer child and lane
+        close are scripted, and the observer fault is what the measured run also hit. What it
+        retains is therefore a genuine failure packet - `owner-failure.json` written, no
+        `owner-result.json` - rather than the passing directory with a file deleted from it.
+        """
+        from tests.unit.test_resident_telemetry_owner import _fixture, run_owner_session
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        request, external, result = _fixture(Path(directory.name).resolve())
+        self.assertEqual(request.run_id, self.request.run_id, "the failed owner must belong to this run")
+        with self.assertRaises(BaseExceptionGroup):
+            run_owner_session(request, external, result, observer_error=True)
+        evidence = request.evidence_directory
+        self.assertFalse((evidence / "owner-result.json").exists(), "a failed owner writes no result")
+        self.assertTrue((evidence / "owner-failure.json").is_file(), "it retains its own first error instead")
+        return evidence
+
+    def test_a_failed_owner_without_a_result_is_reported_not_refused_by_the_report_contract(self):
+        """The measured combination: a negative terminal AND an owner that never wrote a result.
+
+        The measured run produced no report at all from exactly this pair. The unknown gate
+        names the first problem the evidence states, the owner reader states that one as a
+        sentence, and `M6ResourceSafety.reason` is a machine-readable token, so the summary was
+        refused by its own contract on the run it had just measured (`M6ResourceSafety.reason
+        String should match pattern '^[^\\x00-\\x20\\x7f]+$'`). A measured failure that cannot
+        be reported reads downstream exactly like a run that was never scored at all, which is
+        the one thing a negative terminal must never be able to do.
+        """
+        self.negative_terminal(complete_records=2)
+        evidence = self.failed_owner_evidence()
+        retained = {path.name: path.read_bytes() for path in sorted(evidence.iterdir()) if path.is_file()}
+
+        code, report = self.owner_report("owner-failed-no-result", evidence_dir=evidence)
+
+        self.assertIsNotNone(report, f"a measured failure must still be reported: {self.last_error}")
+        self.assertEqual(code, 0, self.last_error)
+        # The bytes on disk are a whole delivery report by the product's own wire decoder, which
+        # is the call the measured driver makes before it reads any verdict out of them.
+        document = self.wire_report("owner-failed-no-result")
+        self.assertFalse(document.delivery_pass, "evidence that is missing can never read as a pass")
+        safety = document.resource_safety
+        self.assertEqual(safety.status, "unknown", safety.reason)
+        # Stable and machine-readable: the owner family, and not the code for a directory that
+        # was never supplied - this one was supplied, was read, and had failed.
+        self.assertTrue(safety.reason.startswith("resident_owner"), safety.reason)
+        self.assertNotEqual(safety.reason, "resident_owner_evidence_not_supplied")
+        self.assertIn("resource_safety_unproven:" + safety.reason, set(document.unknowns))
+        # The owner's own failure record is read and indexed by the digest of its original
+        # bytes, and the reporter leaves the retained evidence exactly as the owner wrote it.
+        inputs = {item.path: item.sha256 for item in document.evidence.inputs}
+        self.assertEqual(inputs.get((evidence / "owner-failure.json").as_posix()),
+                         self.sha(retained["owner-failure.json"]),
+                         "the original error stays in the evidence index, by its own bytes")
+        self.assertEqual({path.name: path.read_bytes() for path in sorted(evidence.iterdir()) if path.is_file()},
+                         retained, "a read-only reporter never rewrites the evidence it scores")
+
+    def test_a_malformed_owner_record_under_a_spaced_path_is_a_named_gap_and_not_a_refusal(self):
+        """The same failed measurement, scored out of a directory whose name contains a space.
+
+        `_Reader.document` names its two failure branches from the path it read, and that path is
+        the absolute one for every file outside `--run-dir` - the owner evidence directory and the
+        telemetry artifact root always are, in the measured run as well. A killed owner leaves a
+        record that starts and does not finish; read from `.../owner evidence/`, the name of that
+        gap carried the space into `unknowns` and the report was refused again for the very
+        failure it exists to name.
+
+        A damaged artifact is a gap in this run's evidence, never the wrong input: it can neither
+        refuse the report nor be answered as an identity, and the bytes stay as the owner left
+        them so the gap can still be audited from the report.
+        """
+        self.negative_terminal(complete_records=2)
+        evidence = self.root / "spaced parent" / "owner evidence"
+        evidence.parent.mkdir()
+        shutil.copytree(self.failed_owner_evidence(), evidence)
+        record = evidence / "owner-failure.json"
+        # What a killed owner can leave behind: the record began and never finished.
+        record.write_bytes(record.read_bytes()[:64])
+        self.assertIn(" ", str(evidence), "this case is about the path, not about the record")
+        retained = {path.name: path.read_bytes() for path in sorted(evidence.iterdir()) if path.is_file()}
+
+        code, report = self.owner_report("owner-record-spaced-path", evidence_dir=evidence)
+
+        self.assertIsNotNone(report, f"a damaged record is a gap to name: {self.last_error}")
+        self.assertEqual(code, 0, self.last_error)
+        self.assertNotIn("m6_campaign_error", self.last_error,
+                         "a damaged artifact is not the wrong input, and no identity answers it")
+        document = self.wire_report("owner-record-spaced-path")
+        self.assertFalse(document.delivery_pass, "damaged owner evidence is not a pass")
+        self.assertEqual(document.resource_safety.status, "unknown", document.resource_safety.reason)
+        self.assertTrue([name for name in document.unknowns if "owner-failure" in name],
+                        f"the damaged record must be named: {sorted(document.unknowns)}")
+        # Its original bytes are indexed as they are, under a path that still opens, and the
+        # reporter repaired nothing it read.
+        indexed = {item.path: item.sha256 for item in document.evidence.inputs
+                   if item.path.endswith("owner-failure.json")}
+        self.assertEqual(list(indexed.values()), [self.sha(retained["owner-failure.json"])])
+        for path, digest in indexed.items():
+            self.assertEqual(self.sha(Path(path).read_bytes()), digest, path)
+        self.assertEqual({path.name: path.read_bytes() for path in sorted(evidence.iterdir()) if path.is_file()},
+                         retained, "a read-only reporter never repairs the evidence it scores")
+
+    def test_a_run_whose_observer_left_no_terminal_at_all_is_an_unknown_and_not_a_refusal(self):
+        """The same defect on the other field, and the commoner way to reach it.
+
+        `_telemetry_facts` states the rule itself - a directory with no complete terminal is an
+        unknown, not a crash - and records `telemetry_terminal_absent:<what it found instead>`.
+        That name is an `M6Reason` as well, this one inside `unknowns`, and the sentence it
+        carries refuses the whole report exactly as the resource reason does. An observer killed
+        between its frames and its terminal leaves precisely this directory, so the repair has
+        to be the class of reason rather than the one line the measured run happened to hit.
+        """
+        for name in ("receipt.v4.json", "seal.v4.json"):
+            (self.run_directory / name).unlink()
+        code, report = self.owner_report("terminal-absent")
+        self.assertIsNotNone(report, f"an absent terminal is an unknown, not a refusal: {self.last_error}")
+        self.assertEqual(code, 0, self.last_error)
+        document = self.wire_report("terminal-absent")
+        self.assertFalse(document.delivery_pass, "no terminal is no measurement")
+        self.assertEqual(document.resource_safety.status, "unknown")
+        self.assertTrue(any(name.startswith("telemetry_terminal_absent") for name in document.unknowns),
+                        f"the absent terminal must be named: {sorted(document.unknowns)}")
+
+    def test_the_same_failed_measurement_with_no_owner_directory_is_reported_end_to_end(self):
+        """The adjacent case that already works, and the contrast that identifies the defect.
+
+        Same run, same negative terminal, no owner directory supplied: the reason the gate picks
+        happens to be a token, so the report is written. The pair above is therefore a defect in
+        the shape of one reason, not a claim that a failed measurement cannot be reported.
+        """
+        self.negative_terminal(complete_records=2)
+        code, report = self.owner_report("terminal-negative-no-owner", evidence_dir=None)
+        self.assertIsNotNone(report, f"exit {code}: {self.last_error}")
+        document = self.wire_report("terminal-negative-no-owner")
+        self.assertFalse(document.delivery_pass)
+        self.assertEqual(document.resource_safety.status, "unknown")
+        self.assertEqual(document.resource_safety.reason, "resident_owner_evidence_not_supplied")
+
     def test_the_entry_consumes_this_owner_s_own_retained_evidence(self):
         # The real summary entry, given this run's original owner directory and its sealed v4
         # artifacts, PASSES the resource gate. Exit 0 and a present evidence hash are produced
@@ -1006,6 +1157,9 @@ class ResidentOwnerEvidenceCliTests(unittest.TestCase):
         self.assertNotEqual(code, 0, "another run's owner directory cannot score this run")
         self.assertIn("another run", self.last_error)
         self.assertIsNone(report)
+        # And it is refused as the wrong input, not by whatever the refusal happened to be
+        # shaped like: the identity family, never a gap this run could have named and scored.
+        self.assertEqual(json.loads(self.last_error)["m6_campaign_error"], "identity")
 
     def test_a_foreign_plan_or_a_false_exit_is_named_by_the_owner_reader(self):
         # These two are decided one layer below the entry, because the report surfaces only its

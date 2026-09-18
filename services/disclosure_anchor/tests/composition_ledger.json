@@ -420,13 +420,13 @@
   },
   "tests/unit/test_m6_delivery_report_independent.py": {
    "private_imports": [],
-   "tests": 31
+   "tests": 35
   },
   "tests/unit/test_m6_e2e_assembly_independent.py": {
    "private_imports": [
     "_await_first_owner_lease"
    ],
-   "tests": 15
+   "tests": 20
   },
   "tests/unit/test_m6_lifecycle_emission_independent.py": {
    "private_imports": [],

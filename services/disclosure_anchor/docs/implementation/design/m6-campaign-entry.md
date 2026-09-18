@@ -55,6 +55,8 @@ admission_reconciliation / ownership_closure 收据并 ACK，quality/public veri
 （`external_admission_stop: before business spawn`）。控制文件身份/字节无效（FIFO、目录、错误 mode、错误字节）：
 spawn 前 → `CampaignInputError`（无业务）；spawn 后 → fail closed：记录 `external_admission_stop_invalid`，
 仍只请求 owner stop、不销毁在途工作（runner 侧对该路径只做存在性判断，因此本来就已停止准入）。
+**scratch 残留审计与报告原因形状（R23 live）。** runner 收据 `resource_audit.scratch_residual_count` / `ownership_closure.residual_count` 只数本次 run 在共享 V4 scratch（`staged_v4/scratch/spool`、`materialization`，路径契约见 `staged_resource_paths`）留下、且 lstat mtime ≥ run 开始的 payload 条目：源快照、部分上传及其 owner 记录、保留归档、staging 树、仍在 scratch 内的输出，以及路径契约无法命名的任何条目（含 symlink 与顶层陌生条目）。两个命名空间目录、`spool/.materialization-locks/` 与生产 `_locked` 永不 unlink 的 `.upload-*.lock` / `.retained-*.zip.lock` / `.<output>.lock` 哨兵（regular 文件）是结构而非残留；审计不打开、不跟随、不删除任何条目。收据 `m6_assembly.scratch_residuals` 列出前 64 个相对路径，让 owner 以 `resource_closure_pending` 拒绝 close 时能说明是什么。`summary` 侧：证据读取器把每个问题名折叠为报告形状（空白/控制字符→`_`、≤200 字符；`_Reader.note`、`TelemetryFacts.problems` 与 owner 回放问题统一经 `problem_name`），失败 owner（无 `owner-result.json`）或缺失终态成为命名的 unknown（如 `resident_owner:evidence_unreplayable:resident_owner_evidence_lacks_owner-result.json`、`telemetry_terminal_absent:*`）而不再让报告被自身契约拒绝；原始错误文本仍在原证据文件中并按字节入索引。另一 run 的 owner 目录（`run_id` 不符）是错误输入，`CampaignIdentityError` 直接拒绝而非计分。
+
 测量驱动（`tests/integration/m6_measured_campaign_independent.py`，`m6.measured-campaign-driver.v3`）在
 telemetry 退出/传输失配时发布 `<driver output>/campaign-admission.STOP` 并只等到 campaign spawn 时冻结的唯一
 绝对期限（`campaign_spawn + campaign_span_requirement`，不续期）；期限耗尽或控制写入失败才强制收尾，且本地退出

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
 import signal
+import stat
 import time
 from types import FrameType
 from typing import Any
@@ -74,13 +77,69 @@ def _read_pinned(path: Path, label: str) -> bytes:
     return payload
 
 
-def _scratch_residuals(settings: Settings, started_utc: datetime) -> int:
-    """Entries left under the shared V4 scratch root that were created during this run."""
-    root = settings.disclosure_runtime_root / "staged_v4" / "scratch"
+# The shared V4 scratch is the two namespaces of `staged_resource_paths`: `spool/` and
+# `materialization/`. Production keeps its lock sentinels forever - `_locked` opens them,
+# flocks them and never unlinks them - so a sentinel this run created is structure it may
+# leave, never work it left unfinished. Everything else the run touched is a residual while
+# it is there: a source snapshot, a partial upload and its owner record, a retained provider
+# archive, a staging tree, an output still inside the scratch, and any entry the path
+# contract cannot name.
+_SCRATCH_NAMESPACES = frozenset({"spool", "materialization"})
+_SPOOL_LOCK_DIRECTORY = ".materialization-locks"
+_SPOOL_SENTINEL = re.compile(r"\A\.(?:upload-[0-9a-f]{64}|retained-[0-9a-f]{64}\.zip)\.lock\Z")
+_STAGING_SENTINEL = re.compile(r"\A\.[^/]+\.lock\Z")
+SCRATCH_RESIDUAL_LIST_BOUND = 64
+
+
+@dataclass(frozen=True, slots=True)
+class ScratchResidualAudit:
+    """What this run left under the shared V4 scratch: the count the closure receipts publish
+    and the first entries by relative path, so a refused close names what held it open."""
+
+    count: int
+    entries: tuple[str, ...]
+
+
+def scratch_residual_audit(root: Path, started_utc: datetime) -> ScratchResidualAudit:
+    """Audit the shared V4 scratch ``root`` for entries this run created and did not consume.
+
+    Entries are read with ``lstat`` and never opened or followed: a symlink or a directory
+    wearing a sentinel's name is unknown state and counts. The two namespaces and the lock
+    directory are read through, not counted, however recently their contents changed; an
+    entry that disappears while it is being read was consumed, not left.
+    """
     if not root.is_dir():
-        return 0
+        return ScratchResidualAudit(0, ())
     threshold = started_utc.timestamp()
-    return sum(1 for entry in root.iterdir() if entry.lstat().st_mtime >= threshold)
+    residuals: list[str] = []
+
+    def entries_of(directory: Path) -> list[tuple[Path, os.stat_result]]:
+        found: list[tuple[Path, os.stat_result]] = []
+        for path in sorted(directory.iterdir()):
+            try:
+                found.append((path, path.lstat()))
+            except FileNotFoundError:
+                continue
+        return found
+
+    def consider(path: Path, info: os.stat_result) -> None:
+        if info.st_mtime >= threshold:
+            residuals.append(path.relative_to(root).as_posix())
+
+    for entry, info in entries_of(root):
+        if entry.name not in _SCRATCH_NAMESPACES or not stat.S_ISDIR(info.st_mode):
+            consider(entry, info)
+            continue
+        for child, child_info in entries_of(entry):
+            if entry.name == "spool" and child.name == _SPOOL_LOCK_DIRECTORY and stat.S_ISDIR(child_info.st_mode):
+                for sentinel, sentinel_info in entries_of(child):
+                    if not (stat.S_ISREG(sentinel_info.st_mode) and _STAGING_SENTINEL.match(sentinel.name)):
+                        consider(sentinel, sentinel_info)
+                continue
+            if entry.name == "spool" and stat.S_ISREG(child_info.st_mode) and _SPOOL_SENTINEL.match(child.name):
+                continue
+            consider(child, child_info)
+    return ScratchResidualAudit(len(residuals), tuple(residuals[:SCRATCH_RESIDUAL_LIST_BOUND]))
 
 
 def run_campaign(
@@ -249,9 +308,10 @@ def _run_owned_campaign(
         finally:
             runtime.close()
         if m6_run is not None and spool is not None and worker is not None:
+            audit = scratch_residual_audit(settings.disclosure_runtime_root / "staged_v4" / "scratch", started_utc)
             assembly = _finish_assembly(
                 m6_run, spool, worker, result=result, owner_identity=owner_identity,
-                scratch_residual_count=_scratch_residuals(settings, started_utc),
+                scratch_residual_count=audit.count, scratch_residuals=audit.entries,
             )
         return campaign_receipt(
             request=request, identity=identity, result=result, started_utc=started_utc,
@@ -271,8 +331,14 @@ def _await_first_owner_lease(worker: M6E2EAssemblyWorker, *, bound_seconds: floa
 def _finish_assembly(
     m6_run: M6RunDirectory, spool: M6LifecycleSpool, worker: M6E2EAssemblyWorker, *,
     result: CoordinatorResult, owner_identity: str, scratch_residual_count: int,
+    scratch_residuals: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Drain the spool, then run the runner closure on the worker's own client thread."""
+    """Drain the spool, then run the runner closure on the worker's own client thread.
+
+    ``scratch_residuals`` are the first audited relative paths behind ``scratch_residual_count``;
+    they enter the assembly record beside the closure so a close the owner refuses as
+    ``resource_closure_pending`` says what was still there.
+    """
     spec = m6_run.require_spec()
     closure: dict[str, Any] = {}
 
@@ -296,6 +362,7 @@ def _finish_assembly(
         "anchor_sha256": m6_run.anchor.canonical_sha256(), "producer_kind": "e2e_runner",
         "producer_epoch_sha256": m6_run.epoch("e2e_runner"), "run_directory_pins": m6_run.pins,
         "spool": spool_status, "worker_error": status.get("worker_error"), "closure": closure,
+        "scratch_residuals": list(scratch_residuals),
     }
 
 

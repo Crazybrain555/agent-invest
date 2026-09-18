@@ -222,6 +222,10 @@ def _replay_lane(
         problems.append(f"owner_check_failed:{lane}:check_resident_closure:{error}")
 
 
+class ResidentOwnerEvidenceForeign(ValueError):
+    """The directory is another run's owner evidence: the wrong input, not a gap in this run's."""
+
+
 def replay_resident_owner_evidence(
     directory: Path, *, run_id: str, windows_node_identity_sha256: str | None,
 ) -> ResidentOwnerEvidence:
@@ -276,7 +280,7 @@ def replay_resident_owner_evidence(
         raise ValueError("resident owner evidence result contract version differs")
     index = _evidence_index(result)
     if _text(intent, "run_id", "owner-intent.json") != run_id or _text(result, "run_id", "owner-result.json") != run_id:
-        raise ValueError("resident owner evidence belongs to another run")
+        raise ResidentOwnerEvidenceForeign("resident owner evidence belongs to another run")
     for name, digest in files.items():
         # The owner writes its result last, so its index cannot contain itself.
         if name != "owner-result.json" and index.get(name) != digest:
@@ -330,5 +334,6 @@ __all__ = [
     "OWNER_RESULT_CONTRACT_VERSION",
     "OWNER_RESULT_CONTRACT_VERSIONS",
     "ResidentOwnerEvidence",
+    "ResidentOwnerEvidenceForeign",
     "replay_resident_owner_evidence",
 ]
