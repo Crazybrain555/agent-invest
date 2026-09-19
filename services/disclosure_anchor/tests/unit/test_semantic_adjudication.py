@@ -384,7 +384,7 @@ class OrderedSemanticAdjudicationExecutorTests(unittest.TestCase):
             ), ""),
         )
         for stdout, stderr in streams:
-            with self.subTest(stdout=stdout), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(stdout=stdout, stderr=stderr), tempfile.TemporaryDirectory() as tmp:
                 primary = CodexCliSemanticAdjudicator(
                     executable=Path("/opt/codex"),
                     runtime_tmp_root=Path(tmp),

@@ -68,7 +68,8 @@ Unit set is preserved with no invented route and the run ends as `degraded_unava
 Adapters assign an availability reason only from typed subprocess failures, a closed structured
 error field, or a provider-owned error event / stderr line matching a versioned complete diagnostic.
 Every nonblank textual diagnostic atom from every inspected output channel must be recognized and
-agree with the same provider-specific availability family; no channel is discarded. Structured
+agree with the same provider-specific availability family; no channel is discarded, except the closed
+benign-notice set named below. Structured
 error events and envelopes use versioned closed key/type shapes. Typed structured status never lets
 unknown, conflicting, schema, protocol, or security sibling evidence become availability.
 Unrecognized non-zero output is `command_failed` or a more specific fail-closed reason; free-form
@@ -76,10 +77,12 @@ stdout and bare diagnostic substrings are never availability evidence.
 The Codex capacity families are the 429/rate-limit/quota/credit-balance diagnostics and the account
 usage limit ("You've hit your usage limit", with or without its purchase-credits and retry-time
 clauses), which classify as `capacity_unavailable` and stay retryable. Two runtime notices the CLI
-writes about its own environment are excluded from that classification because they carry no provider
-verdict: the one-time disabled-code-mode error item that the success path already accepts, and the
-`codex_models_manager` "failed to refresh available models" stderr line (closed full-line set). Any
-other unrecognized line still fails closed.
+writes about its own environment are removed from the diagnostic set before classification, so they can
+no longer veto an otherwise single-family verdict; they carry no provider verdict of their own: the
+one-time disabled-code-mode error item that the success path already accepts, and the exact
+`codex_models_manager` "failed to refresh available models: timeout waiting for child process to exit"
+stderr line (closed full-line set, timestamp-anchored). Any other unrecognized line still fails closed.
+Observed against codex-cli 0.154.0; re-verify the set on a CLI upgrade.
 
 ## Cache and receipt
 

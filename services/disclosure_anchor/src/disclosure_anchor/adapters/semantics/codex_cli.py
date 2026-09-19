@@ -107,7 +107,8 @@ _AUTH_DIAGNOSTICS = tuple(
 _BENIGN_STDERR_NOTICES = tuple(
     re.compile(pattern)
     for pattern in (
-        r"\S+ ERROR codex_models_manager::manager: failed to refresh available models: .+",
+        r"\d{4}-\d{2}-\d{2}T[0-9:.]+Z ERROR codex_models_manager::manager: "
+        r"failed to refresh available models: timeout waiting for child process to exit",
     )
 )
 _CAPACITY_DIAGNOSTICS = tuple(

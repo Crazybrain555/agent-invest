@@ -432,6 +432,14 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
             ),
             # an unrelated stderr error is still fail-closed evidence
             (LIVE_USAGE_LIMIT_STDOUT, MODELS_REFRESH_STDERR + "ERROR something else broke\n", "command_failed", True),
+            # the benign notice is pinned to its exact wording: a different tail is provider evidence again
+            (
+                LIVE_USAGE_LIMIT_STDOUT,
+                MODELS_REFRESH_STDERR.replace("timeout waiting for child process to exit", "401 Unauthorized"),
+                "command_failed",
+                True,
+            ),
+            (LIVE_USAGE_LIMIT_STDOUT, "NOTATIMESTAMP ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\n", "command_failed", True),
             (
                 "\n".join(
                     (
