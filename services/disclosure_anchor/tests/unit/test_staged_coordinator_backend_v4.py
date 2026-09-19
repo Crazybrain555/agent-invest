@@ -17,6 +17,10 @@ from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     RemoteParseCheckpointV4,
     build_initial_remote_parse_checkpoint_v4,
 )
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SemanticRouteContractError,
+    SemanticRouteLockedCandidateOverflowError,
+)
 from disclosure_anchor.application.contracts.staged_resource_credit import (
     ResourceCreditVector,
 )
@@ -598,6 +602,104 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
         )
         self.assertEqual(persistence.appends, [])
         publication_committed.assert_called_once_with(True)
+
+    def _commit_with_publisher_error(self, error: Exception):  # type: ignore[no-untyped-def]
+        authority = _authority("local_materialized")
+        (
+            _,
+            _,
+            values,
+            _,
+            manifest,
+            envelope,
+            _,
+            _,
+            _,
+        ) = _typed_happy_bundle()
+        materialization = mock.Mock()
+        materialization.reopen_materialized_v4.return_value = (
+            MaterializedProviderDocumentV4(
+                receipt=values[6],
+                intent=values[5],
+                provider_envelope=envelope,
+                manifest=manifest,
+            )
+        )
+        publication_committed = mock.Mock()
+        backend, persistence, _, _ = _backend(
+            authority,
+            materialization=materialization,
+            publication_committed=publication_committed,
+        )
+        backend._publisher.execute.side_effect = error
+        return authority, backend, persistence, publication_committed
+
+    def test_commit_semantic_locked_overflow_becomes_local_failure(self) -> None:
+        overflow = SemanticRouteLockedCandidateOverflowError(
+            "semantic route has too many locked candidates: unit_index=9 "
+            "locked_count=15 locked_keys=admin_expenses,rd_expenses"
+        )
+        (
+            authority,
+            backend,
+            persistence,
+            publication_committed,
+        ) = self._commit_with_publisher_error(overflow)
+
+        updated = backend.commit(
+            _work(authority),
+            credit_allowance=ResourceCreditVector(),
+            stage_guard=_guard(),
+        )
+
+        self.assertEqual(updated.state, "cleanup_pending")
+        self.assertEqual(len(persistence.appends), 1)
+        append = persistence.appends[0]
+        self.assertEqual(
+            tuple(item.kind for item in append.new_evidence),
+            ("failure_receipt", "cleanup_plan"),
+        )
+        failure = append.new_evidence[0].value
+        self.assertIsInstance(failure, FailureReceiptV4)
+        self.assertEqual(failure.outcome, "local_failure")
+        self.assertEqual(failure.error_stage, "commit")
+        self.assertEqual(
+            failure.error_code,
+            "semantic_route_locked_candidate_overflow",
+        )
+        self.assertEqual(
+            failure.error_class,
+            "SemanticRouteLockedCandidateOverflowError",
+        )
+        self.assertFalse(failure.retryable)
+        self.assertEqual(failure.retry_budget_class, "semantic_route_contract")
+        self.assertEqual(failure.message, str(overflow))
+        self.assertIsInstance(append.new_evidence[1].value, LocalCleanupPlanV4)
+        self.assertIsNone(append.successor.publication_winner_sha256)
+        # Transaction P was never entered: no winner, no commit notification.
+        publication_committed.assert_not_called()
+        backend._publisher.execute.assert_called_once()
+
+    def test_commit_generic_semantic_contract_error_still_raises(self) -> None:
+        (
+            authority,
+            backend,
+            persistence,
+            publication_committed,
+        ) = self._commit_with_publisher_error(
+            SemanticRouteContractError("semantic Unit input repeats a candidate")
+        )
+
+        with self.assertRaises(SemanticRouteContractError) as caught:
+            backend.commit(
+                _work(authority),
+                credit_allowance=ResourceCreditVector(),
+                stage_guard=_guard(),
+            )
+
+        self.assertIs(type(caught.exception), SemanticRouteContractError)
+        self.assertEqual(persistence.appends, [])
+        publication_committed.assert_not_called()
 
     def test_result_download_and_ack_unavailability_are_retriable(self) -> None:
         materializing = _authority("materializing")

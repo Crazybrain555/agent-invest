@@ -57,7 +57,12 @@ labels（键规划），以及 search projection `key_tokens` 通道注入的中
 `semantic_route_adjudication.v32`。默认 provider 链为 `codex_cli.v4.low` /
 `gpt-5.6-luna` 主用、`claude_cli.v1.low` / `claude-sonnet-5` 备用；仅闭合的 availability
 原因允许 failover，取消、协议、模型身份、安全与无效裁决全部 fail closed。候选与 direct route
-都最多 8 个。provider/model/profile 与 cache/receipt identity 绑定。定期报告正文/表格也
+都最多 8 个。单个 Unit 的 locked 候选超过 8 个时，`_candidates` 以
+`SemanticRouteLockedCandidateOverflowError` 做确定性的 per-Unit 拒绝，消息携带 unit_index、
+locked_count 与排序后的 locked_keys；该计数取自 shortlist 截断之前，必须保持在该位置。commit 阶段
+它被归类为 attempt-local 的 `local_failure`（error_code `semantic_route_locked_candidate_overflow`，
+不可重试），attempt 经 cleanup/ACK 关闭且不产生 publication；其余 route 契约与完整性错误仍然打开
+run circuit。provider/model/profile 与 cache/receipt identity 绑定。定期报告正文/表格也
 可以生成 Unit-local 直接主题候选；章节上下文另走 section_keys，不参与 shortlist。截断时，Unit
 自身标题/正文/表格直接证据先于
 纯字符相似或文档上下文召回，避免弱相似候选挤掉表单字段。direct route 是有边界、偏召回的

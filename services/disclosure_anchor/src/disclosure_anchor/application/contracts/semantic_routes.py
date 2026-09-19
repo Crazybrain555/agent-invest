@@ -78,6 +78,11 @@ class SemanticRouteContractError(ValueError):
     """Semantic route input, receipt, or adjudication is not closed."""
 
 
+class SemanticRouteLockedCandidateOverflowError(SemanticRouteContractError):
+    """One Unit has more locked semantic routes than the closed route envelope;
+    a deterministic, attempt-local refusal."""
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticAdjudicationTerminalV1:
     """One terminal summary derived only from immutable per-Unit receipts."""
@@ -1315,6 +1320,7 @@ __all__ = [
     "SemanticRouteContractError",
     "SemanticRouteDefinition",
     "SemanticRouteEvidence",
+    "SemanticRouteLockedCandidateOverflowError",
     "SemanticRouteReceipt",
     "SemanticRouteReceiptRow",
     "SemanticRouteReceiptRowV3",

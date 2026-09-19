@@ -1134,9 +1134,10 @@
   },
   "tests/unit/test_semantic_router.py": {
    "private_imports": [
+    "_bounded_locked_keys",
     "_normalize_title"
    ],
-   "tests": 169
+   "tests": 174
   },
   "tests/unit/test_serving_model_identity.py": {
    "private_imports": [],
@@ -1206,7 +1207,7 @@
   },
   "tests/unit/test_staged_coordinator_backend_v4.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 15
   },
   "tests/unit/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
@@ -1222,7 +1223,7 @@
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
-   "tests": 76
+   "tests": 77
   },
   "tests/unit/test_staged_parse_stream_admission.py": {
    "private_imports": [],

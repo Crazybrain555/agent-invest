@@ -45,6 +45,9 @@ from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     advance_remote_parse_checkpoint_v4,
     build_local_cleanup_plan_v4,
 )
+from disclosure_anchor.application.contracts.semantic_routes import (
+    SemanticRouteLockedCandidateOverflowError,
+)
 from disclosure_anchor.application.contracts.staged_resource_credit import (
     CleanupOutcome,
     PerAttemptResourceAllowance,
@@ -567,13 +570,28 @@ class DurableStagedCoordinatorBackendV4:
             credit_allowance,
         )
         materialized = self._reopen_materialized(authority, stage_guard)
-        winner = self._publisher.execute(
-            checkpoint=authority.checkpoint,
-            materialized=materialized,
-            claim=authority.claim_witness,
-            claim_guard=self._claim_guard,
-            stage_guard=stage_guard,
-        )
+        try:
+            winner = self._publisher.execute(
+                checkpoint=authority.checkpoint,
+                materialized=materialized,
+                claim=authority.claim_witness,
+                claim_guard=self._claim_guard,
+                stage_guard=stage_guard,
+            )
+        except SemanticRouteLockedCandidateOverflowError as exc:
+            # The publication request builder refuses this document before
+            # transaction P, so nothing was persisted and the attempt can close
+            # through cleanup/ACK.  The base route contract error and every
+            # integrity error still open the run circuit.
+            return self._fail_attempt(
+                work,
+                authority,
+                outcome="local_failure",
+                error=exc,
+                error_stage="commit",
+                credit_allowance=credit_allowance,
+                stage_guard=stage_guard,
+            )
         stage_guard.checkpoint()
         committed = self._persistence.reload_stage_claim(work, stage_guard=stage_guard)
         if committed.state != "publish_committed":
@@ -1058,6 +1076,11 @@ class DurableStagedCoordinatorBackendV4:
             retryable = False
             retry_budget_class = "provider_protocol"
             message = "provider response failed the remote protocol contract"
+        elif isinstance(error, SemanticRouteLockedCandidateOverflowError):
+            error_code = "semantic_route_locked_candidate_overflow"
+            retryable = False
+            retry_budget_class = "semantic_route_contract"
+            message = str(error)
         else:
             raise ValueError("untyped V4 attempt failure cannot be persisted")
         failure = FailureReceiptV4(

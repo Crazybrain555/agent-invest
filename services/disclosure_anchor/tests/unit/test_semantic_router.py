@@ -14,6 +14,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SemanticProviderIdentity,
     SemanticRouteContractError,
     SemanticRouteDefinition,
+    SemanticRouteLockedCandidateOverflowError,
     SemanticRouteTaxonomy,
 )
 from disclosure_anchor.application.ports.semantic_routes import (
@@ -28,6 +29,7 @@ from disclosure_anchor.application.services.provider_unit_builder import (
 from disclosure_anchor.application.services.semantic_router import (
     SemanticRouter,
     SemanticRouteBatchResult,
+    _bounded_locked_keys,
     _normalize_title,
 )
 from disclosure_anchor.application.services.semantic_taxonomy import (
@@ -505,6 +507,90 @@ def _drafts_with_parent_heading(
         ),
         segments=(),
     )
+    admitted = _admitted(document)
+    return admitted, build_provider_units(admitted).units
+
+
+_PERIODIC_CHANGE_SUBJECTS = (
+    "管理费用",
+    "研发费用",
+    "财务费用",
+    "其他收益",
+    "投资收益",
+    "公允价值变动收益",
+    "信用减值损失",
+    "资产减值损失",
+    "资产处置收益",
+    "营业外收入",
+    "所得税费用",
+    "政府补助",
+)
+_PERIODIC_CHANGE_KEYS = (
+    "admin_expenses",
+    "rd_expenses",
+    "finance_expenses",
+    "other_income",
+    "investment_income",
+    "fair_value_change_income",
+    "credit_impairment_loss",
+    "asset_impairment_loss",
+    "asset_disposal_income",
+    "non_operating_items",
+    "income_tax_expense",
+    "government_grants",
+)
+
+
+def _dense_periodic_change_drafts(
+    clause_count: int,
+    *,
+    title: str = "2、合并利润表及现金流量表项目",
+    headings: tuple[str, ...] = (
+        "一、主要财务数据",
+        "（四）主要会计数据和财务指标发生变动的情况及原因",
+    ),
+):  # type: ignore[no-untyped-def]
+    """One dense periodic change-analysis Unit with numbered 科目 clauses."""
+
+    blocks = [
+        _block(
+            index,
+            0,
+            "text",
+            (ProviderPayload("text", None, heading),),
+            annotation="title",
+            level=index + 1,
+        )
+        for index, heading in enumerate(headings)
+    ]
+    blocks.append(
+        _block(
+            len(headings),
+            0,
+            "text",
+            (ProviderPayload("text", None, title),),
+            annotation="title",
+            level=len(headings) + 1,
+        )
+    )
+    for offset, subject in enumerate(_PERIODIC_CHANGE_SUBJECTS[:clause_count]):
+        blocks.append(
+            _block(
+                len(headings) + 1 + offset,
+                0,
+                "text",
+                (
+                    ProviderPayload(
+                        "text",
+                        None,
+                        f"（{offset + 1}）{subject} 2024 年 1-3月发生额较上年同期"
+                        "增长 12.34%，主要系本期业务规模变化所致。",
+                    ),
+                ),
+                annotation=None,
+            )
+        )
+    document = _document(pages=(tuple(blocks),), segments=())
     admitted = _admitted(document)
     return admitted, build_provider_units(admitted).units
 
@@ -4057,6 +4143,159 @@ class SemanticRouterTests(unittest.TestCase):
             result.units[0].semantic_keys,
             ("foreign_currency_translation",),
         )
+
+    def test_locked_overflow_raises_specific_error_with_bounded_context(self) -> None:
+        # Pins the clause-rule half of the real overflow (14 distinct 科目 locks on
+        # the 002997 quarterly report); the title-contains lock that made it 15 is
+        # covered by the offline replay of the materialized document, not here.
+        admitted, drafts = _dense_periodic_change_drafts(
+            len(_PERIODIC_CHANGE_SUBJECTS)
+        )
+        router = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("a refused Unit never reaches the model")
+            ),
+            cache=_MemoryCache(),
+        )
+
+        with self.assertRaises(SemanticRouteLockedCandidateOverflowError) as caught:
+            router.route(
+                admitted=admitted,
+                document=SemanticDocumentContext(
+                    title=None,
+                    filing_type="quarterly_report",
+                ),
+                drafts=drafts,
+            )
+
+        self.assertIs(
+            type(caught.exception),
+            SemanticRouteLockedCandidateOverflowError,
+        )
+        self.assertIsInstance(caught.exception, SemanticRouteContractError)
+        message = str(caught.exception)
+        self.assertIn("unit_index=2", message)
+        self.assertIn(f"locked_count={len(_PERIODIC_CHANGE_KEYS)}", message)
+        self.assertIn(
+            "locked_keys=" + ",".join(sorted(_PERIODIC_CHANGE_KEYS)),
+            message,
+        )
+
+    def test_overflow_diagnostic_lists_a_bounded_number_of_locked_keys(self) -> None:
+        keys = [f"key_{index:03d}" for index in range(40)]
+        text = _bounded_locked_keys(reversed(keys))
+        shown = text.split(",...")[0].split(",")
+        self.assertEqual(shown, keys[:32])
+        self.assertTrue(text.endswith(",...(+8)"))
+        self.assertEqual(_bounded_locked_keys(keys[:32]), ",".join(keys[:32]))
+        self.assertLess(len(_bounded_locked_keys(f"{'k' * 39}_{index}" for index in range(400))), 4096)
+
+    def test_quarterly_dense_change_unit_overflow_fixture(self) -> None:
+        overflow_admitted, overflow_drafts = _dense_periodic_change_drafts(9)
+        router = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("dense periodic clauses are deterministic")
+            ),
+            cache=_MemoryCache(),
+        )
+        document = SemanticDocumentContext(
+            title=None,
+            filing_type="quarterly_report",
+        )
+
+        with self.assertRaises(SemanticRouteLockedCandidateOverflowError) as caught:
+            router.route(
+                admitted=overflow_admitted,
+                document=document,
+                drafts=overflow_drafts,
+            )
+
+        self.assertIn("locked_count=9", str(caught.exception))
+
+        bounded_admitted, bounded_drafts = _dense_periodic_change_drafts(8)
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(
+                lambda _batch: self.fail("dense periodic clauses are deterministic")
+            ),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=bounded_admitted,
+            document=document,
+            drafts=bounded_drafts,
+        )
+
+        self.assertEqual(
+            set(result.units[2].semantic_keys or ()),
+            set(_PERIODIC_CHANGE_KEYS[:8]),
+        )
+        self.assertEqual(result.receipts[2].decision_source, "deterministic")
+
+    def test_locked_exclusive_narrows_before_overflow_check(self) -> None:
+        admitted, drafts = _dense_periodic_change_drafts(
+            10,
+            title="合并资产负债表",
+            headings=(),
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("exclusive exact title must not call model")
+        )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="quarterly_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[0].semantic_keys, ("balance_sheet",))
+        self.assertEqual(result.receipts[0].candidate_keys, ("balance_sheet",))
+        self.assertEqual(result.receipts[0].decision_source, "deterministic")
+        self.assertEqual(adjudicator.calls, 0)
+
+    def test_duplicate_exact_title_does_not_create_locked_overflow(self) -> None:
+        admitted, drafts = _drafts("主要财务数据和指标")
+        taxonomy = SemanticRouteTaxonomy(
+            version="duplicate-title.v1",
+            definitions=tuple(
+                SemanticRouteDefinition(
+                    key=f"duplicate_metrics_{index}",
+                    description=f"同名定义{index}",
+                    labels=("主要财务数据和指标",),
+                    scopes=("quarterly_report",),
+                )
+                for index in range(9)
+            ),
+        )
+        adjudicator = _Adjudicator(
+            lambda _batch: self.fail("an ambiguous duplicate title is a rule abstain")
+        )
+
+        result = SemanticRouter(
+            taxonomy=taxonomy,
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(
+                title=None,
+                filing_type="quarterly_report",
+            ),
+            drafts=drafts,
+        )
+
+        self.assertIsNone(result.units[0].semantic_keys)
+        self.assertEqual(len(result.receipts[0].candidate_keys), 8)
+        self.assertEqual(result.receipts[0].decision_source, "rule_abstain")
+        self.assertEqual(adjudicator.calls, 0)
 
     def test_topics_keep_modality_while_forecast_roles_remain_exact(
         self,

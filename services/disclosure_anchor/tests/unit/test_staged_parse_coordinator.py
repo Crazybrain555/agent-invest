@@ -267,6 +267,7 @@ class _Backend:
         self.retry_local_once = False
         self.local_calls = 0
         self.fail_local_attempts: set[str] = set()
+        self.fail_commit_attempts: set[str] = set()
         self.outcome_by_attempt: dict[str, str] = {}
 
     @staticmethod
@@ -640,9 +641,14 @@ class _Backend:
     ) -> CoordinatorWork:
         stage_guard.checkpoint()
         self.calls.append(f"commit:{work.attempt_id}")
+        if work.attempt_id in self.fail_commit_attempts:
+            self.outcome_by_attempt[work.attempt_id] = "local_failure"
+            target_state = "cleanup_pending"
+        else:
+            target_state = "publish_committed"
         target = _work(
             work.attempt_id,
-            "publish_committed",
+            target_state,
             work.lifecycle_version + 1,
         )
         updated = replace(
@@ -980,6 +986,20 @@ class StagedParseCoordinatorTests(unittest.TestCase):
         cleanup_index = backend.calls.index("cleanup:attempt-1:cleanup_pending")
         second_prepare_index = backend.calls.index("local_prepare:attempt-2")
         self.assertLess(cleanup_index, second_prepare_index)
+
+    def test_commit_local_failure_transition_drains_without_circuit(self) -> None:
+        backend = _Backend(recoverable=(_work("attempt-1", "local_materialized", 6),))
+        backend.fail_commit_attempts.add("attempt-1")
+
+        result = StagedParseCoordinator(backend=backend, limits=_limits()).run()
+
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.final_states, (("attempt-1", "local_failed"),))
+        self.assertEqual(result.credits_in_use, ResourceCreditVector())
+        self.assertIn("commit:attempt-1", backend.calls)
+        self.assertIn("cleanup:attempt-1:cleanup_pending", backend.calls)
+        self.assertIn("ack:attempt-1:ack_pending", backend.calls)
 
     def test_recovery_barrier_precedes_new_admission_and_full_lifecycle_acks(
         self,

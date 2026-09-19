@@ -23,6 +23,12 @@ the coordinator opens its circuit and keeps durable held credits. Exact journal-
 validated deterministic cleanup suffixes remain recoverable; unknown, mutated, linked or oversized contents
 are not deletion authority.
 
+A locked semantic-route overflow (`SemanticRouteLockedCandidateOverflowError`) is raised by the publication
+request builder before transaction P, so nothing is persisted. The COMMIT lane records it as an attempt-local
+`local_failure` with error code `semantic_route_locked_candidate_overflow`, retry budget class
+`semantic_route_contract` and `retryable=false`; the attempt closes through its cleanup plan and ACK without a
+publication. The base `SemanticRouteContractError` and every integrity error still open the run circuit.
+
 Valid promoted output replays exactly. Invalid promoted output, including a markerless response-loss tree,
 is contained by no-replace output→staging rename under the existing resource lock and claim guard, pinned
 root identity and parent fsync, then stops with ownership unresolved. Simultaneous paths, root substitution

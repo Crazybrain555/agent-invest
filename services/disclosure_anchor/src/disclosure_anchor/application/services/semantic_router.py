@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -33,6 +33,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SemanticRouteDefinition,
     SemanticRouteEvidence,
     SemanticRouteEvidenceKind,
+    SemanticRouteLockedCandidateOverflowError,
     SemanticRouteReceipt,
     SemanticRouteSource,
     SemanticRouteSourceKind,
@@ -235,6 +236,20 @@ class _CandidateState:
         if evidence_kind not in self.evidence_kinds:
             self.evidence_kinds.append(evidence_kind)
         self.locked = self.locked or locked
+
+
+# The failure receipt bounds its message at 4096 bytes; the overflow diagnostic
+# lists at most this many locked keys and counts the rest.
+_LOCKED_KEYS_IN_MESSAGE = 32
+
+
+def _bounded_locked_keys(keys: Iterable[str]) -> str:
+    ordered = sorted(keys)
+    shown = ordered[:_LOCKED_KEYS_IN_MESSAGE]
+    text = ",".join(shown)
+    if len(shown) < len(ordered):
+        text += f",...(+{len(ordered) - len(shown)})"
+    return text
 
 
 class SemanticRouter:
@@ -1575,10 +1590,12 @@ class SemanticRouter:
             )
         )
         selected = populated[:MAX_SEMANTIC_CANDIDATES]
-        locked_count = sum(1 for item in populated if item.locked)
-        if locked_count > MAX_SEMANTIC_CANDIDATES:
-            raise SemanticRouteContractError(
-                "exact semantic title produces too many locked routes"
+        locked = tuple(item for item in populated if item.locked)
+        if len(locked) > MAX_SEMANTIC_CANDIDATES:
+            raise SemanticRouteLockedCandidateOverflowError(
+                "semantic route has too many locked candidates: "
+                f"unit_index={unit_index} locked_count={len(locked)} "
+                f"locked_keys={_bounded_locked_keys(item.key for item in locked)}"
             )
         return tuple(
             SemanticRouteCandidate(
