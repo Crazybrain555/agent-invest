@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import os
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -272,8 +275,10 @@ class ServiceIOExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry.get(task.agent_idempotency_key).state, "consumed")
         self.assertEqual(registry.unacked_result_bytes, 0)
 
-    async def test_slow_persist_lock_returns_busy_not_cached_healthy(self):
+    async def test_slow_persist_lock_health_answers_from_the_durable_view(self):
         registry = self.fx.manager.task_protocol_v2
+        durable = await self.fx.client.get("/health")
+        self.assertEqual(durable.status_code, 200)
         entered, release = threading.Event(), threading.Event()
         self.fx.releases.append(release)
         def hold_registry_lock():
@@ -284,14 +289,152 @@ class ServiceIOExecutionTests(unittest.IsolatedAsyncioTestCase):
         holding = self.fx.spawn(self.fx.manager.service_io.call(hold_registry_lock))
         await until(entered.is_set)
         try:
-            response = await asyncio.wait_for(self.fx.client.get("/health"), 1.5)
-            self.assertEqual(response.status_code, 503)
-            self.assertNotEqual(response.json().get("status"), "healthy")
+            started = time.monotonic()
+            held = await asyncio.wait_for(self.fx.client.get("/health"), 1.5)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(held.status_code, 200)
+            self.assertEqual(held.json()["status"], "healthy")
+            self.assertEqual(set(held.json()), set(durable.json()))
+            self.assertEqual(held.json()["task_admission"], durable.json()["task_admission"])
+            self.assertEqual(
+                held.json()["task_protocol_runtime"], durable.json()["task_protocol_runtime"]
+            )
             self.assertFalse(holding.done())
         finally:
             release.set()
             await holding
         self.assertEqual((await self.fx.client.get("/health")).status_code, 200)
+
+    async def test_health_reports_the_unhealthy_manager_shape(self):
+        self.fx.app.state.task_manager = None
+        try:
+            absent = await self.fx.client.get("/health")
+        finally:
+            self.fx.app.state.task_manager = self.fx.manager
+        self.assertEqual(absent.status_code, 503)
+        self.assertEqual(absent.json(), {
+            "status": "unhealthy", "version": self.fx.module.__version__,
+            "error": "Task manager is not initialized",
+        })
+        self.fx.manager.last_worker_error = "controlled worker failure"
+        try:
+            failing = await self.fx.client.get("/health")
+        finally:
+            self.fx.manager.last_worker_error = None
+        self.assertEqual(failing.status_code, 503)
+        self.assertEqual(failing.json(), {
+            "status": "unhealthy", "version": self.fx.module.__version__,
+            "error": "controlled worker failure",
+        })
+        self.assertEqual((await self.fx.client.get("/health")).status_code, 200)
+
+    async def test_degraded_and_uncertain_persistence_close_health(self):
+        registry = self.fx.manager.task_protocol_v2
+        closed = {
+            "status": "unhealthy", "version": self.fx.module.__version__,
+            "error": "registry_persistence_unavailable",
+        }
+        with registry._lock:
+            registry._record_persistence_event(
+                outcome="not_committed", phase="write", committed=False,
+                operation="transition",
+            )
+        try:
+            degraded = await self.fx.client.get("/health")
+        finally:
+            with registry._lock:
+                registry._last_persistence_event = None
+                registry._last_persistence_cause = None
+                registry._last_persistence_cleanup_cause = None
+                registry._publish_durable_view()
+        self.assertEqual(degraded.status_code, 503)
+        self.assertEqual(degraded.json(), closed)
+
+        with registry._lock:
+            registry._uncertain_records = {}
+            registry._publish_durable_view()
+        try:
+            uncertain = await self.fx.client.get("/health")
+        finally:
+            with registry._lock:
+                registry._uncertain_records = None
+                registry._publish_durable_view()
+        self.assertEqual(uncertain.status_code, 503)
+        self.assertEqual(uncertain.json(), closed)
+        self.assertEqual((await self.fx.client.get("/health")).status_code, 200)
+
+    async def test_a_failed_manager_start_releases_the_serving_loop_probe(self):
+        manager = self.fx.manager
+        registered = list(gc.callbacks)
+        failure = RuntimeError("controlled manager start failure")
+        attached = []
+
+        def fail_after_the_probe_attached():
+            attached.append(list(gc.callbacks))
+            raise failure
+
+        with patch.dict(os.environ, {"MINERU_PHASE_TRACE": "1"}), patch.object(
+            manager.task_protocol_executor, "start",
+            side_effect=fail_after_the_probe_attached,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                await manager.start()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(len(attached), 1)
+        self.assertNotEqual(attached[0], registered)
+        self.assertEqual(list(gc.callbacks), registered)
+
+    async def test_pressure_kernel_reads_use_the_observe_lane(self):
+        io = self.fx.manager.service_io
+        lanes = []
+        original = io.call
+        async def spy(function, /, *args, lane="metadata", **kwargs):
+            lanes.append(lane)
+            return await original(function, *args, lane=lane, **kwargs)
+        observer = types.SimpleNamespace(
+            pressure_begin=lambda: (1, {"owner": "controlled"}),
+            pressure_kernel_memory=lambda: {"scope": "controlled"},
+            pressure_finish=lambda started, serving, memory: {
+                "schema": "mineru.process-pressure.v1", "memory": memory,
+            },
+        )
+        with patch.object(self.fx.manager, "capacity_observer", observer), patch.object(io, "call", spy):
+            response = await self.fx.client.get("/agent/telemetry/pressure/v1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["memory"], {"scope": "controlled"})
+        self.assertEqual(lanes, ["observe"])
+
+    async def test_observe_lane_is_single_slotted_and_closes_with_its_owner(self):
+        io = self.fx.manager.service_io
+        self.assertEqual(set(io._pools), {"metadata", "bulk", "observe"})
+        self.assertEqual((io._counts["observe"], io._required_counts["observe"]), (0, 0))
+        order = []
+        entered, release = threading.Event(), threading.Event()
+        self.fx.releases.append(release)
+        def held():
+            order.append("held-in")
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("controlled observe barrier expired")
+            order.append("held-out")
+            return "held"
+        def queued():
+            order.append("queued-in")
+            return "queued"
+        holding = self.fx.spawn(io.call(held, lane="observe"))
+        await until(entered.is_set)
+        waiting = self.fx.spawn(io.call(queued, lane="observe"))
+        await asyncio.sleep(0.05)
+        self.assertFalse(waiting.done())
+        self.assertEqual(order, ["held-in"])
+        release.set()
+        self.assertEqual(await holding, "held")
+        self.assertEqual(await waiting, "queued")
+        self.assertEqual(order, ["held-in", "held-out", "queued-in"])
+        self.assertEqual(io._counts["observe"], 0)
+        await io.close()
+        with self.assertRaises(TaskRegistryObservationBusy):
+            await io.call(lambda: "after-close", lane="observe")
 
     async def test_missing_retained_zip_returns_410_without_pinning_a_reader(self):
         task = await self.fx.completed()

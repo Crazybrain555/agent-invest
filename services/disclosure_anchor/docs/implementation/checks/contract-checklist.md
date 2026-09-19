@@ -47,6 +47,14 @@ created_at: 2026-06-26
 - Patched serving process exposes read-only `GET /agent/telemetry/http-requests/v1` with
   `contract_version=mineru.api-http-request-snapshot.v1`, nonnegative `active_requests` /
   `pending_requests`, and its real namespace `process_id`. Original closed `/health` is unchanged.
+- Patched serving process computes `GET /health` from the registry durable view: the closed key set and
+  values equal the locked projection of the last durable state; no registry lock, no executor lane, no
+  `observe()` busy 503 on this route; 503 shapes unchanged (unhealthy manager, `registry_persistence_unavailable`
+  for degraded/uncertain persistence, capacity-observation `RuntimeError` text) except the mid-observation
+  "task manager became unhealthy during health observation" body, unreachable now that the route no longer
+  awaits between the health gate and the projection. Task routes keep `observe()` busy semantics.
+  Pressure kernel reads use the `observe` IO lane. `MINERU_LOOP_TRACE` JSON lines
+  (lag/gc/summary/probe_failed) are diagnostics only, gated by `MINERU_PHASE_TRACE`.
 - Counters surround only the existing final async POST semaphore; pending/acquire/exception/cancel
   conserve across loop threads. Transport retries remain one logical active call; no inbound-task or
   socket-count substitution. No task-manager initialization or side effect; `Cache-Control: no-store`.

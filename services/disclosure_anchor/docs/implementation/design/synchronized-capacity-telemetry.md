@@ -422,3 +422,32 @@ API health 的 closed projection 同时要求 `max_pending_tasks_requested` 与
 
 正式 schema 位于 `contracts/operational/synchronized-*.v1.schema.json`。所有对象 `extra=forbid`，
 新增字段或语义必须发布新版本。
+
+## host lane API 采样来源与服务循环探针
+
+R24 G4 r2 的实测：解析负载下 `/health` 因等待注册表锁（持锁跨 fsync，见
+`mineru-task-registry-persistence.md` 的 Durable view observation）延迟 78–310 ms，
+`/agent/telemetry/http-requests/v1` 出现未归因的 767 ms 服务循环停顿；host lane 每周期 900 ms、单次超时即致命。
+900 ms freshness、单次失败即终止、receipt 的零漏拍完成判定均不放宽。
+
+- host lane 的 `api_health` 相位继续读 `GET /health`。patched serving process 的 `/health` 改由注册表 durable view
+  与 serving loop 自有事实生成：字段集合与语义不变，不取注册表锁、不占执行器 lane、不再走有界的 `observe()` 忙等；
+  manager 不健康、持久化 degraded/uncertain、容量观测漂移时的 503 形状不变。exporter 源文件、编译进 telemetry DLL
+  与 native owner 的 `MineruBoundedHttp.Get` 固定路径白名单（`/health`、`/agent/telemetry/http-requests/v1`、
+  `/metrics`）、telemetry source staging 均不变；campaign 侧 stream-pressure 读取器与 qualification/bind 继续读同一个
+  `/health`。`/tasks/*` 路由保留 `observe()` 与 `registry_observation_busy` 语义。
+- 压力端点 `pressure_kernel_memory` 改在 `RegistryServiceIO` 的专用 `observe` lane（1 worker）执行，不再与
+  上传/结果文件的 `bulk` lane 排队。
+- 服务循环探针：由 task manager 持有、随其 start/shutdown 启停（start 失败同样释放），100 ms 心跳测量调度延迟，
+  `gc.callbacks` 测量各代回收停顿；在 `MINERU_PHASE_TRACE` 开启时以闭合词表 JSON 行 `MINERU_LOOP_TRACE ` 写 stderr：
+  `lag`（延迟 ≥ 100 ms）、`gc`（停顿 ≥ 50 ms，含 generation、pause_ms、collected）、`summary`（每 60 s：window_seconds、
+  max_lag_ms、lag_count、gc_max_pause_ms、gc_count、dropped）、`probe_failed`（探针自身首次失败，随后停止观测）；滚动 10 s
+  窗口内最多 20 行可丢弃行（lag/gc），超出时丢弃并计入 dropped；summary 占用同一计数但不可丢弃，probe_failed 不进入计数。
+  开关取值非法时与 phase trace 同规则拒绝启动。锁序严格：状态锁持有期间绝不取输出锁（回调的绑定与注册也在锁外）；同线程在
+  序列化/写出自己那一行期间开始的回收事件计数后丢弃而不重入写路径，期间的探针故障报告推迟到该行之后写出。探针的输出锁
+  （protocol 模块、可重入）与 phase trace 的输出锁（model_utils 助手、非重入）相互独立，两类行在 stderr 上不互斥：探针与
+  phase trace 每行各是一次 `sys.stderr.write` 因而完整，同开关下的 `MINERU_MODEL_DEVICE ` 行用 `print` 因而是两次 write，
+  解析器须按 `MINERU_LOOP_TRACE ` 前缀在行内任意位置定位并容忍交错。只观测、不改任何合同字段；用于把剩余停顿归因到
+  GC/GIL/循环后再决定下一步。
+- Mac 侧观察器合同不变：frame、receipt、`HostQueueBinding` 的输入形状不变；Windows 侧 telemetry 字节不变，变化的只有
+  API 镜像内 patched serving 源（需要 release 重建与 install）。

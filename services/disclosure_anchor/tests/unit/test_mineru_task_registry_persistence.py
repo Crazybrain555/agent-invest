@@ -19,8 +19,11 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import suppress
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +33,7 @@ from scripts.windows.mineru_heap_trim_compat.agent_task_protocol_v2 import (
     SplitTaskExecutor,
     TaskProtocolConflict,
     TaskRegistryPersistenceError,
+    admission_counts,
 )
 from scripts.windows.mineru_heap_trim_compat.patch_mineru_344 import (
     TARGET_PREIMAGE_SHA256,
@@ -583,6 +587,139 @@ class ObservationAndRecoveryTests(_RegistryCase):
         self.assertEqual([item["status"] for item in hydrated], ["pending"])
         self.assertEqual(registry.get(KEY).recovery_generation, 2)
         self.assertEqual(lab.open().get(KEY).recovery_generation, 2)
+
+
+class DurableViewTests(_RegistryCase):
+    def test_published_view_carries_the_durable_bytes_through_a_blocked_commit(self) -> None:
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        drive(lab, registry, "pending_unbound", key=OTHER_KEY, task_id=OTHER_TASK)
+        committed = registry.durable_view()
+        durable = json.loads(lab.disk_bytes())
+        self.assertEqual(
+            [asdict(record) for record in committed.records], durable["records"]
+        )
+        self.assertEqual(
+            committed.submission_watermark_bucket,
+            durable["submission_watermark_bucket"],
+        )
+        self.assertFalse(committed.durability_uncertain)
+        self.assertIsNone(committed.persistence_event)
+        self.assertGreater(committed.published_monotonic_ns, 0)
+
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = DurableTaskRegistry._persist_serialized_payload
+
+        def blocked(payload: bytes) -> None:
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("controlled commit barrier expired")
+            original(registry, payload)
+
+        with instance_hook(registry, "_persist_serialized_payload", blocked):
+            committing = threading.Thread(
+                target=registry.transition, args=(KEY, "processing")
+            )
+            committing.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                started = time.monotonic()
+                in_flight = registry.durable_view()
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertEqual(
+                    in_flight.persistence_generation,
+                    committed.persistence_generation,
+                )
+                self.assertEqual(
+                    [asdict(record) for record in in_flight.records],
+                    durable["records"],
+                )
+            finally:
+                release.set()
+                committing.join(5)
+        self.assertFalse(committing.is_alive())
+        after = registry.durable_view()
+        self.assertEqual(
+            after.persistence_generation, committed.persistence_generation + 1
+        )
+        self.assertEqual(
+            {record.idempotency_key: record.state for record in after.records}[KEY],
+            "processing",
+        )
+
+    def test_refused_and_uncertain_commits_pin_the_view_and_close_admission(self) -> None:
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "bound")
+        committed = registry.durable_view()
+        with pre_commit_fault(registry, "write"), self.assertRaises(
+            TaskRegistryPersistenceError
+        ):
+            registry.transition(KEY, "processing")
+        refused = registry.durable_view()
+        self.assertEqual(
+            refused.persistence_generation, committed.persistence_generation
+        )
+        self.assertFalse(refused.durability_uncertain)
+        self.assertEqual(refused.persistence_event["outcome"], "not_committed")
+        self.assertEqual(
+            [asdict(record) for record in refused.records],
+            [asdict(record) for record in committed.records],
+        )
+        with self.assertRaises(TaskRegistryPersistenceError) as degraded:
+            DurableTaskRegistry.admission_status_from_view(refused, set())
+        self.assert_outcome(
+            degraded.exception,
+            outcome="not_committed",
+            committed=False,
+            phase_prefix="write",
+            cause_type=None,
+        )
+        self.assertIsNone(degraded.exception.__cause__)
+
+        with instance_hook(
+            registry, "_replace_registry_file", write_foreign_then_fail
+        ), self.assertRaises(TaskRegistryPersistenceError):
+            registry.transition(KEY, "processing")
+        uncertain = registry.durable_view()
+        self.assertTrue(uncertain.durability_uncertain)
+        self.assertEqual(
+            uncertain.persistence_generation, committed.persistence_generation
+        )
+        with self.assertRaises(TaskRegistryPersistenceError) as closed:
+            DurableTaskRegistry.admission_status_from_view(uncertain, set())
+        self.assert_outcome(
+            closed.exception,
+            outcome="durability_uncertain",
+            committed=False,
+            phase_prefix="replace_ambiguous_bytes",
+            cause_type=None,
+        )
+        self.assertIsNone(closed.exception.__cause__)
+
+    def test_lock_free_counts_equal_the_locked_admission_status(self) -> None:
+        lab = self.lab()
+        registry = lab.open()
+        drive(lab, registry, "processing")
+        drive(lab, registry, "bound", key=OTHER_KEY, task_id=OTHER_TASK)
+        routes, live = {TASK}, {OTHER_TASK}
+        locked = registry.admission_status(routes, live)
+        view = registry.durable_view()
+        self.assertEqual(admission_counts(view.records, routes, live), locked)
+        self.assertEqual(
+            DurableTaskRegistry.admission_status_from_view(view, routes, live), locked
+        )
+        self.assertEqual(
+            (
+                locked["durable_nonterminal_tasks"],
+                locked["accepted_processing_tasks"],
+                locked["accepted_pending_tasks"],
+                locked["routeless_accepted_tasks"],
+            ),
+            (2, 1, 1, 1),
+        )
 
 
 class ReaderAndAckTests(_RegistryCase):

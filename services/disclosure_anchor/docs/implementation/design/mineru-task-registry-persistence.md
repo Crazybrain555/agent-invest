@@ -329,3 +329,38 @@ original 404 `Task not found` absence response. The retained consumed tombstone
 still prevents a repeated POST from treating that key as fresh work. The GET
 lookup must not reuse the repeated-submission 410 response for a consumed key;
 otherwise the original diagnostic disposal cannot confirm absence.
+
+## Durable view observation
+
+Live evidence (R24 G4 r2, 2026-09-19): under seven concurrent parses the serving loop's `/health` waited 78–310 ms
+for the registry lock because every state-changing mutator holds the re-entrant lock across the durable commit
+(temp write, file `fsync`, replace, parent `fsync`) on the Windows bind mount, and the host telemetry lane's 900 ms
+cycle is single-failure fatal. The atomic mutation boundary above is kept unchanged: a mutation is durable or rolled
+back before the lock is released, and no reader of the registry ever sees a non-durable mutation.
+
+The registry additionally publishes an immutable **durable view** (`DurableRegistryView`): deep-copied records,
+the submission watermark bucket, the persistence generation, the last persistence event and the uncertainty flag,
+with the publication instant on the monotonic clock. It is published at initial load (before any other thread can
+reach the registry) and under the registry lock at every `_mark_durable_commit`, on restoring the last durable
+state, at every recorded persistence event (the only path by which a degraded or uncertain state reaches the view)
+and at recovery hydration. `durable_view()` returns
+the current reference without acquiring the registry lock and never blocks on a commit in flight; a view may lag
+that in-flight commit by at most one mutation and therefore never contains a mutation that did not commit. A
+degradation or uncertainty recorded under the lock reaches the view at the next publication within the same lock
+hold; a reader may observe the previous view for the few statements in between, and every record it carries is
+durable. The container is frozen and its records and event are deep-copied once per publication, not per read;
+readers share those objects and must not mutate them.
+
+`/health` is served from the view. Manager health (`is_healthy()`, worker error, shutdown) stays live and
+loop-owned; the admission counts, the runtime facts and the persistence verdict come from the view, joined with the
+loop-owned route and ingress sets. A degraded or uncertain persistence state is carried by the view exactly as
+`assert_persistence_healthy()` would raise it, so the route fails closed with the same structured
+`registry_persistence_unavailable` 503 and never reports a healthy runtime it cannot prove. The route no longer
+takes the registry lock, an executor lane or the bounded `observe()` poll, so it never answers
+`registry_observation_busy`: the R24 choice for this route (503 busy rather than a cached healthy) is superseded,
+because the view is the last durable state, not a cached response. The admission counts may lag one in-flight
+commit by construction. Today no route or ingress removal site can flip `blocked_reason` or `admission_open`
+between a commit and the loop's own bookkeeping; a reordering of those sites must keep that property.
+
+The view does not participate in admission decisions, in the task executor's record checks, or in any mutation;
+those and the task routes keep the locked `admission_status()` and `observe()` paths with their busy semantics.

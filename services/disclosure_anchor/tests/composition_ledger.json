@@ -864,6 +864,10 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/unit/test_mineru_serving_loop_probe.py": {
+   "private_imports": [],
+   "tests": 0
+  },
   "tests/unit/test_mineru_smoke.py": {
    "private_imports": [],
    "tests": 9
@@ -898,7 +902,7 @@
   },
   "tests/unit/test_mineru_task_registry_persistence.py": {
    "private_imports": [],
-   "tests": 29
+   "tests": 32
   },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],

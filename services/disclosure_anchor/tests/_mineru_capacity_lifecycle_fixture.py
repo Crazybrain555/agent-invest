@@ -274,6 +274,7 @@ class CapacityLifecycleFixture:
                 "TaskRegistryPersistenceError": protocol.TaskRegistryPersistenceError,
                 "TaskRegistryObservationBusy": protocol.TaskRegistryObservationBusy,
                 "RegistryServiceIO": protocol.RegistryServiceIO,
+                "ServingLoopProbe": protocol.ServingLoopProbe,
                 "anyio": anyio,
                 "TaskAdmissionFull": protocol.TaskAdmissionFull,
                 "TaskResultCapacityRecoveryRequired": protocol.TaskResultCapacityRecoveryRequired,

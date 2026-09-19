@@ -41,7 +41,8 @@ class ServiceIOASGIFixture:
                          HTTPException=HTTPException, FileResponse=FileResponse,
                          JSONResponse=JSONResponse)
         wanted = {"_request_resources", "_ServiceRequestMiddleware", "_pin_response_result",
-                  "get_async_task_result", "ack_async_task_result", "health_check", "get_task_manager"}
+                  "get_async_task_result", "ack_async_task_result", "health_check", "get_task_manager",
+                  "agent_process_pressure_telemetry"}
         nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
         found = set()
         for node in ast.parse(self.fx.generated).body:

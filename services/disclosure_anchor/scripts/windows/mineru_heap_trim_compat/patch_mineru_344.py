@@ -1724,7 +1724,7 @@ def _patch_service_io_pressure(source: str) -> str:
         "        raise HTTPException(status_code=503, detail='explicit capacity pressure unavailable')\n"
         "    try:\n"
         "        started, serving = observer.pressure_begin()\n"
-        "        memory = await manager.service_io.call(observer.pressure_kernel_memory, lane=\"bulk\")\n"
+        "        memory = await manager.service_io.call(observer.pressure_kernel_memory, lane=\"observe\")\n"
         "        payload = observer.pressure_finish(started, serving, memory)\n"
         "    except TaskRegistryObservationBusy as exc:\n"
         "        raise HTTPException(status_code=503, detail={\"code\": \"pressure_io_busy\"}) from exc\n"
@@ -1766,6 +1766,111 @@ def _patch_service_scope_completion(source: str) -> str:
                             count=1, label="ASGI resource scope registration")
     compile(source, "<owned-service-api>", "exec")
     return source
+
+
+def _patch_health_durable_view_observation(source: str) -> str:
+    """Answer the closed health projection from the durable view, off the data lock."""
+    if "async def create_async_parse_task(" not in source:
+        return source
+    source = _replace_exact(
+        source,
+        "    TaskRegistryPersistenceError, TaskRegistryObservationBusy, RegistryServiceIO,\n",
+        "    TaskRegistryPersistenceError, TaskRegistryObservationBusy, RegistryServiceIO,\n"
+        "    ServingLoopProbe,\n",
+        count=1, label="serving loop probe import",
+    )
+    source = _replace_exact(
+        source,
+        '        self.service_io = RegistryServiceIO(\n'
+        '            drain=_settle_service_operation, max_pending=self.max_nonterminal_tasks + 8\n'
+        '        )\n',
+        '        self.service_io = RegistryServiceIO(\n'
+        '            drain=_settle_service_operation, max_pending=self.max_nonterminal_tasks + 8\n'
+        '        )\n'
+        '        self.serving_loop_probe = ServingLoopProbe()\n',
+        count=1, label="serving loop probe owner",
+    )
+    source = _replace_exact(
+        source,
+        "            self.capacity_observer = observer\n"
+        "        self.is_shutting_down = False\n",
+        "            self.capacity_observer = observer\n"
+        "        self.serving_loop_probe.start(asyncio.get_running_loop())\n"
+        "        self.is_shutting_down = False\n",
+        count=1, label="serving loop probe start",
+    )
+    # A manager that fails to start is never attached to the app, so its
+    # shutdown never runs and the probe must be released here.
+    source = _replace_exact(
+        source,
+        "    async def start(self) -> None:\n",
+        "    async def start(self) -> None:\n"
+        "        try:\n"
+        "            await self._start_owned()\n"
+        "        except BaseException:\n"
+        "            self.serving_loop_probe.close()\n"
+        "            raise\n\n"
+        "    async def _start_owned(self) -> None:\n",
+        count=1, label="serving loop probe start ownership",
+    )
+    source = _replace_exact(
+        source,
+        "            await _settle_service_operation(manager.service_io.close())\n",
+        "            manager.serving_loop_probe.close()\n"
+        "            await _settle_service_operation(manager.service_io.close())\n",
+        count=1, label="serving loop probe close",
+    )
+    source = _replace_exact(
+        source,
+        "    def admission_snapshot(self):\n"
+        "        snapshot = self.task_protocol_v2.admission_status(set(self.tasks), self._ingress_in_flight)\n",
+        "    def admission_snapshot_from_view(self, view):\n"
+        "        return self._decorate_admission(\n"
+        "            self.task_protocol_v2.admission_status_from_view(\n"
+        "                view, set(self.tasks), self._ingress_in_flight\n"
+        "            )\n"
+        "        )\n\n"
+        "    def admission_snapshot(self):\n"
+        "        return self._decorate_admission(\n"
+        "            self.task_protocol_v2.admission_status(set(self.tasks), self._ingress_in_flight)\n"
+        "        )\n\n"
+        "    def _decorate_admission(self, snapshot):\n",
+        count=1, label="durable view admission projection",
+    )
+    # The closed projection is built from the published durable state, so the
+    # route never waits for the data lock that a commit holds across fsync.
+    source = _replace_exact_span(
+        source,
+        "    def view():\n        if not task_manager.is_healthy():\n",
+        '    return {\n        "status": "recovering" if admission["recovery_overcommitted"] else "healthy",\n',
+        '    try:\n'
+        '        view = task_manager.task_protocol_v2.durable_view()\n'
+        '        admission = task_manager.admission_snapshot_from_view(view)\n'
+        '        stats = task_manager.get_stats()\n'
+        "        if getattr(task_manager, 'capacity_config', None) is None:\n"
+        '            protocol_runtime = task_protocol_runtime_status(\n'
+        '                task_manager.task_protocol_v2, task_manager.task_protocol_executor,\n'
+        '                persistence_event=view.persistence_event,\n'
+        '                durability_uncertain=view.durability_uncertain,\n'
+        '            )\n'
+        '            capacity_extra = {}\n'
+        '        else:\n'
+        '            protocol_runtime = task_protocol_runtime_status(\n'
+        '                task_manager.task_protocol_v2, task_manager.task_protocol_executor,\n'
+        '                capacity_config_sha256=task_manager.capacity_config.sha256,\n'
+        '                persistence_event=view.persistence_event,\n'
+        '                durability_uncertain=view.durability_uncertain,\n'
+        '            )\n'
+        "            capacity_extra = {'capacity_observation': task_manager.capacity_observer.snapshot()}\n"
+        '    except TaskRegistryPersistenceError:\n'
+        '        return JSONResponse(status_code=503, content={"status": "unhealthy", "version": __version__, "error": "registry_persistence_unavailable"})\n'
+        '    except RuntimeError as exc:\n'
+        '        return JSONResponse(status_code=503, content={"status": "unhealthy", "version": __version__, "error": str(exc)[:256]})\n',
+        label="durable view health projection",
+    )
+    compile(source, "<owned-service-api>", "exec")
+    return source
+
 
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
@@ -2802,7 +2907,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         source = _patch_registry_persistence_behavior(source)
         source = _patch_admission_responsibility(source)
         source = _patch_explicit_capacity(_patch_result_capacity_before_parse(source))
-        return _patch_service_scope_completion(_patch_service_io_pressure(_patch_service_io_shutdown(_patch_service_io_ingress(_patch_service_io_ack_health(_patch_service_io_manager(source))))))
+        return _patch_health_durable_view_observation(_patch_service_scope_completion(_patch_service_io_pressure(_patch_service_io_shutdown(_patch_service_io_ingress(_patch_service_io_ack_health(_patch_service_io_manager(source)))))))
 
     if relative_path == "mineru/utils/model_utils.py":
         source = _replace_exact(

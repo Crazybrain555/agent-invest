@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import gc
 import hashlib
 import json
 import os
 import stat
+import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections import deque
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, fields
 from functools import wraps
 from pathlib import Path
-from threading import RLock
+from threading import RLock, get_ident
 from typing import Any, Literal
 
 TaskState = Literal[
@@ -228,6 +231,50 @@ class DurableTaskRecord:
             raise TaskProtocolConflict("non-result task contains result identity")
 
 
+@dataclass(frozen=True, slots=True)
+class DurableRegistryView:
+    """One projection of the last committed registry state.
+
+    The container is frozen and its records and persistence event are deep
+    copied once, when the view is published, not on each read.  Readers share
+    those objects and must not mutate them.
+    """
+
+    records: tuple[DurableTaskRecord, ...]
+    submission_watermark_bucket: int
+    persistence_generation: int
+    persistence_event: dict[str, Any] | None
+    durability_uncertain: bool
+    published_monotonic_ns: int
+
+
+def admission_counts(
+    records: Iterable[DurableTaskRecord],
+    route_task_ids: set[str],
+    live_ingress_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Count durable responsibilities independently of the derived route index."""
+    counted = tuple(records)
+    ingress = sum(r.state in {"ingress", "ingress_cleanup"} for r in counted)
+    accepted = [r for r in counted if r.state in {"pending", "processing", "finalizing"}]
+    live_ingress_ids = live_ingress_ids or set()
+    return {
+        "schema": "mineru-task-admission.v1",
+        "registry_schema": "mineru-task-registry.v3",
+        "ingress_tasks": ingress,
+        "accepted_pending_tasks": sum(r.state == "pending" for r in accepted),
+        "accepted_processing_tasks": sum(r.state == "processing" for r in accepted),
+        "accepted_finalizing_tasks": sum(r.state == "finalizing" for r in accepted),
+        "durable_nonterminal_tasks": ingress + len(accepted),
+        "routeless_accepted_tasks": sum(r.task_id not in route_task_ids for r in accepted),
+        "ingress_cleanup_tasks": sum(r.state == "ingress_cleanup" for r in counted),
+        "unowned_ingress_tasks": sum(
+            r.state in {"ingress", "ingress_cleanup"} and r.task_id not in live_ingress_ids
+            for r in counted
+        ),
+    }
+
+
 class DurableTaskRegistry:
     """Atomic registry with reconcile, leases, ACK and reader-safe cleanup."""
 
@@ -287,6 +334,7 @@ class DurableTaskRegistry:
         self._durable_payload = self._read_current_registry_bytes()
         self._last_durable_records = self._clone_records(self._records)
         self._last_durable_watermark_bucket = self._submission_watermark_bucket
+        self._publish_durable_view()
 
     def reconcile_or_create(
         self,
@@ -500,25 +548,30 @@ class DurableTaskRegistry:
         """Count durable responsibilities independently of the derived route index."""
         with self._lock:
             self.assert_observation_safe()
-            records = tuple(self._records.values())
-            ingress = sum(r.state in {"ingress", "ingress_cleanup"} for r in records)
-            accepted = [r for r in records if r.state in {"pending", "processing", "finalizing"}]
-            live_ingress_ids = live_ingress_ids or set()
-            return {
-                "schema": "mineru-task-admission.v1",
-                "registry_schema": "mineru-task-registry.v3",
-                "ingress_tasks": ingress,
-                "accepted_pending_tasks": sum(r.state == "pending" for r in accepted),
-                "accepted_processing_tasks": sum(r.state == "processing" for r in accepted),
-                "accepted_finalizing_tasks": sum(r.state == "finalizing" for r in accepted),
-                "durable_nonterminal_tasks": ingress + len(accepted),
-                "routeless_accepted_tasks": sum(r.task_id not in route_task_ids for r in accepted),
-                "ingress_cleanup_tasks": sum(r.state == "ingress_cleanup" for r in records),
-                "unowned_ingress_tasks": sum(
-                    r.state in {"ingress", "ingress_cleanup"} and r.task_id not in live_ingress_ids
-                    for r in records
-                ),
-            }
+            return admission_counts(
+                self._records.values(), route_task_ids, live_ingress_ids
+            )
+
+    @classmethod
+    def admission_status_from_view(
+        cls,
+        view: DurableRegistryView,
+        route_task_ids: set[str],
+        live_ingress_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Count the published durable view without waiting for the data lock."""
+        cls._raise_view_persistence_error(
+            view.persistence_event, durability_uncertain=view.durability_uncertain
+        )
+        return admission_counts(view.records, route_task_ids, live_ingress_ids)
+
+    def durable_view(self) -> DurableRegistryView:
+        """Return the last durable state without acquiring the data lock.
+
+        The reference may lag one commit that is still in flight, so it never
+        carries a mutation that did not commit.
+        """
+        return self._durable_view
 
     def bind_task_payload(
         self,
@@ -1676,6 +1729,25 @@ class DurableTaskRegistry:
         self._submission_watermark_bucket = (
             self._last_durable_watermark_bucket
         )
+        self._publish_durable_view()
+
+    def _publish_durable_view(self) -> None:
+        """Replace the observable projection with the current durable state."""
+        view = DurableRegistryView(
+            records=tuple(
+                copy.deepcopy(record)
+                for record in sorted(
+                    self._last_durable_records.values(),
+                    key=lambda item: item.idempotency_key,
+                )
+            ),
+            submission_watermark_bucket=self._last_durable_watermark_bucket,
+            persistence_generation=self._persistence_generation,
+            persistence_event=copy.deepcopy(self._last_persistence_event),
+            durability_uncertain=self._uncertain_records is not None,
+            published_monotonic_ns=time.monotonic_ns(),
+        )
+        self._durable_view = view
 
     def _current_state_differs_from_last_durable(self) -> bool:
         return (
@@ -1707,6 +1779,7 @@ class DurableTaskRegistry:
         self._last_persistence_event = event
         self._last_persistence_cause = cause
         self._last_persistence_cleanup_cause = cleanup_cause
+        self._publish_durable_view()
 
     def persistence_status(self) -> dict[str, Any]:
         with self._lock:
@@ -1858,6 +1931,31 @@ class DurableTaskRegistry:
         if cause is None:
             raise error
         raise error from cause
+
+    @staticmethod
+    def _raise_view_persistence_error(
+        event: dict[str, Any] | None, *, durability_uncertain: bool
+    ) -> None:
+        """Fail a published projection exactly as assert_persistence_healthy would.
+
+        A projection carries no exception objects, so the structured error is
+        raised without the original cause.
+        """
+        if event is None:
+            if not durability_uncertain:
+                return
+            raise TaskRegistryPersistenceError(
+                operation="unknown",
+                phase="replace_reconciliation",
+                outcome="durability_uncertain",
+                committed=False,
+            )
+        raise TaskRegistryPersistenceError(
+            operation=str(event["operation"]),
+            phase=str(event["phase"]),
+            outcome=str(event["outcome"]),
+            committed=bool(event["committed"]),
+        )
 
     def assert_observation_safe(self) -> None:
         if self._uncertain_records is None:
@@ -2028,6 +2126,7 @@ class DurableTaskRegistry:
             self._last_persistence_event = None
             self._last_persistence_cause = None
             self._last_persistence_cleanup_cause = None
+            self._publish_durable_view()
         else:
             self._record_persistence_event(
                 outcome=outcome,
@@ -2725,9 +2824,18 @@ def validate_mineru_task_admission(
         raise ValueError("MinerU admission availability contradicts its responsibilities")
 
 
+class _Unset:
+    """Separate an absent persistence argument from an explicit healthy None."""
+
+
+_UNSET = _Unset()
+
+
 def task_protocol_runtime_status(
     registry: DurableTaskRegistry, executor: SplitTaskExecutor,
     *, capacity_config_sha256: str | None = None,
+    persistence_event: dict[str, Any] | None | _Unset = _UNSET,
+    durability_uncertain: bool = False,
 ) -> dict[str, Any]:
     """Content-free facts from the serving process's initialized objects."""
     if not isinstance(registry, DurableTaskRegistry) or not isinstance(executor, SplitTaskExecutor):
@@ -2739,7 +2847,12 @@ def task_protocol_runtime_status(
     }
     if any(type(value) is not int or value < 1 for value in limits.values()):
         raise TaskProtocolConflict("task protocol runtime limits are invalid")
-    registry.assert_persistence_healthy()
+    if isinstance(persistence_event, _Unset):
+        registry.assert_persistence_healthy()
+    else:
+        DurableTaskRegistry._raise_view_persistence_error(
+            persistence_event, durability_uncertain=durability_uncertain
+        )
     result = {
         "schema": "mineru-task-runtime.v2", "enabled": True, **limits,
         "registry_schema": "mineru-task-registry.v3",
@@ -2776,11 +2889,14 @@ __all__ = [
     "TaskAdmissionFull",
     "TaskRegistryObservationBusy",
     "RegistryServiceIO",
+    "ServingLoopProbe",
     "TaskRegistryPersistenceError",
+    "DurableRegistryView",
     "DurableTaskRecord",
     "DurableTaskRegistry",
     "SplitTaskExecutor",
     "TaskProtocolConflict",
+    "admission_counts",
     "evict_consumed_routes",
     "inspect_quiescent_output_root",
     "task_protocol_runtime_status",
@@ -2807,10 +2923,15 @@ class RegistryServiceIO:
         self._pools = {
             "metadata": ThreadPoolExecutor(max_workers=1, thread_name_prefix="mineru-registry"),
             "bulk": ThreadPoolExecutor(max_workers=2, thread_name_prefix="mineru-owned-files"),
+            "observe": ThreadPoolExecutor(max_workers=1, thread_name_prefix="mineru-observe"),
         }
-        self._slots = {"metadata": asyncio.Semaphore(1), "bulk": asyncio.Semaphore(2)}
-        self._counts = {"metadata": 0, "bulk": 0}
-        self._required_counts = {"metadata": 0, "bulk": 0}
+        self._slots = {
+            "metadata": asyncio.Semaphore(1),
+            "bulk": asyncio.Semaphore(2),
+            "observe": asyncio.Semaphore(1),
+        }
+        self._counts = {"metadata": 0, "bulk": 0, "observe": 0}
+        self._required_counts = {"metadata": 0, "bulk": 0, "observe": 0}
         self._idle = asyncio.Event()
         self._idle.set()
         self._close_task: asyncio.Task[None] | None = None
@@ -2962,3 +3083,304 @@ class RegistryRequestResources:
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close(), name="mineru-request-resource-close")
         await self.owner._drain(self._close_task)
+
+
+_LOOP_TRACE_PREFIX = "MINERU_LOOP_TRACE "
+_LOOP_TRACE_SCHEMA = "mineru-loop-trace.v1"
+_LOOP_TRACE_TICK_SECONDS = 0.1
+_LOOP_TRACE_LAG_NS = 100_000_000
+_LOOP_TRACE_GC_PAUSE_NS = 50_000_000
+_LOOP_TRACE_SUMMARY_NS = 60_000_000_000
+_LOOP_TRACE_RATE_WINDOW_NS = 10_000_000_000
+_LOOP_TRACE_RATE_LIMIT = 20
+_LOOP_TRACE_OUTPUT_LOCK = RLock()
+
+
+def is_phase_trace_enabled() -> bool:
+    """Return the default-off, closed-vocabulary phase-trace switch."""
+    value = os.getenv("MINERU_PHASE_TRACE")
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError("MINERU_PHASE_TRACE has an invalid value")
+
+
+def _trace_milliseconds(duration_ns: int) -> float:
+    return round(max(0, duration_ns) / 1_000_000, 3)
+
+
+class ServingLoopProbe:
+    """Observe serving-loop scheduling lag and collector pauses, owning no work.
+
+    Collector callbacks run on whichever thread triggered the collection, so
+    every counter update and rate-limit decision happens under one re-entrant
+    state lock.  It stays re-entrant because a collection can begin inside the
+    critical section on the same thread.  Lock order is strict: the state lock
+    is never held while the output lock is taken, and a thread that is already
+    serializing or writing its own line counts a nested observation as dropped
+    instead of re-entering the write path.
+    """
+
+    def __init__(self) -> None:
+        self._state = RLock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread_ident: int | None = None
+        self._handle: asyncio.TimerHandle | None = None
+        self._gc_callback: Callable[[str, dict[str, int]], None] | None = None
+        self._gc_started_ns: dict[int, int] = {}
+        self._expected_ns = 0
+        self._emitted_ns: deque[int] = deque()
+        self._summary_started_ns = 0
+        self._max_lag_ns = 0
+        self._lag_count = 0
+        self._gc_max_pause_ns = 0
+        self._gc_count = 0
+        self._dropped = 0
+        self._stopped = False
+        self._emitting: set[int] = set()
+        self._pending_failure: str | None = None
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Attach to one running serving loop while the phase trace is enabled."""
+        if not is_phase_trace_enabled():
+            return
+        # Binding the collector hook allocates a tracked object and registering
+        # it makes this thread reachable from a collection: both stay outside
+        # the critical section so no collection can begin while the state lock
+        # is held.
+        callback = self._on_collection
+        with self._state:
+            if self._stopped or self._loop is not None:
+                return
+            self._loop = loop
+            self._loop_thread_ident = get_ident()
+            self._summary_started_ns = time.monotonic_ns()
+            self._gc_callback = callback
+        gc.callbacks.append(callback)
+        with self._state:
+            stopped = self._stopped
+        if stopped:
+            # A close that raced the registration must not leave the hook live.
+            if callback in gc.callbacks:
+                gc.callbacks.remove(callback)
+            return
+        self._schedule()
+
+    def close(self) -> None:
+        """Release the tick and the collector hook; repeated calls are inert."""
+        with self._state:
+            self._stopped = True
+            handle, self._handle = self._handle, None
+            loop = self._loop
+            on_loop_thread = self._loop_thread_ident == get_ident()
+            callback, self._gc_callback = self._gc_callback, None
+            self._gc_started_ns.clear()
+        if callback is not None and callback in gc.callbacks:
+            gc.callbacks.remove(callback)
+        if handle is None:
+            return
+        if on_loop_thread or loop is None:
+            handle.cancel()
+            return
+        try:
+            loop.call_soon_threadsafe(handle.cancel)
+        except RuntimeError:
+            # A closed serving loop can no longer run the cancellation; the
+            # stopped probe neither reschedules nor emits from that tick.
+            return
+
+    def _schedule(self) -> None:
+        with self._state:
+            if self._stopped or self._loop is None:
+                return
+            loop = self._loop
+            self._expected_ns = time.monotonic_ns() + int(
+                _LOOP_TRACE_TICK_SECONDS * 1_000_000_000
+            )
+        handle = loop.call_later(_LOOP_TRACE_TICK_SECONDS, self._tick)
+        with self._state:
+            if not self._stopped:
+                self._handle = handle
+                return
+        handle.cancel()
+
+    def _tick(self) -> None:
+        try:
+            now_ns = time.monotonic_ns()
+            with self._state:
+                if self._stopped:
+                    return
+                lag_ns = max(0, now_ns - self._expected_ns)
+                self._max_lag_ns = max(self._max_lag_ns, lag_ns)
+                summary_due = now_ns - self._summary_started_ns >= _LOOP_TRACE_SUMMARY_NS
+            if lag_ns >= _LOOP_TRACE_LAG_NS:
+                self._emit(
+                    {"event": "lag", "lag_ms": _trace_milliseconds(lag_ns)},
+                    now_ns,
+                    droppable=True,
+                )
+            if summary_due:
+                self._emit_summary(now_ns)
+            self._schedule()
+        except Exception as error:
+            self._fail(error, in_collection=False)
+
+    def _on_collection(self, phase: str, info: dict[str, int]) -> None:
+        try:
+            now_ns = time.monotonic_ns()
+            generation = int(info.get("generation", 0))
+            with self._state:
+                if self._stopped:
+                    return
+                if phase == "start":
+                    self._gc_started_ns[generation] = now_ns
+                    return
+                if phase != "stop":
+                    return
+                started_ns = self._gc_started_ns.pop(generation, None)
+                if started_ns is None:
+                    return
+                pause_ns = max(0, now_ns - started_ns)
+                self._gc_max_pause_ns = max(self._gc_max_pause_ns, pause_ns)
+            if pause_ns >= _LOOP_TRACE_GC_PAUSE_NS:
+                self._emit(
+                    {
+                        "event": "gc",
+                        "generation": generation,
+                        "pause_ms": _trace_milliseconds(pause_ns),
+                        "collected": int(info.get("collected", 0)),
+                    },
+                    now_ns,
+                    droppable=True,
+                )
+        except Exception as error:
+            self._fail(error, in_collection=True)
+
+    def _emit_summary(self, now_ns: int) -> None:
+        with self._state:
+            # Read and zero the window before allocating anything: an
+            # allocation here could start a collection on this thread whose
+            # own event would then belong to neither window.
+            max_lag_ns = self._max_lag_ns
+            lag_count = self._lag_count
+            gc_max_pause_ns = self._gc_max_pause_ns
+            gc_count = self._gc_count
+            dropped = self._dropped
+            self._summary_started_ns = now_ns
+            self._max_lag_ns = 0
+            self._lag_count = 0
+            self._gc_max_pause_ns = 0
+            self._gc_count = 0
+            self._dropped = 0
+        # The summary carries the window's drop count, so the rate limit does
+        # not apply to it.
+        self._emit(
+            {
+                "event": "summary",
+                "window_seconds": _LOOP_TRACE_SUMMARY_NS // 1_000_000_000,
+                "max_lag_ms": _trace_milliseconds(max_lag_ns),
+                "lag_count": lag_count,
+                "gc_max_pause_ms": _trace_milliseconds(gc_max_pause_ns),
+                "gc_count": gc_count,
+                "dropped": dropped,
+            },
+            now_ns,
+            droppable=False,
+        )
+
+    def _emit(self, payload: dict[str, Any], now_ns: int, *, droppable: bool) -> None:
+        # Counting an observation and deciding its admission share one critical
+        # section, so a summary can never split an event between the two.  The
+        # section allocates no collector-tracked object, and the record is built,
+        # serialized and written after it, so the output lock is never taken
+        # while the state lock is held.  A collection that starts on this thread
+        # while it serializes or writes is counted and dropped: writing it here
+        # would land inside the line in progress.
+        ident = get_ident()
+        added = False
+        try:
+            with self._state:
+                if self._stopped:
+                    return
+                if payload["event"] == "lag":
+                    self._lag_count += 1
+                elif payload["event"] == "gc":
+                    self._gc_count += 1
+                while self._emitted_ns and now_ns - self._emitted_ns[0] >= _LOOP_TRACE_RATE_WINDOW_NS:
+                    self._emitted_ns.popleft()
+                if ident in self._emitting:
+                    # A line is already in progress on this thread: count the
+                    # nested observation and drop it rather than write inside
+                    # that line.  Only collector events can arrive this way.
+                    if not droppable:
+                        raise RuntimeError("a non-droppable trace line re-entered its own write path")
+                    self._dropped += 1
+                    return
+                if droppable and len(self._emitted_ns) >= _LOOP_TRACE_RATE_LIMIT:
+                    self._dropped += 1
+                    return
+                self._emitted_ns.append(now_ns)
+                self._emitting.add(ident)
+                added = True
+            self._write(self._line({**payload, "schema": _LOOP_TRACE_SCHEMA, "monotonic_ns": now_ns}))
+        finally:
+            # Only the frame that added the ident may discard it: a nested
+            # dropped emission must not disarm the outer frame's guard.
+            if added:
+                with self._state:
+                    self._emitting.discard(ident)
+                    pending, self._pending_failure = self._pending_failure, None
+                if pending is not None:
+                    self._write(pending)
+
+    def _fail(self, error: Exception, *, in_collection: bool) -> None:
+        line: str | None = self._line({
+            "schema": _LOOP_TRACE_SCHEMA,
+            "event": "probe_failed",
+            "reason": type(error).__name__,
+            "monotonic_ns": time.monotonic_ns(),
+        })
+        with self._state:
+            if self._stopped:
+                return
+            self._stopped = True
+            loop = self._loop
+            if get_ident() in self._emitting:
+                # The failure happened inside this thread's own write path; the
+                # outer frame writes the report after the line in progress.
+                self._pending_failure, line = line, None
+        if line is not None:
+            self._write(line)
+        if not in_collection:
+            self.close()
+            return
+        if loop is None:
+            # No loop means start() never attached the collector hook.
+            return
+        try:
+            # The collector is iterating its callback list right now; release
+            # the hook from the serving loop instead.
+            loop.call_soon_threadsafe(self.close)
+        except RuntimeError:
+            # The serving loop is closed and cannot run the deferred release.
+            # The collector re-reads its callback list on every iteration, so
+            # removing the hook in place is safe and does not leak the probe.
+            self.close()
+
+    @staticmethod
+    def _line(payload: dict[str, Any]) -> str:
+        return (
+            _LOOP_TRACE_PREFIX
+            + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        )
+
+    @staticmethod
+    def _write(line: str) -> None:
+        with _LOOP_TRACE_OUTPUT_LOCK:
+            sys.stderr.write(line)
+            sys.stderr.flush()
