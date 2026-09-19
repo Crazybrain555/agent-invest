@@ -15,6 +15,17 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     CoordinatorLimits,
 )
 
+# One local/remote stage step must cover the largest retained provider result
+# (~34 MB) crossing the Mac<->Windows tunnel at ~0.55 MB/s (~62 s measured),
+# with headroom: a partial spool is never resumed, so a stage that trips the
+# bounded deadline restarts the transfer from zero and opens the circuit.
+# The claim lease sits at the contract ceiling so that
+# ``lease - step - renew margin`` stays at the 30 s the scheduler had before:
+# that difference is the renewal round-trip headroom, the renewal cadence and
+# the ceiling on every deferral/backoff wait.
+PRODUCTION_MAX_STAGE_STEP_SECONDS = 240.0
+PRODUCTION_CLAIM_LEASE_SECONDS = 300
+
 
 @dataclass(frozen=True, slots=True)
 class StagedV4DatabaseConcurrency:
@@ -79,6 +90,8 @@ def staged_v4_coordinator_limits(
         cleanup_workers=mac_finalize_workers,
         ack_workers=mac_finalize_workers,
         admission_probe_seconds=worker_profile.admission_probe_milliseconds / 1000,
+        claim_lease_seconds=PRODUCTION_CLAIM_LEASE_SECONDS,
+        max_stage_step_seconds=PRODUCTION_MAX_STAGE_STEP_SECONDS,
         commit_stage_seconds=worker_profile.commit_stage_seconds,
     )
 

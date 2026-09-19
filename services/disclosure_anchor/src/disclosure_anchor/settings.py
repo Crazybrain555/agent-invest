@@ -124,7 +124,7 @@ class StagedV4Settings(BaseSettings):
         ),
     )
     commit_stage_seconds: int = Field(
-        default=3600, ge=60, le=86400,
+        default=3600, ge=240, le=86400,
         validation_alias=AliasChoices(
             "DISCLOSURE_V4_COMMIT_STAGE_SECONDS", "commit_stage_seconds",
         ),

@@ -419,6 +419,21 @@ renew margin 减去该轮同步调度开销；该开销与 in-flight guard 共�
 在 lane 选择或 poll sleep 前先经过同一 guard。续租不改变 claim generation、credit ledger、状态
 或 transition 顺序。
 
+生产投影（`staged_v4_coordinator_limits`）固定 `max_stage_step_seconds = 240`、`claim_lease_seconds = 300`
+（`claim_renew_margin_seconds = 30`）；`CoordinatorLimits` 的 dataclass 默认值仍为 60/120，只服务于
+composition 之外的直接构造与测试夹具。`commit_stage_seconds` 的配置下限同步为 240（不得小于步长）。
+同一个步长也是 `MinerUHttpRemoteV4` 的单次请求超时。依据：一次 `local` 车道要把最大的
+已保留 provider 结果（约 34 MB）经 Mac↔Windows SSH 隧道下载并解码，实测约 0.55 MB/s 时需要约 62 s，
+而 partial spool 不续传，重试会从头再来；原先的 60 s 使这类文档必然 `bounded_stage_deadline_exceeded`
+并打开熔断。`lease − step − margin` 这一差值同时是续租往返的余量、续租节拍和所有 deferral/backoff
+等待的上限；lease 取合同上限 300 正是为了把它保持在原先的 30 s（若取 280 则只剩 10 s，续租一次
+超过 10 s 的 DB 往返就会被判为契约违例并开路，`retry_max_backoff_seconds = 30` 也永远达不到）。
+代价是卡死车道的发现与崩溃 owner 的认领接管最多推迟到 300 s。该常数不进入 v2 profile 身份：
+在旧步长下 prepared 的 spec 在新 boot 上照常通过校验，调度器步长的变更由 release binding 的
+`source_head`/runtime bundle 身份（重新 attest/qualify/bind）捕获。后续设计项：把"固定时长"的阶段
+判活改为"进展判活"（有字节/记录在流动就续期，只有停滞超过阈值才算卡死）或按结果大小配比预算，
+从而不再需要按最坏个例调这一常数。
+
 当前实现采用完整 recovery barrier 加周期等待续租，因为 admission 的 documents credit 会约束日常
 等待集合。只有真实 backlog 与数据库 RTT 证明一次 barrier 的候选规模超过该续租能力，才引入
 bounded recovery feeder/batch renewal；不能为假设扩容增加第二队列或削弱 recovery-before-admission。
@@ -762,9 +777,12 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   它们不复用调度器 `0.1s` wake tick；archive member count 的配置/执行合同统一为
   `1..100000`，不能把字节信用当成文件数量来静默截断。
 - `DISCLOSURE_V4_COMMIT_STAGE_SECONDS` 是单文档 commit 的总安全预算，默认 `3600`、
-  范围 `60..86400` 秒，纳入本机 v2 profile 身份；它包含语义单飞锁、provider 名额等待、
-  所有模型组和发布准备。它不是按页数推算的完成承诺；各 provider 自身超时仍独立生效。
-  其他阶段保留原 `60s` 上限。commit 使用不可延长的总期限与可续新的 claim 期限两重保护，
+  范围 `240..86400` 秒（下限跟随生产步长 240，见 §4.3.1），纳入本机 v2 profile 身份；它包含
+  语义单飞锁、provider 名额等待、所有模型组和发布准备。它不是按页数推算的完成承诺；各 provider
+  自身超时仍独立生效。配置下限（240）高于 v2 profile 合同下限（60）：已写入的 60..239 profile
+  字节仍能解码，但当前投影会拒绝，须按版本化变更处理。其他阶段的上限由生产投影固定为 `240s`
+  （见 §4.3.1）；dataclass 默认值 `60s` 只服务于测试夹具。
+  commit 使用不可延长的总期限与可续新的 claim 期限两重保护，
   后者扣除续租余量；只有核实成功的续租（含响应丢失后的同 claim 重读）才可向前更新。
   任一期限过期或权限撤销后均不得复活，即使续租响应随后到达。
   live guard 贯穿 builder、router、provider executor 和两种 CLI adapter；等待锁/名额及

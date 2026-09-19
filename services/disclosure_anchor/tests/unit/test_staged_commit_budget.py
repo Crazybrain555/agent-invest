@@ -23,7 +23,10 @@ from disclosure_anchor.application.services.staged_execution_guard import (
 from disclosure_anchor.application.services.staged_parse_coordinator import (
     CoordinatorResult, CoordinatorTerminal, StagedParseCoordinator,
 )
-from disclosure_anchor.application.services.staged_v4_capacity import staged_v4_coordinator_limits
+from disclosure_anchor.application.services.staged_v4_capacity import (
+    PRODUCTION_MAX_STAGE_STEP_SECONDS,
+    staged_v4_coordinator_limits,
+)
 from disclosure_anchor.settings import StagedV4Settings, load_settings, load_staged_v4_settings
 from tests.unit.test_mineru_process_profile import _profile
 from tests.unit.test_settings import _env
@@ -320,7 +323,7 @@ class CommitBudgetIdentityTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             settings = StagedV4Settings(**base)
             self.assertEqual(settings.commit_stage_seconds, 3600)
-            for seconds in (60, 3600, 86400):
+            for seconds in (240, 3600, 86400):
                 with self.subTest(seconds=seconds):
                     current = StagedV4Settings(**base, commit_stage_seconds=seconds)
                     profile = current.worker_profile(process_profile_sha256=remote.sha256,
@@ -329,9 +332,22 @@ class CommitBudgetIdentityTests(unittest.TestCase):
                     self.assertEqual(profile.commit_stage_seconds, seconds)
                     limits = staged_v4_coordinator_limits(remote, worker_profile=profile)
                     self.assertEqual(limits.commit_stage_seconds, seconds)
-                    self.assertEqual(limits.max_stage_step_seconds, 60)
-                    self.assertEqual(limits.claim_lease_seconds, 120)
-            for value in (59, 86401, -1, True, float('nan'), float('inf')):
+                    # The bounded stage step covers the largest retained provider result over the
+                    # Mac<->Windows tunnel (~34 MB took ~62 s at ~0.55 MB/s); the lease keeps the
+                    # 30 s renewal/deferral headroom (lease - step - margin) the scheduler had at 60/120.
+                    self.assertEqual(limits.max_stage_step_seconds, 240)
+                    self.assertEqual(limits.claim_lease_seconds, 300)
+                    self.assertEqual(
+                        limits.claim_lease_seconds - limits.max_stage_step_seconds
+                        - limits.claim_renew_margin_seconds,
+                        30,
+                    )
+            # The settings floor must not admit a commit budget the production projection rejects.
+            self.assertEqual(
+                StagedV4Settings.model_fields['commit_stage_seconds'].metadata[0].ge,
+                PRODUCTION_MAX_STAGE_STEP_SECONDS,
+            )
+            for value in (239, 60, 86401, -1, True, float('nan'), float('inf')):
                 with self.subTest(value=value), self.assertRaises(ValueError):
                     StagedV4Settings(**base, commit_stage_seconds=value)
 
