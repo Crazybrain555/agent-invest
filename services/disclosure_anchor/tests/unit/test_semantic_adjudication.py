@@ -36,7 +36,11 @@ from disclosure_anchor.application.services.semantic_adjudication import (
     OrderedSemanticAdjudicationExecutor,
     semantic_group_cache_key,
 )
-from tests.unit.test_semantic_codex_cli import USAGE_LIMIT_MESSAGE
+from tests.unit.test_semantic_codex_cli import (
+    LIVE_USAGE_LIMIT_STDOUT,
+    MODELS_REFRESH_STDERR,
+    USAGE_LIMIT_MESSAGE,
+)
 
 
 _GROUP_HASH = "sha256:" + "9" * 64
@@ -363,13 +367,9 @@ class OrderedSemanticAdjudicationExecutorTests(unittest.TestCase):
 
     def test_real_codex_structured_capacity_event_still_uses_backup(self) -> None:
         streams = (
-            json.dumps(
-                {
-                    "type": "error",
-                    "message": "API Error: 429 Too Many Requests",
-                }
-            ),
-            "\n".join(
+            (json.dumps({"type": "error", "message": "API Error: 429 Too Many Requests"}), ""),
+            (LIVE_USAGE_LIMIT_STDOUT, MODELS_REFRESH_STDERR),
+            ("\n".join(
                 (
                     json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
                     json.dumps({"type": "turn.started"}),
@@ -381,9 +381,9 @@ class OrderedSemanticAdjudicationExecutorTests(unittest.TestCase):
                         }
                     ),
                 )
-            ),
+            ), ""),
         )
-        for stdout in streams:
+        for stdout, stderr in streams:
             with self.subTest(stdout=stdout), tempfile.TemporaryDirectory() as tmp:
                 primary = CodexCliSemanticAdjudicator(
                     executable=Path("/opt/codex"),
@@ -398,7 +398,7 @@ class OrderedSemanticAdjudicationExecutorTests(unittest.TestCase):
                 )
                 with mock.patch(
                     "disclosure_anchor.adapters.semantics.codex_cli._run_process",
-                    return_value=subprocess.CompletedProcess(["codex"], 1, stdout, ""),
+                    return_value=subprocess.CompletedProcess(["codex"], 1, stdout, stderr),
                 ):
                     outcome = executor.adjudicate(_batch(), group_hash=_GROUP_HASH)
 

@@ -101,6 +101,15 @@ _AUTH_DIAGNOSTICS = tuple(
         r"invalid (?:api key|auth token)(?:\s*[·;:.,-]\s*(?:please\s+)?run\s+/login)?[.!]?",
     )
 )
+# Runtime notices the Codex CLI writes about its own environment; they carry no
+# provider verdict and must not veto an otherwise single-family availability
+# classification.  Closed set, full-line matches only.
+_BENIGN_STDERR_NOTICES = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\S+ ERROR codex_models_manager::manager: failed to refresh available models: .+",
+    )
+)
 _CAPACITY_DIAGNOSTICS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -421,6 +430,7 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
             retryable=False,
         )
     messages: list[str] = []
+    disabled_code_mode_warnings = 0
     for line_number, raw_line in enumerate(stdout.splitlines(), start=1):
         if not raw_line.strip():
             continue
@@ -511,6 +521,12 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
                         reason_code="invalid_runtime_protocol",
                         retryable=False,
                     )
+                if message == _DISABLED_CODE_MODE_WARNING:
+                    disabled_code_mode_warnings += 1
+                    if disabled_code_mode_warnings == 1:
+                        # The same one-time non-execution receipt the success
+                        # path accepts; it is not the provider's failure reason.
+                        continue
                 messages.append(message)
                 continue
             raise SemanticRouteAdjudicatorError(
@@ -1102,9 +1118,15 @@ def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRoute
         )
     except SemanticRouteAdjudicatorError as exc:
         return exc
+    stderr_lines = tuple(
+        line.strip()
+        for line in completed.stderr.splitlines()
+        if line.strip()
+        and not any(pattern.fullmatch(line.strip()) for pattern in _BENIGN_STDERR_NOTICES)
+    )
     diagnostics = (
         *structured_messages,
-        *((completed.stderr,) if completed.stderr.strip() else ()),
+        *(("\n".join(stderr_lines),) if stderr_lines else ()),
     )
     if any("invalid_json_schema" in item.casefold() for item in diagnostics):
         reason = "invalid_output_schema"

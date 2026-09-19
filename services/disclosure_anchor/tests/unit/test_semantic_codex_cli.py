@@ -31,6 +31,28 @@ USAGE_LIMIT_MESSAGE = (
     "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
     " to purchase more credits or try again at Sep 21st, 2026 11:21 PM."
 )
+# Observed 2026-09-19 with codex-cli 0.154.0 through the adapter's exact argv:
+# the CLI reports its disabled hosted code helper once and a models-cache
+# refresh timeout on stderr before the account usage limit ends the turn.
+DISABLED_CODE_MODE_ITEM = (
+    "Code Mode is unavailable because code-mode host is disabled. Code mode will"
+    " fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."
+)
+MODELS_REFRESH_STDERR = (
+    "2026-09-19T14:17:20.873175Z ERROR codex_models_manager::manager: failed to refresh"
+    " available models: timeout waiting for child process to exit\n"
+    "2026-09-19T14:17:20.886893Z ERROR codex_models_manager::manager: failed to refresh"
+    " available models: timeout waiting for child process to exit\n"
+)
+LIVE_USAGE_LIMIT_STDOUT = "\n".join(
+    (
+        json.dumps({"type": "thread.started", "thread_id": "01a0ba07-60f9-7911-89aa-5ebafb756ab9"}),
+        json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": DISABLED_CODE_MODE_ITEM}}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "error", "message": USAGE_LIMIT_MESSAGE}),
+        json.dumps({"type": "turn.failed", "error": {"message": USAGE_LIMIT_MESSAGE}}),
+    )
+)
 
 
 def _batch() -> SemanticAdjudicationBatch:
@@ -386,6 +408,30 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
                 "capacity_unavailable",
                 True,
             ),
+            # the live 0.154.0 stream: code-mode notice + models-cache refresh noise + usage limit
+            (LIVE_USAGE_LIMIT_STDOUT, MODELS_REFRESH_STDERR, "capacity_unavailable", True),
+            # benign notices alone never manufacture an availability reason
+            (
+                json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": DISABLED_CODE_MODE_ITEM}}),
+                MODELS_REFRESH_STDERR,
+                "command_failed",
+                True,
+            ),
+            # a second code-mode notice is an ordinary error message again
+            (
+                "\n".join(
+                    (
+                        json.dumps({"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": DISABLED_CODE_MODE_ITEM}}),
+                        json.dumps({"type": "item.completed", "item": {"id": "item_1", "type": "error", "message": DISABLED_CODE_MODE_ITEM}}),
+                        json.dumps({"type": "error", "message": USAGE_LIMIT_MESSAGE}),
+                    )
+                ),
+                "",
+                "command_failed",
+                True,
+            ),
+            # an unrelated stderr error is still fail-closed evidence
+            (LIVE_USAGE_LIMIT_STDOUT, MODELS_REFRESH_STDERR + "ERROR something else broke\n", "command_failed", True),
             (
                 "\n".join(
                     (

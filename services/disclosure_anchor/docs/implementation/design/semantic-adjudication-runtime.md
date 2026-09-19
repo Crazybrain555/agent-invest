@@ -75,7 +75,11 @@ Unrecognized non-zero output is `command_failed` or a more specific fail-closed 
 stdout and bare diagnostic substrings are never availability evidence.
 The Codex capacity families are the 429/rate-limit/quota/credit-balance diagnostics and the account
 usage limit ("You've hit your usage limit", with or without its purchase-credits and retry-time
-clauses), which classify as `capacity_unavailable` and stay retryable.
+clauses), which classify as `capacity_unavailable` and stay retryable. Two runtime notices the CLI
+writes about its own environment are excluded from that classification because they carry no provider
+verdict: the one-time disabled-code-mode error item that the success path already accepts, and the
+`codex_models_manager` "failed to refresh available models" stderr line (closed full-line set). Any
+other unrecognized line still fails closed.
 
 ## Cache and receipt
 
