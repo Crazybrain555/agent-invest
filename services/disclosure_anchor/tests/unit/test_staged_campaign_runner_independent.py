@@ -15,6 +15,25 @@ from tests.unit import test_staged_new_work_admission_v4 as admission_fixture
 
 
 class CampaignRunnerIndependentTests(unittest.TestCase):
+    def test_spool_fact_bound_counts_every_member_including_carry_in(self):
+        from disclosure_anchor.application.contracts.m6_campaign import M6CampaignScope
+        from tests import m6_support as m6
+        entries = [m6.entry(f"carry-{i:02}", pages=2, mode="e2e_publication", origin="carry_in") for i in range(6)]
+        entries.append(m6.entry("fresh-00", pages=2, mode="e2e_publication", origin="fresh"))
+        manifest = m6.manifest("e2e_publication", *entries)
+        request = campaign_runner.CampaignRunRequest(
+            manifest=manifest, scope=M6CampaignScope.from_manifest(manifest), max_seconds=60,
+        )
+        self.assertEqual(len(request.admission_scope.ordinary_document_ids), 1)
+        # six recovered attempts x (admitted, publication, final) alone need 18 facts; the old
+        # ordinary-only bound (4 * 1 + 8 = 12) would have starved the spool.
+        self.assertEqual(campaign_runner.campaign_spool_fact_bound(request), 4 * 7 + 8)
+        fresh_only = campaign(count=8)
+        fresh_request = campaign_runner.CampaignRunRequest(
+            manifest=fresh_only.manifest, scope=fresh_only.scope, max_seconds=60,
+        )
+        self.assertEqual(campaign_runner.campaign_spool_fact_bound(fresh_request), 4 * 8 + 8)
+
     def test_observation_is_not_durable_admission_and_cannot_stop_first_claim(self):
         admitter, _source, claims, _work, envelope = admission_fixture.StagedV4NewWorkAdmitterTests()._fixture()
         scope = campaign((("doc-1", admission_fixture._SOURCE_SHA),))

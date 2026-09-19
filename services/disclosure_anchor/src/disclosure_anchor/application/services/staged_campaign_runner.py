@@ -189,8 +189,19 @@ def campaign_receipt(
     }
 
 
+def campaign_spool_fact_bound(request: CampaignRunRequest) -> int:
+    """Lifecycle-fact capacity for one owner-bound run.
+
+    Every member of the frozen scope, carried-in members included, may produce
+    up to four facts (admitted, remote accepted, publication committed, final);
+    eight more cover unavailable-fact notes. Counting ordinary members only
+    starved the spool as soon as recovered attempts were announced.
+    """
+    return 4 * len(request.admission_scope.document_ids) + 8
+
+
 __all__ = [
     "CAMPAIGN_RECEIPT_CONTRACT", "CampaignActivationRole", "CampaignInputError", "CampaignRunRequest",
     "CampaignRuntimeIdentity", "CampaignStopReason", "CampaignStopState", "campaign_receipt",
-    "campaign_stop_predicate", "load_campaign_inputs",
+    "campaign_spool_fact_bound", "campaign_stop_predicate", "load_campaign_inputs",
 ]

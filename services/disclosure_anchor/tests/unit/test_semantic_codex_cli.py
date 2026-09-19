@@ -27,6 +27,12 @@ from disclosure_anchor.application.ports.semantic_routes import (
 )
 
 
+USAGE_LIMIT_MESSAGE = (
+    "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
+    " to purchase more credits or try again at Sep 21st, 2026 11:21 PM."
+)
+
+
 def _batch() -> SemanticAdjudicationBatch:
     return SemanticAdjudicationBatch(
         document=SemanticDocumentContext(
@@ -199,6 +205,29 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
             ("Not logged in · Please run /login", "not_authenticated", False),
             ("API Error: 429 Too Many Requests", "capacity_unavailable", True),
             ("quota exceeded", "capacity_unavailable", True),
+            (USAGE_LIMIT_MESSAGE, "capacity_unavailable", True),
+            ("You've hit your usage limit.", "capacity_unavailable", True),
+            (
+                "You've hit your usage limit."
+                " Visit https://chatgpt.com/codex/settings/usage"
+                " to purchase more credits.",
+                "capacity_unavailable",
+                True,
+            ),
+            (USAGE_LIMIT_MESSAGE + "\nquota exceeded", "capacity_unavailable", True),
+            (
+                "You've hit your usage limit. Try again at Sep 21st, 2026 11:21 PM.",
+                "capacity_unavailable",
+                True,
+            ),
+            ("You've hit your usage limit. Try again in 4 hours.", "capacity_unavailable", True),
+            ("context window exceeded: you've hit your usage limit", "command_failed", True),
+            (
+                USAGE_LIMIT_MESSAGE + "\nNot logged in · Please run /login",
+                "command_failed",
+                True,
+            ),
+            ("you have hit your usage limit today", "command_failed", True),
             (
                 "API Error: 429 Too Many Requests\nRate limit exceeded.",
                 "capacity_unavailable",
@@ -321,6 +350,62 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
                 ),
                 "",
                 "capacity_unavailable",
+                True,
+            ),
+            (
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "thread.started",
+                                "thread_id": "thread-1",
+                            }
+                        ),
+                        json.dumps({"type": "turn.started"}),
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": USAGE_LIMIT_MESSAGE,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "turn.failed",
+                                "error": {"message": USAGE_LIMIT_MESSAGE},
+                            }
+                        ),
+                    )
+                ),
+                "",
+                "capacity_unavailable",
+                True,
+            ),
+            (
+                json.dumps({"type": "error", "message": USAGE_LIMIT_MESSAGE}),
+                "",
+                "capacity_unavailable",
+                True,
+            ),
+            (
+                "\n".join(
+                    (
+                        json.dumps({"type": "error", "message": USAGE_LIMIT_MESSAGE}),
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "message": "fatal protocol parser crashed",
+                            }
+                        ),
+                    )
+                ),
+                "",
+                "command_failed",
+                True,
+            ),
+            (
+                json.dumps({"type": "error", "message": USAGE_LIMIT_MESSAGE}),
+                "security policy rejected a forbidden tool call",
+                "command_failed",
                 True,
             ),
             (

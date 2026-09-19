@@ -104,6 +104,13 @@ New evidence after claimed drain/close contradicts that closure.
 
 The adapter must report each attempt final before verifier drain, retain owner
 sequence across same-boot recovery, and never reopen admission during resume.
+A recovered attempt is announced with `attempt_admitted` when its durable head is
+claimed, before any other fact of that attempt; whether that admission is carry-in
+comes from the frozen spec's `carry_in_attempt_ids`, not from when it arrived, so the
+receipt does not charge a listed carry-in against the admission window or the stop
+budget. The owner still refuses every `attempt_admitted` outside `opened && !stopped`,
+so a recovered head must be claimed while admission is open. The runner's lifecycle
+spool is sized for every scope member, carried-in members included.
 It must not freshly resubmit a manifest source marked carry-in. An exact already
 recorded owner record can be replayed by the reader; a *new* owner stamp after
 close, even for a producer retry, contradicts Tclose and makes the receipt invalid.

@@ -112,6 +112,11 @@ _CAPACITY_DIAGNOSTICS = tuple(
         r"rate limit(?:ed| exceeded| reached)?[.!]?",
         r"quota exceeded[.!]?",
         r"credit balance is too low[.?!]?",
+        (
+            r"you['’]?ve hit your usage limit[.!]?"
+            r"(?:\s+visit\s+\S+\s+to purchase more credits)?"
+            r"(?:[.!]?\s+(?:or )?try again (?:at|in) .+?)?[.!]?"
+        ),
     )
 )
 

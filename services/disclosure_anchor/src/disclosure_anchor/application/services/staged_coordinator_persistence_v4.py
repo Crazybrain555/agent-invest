@@ -202,7 +202,16 @@ class DurableStagedCoordinatorPersistenceV4:
         if type(candidate) is not RecoveryCandidate:
             raise ValueError("recovery claim requires an exact candidate")
         observed = self._load(candidate.attempt_id)
-        return self._claim_observed(observed)
+        claimed = self._claim_observed(observed)
+        if (
+            claimed.state in STAGED_RESOURCE_STATE_TRANSITIONS
+            and claimed.claim_owner_identity == self._owner_identity
+        ):
+            # A recovered head is announced before any of its later facts: a
+            # consumer accepts an attempt's facts only after its admission.
+            # Carry-in classification is the run spec's and the reducer's job.
+            report_attempt_admitted(self._lifecycle_facts, observed.authority)
+        return claimed
 
     def renew_claim(
         self,

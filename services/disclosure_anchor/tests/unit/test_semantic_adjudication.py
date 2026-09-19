@@ -36,6 +36,7 @@ from disclosure_anchor.application.services.semantic_adjudication import (
     OrderedSemanticAdjudicationExecutor,
     semantic_group_cache_key,
 )
+from tests.unit.test_semantic_codex_cli import USAGE_LIMIT_MESSAGE
 
 
 _GROUP_HASH = "sha256:" + "9" * 64
@@ -361,36 +362,52 @@ class OrderedSemanticAdjudicationExecutorTests(unittest.TestCase):
             self.assertEqual(caught.exception.attempts[0].outcome, "failed_closed")
 
     def test_real_codex_structured_capacity_event_still_uses_backup(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            primary = CodexCliSemanticAdjudicator(
-                executable=Path("/opt/codex"),
-                runtime_tmp_root=Path(tmp),
-            )
-            backup = _Adapter(_identity("backup", provider="anthropic"))
-            executor = OrderedSemanticAdjudicationExecutor(
+        streams = (
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "API Error: 429 Too Many Requests",
+                }
+            ),
+            "\n".join(
                 (
-                    ConfiguredSemanticProvider(adapter=primary, cache=_Cache()),
-                    _configured(backup),
+                    json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                    json.dumps({"type": "turn.started"}),
+                    json.dumps({"type": "error", "message": USAGE_LIMIT_MESSAGE}),
+                    json.dumps(
+                        {
+                            "type": "turn.failed",
+                            "error": {"message": USAGE_LIMIT_MESSAGE},
+                        }
+                    ),
                 )
-            )
-            event = {
-                "type": "error",
-                "message": "API Error: 429 Too Many Requests",
-            }
-            with mock.patch(
-                "disclosure_anchor.adapters.semantics.codex_cli._run_process",
-                return_value=subprocess.CompletedProcess(
-                    ["codex"], 1, json.dumps(event), ""
-                ),
-            ):
-                outcome = executor.adjudicate(_batch(), group_hash=_GROUP_HASH)
-
-        self.assertEqual(
-            tuple(item.outcome for item in outcome.attempts),
-            ("availability_failed", "succeeded"),
+            ),
         )
-        self.assertEqual(backup.calls, 1)
-        self.assertFalse(outcome.degraded_unavailable)
+        for stdout in streams:
+            with self.subTest(stdout=stdout), tempfile.TemporaryDirectory() as tmp:
+                primary = CodexCliSemanticAdjudicator(
+                    executable=Path("/opt/codex"),
+                    runtime_tmp_root=Path(tmp),
+                )
+                backup = _Adapter(_identity("backup", provider="anthropic"))
+                executor = OrderedSemanticAdjudicationExecutor(
+                    (
+                        ConfiguredSemanticProvider(adapter=primary, cache=_Cache()),
+                        _configured(backup),
+                    )
+                )
+                with mock.patch(
+                    "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                    return_value=subprocess.CompletedProcess(["codex"], 1, stdout, ""),
+                ):
+                    outcome = executor.adjudicate(_batch(), group_hash=_GROUP_HASH)
+
+                self.assertEqual(
+                    tuple(item.outcome for item in outcome.attempts),
+                    ("availability_failed", "succeeded"),
+                )
+                self.assertEqual(backup.calls, 1)
+                self.assertFalse(outcome.degraded_unavailable)
 
     def test_cancelled_and_unknown_failures_never_try_backup(self) -> None:
         for reason_code, retryable in (

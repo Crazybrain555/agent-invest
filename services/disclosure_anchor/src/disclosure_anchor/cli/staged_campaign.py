@@ -46,7 +46,7 @@ from disclosure_anchor.adapters.runtime.stage_observation import (
 from disclosure_anchor.adapters.runtime.staged_worker_v4 import build_staged_worker_v4_campaign_runtime
 from disclosure_anchor.application.services.staged_campaign_runner import (
     CampaignInputError, CampaignRunRequest, CampaignRuntimeIdentity, CampaignStopState,
-    campaign_receipt, campaign_stop_predicate, load_campaign_inputs,
+    campaign_receipt, campaign_spool_fact_bound, campaign_stop_predicate, load_campaign_inputs,
 )
 from disclosure_anchor.application.services.staged_parse_coordinator import CoordinatorResult, CoordinatorSnapshot
 from disclosure_anchor.application.worker.locks import WORKER_NS
@@ -217,7 +217,7 @@ def run_campaign(
                     spool = M6LifecycleSpool(
                         m6_spool_dir, run_id=spec.run_id, spec_sha256=spec.canonical_sha256(),
                         producer_epoch_sha256=m6_run.epoch("e2e_runner"),
-                        max_facts=4 * len(request.admission_scope.ordinary_document_ids) + 8,
+                        max_facts=campaign_spool_fact_bound(request),
                     )
                     clock = diagnostic_continuous_clock()
                     refresh = min(30.0, max(0.1, m6_run.lease.maximum_lease_ns / 3e9))

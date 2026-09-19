@@ -73,6 +73,9 @@ error events and envelopes use versioned closed key/type shapes. Typed structure
 unknown, conflicting, schema, protocol, or security sibling evidence become availability.
 Unrecognized non-zero output is `command_failed` or a more specific fail-closed reason; free-form
 stdout and bare diagnostic substrings are never availability evidence.
+The Codex capacity families are the 429/rate-limit/quota/credit-balance diagnostics and the account
+usage limit ("You've hit your usage limit", with or without its purchase-credits and retry-time
+clauses), which classify as `capacity_unavailable` and stay retryable.
 
 ## Cache and receipt
 

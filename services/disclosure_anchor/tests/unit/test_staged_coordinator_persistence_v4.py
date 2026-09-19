@@ -13,6 +13,7 @@ from unittest import mock
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     advance_remote_parse_checkpoint_v4,
     build_initial_remote_parse_checkpoint_v4,
+    build_resource_free_remote_parse_checkpoint_v4,
     build_resource_reservation_v4,
 )
 from disclosure_anchor.application.contracts.staged_credit import (
@@ -35,6 +36,7 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4SuccessorNotCommitted,
     V4SuccessorReconciliation,
 )
+from disclosure_anchor.application.ports.staged_lifecycle_facts import AttemptAdmittedFact
 from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness
 from disclosure_anchor.application.services.staged_coordinator_persistence_v4 import (
     DurableStagedCoordinatorPersistenceV4,
@@ -166,6 +168,155 @@ def _prepared_authority(
         staged_by_link=None,
         database_lease=database_lease,
     )
+
+
+_RESOURCEFUL_STATE_ORDER = (
+    "prepared",
+    "reconciling",
+    "submitted",
+    "remote_terminal",
+    "materializing",
+    "local_materialized",
+)
+
+
+def _advanced_authority(
+    attempt_id: str,
+    *,
+    state: str,
+    snapshot_bytes: int,
+    database_now: datetime,
+) -> RemoteParseV4Authority:
+    """One current head walked to `state`, left behind by a crashed owner.
+
+    Past `prepared` a durable head can only be recovered from an earlier
+    claim, so the head carries that owner's exact expired lease.
+    """
+    authority = _prepared_authority(
+        attempt_id,
+        snapshot_bytes=snapshot_bytes,
+        database_now=database_now,
+    )
+    base = ResourceCreditVector(
+        documents=1,
+        snapshot_items=1,
+        snapshot_bytes=snapshot_bytes,
+    )
+    remote = replace(base, provider_tasks=1, provider_result_bytes=20, ack_items=1)
+    steps = {
+        "reconciling": (
+            replace(base, remote_waits=1),
+            {"submission_intent_sha256": _sha(f"{attempt_id}:submission")},
+        ),
+        "submitted": (
+            replace(base, remote_waits=1, provider_tasks=1, ack_items=1),
+            {"accepted_submission_sha256": _sha(f"{attempt_id}:accepted")},
+        ),
+        "remote_terminal": (
+            remote,
+            {"terminal_receipt_sha256": _sha(f"{attempt_id}:terminal")},
+        ),
+        "materializing": (
+            replace(
+                remote,
+                materialization_items=1,
+                compressed_bytes=20,
+                decoded_bytes=65_536,
+                temp_disk_bytes=131_072,
+            ),
+            {"materialization_intent_sha256": _sha(f"{attempt_id}:materializing")},
+        ),
+        "local_materialized": (
+            replace(
+                remote,
+                compressed_bytes=20,
+                output_items=1,
+                output_bytes=65_536,
+                output_pages=2,
+            ),
+            {"local_materialization_receipt_sha256": _sha(f"{attempt_id}:materialized")},
+        ),
+    }
+    history = list(authority.checkpoint_history)
+    for name in _RESOURCEFUL_STATE_ORDER[1: _RESOURCEFUL_STATE_ORDER.index(state) + 1]:
+        held, evidence = steps[name]
+        history.append(
+            advance_remote_parse_checkpoint_v4(
+                history[-1],
+                state=name,
+                held_resource_credit=held,
+                **evidence,
+            )
+        )
+    checkpoint = history[-1]
+    expired_until = database_now - timedelta(seconds=1)
+    return replace(
+        authority,
+        state=checkpoint.state,
+        lifecycle_version=checkpoint.lifecycle_version,
+        checkpoint_sha256=checkpoint.sha256,
+        checkpoint_history=tuple(history),
+        claim_generation=2,
+        claim_owner_identity="crashed-worker-boot",
+        claim_lease_until=expired_until,
+        database_lease=DatabaseLeaseSnapshot(
+            database_observed_at_utc=database_now,
+            lease_until_utc=expired_until,
+            remaining_microseconds=-1_000_000,
+        ),
+    )
+
+
+def _final_authority(authority: RemoteParseV4Authority) -> RemoteParseV4Authority:
+    """The same attempt as an unclaimable resource-free final head."""
+    prepared = authority.checkpoint
+    final = build_resource_free_remote_parse_checkpoint_v4(
+        state="preparation_failed",
+        attempt_id=prepared.attempt_id,
+        attempt_generation=prepared.attempt_generation,
+        fence_identity=prepared.fence_identity,
+        document_id=prepared.document_id,
+        processing_run_id=prepared.processing_run_id,
+        source_pdf_sha256=prepared.source_pdf_sha256,
+        source_byte_count=prepared.source_byte_count,
+        source_page_count=prepared.source_page_count,
+        request_sha256=prepared.request_sha256,
+        runtime_epoch_sha256=prepared.runtime_epoch_sha256,
+        process_profile_sha256=prepared.process_profile_sha256,
+        credit_policy_sha256=prepared.credit_policy_sha256,
+        reservation_input_sha256=prepared.reservation_input_sha256,
+        failure_receipt_sha256=_sha(f"{prepared.attempt_id}:failure"),
+    )
+    return replace(
+        authority,
+        state=final.state,
+        lifecycle_version=final.lifecycle_version,
+        checkpoint_sha256=final.sha256,
+        checkpoint_history=(final,),
+    )
+
+
+class _LifecycleFacts:
+    """Records exactly what the persistence hands the lifecycle facts port."""
+
+    def __init__(self) -> None:
+        self.admitted: list[AttemptAdmittedFact] = []
+        self.unavailable: list[tuple[str, str, str]] = []
+
+    def attempt_admitted(self, fact: AttemptAdmittedFact) -> None:
+        self.admitted.append(fact)
+
+    def remote_accepted(self, fact: object) -> None:
+        raise AssertionError("a recovery claim reports no remote acceptance")
+
+    def publication_committed(self, fact: object) -> None:
+        raise AssertionError("a recovery claim reports no publication")
+
+    def attempt_final(self, fact: object) -> None:
+        raise AssertionError("a recovery claim reports no attempt final")
+
+    def fact_unavailable(self, kind: str, attempt_id: str, reason: str) -> None:
+        self.unavailable.append((kind, attempt_id, reason))
 
 
 class _Clock:
@@ -478,12 +629,15 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
         self,
         repository: _Repository,
         factory: _Factory,
+        *,
+        lifecycle_facts: _LifecycleFacts | None = None,
     ) -> DurableStagedCoordinatorPersistenceV4:
         return DurableStagedCoordinatorPersistenceV4(
             uow_factory=factory,  # type: ignore[arg-type]
             limits=_limits(),
             owner_identity="worker-boot-one",
             monotonic=self.clock,
+            lifecycle_facts=lifecycle_facts,
         )
 
     def test_claim_then_fresh_backend_renews_without_process_cache(self) -> None:
@@ -600,6 +754,120 @@ class StagedCoordinatorPersistenceV4Tests(unittest.TestCase):
         self.assertGreaterEqual(raised.exception.retry_after_seconds, 30)
         self.assertEqual(repository.claim_calls, 0)
         self.assertEqual(repository.heads[authority.attempt_id].claim_generation, 3)
+
+    def test_recovery_claim_announces_each_recovered_head_it_takes(self) -> None:
+        for state in ("reconciling", "remote_terminal", "local_materialized"):
+            with self.subTest(state=state):
+                authority = _advanced_authority(
+                    f"attempt-{state}",
+                    state=state,
+                    snapshot_bytes=100,
+                    database_now=self.database_now,
+                )
+                assert authority.reservation is not None
+                repository = _Repository((authority,))
+                facts = _LifecycleFacts()
+                backend = self._backend(
+                    repository, _Factory(repository), lifecycle_facts=facts,
+                )
+
+                claimed = backend.claim_recovery(
+                    repository._candidate(repository.load(authority.attempt_id))
+                )
+
+                self.assertEqual(claimed.state, state)
+                self.assertEqual(claimed.claim_owner_identity, "worker-boot-one")
+                self.assertEqual(facts.unavailable, [])
+                self.assertEqual(
+                    facts.admitted,
+                    [
+                        AttemptAdmittedFact(
+                            attempt_id=authority.attempt_id,
+                            fence_identity=authority.fence_identity,
+                            document_id=authority.document_id,
+                            processing_run_id=authority.processing_run_id,
+                            source_pdf_sha256=authority.source_pdf_sha256,
+                            source_byte_count=100,
+                            source_page_count=2,
+                            process_profile_sha256=(
+                                authority.reservation.process_profile_sha256
+                            ),
+                        )
+                    ],
+                )
+
+    def test_recovery_claim_announces_nothing_without_a_live_owned_head(self) -> None:
+        foreign = _advanced_authority(
+            "attempt-foreign-recovery",
+            state="remote_terminal",
+            snapshot_bytes=100,
+            database_now=self.database_now,
+        )
+        lease_until = self.database_now + timedelta(seconds=30)
+        foreign = replace(
+            foreign,
+            claim_generation=3,
+            claim_owner_identity="other-worker",
+            claim_lease_until=lease_until,
+            database_lease=DatabaseLeaseSnapshot(
+                database_observed_at_utc=self.database_now,
+                lease_until_utc=lease_until,
+                remaining_microseconds=30_000_000,
+            ),
+        )
+        repository = _Repository((foreign,))
+        facts = _LifecycleFacts()
+        backend = self._backend(repository, _Factory(repository), lifecycle_facts=facts)
+
+        with self.assertRaises(RecoveryDeferred):
+            backend.claim_recovery(
+                repository._candidate(repository.load(foreign.attempt_id))
+            )
+
+        self.assertEqual((facts.admitted, facts.unavailable), ([], []))
+
+        prepared = _prepared_authority(
+            "attempt-final-recovery",
+            snapshot_bytes=100,
+            database_now=self.database_now,
+        )
+        repository = _Repository((prepared,))
+        facts = _LifecycleFacts()
+        backend = self._backend(repository, _Factory(repository), lifecycle_facts=facts)
+        candidate = repository._candidate(repository.load(prepared.attempt_id))
+        repository.heads[prepared.attempt_id] = _final_authority(prepared)
+
+        closed = backend.claim_recovery(candidate)
+
+        self.assertEqual(closed.state, "preparation_failed")
+        self.assertEqual((facts.admitted, facts.unavailable), ([], []))
+        self.assertEqual(repository.claim_calls, 0)
+
+    def test_repeated_recovery_claim_repeats_the_identical_admission_fact(self) -> None:
+        # Every recovery claim announces its head; the exact replay is what the
+        # delivery spool deduplicates by (fact kind, attempt id).
+        authority = _advanced_authority(
+            "attempt-reclaimed",
+            state="reconciling",
+            snapshot_bytes=100,
+            database_now=self.database_now,
+        )
+        repository = _Repository((authority,))
+        facts = _LifecycleFacts()
+        backend = self._backend(repository, _Factory(repository), lifecycle_facts=facts)
+
+        first = backend.claim_recovery(
+            repository._candidate(repository.load(authority.attempt_id))
+        )
+        repository.database_now += timedelta(seconds=1)
+        backend.renew_claim(first, lease_seconds=120)
+        backend.claim_recovery(
+            repository._candidate(repository.load(authority.attempt_id))
+        )
+
+        self.assertEqual(len(facts.admitted), 2, "a renewal announces nothing")
+        self.assertEqual(facts.admitted[0], facts.admitted[1])
+        self.assertEqual(facts.unavailable, [])
 
     def test_claim_commit_response_loss_closes_from_durable_head(self) -> None:
         authority = _prepared_authority(

@@ -79,7 +79,7 @@ stream activation、全局恢复与七 lane；准入上限就是冻结的普通�
 计数钩子；截止时间或停止文件只关闭新准入，已接受任务照常排空。收据 `staged-v4-campaign.v1` 只投影
 协调器的持久结果（admitted/completed/final_states/errors/credits）与 activation 角色（candidate/production
 只是标签）；哪些成员被认领由持久 attempt 行核对，收据不自造文档级准入清单。
-它不生成正式 M6 owner 事件、发布 credit 或资格。
+未带 `--m6-run` 时它不生成正式 M6 owner 事件、发布 credit 或资格；带 `--m6-run` 时它以 `e2e_runner` 身份投递 M6 producer 事件（含为续跑/carry-in 尝试补发的 `attempt_admitted`），credit 与资格仍由 owner 与独立验证者裁定。
 
 既有 `staged_commission` 小批量入口也接入同一 owned pressure context，并将同一个
 control 交给真实 staged runtime；未配置时保持关闭。它仍只接受显式的 1–8 个文档，

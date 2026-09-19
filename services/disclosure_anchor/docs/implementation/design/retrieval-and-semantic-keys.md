@@ -56,7 +56,9 @@ labels（键规划），以及 search projection `key_tokens` 通道注入的中
 当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r64`、router `semantic_router.v101`、prompt
 `semantic_route_adjudication.v32`。默认 provider 链为 `codex_cli.v4.low` /
 `gpt-5.6-luna` 主用、`claude_cli.v1.low` / `claude-sonnet-5` 备用；仅闭合的 availability
-原因允许 failover，取消、协议、模型身份、安全与无效裁决全部 fail closed。候选与 direct route
+原因允许 failover，取消、协议、模型身份、安全与无效裁决全部 fail closed。Codex 的
+capacity 家族包含 429/限流/配额/余额不足，以及账号用量上限（"You've hit your usage limit"，
+含或不含购买额度与重试时间子句），都归为 `capacity_unavailable`。候选与 direct route
 都最多 8 个。单个 Unit 的 locked 候选超过 8 个时，`_candidates` 以
 `SemanticRouteLockedCandidateOverflowError` 做确定性的 per-Unit 拒绝，消息携带 unit_index、
 locked_count 与排序后的 locked_keys；该计数取自 shortlist 截断之前，必须保持在该位置。commit 阶段

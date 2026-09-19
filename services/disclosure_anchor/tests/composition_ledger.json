@@ -480,7 +480,7 @@
   },
   "tests/unit/test_m6_run_accounting.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 28
   },
   "tests/unit/test_m6_run_contract.py": {
    "private_imports": [],
@@ -1185,7 +1185,7 @@
   },
   "tests/unit/test_staged_campaign_runner_independent.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 6
   },
   "tests/unit/test_staged_campaign_sql_v4.py": {
    "private_imports": [],
@@ -1211,7 +1211,7 @@
   },
   "tests/unit/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
-   "tests": 20
+   "tests": 23
   },
   "tests/unit/test_staged_credit.py": {
    "private_imports": [],

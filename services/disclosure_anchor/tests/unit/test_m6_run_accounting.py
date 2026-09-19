@@ -1175,6 +1175,37 @@ class ModeAndOriginTests(unittest.TestCase):
         receipt = m6.reduce(fixture, j, history=(fact_a,), qualifications=(proof_a,))
         self.assertEqual(receipt.status, "invalid", "a carry-in attempt id cannot admit a fresh source")
 
+    def test_recovered_carry_in_may_be_admitted_outside_the_admission_window(self) -> None:
+        # A recovered attempt is announced when its head is claimed, which is
+        # before the owner opens admission and can be after the stop; only its
+        # fresh siblings owe the window. k: 9 carry-in pages, a: 7 fresh pages.
+        fixture = e2e({"a": (7, "fresh"), "k": (9, "carry_in")}, carry_in=("carry-k",))
+        a, k = fixture.entries["a"], fixture.entries["k"]
+
+        j = m6.Journal(fixture)
+        j.start()
+        _, proof_k, fact_k = m6.e2e_publish(j, k, "carry-k", admit_at=0.5, ledger_seq=1)
+        j.opened(j.at(7))
+        _, proof_a, fact_a = m6.e2e_publish(j, a, "att-a", admit_at=8, ledger_seq=2)
+        j.close_run(stop_at=60)
+        receipt = m6.reduce(fixture, j, history=(fact_a, fact_k), qualifications=(proof_a, proof_k))
+        self.assertEqual(receipt.status, "complete", receipt)
+        self.assertEqual(m6.outcomes(receipt), {"att-a": "credited_window", "carry-k": "carry_in"})
+        self.assertEqual(receipt.metrics, M6PublicationMetrics(window_pages=7, whole_run_pages=7, carry_in_pages=9))
+
+        j = opened(fixture)
+        _, proof_a, fact_a = m6.e2e_publish(j, a, "att-a", admit_at=2, ledger_seq=1)
+        j.stop_requested(j.at(30))
+        j.stop_effective(j.at(31))
+        _, proof_k, fact_k = m6.e2e_publish(j, k, "carry-k", admit_at=32, ledger_seq=2)
+        j.drained(j.at(40))
+        j.resources_closed(j.at(41))
+        j.closed(j.at(42))
+        receipt = m6.reduce(fixture, j, history=(fact_a, fact_k), qualifications=(proof_a, proof_k))
+        self.assertEqual(receipt.status, "complete", receipt)
+        self.assertEqual(m6.outcomes(receipt), {"att-a": "credited_window", "carry-k": "carry_in"})
+        self.assertEqual(receipt.metrics, M6PublicationMetrics(window_pages=7, whole_run_pages=7, carry_in_pages=9))
+
     def test_service_replay_is_not_e2e_and_incident_is_permanent(self) -> None:
         fixture = service({"s": (4, "fresh")})
         s = fixture.entries["s"]
