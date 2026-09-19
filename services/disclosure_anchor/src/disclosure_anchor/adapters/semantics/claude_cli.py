@@ -31,6 +31,11 @@ from disclosure_anchor.application.ports.staged_execution import current_semanti
 _CLAUDE_AUTH_DIAGNOSTICS = (
     *codex_cli._AUTH_DIAGNOSTICS,
     re.compile(r"anthropic profile login expired[.!]?", re.IGNORECASE),
+    # Claude Code 2.1.274 `result` when the CLI's own stored login is gone.
+    re.compile(
+        r"failed to authenticate:\s*oauth session expired and could not be refreshed[.!]?",
+        re.IGNORECASE,
+    ),
 )
 _CLAUDE_CAPACITY_DIAGNOSTICS = (
     *codex_cli._CAPACITY_DIAGNOSTICS,
@@ -51,6 +56,8 @@ _ERROR_ENVELOPE_INT_METADATA = frozenset(
         "duration_api_ms",
         "duration_ms",
         "num_turns",
+        "queued_turn_count",
+        "result_index",
         "time_to_request_ms",
         "ttft_ms",
         "ttft_stream_ms",
@@ -62,7 +69,18 @@ _ERROR_ENVELOPE_STRING_METADATA = frozenset(
 _ERROR_ENVELOPE_OPTIONAL_STRING_METADATA = frozenset(
     {"fast_mode_disabled_reason", "stop_reason", "terminal_reason"}
 )
-_ERROR_ENVELOPE_DICT_METADATA = frozenset({"modelUsage", "usage"})
+_ERROR_ENVELOPE_DICT_METADATA = frozenset({"modelUsage", "subagent_stats", "usage"})
+# Claude Code 2.1.274 subagent accounting; the adjudicator runs with tools
+# disabled, so every counter must stay zero (a nonzero one is a capability breach).
+_SUBAGENT_STATS_COUNTERS = frozenset(
+    {"completed", "failed", "max_depth", "spawned", "spawned_by_subagents", "started_in_background"}
+)
+_SUBAGENT_STATS_GROUPS: dict[str, frozenset[str]] = {
+    "killed": frozenset({"parent", "system", "user"}),
+    "refused": frozenset({"budget", "concurrency_limit", "depth_limit"}),
+    "requested": frozenset({"background", "foreground", "unset"}),
+}
+_SUBAGENT_STATS_FIELDS = _SUBAGENT_STATS_COUNTERS | set(_SUBAGENT_STATS_GROUPS) | {"by_type"}
 _ERROR_ENVELOPE_FIELDS = (
     _ERROR_ENVELOPE_CORE_FIELDS
     | _ERROR_ENVELOPE_INT_METADATA
@@ -302,7 +320,16 @@ def _structured_output(stdout: str) -> dict[str, object]:
             reason_code="forbidden_tool_call",
             retryable=False,
         )
-    if _reports_disabled_capability(payload):
+    # The success path validates no envelope shape, so an unreadable subagent
+    # block counts as a breach rather than as zero activity.
+    if (
+        _reports_disabled_capability(payload)
+        or _reports_subagent_activity(payload)
+        or (
+            "subagent_stats" in payload
+            and not _valid_subagent_stats(payload["subagent_stats"])
+        )
+    ):
         raise SemanticRouteAdjudicatorError(
             "Claude semantic runtime reported a disabled capability",
             reason_code="forbidden_tool_call",
@@ -459,7 +486,7 @@ def _validate_error_envelope_metadata(payload: dict[str, object]) -> None:
             reason_code="invalid_runtime_protocol",
             retryable=False,
         )
-    if _reports_disabled_capability(payload):
+    if _reports_disabled_capability(payload) or _reports_subagent_activity(payload):
         raise SemanticRouteAdjudicatorError(
             "Claude semantic error envelope reported a disabled capability",
             reason_code="forbidden_tool_call",
@@ -486,8 +513,9 @@ def _validate_error_envelope_metadata(payload: dict[str, object]) -> None:
         )
     if (
         ("type" in payload and payload["type"] != "result")
-        # Claude Code 2.1.237 uses `success` for a completed CLI envelope even
-        # when `is_error=true`; `terminal_reason=api_error` carries the failure.
+        # Claude Code 2.1.237, re-observed at 2.1.274: `success` is the subtype of a
+        # completed CLI envelope even when `is_error=true`; `terminal_reason=api_error`
+        # carries the failure.
         or ("subtype" in payload and payload["subtype"] != "success")
         or ("fast_mode_state" in payload and payload["fast_mode_state"] != "off")
         or (
@@ -543,6 +571,43 @@ def _validate_error_envelope_metadata(payload: dict[str, object]) -> None:
             reason_code="invalid_runtime_protocol",
             retryable=False,
         )
+    if "subagent_stats" in payload and not _valid_subagent_stats(
+        payload["subagent_stats"]
+    ):
+        raise SemanticRouteAdjudicatorError(
+            "Claude semantic error envelope subagent metadata is invalid",
+            reason_code="invalid_runtime_protocol",
+            retryable=False,
+        )
+
+
+def _valid_subagent_stats(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != _SUBAGENT_STATS_FIELDS:
+        return False
+    if any(not _is_nonnegative_int(value.get(key)) for key in _SUBAGENT_STATS_COUNTERS):
+        return False
+    for key, members in _SUBAGENT_STATS_GROUPS.items():
+        group = value.get(key)
+        if (
+            not isinstance(group, dict)
+            or set(group) != members
+            or any(not _is_nonnegative_int(item) for item in group.values())
+        ):
+            return False
+    return value.get("by_type") == {}
+
+
+def _reports_subagent_activity(payload: dict[str, object]) -> bool:
+    stats = payload.get("subagent_stats")
+    if not isinstance(stats, dict):
+        return False
+    if any(_is_positive_int(stats.get(key)) for key in _SUBAGENT_STATS_COUNTERS):
+        return True
+    return any(
+        isinstance(stats.get(key), dict)
+        and any(_is_positive_int(item) for item in stats[key].values())
+        for key in _SUBAGENT_STATS_GROUPS
+    )
 
 
 def _valid_usage(value: object) -> bool:

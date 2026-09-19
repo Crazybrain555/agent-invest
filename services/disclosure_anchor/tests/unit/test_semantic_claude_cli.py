@@ -108,6 +108,51 @@ def _error_usage() -> dict[str, object]:
     }
 
 
+def _subagent_stats(**changes: object) -> dict[str, object]:
+    stats: dict[str, object] = {
+        "spawned": 0,
+        "requested": {"background": 0, "foreground": 0, "unset": 0},
+        "started_in_background": 0,
+        "max_depth": 0,
+        "spawned_by_subagents": 0,
+        "completed": 0,
+        "failed": 0,
+        "killed": {"parent": 0, "user": 0, "system": 0},
+        "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 0},
+        "by_type": {},
+    }
+    stats.update(changes)
+    return stats
+
+
+def _live_expired_login_envelope() -> dict[str, object]:
+    # Claude Code 2.1.274 `-p --output-format json` envelope captured with the
+    # adapter's exact argv while the CLI's stored login was gone (empty stderr).
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "duration_ms": 16,
+        "duration_api_ms": 0,
+        "num_turns": 1,
+        "result": "Failed to authenticate: OAuth session expired and could not be refreshed",
+        "stop_reason": "stop_sequence",
+        "terminal_reason": "api_error",
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "total_cost_usd": 0,
+        "usage": _error_usage(),
+        "modelUsage": {},
+        "permission_denials": [],
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "queued_turn_count": 0,
+        "result_index": 0,
+        "subagent_stats": _subagent_stats(),
+        "api_error_status": None,
+        "uuid": "00000000-0000-4000-8000-000000000002",
+    }
+
+
 def _model_usage(
     *,
     canonical_model: str,
@@ -227,7 +272,26 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
             (json.dumps(unexpected_helper), "model_identity_mismatch"),
             (json.dumps(model_tool_receipt), "forbidden_tool_call"),
             (json.dumps(server_tool_receipt), "forbidden_tool_call"),
+            (
+                json.dumps({**json.loads(_stdout()), "subagent_stats": _subagent_stats(spawned=1)}),
+                "forbidden_tool_call",
+            ),
+            (
+                json.dumps({**json.loads(_stdout()), "subagent_stats": "spawned 1 agent"}),
+                "forbidden_tool_call",
+            ),
         )
+        with mock.patch(
+            "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+            return_value=subprocess.CompletedProcess(
+                ["claude"], 0,
+                json.dumps({**json.loads(_stdout()), "subagent_stats": _subagent_stats()}), "",
+            ),
+        ):
+            self.assertEqual(
+                adapter.adjudicate_with_result(_batch()).decisions[0].routes[0].key,
+                "forecast_summary",
+            )
         for stdout, reason_code in cases:
             with (
                 self.subTest(reason_code=reason_code),
@@ -303,6 +367,20 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
             ("overloaded_error", "capacity_unavailable", True),
             ("API Error: overloaded", "capacity_unavailable", True),
             ("Anthropic profile login expired.", "not_authenticated", True),
+            # The four `authentication_failed` sentences Claude Code 2.1.274 emits.
+            (
+                "Failed to authenticate: OAuth session expired and could not be refreshed",
+                "not_authenticated",
+                True,
+            ),
+            ("Login expired · Please run /login", "not_authenticated", True),
+            (
+                "Authentication error · This may be a temporary network issue, please try again",
+                "not_authenticated",
+                True,
+            ),
+            ("Invalid API key · Fix external API key", "not_authenticated", True),
+            ("Failed to authenticate: invalid API key", "command_failed", False),
             ("unexpected internal failure", "command_failed", False),
             (
                 "fatal protocol error while formatting login diagnostics",
@@ -516,6 +594,33 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                 "capacity_unavailable",
                 True,
             ),
+            (_live_expired_login_envelope(), "", "not_authenticated", True),
+            (
+                {**_live_expired_login_envelope(), "api_error_status": 401},
+                "",
+                "not_authenticated",
+                True,
+            ),
+            (
+                {
+                    **_live_expired_login_envelope(),
+                    "subagent_stats": _subagent_stats(spawned=1),
+                },
+                "",
+                "forbidden_tool_call",
+                False,
+            ),
+            (
+                {
+                    **_live_expired_login_envelope(),
+                    "subagent_stats": _subagent_stats(
+                        requested={"background": 1, "foreground": 0, "unset": 0}
+                    ),
+                },
+                "",
+                "forbidden_tool_call",
+                False,
+            ),
         )
         for payload, stderr, reason_code, retryable in cases:
             with (
@@ -609,6 +714,18 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                 "result": "API Error: 429 Too Many Requests",
                 "duration_ms": -1,
             },
+            {**_live_expired_login_envelope(), "queued_turn_count": -1},
+            {**_live_expired_login_envelope(), "result_index": True},
+            {**_live_expired_login_envelope(), "subagent_stats": {}},
+            {
+                **_live_expired_login_envelope(),
+                "subagent_stats": _subagent_stats(security_error="forbidden tool call"),
+            },
+            {
+                **_live_expired_login_envelope(),
+                "subagent_stats": _subagent_stats(by_type={"Explore": 0}),
+            },
+            {**_live_expired_login_envelope(), "queued_turns": 0},
             {
                 "is_error": True,
                 "permission_denials": [],
@@ -689,6 +806,8 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                 "result": "API Error: 429 Too Many Requests",
                 "usage": {**_error_usage(), "inference_geo": "invalid_json_schema"},
             },
+        )
+        capability_cases = (
             {
                 "is_error": True,
                 "permission_denials": [],
@@ -726,23 +845,24 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                 ),
             },
         )
-        for payload in cases:
-            with (
-                self.subTest(payload=payload),
-                mock.patch(
-                    "disclosure_anchor.adapters.semantics.codex_cli._run_process",
-                    return_value=subprocess.CompletedProcess(
-                        ["claude"], 1, json.dumps(payload), ""
+        for payloads, expected_reason in (
+            (cases, "invalid_runtime_protocol"),
+            (capability_cases, "forbidden_tool_call"),
+        ):
+            for payload in payloads:
+                with (
+                    self.subTest(payload=payload),
+                    mock.patch(
+                        "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                        return_value=subprocess.CompletedProcess(
+                            ["claude"], 1, json.dumps(payload), ""
+                        ),
                     ),
-                ),
-                self.assertRaises(SemanticRouteAdjudicatorError) as caught,
-            ):
-                adapter.adjudicate_with_result(_batch())
-            expected_reason = (
-                "forbidden_tool_call" if payload in cases[-3:] else "invalid_runtime_protocol"
-            )
-            self.assertEqual(caught.exception.reason_code, expected_reason)
-            self.assertFalse(caught.exception.retryable)
+                    self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+                ):
+                    adapter.adjudicate_with_result(_batch())
+                self.assertEqual(caught.exception.reason_code, expected_reason)
+                self.assertFalse(caught.exception.retryable)
 
         duplicate_or_nonfinite = (
             (

@@ -83,6 +83,16 @@ one-time disabled-code-mode error item that the success path already accepts, an
 `codex_models_manager` "failed to refresh available models: timeout waiting for child process to exit"
 stderr line (closed full-line set, timestamp-anchored). Any other unrecognized line still fails closed.
 Observed against codex-cli 0.154.0; re-verify the set on a CLI upgrade.
+The Claude error envelope's closed key set follows Claude Code 2.1.274: besides the earlier metadata it
+carries `queued_turn_count`, `result_index` (non-negative ints) and `subagent_stats` (closed counter
+shape; the adjudicator runs with tools disabled, so any nonzero subagent counter is a forbidden
+capability, not availability; on the success path, which validates no envelope shape, a present but
+unreadable block is likewise a breach). The CLI's `authentication_failed` sentences surface in `result`
+with `api_error_status` null — "Failed to authenticate: OAuth session expired and could not be
+refreshed", "Login expired · Please run /login", "Authentication error · This may be a temporary
+network issue, please try again", "Invalid API key · Fix external API key" — and belong to the Claude
+`not_authenticated` family (retryable); the middle dot is part of the complete diagnostic. Any other
+unknown key still fails closed as `invalid_runtime_protocol`; re-verify the set on a CLI upgrade.
 
 ## Cache and receipt
 

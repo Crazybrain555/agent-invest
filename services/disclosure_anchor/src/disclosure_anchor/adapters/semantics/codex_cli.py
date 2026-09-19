@@ -91,14 +91,20 @@ _AUTH_DIAGNOSTICS = tuple(
         r"(?:please\s+)?run\s+/login[.!]?",
         r"oauth access token has expired(?:[.!]?\s*(?:please\s+)?re-?authenticate)?[.!]?",
         r"oauth token revoked(?:[.!]?\s*(?:please\s+)?run\s+/login)?[.!]?",
-        r"login expired(?:[.!]?\s*(?:please\s+)?run\s+/login)?[.!]?",
-        r"authentication error(?:[.!]?\s*this may be a temporary network issue, please try again)?[.!]?",
+        r"login expired(?:\s*[·;:.,-]\s*(?:please\s+)?run\s+/login)?[.!]?",
+        (
+            r"authentication error(?:\s*[·;:.,-]\s*this may be a temporary network issue,"
+            r" please try again)?[.!]?"
+        ),
         (
             r"api error:\s*401(?:\s+(?:unauthorized"
             r"|oauth access token has expired[.!]?(?:\s*(?:please\s+)?re-?authenticate)?"
             r"|invalid (?:api key|auth token)))?[.!]?"
         ),
-        r"invalid (?:api key|auth token)(?:\s*[·;:.,-]\s*(?:please\s+)?run\s+/login)?[.!]?",
+        (
+            r"invalid (?:api key|auth token)(?:\s*[·;:.,-]\s*(?:(?:please\s+)?run\s+/login"
+            r"|fix external api key))?[.!]?"
+        ),
     )
 )
 # Runtime notices the Codex CLI writes about its own environment; they carry no
