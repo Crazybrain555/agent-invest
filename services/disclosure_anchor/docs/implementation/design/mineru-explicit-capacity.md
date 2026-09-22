@@ -64,8 +64,13 @@ Compose must select that profile: CPU has no GPU reservation; `cuda0` uses
 installer compares all non-device configuration, including capacity, unchanged.
 To change H or another capacity setting while retaining CUDA, omit
 `-ApiDeviceProfile` and use the capacity-upgrade path above; existing device
-configuration remains part of its strict comparison. Neither option grants
-permission to operate a shared runtime. Collector checks the actual API device
+configuration remains part of its strict comparison. The release wrapper chooses
+this capacity axis when the pinned previous capacity hash differs from the
+candidate capacity hash; its deployment profile remains the desired device,
+not an unconditional request for a device transition. With unchanged capacity
+(or a legacy predecessor), it retains the explicit device-selection axis.
+A simultaneous device and capacity change is rejected by the strict comparison.
+Neither option grants permission to operate a shared runtime. Collector checks the actual API device
 requests, environment and unprivileged container boundary; rollback restores and
 verifies the previous profile while preserving inference/proxy epochs.
 

@@ -255,9 +255,15 @@ try {
         CapacityConfigSource=(Join-Path $ReleaseRoot 'api-context\capacity-config.json')
         ExpectedCapacityConfigSha256=$capacitySha
         ApiOnlyCompatibilityUpgrade=$null
-        ApiDeviceProfile=[string]$binding.api_device_profile
         OperationRecordDirectory=$recordsDir
         OperationBudgetSeconds=[string]$budgetSeconds
+    }
+    # A release profile declares the desired device, not always a device transition.
+    # A changed explicit capacity uses the existing capacity-only comparison, which
+    # retains device and all non-capacity fields. Mixed device/capacity edits still fail.
+    if ($null -eq $binding.expected_previous_capacity_sha256 -or
+        [string]$binding.expected_previous_capacity_sha256 -ceq $capacitySha) {
+        $installerParameters['ApiDeviceProfile']=[string]$binding.api_device_profile
     }
     $installerArguments=@()
     $tokens=@()

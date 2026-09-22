@@ -38,6 +38,7 @@ if(@($parseErrors).Count){throw ($parseErrors|Out-String)}
 $Allow=@('Get-CanonicalObjectJson','Assert-RequiredProperties','Assert-ClosedProperties',
     'Get-ApiDeviceProfile','Assert-ApiDeviceTransition','Assert-ApiDeviceRuntime',
     'Assert-ApiOnlyUpgradeInputs','Get-ResolvedCompose','Assert-CapacityCompose',
+    'Assert-ApiStopBudgetTransition','Remove-ApiStopBudgetProjection',
     'Invoke-ApiOnlyRecreate','Get-StableServiceEpochs','Assert-StableServiceEpochs',
     'Restore-PreviousDeployment','Get-RollbackRegistryWitness','Assert-RollbackRegistryUnchanged',
     'Restore-ApiCompatTag','Remove-CompatBuildTag','Get-OptionalImageId','ConvertFrom-NativeProcessText')
@@ -126,6 +127,7 @@ $CollectorTarget=Join-Path $OutputRoot 'collector.ps1';$ReceiptTarget=Join-Path 
 $ComposeBackup=Join-Path $OutputRoot 'old-compose.bak';$CollectorBackup=Join-Path $OutputRoot 'old-collector.bak';$ReceiptBackup=Join-Path $OutputRoot 'old-receipt.bak'
 function Reset {
     $script:NextCompose=Cuda-Compose;$script:PreviousCompose=Cpu-Compose
+    $script:NextCompose.services.'mineru-api'|Add-Member -NotePropertyName stop_grace_period -NotePropertyValue '10s'
     $script:ComposeExisted=$true;$script:CollectorExisted=$true;$script:ReceiptExisted=$true
     $script:ExplicitCapacity=$true;$script:ApiDeviceProfile='cuda0';$script:PreviousApiDeviceProfile='cpu'
     $script:ApiOnlyCompatibilityUpgrade=$true;$script:ReuseCurrentPublishedImage=$false
