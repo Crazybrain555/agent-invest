@@ -144,6 +144,9 @@ class _StageGuard:
     def remaining_seconds(self) -> float:
         return 60.0
 
+    def note(self, kind: str, **scalars: int | str | None) -> None:
+        return None
+
 
 class _V4SemanticRouter:
     def route(self, *, drafts: tuple[Any, ...], **_kwargs: Any) -> Any:
