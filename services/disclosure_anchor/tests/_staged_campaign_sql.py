@@ -68,7 +68,8 @@ class CampaignSqlDatabase:
                 "CREATE TABLE disclosure_core.security(security_id TEXT,security_code TEXT)",
                 "CREATE TABLE disclosure_core.source_access(source_access_id TEXT,result_snapshot TEXT)",
                 "CREATE TABLE disclosure_core.tracked_company(company_id TEXT,status TEXT)",
-                "CREATE TABLE disclosure_core.processing_run(document_id TEXT,run_kind TEXT,provider_document_relpath TEXT,normalized_ir_relpath TEXT,status TEXT,error TEXT)",
+                "CREATE TABLE disclosure_core.processing_run(document_id TEXT,run_kind TEXT,provider_document_relpath TEXT,normalized_ir_relpath TEXT,status TEXT,error TEXT,processing_run_id TEXT,started_at DATETIME)",
+                "CREATE TABLE disclosure_ops.parse_requeue_decision(decision_id TEXT,document_id TEXT,processing_run_id TEXT,failure_error_code TEXT,failure_retry_budget_class TEXT,fixed_by TEXT,reason TEXT,decided_by TEXT,decided_at DATETIME)",
                 "CREATE TABLE disclosure_ops.remote_parse_attempt(attempt_id TEXT,document_id TEXT,source_pdf_sha256 TEXT,checkpoint_contract_version INTEGER,state TEXT,is_current BOOLEAN,row_version INTEGER,claim_generation INTEGER,claim_owner_identity TEXT,claim_lease_until DATETIME)",
             ):
                 c.exec_driver_sql(sql)

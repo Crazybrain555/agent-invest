@@ -21,6 +21,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from disclosure_anchor.adapters.db.postgres import mappers, models
+from disclosure_anchor.application.contracts.parse_requeue_decision import (
+    ParseRequeueDecisionRecord,
+)
 from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     ALLOWED_TRANSITIONS,
     AcceptedSubmissionReceipt,
@@ -3264,6 +3267,29 @@ class ProcessingRunRepository(_ProcessingRunRepositoryBase):
         )
         return mappers.processing_run_to_entity(row) if row is not None else None
 
+    def succeeded_provider_runs_for_document(
+        self, document_id: str
+    ) -> tuple[e.ProcessingRun, ...]:
+        # Every succeeded provider generation, unknown start times first: a
+        # caller that must order them against another run cannot silently
+        # skip the ones it cannot place.
+        rows = (
+            self._session.query(models.ProcessingRun)
+            .filter(
+                models.ProcessingRun.document_id == document_id,
+                models.ProcessingRun.run_kind.in_(("parse", "rebuild_units")),
+                models.ProcessingRun.status == "succeeded",
+                models.ProcessingRun.provider_document_relpath.isnot(None),
+                models.ProcessingRun.normalized_ir_relpath.is_(None),
+            )
+            .order_by(
+                models.ProcessingRun.started_at.desc().nullsfirst(),
+                models.ProcessingRun.processing_run_id.desc(),
+            )
+            .all()
+        )
+        return tuple(mappers.processing_run_to_entity(row) for row in rows)
+
     def update(self, run: e.ProcessingRun) -> e.ProcessingRun:
         row = self._session.get(models.ProcessingRun, run.processing_run_id)
         if row is None:
@@ -3309,6 +3335,59 @@ class ProcessingRunRepository(_ProcessingRunRepositoryBase):
             setattr(row, column, getattr(updated, column))
         self._session.flush()
         return mappers.processing_run_to_entity(row)
+
+    def parse_requeue_decision_for_run(
+        self, processing_run_id: str
+    ) -> Optional[ParseRequeueDecisionRecord]:
+        row = (
+            self._session.query(models.ParseRequeueDecision)
+            .filter(
+                models.ParseRequeueDecision.processing_run_id == processing_run_id
+            )
+            .one_or_none()
+        )
+        return _parse_requeue_decision(row) if row is not None else None
+
+    def add_parse_requeue_decision(
+        self, decision: ParseRequeueDecisionRecord
+    ) -> ParseRequeueDecisionRecord:
+        # Append-only: the unique run constraint, not a read-then-write guess,
+        # is what keeps one decision per failed run.
+        self._session.add(
+            models.ParseRequeueDecision(
+                decision_id=decision.decision_id,
+                document_id=decision.document_id,
+                processing_run_id=decision.processing_run_id,
+                failure_error_code=decision.failure_error_code,
+                failure_retry_budget_class=decision.failure_retry_budget_class,
+                fixed_by=decision.fixed_by,
+                reason=decision.reason,
+                decided_by=decision.decided_by,
+            )
+        )
+        self._session.flush()
+        stored = self._session.get(models.ParseRequeueDecision, decision.decision_id)
+        if stored is None:
+            raise KeyError(
+                f"parse_requeue_decision not found: {decision.decision_id}"
+            )
+        return _parse_requeue_decision(stored)
+
+
+def _parse_requeue_decision(
+    row: models.ParseRequeueDecision,
+) -> ParseRequeueDecisionRecord:
+    return ParseRequeueDecisionRecord(
+        decision_id=row.decision_id,
+        document_id=row.document_id,
+        processing_run_id=row.processing_run_id,
+        failure_error_code=row.failure_error_code,
+        failure_retry_budget_class=row.failure_retry_budget_class,
+        fixed_by=row.fixed_by,
+        reason=row.reason,
+        decided_by=row.decided_by,
+        decided_at=row.decided_at,
+    )
 
 
 class DocumentUnitRepository:

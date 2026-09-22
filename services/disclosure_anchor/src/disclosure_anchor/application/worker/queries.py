@@ -24,22 +24,34 @@ _TERMINAL_PUBLISH_QUARANTINE_SQL = """
 """
 # Retry charging is source-typed when the failure is created.  Scheduling
 # never infers infrastructure or cancellation semantics from error-code text.
-_PARSE_FAILURE_CONTRACT_VALID_SQL = """
+# A contract-class failure is permanent for the scheduler; only the explicit
+# append-only decision in disclosure_ops.parse_requeue_decision releases one,
+# and the failed run itself is never rewritten.  Doctor lists exactly what this
+# predicate keeps out, so both read the same definition.
+PARSE_UNRELEASED_CONTRACT_FAILURE_SQL = """
+    failed_run.run_kind = 'parse'
+    AND failed_run.provider_document_relpath IS NOT NULL
+    AND failed_run.normalized_ir_relpath IS NULL
+    AND failed_run.status = 'failed'
+    AND (
+         jsonb_typeof(failed_run.error->'retryable')
+             IS DISTINCT FROM 'boolean'
+         OR failed_run.error->>'retry_budget_class' IS NULL
+         OR failed_run.error->>'retry_budget_class'
+            NOT IN ('item', 'infrastructure', 'neutral')
+    )
+    AND NOT EXISTS (
+        SELECT 1
+          FROM disclosure_ops.parse_requeue_decision AS prd
+         WHERE prd.processing_run_id = failed_run.processing_run_id
+    )
+"""
+_PARSE_FAILURE_CONTRACT_VALID_SQL = f"""
     NOT EXISTS (
         SELECT 1
           FROM disclosure_core.processing_run AS failed_run
          WHERE failed_run.document_id = q.document_id
-           AND failed_run.run_kind = 'parse'
-           AND failed_run.provider_document_relpath IS NOT NULL
-           AND failed_run.normalized_ir_relpath IS NULL
-           AND failed_run.status = 'failed'
-           AND (
-                jsonb_typeof(failed_run.error->'retryable')
-                    IS DISTINCT FROM 'boolean'
-                OR failed_run.error->>'retry_budget_class' IS NULL
-                OR failed_run.error->>'retry_budget_class'
-                   NOT IN ('item', 'infrastructure', 'neutral')
-           )
+           AND ({PARSE_UNRELEASED_CONTRACT_FAILURE_SQL})
     )
 """
 _PARSE_ITEM_FAILURE_COUNT_SQL = """
@@ -63,8 +75,31 @@ _PARSE_CHARGED_FAILURE_COUNT_SQL = """
         AND charged_failure.error->>'retry_budget_class'
             IN ('item', 'infrastructure'))
 """
+# A contract failure is stored with retryable=false, so the view's
+# last_failed_retryable latch excludes the document as well.  A decision
+# releases exactly the run it names: this is true only while that run is still
+# the latest failure, selected exactly as pending_parse_v1 selects it (0032).
+# A newer undecided failure re-engages both gates.
+PARSE_LAST_FAILURE_RELEASED_SQL = """
+    EXISTS (
+        SELECT 1
+          FROM disclosure_ops.parse_requeue_decision AS prd
+         WHERE prd.processing_run_id = (
+                SELECT latest_failure.processing_run_id
+                  FROM disclosure_core.processing_run AS latest_failure
+                 WHERE latest_failure.document_id = q.document_id
+                   AND latest_failure.run_kind = 'parse'
+                   AND latest_failure.provider_document_relpath IS NOT NULL
+                   AND latest_failure.normalized_ir_relpath IS NULL
+                   AND latest_failure.status = 'failed'
+                 ORDER BY latest_failure.started_at DESC,
+                          latest_failure.processing_run_id DESC
+                 LIMIT 1)
+    )
+"""
 _PARSE_RETRY_ELIGIBLE_SQL = f"""
-    COALESCE(q.last_failed_retryable, true)
+    (COALESCE(q.last_failed_retryable, true)
+     OR ({PARSE_LAST_FAILURE_RELEASED_SQL}))
     AND ({_PARSE_FAILURE_CONTRACT_VALID_SQL})
     AND {_PARSE_ITEM_FAILURE_COUNT_SQL} < :max_retries
     AND {_PARSE_CHARGED_FAILURE_COUNT_SQL} < :max_retries_ceiling
@@ -716,6 +751,81 @@ def pending_parse(
         params,
     ).mappings()
     return [dict(row) for row in rows]
+
+
+def parse_admission_diagnosis(
+    conn: Connection, *, document_id: str, max_retries: int
+) -> dict[str, Any]:
+    """Explain one document's parse admission with the queue's own predicate.
+
+    An explicit requeue decision releases the gates it names; it admits
+    nothing by itself, and a successful write is not evidence that the worker
+    will pick the document up. The caller therefore asks :func:`pending_parse`
+    the eligibility question and reports the remaining blockers as facts,
+    rather than inferring them from the write.
+    """
+
+    eligible = bool(
+        pending_parse(
+            conn,
+            max_retries=max_retries,
+            limit=1,
+            document_ids=(document_id,),
+        )
+    )
+    row = (
+        conn.execute(
+            text(
+                f"""
+                SELECT q.status AS document_status,
+                       EXISTS (
+                           SELECT 1
+                             FROM {CORE_SCHEMA}.processing_run AS running
+                            WHERE running.document_id = q.document_id
+                              AND running.status = 'running'
+                       ) AS running_run_present,
+                       latest_failure.processing_run_id AS latest_failed_run_id,
+                       CASE
+                         WHEN jsonb_typeof(latest_failure.error->'retryable')
+                              = 'boolean'
+                         THEN (latest_failure.error->>'retryable')::boolean
+                       END AS latest_failed_run_retryable,
+                       ({PARSE_LAST_FAILURE_RELEASED_SQL})
+                           AS latest_failed_run_released,
+                       (SELECT count(*)
+                          FROM {CORE_SCHEMA}.processing_run AS failed_run
+                         WHERE failed_run.document_id = q.document_id
+                           AND ({PARSE_UNRELEASED_CONTRACT_FAILURE_SQL}))
+                           AS unreleased_contract_failures,
+                       {_PARSE_ITEM_FAILURE_COUNT_SQL} AS item_failure_count,
+                       {_PARSE_CHARGED_FAILURE_COUNT_SQL}
+                           AS charged_failure_count
+                  FROM {CORE_SCHEMA}.document AS q
+                  LEFT JOIN LATERAL (
+                        SELECT lf.processing_run_id, lf.error
+                          FROM {CORE_SCHEMA}.processing_run AS lf
+                         WHERE lf.document_id = q.document_id
+                           AND lf.run_kind = 'parse'
+                           AND lf.provider_document_relpath IS NOT NULL
+                           AND lf.normalized_ir_relpath IS NULL
+                           AND lf.status = 'failed'
+                         ORDER BY lf.started_at DESC, lf.processing_run_id DESC
+                         LIMIT 1
+                       ) AS latest_failure ON true
+                 WHERE q.document_id = :document_id
+                """
+            ),
+            {"document_id": document_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise ValueError(f"document not found: {document_id}")
+    blockers = dict(row)
+    blockers["max_item_failures"] = max_retries
+    blockers["max_charged_failures"] = max_retries * RETRY_CEILING_MULTIPLIER
+    return {"currently_eligible": eligible, "remaining_blockers": blockers}
 
 
 def pending_build(

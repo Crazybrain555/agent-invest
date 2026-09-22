@@ -716,3 +716,35 @@ prompt v33 增加降级候选裁决说明；cache/receipt identity 随版本变�
 跟进：semantic-retrieval-query-gold.v4.json 仍 pin router v101，下次检索质量评审前须在 v102 上重新评定
 设计 docs/implementation/design/retrieval-and-semantic-keys.md；测试 tests/unit/test_semantic_router.py
 ```
+
+2026-09-22（0063 契约类 parse 失败的显式放行决定）——public view/API/change feed 不变:
+
+```text
+disclosure_ops.parse_requeue_decision 是私有 append-only ops 表：decision_id 为 prq_ ULID，
+document_id/processing_run_id 均为 RESTRICT FK，processing_run_id UNIQUE（一次失败至多一条决定），
+failure_retry_budget_class CHECK 为闭集合 IN (provider_artifact_contract, provider_protocol,
+provider_runaway, provider_terminal, semantic_route_contract)——与 coordinator 实际写入的契约类一致，
+扩集合需要新的 revision；failure_error_code/fixed_by/reason/decided_by 非空 CHECK，decided_at 由
+数据库 now() 赋值。只授予 disclosure_app SELECT/INSERT（无 UPDATE/DELETE/TRUNCATE），
+PUBLIC/reader/future_l2_reader 全部 REVOKE：append-only 由权限保证，不依赖 CLI 自觉。
+pending_parse（及共享该 helper 的 V4 ordinary candidate source）的两道准入门同时读这张表：契约类
+排除按 failed_run.processing_run_id 逐 run 例外；last_failed_retryable 闩锁按 0032 视图口径的
+「最新失败 provider-only parse run」例外。决定只放行它指名的那一次失败；出现新的无决定失败时两道门
+重新关闭。失败 run 永不改写（逐字节不变），item/charged 重试预算计数不变。
+CLI `python -m disclosure_anchor.cli.parse_requeue`（make parse-requeue）写入并打印 JSON receipt，
+--dry-run 跑完 guardrail 不写、不分配 decision_id。receipt 分列三件事：decision_recorded、
+currently_eligible（写入后经 pending_parse 本身判定，不另写谓词）、remaining_blockers（最新失败 run 与
+其 retryable/released、未放行契约类失败数、item/charged 计数与上限、document 状态、是否有 running run），
+并显式声明登记决定本身不带来准入：只有正常 worker 扫描或已授权 campaign 才会真正重排。
+guardrail 全部 fail closed：run 属于该 document、provider-only parse run、status=failed、
+error.retryable 为 boolean、retry_budget_class 在上述闭集合内（自动类与未知类各有专门 error_code）、
+不存在不早于该失败的成功 provider run（parse 与 rebuild_units 同算，按 (started_at, processing_run_id)
+排序，未知 started_at 不算更早）、该 run 尚无决定、fixed_by/reason/decided_by 非空。
+doctor 两行均为 WARN 级（与既有 parse dead letters 一致）：无决定的契约类失败只看队列会考虑的文档
+（document.status ∈ registered/parse_failed；之后的成功 parse 不算隐式放行；最多列 20 个 document id + 总数）；
+决定态按「决定之后最新一次 provider parse run 的结果」判：succeeded→resolved、failed→released_refailed、
+无→released_pending（无 started_at 的 run 不计），pending 是否真的重新排队直接问 pending_parse；未 resolved
+（pending 或 refailed）且决定超过 24h 的 WARN；诊断 SQL 失败报 FAIL，不静默为 0。
+guardrail 里「不存在不早于该失败的成功 provider run」对每一条成功 provider run 逐条判定，started_at 未知的
+成功 run 一律视为不可证明更早 → 拒绝。
+```

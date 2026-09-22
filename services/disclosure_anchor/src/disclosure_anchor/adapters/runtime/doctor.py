@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from disclosure_anchor.adapters.db.postgres.connection import (
     create_db_engine,
@@ -80,6 +81,8 @@ _PYTHON_STRIP_CHARS_SQL = (
 )
 _CANONICAL_CODE_SQL = f"btrim(security_code, {_PYTHON_STRIP_CHARS_SQL})"
 _CANONICAL_EXCHANGE_SQL = f"upper(btrim(exchange, {_PYTHON_STRIP_CHARS_SQL}))"
+_PARSE_REQUEUE_SAMPLE = 20
+_RELEASED_PARSE_STALE_HOURS = 24
 
 
 @dataclass(frozen=True)
@@ -449,6 +452,7 @@ def run_doctor(
             run_raw_archive_checks(settings, engine, full=full, sample_size=sample_size)
         )
         checks.extend(_processing_run_checks(settings, engine))
+        checks.extend(parse_requeue_checks(settings, engine))
         checks.extend(
             _document_unit_locator_checks(settings, engine, sample_size=sample_size)
         )
@@ -1321,6 +1325,159 @@ def _processing_run_checks(settings: Settings, engine: Engine) -> list[CheckResu
                     )
                 )
     return checks
+
+
+def parse_requeue_checks(settings: Settings, engine: Engine) -> list[CheckResult]:
+    """Surface parse failures that only an explicit decision can release.
+
+    The blocking predicate is the queue's own, so the first line lists exactly
+    the documents ``pending_parse`` keeps out with no decision recorded, over
+    the population the queue considers (status registered / parse_failed). The
+    second line follows the decisions themselves — released_pending,
+    released_refailed and resolved are the outcome of the latest provider parse
+    run started after the decision — and re-asks ``pending_parse`` whether each
+    still-pending document is actually queued again: a released document that
+    neither queues nor parses is a silent backlog, not a fix, so any unresolved
+    decision warns once it is more than a day old. Both lines warn like the
+    existing parse dead letters; a failed diagnostic is a FAIL, never a quiet
+    zero.
+    """
+
+    from disclosure_anchor.application.worker.queries import (
+        PARSE_UNRELEASED_CONTRACT_FAILURE_SQL,
+        pending_parse,
+    )
+
+    try:
+        with engine.connect() as conn:
+            # Exactly what the queue keeps out, over the documents the queue
+            # would otherwise consider (pending_parse_v1 population): a later
+            # success is not a release, and a published document is not queue
+            # backlog.
+            blocked_rows = (
+                conn.execute(
+                    text(
+                        f"""
+                        SELECT blocked.document_id,
+                               count(*) OVER () AS blocked_count
+                          FROM (
+                                SELECT DISTINCT failed_run.document_id
+                                  FROM {CORE_SCHEMA}.processing_run AS failed_run
+                                  JOIN {CORE_SCHEMA}.document AS d
+                                    ON d.document_id = failed_run.document_id
+                                 WHERE d.status IN ('registered', 'parse_failed')
+                                   AND ({PARSE_UNRELEASED_CONTRACT_FAILURE_SQL})
+                               ) AS blocked
+                         ORDER BY blocked.document_id
+                         LIMIT :limit
+                        """
+                    ),
+                    {"limit": _PARSE_REQUEUE_SAMPLE},
+                )
+                .mappings()
+                .all()
+            )
+            # A decision's state is the outcome of the LATEST provider parse
+            # run started after it: a success followed by a newer failure is
+            # released_refailed, not resolved.  A run without a start time
+            # cannot be placed after the decision and is not counted.
+            decision_rows = (
+                conn.execute(
+                    text(
+                        f"""
+                        SELECT prd.document_id,
+                               CASE latest.status
+                                 WHEN 'succeeded' THEN 'resolved'
+                                 WHEN 'failed' THEN 'released_refailed'
+                                 ELSE 'released_pending'
+                               END AS state,
+                               prd.decided_at < now()
+                                   - make_interval(hours => :hours) AS aged
+                          FROM {OPS_SCHEMA}.parse_requeue_decision AS prd
+                          LEFT JOIN LATERAL (
+                                SELECT later.status
+                                  FROM {CORE_SCHEMA}.processing_run AS later
+                                 WHERE later.document_id = prd.document_id
+                                   AND later.run_kind = 'parse'
+                                   AND later.provider_document_relpath IS NOT NULL
+                                   AND later.normalized_ir_relpath IS NULL
+                                   AND later.status IN ('succeeded', 'failed')
+                                   AND later.started_at > prd.decided_at
+                                 ORDER BY later.started_at DESC,
+                                          later.processing_run_id DESC
+                                 LIMIT 1
+                               ) AS latest ON true
+                         ORDER BY prd.decided_at, prd.document_id
+                        """
+                    ),
+                    {"hours": _RELEASED_PARSE_STALE_HOURS},
+                )
+                .mappings()
+                .all()
+            )
+            pending = [
+                row for row in decision_rows if row["state"] == "released_pending"
+            ]
+            pending_ids = tuple(str(row["document_id"]) for row in pending)
+            # Admission is asked of the queue itself; a second copy of the
+            # predicate here could disagree with what the worker sees.
+            queued = (
+                {
+                    str(row["document_id"])
+                    for row in pending_parse(
+                        conn,
+                        max_retries=settings.disclosure_max_parse_retries,
+                        limit=len(pending_ids),
+                        document_ids=pending_ids,
+                    )
+                }
+                if pending_ids
+                else set()
+            )
+    except SQLAlchemyError as exc:
+        return [_fail("parse requeue diagnosis", f"cannot be evaluated: {exc}")]
+
+    blocked_name = "contract-class parse failures without requeue decision"
+    released_name = "released parse failures still pending"
+    if not blocked_rows:
+        blocked_check = _pass(blocked_name, "none")
+    else:
+        sample = ", ".join(str(row["document_id"]) for row in blocked_rows)
+        blocked_check = _warn(
+            blocked_name,
+            f"count={blocked_rows[0]['blocked_count']}; "
+            f"no automatic retry exists: {sample}",
+        )
+    refailed = sum(row["state"] == "released_refailed" for row in decision_rows)
+    resolved = sum(row["state"] == "resolved" for row in decision_rows)
+    # Unresolved = pending or refailed: neither has produced a successful parse
+    # since the decision, and both age against the same clock.
+    aged = [
+        row for row in decision_rows if row["state"] != "resolved" and row["aged"]
+    ]
+    if not decision_rows:
+        released_check = _pass(released_name, "no requeue decisions")
+    else:
+        scope = (
+            f"released_pending={len(pending)} queued={len(queued)} "
+            f"released_refailed={refailed} resolved={resolved}"
+        )
+        if not aged:
+            released_check = _pass(
+                released_name,
+                f"{scope}; no unresolved decision older than "
+                f"{_RELEASED_PARSE_STALE_HOURS}h",
+            )
+        else:
+            sample = ", ".join(
+                str(row["document_id"]) for row in aged[:_PARSE_REQUEUE_SAMPLE]
+            )
+            released_check = _warn(
+                released_name,
+                f"{scope}; {len(aged)} unresolved older than "
+                f"{_RELEASED_PARSE_STALE_HOURS}h: {sample}",
+            )
+    return [blocked_check, released_check]
 
 
 def _semantic_receipt_check(

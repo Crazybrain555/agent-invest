@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sqlalchemy.exc import ProgrammingError
+
 from disclosure_anchor.adapters.db.postgres.connection import (
     RuntimeDatabaseIdentity,
     require_runtime_app_connection,
@@ -20,6 +22,7 @@ from disclosure_anchor.adapters.runtime.doctor import (
     _semantic_receipt_check,
     mineru_remote_inference_check,
     inventory_orphan_files,
+    parse_requeue_checks,
     atomic_publication_readiness_checks,
     running_run_liveness_checks,
     run_doctor,
@@ -680,6 +683,106 @@ class DoctorTests(unittest.TestCase):
             conn.execute.call_args_list[1].args[1]["seconds"],
             settings.disclosure_stale_run_threshold_seconds,
         )
+
+    def test_parse_requeue_reports_undecided_failures_and_decision_states(
+        self,
+    ) -> None:
+        blocked_name = "contract-class parse failures without requeue decision"
+        released_name = "released parse failures still pending"
+        cases = (
+            (
+                [{"document_id": "doc_blocked", "blocked_count": 3}],
+                [],
+                [],
+                [
+                    (blocked_name, "WARN", "count=3"),
+                    (released_name, "PASS", "no requeue decisions"),
+                ],
+            ),
+            (
+                [],
+                [
+                    {
+                        "document_id": "doc_stale",
+                        "state": "released_pending",
+                        "aged": True,
+                    },
+                    {
+                        "document_id": "doc_fresh",
+                        "state": "released_pending",
+                        "aged": False,
+                    },
+                    {
+                        "document_id": "doc_refailed",
+                        "state": "released_refailed",
+                        "aged": True,
+                    },
+                    {"document_id": "doc_done", "state": "resolved", "aged": True},
+                ],
+                [{"document_id": "doc_fresh"}],
+                [
+                    (blocked_name, "PASS", "none"),
+                    (
+                        released_name,
+                        "WARN",
+                        "released_pending=2 queued=1 released_refailed=1 "
+                        "resolved=1; 2 unresolved older than 24h: "
+                        "doc_stale, doc_refailed",
+                    ),
+                ],
+            ),
+        )
+        for blocked, decisions, queued, expected in cases:
+            with self.subTest(expected=expected[0][1]):
+                connection = MagicMock()
+                blocked_result = MagicMock()
+                blocked_result.mappings.return_value.all.return_value = blocked
+                decision_result = MagicMock()
+                decision_result.mappings.return_value.all.return_value = decisions
+                queued_result = MagicMock()
+                queued_result.mappings.return_value = queued
+                connection.execute.side_effect = (
+                    blocked_result,
+                    decision_result,
+                    queued_result,
+                )
+                engine = MagicMock()
+                engine.connect.return_value.__enter__.return_value = connection
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    results = parse_requeue_checks(_settings(Path(tmp)), engine)
+
+                self.assertEqual(
+                    [(item.name, item.status) for item in results],
+                    [(name, status) for name, status, _ in expected],
+                )
+                for item, (_, _, message) in zip(results, expected):
+                    self.assertIn(message, item.message)
+                blocked_sql = str(connection.execute.call_args_list[0].args[0])
+                self.assertIn("disclosure_ops.parse_requeue_decision", blocked_sql)
+                # The blocked line is the queue's exclusion over the queue's
+                # population; a later success is never an implicit release.
+                self.assertIn("d.status IN ('registered', 'parse_failed')", blocked_sql)
+                self.assertNotIn("succeeded", blocked_sql)
+                decision_sql = str(connection.execute.call_args_list[1].args[0])
+                self.assertIn("ORDER BY later.started_at DESC", decision_sql)
+
+    def test_parse_requeue_diagnosis_failure_is_never_a_quiet_zero(self) -> None:
+        connection = MagicMock()
+        connection.execute.side_effect = ProgrammingError(
+            "SELECT 1", {}, Exception('relation "parse_requeue_decision" does not exist')
+        )
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with tempfile.TemporaryDirectory() as tmp:
+            results = parse_requeue_checks(_settings(Path(tmp)), engine)
+
+        self.assertEqual(
+            [(item.name, item.status) for item in results],
+            [("parse requeue diagnosis", "FAIL")],
+        )
+        self.assertIn("does not exist", results[0].message)
 
     @patch(
         "disclosure_anchor.adapters.runtime.doctor._ops_launchd_check",

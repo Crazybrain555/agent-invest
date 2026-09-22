@@ -27,7 +27,7 @@ WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISC
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
+	pg-status db-create migrate register parse build-units publish process rebuild-units parse-requeue rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
 	worker-status worker-restart worker-backfill-publish-kpi mineru-smoke mineru-service-epoch-freeze mineru-validation-receipt mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
 	generate-current-source-replay audit-live-unit-replay capacity-observe capacity-verify capacity-summary
 
@@ -147,6 +147,12 @@ process:
 rebuild-units:
 	@case "$(ALLOW_EMPTY)" in ""|YES) ;; *) echo 'ALLOW_EMPTY must be empty or YES' >&2; exit 2;; esac
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.pipeline rebuild-units --document-id "$(DOC)" $(if $(filter YES,$(ALLOW_EMPTY)),--allow-empty) $(if $(REASON),--reason "$(REASON)")
+
+# Release one contract-class parse failure (doctor lists the candidates). The
+# failed run is never rewritten; DRY_RUN=1 checks the guardrails only.
+parse-requeue:
+	@case "$(DRY_RUN)" in ""|1) ;; *) echo 'DRY_RUN must be empty or 1' >&2; exit 2;; esac
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.parse_requeue --document-id "$(DOC)" --processing-run-id "$(RUN)" --fixed-by "$(FIXED_BY)" --reason "$(REASON)" --decided-by "$(DECIDED_BY)" $(if $(filter 1,$(DRY_RUN)),--dry-run)
 
 # Rebuild the 06R derived search projection (U7): delta by default, ALL=YES for a
 # full recompute + orphan prune after a retrieval rules/dictionary version bump.

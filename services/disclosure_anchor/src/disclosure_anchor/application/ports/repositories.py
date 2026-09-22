@@ -17,6 +17,9 @@ from disclosure_anchor.application.contracts.remote_parse_checkpoint import (
     RemoteParseAttempt,
     RemoteParseResumeSecret,
 )
+from disclosure_anchor.application.contracts.parse_requeue_decision import (
+    ParseRequeueDecisionRecord,
+)
 from disclosure_anchor.application.contracts.staged_credit import (
     CreditVector,
     DatabaseLeaseSnapshot,
@@ -121,7 +124,16 @@ class ProcessingRunRepository(Protocol):
     def latest_succeeded_provider_run_for_document(
         self, document_id: str
     ) -> Optional[ProcessingRun]: ...
+    def succeeded_provider_runs_for_document(
+        self, document_id: str
+    ) -> tuple[ProcessingRun, ...]: ...
     def update(self, run: ProcessingRun) -> ProcessingRun: ...
+    def parse_requeue_decision_for_run(
+        self, processing_run_id: str
+    ) -> Optional[ParseRequeueDecisionRecord]: ...
+    def add_parse_requeue_decision(
+        self, decision: ParseRequeueDecisionRecord
+    ) -> ParseRequeueDecisionRecord: ...
 
 
 @dataclass(frozen=True, slots=True)

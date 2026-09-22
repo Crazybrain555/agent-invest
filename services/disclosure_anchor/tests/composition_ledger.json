@@ -58,7 +58,7 @@
   },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
-   "tests": 28
+   "tests": 33
   },
   "tests/integration/test_outbox_commit_order.py": {
    "private_imports": [],
@@ -290,7 +290,7 @@
     "_processing_run_checks",
     "_semantic_receipt_check"
    ],
-   "tests": 35
+   "tests": 37
   },
   "tests/unit/test_doctor_render.py": {
    "private_imports": [],
@@ -911,6 +911,10 @@
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
    "tests": 6
+  },
+  "tests/unit/test_parse_requeue.py": {
+   "private_imports": [],
+   "tests": 7
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],

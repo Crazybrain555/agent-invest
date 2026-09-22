@@ -1478,6 +1478,34 @@ class DurablePublishSupplement(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class ParseRequeueDecision(Base):
+    """Explicit, append-only release of one contract-class parse failure.
+
+    The failed run stays exactly as it was recorded; this row is the only
+    evidence that an operator judged the cause fixed and re-admitted the
+    document to the parse queue.
+    """
+
+    __tablename__ = "parse_requeue_decision"
+    __table_args__ = (
+        UniqueConstraint("processing_run_id", name="uq_parse_requeue_decision_run"),
+        CheckConstraint("decision_id ~ '^prq_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_parse_requeue_decision_id"),
+        CheckConstraint("failure_retry_budget_class IN ('provider_artifact_contract','provider_protocol','provider_runaway','provider_terminal','semantic_route_contract')", name="ck_parse_requeue_decision_class"),
+        CheckConstraint("btrim(failure_error_code) <> '' AND btrim(fixed_by) <> '' AND btrim(reason) <> '' AND btrim(decided_by) <> ''", name="ck_parse_requeue_decision_evidence"),
+        Index("ix_parse_requeue_decision_document", "document_id", "decided_at"),
+        {"schema": OPS_SCHEMA},
+    )
+    decision_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey(f"{CORE_SCHEMA}.document.document_id", ondelete="RESTRICT"), nullable=False)
+    processing_run_id: Mapped[str] = mapped_column(ForeignKey(f"{CORE_SCHEMA}.processing_run.processing_run_id", ondelete="RESTRICT"), nullable=False)
+    failure_error_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    failure_retry_budget_class: Mapped[str] = mapped_column(String(64), nullable=False)
+    fixed_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    decided_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class ProgressRelayHead(Base):
     __tablename__ = "progress_relay_head"
     __table_args__ = (

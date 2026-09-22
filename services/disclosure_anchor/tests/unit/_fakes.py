@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from datetime import datetime, timezone
 from typing import Generic, Protocol, Self, TypeVar, cast
 
+from disclosure_anchor.application.contracts.parse_requeue_decision import (
+    ParseRequeueDecisionRecord,
+)
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Repository,
 )
@@ -207,8 +211,29 @@ class DocumentRepo(_Repo[e.Document]):
 
 
 class ProcessingRunRepo(_Repo[e.ProcessingRun]):
+    def __init__(self, items: Iterable[e.ProcessingRun] = ()) -> None:
+        # Stands in for the append-only ops table: one decision per run, and a
+        # decided_at the database assigns.
+        self.parse_requeue_decisions: dict[str, ParseRequeueDecisionRecord] = {}
+        self.decision_clock = datetime(2026, 9, 22, 12, 0, tzinfo=timezone.utc)
+        super().__init__(items)
+
     def _key(self, item: e.ProcessingRun) -> str:
         return item.processing_run_id
+
+    def parse_requeue_decision_for_run(
+        self, processing_run_id: str
+    ) -> ParseRequeueDecisionRecord | None:
+        return self.parse_requeue_decisions.get(processing_run_id)
+
+    def add_parse_requeue_decision(
+        self, decision: ParseRequeueDecisionRecord
+    ) -> ParseRequeueDecisionRecord:
+        if decision.processing_run_id in self.parse_requeue_decisions:
+            raise ValueError("parse requeue decision already exists for run")
+        stored = decision.model_copy(update={"decided_at": self.decision_clock})
+        self.parse_requeue_decisions[decision.processing_run_id] = stored
+        return stored
 
     def latest_succeeded_provider_run_for_document(
         self, document_id: str
@@ -224,6 +249,19 @@ class ProcessingRunRepo(_Repo[e.ProcessingRun]):
         ]
         matches.sort(key=lambda item: (item.started_at is not None, item.started_at, item.processing_run_id))
         return matches[-1] if matches else None
+
+    def succeeded_provider_runs_for_document(
+        self, document_id: str
+    ) -> tuple[e.ProcessingRun, ...]:
+        return tuple(
+            item
+            for item in self.items.values()
+            if item.document_id == document_id
+            and item.run_kind in ("parse", "rebuild_units")
+            and item.status == "succeeded"
+            and item.provider_document_relpath is not None
+            and item.normalized_ir_relpath is None
+        )
 
 
 class DocumentUnitRepo(_Repo[e.DocumentUnit]):

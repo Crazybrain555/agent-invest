@@ -603,6 +603,39 @@ SELECT count(*) FROM disclosure_ops.pending_parse_v1 WHERE failed_parse_count > 
 `subject_identity_conflict` 等 retryable=false 的下载失败永久出队，证据在
 `source_access(status='failed')` 与 quarantine 目录（含 sha256 manifest）。
 
+### 5.1 契约类 parse 失败的显式放行
+
+契约类 retry budget（`semantic_route_contract` / `provider_protocol` / `provider_artifact_contract` /
+`provider_runaway` / `provider_terminal`）永远不自动重试：调度端无法判断根因是否已修。doctor 的
+`contract-class parse failures without requeue decision` WARN 列出这些文档（含 document id 与总数）。
+确认修复已经在跑的代码里生效之后，由 operator 显式登记一条 append-only 决定放行该次失败：
+
+```bash
+# 先 dry-run：跑完全部 guardrail 并打印 receipt，不写任何行
+make parse-requeue DOC=<document_id> RUN=<processing_run_id> \
+  FIXED_BY="semantic_router.v102 4548ecaa" REASON="<为什么现在可以重排>" \
+  DECIDED_BY="<operator>" DRY_RUN=1
+# receipt 无误后去掉 DRY_RUN 写入；失败会打印 typed error 并非零退出
+```
+
+放行只针对 RUN 指定的那一次失败：它同时解开 `pending_parse_v1.last_failed_retryable` 闩锁（仅在该 run
+仍是最新失败时）和契约类排除。之后若再产生一次没有决定的失败，两道门重新关上，需要新的决定。失败 run
+本身永不改写（`disclosure_app` 对决定表只有 SELECT/INSERT，没有 UPDATE/DELETE），决定行记录修了什么、
+为什么、谁决定；重试预算不变（契约类失败不计费）。
+
+receipt 把三件事分开，不给单一的「成功」：`decision_recorded`（是否真的写了、decision_id）、
+`currently_eligible`（写入之后直接问 `pending_parse` 得到的当前可排队性）、`remaining_blockers`
+（最新失败 run 及其 retryable/是否已放行、未放行契约类失败数、item/charged 计数与上限、document 状态、
+是否有 running run）。**登记决定本身不等于重新解析**：文档只会在正常 worker 轮询或已授权的 campaign
+扫到它时才真正进入 parse。若 `retry_budget_class` 缺失、畸形或不在上述闭集合内，或 `error.retryable`
+不是布尔值，命令一律拒绝——队列排除它并不能证明 operator 可以重新放行。
+
+放行之后用 doctor 的 `released parse failures still pending` 跟踪：该行按决定之后最新一次 provider parse run
+的结果把决定分成 released_pending / released_refailed / resolved 三态（成功之后又失败算 refailed，不算 resolved），
+并直接向 `pending_parse` 询问 pending 的那些是否真的重新排队；未 resolved 的决定超过 24 小时会 WARN。
+`contract-class parse failures without requeue decision` 只看队列会考虑的文档（status 为 registered / parse_failed），
+已发布的文档不算积压。诊断 SQL 本身失败时报 FAIL，不会静默报 0。
+
 ## 6. TCC / launchd 假死
 
 worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_worker_once.sh` 头部注释）。

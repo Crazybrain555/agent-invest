@@ -7,13 +7,30 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from disclosure_anchor.adapters.db.postgres.classification_refresh import (
     refresh_document_classification,
 )
+from disclosure_anchor.adapters.db.postgres.schema import APP_ROLE
+from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
+from disclosure_anchor.adapters.runtime.doctor import parse_requeue_checks
+from disclosure_anchor.application.use_cases.parse_requeue import (
+    ParseRequeue,
+    ParseRequeueCommand,
+)
 from disclosure_anchor.application.worker import queries
 from disclosure_anchor.domain import ids
+from disclosure_anchor.domain.errors import ParseRequeueError
+from disclosure_anchor.settings import load_settings
 from tests.integration._support import engine_or_skip
+
+_CONTRACT_FAILURE = {
+    "stage": "parse",
+    "error_code": "semantic_route_locked_candidate_overflow",
+    "retryable": False,
+    "retry_budget_class": "semantic_route_contract",
+}
 
 
 class OpsQueueViewTests(unittest.TestCase):
@@ -24,11 +41,22 @@ class OpsQueueViewTests(unittest.TestCase):
         self.run_ids: list[str] = []
         self.unit_ids: list[str] = []
         self.sa_ids: list[str] = []
+        self.decision_ids: list[str] = []
         self.company_id: str | None = None
         self.tracked_id: str | None = None
 
     def tearDown(self) -> None:
         with self.engine.begin() as conn:
+            if self.decision_ids:
+                # Append-only evidence with RESTRICT FKs: it goes before the
+                # runs and documents it references.
+                conn.execute(
+                    text(
+                        "DELETE FROM disclosure_ops.parse_requeue_decision "
+                        "WHERE decision_id = ANY(:ids)"
+                    ),
+                    {"ids": self.decision_ids},
+                )
             if self.unit_ids:
                 conn.execute(
                     text(
@@ -281,6 +309,47 @@ class OpsQueueViewTests(unittest.TestCase):
         )
         self.run_ids.append(run_id)
         return run_id
+
+    def _insert_decision(
+        self,
+        conn,
+        document_id: str,
+        run_id: str,
+        *,
+        retry_budget_class: str = "semantic_route_contract",
+        decided_at: datetime | None = None,
+    ) -> str:
+        decision_id = f"prq_{ids.new_ulid()}"
+        conn.execute(
+            text(
+                "INSERT INTO disclosure_ops.parse_requeue_decision "
+                "(decision_id, document_id, processing_run_id, "
+                " failure_error_code, failure_retry_budget_class, fixed_by, "
+                " reason, decided_by, decided_at) "
+                "VALUES (:id, :doc, :run, :error_code, :budget_class, "
+                "        :fixed_by, :reason, :decided_by, "
+                "        COALESCE(:decided_at, now()))"
+            ),
+            {
+                "id": decision_id,
+                "doc": document_id,
+                "run": run_id,
+                "error_code": _CONTRACT_FAILURE["error_code"],
+                "budget_class": retry_budget_class,
+                "fixed_by": "semantic_router.v102 4548ecaa",
+                "reason": "locked-candidate overflow now demotes candidates",
+                "decided_by": "integration-test",
+                "decided_at": decided_at,
+            },
+        )
+        self.decision_ids.append(decision_id)
+        return decision_id
+
+    def _pending_parse_ids(self, conn) -> set[str]:
+        return {
+            row["document_id"]
+            for row in queries.pending_parse(conn, max_retries=3, limit=500000)
+        }
 
     def _insert_unit(self, conn, document_id: str, run_id: str) -> str:
         unit_id = f"du_qv{self.suffix}{len(self.unit_ids)}"
@@ -778,6 +847,281 @@ class OpsQueueViewTests(unittest.TestCase):
                 )
             }
         self.assertNotIn(document_id, pending_ids)
+
+    def test_requeue_decision_releases_only_the_named_latest_failure(self) -> None:
+        # A contract-class failure is excluded twice: by its own class and by
+        # the view's retryable latch. One decision must release both, and only
+        # for the run it names. PostgresV4OrdinaryParseCandidateSource reads
+        # the same helper (staged_new_work_v4.py list_candidates).
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            document_id = self._insert_document(conn, status="parse_failed")
+            failed_run = self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                started_at=datetime(2026, 9, 20, 8, 0, tzinfo=timezone.utc),
+                error=_CONTRACT_FAILURE,
+            )
+            self.assertNotIn(document_id, self._pending_parse_ids(conn))
+            self._insert_decision(conn, document_id, failed_run)
+            self.assertIn(document_id, self._pending_parse_ids(conn))
+            self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                started_at=datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc),
+                error=_CONTRACT_FAILURE,
+            )
+            self.assertNotIn(
+                document_id,
+                self._pending_parse_ids(conn),
+                "a newer undecided failure re-engages both gates",
+            )
+        finally:
+            txn.rollback()
+            conn.close()
+
+    def test_requeue_release_keeps_an_older_unreleased_failure_blocking(self) -> None:
+        # Releasing the latest failure opens the retryable latch, but an older
+        # contract failure without its own decision still blocks: every
+        # intended blocker must be released explicitly.
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            document_id = self._insert_document(conn, status="parse_failed")
+            older = self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                started_at=datetime(2026, 9, 20, 8, 0, tzinfo=timezone.utc),
+                error=_CONTRACT_FAILURE,
+            )
+            latest = self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                started_at=datetime(2026, 9, 21, 8, 0, tzinfo=timezone.utc),
+                error=_CONTRACT_FAILURE,
+            )
+            self._insert_decision(conn, document_id, latest)
+            self.assertNotIn(document_id, self._pending_parse_ids(conn))
+            diagnosis = queries.parse_admission_diagnosis(
+                conn, document_id=document_id, max_retries=3
+            )
+            self.assertFalse(diagnosis["currently_eligible"])
+            self.assertTrue(diagnosis["remaining_blockers"]["latest_failed_run_released"])
+            self.assertEqual(
+                diagnosis["remaining_blockers"]["unreleased_contract_failures"], 1
+            )
+            self._insert_decision(conn, document_id, older)
+            self.assertIn(document_id, self._pending_parse_ids(conn))
+        finally:
+            txn.rollback()
+            conn.close()
+
+    def test_parse_requeue_doctor_follows_the_latest_run_after_each_decision(
+        self,
+    ) -> None:
+        # The decision's state is the outcome of the latest provider parse run
+        # started after it, and any unresolved decision older than a day warns;
+        # the blocked line only counts documents the queue would consider.
+        def released():
+            checks = {
+                check.name: check
+                for check in parse_requeue_checks(load_settings(), self.engine)
+            }
+            return checks["released parse failures still pending"], checks[
+                "contract-class parse failures without requeue decision"
+            ]
+
+        old = datetime.now(timezone.utc) - timedelta(days=2)
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parse_failed")
+            failed = self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                started_at=old - timedelta(hours=1),
+                error=_CONTRACT_FAILURE,
+            )
+            self._insert_decision(conn, document_id, failed, decided_at=old)
+        pending, blocked = released()
+        self.assertEqual(pending.status, "WARN")
+        self.assertIn("released_pending=1", pending.message)
+        self.assertIn(f"1 unresolved older than 24h: {document_id}", pending.message)
+        self.assertNotIn(document_id, blocked.message)
+
+        with self.engine.begin() as conn:
+            self._insert_run(
+                conn,
+                document_id,
+                status="succeeded",
+                started_at=old + timedelta(hours=1),
+            )
+        resolved, _ = released()
+        self.assertEqual(resolved.status, "PASS")
+        self.assertIn("resolved=1", resolved.message)
+
+        with self.engine.begin() as conn:
+            self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                started_at=old + timedelta(hours=2),
+                error=_CONTRACT_FAILURE,
+            )
+        refailed, blocked = released()
+        self.assertEqual(refailed.status, "WARN")
+        self.assertIn("released_refailed=1 resolved=0", refailed.message)
+        self.assertIn(f"1 unresolved older than 24h: {document_id}", refailed.message)
+        self.assertIn(document_id, blocked.message)
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.document SET status = 'published' "
+                    "WHERE document_id = :id"
+                ),
+                {"id": document_id},
+            )
+        _, blocked = released()
+        self.assertNotIn(document_id, blocked.message)
+
+    def test_requeue_decision_is_append_only_evidence_for_the_app_role(self) -> None:
+        # Append-only is a grant, not a CLI convention, and the released run
+        # keeps every stored byte.
+        run_row_sql = (
+            "SELECT to_jsonb(r)::text FROM disclosure_core.processing_run AS r "
+            "WHERE r.processing_run_id = :id"
+        )
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            document_id = self._insert_document(conn, status="parse_failed")
+            failed_run = self._insert_run(
+                conn, document_id, status="failed", error=_CONTRACT_FAILURE
+            )
+            before = conn.execute(text(run_row_sql), {"id": failed_run}).scalar_one()
+            conn.execute(text(f'SET ROLE "{APP_ROLE}"'))
+            self._insert_decision(conn, document_id, failed_run)
+            self.assertEqual(
+                conn.execute(text(run_row_sql), {"id": failed_run}).scalar_one(),
+                before,
+            )
+            for statement, error in (
+                (
+                    "UPDATE disclosure_ops.parse_requeue_decision "
+                    "SET reason = 'edited'",
+                    ProgrammingError,
+                ),
+                ("DELETE FROM disclosure_ops.parse_requeue_decision", ProgrammingError),
+            ):
+                with self.subTest(statement=statement):
+                    savepoint = conn.begin_nested()
+                    with self.assertRaises(error):
+                        conn.execute(text(statement))
+                    savepoint.rollback()
+            savepoint = conn.begin_nested()
+            with self.assertRaises(IntegrityError):
+                self._insert_decision(
+                    conn,
+                    document_id,
+                    failed_run,
+                    retry_budget_class="deterministic",
+                )
+            savepoint.rollback()
+        finally:
+            txn.rollback()
+            conn.close()
+
+    def test_parse_requeue_use_case_appends_one_decision_per_failed_run(self) -> None:
+        with self.engine.begin() as conn:
+            document_id = self._insert_document(conn, status="parse_failed")
+            failed_run = self._insert_run(
+                conn,
+                document_id,
+                status="failed",
+                started_at=datetime(2026, 9, 20, 8, 0, tzinfo=timezone.utc),
+                error=_CONTRACT_FAILURE,
+            )
+            item_document_id = self._insert_document(conn, status="parse_failed")
+            item_run = self._insert_run(
+                conn,
+                item_document_id,
+                status="failed",
+                error={
+                    "stage": "parse",
+                    "error_code": "parser_task_failed",
+                    "retryable": True,
+                    "retry_budget_class": "item",
+                },
+            )
+        requeue = ParseRequeue(
+            uow_factory=lambda: SqlAlchemyUnitOfWork(engine=self.engine)
+        )
+        command = ParseRequeueCommand(
+            document_id=document_id,
+            processing_run_id=failed_run,
+            fixed_by="semantic_router.v102 4548ecaa",
+            reason="locked-candidate overflow now demotes to model candidates",
+            decided_by="integration-test",
+        )
+
+        result = requeue.execute(command)
+        self.decision_ids.append(str(result.decision_id))
+
+        self.assertEqual(result.failure_retry_budget_class, "semantic_route_contract")
+        self.assertIsNotNone(result.decided_at)
+        with self.engine.connect() as conn:
+            self.assertIn(document_id, self._pending_parse_ids(conn))
+            diagnosis = queries.parse_admission_diagnosis(
+                conn, document_id=document_id, max_retries=3
+            )
+        blockers = diagnosis["remaining_blockers"]
+        self.assertTrue(diagnosis["currently_eligible"])
+        self.assertEqual(blockers["latest_failed_run_id"], failed_run)
+        self.assertFalse(blockers["latest_failed_run_retryable"])
+        self.assertTrue(blockers["latest_failed_run_released"])
+        self.assertEqual(blockers["unreleased_contract_failures"], 0)
+        self.assertEqual(blockers["document_status"], "parse_failed")
+        self.assertFalse(blockers["running_run_present"])
+        self.assertEqual(
+            blockers["max_charged_failures"], 3 * queries.RETRY_CEILING_MULTIPLIER
+        )
+        # The doctor lines execute their own SQL against the real schema.
+        checks = {
+            check.name: check
+            for check in parse_requeue_checks(load_settings(), self.engine)
+        }
+        blocked = checks["contract-class parse failures without requeue decision"]
+        released = checks["released parse failures still pending"]
+        self.assertNotIn(document_id, blocked.message)
+        self.assertNotEqual(blocked.status, "FAIL")
+        self.assertEqual(released.status, "PASS")
+        self.assertIn("released_pending=", released.message)
+        with self.assertRaises(ParseRequeueError) as replayed:
+            requeue.execute(command)
+        self.assertEqual(
+            replayed.exception.error["error_code"], "DECISION_ALREADY_EXISTS"
+        )
+        with self.assertRaises(IntegrityError):
+            with self.engine.begin() as conn:
+                self._insert_decision(conn, document_id, failed_run)
+        with self.assertRaises(ParseRequeueError) as automatic:
+            requeue.execute(
+                ParseRequeueCommand(
+                    document_id=item_document_id,
+                    processing_run_id=item_run,
+                    fixed_by="semantic_router.v102 4548ecaa",
+                    reason="item-class failures are retried by the scheduler",
+                    decided_by="integration-test",
+                )
+            )
+        self.assertEqual(
+            automatic.exception.error["error_code"], "RETRY_BUDGET_CLASS_IS_AUTOMATIC"
+        )
 
     def test_pending_parse_returns_archived_bytes_and_ignores_legacy_flag(
         self,

@@ -151,3 +151,11 @@ class PublishRunError(DisclosureAnchorError):
     def __init__(self, error: dict) -> None:
         self.error = error
         super().__init__(str(error))
+
+
+class ParseRequeueError(DisclosureAnchorError):
+    """Raised when an explicit parse requeue decision is refused."""
+
+    def __init__(self, error: dict) -> None:
+        self.error = error
+        super().__init__(str(error))

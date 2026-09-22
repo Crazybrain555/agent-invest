@@ -29,6 +29,29 @@ request builder before transaction P, so nothing is persisted. The COMMIT lane r
 `semantic_route_contract` and `retryable=false`; the attempt closes through its cleanup plan and ACK without a
 publication. The base `SemanticRouteContractError` and every integrity error still open the run circuit.
 
+A contract retry-budget class is never retried automatically: scheduling cannot know that the cause was fixed.
+The releasable classes are the closed set the coordinator persists — `semantic_route_contract`,
+`provider_protocol`, `provider_artifact_contract`, `provider_runaway`, `provider_terminal`. Two admission gates
+hold such a document out of `pending_parse`: the view's `last_failed_retryable` latch, because the failure is
+stored with `retryable=false`, and the contract-class exclusion over every failed provider parse run. One
+append-only row in `disclosure_ops.parse_requeue_decision` releases both, and only for the run it names — the
+exclusion takes a per-run exception, and the latch only while that run is still the latest failure. A newer
+undecided failure re-engages both gates. The failed run is never rewritten; the decision carries what was fixed,
+why and who decided it, and only `disclosure_app` may SELECT and INSERT it, never UPDATE or DELETE.
+
+`python -m disclosure_anchor.cli.parse_requeue` writes the decision with fail-closed guardrails and a
+`--dry-run` that writes nothing. A missing, malformed or unknown retry class, or a non-boolean `error.retryable`,
+is refused rather than released: the queue excluding a row is not evidence that an operator may re-admit it. The
+receipt keeps three facts apart — whether the decision was recorded, whether the document is eligible right now
+(asked of `pending_parse` itself, after the write), and the remaining blockers. Recording a decision admits
+nothing by itself; the document is parsed only when a normal worker scan or an authorized campaign picks it up.
+Retry budgets are unchanged: a released contract failure still charges neither budget. Every succeeded provider
+generation must be provably older than the released failure; one with an unknown start time refuses the release.
+Doctor lists contract-class failures with no decision over the documents the queue would consider, and reports
+each decision as the outcome of the latest provider parse run after it (released_pending, released_refailed or
+resolved); any unresolved decision older than a day warns, and a failed diagnostic is a check failure, never a
+quiet zero.
+
 Valid promoted output replays exactly. Invalid promoted output, including a markerless response-loss tree,
 is contained by no-replace output→staging rename under the existing resource lock and claim guard, pinned
 root identity and parent fsync, then stops with ownership unresolved. Simultaneous paths, root substitution
