@@ -748,3 +748,18 @@ doctor 两行均为 WARN 级（与既有 parse dead letters 一致）：无决�
 guardrail 里「不存在不早于该失败的成功 provider run」对每一条成功 provider run 逐条判定，started_at 未知的
 成功 run 一律视为不可证明更早 → 拒绝。
 ```
+
+2026-09-22（router v103：降级组按 Unit 顺序连续；日历 token 封闭）——public view/API/change feed 不变:
+
+```text
+semantic_router.v102 → v103（prompt 仍为 v33，taxonomy 仍为 r64）。
+1. `_semantic_adjudication_groups` 按 Unit 顺序分组，降级溢出 Unit 是单例边界：v102 把普通 Unit 先全部分批、降级 Unit 排最后，
+   当降级 Unit 夹在同一批次的两个普通 Unit 之间时，receipt 按 Unit 顺序存储会让 `_derive_v2_receipt_group_hashes` 判
+   "group membership is not contiguous"、Publish 回放拒绝；现在不会。无降级 Unit 的文档分组与 v102 相同。
+2. `_is_standardized_quantitative_topic` 的期间语法改为封闭 token：年(度)/月(份)/日/季度/纯数字日期与区间（分隔符含 −、到），
+   整体可能所有式跳过，数值排除复用同一 token；标签后允许冒号；方向分支复用主语语法（总额、括号缩写）。修复：2024-03-31、
+   2024/03/31、2024-03、2024年1季度、2023-2024年度、1−3月、1到3月 曾被当作数值锁定；2024年3月31日为…、：2024年度为…、
+   总额/括号缩写+期间+方向 曾漏锁；2024.3 / 1,234.56 仍是金额。
+验证：tests/unit/test_semantic_router.py（降级 Unit 夹在普通 Unit 之间的 v2 回放用例、期间用例表）；36 篇已发布文档 / 10,747 Unit
+回放（a-locked-overflow-replay/v103-*）0 变化；外部复审 ChatGPT Pro 对 4548ecaa 的 P1/P2 由本次修复。
+```

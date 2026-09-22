@@ -53,7 +53,7 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 合并是不可逆信息销毁，而并集只需一行 OR。检索的中文桥梁在两处：semantic-routes catalog 的中文
 labels（键规划），以及 search projection `key_tokens` 通道注入的中文规范标签 token（rp v4 起）。
 
-当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r64`、router `semantic_router.v102`、prompt
+当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r64`、router `semantic_router.v103`、prompt
 `semantic_route_adjudication.v33`。默认 provider 链为 `codex_cli.v4.low` /
 `gpt-5.6-luna` 主用、`claude_cli.v1.low` / `claude-sonnet-5` 备用；仅闭合的 availability
 原因允许 failover，取消、协议、模型身份、安全与无效裁决全部 fail closed。Codex 的
@@ -66,7 +66,8 @@ capacity 家族包含 429/限流/配额/余额不足，以及账号用量上限�
 的输入超过 8 个候选，上限 32（`MAX_DEMOTED_SEMANTIC_CANDIDATES`）。模型可对每个降级候选逐个裁决
 （决策成员上限同为 32），程序在规范排序后只保留前 8 个 direct route；receipt 的 candidate_keys 记录
 全部降级键，evidence kinds 同时带原证据、降级标记与 `model_adjudicated`，审计能看出该 Unit 是因
-锁定溢出而交由模型裁决。locked 超过 32 个时仍以 `SemanticRouteLockedCandidateOverflowError` 做
+锁定溢出而交由模型裁决。分组按 Unit 顺序进行，降级 Unit 是单例边界（遇到它就截断当前普通批次），因此 v2 receipt 按 Unit
+顺序存储时每个组的成员保持连续，Publish 回放能恢复历史分组；无降级 Unit 的文档分组不变。locked 超过 32 个时仍以 `SemanticRouteLockedCandidateOverflowError` 做
 确定性的 per-Unit 拒绝，消息携带 unit_index、locked_count 与排序后的 locked_keys；该计数取自
 shortlist 截断之前，必须保持在该位置。commit 阶段它被归类为 attempt-local 的 `local_failure`
 （error_code `semantic_route_locked_candidate_overflow`，不可重试），attempt 经 cleanup/ACK 关闭且
@@ -77,8 +78,11 @@ shortlist 截断之前，必须保持在该位置。commit 阶段它被归类为
 Unit-local **主题**，不表示陈述为真、已实现、属于本期、无条件或可采信；历史、风险、预测、计划、
 条件、因果、否定、无发生与不适用由 L2 解释，不能抹掉已成立的 L1 主题 witness。定期报告的
 allowlisted label 紧邻数值/方向，以及严格 typed table field/header，均可确定性落粗主题；紧邻的
-日历期间（`管理费用2024年1-3月…`、`…12月`、`…1-3月`）是期间指代而非该主题的数值结果：跳过期间后仍须有
-真实数值或方向结果才锁定（`管理费用2024年度为1,234万元` 锁定，`管理费用2024年1-3月发生额较上年同期…` 不锁定）；普通
+日历期间是期间指代而非该主题的数值结果：年/年度（含 `2023-2024年度` 这类区间）、月/月份（含 `1-3`、`1−3`、`1至3`、`1到3` 区间）、
+日、季度（`第一季度`/`一季度`/`1季度`）与纯数字日期（`2024-03-31`、`2024/3/31`、`2024.03.31`、`2024-03`）都是封闭的期间 token，整体
+跳过、绝不回退成数值；标签后允许一个冒号再接期间；跳过期间后仍须有真实数值或方向结果才锁定（`管理费用2024年度为1,234万元`、
+`管理费用2024年3月31日为1,234万元` 锁定，`管理费用2024年1-3月发生额较上年同期…`、`管理费用2024-03-31发生额如下` 不锁定）；带小数点
+的数对（`2024.3`、`1,234.56`）是金额不是日期；方向句与数值句共用同一主语语法（含 总额 与括号缩写）；普通
 table_text 和数据格只保留 lexical/candidate。有内容 Unit 的唯一精确定期报告标题仍直接成为唯一
 route；heading-only 标题只走 title/heading_path/section_keys。
 

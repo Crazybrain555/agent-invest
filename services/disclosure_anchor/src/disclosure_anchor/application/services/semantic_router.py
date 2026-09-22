@@ -2493,18 +2493,25 @@ def _semantic_adjudication_groups(
     *,
     batch_size: int,
 ) -> tuple[tuple[SemanticRouteUnitInput, ...], ...]:
-    # A demoted overflow Unit carries up to MAX_DEMOTED_SEMANTIC_CANDIDATES
-    # candidates; it is adjudicated alone so the provider output schema and
-    # the group identity of ordinary Units stay bounded and stable.
-    ordinary = tuple(item for item in inputs if not _is_demoted_overflow_input(item))
-    demoted = tuple(item for item in inputs if _is_demoted_overflow_input(item))
-    return (
-        *(
-            tuple(ordinary[offset : offset + batch_size])
-            for offset in range(0, len(ordinary), batch_size)
-        ),
-        *((item,) for item in demoted),
-    )
+    # Preserve contiguous source-order membership for v2 receipt replay.
+    # An overflow Unit is a singleton boundary, not a reason to collect its
+    # ordinary neighbours into a non-contiguous group.
+    groups: list[tuple[SemanticRouteUnitInput, ...]] = []
+    ordinary: list[SemanticRouteUnitInput] = []
+    for item in inputs:
+        if _is_demoted_overflow_input(item):
+            if ordinary:
+                groups.append(tuple(ordinary))
+                ordinary.clear()
+            groups.append((item,))
+        else:
+            ordinary.append(item)
+            if len(ordinary) == batch_size:
+                groups.append(tuple(ordinary))
+                ordinary.clear()
+    if ordinary:
+        groups.append(tuple(ordinary))
+    return tuple(groups)
 
 
 def _derive_v2_receipt_group_hashes(
@@ -3516,15 +3523,29 @@ def _is_standardized_quantitative_topic(
     # is deixis, not the topic's numeric result: it is consumed without being
     # given back, and a real value or directional result must still follow.
     # The value itself can never be a 年/月/日 stamp or a bare month range.
-    period = (
-        r"(?:[0-9０-９]{1,4}年)?+(?:度)?+"
-        r"(?:[0-9０-９]{1,2}(?:[-－—–~～至][0-9０-９]{1,2})?月)?+(?:份)?+"
+    # Closed calendar tokens, consumed atomically. Do not accept a prefix
+    # of a known date as a result. This is not a general-purpose date parser.
+    digit = r"[0-9０-９]"
+    range_sep = r"[-－—–−~～至到]"
+    year = rf"{digit}{{1,4}}(?:{range_sep}{digit}{{1,4}})?年(?:度)?"
+    month = rf"{digit}{{1,2}}(?:{range_sep}{digit}{{1,2}})?月(?:份)?"
+    day = rf"{digit}{{1,2}}日"
+    quarter = r"(?:第)?[一二三四1-4１-４](?:季度|季)"
+    # 2024-03-31 / 2024/3/31 / 2024.03.31 and the year-month forms 2024-03 /
+    # 2024/03; a dotted pair (2024.3, 1,234.56) stays an amount.
+    full_numeric_date = (
+        rf"{digit}{{4}}(?:[-－—–−/／]{digit}{{1,2}}(?:[-－—–−/／.．]{digit}{{1,2}})?"
+        rf"|[.．]{digit}{{1,2}}[.．]{digit}{{1,2}})(?!{digit})"
     )
-    value = (
-        r"(?:人民币)?[+\-－−]?"
-        r"(?![0-9０-９]{1,4}(?:年|月|日)|[0-9０-９]{1,2}(?:[-－—–~～至][0-9０-９]{1,2})?月)"
-        r"[0-9０-９]"
+    # The complete 年/年度 form goes first: a numeric-date prefix such as
+    # 2023-24 must not commit before 2023-24年度 has been tried.
+    period_token = (
+        rf"(?:{year}(?:{quarter}|{month}(?:{day})?)?|"
+        rf"{full_numeric_date}|"
+        rf"{quarter}|{month}(?:{day})?|{day})"
     )
+    period = rf"(?:{period_token})?+"
+    value = rf"(?:人民币)?[+\-－−]?(?!{period_token}){digit}"
     connectors = (
         "为",
         "达",
@@ -3542,7 +3563,7 @@ def _is_standardized_quantitative_topic(
         "变动幅度为",
     )
     acronym = r"(?:[（(][a-z0-9._/\-]{1,12}[）)])?"
-    subject = re.escape(label) + acronym + r"(?:总额)?" + period
+    subject = re.escape(label) + acronym + r"(?:总额)?(?::)?" + period
     if label.endswith(connectors):
         direct_result = re.compile(subject + value)
     else:
@@ -3567,7 +3588,7 @@ def _is_standardized_quantitative_topic(
             )
         )
         matches.extend(
-            re.compile(re.escape(label) + period + rf"(?:{directional})").finditer(
+            re.compile(subject + rf"(?:{directional})").finditer(
                 normalized_source
             )
         )

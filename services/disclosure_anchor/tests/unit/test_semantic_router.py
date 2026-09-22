@@ -559,13 +559,15 @@ def _dense_periodic_change_drafts(
     ),
     phrasing: str = "date_adjacent",
     subjects: tuple[str, ...] = _PERIODIC_CHANGE_SUBJECTS,
+    leading_units: tuple[tuple[str, str], ...] = (),
     trailing_units: tuple[tuple[str, str], ...] = (),
 ):  # type: ignore[no-untyped-def]
     """One dense periodic change-analysis Unit with numbered 科目 clauses.
 
     ``date_adjacent`` is the 002997 wording (科目 followed by the reporting
     period, then the directional result); ``directional`` puts the result
-    right after the 科目 so the clause rule locks it.
+    right after the 科目 so the clause rule locks it.  ``leading_units`` and
+    ``trailing_units`` add ordinary (title, body) Units before and after it.
     """
 
     blocks = [
@@ -579,9 +581,15 @@ def _dense_periodic_change_drafts(
         )
         for index, heading in enumerate(headings)
     ]
+    for unit_title, body in leading_units:
+        blocks.append(
+            _block(len(blocks), 0, "text", (ProviderPayload("text", None, unit_title),),
+                   annotation="title", level=len(headings) + 1)
+        )
+        blocks.append(_block(len(blocks), 0, "text", (ProviderPayload("text", None, body),), annotation=None))
     blocks.append(
         _block(
-            len(headings),
+            len(blocks),
             0,
             "text",
             (ProviderPayload("text", None, title),),
@@ -596,7 +604,7 @@ def _dense_periodic_change_drafts(
     for offset, subject in enumerate(subjects[:clause_count]):
         blocks.append(
             _block(
-                len(headings) + 1 + offset,
+                len(blocks),
                 0,
                 "text",
                 (ProviderPayload("text", None, clause.format(n=offset + 1, subject=subject)),),
@@ -4181,6 +4189,35 @@ class SemanticRouterTests(unittest.TestCase):
             ("管理费用2024年度为1,234.56万元。", True),
             ("管理费用2023年1-9月为1,234.56万元。", True),
             ("管理费用2024年1-3月增长47.98%。", True),
+            # Closed calendar tokens: numeric dates, quarters, day stamps and
+            # ranges (incl. − and 到) are skipped whole, never read as a value.
+            ("管理费用2024-03-31发生额如下。", False),
+            ("管理费用2024/03/31发生额如下。", False),
+            ("管理费用2024-03发生额如下。", False),
+            ("管理费用2024.3.31发生额如下。", False),
+            ("管理费用2024年1季度预算安排如下。", False),
+            ("管理费用2024年第一季度发生额如下。", False),
+            ("管理费用2023-2024年度预算安排如下。", False),
+            ("管理费用1−3月发生额如下。", False),
+            ("管理费用1到3月发生额如下。", False),
+            ("管理费用12月31日余额如下。", False),
+            ("管理费用２０２４年度１－３月份发生额如下。", False),
+            # …and a genuine value after any of them still locks; a dotted
+            # pair is an amount, not a date.
+            ("管理费用2024年3月31日为1234万元。", True),
+            ("管理费用：2024年度为1234万元。", True),
+            ("管理费用2024年一季度为1234万元。", True),
+            ("管理费用2024.3万元。", True),
+            ("管理费用1234.56万元。", True),
+            ("管理费用２０２４年度１－３月份为１２３４万元。", True),
+            # An abbreviated year range is the complete 年度 token, not a
+            # numeric-date prefix that would swallow "2023-24".
+            ("管理费用2023-24年度为1234万元。", True),
+            ("管理费用2023-24年度增长。", True),
+            # The directional statement shares the subject grammar (总额, acronym).
+            ("管理费用总额2024年度增长。", True),
+            ("管理费用（ABC）2024年度增长。", True),
+            ("管理费用２０２４年度１－３月份增长。", True),
         )
         document = SemanticDocumentContext(title=None, filing_type="quarterly_report")
         for body, locked in cases:
@@ -4281,7 +4318,7 @@ class SemanticRouterTests(unittest.TestCase):
         # One demoted overflow Unit (index 2) plus two ordinary soft-candidate
         # Units (3 and 4) in the same document: the ordinary ones share a group,
         # the demoted one is sent alone so the provider output schema and the
-        # ordinary group identity stay bounded.
+        # ordinary group identity stay bounded.  Groups follow Unit order.
         soft = ("管理费用较上年同期增长 47.98%，研发费用较上年同期增长 35.98%。")
         overflow_admitted, overflow_drafts = _dense_periodic_change_drafts(
             9, phrasing="directional",
@@ -4308,7 +4345,52 @@ class SemanticRouterTests(unittest.TestCase):
             drafts=overflow_drafts,
         )
         self.assertEqual(adjudicator.calls, len(groups))
-        self.assertEqual(groups, [(3, 4), (2,)])
+        self.assertEqual(groups, [(2,), (3, 4)])
+
+    def test_demoted_overflow_between_ordinary_units_keeps_v2_groups_replayable(self) -> None:
+        # An ordinary soft-candidate Unit on each side of the demoted overflow
+        # Unit: the ordinary ones must not be batched across the singleton,
+        # because v2 receipts are stored in Unit order and replay requires each
+        # group's members to be contiguous.  Replay with a different batch
+        # size must recover the historical groups without a model call.
+        soft = "管理费用较上年同期增长 47.98%，研发费用较上年同期增长 35.98%。"
+        for affirm in (False, True):
+            with self.subTest(affirm=affirm):
+                admitted, drafts = _dense_periodic_change_drafts(
+                    9, phrasing="directional",
+                    leading_units=(("1、其他说明", soft),),
+                    trailing_units=(("3、补充说明", soft),),
+                )
+                groups: list[tuple[int, ...]] = []
+
+                def decide(batch: SemanticAdjudicationBatch) -> tuple[SemanticAdjudicationDecision, ...]:
+                    groups.append(tuple(unit.unit_index for unit in batch.units))
+                    return tuple(
+                        SemanticAdjudicationDecision(
+                            unit_index=unit.unit_index,
+                            routes=tuple(
+                                SemanticAdjudicatedRoute(key=candidate.key, support_ids=candidate.source_ids)
+                                for candidate in unit.candidates
+                            ) if affirm else (),
+                        )
+                        for unit in batch.units
+                    )
+
+                executor = _Executor(decide)
+                document = SemanticDocumentContext(title=None, filing_type="quarterly_report")
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(), executor=executor, batch_size=16,
+                ).route(admitted=admitted, document=document, drafts=drafts)
+                self.assertEqual(groups, [(2,), (3,), (4,)])
+                overflow = result.receipts[3]
+                self.assertEqual(len(overflow.candidate_keys), 9)
+                self.assertEqual(len(overflow.semantic_keys), 8 if affirm else 0)
+                calls = executor.calls
+                replayed = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(), executor=executor, batch_size=1,
+                ).replay(admitted=admitted, document=document, drafts=drafts, receipts=result.receipts)
+                self.assertEqual(replayed.units, result.units)
+                self.assertEqual(executor.calls, calls)
 
     def test_locked_overflow_demotion_respects_the_model_membership(self) -> None:
         admitted, drafts = _dense_periodic_change_drafts(
