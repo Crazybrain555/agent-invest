@@ -130,7 +130,11 @@ def _statement_blocks(node: ast.AST):
 
 
 def _single_owned_thread_await(node: ast.AST, target: str) -> ast.Await:
-    """The one ``await to_thread_owned(<target>, ...)`` expression inside ``node``."""
+    """The one ``await to_thread_owned(<target>, ...)`` expression inside ``node``.
+
+    ``target`` is the written first argument: a plain name such as
+    ``trim_process_heap`` or a bound method such as ``owned_document.close``.
+    """
     awaits = [
         child
         for child in ast.walk(node)
@@ -138,14 +142,23 @@ def _single_owned_thread_await(node: ast.AST, target: str) -> ast.Await:
         and isinstance(child.value, ast.Call)
         and _called_name(child.value) == "to_thread_owned"
         and child.value.args
-        and isinstance(child.value.args[0], ast.Name)
-        and child.value.args[0].id == target
+        and ast.unparse(child.value.args[0]) == target
     ]
     if len(awaits) != 1:
         raise AssertionError(
             f"expected exactly one awaited to_thread_owned({target}), found {len(awaits)}"
         )
     return awaits[0]
+
+
+def _statement_index(block: list, target: ast.AST) -> int:
+    """Position of the statement of ``block`` that holds ``target``."""
+    holders = [
+        index for index, statement in enumerate(block) if _contains(statement, target)
+    ]
+    if len(holders) != 1:
+        raise AssertionError(f"target is held by {len(holders)} statements of the block")
+    return holders[0]
 
 
 def _statement_after(node: ast.AST, target: ast.AST) -> ast.stmt:
@@ -1035,6 +1048,9 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
                 "mineru/cli/fast_api.py": (
                     "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
                 ),
+                "mineru/cli/common.py": (
+                    "d1e23e310bddc3da2d7f491be81ef112435824403d1c3a29e438505c1707dbc5"
+                ),
                 "mineru/backend/vlm/vlm_analyze.py": (
                     "0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390"
                 ),
@@ -1163,7 +1179,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         # path — and never reaches for the owned thread pool. Pin the shape of
         # that function, not a module-wide count. The asynchronous analyzer is
         # pinned by
-        # test_async_document_end_release_is_awaited_on_the_owned_thread_pool.
+        # test_async_document_native_boundary_is_entirely_on_the_owned_pool.
         hybrid_tree = ast.parse(patched_hybrid)
         sync_analyze = _named_function(hybrid_tree, "doc_analyze")
         self.assertIsInstance(sync_analyze, ast.FunctionDef)
@@ -1264,7 +1280,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIsNot(gc_module.collect, collect)
         self.assertIs(gc_module.collect, original_collect)
 
-    def test_async_document_end_release_is_awaited_on_the_owned_thread_pool(
+    def test_async_document_native_boundary_is_entirely_on_the_owned_pool(
         self,
     ) -> None:
         hybrid = _pinned_preimage(
@@ -1274,14 +1290,24 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         patched_hybrid = patch_source(
             "mineru/backend/hybrid/hybrid_analyze.py", hybrid
         )
-        async_analyze = _named_function(patched_hybrid, "aio_doc_analyze")
+        hybrid_tree = ast.parse(patched_hybrid)
+        async_analyze = _named_function(hybrid_tree, "aio_doc_analyze")
         self.assertIsInstance(async_analyze, ast.AsyncFunctionDef)
 
         # Nothing on the asynchronous path may hold the serving loop: no heap
-        # return, no allocator release, and above all no cyclic collection.
+        # return, no allocator release, above all no cyclic collection, and no
+        # pdfium call — classification, open, page count and close included.
         self.assertEqual(_calls_to(async_analyze, "clean_memory"), [])
         self.assertEqual(_bare_calls_to(async_analyze, "trim_process_heap"), [])
         self.assertEqual(_calls_to(async_analyze, "gc.collect"), [])
+        for native in (
+            "ocr_classify",
+            "open_pdfium_document",
+            "get_pdfium_document_page_count",
+            "close_pdfium_document",
+        ):
+            with self.subTest(native=native):
+                self.assertEqual(_calls_to(async_analyze, native), [])
 
         # The per-window heap return is awaited on the owned pool, and it still
         # runs for a failed window because it stays in the window loop's finally.
@@ -1296,18 +1322,143 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         ]
         self.assertEqual(len(window_finally), 1)
 
-        # The document-end release is awaited on the same pool and still closes
+        # One holder created on the loop owns the document; the prologue that
+        # fills it is awaited on the pool before any trace event exists, so a
+        # cancellation there can never leave a started document untraceable.
+        prepare_await = _single_owned_thread_await(
+            async_analyze, "owned_document.prepare"
+        )
+        self.assertEqual(
+            ast.unparse(prepare_await),
+            "await to_thread_owned(owned_document.prepare, pdf_bytes, parse_method)",
+        )
+        self.assertEqual(
+            [ast.unparse(call) for call in _calls_to(async_analyze, "_OwnedPdfiumDocument")],
+            ["_OwnedPdfiumDocument()"],
+        )
+
+        # Document end closes and releases in one owned call, and still closes
         # the phase trace as its very next statement.
         release_await = _single_owned_thread_await(
-            async_analyze, "release_document_memory_owned"
+            async_analyze, "owned_document.close_and_release"
         )
         self.assertEqual(
             ast.unparse(release_await),
-            "await to_thread_owned(release_document_memory_owned, device)",
+            "await to_thread_owned(owned_document.close_and_release, device)",
         )
         self.assertEqual(
             ast.unparse(_statement_after(async_analyze, release_await)),
             "phase_trace.document_completed()",
+        )
+
+        # The document body is guarded by one ``except BaseException`` handler,
+        # not a finally: the success path must not repeat the close, and the
+        # failure path owns both the trace event and the single close attempt.
+        document_try = [
+            node
+            for node in ast.walk(async_analyze)
+            if isinstance(node, ast.Try) and _block_contains(node.body, release_await)
+        ]
+        self.assertEqual(len(document_try), 1)
+        handler = document_try[0]
+        self.assertEqual(handler.finalbody, [])
+        self.assertEqual(len(handler.handlers), 1)
+        self.assertEqual(ast.unparse(handler.handlers[0].type), "BaseException")
+        self.assertLess(
+            _statement_index(handler.body, prepare_await),
+            _statement_index(
+                handler.body,
+                _calls_to(async_analyze, "phase_trace.document_started")[0],
+            ),
+        )
+
+        failure_close = _single_owned_thread_await(
+            async_analyze, "owned_document.close"
+        )
+        self.assertEqual(
+            ast.unparse(failure_close), "await to_thread_owned(owned_document.close)"
+        )
+        self.assertTrue(_block_contains(handler.handlers[0].body, failure_close))
+        close_guard = [
+            node
+            for node in ast.walk(handler.handlers[0])
+            if isinstance(node, ast.If) and _block_contains(node.body, failure_close)
+        ]
+        self.assertEqual(
+            [ast.unparse(node.test) for node in close_guard],
+            ["not owned_document.close_attempted"],
+        )
+        self.assertEqual(
+            [
+                ast.unparse(node.test)
+                for node in ast.walk(handler.handlers[0])
+                if isinstance(node, ast.If)
+                and _block_contains(
+                    node.body, _calls_to(async_analyze, "phase_trace.document_failed")[0]
+                )
+            ],
+            ["not owned_document.closed and phase_trace is not None"],
+        )
+
+        # The flag the old ``doc_closed`` local carried now lives on the holder.
+        self.assertEqual(
+            [
+                node.id
+                for node in ast.walk(async_analyze)
+                if isinstance(node, ast.Name) and node.id == "doc_closed"
+            ],
+            [],
+        )
+
+        # Only the render result still needs a cancellation-result cleanup; the
+        # document handle is never closed by a result callback.
+        cancellation_cleanups = [
+            call
+            for call in ast.walk(async_analyze)
+            if isinstance(call, ast.Call)
+            and any(keyword.arg == "on_cancel_result" for keyword in call.keywords)
+        ]
+        self.assertEqual(
+            [
+                (
+                    _called_name(call),
+                    [
+                        ast.unparse(keyword.value)
+                        for keyword in call.keywords
+                        if keyword.arg == "on_cancel_result"
+                    ],
+                )
+                for call in cancellation_cleanups
+            ],
+            [("drain_owned_awaitable", ["_close_images"])],
+        )
+
+        # The close itself records the attempt before the native call, so a
+        # cancelled or failed close is never retried by the caller.
+        holder = [
+            node
+            for node in ast.walk(hybrid_tree)
+            if isinstance(node, ast.ClassDef) and node.name == "_OwnedPdfiumDocument"
+        ]
+        self.assertEqual(len(holder), 1)
+        self.assertEqual(
+            [
+                ast.unparse(statement)
+                for statement in _named_function(holder[0], "close").body
+            ],
+            [
+                "if self.pdf_doc is None or self.close_attempted:\n    return",
+                "self.close_attempted = True",
+                "close_pdfium_document(self.pdf_doc)",
+                "self.closed = True",
+            ],
+        )
+        self.assertEqual(
+            [
+                ast.unparse(statement)
+                for statement in _named_function(holder[0], "close_and_release").body
+            ],
+            ["self.close()", "release_document_memory_owned(device)"],
         )
 
     def test_phase_trace_is_default_off_content_free_and_strictly_closed(self) -> None:

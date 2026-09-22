@@ -63,6 +63,13 @@ identity conflicts and clock regression expose invalid receipts. IO/programming
 exceptions propagate. `journal_prefix_sha256` and `journal_bytes_consumed` identify
 the exact bytes consumed, even when a bound prevents reading the entire log.
 
+The qualified native owner uses legacy .NET path handling. Before campaign
+preparation and native store creation, the complete run directory plus the
+longest `receipt-<sha256>.json.pending-<guid>` name must fit below 260 UTF-16
+code units. A configuration that cannot write its closing receipt is rejected
+before admission; shorten the explicit workspace root or run ID. Receipt hashes,
+immutable writes and retained failure evidence are unchanged.
+
 ## Credit authority
 
 The E2E result is `first_qualified_publication`. Full source pages count once only

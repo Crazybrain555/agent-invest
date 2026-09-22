@@ -9,7 +9,7 @@ import importlib.util
 import os
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +26,7 @@ RELATIVE = {
     "vlm": "mineru/backend/vlm/vlm_analyze.py",
     "model": "mineru/utils/model_utils.py",
     "api": "mineru/cli/fast_api.py",
+    "cli": "mineru/cli/common.py",
 }
 # Independent frozen upstream identities, not a hash table copied from the generator at runtime.
 PREIMAGE_HASHES = {
@@ -33,6 +34,7 @@ PREIMAGE_HASHES = {
     "vlm": "0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390",
     "model": "7662656c5c406ab704065b8a3a6e662b662b0bb877b76b08c7d8a8a7eaf9c109",
     "api": "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39",
+    "cli": "d1e23e310bddc3da2d7f491be81ef112435824403d1c3a29e438505c1707dbc5",
 }
 
 
@@ -157,9 +159,33 @@ class Resource:
         self.events.append(f"{self.name}:close")
 
 
+class GuardProbe:
+    """A real re-entrant guard around the stubbed pdfium seams.
+
+    Production serializes every pdfium call behind one process lock. The probe
+    reproduces that contention and announces, from the owned worker thread, that
+    it is about to block on the guard, so a test can fence the loop instead of
+    sleeping.
+    """
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.waiting = asyncio.Event()
+        self.attempts = []
+        self.loop = asyncio.get_running_loop()
+
+    def hold(self, name):
+        self.attempts.append(name)
+        self.loop.call_soon_threadsafe(self.waiting.set)
+        return self.lock
+
+
 class Trace:
-    def __init__(self, events):
+    def __init__(self, events, faults=None):
         self.events = events
+        # The real document-end trace writes and flushes stderr, so it can fail
+        # after the event is on its way out; that is the shape reproduced here.
+        self.faults = dict(faults or {})
 
     def start(self):
         return 1
@@ -178,6 +204,9 @@ class Trace:
 
     def document_failed(self):
         self.events.append("document:failed")
+        fault = self.faults.get("document_failed")
+        if fault is not None:
+            raise fault
 
 
 class DocumentFixture:
@@ -191,6 +220,8 @@ class DocumentFixture:
         effort="medium",
         ocr=False,
         client=False,
+        faults=None,
+        guard=False,
     ):
         self.sources = sources
         self.kind = kind
@@ -204,23 +235,77 @@ class DocumentFixture:
         self.barrier = NativeBarrier(self.events, block, error=error) if block else None
         self.block = block
         self.failure = error
+        # Seam name -> exception raised by that seam without a barrier round trip.
+        self.faults = dict(faults or {})
+        self.guard = GuardProbe() if guard else None
         self.model = object()
         self.calls = []
+        # Document-lifetime seams: name, arguments and the thread that ran them.
+        self.document_calls = []
+        # Every real _OwnedPdfiumDocument the generated analyzer created.
+        self.documents = []
         self.namespace = load_owned(sources["model"], sources[kind])
         self.namespace.update(self._environment())
-        load_definitions(
-            sources[kind], {"aio_doc_analyze", "_close_images"}, self.namespace
-        )
+        definitions = {"aio_doc_analyze", "_close_images"}
+        if kind == "hybrid":
+            definitions.add("_OwnedPdfiumDocument")
+        load_definitions(sources[kind], definitions, self.namespace)
+        if kind == "hybrid":
+            self._record_owned_documents()
         if kind == "vlm":
             load_definitions(sources[kind], {"_get_model_async"}, self.namespace)
+
+    def _record_owned_documents(self):
+        """Keep every holder the real analyzer builds; its body stays untouched."""
+        holder = self.namespace["_OwnedPdfiumDocument"]
+        self.holder_class = holder
+
+        def create(*args, **kwargs):
+            document = holder(*args, **kwargs)
+            self.documents.append(document)
+            return document
+
+        self.namespace["_OwnedPdfiumDocument"] = create
+
+    def _gate(self, name):
+        """Barrier and injected failure shared by every stubbed seam."""
+        if self.block == name:
+            self.barrier.enter()
+        fault = self.faults.get(name)
+        if fault is not None:
+            raise fault
 
     def native(self, name, result=None):
         def operation(*args, **kwargs):
             self.calls.append((name, args, kwargs))
             self.events.append(name)
-            if self.block == name:
-                self.barrier.enter()
+            self._gate(name)
             return result(*args, **kwargs) if callable(result) else result
+
+        return operation
+
+    def document_seam(self, name, result=None, *, event=None, guarded=False):
+        """A document-lifetime native seam: recorded, blockable, failable, guarded."""
+
+        def operation(*args, **kwargs):
+            self.document_calls.append(
+                SimpleNamespace(
+                    name=name,
+                    args=args,
+                    kwargs=kwargs,
+                    thread_id=threading.get_ident(),
+                )
+            )
+            if event is not None:
+                self.events.append(event)
+            self._gate(name)
+            contention = (
+                self.guard.hold(name)
+                if guarded and self.guard is not None
+                else nullcontext()
+            )
+            with contention:
+                return result(*args, **kwargs) if callable(result) else result
 
         return operation
 
@@ -259,7 +344,7 @@ class DocumentFixture:
             aio_batch_extract_with_layout=infer, aio_batch_two_step_extract=infer
         )
         self.predictor = predictor
-        trace = Trace(self.events)
+        trace = Trace(self.events, self.faults)
         return {
             "time": time,
             "asyncio": asyncio,
@@ -270,11 +355,25 @@ class DocumentFixture:
             "_resolve_effective_image_analysis": lambda effort, image: image,
             "_maybe_enable_serial_execution": lambda value, backend: value,
             "get_device": lambda: "cpu",
-            "ocr_classify": lambda *a, **kw: self.ocr,
-            "open_pdfium_document": lambda *a: self.pdf,
-            "close_pdfium_document": lambda doc: doc.close(),
+            "ocr_classify": self.document_seam(
+                "classify",
+                lambda *a, **kw: self.ocr,
+                event="ocr-classify",
+                guarded=True,
+            ),
+            "open_pdfium_document": self.document_seam(
+                "open_document", lambda *a: self.pdf, event="pdf:open", guarded=True
+            ),
+            "close_pdfium_document": self.document_seam(
+                "close_document",
+                lambda doc: doc.close(),
+                event="pdf:close-call",
+                guarded=True,
+            ),
             "init_middle_json": lambda *a, **kw: {"pdf_info": []},
-            "get_pdfium_document_page_count": lambda doc: 1,
+            "get_pdfium_document_page_count": self.document_seam(
+                "page_count", lambda doc: 1, event="pdf:page-count", guarded=True
+            ),
             "strict_processing_window_size": lambda: 16,
             "serial_execution_profile": lambda size: SimpleNamespace(window_size=size),
             "get_batch_ratio": lambda device: 1,
@@ -302,8 +401,8 @@ class DocumentFixture:
             "apply_server_side_postprocess": self.native("server_finalize"),
             "finalize_middle_json": self.native("finalize"),
             "clean_memory": lambda device: self.events.append("clean-memory"),
-            "release_document_memory_owned": lambda device: self.events.append(
-                "release-document-memory"
+            "release_document_memory_owned": self.document_seam(
+                "release_document", event="release-document-memory"
             ),
             "ModelSingleton": lambda: SimpleNamespace(
                 get_model=self.native("get_model", predictor)
@@ -322,6 +421,144 @@ class DocumentFixture:
         return asyncio.create_task(
             self.namespace["aio_doc_analyze"](b"sentinel-owned-pdf", None, **kwargs)
         )
+
+    async def settle(self, task):
+        if self.barrier:
+            self.barrier.release.set()
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), 5)
+        except asyncio.CancelledError:
+            return None
+
+
+class CliFixture:
+    """The real generated asynchronous CLI entry over sentinel output seams.
+
+    ``aio_do_parse`` and the two asynchronous per-backend processors are loaded
+    from the generated ``mineru/cli/common.py``; every filesystem, model and
+    output-generation effect is a recorded stub, so the only real behaviour under
+    test is which call the coroutine keeps on the serving loop.
+    """
+
+    IMAGE_DIRECTORY = "literal-image-dir"
+    MARKDOWN_DIRECTORY = "literal-md-dir"
+
+    def __init__(self, sources, *, block=None, backend="hybrid-transformers"):
+        self.sources = sources
+        self.backend = backend
+        self.events = []
+        self.calls = []
+        self.block = block
+        self.barrier = NativeBarrier(self.events, block) if block else None
+        self.writers = []
+        self.namespace = load_owned(sources["model"], sources["cli"])
+        self.namespace.update(self._environment())
+        load_definitions(
+            sources["cli"],
+            {"aio_do_parse", "_async_process_vlm", "_async_process_hybrid"},
+            self.namespace,
+        )
+
+    def seam(self, name, result=None):
+        def operation(*args, **kwargs):
+            self.calls.append(
+                SimpleNamespace(
+                    name=name,
+                    args=args,
+                    kwargs=kwargs,
+                    thread_id=threading.get_ident(),
+                )
+            )
+            self.events.append(name)
+            if self.block == name:
+                self.barrier.enter()
+            return result(*args, **kwargs) if callable(result) else result
+
+        return operation
+
+    def named(self, name):
+        return [call for call in self.calls if call.name == name]
+
+    def _environment(self):
+        async def analyze(pdf_bytes, **kwargs):
+            self.calls.append(
+                SimpleNamespace(
+                    name="analyze",
+                    args=(pdf_bytes,),
+                    kwargs=kwargs,
+                    thread_id=threading.get_ident(),
+                )
+            )
+            self.events.append("analyze")
+            return (
+                {"pdf_info": ["literal-page-info"]},
+                ["literal-infer-result"],
+            )
+
+        def writer(directory):
+            handle = SimpleNamespace(directory=directory)
+            self.writers.append(handle)
+            return handle
+
+        return {
+            "asyncio": asyncio,
+            # A stub environment mapping: the generated entry writes MinerU
+            # switches into it, and a test process must not inherit them.
+            "os": SimpleNamespace(environ={}),
+            "logger": SimpleNamespace(
+                warning=lambda *a: self.events.append("warning"),
+                info=lambda *a: None,
+                debug=lambda *a: None,
+            ),
+            "MakeMode": SimpleNamespace(MM_MD="literal-mm-md"),
+            "DEFAULT_HYBRID_EFFORT": "literal-default-effort",
+            "normalize_backend": lambda backend: backend,
+            "ensure_backend_dependencies": lambda backend: self.events.append(
+                "dependencies"
+            ),
+            "get_vlm_engine": lambda **kwargs: "literal-engine",
+            "validate_effort": lambda value: f"validated:{value}",
+            "FileBasedDataWriter": writer,
+            "aio_vlm_doc_analyze": analyze,
+            "_load_hybrid_analyze_entrypoint": lambda name, backend: analyze,
+            "_process_office_doc": self.seam("office", lambda *a, **kw: []),
+            "_process_pipeline": self.seam("pipeline"),
+            "_prepare_pdf_bytes": self.seam(
+                "prepare_pdf_bytes",
+                lambda values, start, end: [b"literal-rewritten-pdf" for _ in values],
+            ),
+            "prepare_env": self.seam(
+                "prepare_env",
+                lambda *args: (self.IMAGE_DIRECTORY, self.MARKDOWN_DIRECTORY),
+            ),
+            "_process_output": self.seam("process_output"),
+        }
+
+    def start(self, **overrides):
+        arguments = {
+            "output_dir": "literal-output-dir",
+            "pdf_file_names": ["literal-file-name"],
+            "pdf_bytes_list": [b"literal-source-pdf"],
+            "p_lang_list": ["literal-lang"],
+            "backend": self.backend,
+            "parse_method": "literal-parse-method",
+            "formula_enable": "literal-formula",
+            "table_enable": "literal-table",
+            "server_url": "literal-server-url",
+            "f_draw_layout_bbox": "literal-draw-layout",
+            "f_draw_span_bbox": "literal-draw-span",
+            "f_dump_md": "literal-dump-md",
+            "f_dump_middle_json": "literal-dump-middle",
+            "f_dump_model_output": "literal-dump-model",
+            "f_dump_orig_pdf": "literal-dump-orig",
+            "f_dump_content_list": "literal-dump-content",
+            "f_make_md_mode": "literal-md-mode",
+            "start_page_id": "literal-start-page",
+            "end_page_id": "literal-end-page",
+            "effort": "literal-effort",
+        }
+        arguments.update(overrides)
+        return asyncio.create_task(self.namespace["aio_do_parse"](**arguments))
 
     async def settle(self, task):
         if self.barrier:

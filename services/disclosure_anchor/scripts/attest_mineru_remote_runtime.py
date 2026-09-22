@@ -77,6 +77,9 @@ CAPACITY_ENV_KEYS = {
     "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES",
 }
 EXPECTED_COMPAT_PREIMAGES = {
+    "mineru/cli/common.py": (
+        "sha256:d1e23e310bddc3da2d7f491be81ef112435824403d1c3a29e438505c1707dbc5"
+    ),
     "mineru/cli/api_request.py": (
         "sha256:16e16ee7fe9d3b1872f6fb43e1f7b2e7d314d2f726311e821813abece0334e77"
     ),

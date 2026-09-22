@@ -198,6 +198,7 @@ class AdmissionCollectorTests(unittest.TestCase):
                     "/usr/local/lib/python3.12/dist-packages/" + relative
                     for relative in (
                         "mineru/cli/api_request.py", "mineru/cli/fast_api.py",
+                        "mineru/cli/common.py",
                         "mineru/backend/vlm/vlm_analyze.py",
                         "mineru/backend/hybrid/hybrid_analyze.py",
                         "mineru/utils/model_utils.py",

@@ -166,8 +166,8 @@ MinerU 3.4.4 在 WSL/FastAPI 连续处理大 PDF 后可能把已经 free 的 gli
 PID1 RSS；本机真实 heavy 文档已复现该行为，与上游
 [issue #5313](https://github.com/opendatalab/MinerU/issues/5313) 的现场一致。当前使用一个临时、
 精确源码兼容层，而不是复制未合并的 [PR #5354](https://github.com/opendatalab/MinerU/pull/5354)：
-derived image 固定 base digest、MinerU 版本和三个源文件 preimage hash，只在每个处理窗口及文档
-final cleanup 后显式调用 glibc `malloc_trim(0)`；开关必须为闭合值，启用时缺少 glibc/hook 会
+derived image 固定 base digest、MinerU 版本和兼容层目标源文件的 preimage hash。其中内存归还逻辑
+在每个处理窗口及文档 final cleanup 后显式调用 glibc `malloc_trim(0)`；开关必须为闭合值，启用时缺少 glibc/hook 会
 fail loud。collector、install receipt 和 manifest v8 同时绑定 patcher/Dockerfile hash、derived
 image ID、base digest、策略名、patched source hash 与 live hook；任一漂移都拒绝准入。它不改变
 解析语义、页窗口或并发，只把 allocator 可归还的空闲页返还给 OS；上游正式修复合并并通过同一
@@ -180,6 +180,12 @@ Hybrid 异步服务路径的窗口 heap trim 和文档结束时的 CUDA cache/he
 保留原清理路径。此改动不改变解析内容，但不能保证自动回收没有长停顿。部署后须同时
 检查原健康检查限时、资源门槛和连续文档的内存走势；若仍超时或内存持续增长，停止新
 准入并排空已有任务，保留日志后处理原因，不能通过放宽限时或关闭自动回收掩盖问题。
+
+异步入口的 PDF 重写、输出目录创建和输出生成也通过 `to_thread_owned` 执行；Hybrid 的
+OCR 分类、PDFium 打开、页数读取和关闭由同一文档持有者管理，取消后先等待已开始的操作
+结束，再完成必要清理。PDFium 全局互斥锁保留，不能为增加并发而删除；关闭已尝试后不重复
+调用原生关闭。同步入口、模型和解析算法不因此改变。`mineru/cli/common.py` 同样进入
+compatibility marker、collector 和 attester 的精确源码清单，须重新构建并核实实际部署字节。
 
 首次安装或兼容层字节变化时，先把 compose、collector、`Dockerfile` 和 patcher 四份已审阅
 文件复制到 Windows 同一临时发布目录，再在 worker/GC disabled、API/vLLM idle、旧证据已保存的

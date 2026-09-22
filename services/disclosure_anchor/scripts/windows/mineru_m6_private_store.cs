@@ -24,6 +24,14 @@ public sealed class MineruM6PrivateStore : IDisposable {
     long artifactBytes;
     bool disposed;
 
+    public static void ValidateRunDirectoryCapacity(string path) {
+        // The qualified legacy .NET host does not opt into long paths. Reserve
+        // the longest immutable receipt's temporary name, not only owner.lock.
+        string pending="receipt-"+new string('0',64)+".json.pending-"+new string('0',32);
+        if(Path.Combine(path,pending).Length>=260)
+            throw new PathTooLongException("M6 receipt pending path reaches legacy MAX_PATH; shorten workspace root or run id before launch");
+    }
+
     public static void CreatePrivateDirectory(string path) {
         if(!Path.IsPathRooted(path) || Path.GetFullPath(path)!=path || Directory.Exists(path) || File.Exists(path))
             throw new IOException("New absolute private run directory required");
@@ -57,6 +65,7 @@ public sealed class MineruM6PrivateStore : IDisposable {
         if(!Path.IsPathRooted(runDirectory) || Path.GetFullPath(runDirectory)!=runDirectory ||
             runDirectory.StartsWith(@"\\",StringComparison.Ordinal) || maxArtifacts<8 || maxArtifacts>16384 ||
             maxArtifactBytes<65536 || maxArtifactBytes>268435456) throw new ArgumentException("M6 private storage bounds/path");
+        ValidateRunDirectoryCapacity(runDirectory);
         root=runDirectory;maximumArtifacts=maxArtifacts;maximumArtifactBytes=maxArtifactBytes;
         AssertPrivateDirectory(root);
         ownerLock=new FileStream(Path.Combine(root,"owner.lock"),resume ? FileMode.Open : FileMode.CreateNew,FileAccess.ReadWrite,FileShare.None);

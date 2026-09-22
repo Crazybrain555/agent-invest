@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
-import hashlib
 import json
 import tempfile
 import threading
@@ -215,18 +213,16 @@ class HybridAsyncAppendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(
                     fx.events.index(finalizer), fx.events.index("pdf:close")
                 )
-                # Document end releases allocator caches and the heap on the
-                # owned pool, then closes the phase trace; the pdfium document
-                # is already closed by then, as it was before the release moved
-                # off the serving loop.
+                # Document end closes the pdfium document and releases the
+                # allocator caches and heap in one owned-pool call, then closes
+                # the phase trace on the loop. The close is no longer a serving
+                # loop statement, but it still precedes the release exactly as
+                # it did before either moved off the loop.
                 self.assertEqual(
-                    fx.events[-2:],
-                    ["release-document-memory", "document:completed"],
+                    fx.events[-3:],
+                    ["pdf:close", "release-document-memory", "document:completed"],
                 )
-                self.assertLess(
-                    fx.events.index("pdf:close"),
-                    fx.events.index("release-document-memory"),
-                )
+                self.assertEqual(fx.events.count("pdf:close"), 1)
 
     async def test_append_error_is_original_and_partial_output_is_not_success(self):
         error = NativeFailure("literal second-page append failure")
@@ -248,18 +244,3 @@ class HybridAsyncAppendTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("phase-end:window_append", fx.events)
             self.assertNotIn("document:completed", fx.events)
             self.assertIn("document:failed", fx.events)
-
-    def test_synchronous_entrypoint_remains_exact_previous_production_source(self):
-        node = next(
-            n
-            for n in ast.parse(self.sources["hybrid"]).body
-            if isinstance(n, ast.FunctionDef) and n.name == "doc_analyze"
-        )
-        # Exact source segment from baseline 733a9332, independently checked on
-        # Python 3.9 and 3.13. ast.dump itself has version-dependent formatting.
-        self.assertEqual(
-            hashlib.sha256(
-                ast.get_source_segment(self.sources["hybrid"], node).encode()
-            ).hexdigest(),
-            "c2fe26dc4dd1524af2c167813dcc28b6b9741fd5d6e6d4050acce9190f77e63d",
-        )

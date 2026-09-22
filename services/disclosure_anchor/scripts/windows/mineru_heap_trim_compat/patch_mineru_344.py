@@ -34,6 +34,9 @@ TARGET_PREIMAGE_SHA256: Final = {
     "mineru/cli/fast_api.py": (
         "f7f233d86ae0f5aab6ffe5d8eccef4344c968aeaf879563dae99d4875057ee39"
     ),
+    "mineru/cli/common.py": (
+        "d1e23e310bddc3da2d7f491be81ef112435824403d1c3a29e438505c1707dbc5"
+    ),
     "mineru/backend/vlm/vlm_analyze.py": (
         "0fadf7a94ae702861b4a1fa7f42358c6687cfc63fbe322c004fb1d3248658390"
     ),
@@ -4003,6 +4006,88 @@ def _hybrid_model_device_event(model, role, capacity):
             label="VLM native model initialization and finalization drain",
         )
 
+    if relative_path == "mineru/cli/common.py":
+        # The asynchronous CLI entry runs the pdfium rewrite of every PDF, the
+        # output directory creation and the whole output generation (markdown,
+        # content lists, JSON dumps, file writes) on the serving loop. Each is
+        # awaited on the owned thread pool instead; the synchronous do_parse
+        # path and the office conversion path keep their upstream shape.
+        source = _replace_exact(
+            source,
+            "from mineru.utils.pdf_image_tools import images_bytes_to_pdf_bytes\n",
+            "from mineru.utils.model_utils import to_thread_owned\n"
+            "from mineru.utils.pdf_image_tools import images_bytes_to_pdf_bytes\n",
+            count=1,
+            label="CLI owned thread import",
+        )
+        source = _replace_exact_occurrence(
+            source,
+            "    pdf_bytes_list = _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id)\n",
+            "    pdf_bytes_list = await to_thread_owned(\n"
+            "        _prepare_pdf_bytes, pdf_bytes_list, start_page_id, end_page_id\n"
+            "    )\n",
+            count=2,
+            occurrence=1,
+            label="CLI asynchronous PDF rewrite off the serving loop",
+        )
+        source = _replace_exact_occurrence(
+            source,
+            "        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)\n",
+            "        local_image_dir, local_md_dir = await to_thread_owned(\n"
+            "            prepare_env, output_dir, pdf_file_name, parse_method\n"
+            "        )\n",
+            count=3,
+            occurrence=1,
+            label="CLI asynchronous VLM output directories off the serving loop",
+        )
+        source = _replace_exact_occurrence(
+            source,
+            "        local_image_dir, local_md_dir = prepare_env("
+            'output_dir, pdf_file_name, f"hybrid_{parse_method}")\n',
+            "        local_image_dir, local_md_dir = await to_thread_owned(\n"
+            '            prepare_env, output_dir, pdf_file_name, f"hybrid_{parse_method}"\n'
+            "        )\n",
+            count=2,
+            occurrence=1,
+            label="CLI asynchronous hybrid output directories off the serving loop",
+        )
+        output_call = (
+            "        _process_output(\n"
+            "            pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,\n"
+            "            md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,\n"
+            "            f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,\n"
+            '            f_make_md_mode, middle_json, infer_result, process_mode="vlm"\n'
+            "        )\n"
+        )
+        owned_output_call = (
+            "        await to_thread_owned(\n"
+            "            _process_output,\n"
+            "            pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,\n"
+            "            md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,\n"
+            "            f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,\n"
+            '            f_make_md_mode, middle_json, infer_result, process_mode="vlm"\n'
+            "        )\n"
+        )
+        # Occurrences in file order: _async_process_vlm, _process_vlm,
+        # _process_hybrid, _async_process_hybrid. The last one is replaced first
+        # so that the first one's index is unchanged.
+        source = _replace_exact_occurrence(
+            source,
+            output_call,
+            owned_output_call,
+            count=4,
+            occurrence=3,
+            label="CLI asynchronous hybrid output generation off the serving loop",
+        )
+        return _replace_exact_occurrence(
+            source,
+            output_call,
+            owned_output_call,
+            count=3,
+            occurrence=0,
+            label="CLI asynchronous VLM output generation off the serving loop",
+        )
+
     if relative_path == "mineru/backend/hybrid/hybrid_analyze.py":
         source = _replace_exact(
             source,
@@ -4511,6 +4596,146 @@ def _hybrid_model_device_event(model, role, capacity):
             "            close_pdfium_document(pdf_doc)\n",
             count=2,
             label="Hybrid document failure",
+        )
+        # Asynchronous document ownership. The prologue (OCR classification,
+        # pdfium open, page count) and every close of the pdfium document run
+        # on the owned thread pool; the holder created on the loop before the
+        # first dispatch keeps the handle across cancellation, so no result
+        # callback has to close a document on the loop. The synchronous
+        # doc_analyze keeps its upstream prologue and finally block.
+        source = _replace_exact(
+            source,
+            "\n\ndef doc_analyze(\n",
+            '''
+
+class _OwnedPdfiumDocument:
+    """One pdfium document whose native calls all run on owned worker threads.
+
+    The thread that closes flips ``close_attempted`` before the native call, so
+    a close that was cancelled mid-flight or that failed is never repeated by
+    the caller's failure path; ``closed`` records an actually completed close.
+    """
+
+    def __init__(self):
+        self.pdf_doc = None
+        self.close_attempted = False
+        self.closed = False
+
+    def prepare(self, pdf_bytes, parse_method):
+        ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
+        self.pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
+        try:
+            page_count = get_pdfium_document_page_count(self.pdf_doc)
+        except BaseException as failure:
+            try:
+                self.close()
+            except BaseException as cleanup_failure:
+                failure.add_note(
+                    "owned document close after page count failure failed: "
+                    f"{type(cleanup_failure).__name__}"
+                )
+                raise failure from cleanup_failure
+            raise
+        return ocr_enable, page_count
+
+    def close(self):
+        if self.pdf_doc is None or self.close_attempted:
+            return
+        self.close_attempted = True
+        close_pdfium_document(self.pdf_doc)
+        self.closed = True
+
+    def close_and_release(self, device):
+        self.close()
+        release_document_memory_owned(device)
+
+
+def doc_analyze(
+''',
+            count=1,
+            label="Hybrid owned document holder",
+        )
+        source = _replace_exact_occurrence(
+            source,
+            "    device = get_device()\n"
+            "    _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)\n"
+            "\n"
+            "    pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)\n"
+            "    middle_json = init_middle_json(\n"
+            "        _ocr_enable,\n"
+            "        effort=effort,\n"
+            "    )\n"
+            "    model_list = []\n"
+            "    phase_trace = None\n"
+            "    doc_closed = False\n"
+            "    hybrid_pipeline_model = None\n"
+            "    try:\n"
+            "        page_count = get_pdfium_document_page_count(pdf_doc)\n",
+            "    device = get_device()\n"
+            "    owned_document = _OwnedPdfiumDocument()\n"
+            "    model_list = []\n"
+            "    phase_trace = None\n"
+            "    hybrid_pipeline_model = None\n"
+            "    try:\n"
+            "        _ocr_enable, page_count = await to_thread_owned(\n"
+            "            owned_document.prepare, pdf_bytes, parse_method\n"
+            "        )\n"
+            "        pdf_doc = owned_document.pdf_doc\n"
+            "        middle_json = init_middle_json(\n"
+            "            _ocr_enable,\n"
+            "            effort=effort,\n"
+            "        )\n",
+            count=2,
+            occurrence=1,
+            label="Hybrid asynchronous document prologue off the serving loop",
+        )
+        source = _replace_exact(
+            source,
+            '        phase_trace.complete("document_finalize", finalize_started_ns)\n'
+            "        close_pdfium_document(pdf_doc)\n"
+            "        doc_closed = True\n"
+            "        await to_thread_owned(release_document_memory_owned, device)\n"
+            "        phase_trace.document_completed()\n"
+            "        return middle_json, model_list\n"
+            "    finally:\n"
+            "        if not doc_closed:\n"
+            "            if phase_trace is not None:\n"
+            "                phase_trace.document_failed()\n"
+            "            close_pdfium_document(pdf_doc)\n",
+            '        phase_trace.complete("document_finalize", finalize_started_ns)\n'
+            "        await to_thread_owned(owned_document.close_and_release, device)\n"
+            "        phase_trace.document_completed()\n"
+            "        return middle_json, model_list\n"
+            "    except BaseException as failure:\n"
+            "        # The trace end writes to stderr and the close needs the pdfium\n"
+            "        # guard; neither may skip the other. Every cleanup failure is\n"
+            "        # chained onto the original failure, which stays the one raised.\n"
+            "        cleanup_failure = None\n"
+            "        if not owned_document.closed and phase_trace is not None:\n"
+            "            try:\n"
+            "                phase_trace.document_failed()\n"
+            "            except BaseException as trace_failure:\n"
+            "                failure.add_note(\n"
+            '                    "phase trace document end after failure failed: "\n'
+            '                    f"{type(trace_failure).__name__}"\n'
+            "                )\n"
+            "                cleanup_failure = trace_failure\n"
+            "        if not owned_document.close_attempted:\n"
+            "            try:\n"
+            "                await to_thread_owned(owned_document.close)\n"
+            "            except BaseException as close_failure:\n"
+            "                failure.add_note(\n"
+            '                    "owned document close after failure failed: "\n'
+            '                    f"{type(close_failure).__name__}"\n'
+            "                )\n"
+            "                if cleanup_failure is not None:\n"
+            "                    close_failure.__context__ = cleanup_failure\n"
+            "                cleanup_failure = close_failure\n"
+            "        if cleanup_failure is not None:\n"
+            "            raise failure from cleanup_failure\n"
+            "        raise\n",
+            count=1,
+            label="Hybrid asynchronous document close and release off the serving loop",
         )
         source = _patch_owned_render_await(source)
         return _replace_exact(

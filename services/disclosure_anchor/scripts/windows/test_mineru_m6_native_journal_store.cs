@@ -491,4 +491,80 @@ public static class MineruM6StoreTests {
             MineruM6NativeSuite.Check(!File.Exists(Path.Combine(path, "spec.json")), "pin released after CloseReadPins");
         }
     }
+
+    // The worst-case artifact this store ever creates, derived from the store's
+    // own naming rules and not from the product expression: the temporary name
+    // of an immutable receipt. 8 + 64 + 5 + 9 + 32 = 118 UTF-16 units.
+    static string WorstCasePendingLeaf() {
+        return "receipt-" + new string('0', 64) + ".json" + ".pending-" + new string('0', 32);
+    }
+    // A run directory of exactly "units" UTF-16 units under an existing parent.
+    static string PadTo(string parent, int units) {
+        int needed = units - parent.Length - 1;
+        MineruM6NativeSuite.Check(needed >= 1 && needed <= 255,
+            "suite temp root leaves room for a " + units + "-unit run directory (needed " + needed + " name characters)");
+        return Path.Combine(parent, new string('p', needed));
+    }
+
+    public static void Test10_RunDirectoryCapacityCountsUtf16UnitsAtTheLegacyBoundary() {
+        string pending = WorstCasePendingLeaf();
+        MineruM6NativeSuite.Equal(118, pending.Length, "worst-case pending receipt leaf is 118 units");
+        // 140 + separator + 118 = 259, the longest path the legacy host can use.
+        string longest = "C:\\" + new string('p', 137);
+        MineruM6NativeSuite.Equal(140, longest.Length, "longest usable run directory is 140 units");
+        MineruM6NativeSuite.Equal(259, Path.Combine(longest, pending).Length, "its worst-case artifact path is 259 units");
+        MineruM6PrivateStore.ValidateRunDirectoryCapacity(longest);
+        string over = longest + "p";
+        MineruM6NativeSuite.Equal(141, over.Length, "one more unit");
+        MineruM6NativeSuite.Equal(260, Path.Combine(over, pending).Length, "its worst-case artifact path reaches 260 units");
+        PathTooLongException refused = MineruM6NativeSuite.Throws<PathTooLongException>(
+            delegate { MineruM6PrivateStore.ValidateRunDirectoryCapacity(over); }, "141-unit run directory refused");
+        MineruM6NativeSuite.Check(refused.Message.IndexOf("legacy MAX_PATH", StringComparison.Ordinal) >= 0,
+            "capacity refusal names the legacy limit: " + refused.Message);
+        // The limit counts UTF-16 code units, not visible characters: replacing
+        // one BMP character of the same 137-character parent with a non-BMP
+        // scalar (U+1D11E) adds a unit and crosses the boundary.
+        string astral = "C:\\" + "\uD834\uDD1E" + new string('p', 136);
+        MineruM6NativeSuite.Equal(141, astral.Length, "137 characters including one non-BMP scalar are 141 units");
+        MineruM6NativeSuite.Throws<PathTooLongException>(
+            delegate { MineruM6PrivateStore.ValidateRunDirectoryCapacity(astral); }, "non-BMP parent counted as two units");
+    }
+
+    public static void Test11_LongestAllowedRunStoreWritesAReceiptAndOneMoreUnitHasNoEffects() {
+        // The only test that proves 259 really works on the real host: a private
+        // run directory of exactly 140 units, with a real receipt published into it.
+        string parent = MineruM6NativeSuite.NewTempDir("capacity");
+        string allowed = PadTo(parent, 140);
+        MineruM6PrivateStore.CreatePrivateDirectory(allowed);
+        MineruM6NativeSuite.Equal(140, allowed.Length, "run directory is exactly 140 units");
+        string body = "{\"r\":1}";
+        string sha = MineruM6NativeSuite.Sha(body);
+        string name = "receipt-" + sha.Substring(7) + ".json";
+        MineruM6NativeSuite.Equal(259, Path.Combine(allowed, name + ".pending-" + new string('0', 32)).Length,
+            "worst-case pending path for this run is exactly 259 units");
+        using (MineruM6PrivateStore store = new MineruM6PrivateStore(allowed, false, 8, 65536)) {
+            store.WriteImmutable(name, B(body));
+            MineruM6NativeSuite.EqualBytes(B(body), MineruM6JournalRig.ReadAll(Path.Combine(allowed, name)),
+                "receipt bytes on disk at the longest allowed path");
+            MineruM6NativeSuite.Equal(body, store.ReadReceipt(sha), "receipt read back at the longest allowed path");
+            MineruM6NativeSuite.Equal(0, Directory.GetFiles(allowed, "*.pending-*").Length, "no pending leftovers");
+        }
+        // One unit more: the constructor refuses before AssertPrivateDirectory
+        // and owner.lock, so an existing private directory keeps no trace of it.
+        string refusedRun = PadTo(parent, 141);
+        MineruM6PrivateStore.CreatePrivateDirectory(refusedRun);
+        MineruM6NativeSuite.Equal(141, refusedRun.Length, "run directory is exactly 141 units");
+        MineruM6NativeSuite.Throws<PathTooLongException>(
+            delegate { new MineruM6PrivateStore(refusedRun, false, 8, 65536).Dispose(); }, "141-unit run store refused");
+        MineruM6NativeSuite.Check(!File.Exists(Path.Combine(refusedRun, "owner.lock")), "owner.lock not created on refusal");
+        MineruM6NativeSuite.Equal(0, Directory.GetFileSystemEntries(refusedRun).Length, "refused run directory stays empty");
+    }
+    // No host-level case is added: MineruM6OwnerHost.Main enters the irreversible
+    // process-wide self-Job (mineru_m6_owner_host.cs:284) before it reads the
+    // configuration and constructs Host, where the capacity check lives
+    // (:122). Driving Main far enough to reach the check inside the suite
+    // process would install a finite lifetime and memory cap on the suite
+    // itself and would contradict MineruM6HostCliTests.Test01 and
+    // MineruM6SelfJobNegativeTests.Test01, which both assert the Job was never
+    // entered. The rig has no owner-host child-process scenario to use instead.
 }

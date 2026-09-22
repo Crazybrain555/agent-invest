@@ -692,6 +692,12 @@ class M6CampaignAssembly:
         self._now_ns = continuous_ns or diagnostic_continuous_clock().now_ns
         self._workspace = self._binding.windows.workspace_root / f"m6-{self._intent.run.run_id}"
         self._private_root = self._workspace / "private"
+        # Mirror the qualified legacy .NET store's worst-case pending receipt,
+        # before Prepare/Run or any PDF admission. .NET counts UTF-16 code units.
+        run_store = self._private_root / "runs" / hashlib.sha256(self._intent.run.run_id.encode("utf-8")).hexdigest()
+        pending_receipt = run_store / ("receipt-" + "0" * 64 + ".json.pending-" + "0" * 32)
+        if len(str(pending_receipt).encode("utf-16-le")) // 2 >= 260:
+            raise CampaignInputError("M6 receipt pending path reaches legacy MAX_PATH; shorten workspace root or run id before launch")
         self._attempt_dir = self._private_root / "attempts" / attempt_id
         self._summary = CampaignSummary(mode=mode, run_id=self._intent.run.run_id, attempt_id=attempt_id,
                                         intent_sha256=inputs.intent_sha256)

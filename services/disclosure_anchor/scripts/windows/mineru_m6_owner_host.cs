@@ -119,6 +119,7 @@ public static class MineruM6OwnerHost {
                 "nvml",cfg.Get("nvml_dll_sha256").Raw),4096),"run_id:id","mode:=service_diagnostic|e2e_publication","source:hash","node:hash","nvml:hash");
             string root=S(cfg,"run_root");PrivateDirectory(root);
             string directory=Path.Combine(root,H(runId).Substring(7));
+            MineruM6PrivateStore.ValidateRunDirectoryCapacity(directory);
             string resourceRaw=MineruM6OwnerWire.Resources(cfg.Get("resources"));
             Require(resourceRaw==cfg.Get("resources").Raw,"M6 deployment resources are not canonical");
             Require(cfg.Get("resources").Get("max_record_bytes").Integer()<=60000,"M6 native record envelope exceeded");

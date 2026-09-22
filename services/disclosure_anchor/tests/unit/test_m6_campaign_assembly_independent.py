@@ -52,10 +52,10 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                 "journal_prefix_bytes": 0, "journal_prefix_sha256": "sha256:" + hashlib.sha256(b"").hexdigest()}
 
     def assembly(self, root, launch=None, *, mode="run", create_output=True,
-                 binding=None, intent=None, anchor=None, spec=None):
+                 binding=None, intent=None, anchor=None, spec=None, workspace_root=None):
         # Contract loading has separate coverage; these declared port doubles isolate
         # process ownership/record verification without any production credentials.
-        windows = SimpleNamespace(workspace_root=PureWindowsPath(r"C:\test-root"), hostname="TEST-HOST",
+        windows = SimpleNamespace(workspace_root=PureWindowsPath(workspace_root or r"C:\test-root"), hostname="TEST-HOST",
                                   owner_executable_path=PureWindowsPath(r"C:\test-bin\owner.exe"),
                                   owner_executable_sha256=m6.digest("binary"), launcher_sha256=m6.digest("launcher"))
         binding = binding if binding is not None else SimpleNamespace(
@@ -85,6 +85,78 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
         assembly._controller = Mock()
         assembly._launcher = Mock()
         return owner.ScriptedOwner(self.spec, self.anchor, owner.ManualClock()).status(observed=self.spec.t0_ticks)
+
+    # The worst-case artifact the legacy .NET run store ever creates, written
+    # out from the documented Windows layout rather than the product expression:
+    #   <workspace_root>\m6-<run_id>\private\runs\<sha256 hex of UTF-8 run_id>
+    #     \receipt-<64 hex>.json.pending-<32 hex>
+    PENDING_RECEIPT_LEAF = "receipt-" + "0" * 64 + ".json.pending-" + "0" * 32
+    PATH_CAPACITY_MESSAGE = (
+        "M6 receipt pending path reaches legacy MAX_PATH; "
+        "shorten workspace root or run id before launch"
+    )
+
+    def pending_receipt_units(self, workspace_root, run_id):
+        """UTF-16 code units of that path — exactly what .NET String.Length counts."""
+        path = "\\".join((
+            str(workspace_root), "m6-" + run_id, "private", "runs",
+            hashlib.sha256(run_id.encode("utf-8")).hexdigest(), self.PENDING_RECEIPT_LEAF,
+        ))
+        return len(path.encode("utf-16-le")) // 2
+
+    def workspace_root_for(self, units, run_id, *, astral=False):
+        """A Windows root whose worst-case receipt path is exactly ``units`` units."""
+        head = "C:\\" + ("\U0001d11e" if astral else "")
+        padding = 0
+        while True:
+            root = PureWindowsPath(head + "w" * padding)
+            reached = self.pending_receipt_units(root, run_id)
+            if reached >= units:
+                self.assertEqual(reached, units, "padding overshot the requested length")
+                return root
+            padding += 1
+
+    def test_native_receipt_path_capacity_is_refused_before_any_campaign_effect(self):
+        # 259 units is the longest path the qualified legacy .NET host can use;
+        # 260 is refused on the Mac, before Prepare/Run or any PDF admission.
+        run_id = self.spec.run_id
+        longest = self.workspace_root_for(259, run_id)
+        over = self.workspace_root_for(260, run_id)
+        self.assertEqual(len(str(over)), len(str(longest)) + 1)
+        for mode in ("run", "bootstrap-check"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    assembly = self.assembly(root, mode=mode, workspace_root=longest)
+                    self.assertEqual(
+                        str(assembly._workspace), str(longest) + "\\m6-" + run_id
+                    )
+                    self.assertTrue((root / "output").is_dir())
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    with self.assertRaises(CampaignInputError) as caught:
+                        self.assembly(root, mode=mode, workspace_root=over)
+                    self.assertEqual(str(caught.exception), self.PATH_CAPACITY_MESSAGE)
+                    # Construction rejects before its first filesystem effect.
+                    self.assertEqual(list(root.rglob("*")), [])
+
+    def test_native_receipt_path_capacity_counts_utf16_units_not_characters(self):
+        run_id = self.spec.run_id
+        longest = self.workspace_root_for(259, run_id)
+        astral = self.workspace_root_for(260, run_id, astral=True)
+        # The same number of characters, one of them outside the BMP: the .NET
+        # limit counts its two UTF-16 units, so the same-looking root is refused.
+        self.assertEqual(len(str(astral)), len(str(longest)))
+        self.assertEqual(
+            len(str(astral).encode("utf-8")), len(str(longest).encode("utf-8")) + 3
+        )
+        self.assertIn("\U0001d11e", str(astral))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(CampaignInputError) as caught:
+                self.assembly(root, workspace_root=astral)
+            self.assertEqual(str(caught.exception), self.PATH_CAPACITY_MESSAGE)
+            self.assertEqual(list(root.rglob("*")), [])
 
     def test_fresh_ready_requires_exact_identity_types_and_fields(self):
         value = self.ready()

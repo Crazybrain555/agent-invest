@@ -416,7 +416,7 @@
    "private_imports": [
     "_parser"
    ],
-   "tests": 23
+   "tests": 25
   },
   "tests/unit/test_m6_delivery_report_independent.py": {
    "private_imports": [],
@@ -582,7 +582,7 @@
   },
   "tests/unit/test_mineru_async_append.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 0
   },
   "tests/unit/test_mineru_canary.py": {
    "private_imports": [],
@@ -723,6 +723,10 @@
   "tests/unit/test_mineru_diagnostic_wire.py": {
    "private_imports": [],
    "tests": 7
+  },
+  "tests/unit/test_mineru_document_ownership.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/unit/test_mineru_executor_stage_counters.py": {
    "private_imports": [],

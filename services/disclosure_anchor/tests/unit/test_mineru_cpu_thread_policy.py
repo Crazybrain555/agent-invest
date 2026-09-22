@@ -27,7 +27,9 @@ class CpuThreadManifestTest(unittest.TestCase):
         # S6 adds one independently observed module to compatibility evidence.
         # Only that evidence hash and outer identity changed; CPU policy and
         # every other v9 field retain the pre-S6 shape. Not a v10 oracle.
-        expected = '2d346fe5d3d90c10ca454434deba26179c83464265c05af83ec57baa292ea698'
+        # The compatibility inventory then gained mineru/cli/common.py, which
+        # moved the same two fields again and nothing else.
+        expected = '9c7b82884e666f76df11707cc9df64a6314232dddb5ab9e9576dd1718f3d56cd'
         default = build()
         explicit = build(expected_api_cpu_threads=1)
         self.assertEqual(canonical(default), canonical(explicit))

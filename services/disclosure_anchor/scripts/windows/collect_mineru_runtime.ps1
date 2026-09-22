@@ -851,6 +851,7 @@ from mineru.backend.pipeline.model_init import PIPELINE_INFERENCE_LOCKS_ENABLED
 from mineru.cli import agent_task_protocol_v2
 
 paths = (
+    "mineru/cli/common.py",
     "mineru/cli/api_request.py",
     "mineru/backend/vlm/vlm_analyze.py",
     "mineru/backend/hybrid/hybrid_analyze.py",

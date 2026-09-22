@@ -56,7 +56,9 @@ OBSERVED_COMPAT_PATHS = (
     "mineru/utils/model_utils.py",
     "mineru_vl_utils/post_process/cross_page_table.py", "mineru_vl_utils/vlm_client/http_client.py",
     "mineru_vl_utils/post_process/__init__.py",
+    "mineru/cli/common.py",
 )
+OBSERVED_COMPAT_DIGEST_CHARACTERS = ("a", "b", "c", "d", "e", "f", "1", "2", "3")
 S6_PREIMAGE = "sha256:c1c426dfd5786d196a94854f8453b6deb800efd14c3749a8996ce201b29c9ad2"
 
 
@@ -145,7 +147,7 @@ def _observation() -> dict[str, Any]:
                     path: "sha256:" + character * 64
                     for path, character in zip(
                         OBSERVED_COMPAT_PATHS,
-                        ("a", "b", "c", "d", "e", "f", "1", "2"),
+                        OBSERVED_COMPAT_DIGEST_CHARACTERS,
                         strict=True,
                     )
                 },
@@ -155,7 +157,7 @@ def _observation() -> dict[str, Any]:
                 path: "sha256:" + character * 64
                 for path, character in zip(
                     OBSERVED_COMPAT_PATHS,
-                    ("a", "b", "c", "d", "e", "f", "1", "2"),
+                    OBSERVED_COMPAT_DIGEST_CHARACTERS,
                     strict=True,
                 )
             },
