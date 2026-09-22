@@ -178,6 +178,15 @@ telemetry 退出/传输失配时发布 `<driver output>/campaign-admission.STOP`
   `SYNC_COOLDOWN_MAX_SECONDS=7200` 是同步冷却上限；`BoundedOwnerCommand` 仅用于安装/资格/resident telemetry owner 与本
   组合根，永久 worker 不经其运行。M6 的两小时是有限测量会话的边界，不是生产运行时限；多日 soak 尚未进行。
 
+### 提前完成与关闭原因
+
+完整且无失败的 runner/verifier 收尾后，组合根在 close 前读取一次 owner status。
+仅当该 owner 的 `observed_qpc_ticks >= spec.deadline_ticks` 时使用 `deadline_drained`；
+有限语料在截止前正常耗尽时使用已有的 `stop_requested`。runner 的准入关闭、verifier drain、
+资源收据、零残留及真实子进程退出仍由原生 owner 独立校验；真实失败保持 `failed`。
+状态读取失败不得猜测时钟或伪造成功。读取后刚好跨过 deadline 仍可合法以 `stop_requested` 关闭。
+此规则不延长预算，也不把短测提前完成算成 hour_baseline/stability_repeat 的完整测量窗。
+
 ## 4. 退出码与失败可见性
 
 `run|bootstrap-check`：0 complete；1 failed；64 输入；65 身份不一致；70 outcome unknown。

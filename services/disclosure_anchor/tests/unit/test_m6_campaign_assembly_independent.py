@@ -20,12 +20,12 @@ from disclosure_anchor.adapters.runtime.m6_campaign_private_binding import (
 )
 from disclosure_anchor.adapters.runtime.m6_e2e_assembly import M6LifecycleSpool
 from disclosure_anchor.adapters.runtime.m6_e2e_run import load_m6_run_directory
-from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6LeasePolicy
+from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6LeasePolicy, M6OwnerRejected
 from disclosure_anchor.adapters.runtime.m6_verifier_supervisor import RunnerSpoolTail
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig
 from disclosure_anchor.application.ports.staged_lifecycle_facts import AttemptAdmittedFact
 from disclosure_anchor.cli.m6_verifier_supervisor import _parser as verifier_parser
-from disclosure_anchor.application.contracts.m6_owner import M6OwnerReply
+from disclosure_anchor.application.contracts.m6_owner import M6CloseOwner, M6OwnerControl, M6OwnerReply
 from disclosure_anchor.adapters.runtime.resident_owner_control import BoundedOwnerCommand, OwnerCommandResult
 from disclosure_anchor.application.services.m6_launch_budget import finish_wait_seconds
 from tests import m6_owner_support as owner
@@ -219,6 +219,107 @@ class CampaignAssemblyIndependentTests(unittest.TestCase):
                 assembly._supervise_children(self.spec, status, 1_000_000_000)
             self.assertIs(caught.exception.__cause__, original_error)
             runner.abort.assert_called_once()
+
+
+    # -- close reason -------------------------------------------------------
+    # The owner's own drain, residual and resource proof stays native: these
+    # cases cover only which reason the composition is entitled to claim, and
+    # that the runner's closure receipt is forwarded verbatim beside it.
+
+    def closure(self):
+        return {"complete": True, "ownership_closure_sha256": m6.digest("ownership-closure"),
+                "residual_count": 0, "children_exited": True, "admitted_attempt_count": 7}
+
+    def closing_controller(self, assembly, *, observed, status_error=None):
+        """Answer the two closing requests with the owner's own stamped status."""
+        scripted = owner.ScriptedOwner(self.spec, self.anchor, owner.ManualClock())
+        sent = []
+
+        def reply(status):
+            return M6OwnerReply(request_sha256=m6.digest("closing-request"), outcome="ok",
+                                status=status, record=None, error_code=None)
+
+        def request(command):
+            sent.append(command)
+            if command == M6OwnerControl(kind="status") and status_error is not None:
+                raise status_error
+            if isinstance(command, M6CloseOwner):
+                return reply(scripted.status(observed=observed, state="closed"))
+            return reply(scripted.status(observed=observed))
+
+        assembly._controller.request = Mock(side_effect=request)
+        return sent
+
+    def completing_children(self, assembly, *, runner_exit):
+        """Two children that exit at once, leaving exactly the receipts read after the loop."""
+        exits = {"runner": runner_exit, "verifier": 0}
+        children = []
+
+        def spawn(argv, **keywords):
+            label = "runner" if not children else "verifier"
+            child = Mock(captured_output=(b"", b""), retention_report=Mock(return_value={}))
+            child.poll = Mock(return_value=OwnerCommandResult(exits[label], b"", b""))
+            children.append(child)
+            if label == "verifier":
+                (assembly._output / "runner" / "campaign-receipt.json").write_text(canonical(
+                    {"m6_assembly": {"run_id": self.spec.run_id, "spec_sha256": self.spec.canonical_sha256(),
+                                     "status": "complete", "closure": self.closure()}}))
+                verifier_dir = assembly._output / "verifier"
+                verifier_dir.mkdir(mode=0o700)
+                (verifier_dir / "run-summary.json").write_text(canonical({"status": "complete"}))
+            return child
+
+        return Mock(side_effect=spawn)
+
+    def supervised_to_close(self, root, *, observed, runner_exit=0, status_error=None):
+        assembly = self.assembly(Path(root))
+        status = self.attach_owner(assembly, root)
+        assembly._launch = self.completing_children(assembly, runner_exit=runner_exit)
+        assembly._launcher.poll = Mock(return_value=None)
+        sent = self.closing_controller(assembly, observed=observed, status_error=status_error)
+        record = assembly._supervise_children(self.spec, status, 1_000_000_000)
+        closes = [command for command in sent if isinstance(command, M6CloseOwner)]
+        return assembly, record, sent, closes
+
+    def test_close_reason_follows_the_owner_clock_and_not_a_completed_runner(self):
+        for observed, expected in ((self.spec.deadline_ticks - 1, "stop_requested"),
+                                   (self.spec.deadline_ticks, "deadline_drained"),
+                                   (self.spec.deadline_ticks + 1, "deadline_drained")):
+            with self.subTest(observed=observed), tempfile.TemporaryDirectory() as directory:
+                assembly, record, _sent, closes = self.supervised_to_close(directory, observed=observed)
+                self.assertEqual(len(closes), 1)
+                self.assertEqual(closes[0].reason, expected)
+                # Drain, residual and exit proof stay the runner's closure
+                # receipt, forwarded unchanged; the reason never edits them.
+                self.assertEqual(closes[0].ownership_receipt_sha256, self.closure()["ownership_closure_sha256"])
+                self.assertEqual((closes[0].residual_count, closes[0].children_exited), (0, True))
+                self.assertEqual(record["close"], {"outcome": "ok", "owner_state": "closed"})
+                self.assertEqual(record["failures"], {})
+                self.assertIsNone(assembly._summary.first_error)
+
+    def test_a_failed_child_closes_as_failed_without_asking_the_owner_clock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assembly, record, sent, closes = self.supervised_to_close(
+                directory, observed=self.spec.deadline_ticks + 1, runner_exit=3)
+            self.assertEqual([close.reason for close in closes], ["failed"])
+            self.assertEqual(record["failures"]["runner"], "exit 3")
+            # An elapsed deadline cannot relabel a failed run: the failing path
+            # asks for no closing status at all.
+            self.assertNotIn(M6OwnerControl(kind="status"), sent[sent.index(closes[0]) - 1:])
+            self.assertEqual(assembly._summary.first_error["stage"], "supervision")
+
+    def test_a_refused_closing_status_refuses_to_close_at_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rejected = M6OwnerReply(request_sha256=m6.digest("closing-request"), outcome="rejected",
+                                    status=owner.ScriptedOwner(self.spec, self.anchor, owner.ManualClock())
+                                    .status(observed=self.spec.deadline_ticks),
+                                    record=None, error_code="owner-busy")
+            assembly, record, _sent, closes = self.supervised_to_close(
+                directory, observed=self.spec.deadline_ticks, status_error=M6OwnerRejected(rejected))
+            self.assertEqual(closes, [])
+            self.assertNotIn("close", record)
+            self.assertEqual(assembly._summary.first_error["stage"], "close")
+            self.assertIn("owner-busy", assembly._summary.first_error["message"])
 
     def test_an_exit_record_without_matching_start_record_is_not_remote_exit_proof(self):
         with tempfile.TemporaryDirectory() as directory:

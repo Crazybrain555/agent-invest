@@ -416,7 +416,7 @@
    "private_imports": [
     "_parser"
    ],
-   "tests": 20
+   "tests": 23
   },
   "tests/unit/test_m6_delivery_report_independent.py": {
    "private_imports": [],
@@ -800,7 +800,7 @@
   },
   "tests/unit/test_mineru_process_pressure_producer.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 10
   },
   "tests/unit/test_mineru_process_profile.py": {
    "private_imports": [],
@@ -875,6 +875,10 @@
   "tests/unit/test_mineru_ssh_tunnel.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_mineru_stage_durable_handoff.py": {
+   "private_imports": [],
+   "tests": 0
   },
   "tests/unit/test_mineru_stream_activation_loading.py": {
    "private_imports": [],

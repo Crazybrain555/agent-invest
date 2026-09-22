@@ -71,15 +71,24 @@ def _linux_pressure_memory() -> dict:
     membership = _kernel_text(Path("/proc/self/cgroup"), 4096)
     if membership != "0::/\n":
         raise RuntimeError("pressure requires the qualified private cgroup root")
-    def mounted_root() -> str:
+    def mounted_root() -> dict[str, str]:
         matches = []
         for line in _kernel_text(Path("/proc/self/mountinfo")).splitlines():
             left, separator, right = line.partition(" - ")
             filesystem = right.split()
             if separator and filesystem and filesystem[0] == "cgroup2":
                 fields = left.split()
-                if len(fields) >= 6 and fields[3:5] == ["/", "/sys/fs/cgroup"]:
-                    matches.append(line)
+                if len(fields) >= 6 and len(filesystem) == 3 and fields[3:5] == ["/", "/sys/fs/cgroup"]:
+                    # Identity is the qualified mount instance, not a whole line
+                    # containing host-global cgroup policy (e.g. nsdelegate) and
+                    # propagation tags. Keep local mount flags as a conservative
+                    # deployment guard; actual kernel counters are read afresh.
+                    matches.append({
+                        "mount_id": fields[0], "parent_id": fields[1],
+                        "device": fields[2], "root": fields[3], "mount_point": fields[4],
+                        "mount_options": ",".join(sorted(fields[5].split(","))),
+                        "filesystem": filesystem[0], "source": filesystem[1],
+                    })
         if len(matches) != 1:
             raise RuntimeError("pressure cgroup mount does not identify one namespace root")
         return matches[0]

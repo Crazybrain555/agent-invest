@@ -53,6 +53,11 @@ created_at: 2026-06-26
   for degraded/uncertain persistence, capacity-observation `RuntimeError` text) except the mid-observation
   "task manager became unhealthy during health observation" body, unreachable now that the route no longer
   awaits between the health gate and the projection. Task routes keep `observe()` busy semantics.
+  Executor stage entry follows its durable commit; stage exit precedes the next durable transition.
+  A parse permit awaiting the processing commit is still reserved, but not counted as executing.
+  Capacity inequalities and actual semaphore limits are unchanged. Pressure identity uses canonical
+  mount-instance fields and the qualified local mount flags, excluding host-global super-options and
+  propagation metadata; actual source replacement remains fatal and the new release rebinds the digest.
   Pressure kernel reads use the `observe` IO lane. `MINERU_LOOP_TRACE` JSON lines
   (lag/gc/summary/probe_failed) are diagnostics only, gated by `MINERU_PHASE_TRACE`.
 - Counters surround only the existing final async POST semaphore; pending/acquire/exception/cancel

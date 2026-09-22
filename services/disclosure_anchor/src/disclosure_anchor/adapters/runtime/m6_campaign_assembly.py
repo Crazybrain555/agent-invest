@@ -1138,14 +1138,18 @@ class M6CampaignAssembly:
             "failures": failures, "owner_state": owner_state,
         }
         closure = runner_receipt.get("closure")
-        if type(closure) is dict and closure.get("complete") is True and not failures:
-            reason: Literal["deadline_drained", "stop_requested", "failed"] = "deadline_drained"
-        elif type(closure) is dict and closure.get("complete") is True:
-            reason = "failed"
-        else:
+        if not (type(closure) is dict and closure.get("complete") is True):
             self._summary.fail("closure", "runner produced no complete closure; the owner cannot be closed from it")
             return record
         try:
+            reason: Literal["deadline_drained", "stop_requested", "failed"] = "failed"
+            if not failures:
+                # Only the owner clock can prove its deadline has elapsed. A finite
+                # corpus can drain earlier; the runner's closure already stopped
+                # admission, and all native drain/resource checks still apply.
+                closing_status = self._controller.request(M6OwnerControl(kind="status")).status
+                reason = ("deadline_drained" if closing_status.observed_qpc_ticks >= spec.deadline_ticks
+                          else "stop_requested")
             closed = self._controller.request(M6CloseOwner(
                 ownership_receipt_sha256=closure["ownership_closure_sha256"], residual_count=closure["residual_count"],
                 children_exited=closure["children_exited"], reason=reason,

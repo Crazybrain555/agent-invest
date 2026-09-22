@@ -230,6 +230,88 @@ class ThinPressureProducerTests(unittest.TestCase):
                 link.unlink()
                 link.symlink_to("cgroup:[421]")
 
+    def identity(self):
+        return self.module._linux_pressure_memory()["cgroup_identity_sha256"]
+
+    def test_host_global_cgroup_policy_and_propagation_do_not_replace_the_instance(self):
+        """nsdelegate and propagation tags are host policy, not this mount's identity."""
+        line = self.files["/proc/self/mountinfo"]
+        baseline = self.identity()
+        variants = {
+            # Superblock options are systemwide cgroup2 policy, settable by any
+            # remount from the initial namespace.
+            "super_options": line.replace(" cgroup rw\n", " cgroup rw,nsdelegate,memory_recursive_prot\n"),
+            # Optional propagation fields describe the mount tree, not the instance.
+            "propagation": line.replace(" ro,nosuid,nodev -", " ro,nosuid,nodev shared:2 master:7 -"),
+            # The same local option set in another order is the same policy.
+            "option_order": line.replace(" ro,nosuid,nodev ", " nodev,ro,nosuid "),
+        }
+        for name, value in variants.items():
+            with self.subTest(changed=name):
+                self.write("/proc/self/mountinfo", value)
+                try:
+                    self.assertEqual(self.identity(), baseline)
+                finally:
+                    self.write("/proc/self/mountinfo", line)
+        observer = self.module.CapacityServingObservation(self.config, self.manager)
+        observer.pressure_snapshot()
+        original_read = self.module._kernel_text
+
+        def read_and_toggle(path, maximum=65536):
+            result = original_read(path, maximum)
+            if path == self.path("/sys/fs/cgroup/memory.events"):
+                self.write("/proc/self/mountinfo", variants["super_options"])
+            return result
+
+        try:
+            # Toggled mid-read, the re-read must still recognise the same mount.
+            with patch.object(self.module, "_kernel_text", side_effect=read_and_toggle):
+                self.assertEqual(self.identity(), baseline)
+            # And the toggle must not end the observer's cgroup lifetime.
+            self.assertEqual(
+                observer.pressure_snapshot()["memory"]["cgroup_identity_sha256"], baseline
+            )
+        finally:
+            self.write("/proc/self/mountinfo", line)
+
+    def test_actual_instance_replacement_and_malformed_mount_fields_still_fail(self):
+        """Local mount policy stays a conservative guard; a new instance is rejected."""
+        line = self.files["/proc/self/mountinfo"]
+        baseline = self.identity()
+        observer = self.module.CapacityServingObservation(self.config, self.manager)
+        observer.pressure_snapshot()
+        replaced = {
+            "mount_id": line.replace("31 22", "32 22"),
+            "parent_id": line.replace("31 22", "31 23"),
+            "device": line.replace("0:28", "0:29"),
+            "source": line.replace(" - cgroup2 cgroup ", " - cgroup2 other "),
+            # Mutable, but a changed local option set still replaces the identity.
+            "mount_options": line.replace(" ro,nosuid,nodev ", " rw,nosuid,nodev "),
+        }
+        for name, value in replaced.items():
+            with self.subTest(changed=name):
+                self.write("/proc/self/mountinfo", value)
+                try:
+                    self.assertNotEqual(self.identity(), baseline)
+                    with self.assertRaises(RuntimeError):
+                        observer.pressure_snapshot()
+                finally:
+                    self.write("/proc/self/mountinfo", line)
+        for name, value in (
+            # A mount line whose fields cannot be read as one qualified instance
+            # is never matched, so no root is identified at all.
+            ("no_super_options", line.replace(" - cgroup2 cgroup rw\n", " - cgroup2 cgroup\n")),
+            ("extra_super_field", line.replace(" - cgroup2 cgroup rw\n", " - cgroup2 cgroup rw extra\n")),
+            ("short_left_fields", line.replace("31 22 0:28 / /sys/fs/cgroup ro,nosuid,nodev", "31 22 0:28 / /sys/fs/cgroup")),
+        ):
+            with self.subTest(malformed=name):
+                self.write("/proc/self/mountinfo", value)
+                try:
+                    with self.assertRaises(RuntimeError):
+                        self.module._linux_pressure_memory()
+                finally:
+                    self.write("/proc/self/mountinfo", line)
+
     def test_empty_oversized_or_non_ascii_kernel_payload_is_rejected(self):
         path = self.path("/proc/self/cgroup")
         for raw in (b"", b"x" * 4097, b"\xff"):

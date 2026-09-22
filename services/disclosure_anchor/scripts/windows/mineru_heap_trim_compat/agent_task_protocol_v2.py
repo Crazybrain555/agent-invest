@@ -2638,11 +2638,27 @@ class SplitTaskExecutor:
         return self._finalizer_slots
 
     def stage_snapshot(self) -> dict[str, int]:
-        """Actual acquire/wait ownership, read on the executor's serving loop."""
+        """Durably backed stage ownership, read on the executor's serving loop.
+
+        Every counted owner is carried by the registry's published durable view:
+        ``parse_waiting`` and ``result_capacity_waiting`` are backed by durable
+        pending tasks; ``parse_active`` starts after the processing commit.
+        Both finalizer counters are backed by the finalizing commit. A task
+        that holds a parse slot while its ``processing`` commit is still in
+        flight is counted in neither stage, so the closed health invariant
+        ``stage owners <= durable responsibility`` holds at every serving-loop
+        step even though ``/health`` reads the last durable view.
+        """
         return dict(self._stage_counts)
 
     @asynccontextmanager
-    async def _stage_slot(self, semaphore: asyncio.Semaphore, stage: str) -> AsyncIterator[None]:
+    async def _stage_slot(
+        self,
+        semaphore: asyncio.Semaphore,
+        stage: str,
+        *,
+        enter: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[None]:
         waiting = stage + "_waiting"
         active = stage + "_active"
         self._stage_counts[waiting] += 1
@@ -2650,6 +2666,12 @@ class SplitTaskExecutor:
             await semaphore.acquire()
         finally:
             self._stage_counts[waiting] -= 1
+        if enter is not None:
+            try:
+                await enter()
+            except BaseException:
+                semaphore.release()
+                raise
         self._stage_counts[active] += 1
         try:
             yield
@@ -2722,11 +2744,16 @@ class SplitTaskExecutor:
                     self._stage_counts["result_capacity_waiting"] -= 1
             else:
                 break
+        async def enter_parse() -> None:
+            # Durable first, then counted: the slot is held but uncounted until the
+            # ``processing`` commit has published, so the stage counters never claim
+            # an owner the durable view does not yet carry.
+            if self._abort_pending:
+                raise TaskExecutionStopped("parse slot wait stopped with pending responsibility")
+            await write(registry.transition, key, "processing")
+
         try:
-            async with self._stage_slot(self._parse, "parse"):
-                if self._abort_pending:
-                    raise TaskExecutionStopped("parse slot wait stopped with pending responsibility")
-                await write(registry.transition, key, "processing")
+            async with self._stage_slot(self._parse, "parse", enter=enter_parse):
                 await parse()
             await write(registry.transition, key, "finalizing")
             async with self._stage_slot(self._finalize, "finalizer"):

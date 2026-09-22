@@ -93,6 +93,28 @@ the external manifest identity before observing the host. A legacy consumer must
 reject v11 unless its external capacity authority has been threaded through.
 Full Settings/staged-worker/PG qualification remains a separate activation step.
 
+## Durable stage observations and pressure identity
+
+A stage count is published only after its backing durable state commits, and
+removed before that durable state advances. `result_capacity_waiting` and
+`parse_waiting` are backed by pending tasks; `parse_active` by processing tasks;
+both finalizer counters by finalizing tasks. The parse semaphore is acquired
+before the processing commit, so a task can temporarily hold a permit while
+counted in no stage. This is not free capacity: the semaphore still bounds N,
+the durable task still consumes P, and the parser has not started. This preserves
+the existing inequalities without requiring stage counts to exhaust durable work.
+The health route reads one last-durable view and the serving-loop counts without
+awaiting or taking the persistence lock. Failed commits remain visible failures.
+
+Pressure identity binds cgroup membership, namespace, root device/inode and the
+qualified mount's structural fields. Local mount options remain a conservative
+deployment guard. Host-global superblock options (including `nsdelegate`) and
+propagation tags are not instance identity. The producer compares the same
+canonical projection before/after each read and across its serving lifetime;
+source replacement or an unsupported root still fails closed. Kernel memory
+values remain fresh observations, never capacity reservations. The changed
+identity digest requires a new release binding; the v1 wire shape is unchanged.
+
 ## Continuous supply and qualification
 
 Native N/P/H and framework settings remain fixed for an epoch. A later online
