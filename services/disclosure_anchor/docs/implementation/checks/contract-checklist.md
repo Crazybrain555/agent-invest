@@ -763,3 +763,20 @@ semantic_router.v102 → v103（prompt 仍为 v33，taxonomy 仍为 r64）。
 验证：tests/unit/test_semantic_router.py（降级 Unit 夹在普通 Unit 之间的 v2 回放用例、期间用例表）；36 篇已发布文档 / 10,747 Unit
 回放（a-locked-overflow-replay/v103-*）0 变化；外部复审 ChatGPT Pro 对 4548ecaa 的 P1/P2 由本次修复。
 ```
+
+2026-09-22（router v104 因果片段不锁定 + taxonomy r65 变动情况及原因章节容器）——public view/API/change feed 不变:
+
+```text
+semantic_router.v103 → v104；semantic-taxonomy-2026-08-r64 → r65（semantic-financial r34 → r35，199 条 financial 路由；prompt 仍 v33）。
+1. `_is_standardized_quantitative_topic`：命中落在尾随原因片段（引导词 主要系/主要是(由于|因为)?/主要由于/主要因(为)?/主要原因(是|为|系)/
+   系由于/系因/原因(是|为|系) 在任意子句边界后，是由于/是因为/系(?!统|列|数|指) 仅在 ，,:;； 之后；片段到 。；;！？ 或下一条 （n） 为止）
+   时不算锁定见证；裸 由于/因为 只覆盖到第一个逗号。方向词表补 同比上升/同比增加/同比减少/同比降低；标签后允许 科目 填充词。
+   动机：002997 unit 9 修完日期后剩下的 6 个锁全来自 "主要系利息收入增加" 类从句，与提示词第 6 条相反；回放 36 篇 / 10,747 Unit：
+   12 个 Unit / 7 篇变化（去掉原因从句锁、补回主句锁），其中 5 个 Unit 因主句全部锁住而进入 9–20 锁定的降级路径（首次由真实语料触发），
+   0 个 >32 溢出。已发布 Unit 的键需 rebuild 才变。
+2. 新增 financial context container `financial_data_change_explanation`（names/aliases 为季报/半年报该章节的标题写法）：标题下的
+   Unit 进 section_keys；不参与正文/相似度候选；与其他 context container 一致，自身标题正好是该标签的有正文 Unit 把它作为直接 route；语料现状：季报该标题下 55 个 Unit 中 44 个无直接键，此前 section_keys 只有上级
+   company_profile_metrics。
+验证：tests/unit/test_semantic_router.py（因果片段用例表、章节键投影用例、taxonomy 计数 345）；回放存档 a-locked-overflow-replay/；
+Codex 只读复审。跟进：semantic-retrieval-query-gold.v4.json 仍 pin r64 / v101，下次检索质量评审前须重新评定。
+```

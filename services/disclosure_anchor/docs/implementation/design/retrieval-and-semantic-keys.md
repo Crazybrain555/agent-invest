@@ -39,7 +39,9 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 5. `section_keys`：确定性的结构位置。只从已接受 `heading_path` 根到叶精确匹配 taxonomy
    中显式结构容器；定期报告使用 `context_container`，事件公告仅开放少量命中 filing_type/
    authoritative disclosure_topics scope 的
-   `section_container`。无 contains/similarity、无模型、无 Document facet 直接传播。heading-only Unit
+   `section_container`。r65 起，季报/半年报的「主要会计数据和财务指标发生变动的情况及原因」标题（含 「主要会计数据、财务指标发生变动的情况、原因」「…变动的情况及主要原因」「主要财务数据同比变动情况」等写法）是 financial context container
+   `financial_data_change_explanation`：该标题下的 Unit 及其子 Unit 在 section_keys 里带上它；它不参与正文/相似度候选，但与其他
+   context container 一样，自身标题正好是该标签的有正文 Unit 也把它作为直接 route（该 Unit 的其余锁定主题照常保留）。无 contains/similarity、无模型、无 Document facet 直接传播。heading-only Unit
    仍可用其 hash-bound accepted heading path 标记自身的精确结构位置；没有可匹配 heading 的真空 Unit
    保持 NULL。它与 direct topic 分列、分过滤器；只有 direct topic 进入全文 key token
    channel，section route 由显式数组过滤参与 L2/L3 查询联合。
@@ -53,7 +55,7 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 合并是不可逆信息销毁，而并集只需一行 OR。检索的中文桥梁在两处：semantic-routes catalog 的中文
 labels（键规划），以及 search projection `key_tokens` 通道注入的中文规范标签 token（rp v4 起）。
 
-当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r64`、router `semantic_router.v103`、prompt
+当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r65`、router `semantic_router.v104`、prompt
 `semantic_route_adjudication.v33`。默认 provider 链为 `codex_cli.v4.low` /
 `gpt-5.6-luna` 主用、`claude_cli.v1.low` / `claude-sonnet-5` 备用；仅闭合的 availability
 原因允许 failover，取消、协议、模型身份、安全与无效裁决全部 fail closed。Codex 的
@@ -82,7 +84,9 @@ allowlisted label 紧邻数值/方向，以及严格 typed table field/header，
 日、季度（`第一季度`/`一季度`/`1季度`）与纯数字日期（`2024-03-31`、`2024/3/31`、`2024.03.31`、`2024-03`）都是封闭的期间 token，整体
 跳过、绝不回退成数值；标签后允许一个冒号再接期间；跳过期间后仍须有真实数值或方向结果才锁定（`管理费用2024年度为1,234万元`、
 `管理费用2024年3月31日为1,234万元` 锁定，`管理费用2024年1-3月发生额较上年同期…`、`管理费用2024-03-31发生额如下` 不锁定）；带小数点
-的数对（`2024.3`、`1,234.56`）是金额不是日期；方向句与数值句共用同一主语语法（含 总额 与括号缩写）；普通
+的数对（`2024.3`、`1,234.56`）是金额不是日期；方向句与数值句共用同一主语语法（含 总额、括号缩写与中性填充词 科目）；方向词含 同比增长/下降/上升/增加/减少/降低 与对应裸词；
+落在尾随原因片段里的命中（`…，主要系/主要是/主要由于/主要因/主要原因是/系/是由于/原因是 … 所致。`，到句末或下一条编号）不是锁定见证：
+它说的是另一个主题的原因，候选留作软候选交模型按因果从句规则判；句首或逗号后的裸 `由于/因为` 只覆盖到第一个逗号，主句仍锁；普通
 table_text 和数据格只保留 lexical/candidate。有内容 Unit 的唯一精确定期报告标题仍直接成为唯一
 route；heading-only 标题只走 title/heading_path/section_keys。
 

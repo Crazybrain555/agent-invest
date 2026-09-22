@@ -3563,7 +3563,7 @@ def _is_standardized_quantitative_topic(
         "变动幅度为",
     )
     acronym = r"(?:[（(][a-z0-9._/\-]{1,12}[）)])?"
-    subject = re.escape(label) + acronym + r"(?:总额)?(?::)?" + period
+    subject = re.escape(label) + acronym + r"(?:总额|科目)?(?::)?" + period
     if label.endswith(connectors):
         direct_result = re.compile(subject + value)
     else:
@@ -3579,6 +3579,10 @@ def _is_standardized_quantitative_topic(
             for item in (
                 "同比增长",
                 "同比下降",
+                "同比增加",
+                "同比减少",
+                "同比上升",
+                "同比降低",
                 "增加",
                 "减少",
                 "增长",
@@ -3606,7 +3610,13 @@ def _is_standardized_quantitative_topic(
         )
     if not matches:
         return False
+    # A witness inside a trailing causal explanation (…，主要系利息收入增加所致)
+    # names the reason for another topic's result, not a topic this Unit
+    # reports; it stays a soft candidate for the model's causal-clause rule.
+    causal_spans = _causal_explanation_spans(normalized_source)
     for match in matches:
+        if any(start <= match.start() < end for start, end in causal_spans):
+            continue
         if any(
             longer_match.start() <= match.start() < longer_match.end()
             for longer_label in longer_labels
@@ -3615,6 +3625,48 @@ def _is_standardized_quantitative_topic(
             continue
         return True
     return False
+
+
+_CAUSAL_LEAD_ANY_BOUNDARY_RE = re.compile(
+    r"(?:^|(?<=[，,:;；。！!？?]))"
+    r"(?:主要系|主要是由于|主要是因为|主要是|主要由于|主要因为|主要因|"
+    r"主要原因(?:是|为|系)|系由于|系因|原因(?:是|为|系))"
+)
+_CAUSAL_LEAD_AFTER_CLAUSE_RE = re.compile(
+    r"(?<=[，,:;；])(?:是由于|是因为|系(?!统|列|数|指))"
+)
+_CAUSAL_SPAN_END_RE = re.compile(
+    r"[。；;！!？?]|[（(][0-9０-９一二三四五六七八九十]{1,3}[）)]"
+)
+# A bare 由于/因为 clause explains the clause that follows its first comma
+# (由于A增加，B下降 — wherever it sits); only that leading clause is the
+# explanation.  Trailing 主要系/主要是/系… explanations run to the sentence end.
+_CAUSAL_LEAD_SENTENCE_START_RE = re.compile(
+    r"(?:^|(?<=[。；;！!？?，,:]))(?:由于|因为)"
+)
+_CAUSAL_LEADING_CLAUSE_END_RE = re.compile(r"[，,。；;！!？?]")
+
+
+def _causal_explanation_spans(normalized_source: str) -> tuple[tuple[int, int], ...]:
+    """Locate causal explanations as spans of the normalized source text.
+
+    A trailing explanation (…，主要系X增加所致) runs from its lead to the sentence
+    end or the next numbered item.  A bare 由于/因为 clause (由于X增加，Y下降) is a
+    span too, but only up to its first comma: the main clause that follows stays
+    outside it and keeps its own witness.
+    """
+
+    spans: list[tuple[int, int]] = []
+    for pattern in (_CAUSAL_LEAD_ANY_BOUNDARY_RE, _CAUSAL_LEAD_AFTER_CLAUSE_RE):
+        for lead in pattern.finditer(normalized_source):
+            end_match = _CAUSAL_SPAN_END_RE.search(normalized_source, lead.end())
+            end = len(normalized_source) if end_match is None else end_match.start()
+            spans.append((lead.start(), end))
+    for lead in _CAUSAL_LEAD_SENTENCE_START_RE.finditer(normalized_source):
+        end_match = _CAUSAL_LEADING_CLAUSE_END_RE.search(normalized_source, lead.end())
+        end = len(normalized_source) if end_match is None else end_match.start()
+        spans.append((lead.start(), end))
+    return tuple(sorted(spans))
 
 
 def _market_value_management_support_ids(

@@ -1141,7 +1141,7 @@
     "_bounded_locked_keys",
     "_normalize_title"
    ],
-   "tests": 180
+   "tests": 182
   },
   "tests/unit/test_serving_model_identity.py": {
    "private_imports": [],

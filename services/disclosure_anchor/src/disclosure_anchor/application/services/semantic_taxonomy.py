@@ -16,7 +16,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 )
 
 
-SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r64"
+SEMANTIC_TAXONOMY_VERSION = "semantic-taxonomy-2026-08-r65"
 _FINANCIAL_RESOURCE = "semantic_financial_routes.v1.json"
 _EVENT_RESOURCE = "semantic_event_routes.v1.json"
 _PERIODIC_SCOPES = ("annual_report", "semiannual_report", "quarterly_report")
@@ -60,7 +60,7 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
         "version",
     }:
         raise SemanticRouteContractError("event semantic taxonomy fields drift")
-    if financial.get("version") != "semantic-financial-2026-08-r34":
+    if financial.get("version") != "semantic-financial-2026-08-r35":
         raise SemanticRouteContractError("financial semantic taxonomy version drift")
     if events.get("version") != "semantic-events-2026-08-r49":
         raise SemanticRouteContractError("event semantic taxonomy version drift")
@@ -69,9 +69,9 @@ def load_semantic_route_taxonomy() -> SemanticRouteTaxonomy:
 
     definitions: list[SemanticRouteDefinition] = []
     raw_keys = financial.get("keys")
-    if not isinstance(raw_keys, dict) or len(raw_keys) != 198:
+    if not isinstance(raw_keys, dict) or len(raw_keys) != 199:
         raise SemanticRouteContractError(
-            "financial semantic taxonomy must contain exactly 198 routes"
+            "financial semantic taxonomy must contain exactly 199 routes"
         )
     raw_scope_extensions = financial.get("event_scope_extensions")
     if not isinstance(raw_scope_extensions, dict) or not set(

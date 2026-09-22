@@ -635,8 +635,8 @@ class SemanticTaxonomyTests(unittest.TestCase):
     def test_packaged_taxonomy_is_closed_and_has_no_fake_fallback_route(self) -> None:
         taxonomy = load_semantic_route_taxonomy()
 
-        self.assertEqual(len(taxonomy.definitions), 344)
-        self.assertEqual(len(taxonomy.by_key()), 344)
+        self.assertEqual(len(taxonomy.definitions), 345)
+        self.assertEqual(len(taxonomy.by_key()), 345)
         self.assertNotIn(taxonomy.fallback_key, taxonomy.by_key())
         self.assertNotIn("other_information", taxonomy.by_key())
         self.assertNotIn("other_significant_events", taxonomy.by_key())
@@ -4248,6 +4248,126 @@ class SemanticRouterTests(unittest.TestCase):
                     for batch in seen:
                         for unit in batch.units:
                             self.assertTrue(all(not item.locked for item in unit.candidates))
+
+    def test_causal_explanation_witness_does_not_lock_a_periodic_topic(self) -> None:
+        # A 科目 named only inside a trailing causal explanation (…，主要系X增加所致)
+        # explains another topic's result: it stays a soft candidate for the
+        # model's causal-clause rule, while the main clause keeps its own lock.
+        # 同比上升/同比增加/同比减少/同比降低 and the 科目 filler are part of the
+        # main-clause grammar so the subject locks on its own witness.
+        cases = (
+            ("财务费用增长10%，主要系利息收入增加。", {"finance_expenses"}, {"interest_income"}),
+            ("财务费用下降171.31%，主要系利息收入增加以及计提的可转债利息费用减少所致；", {"finance_expenses"}, {"interest_income"}),
+            ("主要系利息收入增加。利息收入为100万元。", {"interest_income"}, set()),
+            ("主要系利息收入增加、利息支出减少。", set(), {"interest_income", "interest_expense"}),
+            ("所得税费用增长84.88%，主要系本期利润总额增加，当期计提的所得税费用增加所致。", {"income_tax_expense"}, set()),
+            ("由于利息收入增加，财务费用下降。", {"finance_expenses"}, {"interest_income"}),
+            ("由于本期利息收入增加，其他收益减少，财务费用下降。", {"finance_expenses", "other_income"}, {"interest_income"}),
+            ("因为政府补助增加。其他收益增长。", {"other_income"}, {"government_grants"}),
+            ("其他收益增长381.20%，主要系本期政府补助增加所致；（6）投资收益增长86.88%，主要系对联营企业确认的投资收益增加所致。", {"other_income", "investment_income"}, {"government_grants"}),
+            ("财务费用下降，系利息收入增加所致。", {"finance_expenses"}, {"interest_income"}),
+            ("营业收入增长，系统集成业务收入增加。", {"revenue_and_cost"}, set()),
+            ("（15）报告期末，短期借款同比上升532.51%，主要是银行短期借款增加所致。", {"short_term_borrowings"}, set()),
+            ("（1）营业收入同比上升64.07%，主要系报告期公司主要产品及磷酸销售收入增长。", {"revenue_and_cost"}, set()),
+            ("（2）应收票据科目上升49.95%，主要系收到的银行承兑汇票及出口信用证增加所致；", {"notes_receivable"}, set()),
+            ("报告期内公司营业收入同比减少32.41%，主要原因为报告期内制冷剂产品价格及销售量同比下降所致。", {"revenue_and_cost"}, set()),
+            ("本公司的初始投资成本，由于香港清芯在合并日净资产账面价值为负数，本公司对香港清芯的初始投资成本按零确定，同时冲减资本公积人民币24,541,650.00元。", {"capital_reserve"}, set()),
+            # The added 同比 variants and the item-marker terminator without any
+            # sentence punctuation; a protected 系 word never opens a span.
+            ("其他收益同比增加20%，主要系政府补助同比增加（２）投资收益同比降低5%，主要系利息收入减少所致", {"other_income", "investment_income"}, {"government_grants", "interest_income"}),
+            ("营业收入增长，系统集成业务收入增加，投资收益同比增加。", {"revenue_and_cost", "investment_income"}, set()),
+        )
+        document = SemanticDocumentContext(title=None, filing_type="quarterly_report")
+        for body, must_lock, must_not_lock in cases:
+            with self.subTest(body=body):
+                admitted, drafts = _drafts_with_body("主要会计数据变动说明", body)
+                seen: list[SemanticAdjudicationBatch] = []
+
+                def abstain(batch: SemanticAdjudicationBatch) -> tuple[SemanticAdjudicationDecision, ...]:
+                    seen.append(batch)
+                    return tuple(
+                        SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                        for unit in batch.units
+                    )
+
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(abstain),
+                    cache=_MemoryCache(),
+                ).route(admitted=admitted, document=document, drafts=drafts)
+                receipt = result.receipts[0]
+                keys = set(receipt.semantic_keys)
+                if must_lock:
+                    self.assertEqual(receipt.decision_source, "deterministic", receipt)
+                    self.assertTrue(must_lock <= keys, (must_lock, keys))
+                self.assertFalse(must_not_lock & keys, (must_not_lock, keys))
+                # The causal 科目 is still a candidate, just never a locked one:
+                # it stays soft for the model whenever the Unit is adjudicated.
+                for key in must_not_lock:
+                    self.assertIn(key, receipt.candidate_keys, (key, receipt.candidate_keys))
+                for batch in seen:
+                    for unit in batch.units:
+                        for candidate in unit.candidates:
+                            if candidate.key in must_not_lock:
+                                self.assertFalse(candidate.locked, candidate)
+
+    def test_change_explanation_heading_projects_the_financial_section_key(self) -> None:
+        # The quarterly 变动情况及原因 container is a structural key: every Unit
+        # under that heading carries it in section_keys, it is never a body or
+        # similarity candidate, and the direct keys are whatever the body earns.
+        # Like every context container, a content-bearing Unit whose OWN title
+        # is that exact heading also takes it as its direct route.
+        own_admitted, own_drafts = _drafts_with_body(
+            "（三）主要会计数据和财务指标发生变动的情况及原因",
+            "财务费用较上年同期下降 171.31%，主要系利息收入增加所致；",
+        )
+        own = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(lambda batch: self.fail("exact own title is deterministic")),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=own_admitted,
+            document=SemanticDocumentContext(title=None, filing_type="quarterly_report"),
+            drafts=own_drafts,
+        )
+        self.assertEqual(own.units[0].semantic_keys, ("financial_data_change_explanation",))
+        self.assertIn("financial_data_change_explanation", own.units[0].section_keys or ())
+        for heading in (
+            "（三） 主要会计数据和财务指标发生变动的情况及原因",
+            "(三)主要会计数据、财务指标发生变动的情况、原因",
+            "1、主要会计数据和财务指标变动的情况及主要原因",
+        ):
+            with self.subTest(heading=heading):
+                admitted, drafts = _drafts_with_parent_heading(
+                    heading,
+                    "2、合并利润表及现金流量表项目",
+                    "（2）管理费用 2024 年 1-3月发生额较上年同期增长 47.98%，主要系人员薪酬费用增加所致；",
+                )
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(
+                        lambda batch: tuple(
+                            SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                            for unit in batch.units
+                        )
+                    ),
+                    cache=_MemoryCache(),
+                ).route(
+                    admitted=admitted,
+                    document=SemanticDocumentContext(title=None, filing_type="quarterly_report"),
+                    drafts=drafts,
+                )
+                carriers = [
+                    unit for unit in result.units
+                    if unit.title == heading or heading in (unit.heading_path or ())
+                ]
+                self.assertTrue(carriers)
+                for unit in carriers:
+                    self.assertIn("financial_data_change_explanation", unit.section_keys or ())
+                for unit in result.units:
+                    self.assertNotIn("financial_data_change_explanation", unit.semantic_keys or ())
+                for receipt in result.receipts:
+                    self.assertNotIn("financial_data_change_explanation", receipt.candidate_keys)
 
     def test_locked_overflow_demotes_every_lock_to_model_candidates_in_source_order(self) -> None:
         # The 002997 quarterly report: one Unit enumerating more locked 科目 than the
