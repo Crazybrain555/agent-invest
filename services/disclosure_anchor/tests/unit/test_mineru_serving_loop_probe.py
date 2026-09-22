@@ -39,6 +39,15 @@ class ServingLoopProbeTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.probe.close)
         self.captured = io.StringIO()
 
+    async def asyncSetUp(self) -> None:
+        # IsolatedAsyncioTestCase runs its loop in debug mode, whose
+        # slow-callback notice ("Executing <Task …> took 0.1 seconds") is
+        # logged through the asyncio logger's last-resort handler straight
+        # into the redirected stderr whenever the machine is busy. It is not
+        # probe output; keep it out of the captured stream so the line-level
+        # assertions below only ever see the probe's own trace lines.
+        asyncio.get_running_loop().slow_callback_duration = 3600.0
+
     async def test_a_blocked_loop_reports_its_scheduling_lag(self) -> None:
         with redirect_stderr(self.captured):
             self.probe.start(asyncio.get_running_loop())
@@ -331,9 +340,14 @@ class ServingLoopProbeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.probe._emitting, set())
             self.assertIsNone(self.probe._pending_failure)
             self.assertGreaterEqual(self.probe._dropped, 1)
+        # No torn or nested write: every trace line starts with exactly one
+        # prefix, and nothing that is not a trace line carries a trace fragment.
         for line in captured.getvalue().splitlines():
-            self.assertTrue(line.startswith(protocol._LOOP_TRACE_PREFIX), line)
-            self.assertEqual(line.count(protocol._LOOP_TRACE_PREFIX), 1, line)
+            if protocol._LOOP_TRACE_PREFIX in line:
+                self.assertTrue(line.startswith(protocol._LOOP_TRACE_PREFIX), line)
+                self.assertEqual(line.count(protocol._LOOP_TRACE_PREFIX), 1, line)
+            else:
+                self.assertNotIn('"event"', line)
 
     async def test_a_failure_inside_the_write_path_is_reported_after_the_line(self) -> None:
         # A collector callback that faults while this thread is writing its own
@@ -374,9 +388,9 @@ class ServingLoopProbeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(worker.is_alive(), "the failing write path deadlocked")
             await asyncio.sleep(0.05)
         self.assertEqual(faults, ["raised"])
-        lines = captured.getvalue().splitlines()
+        # Only prefixed lines are trace records; the report follows the line.
         self.assertEqual(
-            [json.loads(line[len(protocol._LOOP_TRACE_PREFIX):])["event"] for line in lines],
+            [event["event"] for event in trace_lines(captured)],
             ["lag", "probe_failed"],
         )
         self.assertEqual(list(gc.callbacks), registered)
