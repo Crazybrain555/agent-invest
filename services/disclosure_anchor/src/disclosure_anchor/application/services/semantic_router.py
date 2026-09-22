@@ -17,7 +17,9 @@ from disclosure_anchor.application.contracts.provider_document_admission import 
 from disclosure_anchor.application.contracts.provider_document import ProviderBlock
 from disclosure_anchor.application.contracts.provider_unit import ProviderUnitDraft
 from disclosure_anchor.application.contracts.semantic_routes import (
+    MAX_DEMOTED_SEMANTIC_CANDIDATES,
     MAX_SEMANTIC_CANDIDATES,
+    MAX_SEMANTIC_ROUTES,
     SEMANTIC_FAILOVER_POLICY_VERSION,
     SEMANTIC_FALLBACK_KEY,
     SEMANTIC_ROUTE_RECEIPT_V1,
@@ -241,6 +243,45 @@ class _CandidateState:
 # The failure receipt bounds its message at 4096 bytes; the overflow diagnostic
 # lists at most this many locked keys and counts the rest.
 _LOCKED_KEYS_IN_MESSAGE = 32
+
+
+def _demoted_overflow_candidates(
+    locked: Sequence[_CandidateState],
+    *,
+    sources: Sequence[SemanticRouteSource],
+) -> tuple[SemanticRouteCandidate, ...]:
+    """Demote an over-cap locked set to unlocked model candidates in source order."""
+
+    position = {source.source_id: index for index, source in enumerate(sources)}
+    ordered = sorted(
+        locked,
+        key=lambda item: (
+            min(
+                (position.get(source_id, len(position)) for source_id in item.source_ids or ()),
+                default=len(position),
+            ),
+            item.key,
+        ),
+    )
+    return tuple(
+        SemanticRouteCandidate(
+            key=item.key,
+            source_ids=tuple(item.source_ids or ()),
+            evidence_kinds=(
+                *tuple(item.evidence_kinds or ()),
+                "source_locked_overflow_demoted",
+            ),
+            locked=False,
+        )
+        for item in ordered
+    )
+
+
+def _is_demoted_overflow_input(unit_input: SemanticRouteUnitInput) -> bool:
+    return bool(unit_input.candidates) and all(
+        "source_locked_overflow_demoted" in candidate.evidence_kinds
+        for candidate in unit_input.candidates
+    )
 
 
 def _bounded_locked_keys(keys: Iterable[str]) -> str:
@@ -1591,12 +1632,20 @@ class SemanticRouter:
         )
         selected = populated[:MAX_SEMANTIC_CANDIDATES]
         locked = tuple(item for item in populated if item.locked)
-        if len(locked) > MAX_SEMANTIC_CANDIDATES:
+        if len(locked) > MAX_DEMOTED_SEMANTIC_CANDIDATES:
             raise SemanticRouteLockedCandidateOverflowError(
                 "semantic route has too many locked candidates: "
                 f"unit_index={unit_index} locked_count={len(locked)} "
                 f"locked_keys={_bounded_locked_keys(item.key for item in locked)}"
             )
+        if len(locked) > MAX_SEMANTIC_CANDIDATES:
+            # More rule-locked topics than one Unit may carry: the Unit is a
+            # multi-topic list (a change-analysis or note enumerating 科目),
+            # not a routing refusal.  Every lock is demoted to a model
+            # candidate, keeps its original evidence so the receipt shows why
+            # it was lockable, and is ordered by where the Unit first cites it
+            # so the model's membership and the router's cut are stable.
+            return _demoted_overflow_candidates(locked, sources=sources)
         return tuple(
             SemanticRouteCandidate(
                 key=item.key,
@@ -1848,6 +1897,10 @@ class SemanticRouter:
             for index, key in enumerate(ordered_keys)
             if index == 0 or not _similarity_only_candidate(candidates[key])
         )
+        if _is_demoted_overflow_input(unit_input):
+            # The model may affirm every demoted topic; the published route
+            # set stays bounded, keeping the first ones the Unit cites.
+            stable_routes = stable_routes[:MAX_SEMANTIC_ROUTES]
         if stable_routes == canonical.routes:
             return canonical
         return replace(canonical, routes=stable_routes)
@@ -2388,6 +2441,10 @@ def _semantic_input_requires_model(
     *,
     document: SemanticDocumentContext,
 ) -> bool:
+    if _is_demoted_overflow_input(unit_input):
+        # The rules already proved every candidate; only their membership in
+        # one bounded Unit route set is left, and that is the model's call.
+        return True
     if not (
         _MODEL_MIN_CANDIDATES
         <= len(unit_input.candidates)
@@ -2436,9 +2493,17 @@ def _semantic_adjudication_groups(
     *,
     batch_size: int,
 ) -> tuple[tuple[SemanticRouteUnitInput, ...], ...]:
-    return tuple(
-        tuple(inputs[offset : offset + batch_size])
-        for offset in range(0, len(inputs), batch_size)
+    # A demoted overflow Unit carries up to MAX_DEMOTED_SEMANTIC_CANDIDATES
+    # candidates; it is adjudicated alone so the provider output schema and
+    # the group identity of ordinary Units stay bounded and stable.
+    ordinary = tuple(item for item in inputs if not _is_demoted_overflow_input(item))
+    demoted = tuple(item for item in inputs if _is_demoted_overflow_input(item))
+    return (
+        *(
+            tuple(ordinary[offset : offset + batch_size])
+            for offset in range(0, len(ordinary), batch_size)
+        ),
+        *((item,) for item in demoted),
     )
 
 
@@ -3447,7 +3512,19 @@ def _is_standardized_quantitative_topic(
         return False
     label = normalized_label.rstrip(":")
     normalized_source = _normalize_match_text(source.text)
-    value = r"(?:人民币)?[+\-－−]?[0-9０-９]"
+    # A calendar period right after the label (管理费用2024年1-3月…, 管理费用12月…)
+    # is deixis, not the topic's numeric result: it is consumed without being
+    # given back, and a real value or directional result must still follow.
+    # The value itself can never be a 年/月/日 stamp or a bare month range.
+    period = (
+        r"(?:[0-9０-９]{1,4}年)?+(?:度)?+"
+        r"(?:[0-9０-９]{1,2}(?:[-－—–~～至][0-9０-９]{1,2})?月)?+(?:份)?+"
+    )
+    value = (
+        r"(?:人民币)?[+\-－−]?"
+        r"(?![0-9０-９]{1,4}(?:年|月|日)|[0-9０-９]{1,2}(?:[-－—–~～至][0-9０-９]{1,2})?月)"
+        r"[0-9０-９]"
+    )
     connectors = (
         "为",
         "达",
@@ -3465,7 +3542,7 @@ def _is_standardized_quantitative_topic(
         "变动幅度为",
     )
     acronym = r"(?:[（(][a-z0-9._/\-]{1,12}[）)])?"
-    subject = re.escape(label) + acronym + r"(?:总额)?"
+    subject = re.escape(label) + acronym + r"(?:总额)?" + period
     if label.endswith(connectors):
         direct_result = re.compile(subject + value)
     else:
@@ -3490,7 +3567,7 @@ def _is_standardized_quantitative_topic(
             )
         )
         matches.extend(
-            re.compile(re.escape(label) + rf"(?:{directional})").finditer(
+            re.compile(re.escape(label) + period + rf"(?:{directional})").finditer(
                 normalized_source
             )
         )

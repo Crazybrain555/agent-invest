@@ -702,3 +702,17 @@ prompt 与 selector 留在既有 Unit；只有完整 headed Unit 在同页按 so
 一个 closed selector part也不足以证明 Unit-level ownership，仍保持 NULL，直到 Provider 提供明确
 prompt role。
 ```
+
+2026-09-22（router v102 / prompt v33 锁定溢出降级 + 日期不作数值）:
+
+```text
+SemanticRouteEvidenceKind 新增 source_locked_overflow_demoted；MAX_DEMOTED_SEMANTIC_CANDIDATES = 32
+MAX_SEMANTIC_DECISION_ROUTES_PER_UNIT（模型决策成员上限，非路由上限）= 32；MAX_SEMANTIC_ROUTES / MAX_SEMANTIC_CANDIDATES 仍为 8
+（公共 semantic_keys 上限、DB CHECK、domain VO 未变）
+SemanticRouteUnitInput 只在全部候选带降级标记且无 locked 时允许 9..32 个候选；降级 Unit 单独成组裁决
+路由器：locked 9..32 个 → 降级为软候选交模型，规范排序后保留前 8 个 direct route；>32 仍 SemanticRouteLockedCandidateOverflowError
+定期报告量化主题锁定：标签后的日历期间（年/年度/月/月份/1-3月/1至3月）跳过且不作数值；期间后仍须真实数值或方向结果
+prompt v33 增加降级候选裁决说明；cache/receipt identity 随版本变化，已发布 receipt 只读不变
+跟进：semantic-retrieval-query-gold.v4.json 仍 pin router v101，下次检索质量评审前须在 v102 上重新评定
+设计 docs/implementation/design/retrieval-and-semantic-keys.md；测试 tests/unit/test_semantic_router.py
+```

@@ -931,6 +931,9 @@ def _prompt(batch: SemanticAdjudicationBatch) -> str:
         "2. locked=true 的候选只来自 Unit 自身标题的唯一精确命中、定期报告正文中受控财务项目"
         "标准全称与数值结果的同时出现，或正文明确记载正式审议通过且议案标题包含该主题，"
         "对应 verdict 必须填 true。整张报表中的行项目仍属于报表容器，不能因此锁成 secondary。"
+        "带 source_locked_overflow_demoted 证据的候选来自同一 Unit 中数量超过上限的规则可锁定"
+        "科目（如变动原因说明或附注逐项列出的科目），它们已不再 locked：逐个判断该科目是否"
+        "为本 Unit 直接披露的主题，是则填 true；程序按来源顺序最多保留 8 个。"
         "verdicts 对象的字段顺序没有"
         "业务含义，程序会按来源证据统一排序。\n"
         "3. 你只输出每个 candidate 的布尔裁决，不输出证据 ID；程序会把 verdict=true 的"
@@ -996,7 +999,8 @@ def _prompt(batch: SemanticAdjudicationBatch) -> str:
         "授予行为、授予日、授予价格、授予数量或授予对象时才选择 incentive_grant，归属、作废、"
         "调整等后续事项不得因历史批次措辞附加该 route。表格若独立列出激励对象姓名、职务、"
         "类别、人数或分配，则 incentive_recipients 是直接表格 route。"
-        "每个 Unit 最多 8 个，不输出置信度或解释文字。\n"
+        "每个 Unit 最多 8 个；带 source_locked_overflow_demoted 的候选除外，逐个如实裁决，"
+        "由程序按来源顺序截取前 8 个。不输出置信度或解释文字。\n"
         "INPUT_JSON:\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True)
     )

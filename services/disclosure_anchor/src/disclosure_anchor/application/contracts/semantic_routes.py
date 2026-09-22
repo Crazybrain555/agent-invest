@@ -17,12 +17,19 @@ SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v2.jsonl"
 SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME = "semantic_route_receipts.v3.jsonl"
 SEMANTIC_FAILOVER_POLICY_VERSION = "availability_only.v1"
 SEMANTIC_OUTPUT_SCHEMA_VERSION = "semantic_route_output.v1"
-SEMANTIC_ROUTER_VERSION = "semantic_router.v101"
-SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v32"
+SEMANTIC_ROUTER_VERSION = "semantic_router.v102"
+SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v33"
 SEMANTIC_FALLBACK_KEY = "document_content"
 MAX_SEMANTIC_ROUTES = 8
-MAX_SEMANTIC_ROUTES_PER_UNIT = MAX_SEMANTIC_ROUTES
 MAX_SEMANTIC_CANDIDATES = 8
+# A Unit whose rule-locked topics exceed the shortlist is a multi-topic list, not
+# a refusal: its locks are demoted to model candidates, all of them shown to the
+# model up to this bound, and the model's membership may name every one of them
+# before the router keeps the first MAX_SEMANTIC_ROUTES in source order.
+MAX_DEMOTED_SEMANTIC_CANDIDATES = 32
+# Decision membership only: the model may name every demoted candidate before the
+# router keeps MAX_SEMANTIC_ROUTES of them.  This is not a route cap.
+MAX_SEMANTIC_DECISION_ROUTES_PER_UNIT = MAX_DEMOTED_SEMANTIC_CANDIDATES
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,127}$")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -67,6 +74,7 @@ SemanticRouteEvidenceKind = Literal[
     "source_table_candidate",
     "source_labeled_field_exact",
     "source_quantitative_topic",
+    "source_locked_overflow_demoted",
     "source_resolved_proposal_exact",
     "document_context_candidate",
     "model_adjudicated",
@@ -340,7 +348,17 @@ class SemanticRouteUnitInput:
         if len(candidate_keys) != len(set(candidate_keys)):
             raise SemanticRouteContractError("semantic Unit input repeats a candidate")
         if len(candidate_keys) > MAX_SEMANTIC_CANDIDATES:
-            raise SemanticRouteContractError("semantic Unit input has too many candidates")
+            # Only a demoted locked-overflow list may exceed the shortlist, and then
+            # every candidate must carry the demotion marker and none may stay locked.
+            if (
+                len(candidate_keys) > MAX_DEMOTED_SEMANTIC_CANDIDATES
+                or any(
+                    candidate.locked
+                    or "source_locked_overflow_demoted" not in candidate.evidence_kinds
+                    for candidate in self.candidates
+                )
+            ):
+                raise SemanticRouteContractError("semantic Unit input has too many candidates")
         known_sources = set(source_ids)
         if any(
             not set(candidate.source_ids).issubset(known_sources)
@@ -373,7 +391,7 @@ class SemanticAdjudicationDecision:
     routes: tuple[SemanticAdjudicatedRoute, ...]
 
     def __post_init__(self) -> None:
-        if self.unit_index < 0 or len(self.routes) > MAX_SEMANTIC_ROUTES_PER_UNIT:
+        if self.unit_index < 0 or len(self.routes) > MAX_SEMANTIC_DECISION_ROUTES_PER_UNIT:
             raise SemanticRouteContractError("semantic adjudication size is invalid")
         keys = [route.key for route in self.routes]
         if len(keys) != len(set(keys)):
@@ -1296,9 +1314,10 @@ def _text(payload: object, *, label: str) -> str:
 
 
 __all__ = [
+    "MAX_DEMOTED_SEMANTIC_CANDIDATES",
     "MAX_SEMANTIC_CANDIDATES",
     "MAX_SEMANTIC_ROUTES",
-    "MAX_SEMANTIC_ROUTES_PER_UNIT",
+    "MAX_SEMANTIC_DECISION_ROUTES_PER_UNIT",
     "SEMANTIC_FALLBACK_KEY",
     "SEMANTIC_PROMPT_VERSION",
     "SEMANTIC_FAILOVER_POLICY_VERSION",

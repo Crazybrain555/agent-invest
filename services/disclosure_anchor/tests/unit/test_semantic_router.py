@@ -5,6 +5,9 @@ from dataclasses import replace
 import unittest
 
 from disclosure_anchor.application.contracts.semantic_routes import (
+    MAX_DEMOTED_SEMANTIC_CANDIDATES,
+    MAX_SEMANTIC_CANDIDATES,
+    MAX_SEMANTIC_ROUTES,
     SEMANTIC_FAILOVER_POLICY_VERSION,
     SEMANTIC_PROMPT_VERSION,
     SemanticAdjudicatedRoute,
@@ -12,10 +15,15 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SemanticDocumentContext,
     SemanticProviderAttempt,
     SemanticProviderIdentity,
+    SemanticRouteCandidate,
     SemanticRouteContractError,
     SemanticRouteDefinition,
+    SemanticRouteEvidence,
     SemanticRouteLockedCandidateOverflowError,
+    SemanticRouteReceipt,
+    SemanticRouteSource,
     SemanticRouteTaxonomy,
+    SemanticRouteUnitInput,
 )
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
@@ -549,8 +557,16 @@ def _dense_periodic_change_drafts(
         "一、主要财务数据",
         "（四）主要会计数据和财务指标发生变动的情况及原因",
     ),
+    phrasing: str = "date_adjacent",
+    subjects: tuple[str, ...] = _PERIODIC_CHANGE_SUBJECTS,
+    trailing_units: tuple[tuple[str, str], ...] = (),
 ):  # type: ignore[no-untyped-def]
-    """One dense periodic change-analysis Unit with numbered 科目 clauses."""
+    """One dense periodic change-analysis Unit with numbered 科目 clauses.
+
+    ``date_adjacent`` is the 002997 wording (科目 followed by the reporting
+    period, then the directional result); ``directional`` puts the result
+    right after the 科目 so the clause rule locks it.
+    """
 
     blocks = [
         _block(
@@ -573,23 +589,26 @@ def _dense_periodic_change_drafts(
             level=len(headings) + 1,
         )
     )
-    for offset, subject in enumerate(_PERIODIC_CHANGE_SUBJECTS[:clause_count]):
+    clause = {
+        "date_adjacent": "（{n}）{subject} 2024 年 1-3月发生额较上年同期增长 12.34%，主要系本期业务规模变化所致。",
+        "directional": "（{n}）{subject}增长 12.34%，主要系本期业务规模变化所致。",
+    }[phrasing]
+    for offset, subject in enumerate(subjects[:clause_count]):
         blocks.append(
             _block(
                 len(headings) + 1 + offset,
                 0,
                 "text",
-                (
-                    ProviderPayload(
-                        "text",
-                        None,
-                        f"（{offset + 1}）{subject} 2024 年 1-3月发生额较上年同期"
-                        "增长 12.34%，主要系本期业务规模变化所致。",
-                    ),
-                ),
+                (ProviderPayload("text", None, clause.format(n=offset + 1, subject=subject)),),
                 annotation=None,
             )
         )
+    for unit_title, body in trailing_units:
+        blocks.append(
+            _block(len(blocks), 0, "text", (ProviderPayload("text", None, unit_title),),
+                   annotation="title", level=len(headings) + 1)
+        )
+        blocks.append(_block(len(blocks), 0, "text", (ProviderPayload("text", None, body),), annotation=None))
     document = _document(pages=(tuple(blocks),), segments=())
     admitted = _admitted(document)
     return admitted, build_provider_units(admitted).units
@@ -4144,43 +4163,263 @@ class SemanticRouterTests(unittest.TestCase):
             ("foreign_currency_translation",),
         )
 
-    def test_locked_overflow_raises_specific_error_with_bounded_context(self) -> None:
-        # Pins the clause-rule half of the real overflow (14 distinct 科目 locks on
-        # the 002997 quarterly report); the title-contains lock that made it 15 is
-        # covered by the offline replay of the materialized document, not here.
+    def test_date_adjacent_periodic_clause_is_not_a_quantitative_lock(self) -> None:
+        # A 科目 followed by the reporting period is period deixis, not the topic's
+        # numeric result; only an adjacent value or directional result locks it.
+        cases = (
+            ("（2）管理费用 2024 年 1-3月发生额较上年同期增长 47.98%，主要系人员薪酬费用增加所致；", False),
+            ("管理费用 2024 年度预算安排如下。", False),
+            ("管理费用12月发生额如下。", False),
+            ("管理费用1-3月发生额较上年同期增长47.98%。", False),
+            ("管理费用1至3月发生额较上年同期增长47.98%。", False),
+            ("管理费用较上年同期增长 47.98%，主要系人员薪酬费用增加所致；", False),
+            ("管理费用为 1,234.56 万元，同比增长 47.98%。", True),
+            ("管理费用增长 47.98%，主要系薪酬增加。", True),
+            ("管理费用2024万元。", True),
+            # The period is skipped, never taken as the value; a real value or
+            # directional result after it still locks the topic.
+            ("管理费用2024年度为1,234.56万元。", True),
+            ("管理费用2023年1-9月为1,234.56万元。", True),
+            ("管理费用2024年1-3月增长47.98%。", True),
+        )
+        document = SemanticDocumentContext(title=None, filing_type="quarterly_report")
+        for body, locked in cases:
+            with self.subTest(body=body):
+                admitted, drafts = _drafts_with_body("主要会计数据变动说明", body)
+                seen: list[SemanticAdjudicationBatch] = []
+
+                def abstain(batch: SemanticAdjudicationBatch) -> tuple[SemanticAdjudicationDecision, ...]:
+                    seen.append(batch)
+                    return tuple(
+                        SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                        for unit in batch.units
+                    )
+
+                result = SemanticRouter(
+                    taxonomy=load_semantic_route_taxonomy(),
+                    adjudicator=_Adjudicator(abstain),
+                    cache=_MemoryCache(),
+                ).route(admitted=admitted, document=document, drafts=drafts)
+                receipt = result.receipts[0]
+                if locked:
+                    self.assertEqual(receipt.decision_source, "deterministic")
+                    self.assertIn("admin_expenses", receipt.semantic_keys)
+                    self.assertEqual(seen, [])
+                else:
+                    self.assertNotEqual(receipt.decision_source, "deterministic")
+                    self.assertNotIn("admin_expenses", receipt.semantic_keys)
+                    for batch in seen:
+                        for unit in batch.units:
+                            self.assertTrue(all(not item.locked for item in unit.candidates))
+
+    def test_locked_overflow_demotes_every_lock_to_model_candidates_in_source_order(self) -> None:
+        # The 002997 quarterly report: one Unit enumerating more locked 科目 than the
+        # shortlist holds is a multi-topic list, so its locks become model candidates.
+        clause_count = MAX_SEMANTIC_CANDIDATES + 1
+        admitted, drafts = _dense_periodic_change_drafts(clause_count, phrasing="directional")
+        seen: list[SemanticAdjudicationBatch] = []
+
+        def affirm_everything(
+            batch: SemanticAdjudicationBatch,
+        ) -> tuple[SemanticAdjudicationDecision, ...]:
+            seen.append(batch)
+            return tuple(
+                SemanticAdjudicationDecision(
+                    unit_index=unit.unit_index,
+                    routes=tuple(
+                        SemanticAdjudicatedRoute(key=item.key, support_ids=item.source_ids)
+                        for item in unit.candidates
+                    ),
+                )
+                for unit in batch.units
+            )
+
+        adjudicator = _Adjudicator(affirm_everything)
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="quarterly_report"),
+            drafts=drafts,
+        )
+
+        self.assertEqual(adjudicator.calls, 1)
+        (unit_input,) = [unit for unit in seen[0].units if unit.unit_index == 2]
+        self.assertEqual(
+            tuple(item.key for item in unit_input.candidates),
+            _PERIODIC_CHANGE_KEYS[:clause_count],
+        )
+        self.assertTrue(all(not item.locked for item in unit_input.candidates))
+        self.assertTrue(
+            all(
+                item.evidence_kinds[-1] == "source_locked_overflow_demoted"
+                and "source_quantitative_topic" in item.evidence_kinds
+                for item in unit_input.candidates
+            )
+        )
+        # The model affirmed every demoted topic; the published set keeps the
+        # first MAX_SEMANTIC_ROUTES in the order the Unit cites them.
+        self.assertEqual(
+            result.units[2].semantic_keys,
+            _PERIODIC_CHANGE_KEYS[:MAX_SEMANTIC_ROUTES],
+        )
+        receipt = result.receipts[2]
+        self.assertEqual(receipt.decision_source, "model")
+        self.assertEqual(receipt.candidate_keys, _PERIODIC_CHANGE_KEYS[:clause_count])
+        self.assertEqual(len(receipt.semantic_keys), MAX_SEMANTIC_ROUTES)
+        self.assertTrue(
+            all(
+                {"source_quantitative_topic", "source_locked_overflow_demoted", "model_adjudicated"}
+                <= set(evidence.kinds)
+                for evidence in receipt.evidence
+            )
+        )
+
+    def test_demoted_overflow_unit_is_adjudicated_in_its_own_group(self) -> None:
+        # One demoted overflow Unit (index 2) plus two ordinary soft-candidate
+        # Units (3 and 4) in the same document: the ordinary ones share a group,
+        # the demoted one is sent alone so the provider output schema and the
+        # ordinary group identity stay bounded.
+        soft = ("管理费用较上年同期增长 47.98%，研发费用较上年同期增长 35.98%。")
+        overflow_admitted, overflow_drafts = _dense_periodic_change_drafts(
+            9, phrasing="directional",
+            trailing_units=(("3、其他说明", soft), ("4、补充说明", soft)),
+        )
+        groups: list[tuple[int, ...]] = []
+
+        def abstain(batch: SemanticAdjudicationBatch) -> tuple[SemanticAdjudicationDecision, ...]:
+            groups.append(tuple(unit.unit_index for unit in batch.units))
+            return tuple(
+                SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                for unit in batch.units
+            )
+
+        adjudicator = _Adjudicator(abstain)
+        SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+            batch_size=16,
+        ).route(
+            admitted=overflow_admitted,
+            document=SemanticDocumentContext(title=None, filing_type="quarterly_report"),
+            drafts=overflow_drafts,
+        )
+        self.assertEqual(adjudicator.calls, len(groups))
+        self.assertEqual(groups, [(3, 4), (2,)])
+
+    def test_locked_overflow_demotion_respects_the_model_membership(self) -> None:
         admitted, drafts = _dense_periodic_change_drafts(
-            len(_PERIODIC_CHANGE_SUBJECTS)
+            len(_PERIODIC_CHANGE_SUBJECTS), phrasing="directional"
+        )
+        keep = {"rd_expenses", "government_grants"}
+
+        def pick_two(
+            batch: SemanticAdjudicationBatch,
+        ) -> tuple[SemanticAdjudicationDecision, ...]:
+            return tuple(
+                SemanticAdjudicationDecision(
+                    unit_index=unit.unit_index,
+                    routes=tuple(
+                        SemanticAdjudicatedRoute(key=item.key, support_ids=item.source_ids)
+                        for item in unit.candidates
+                        if item.key in keep
+                    ),
+                )
+                for unit in batch.units
+            )
+
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(pick_two),
+            cache=_MemoryCache(),
+        ).route(
+            admitted=admitted,
+            document=SemanticDocumentContext(title=None, filing_type="quarterly_report"),
+            drafts=drafts,
+        )
+
+        self.assertEqual(result.units[2].semantic_keys, ("rd_expenses", "government_grants"))
+        self.assertEqual(result.receipts[2].decision_source, "model")
+
+    def test_locked_overflow_beyond_the_demotion_bound_still_fails_closed(self) -> None:
+        count = MAX_DEMOTED_SEMANTIC_CANDIDATES + 1
+        subjects = tuple(f"测试科目{index:02d}" for index in range(count))
+        taxonomy = SemanticRouteTaxonomy(
+            version="overflow-bound.v1",
+            definitions=tuple(
+                SemanticRouteDefinition(
+                    key=f"test_topic_{index:02d}",
+                    description=f"测试科目{index:02d}",
+                    labels=(subject,),
+                    scopes=("annual_report", "semiannual_report", "quarterly_report"),
+                    quantitative_topic=True,
+                )
+                for index, subject in enumerate(subjects)
+            ),
+        )
+        admitted, drafts = _dense_periodic_change_drafts(
+            count, phrasing="directional", subjects=subjects
         )
         router = SemanticRouter(
-            taxonomy=load_semantic_route_taxonomy(),
-            adjudicator=_Adjudicator(
-                lambda _batch: self.fail("a refused Unit never reaches the model")
-            ),
+            taxonomy=taxonomy,
+            adjudicator=_Adjudicator(lambda _batch: self.fail("a refused Unit never reaches the model")),
             cache=_MemoryCache(),
         )
 
         with self.assertRaises(SemanticRouteLockedCandidateOverflowError) as caught:
             router.route(
                 admitted=admitted,
-                document=SemanticDocumentContext(
-                    title=None,
-                    filing_type="quarterly_report",
-                ),
+                document=SemanticDocumentContext(title=None, filing_type="quarterly_report"),
                 drafts=drafts,
             )
 
-        self.assertIs(
-            type(caught.exception),
-            SemanticRouteLockedCandidateOverflowError,
-        )
+        self.assertIs(type(caught.exception), SemanticRouteLockedCandidateOverflowError)
         self.assertIsInstance(caught.exception, SemanticRouteContractError)
         message = str(caught.exception)
         self.assertIn("unit_index=2", message)
-        self.assertIn(f"locked_count={len(_PERIODIC_CHANGE_KEYS)}", message)
-        self.assertIn(
-            "locked_keys=" + ",".join(sorted(_PERIODIC_CHANGE_KEYS)),
-            message,
+        self.assertIn(f"locked_count={count}", message)
+        self.assertIn("locked_keys=" + ",".join(sorted(f"test_topic_{index:02d}" for index in range(32))), message)
+        self.assertTrue(message.endswith(",...(+1)"))
+
+    def test_demoted_unit_input_contract_is_closed(self) -> None:
+        sources = tuple(
+            SemanticRouteSource(source_id=f"u0:b{index}", kind="body_text", text=f"科目{index}增长1%")
+            for index in range(MAX_DEMOTED_SEMANTIC_CANDIDATES + 1)
         )
+
+        def candidate(index: int, *, demoted: bool = True, locked: bool = False) -> SemanticRouteCandidate:
+            return SemanticRouteCandidate(
+                key=f"topic_{index:02d}",
+                source_ids=(sources[index].source_id,),
+                evidence_kinds=(
+                    ("source_quantitative_topic", "source_locked_overflow_demoted")
+                    if demoted
+                    else ("source_quantitative_topic",)
+                ),
+                locked=locked,
+            )
+
+        def unit_input(candidates: tuple[SemanticRouteCandidate, ...]) -> SemanticRouteUnitInput:
+            return SemanticRouteUnitInput(
+                unit_index=0,
+                input_hash="sha256:" + "a" * 64,
+                sources=sources,
+                candidates=candidates,
+            )
+
+        accepted = unit_input(tuple(candidate(index) for index in range(MAX_SEMANTIC_CANDIDATES + 1)))
+        self.assertEqual(len(accepted.candidates), MAX_SEMANTIC_CANDIDATES + 1)
+        unit_input(tuple(candidate(index) for index in range(MAX_DEMOTED_SEMANTIC_CANDIDATES)))
+        for label, candidates in (
+            ("undemoted over the shortlist", tuple(candidate(index, demoted=False) for index in range(MAX_SEMANTIC_CANDIDATES + 1))),
+            ("one still locked", (*tuple(candidate(index) for index in range(MAX_SEMANTIC_CANDIDATES)), candidate(MAX_SEMANTIC_CANDIDATES, locked=True))),
+            ("over the demotion bound", tuple(candidate(index) for index in range(MAX_DEMOTED_SEMANTIC_CANDIDATES + 1))),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(SemanticRouteContractError, "too many candidates"):
+                unit_input(candidates)
 
     def test_overflow_diagnostic_lists_a_bounded_number_of_locked_keys(self) -> None:
         keys = [f"key_{index:03d}" for index in range(40)]
@@ -4192,52 +4431,60 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertLess(len(_bounded_locked_keys(f"{'k' * 39}_{index}" for index in range(400))), 4096)
 
     def test_quarterly_dense_change_unit_overflow_fixture(self) -> None:
-        overflow_admitted, overflow_drafts = _dense_periodic_change_drafts(9)
-        router = SemanticRouter(
-            taxonomy=load_semantic_route_taxonomy(),
-            adjudicator=_Adjudicator(
-                lambda _batch: self.fail("dense periodic clauses are deterministic")
-            ),
-            cache=_MemoryCache(),
-        )
-        document = SemanticDocumentContext(
-            title=None,
-            filing_type="quarterly_report",
-        )
+        document = SemanticDocumentContext(title=None, filing_type="quarterly_report")
 
-        with self.assertRaises(SemanticRouteLockedCandidateOverflowError) as caught:
-            router.route(
-                admitted=overflow_admitted,
-                document=document,
-                drafts=overflow_drafts,
-            )
-
-        self.assertIn("locked_count=9", str(caught.exception))
-
-        bounded_admitted, bounded_drafts = _dense_periodic_change_drafts(8)
+        bounded_admitted, bounded_drafts = _dense_periodic_change_drafts(8, phrasing="directional")
         result = SemanticRouter(
             taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=_Adjudicator(lambda _batch: self.fail("eight locked clauses are deterministic")),
+            cache=_MemoryCache(),
+        ).route(admitted=bounded_admitted, document=document, drafts=bounded_drafts)
+        self.assertEqual(set(result.units[2].semantic_keys or ()), set(_PERIODIC_CHANGE_KEYS[:8]))
+        self.assertEqual(result.receipts[2].decision_source, "deterministic")
+
+        overflow_admitted, overflow_drafts = _dense_periodic_change_drafts(9, phrasing="directional")
+        adjudicator = _Adjudicator(
+            lambda batch: tuple(
+                SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                for unit in batch.units
+            )
+        )
+        result = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
+            adjudicator=adjudicator,
+            cache=_MemoryCache(),
+        ).route(admitted=overflow_admitted, document=document, drafts=overflow_drafts)
+        self.assertEqual(adjudicator.calls, 1)
+        self.assertIsNone(result.units[2].semantic_keys)
+        self.assertEqual(result.receipts[2].decision_source, "model_abstain")
+        self.assertEqual(result.receipts[2].candidate_keys, _PERIODIC_CHANGE_KEYS[:9])
+
+        # The reporting-period wording of the real document never locks, so the
+        # same Unit is an ordinary soft-candidate Unit rather than an overflow.
+        dated_admitted, dated_drafts = _dense_periodic_change_drafts(9, phrasing="date_adjacent")
+        seen: list[SemanticAdjudicationBatch] = []
+        dated = SemanticRouter(
+            taxonomy=load_semantic_route_taxonomy(),
             adjudicator=_Adjudicator(
-                lambda _batch: self.fail("dense periodic clauses are deterministic")
+                lambda batch: (seen.append(batch) or tuple(
+                    SemanticAdjudicationDecision(unit_index=unit.unit_index, routes=())
+                    for unit in batch.units
+                ))
             ),
             cache=_MemoryCache(),
-        ).route(
-            admitted=bounded_admitted,
-            document=document,
-            drafts=bounded_drafts,
-        )
-
-        self.assertEqual(
-            set(result.units[2].semantic_keys or ()),
-            set(_PERIODIC_CHANGE_KEYS[:8]),
-        )
-        self.assertEqual(result.receipts[2].decision_source, "deterministic")
+        ).route(admitted=dated_admitted, document=document, drafts=dated_drafts)
+        self.assertNotEqual(dated.receipts[2].decision_source, "deterministic")
+        self.assertLessEqual(len(dated.receipts[2].candidate_keys), MAX_SEMANTIC_CANDIDATES)
+        for batch in seen:
+            for unit in batch.units:
+                self.assertTrue(all(not item.locked for item in unit.candidates))
 
     def test_locked_exclusive_narrows_before_overflow_check(self) -> None:
         admitted, drafts = _dense_periodic_change_drafts(
             10,
             title="合并资产负债表",
             headings=(),
+            phrasing="directional",
         )
         adjudicator = _Adjudicator(
             lambda _batch: self.fail("exclusive exact title must not call model")
@@ -6536,27 +6783,33 @@ class SemanticRouterTests(unittest.TestCase):
         self.assertEqual(result.receipts[0].decision_source, "model_abstain")
         self.assertEqual(result.receipts[0].semantic_keys, ("document_content",))
 
-    def test_model_can_return_eight_bounded_routes_but_not_nine(self) -> None:
+    def test_model_membership_may_name_every_demoted_topic_but_receipts_stay_bounded(self) -> None:
+        def routes(count: int) -> tuple[SemanticAdjudicatedRoute, ...]:
+            return tuple(
+                SemanticAdjudicatedRoute(key=f"route_{index}", support_ids=("u0:title",))
+                for index in range(count)
+            )
+
         accepted = SemanticAdjudicationDecision(
-            unit_index=0,
-            routes=tuple(
-                SemanticAdjudicatedRoute(
-                    key=f"route_{index}",
-                    support_ids=("u0:title",),
-                )
-                for index in range(8)
-            ),
+            unit_index=0, routes=routes(MAX_DEMOTED_SEMANTIC_CANDIDATES)
         )
-        self.assertEqual(len(accepted.routes), 8)
+        self.assertEqual(len(accepted.routes), MAX_DEMOTED_SEMANTIC_CANDIDATES)
         with self.assertRaisesRegex(SemanticRouteContractError, "size"):
             SemanticAdjudicationDecision(
-                unit_index=0,
-                routes=tuple(
-                    SemanticAdjudicatedRoute(
-                        key=f"route_{index}",
-                        support_ids=("u0:title",),
-                    )
-                    for index in range(9)
+                unit_index=0, routes=routes(MAX_DEMOTED_SEMANTIC_CANDIDATES + 1)
+            )
+        keys = tuple(f"route_{index}" for index in range(MAX_SEMANTIC_ROUTES + 1))
+        with self.assertRaisesRegex(SemanticRouteContractError, "too many routes"):
+            SemanticRouteReceipt(
+                taxonomy_version="t.v1",
+                router_version="semantic_router.v1",
+                input_hash="sha256:" + "a" * 64,
+                candidate_keys=keys,
+                semantic_keys=keys,
+                decision_source="deterministic",
+                evidence=tuple(
+                    SemanticRouteEvidence(key=key, kinds=("source_heading_exact",), source_ids=("u0:title",))
+                    for key in keys
                 ),
             )
 
