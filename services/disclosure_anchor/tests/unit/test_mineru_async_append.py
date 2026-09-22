@@ -215,7 +215,18 @@ class HybridAsyncAppendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(
                     fx.events.index(finalizer), fx.events.index("pdf:close")
                 )
-                self.assertEqual(fx.events[-2:], ["document:completed", "trim"])
+                # Document end releases allocator caches and the heap on the
+                # owned pool, then closes the phase trace; the pdfium document
+                # is already closed by then, as it was before the release moved
+                # off the serving loop.
+                self.assertEqual(
+                    fx.events[-2:],
+                    ["release-document-memory", "document:completed"],
+                )
+                self.assertLess(
+                    fx.events.index("pdf:close"),
+                    fx.events.index("release-document-memory"),
+                )
 
     async def test_append_error_is_original_and_partial_output_is_not_success(self):
         error = NativeFailure("literal second-page append failure")

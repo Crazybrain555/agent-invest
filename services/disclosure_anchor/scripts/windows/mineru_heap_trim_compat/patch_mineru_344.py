@@ -3570,6 +3570,20 @@ def trim_process_heap() -> bool:
     return True
 
 
+def release_document_memory_owned(device) -> None:
+    """Document-end memory release for the serving loop's owned thread pool.
+
+    Returns the CUDA caching allocator's unused blocks and the glibc heap, both of
+    which release the GIL. It never runs a cyclic collection: ``gc.collect()``
+    holds the GIL for the whole traversal, so from any thread it stalls the
+    serving loop and with it ``/health``. Cyclic garbage is left to the automatic
+    collector; the serving profile is CUDA/CPU only.
+    """
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    trim_process_heap()
+
+
 '''
         helper += '''_MODEL_DEVICE_OUTPUT_PREFIX = "MINERU_MODEL_DEVICE "
 _MODEL_DEVICE_LOCK = threading.Lock()
@@ -4006,6 +4020,7 @@ def _hybrid_model_device_event(model, role, capacity):
             "    drain_owned_awaitable,\n"
             "    to_thread_owned,\n"
             "    trim_process_heap,\n"
+            "    release_document_memory_owned,\n"
             ")\n",
             count=1,
             label="Hybrid import",
@@ -4406,6 +4421,22 @@ def _hybrid_model_device_event(model, role, capacity):
         )
         source = _replace_exact_occurrence(
             source,
+            "                finally:\n"
+            "                    _close_images(images_list)\n"
+            "                    trim_process_heap()\n"
+            "                    phase_trace.complete(\n"
+            '                        "window_total",\n',
+            "                finally:\n"
+            "                    _close_images(images_list)\n"
+            "                    await to_thread_owned(trim_process_heap)\n"
+            "                    phase_trace.complete(\n"
+            '                        "window_total",\n',
+            count=2,
+            occurrence=1,
+            label="Hybrid asynchronous window heap return off the serving loop",
+        )
+        source = _replace_exact_occurrence(
+            source,
             "                    append_page_model_list_to_middle_json(\n",
             "                    await to_thread_owned(\n"
             "                        append_page_model_list_to_middle_json,\n",
@@ -4448,6 +4479,25 @@ def _hybrid_model_device_event(model, role, capacity):
             "        return middle_json, model_list\n",
             count=2,
             label="Hybrid document completion",
+        )
+        # The serving loop must never run a cyclic collection: the asynchronous
+        # variant releases allocator caches and the heap on its owned thread and
+        # leaves cyclic garbage to the automatic collector. The synchronous
+        # doc_analyze (occurrence 0) keeps the original clean_memory sequence.
+        source = _replace_exact_occurrence(
+            source,
+            "        doc_closed = True\n"
+            "        clean_memory(device)\n"
+            "        phase_trace.document_completed()\n"
+            "        trim_process_heap()\n"
+            "        return middle_json, model_list\n",
+            "        doc_closed = True\n"
+            "        await to_thread_owned(release_document_memory_owned, device)\n"
+            "        phase_trace.document_completed()\n"
+            "        return middle_json, model_list\n",
+            count=2,
+            occurrence=1,
+            label="Hybrid asynchronous document memory release off the serving loop",
         )
         source = _replace_exact(
             source,

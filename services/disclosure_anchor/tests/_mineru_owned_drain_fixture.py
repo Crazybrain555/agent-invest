@@ -302,6 +302,9 @@ class DocumentFixture:
             "apply_server_side_postprocess": self.native("server_finalize"),
             "finalize_middle_json": self.native("finalize"),
             "clean_memory": lambda device: self.events.append("clean-memory"),
+            "release_document_memory_owned": lambda device: self.events.append(
+                "release-document-memory"
+            ),
             "ModelSingleton": lambda: SimpleNamespace(
                 get_model=self.native("get_model", predictor)
             ),

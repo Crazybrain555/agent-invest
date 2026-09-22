@@ -173,6 +173,14 @@ image ID、base digest、策略名、patched source hash 与 live hook；任一�
 解析语义、页窗口或并发，只把 allocator 可归还的空闲页返还给 OS；上游正式修复合并并通过同一
 held-out 验收后，应删除这个兼容层而不是永久形成私有 fork。
 
+Hybrid 异步服务路径的窗口 heap trim 和文档结束时的 CUDA cache/heap 归还使用已有
+`to_thread_owned`，取消时仍等待已开始的清理结束。该路径不再逐文档强制执行
+`gc.collect()`：CPython 全量循环回收会持有 GIL，即使移入线程也可能阻塞健康检查。
+自动循环回收保持启用，不 freeze heap、不修改阈值；同步 `doc_analyze` 和 VLM backend
+保留原清理路径。此改动不改变解析内容，但不能保证自动回收没有长停顿。部署后须同时
+检查原健康检查限时、资源门槛和连续文档的内存走势；若仍超时或内存持续增长，停止新
+准入并排空已有任务，保留日志后处理原因，不能通过放宽限时或关闭自动回收掩盖问题。
+
 首次安装或兼容层字节变化时，先把 compose、collector、`Dockerfile` 和 patcher 四份已审阅
 文件复制到 Windows 同一临时发布目录，再在 worker/GC disabled、API/vLLM idle、旧证据已保存的
 条件下运行版本化安装器：

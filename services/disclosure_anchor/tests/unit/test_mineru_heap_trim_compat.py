@@ -43,6 +43,149 @@ def _pinned_preimage(relative_path: str, expected_sha256: str) -> str:
     return raw.decode("utf-8")
 
 
+def _named_function(source: str | ast.AST, name: str):
+    """The single ``def``/``async def`` named ``name`` in ``source``.
+
+    Accepts a parsed tree so a caller that needs node identity across several
+    lookups can parse once.
+    """
+    tree = ast.parse(source) if isinstance(source, str) else source
+    matches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"expected exactly one {name}, found {len(matches)}")
+    return matches[0]
+
+
+def _called_name(call: ast.Call) -> str:
+    """The dotted callee of ``call``; empty when the callee is not a name path."""
+    parts: list[str] = []
+    func = call.func
+    while isinstance(func, ast.Attribute):
+        parts.append(func.attr)
+        func = func.value
+    if not isinstance(func, ast.Name):
+        return ""
+    parts.append(func.id)
+    return ".".join(reversed(parts))
+
+
+def _calls_to(node: ast.AST, dotted: str) -> list[ast.Call]:
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call) and _called_name(child) == dotted
+    ]
+
+
+def _bare_calls_to(node: ast.AST, dotted: str) -> list[ast.Call]:
+    """Calls written literally as ``<dotted>()`` — no arguments at all."""
+    return [
+        call for call in _calls_to(node, dotted) if not call.args and not call.keywords
+    ]
+
+
+def _bare_calls_outside_coroutines(tree: ast.AST, dotted: str) -> list[ast.Call]:
+    """``<dotted>()`` calls of ``tree`` that no ``async def`` encloses."""
+    coroutines = [
+        node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)
+    ]
+    return [
+        call
+        for call in _bare_calls_to(tree, dotted)
+        if not any(_contains(coroutine, call) for coroutine in coroutines)
+    ]
+
+
+def _owned_thread_calls(node: ast.AST, target: str) -> list[ast.Call]:
+    """``to_thread_owned(<target>, ...)`` calls inside ``node``."""
+    return [
+        call
+        for call in _calls_to(node, "to_thread_owned")
+        if call.args and isinstance(call.args[0], ast.Name) and call.args[0].id == target
+    ]
+
+
+def _contains(node: ast.AST, target: ast.AST) -> bool:
+    return any(child is target for child in ast.walk(node))
+
+
+def _block_contains(block: list, target: ast.AST) -> bool:
+    return any(_contains(statement, target) for statement in block)
+
+
+def _statement_blocks(node: ast.AST):
+    for child in ast.walk(node):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(child, field, None)
+            if (
+                isinstance(block, list)
+                and block
+                and all(isinstance(item, ast.stmt) for item in block)
+            ):
+                yield block
+
+
+def _single_owned_thread_await(node: ast.AST, target: str) -> ast.Await:
+    """The one ``await to_thread_owned(<target>, ...)`` expression inside ``node``."""
+    awaits = [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Await)
+        and isinstance(child.value, ast.Call)
+        and _called_name(child.value) == "to_thread_owned"
+        and child.value.args
+        and isinstance(child.value.args[0], ast.Name)
+        and child.value.args[0].id == target
+    ]
+    if len(awaits) != 1:
+        raise AssertionError(
+            f"expected exactly one awaited to_thread_owned({target}), found {len(awaits)}"
+        )
+    return awaits[0]
+
+
+def _statement_after(node: ast.AST, target: ast.AST) -> ast.stmt:
+    """The statement written immediately after the one holding ``target``."""
+    holders = [
+        statement
+        for statement in ast.walk(node)
+        if isinstance(statement, ast.Expr) and statement.value is target
+    ]
+    if len(holders) != 1:
+        raise AssertionError("target expression is not a standalone statement")
+    holder = holders[0]
+    for block in _statement_blocks(node):
+        for index, statement in enumerate(block):
+            if statement is holder:
+                if index + 1 >= len(block):
+                    raise AssertionError("target statement ends its block")
+                return block[index + 1]
+    raise AssertionError("target statement is not part of the function body")
+
+
+def _window_loop(node: ast.AST) -> ast.For:
+    """The processing-window ``for`` loop of a hybrid document analyzer."""
+    loops = [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.For)
+        and isinstance(child.target, ast.Tuple)
+        and [
+            element.id
+            for element in child.target.elts
+            if isinstance(element, ast.Name)
+        ]
+        == ["window_index", "window_start"]
+    ]
+    if len(loops) != 1:
+        raise AssertionError(f"expected one processing-window loop, found {len(loops)}")
+    return loops[0]
+
+
 def _http_client_fixture() -> str:
     return '''import asyncio
 
@@ -1009,8 +1152,44 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             "mineru/backend/hybrid/hybrid_analyze.py", hybrid
         )
 
+        # The vlm backend keeps the synchronous heap return on both of its
+        # window/document paths; it is not part of the hybrid serving profile.
         self.assertEqual(patched_vlm.count("trim_process_heap()"), 4)
-        self.assertEqual(patched_hybrid.count("trim_process_heap()"), 4)
+        self.assertNotIn("to_thread_owned(trim_process_heap)", patched_vlm)
+        self.assertNotIn("release_document_memory_owned", patched_vlm)
+
+        # Hybrid: the synchronous doc_analyze keeps the original document-end
+        # sequence — a literal heap return on both the window and the document
+        # path — and never reaches for the owned thread pool. Pin the shape of
+        # that function, not a module-wide count. The asynchronous analyzer is
+        # pinned by
+        # test_async_document_end_release_is_awaited_on_the_owned_thread_pool.
+        hybrid_tree = ast.parse(patched_hybrid)
+        sync_analyze = _named_function(hybrid_tree, "doc_analyze")
+        self.assertIsInstance(sync_analyze, ast.FunctionDef)
+
+        self.assertEqual(
+            [ast.unparse(call) for call in _calls_to(sync_analyze, "clean_memory")],
+            ["clean_memory(device)"],
+        )
+        self.assertEqual(len(_bare_calls_to(sync_analyze, "trim_process_heap")), 2)
+        self.assertEqual(_owned_thread_calls(sync_analyze, "trim_process_heap"), [])
+        self.assertEqual(
+            _owned_thread_calls(sync_analyze, "release_document_memory_owned"), []
+        )
+        self.assertEqual(_calls_to(sync_analyze, "gc.collect"), [])
+        # Module-wide: every literal heap return on the module's synchronous
+        # side belongs to doc_analyze — none leaked into a helper. Coroutines are
+        # excluded so this pin stays owned by the synchronous path alone.
+        synchronous_trims = _bare_calls_outside_coroutines(
+            hybrid_tree, "trim_process_heap"
+        )
+        self.assertEqual(len(synchronous_trims), 2)
+        self.assertEqual(
+            [call for call in synchronous_trims if _contains(sync_analyze, call)],
+            synchronous_trims,
+        )
+
         self.assertEqual(patched_vlm.count('"window_vlm",'), 2)
         self.assertEqual(patched_hybrid.count('"window_layout",'), 2)
         self.assertEqual(patched_hybrid.count('"window_postprocess",'), 2)
@@ -1018,6 +1197,118 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("serial_execution_profile", patched_hybrid)
         self.assertNotIn("get_processing_window_size(default=64)", patched_vlm)
         self.assertNotIn("get_processing_window_size(default=64)", patched_hybrid)
+
+    def test_async_document_end_release_never_collects_on_any_thread(self) -> None:
+        source = (
+            "import math\nimport os\nimport time\nimport gc\n"
+            "\ndef clean_memory(device='cuda'):\n    gc.collect()\n"
+        )
+        namespace: dict[str, object] = {}
+        exec(
+            compile(
+                patch_source("mineru/utils/model_utils.py", source),
+                "patched-model-utils.py",
+                "exec",
+            ),
+            namespace,
+        )
+
+        empty_cache_calls: list[str] = []
+        trim_calls: list[int] = []
+        available = [True]
+
+        def _recording_malloc_trim():
+            def _trim(size):
+                trim_calls.append(size)
+                return 0
+
+            return _trim
+
+        cuda = SimpleNamespace(
+            is_available=lambda: available[0],
+            empty_cache=lambda: empty_cache_calls.append("empty_cache"),
+        )
+        namespace["torch"] = SimpleNamespace(cuda=cuda)
+        namespace["_malloc_trim"] = _recording_malloc_trim
+
+        release = namespace["release_document_memory_owned"]
+        gc_module = namespace["gc"]
+        original_collect = gc_module.collect
+        with patch.dict(os.environ, {"MINERU_MALLOC_TRIM": "1"}), patch.object(
+            gc_module,
+            "collect",
+            side_effect=AssertionError(
+                "gc.collect must not run on the document-end path"
+            ),
+        ) as collect:
+            self.assertIsNone(release("cuda"))
+            self.assertEqual(empty_cache_calls, ["empty_cache"])
+            self.assertEqual(trim_calls, [0])
+
+            self.assertIsNone(release("cpu"))
+            self.assertEqual(empty_cache_calls, ["empty_cache"])
+            self.assertEqual(trim_calls, [0, 0])
+
+            available[0] = False
+            self.assertIsNone(release("cuda:1"))
+            self.assertEqual(empty_cache_calls, ["empty_cache"])
+            self.assertEqual(trim_calls, [0, 0, 0])
+
+            self.assertEqual(collect.call_count, 0)
+            # Control: the collector the document-end path must never reach.
+            with self.assertRaisesRegex(
+                AssertionError, "must not run on the document-end path"
+            ):
+                namespace["clean_memory"]("cuda")
+
+        self.assertIsNot(gc_module.collect, collect)
+        self.assertIs(gc_module.collect, original_collect)
+
+    def test_async_document_end_release_is_awaited_on_the_owned_thread_pool(
+        self,
+    ) -> None:
+        hybrid = _pinned_preimage(
+            "mineru/backend/hybrid/hybrid_analyze.py",
+            "404ce6552e9d7374b96de798d2d0f7d72927eef9485668e79c82c5002b36adb0",
+        )
+        patched_hybrid = patch_source(
+            "mineru/backend/hybrid/hybrid_analyze.py", hybrid
+        )
+        async_analyze = _named_function(patched_hybrid, "aio_doc_analyze")
+        self.assertIsInstance(async_analyze, ast.AsyncFunctionDef)
+
+        # Nothing on the asynchronous path may hold the serving loop: no heap
+        # return, no allocator release, and above all no cyclic collection.
+        self.assertEqual(_calls_to(async_analyze, "clean_memory"), [])
+        self.assertEqual(_bare_calls_to(async_analyze, "trim_process_heap"), [])
+        self.assertEqual(_calls_to(async_analyze, "gc.collect"), [])
+
+        # The per-window heap return is awaited on the owned pool, and it still
+        # runs for a failed window because it stays in the window loop's finally.
+        trim_await = _single_owned_thread_await(async_analyze, "trim_process_heap")
+        self.assertEqual(
+            ast.unparse(trim_await), "await to_thread_owned(trim_process_heap)"
+        )
+        window_finally = [
+            node
+            for node in ast.walk(_window_loop(async_analyze))
+            if isinstance(node, ast.Try) and _block_contains(node.finalbody, trim_await)
+        ]
+        self.assertEqual(len(window_finally), 1)
+
+        # The document-end release is awaited on the same pool and still closes
+        # the phase trace as its very next statement.
+        release_await = _single_owned_thread_await(
+            async_analyze, "release_document_memory_owned"
+        )
+        self.assertEqual(
+            ast.unparse(release_await),
+            "await to_thread_owned(release_document_memory_owned, device)",
+        )
+        self.assertEqual(
+            ast.unparse(_statement_after(async_analyze, release_await)),
+            "phase_trace.document_completed()",
+        )
 
     def test_phase_trace_is_default_off_content_free_and_strictly_closed(self) -> None:
         source = (

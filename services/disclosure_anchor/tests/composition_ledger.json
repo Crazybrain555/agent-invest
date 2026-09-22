@@ -730,7 +730,7 @@
   },
   "tests/unit/test_mineru_heap_trim_compat.py": {
    "private_imports": [],
-   "tests": 22
+   "tests": 24
   },
   "tests/unit/test_mineru_heap_trim_compat_m6.py": {
    "private_imports": [],
