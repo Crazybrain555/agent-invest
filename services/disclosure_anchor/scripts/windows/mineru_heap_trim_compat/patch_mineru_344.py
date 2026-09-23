@@ -1875,6 +1875,65 @@ def _patch_health_durable_view_observation(source: str) -> str:
     return source
 
 
+def _patch_api_gc_lifecycle(source: str) -> str:
+    """Wire a CLI-only pre-serving freeze; exact full-file preimages still apply."""
+    if "def main(" not in source:
+        # Existing reduced manager fixtures have no executable CLI/lifespan.
+        return source
+    source = _replace_exact(
+        source,
+        "    ServingLoopProbe,\n",
+        "    ServingLoopProbe, bootstrap_api_gc, enter_api_gc_runtime,\n"
+        "    mark_api_gc_quiesced, close_api_gc, shutdown_pdf_render_executor_verified,\n",
+        count=1, label="GC lifecycle imports",
+    )
+    source = _replace_exact(
+        source,
+        'async def startup_app_state(app: FastAPI) -> "AsyncTaskManager":\n',
+        'async def startup_app_state(app: FastAPI) -> "AsyncTaskManager":\n'
+        '    enter_api_gc_runtime()\n',
+        count=1, label="GC sealed before recovery dispatcher",
+    )
+    source = _replace_exact(
+        source,
+        '    if cleanup_error is not None:\n        raise cleanup_error\n\n\n'
+        'def shutdown_runtime_resources() -> None:\n',
+        '    if cleanup_error is not None:\n        raise cleanup_error\n'
+        '    mark_api_gc_quiesced()\n\n\n'
+        'def shutdown_runtime_resources() -> None:\n',
+        count=1, label="GC quiescence after all owned runtime cleanup",
+    )
+    source = _replace_exact(
+        source,
+        'def shutdown_runtime_resources() -> None:\n    try:\n        shutdown_cached_models()\n    except Exception as exc:\n        logger.warning(f"Failed to shutdown cached VLM models: {exc}")\n\n    try:\n        shutdown_pdf_render_executor()\n    except Exception as exc:\n        logger.warning(f"Failed to shutdown PDF render executor: {exc}")\n',
+        'def shutdown_runtime_resources() -> None:\n    failure = None\n    for close in (shutdown_cached_models, shutdown_pdf_render_executor_verified):\n        try:\n            close()\n        except BaseException as exc:\n            if failure is None:\n                failure = exc\n            else:\n                failure.add_note("another runtime close failed: " + repr(exc))\n    if failure is not None:\n        raise failure\n',
+        count=1, label="GC requires positive native cleanup; do not swallow errors",
+    )
+    old = '    if reload:\n        uvicorn.run(\n'
+    if source.count(old) != 1:
+        raise RuntimeError("GC main branch anchor drifted")
+    start = source.index(old)
+    end = source.index('\n\nif __name__ == "__main__":', start)
+    branch = source[start:end]
+    replacement = (
+        '    bootstrap_api_gc(app, reload=reload)\n'
+        '    _gc_primary = None\n'
+        '    try:\n' + ''.join('    '+line if line.strip() else line for line in branch.splitlines(keepends=True))
+        + '\n    except BaseException as exc:\n'
+        '        _gc_primary = exc\n'
+        '        raise\n'
+        '    finally:\n'
+        '        try:\n'
+        '            close_api_gc()\n'
+        '        except BaseException as cleanup:\n'
+        '            if _gc_primary is not None:\n'
+        '                _gc_primary.add_note("API GC close failed: " + repr(cleanup))\n'
+        '            else:\n'
+        '                raise\n'
+    )
+    return source[:start] + replacement + source[end:]
+
+
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
 
@@ -2910,7 +2969,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         source = _patch_registry_persistence_behavior(source)
         source = _patch_admission_responsibility(source)
         source = _patch_explicit_capacity(_patch_result_capacity_before_parse(source))
-        return _patch_health_durable_view_observation(_patch_service_scope_completion(_patch_service_io_pressure(_patch_service_io_shutdown(_patch_service_io_ingress(_patch_service_io_ack_health(_patch_service_io_manager(source)))))))
+        return _patch_api_gc_lifecycle(_patch_health_durable_view_observation(_patch_service_scope_completion(_patch_service_io_pressure(_patch_service_io_shutdown(_patch_service_io_ingress(_patch_service_io_ack_health(_patch_service_io_manager(source))))))))
 
     if relative_path == "mineru/utils/model_utils.py":
         source = _replace_exact(

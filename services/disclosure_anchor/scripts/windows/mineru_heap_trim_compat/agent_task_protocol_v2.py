@@ -3411,3 +3411,308 @@ class ServingLoopProbe:
         with _LOOP_TRACE_OUTPUT_LOCK:
             sys.stderr.write(line)
             sys.stderr.flush()
+
+
+# An API-process GC lifecycle, not a second task/receipt authority.
+_API_GC_POLICY = "api-static-prefix-freeze.v1"
+_API_GC_EPOCH: ApiGcEpoch | None = None
+
+
+class ApiGcEpoch:
+    """Seal once before a serving loop/registry exists; never freeze requests.
+
+    Automatic GC and its thresholds remain unchanged. The phase is only a
+    process-local cleanup invariant. A failed/partial shutdown must not report
+    this epoch as closed, and may leave reclamation to process termination.
+    """
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()
+        self.thread_id = get_ident()
+        self.phase = "new"
+        self.thresholds = gc.get_threshold()
+        self.frozen_count = 0
+        self.owns_freeze = False
+
+    def _owner(self) -> None:
+        if (os.getpid(), get_ident()) != (self.pid, self.thread_id):
+            raise RuntimeError("API GC lifecycle owner changed")
+
+    def _automatic_policy(self) -> None:
+        if not gc.isenabled() or gc.get_threshold() != self.thresholds:
+            raise RuntimeError("API GC automatic policy changed")
+
+    def prepare(self, initialize: Callable[[], object]) -> None:
+        self._owner()
+        if self.phase != "new":
+            raise RuntimeError("API GC bootstrap is one-shot")
+        self._automatic_policy()
+        # A nonzero freeze count is not a foreign freeze: CPython 3.12
+        # collections move immortal containers (static builtin types' base and
+        # MRO tuples) into the permanent generation before any gc.freeze().
+        if gc.get_debug() & gc.DEBUG_SAVEALL or gc.garbage:
+            raise RuntimeError("API GC debug/uncollectable state is not clean")
+        self.phase = "initializing"
+        try:
+            # No PDF, HTTP client, task manager, registry or serving loop here.
+            # initialize returns only after its owned work and temporary scopes
+            # have completed; it must not return a request/resource graph.
+            if initialize() is not None:
+                raise RuntimeError("static initializer must return None")
+            self._automatic_policy()
+            # These are generation 0/1/2, not three full collections.
+            for generation in (0, 1, 2):
+                gc.collect(generation)
+            if gc.garbage:
+                raise RuntimeError("uncollectable objects after static initialization")
+            self._automatic_policy()
+            # Mark ownership first so a failure at this boundary is unwound.
+            self.owns_freeze = True
+            gc.freeze()
+            self.frozen_count = gc.get_freeze_count()
+            self._automatic_policy()
+            if self.frozen_count <= 0:
+                raise RuntimeError("API GC freeze produced no permanent generation")
+            self.phase = "frozen"
+        except BaseException as primary:
+            self.phase = "failed"
+            if self.owns_freeze:
+                try:
+                    gc.unfreeze()
+                    self.owns_freeze = False
+                except BaseException as cleanup:
+                    primary.add_note("API GC bootstrap unfreeze failed: " + repr(cleanup))
+            raise
+
+    def enter_runtime(self) -> None:
+        self._owner()
+        self._automatic_policy()
+        if self.phase != "frozen" or not self.owns_freeze:
+            raise RuntimeError("API serving requires a fresh sealed GC epoch")
+        self.phase = "runtime"
+
+    def quiesced(self) -> None:
+        self._owner()
+        if self.phase != "runtime":
+            raise RuntimeError("API GC quiescence without an owned runtime")
+        self.phase = "quiesced"
+
+    def close(self, clear_static: Callable[[], None]) -> None:
+        self._owner()
+        if self.phase == "closed":
+            return
+        if self.phase not in {"frozen", "quiesced"}:
+            raise RuntimeError("API GC close refused: runtime not proven quiescent")
+        # No live requests, native work, RegistryServiceIO or render executor.
+        # Keep original automatic policy; unfreeze also restores eligibility
+        # of any cycle crossing the static prefix before its roots are removed.
+        try:
+            gc.unfreeze()
+            self.owns_freeze = False
+            clear_static()
+            gc.collect(2)
+            self._automatic_policy()
+        except BaseException:
+            self.phase = "failed"
+            raise
+        self.phase = "closed"
+
+
+def _api_gc_managed() -> bool:
+    return ("MINERU_CAPACITY_CONFIG_PATH" in os.environ
+            or "MINERU_CAPACITY_CONFIG_SHA256" in os.environ)
+
+
+def _initialize_api_static_models() -> None:
+    """Constructor prewarm of EXACT Hybrid keys used by 3.4.4, not PDF warmup.
+
+    _predict_layout_for_window does not pass lang; its keys are (None, bool).
+    Native forward/render/HTTP warmup remains the existing post-boot canary.
+    Objects first created by that canary stay in the collectable generations.
+    """
+    from mineru.backend.pipeline.model_init import HybridModelSingleton
+    from mineru.utils.config_reader import get_device
+    import torch
+
+    models = HybridModelSingleton()
+    for formula_enabled in (False, True):
+        models.get_model(lang=None, formula_enable=formula_enabled)
+    device = get_device()
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize(device)
+
+
+def _clear_api_static_models() -> None:
+    # Called only before a runtime was started or after its owned cleanup.
+    from mineru.backend.pipeline.model_init import (
+        AtomModelSingleton, HybridModelSingleton, PIPELINE_MODEL_INIT_LOCK,
+    )
+    with PIPELINE_MODEL_INIT_LOCK:
+        # Drop roots outside the lock; no per-request cache clearing is added.
+        retained = (tuple(HybridModelSingleton._models.values()),
+                    tuple(AtomModelSingleton._models.values()))
+        HybridModelSingleton._models.clear()
+        AtomModelSingleton._models.clear()
+    del retained
+
+
+def shutdown_pdf_render_executor_verified() -> None:
+    """Final API shutdown of the PDF render pool; every failure stays visible.
+
+    The upstream shutdown recycles best-effort: it drops the pool root, only logs
+    terminate/kill/join or executor-shutdown errors and never re-checks the
+    workers, so its return proves nothing. This runs the same terminate, grace
+    join, kill and join sequence with the upstream timeouts, keeps each error and
+    re-checks every worker it took over before returning. ``shutdown(wait=False)``
+    also drops the executor's reference to its manager thread, which can still be
+    closing queues and joining workers after they exit; that thread is taken over
+    first and must finish within the same final join bound. Recycling a failed
+    pool while serving keeps the upstream best-effort path.
+    """
+    from mineru.utils import pdf_image_tools as render
+
+    grace_seconds = render.PDF_RENDER_TERMINATE_GRACE_PERIOD_SECONDS
+    kill_join_seconds = render.PDF_RENDER_KILL_JOIN_TIMEOUT_SECONDS
+    with render._pdf_render_executor_lock:
+        executor, render._pdf_render_executor = render._pdf_render_executor, None
+    if executor is None:
+        return
+    failures: list[BaseException] = []
+    workers = list((getattr(executor, "_processes", None) or {}).values())
+    manager = getattr(executor, "_executor_manager_thread", None)
+    signalled = []
+    for worker in workers:
+        try:
+            if not worker.is_alive():
+                continue
+        except BaseException as exc:
+            failures.append(exc)
+        signalled.append(worker)
+        try:
+            worker.terminate()
+        except BaseException as exc:
+            failures.append(exc)
+    deadline = time.monotonic() + grace_seconds
+    for worker in signalled:
+        try:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        except BaseException as exc:
+            failures.append(exc)
+    for worker in signalled:
+        try:
+            if worker.is_alive():
+                worker.kill()
+        except BaseException as exc:
+            failures.append(exc)
+    for worker in signalled:
+        try:
+            if worker.is_alive():
+                worker.join(timeout=kill_join_seconds)
+        except BaseException as exc:
+            failures.append(exc)
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except BaseException as exc:
+        failures.append(exc)
+    verdicts: list[str] = []
+    if manager is not None:
+        # Settled before the workers are re-checked, since its own joins reap them.
+        try:
+            manager.join(timeout=kill_join_seconds)
+            manager_alive = manager.is_alive()
+        except BaseException as exc:
+            failures.append(exc)
+            manager_alive = True
+        if manager_alive:
+            verdicts.append("PDF render executor manager thread not proven finished")
+    unproven = 0
+    for worker in workers:
+        try:
+            if worker.is_alive():
+                unproven += 1
+        except BaseException as exc:
+            failures.append(exc)
+            unproven += 1
+    if unproven:
+        verdicts.insert(0, f"{unproven} PDF render worker(s) not proven terminated")
+    if verdicts:
+        if failures:
+            for verdict in verdicts:
+                failures[0].add_note(verdict)
+        else:
+            failures.append(RuntimeError("; ".join(verdicts)))
+    if failures:
+        for other in failures[1:]:
+            failures[0].add_note("PDF render final shutdown also failed: " + repr(other))
+        raise failures[0]
+
+
+def bootstrap_api_gc(fastapi_app: Any, *, reload: bool) -> None:
+    """CLI-only; imports of fast_api and legacy/unmanaged callers are inert."""
+    global _API_GC_EPOCH
+    if not _api_gc_managed():
+        return
+    import multiprocessing
+    import threading
+    if (sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 12)
+            or not sys.platform.startswith("linux")):
+        raise RuntimeError("managed API GC policy requires Linux CPython 3.12")
+    if (reload or multiprocessing.current_process().name != "MainProcess"
+            or threading.current_thread() is not threading.main_thread()):
+        raise RuntimeError("managed API GC requires a non-reloading main process")
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("API GC bootstrap must precede the serving event loop")
+    if _API_GC_EPOCH is not None or fastapi_app.state.task_manager is not None:
+        raise RuntimeError("API GC cannot freeze a previously started runtime")
+    if fastapi_app.state.service_config.get("enable_vlm_preload", False):
+        raise RuntimeError("managed Hybrid API must not preload a local VLM engine")
+    from mineru.cli.agent_capacity_bootstrap import get_process_capacity
+    capacity = get_process_capacity()
+    if capacity is None or capacity.api_process_limit != 1 or capacity.api_event_loop_limit != 1:
+        raise RuntimeError("API GC policy requires one process and one serving loop")
+    epoch = ApiGcEpoch()
+    _API_GC_EPOCH = epoch
+    try:
+        epoch.prepare(_initialize_api_static_models)
+        print("MINERU_GC_LIFECYCLE " + json.dumps({
+            "policy": _API_GC_POLICY, "phase": "frozen", "pid": epoch.pid,
+            "freeze_count": epoch.frozen_count, "automatic_gc": gc.isenabled(),
+            "thresholds": epoch.thresholds,
+        }, sort_keys=True), file=sys.stderr, flush=True)
+    except BaseException as primary:
+        try:
+            if epoch.phase == "frozen":
+                epoch.close(_clear_api_static_models)
+            else:
+                _clear_api_static_models()
+        except BaseException as cleanup:
+            primary.add_note("API static bootstrap cleanup failed: " + repr(cleanup))
+        raise
+
+
+def enter_api_gc_runtime() -> None:
+    if _api_gc_managed():
+        if _API_GC_EPOCH is None:
+            raise RuntimeError("managed API must start through its GC-bootstrap CLI")
+        _API_GC_EPOCH.enter_runtime()
+
+
+def mark_api_gc_quiesced() -> None:
+    if _api_gc_managed():
+        if _API_GC_EPOCH is None:
+            raise RuntimeError("API GC epoch is missing during shutdown")
+        _API_GC_EPOCH.quiesced()
+
+
+def close_api_gc() -> None:
+    if _API_GC_EPOCH is None:
+        return
+    _API_GC_EPOCH.close(_clear_api_static_models)
+    print("MINERU_GC_LIFECYCLE " + json.dumps({
+        "policy": _API_GC_POLICY, "phase": "closed", "pid": os.getpid(),
+        "automatic_gc": gc.isenabled(),
+    }, sort_keys=True), file=sys.stderr, flush=True)

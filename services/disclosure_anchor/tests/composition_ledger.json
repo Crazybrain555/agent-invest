@@ -580,6 +580,10 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_mineru_api_gc_lifecycle.py": {
+   "private_imports": [],
+   "tests": 24
+  },
   "tests/unit/test_mineru_async_append.py": {
    "private_imports": [],
    "tests": 0
