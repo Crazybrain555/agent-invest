@@ -1,0 +1,106 @@
+name: TCF Blind Forecast Alpha
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'tcf_blind/case_alpha/**'
+      - '.github/workflows/tcf_blind_forecast.yml'
+permissions:
+  contents: read
+  copilot-requests: write
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+      - name: Apply deterministic runtime hardening
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          p=Path('tcf_blind/case_alpha/run_forecast.py')
+          s=p.read_text()
+          s=s.replace('for i in range(2):', 'for i in range(3):')
+          s=s.replace("'max_tokens': 16000", "'max_tokens': 8000")
+          old="weights=forecast['mechanism_map'].get('weights', forecast['mechanism_map'])\nif not isinstance(weights,dict) or not weights: weights={'recurring-contract-software':1.0}\ns=sum(float(v) for v in weights.values()); weights={k:float(v)/s for k,v in weights.items()}"
+          new="weights=forecast['mechanism_map'].get('weights', {}) if isinstance(forecast['mechanism_map'],dict) else {}\nweights={str(k):float(v) for k,v in weights.items() if isinstance(v,(int,float)) or str(v).replace('.','',1).isdigit()}\nif not weights: weights={'recurring-contract-software':1.0}\ns=sum(weights.values()); weights={k:v/s for k,v in weights.items()}"
+          s=s.replace(old,new)
+
+          start=s.index('payload = {')
+          end=s.index('try:\n    forecast = json.loads(raw)')
+          cli_call="""prompt = system + '\\n\\nINPUT BUNDLE:\\n' + user
+          cli_root = Path('/tmp/tcf-blind-copilot')
+          cli_root.mkdir(parents=True, exist_ok=True)
+          copilot = subprocess.run([
+              'copilot', '-p', prompt, '-s',
+              '-C', str(cli_root),
+              '--no-ask-user',
+              '--no-custom-instructions',
+              '--disable-builtin-mcps',
+              '--excluded-tools=bash,list_bash,read_bash,stop_bash,write_bash,apply_patch,create,edit,view,list_agents,read_agent,task,write_agent,ask_user,glob,grep,skill,web_fetch'
+          ], capture_output=True, text=True, timeout=900)
+          if copilot.returncode != 0:
+              raise SystemExit('copilot cli failed\\n' + copilot.stderr)
+          raw = copilot.stdout.strip()
+          api = {'provider':'github-copilot-cli','model':MODEL_ID,'choices':[{'message':{'content':raw}}]}
+          """
+          cli_call='\n'.join(line[10:] if line.startswith('          ') else line for line in cli_call.splitlines())+'\n'
+          s=s[:start]+cli_call+s[end:]
+          p.write_text(s)
+
+          bundle_path=Path('tcf_blind/case_alpha/case_bundle.json')
+          bundle=json.loads(bundle_path.read_text(encoding='utf-8'))
+          blind=bundle['blind_case']
+          family_map={
+              'F1':'filing',
+              'IR1':'formal-investor-dialogue',
+              'X1':'cross-company-official',
+              'R1':'industry-research',
+              'P1':'technical-paper-standard',
+              'N1':'news-media-discovery',
+          }
+          for source in blind['sources']:
+              source_id=source['id']
+              source.setdefault('source_id', source_id)
+              source.setdefault('family', family_map[source_id])
+              source.setdefault('limitations', source.get('limits', ''))
+          blind.setdefault('independence_clusters', [
+              {'cluster':'C1','source_ids':['F1','IR1'],'note':'same-company official evidence; treat as one independence cluster'},
+              {'cluster':'C2','source_ids':['X1'],'note':'cross-company official evidence'},
+              {'cluster':'C3','source_ids':['R1','N1'],'note':'N1 traces to R1 and carries no independent weight'},
+              {'cluster':'C4','source_ids':['P1'],'note':'independent technical evidence'},
+          ])
+          bundle_path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
+          PY
+      - name: Install workbook dependency
+        run: python -m pip install --quiet xlsxwriter
+      - name: Run isolated blind forecaster
+        id: forecast
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MODEL_ID: copilot-default
+        run: |
+          mkdir -p tcf_blind/case_alpha/run_diagnostics
+          set +e
+          python tcf_blind/case_alpha/run_forecast.py > tcf_blind/case_alpha/run_diagnostics/stdout.txt 2> tcf_blind/case_alpha/run_diagnostics/stderr.txt
+          CODE=$?
+          echo "$CODE" > tcf_blind/case_alpha/run_diagnostics/exit_code.txt
+          exit $CODE
+      - name: Upload forecast and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcf-blind-alpha-forecast
+          path: |
+            tcf_blind/case_alpha/forecast_workspace
+            tcf_blind/case_alpha/raw_api_response.json
+            tcf_blind/case_alpha/run_diagnostics
+          if-no-files-found: warn
+      - name: Fail workflow when forecaster failed
+        if: steps.forecast.outcome == 'failure'
+        run: exit 1
