@@ -785,3 +785,27 @@ semantic_router.v103 → v104；semantic-taxonomy-2026-08-r64 → r65（semantic
 验证：tests/unit/test_semantic_router.py（因果片段用例表、章节键投影用例、taxonomy 计数 345）；回放存档 a-locked-overflow-replay/；
 Codex 只读复审。跟进：semantic-retrieval-query-gold.v4.json 仍 pin r64 / v101，下次检索质量评审前须重新评定。
 ```
+
+2026-09-23（R28 已接受 PDF 的 typed 暂时终态失败 → 既有 infrastructure 预算自动有限重排）——migration/public view/API 不变:
+
+```text
+Windows（新 API 镜像）：生成的 mineru_vl_utils http_client 由最终请求所有者 _ProcessAsyncRequestLimiter 在异常实例上标记
+最终 VLM chat 请求的结果（get_response_data 非 200 → 原类 ServerError、原 message 加状态码标记；最终 POST 的 httpx
+TransportError → 精确类名标记），类型、message、传播不变。agent_task_protocol_v2.task_failure_cause 只按该标记给出闭合
+mineru-task-failure-cause.v1 {schema, task_id, retry_class, code, http_status, transport_error}；registry.fail 在同一次
+_persist 写入 state=failed、原 error（mineru-task-failure.v1 不变）与 failure_cause；ACK 消费时清除，quiescent 根不得含有；
+v3 记录仅在存在时编码该键（其余记录字节不变，registry schema 仍 v3，旧 reader 对未 ACK 的 typed failed 记录 fail closed）。
+build_status_payload 在 protocol_state 旁投影 failure_cause（仅 status=failed）。
+Mac：protocol_v2_wire 在 TASK_PAYLOAD_FIELDS_V2 增加可选闭合字段 failure_cause，仅允许在 failed 上出现，校验 schema、task_id、
+code 形状，并用 remote_provider_v4.provider_failure_retry_class_v4 复算 retry_class，任何漂移/未知版本或 code 为协议违约（不进
+可重试分支）；TaskProtocolV2Observation 不变。RemoteProviderFailedV4 新增可选 failure_cause（RemoteProviderFailureCauseV4，
+在 wire 解析处与 remote_task_identity 及同一状态响应字节的 sha256/字节数绑定，wire JSON 仍为 6 个字段）。只按最终 POST 的最终
+观察结果分类，不宣称内层 httpx-retries 已耗尽。后端：outcome 任务身份须等于 accepted；缺失 → 与原来逐字节相同的 provider_terminal_failure/
+provider_terminal/retryable=false；transient（429/502/503/504、ConnectError/ConnectTimeout/ReadTimeout/WriteTimeout/PoolTimeout）
+→ provider_terminal_transient_failure/infrastructure/retryable=true；其余 typed → provider_terminal_failure/provider_terminal，
+message = "<descriptor>; response <sha256>; provider error: <原文>"（≤4096）。FailureReceiptV4、TerminalReceiptV4、
+processing_run.error 键集合、outbox 事件形状、change_event 契约不变，只是 V4 首次写入既有值 retry_budget_class=infrastructure
+与新 error_code 值。失败仍经 receipt → cleanup → ACK → 终态 failed run；之后才由普通 pending_parse 以新 attempt/fence/key
+重排，上限为既有 item<max_retries、item+infrastructure<5×max_retries（默认 15），跨重启计数，失败 run 不改写。
+部署：先 Mac worker 再 Windows API 镜像（patcher 与 task protocol 源码哈希、镜像身份变化，需要走原发布/资格链）。
+```

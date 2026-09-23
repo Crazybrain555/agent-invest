@@ -238,6 +238,14 @@ blocks it as unverified. This check precedes restoring any old deployment
 files or tag. Operator writer exclusion must span the entire operation,
 including already-issued requests still in multipart/Form processing.
 
+A v3 record may also carry the closed, task-bound `failure_cause`
+(`mineru-task-failure-cause.v1`), written in the same transaction as
+`state=failed` and only while a failed task awaits ACK; consumption clears it
+and a quiescent root may not contain it. The key is encoded only when present,
+so every other record keeps its exact prior v3 bytes: an executable from before
+the field reads a drained registry but fails closed on a pending typed failure.
+v2 records never carry it.
+
 After FastAPI has parsed the Form, but before creating an API-owned directory
 or awaiting upload copies, new keyed ingress reserves durable nonterminal
 capacity atomically. Existing keys reconcile their original task/attempt/fence

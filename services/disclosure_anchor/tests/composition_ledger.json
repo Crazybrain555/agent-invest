@@ -72,6 +72,10 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/integration/test_provider_terminal_retry_independent.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/integration/test_public_views_content.py": {
    "private_imports": [],
    "tests": 14
@@ -391,6 +395,10 @@
   "tests/unit/test_integration_db_safety.py": {
    "private_imports": [],
    "tests": 16
+  },
+  "tests/unit/test_integration_runner_staged_env_independent.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_linux_resident_host_sampler.py": {
    "private_imports": [],
@@ -1007,6 +1015,10 @@
   "tests/unit/test_provider_table_projection.py": {
    "private_imports": [],
    "tests": 11
+  },
+  "tests/unit/test_provider_terminal_retry_independent.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],

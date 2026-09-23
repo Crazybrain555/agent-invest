@@ -52,6 +52,25 @@ each decision as the outcome of the latest provider parse run after it (released
 resolved); any unresolved decision older than a day warns, and a failed diagnostic is a check failure, never a
 quiet zero.
 
+An accepted task that ends `failed` is a `provider_terminal` contract failure unless the provider recorded a typed
+transient cause. The cause is typed where it happens: the generated MinerU http client marks the exception that
+leaves the one final VLM chat request (HTTP 429/502/503/504 seen by `get_response_data`, or an exact
+`ConnectError`/`ConnectTimeout`/`ReadTimeout`/`WriteTimeout`/`PoolTimeout` raised by that POST). Only the final
+observed outcome is classified; it does not prove that the inner httpx-retries budget was used (a response-body
+`ReadTimeout` is raised once, after the transport returned), and no further retry layer is added. The task
+registry commits `state=failed`, the unchanged `error` and the closed `mineru-task-failure-cause.v1` object in one
+write, and the status payload projects it beside `protocol_state`. Upstream reuses `ServerError` for status and
+content errors, so class names and message text are never evidence; content/parse errors, other statuses or
+transport errors, OOM, cancellation, finalizer or model-probe failures, a later secondary failure on the same
+exception, an absent field (older API or record), an unknown version or code, and a class that disagrees with the
+closed table are never automatic. Only a proven transient cause becomes
+`provider_terminal_transient_failure` with `retryable=true` and `retry_budget_class=infrastructure`, charged to the
+existing ceiling of `5 * max_retries` (15 by default) item-plus-infrastructure failed runs per document. The attempt
+still records its failure receipt, cleans up and ACKs under the same responsibility; only after the final failed
+run commits can the ordinary `pending_parse` scan admit a new attempt with a new fence and request key. Every failed
+run and its typed message (cause descriptor, status response hash, original provider error) is kept. An unknown POST
+outcome is unaffected: it keeps reconciling the same key.
+
 Valid promoted output replays exactly. Invalid promoted output, including a markerless response-loss tree,
 is contained by no-replace output→staging rename under the existing resource lock and claim guard, pinned
 root identity and parent fsync, then stops with ownership unresolved. Simultaneous paths, root substitution

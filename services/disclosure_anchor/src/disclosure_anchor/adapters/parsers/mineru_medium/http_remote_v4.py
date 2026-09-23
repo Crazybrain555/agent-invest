@@ -33,6 +33,7 @@ from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
     normalize_api_origin_v2,
     parse_result_lease_v2,
     parse_task_payload_v2,
+    parse_task_payload_with_failure_cause_v2,
     response_identity_v2,
     result_lease_url_v2,
     submission_form_v2,
@@ -369,7 +370,7 @@ class MinerUHttpRemoteV4:
                 f"MinerU V4 status returned HTTP {status_code}"
             )
         try:
-            observation = parse_task_payload_v2(
+            observation, failure_cause = parse_task_payload_with_failure_cause_v2(
                 exact,
                 api_origin=api_origin,
                 idempotency_key=intent.client_submit_key,
@@ -401,6 +402,7 @@ class MinerUHttpRemoteV4:
                 ),
                 response_sha256=response_sha256,
                 response_byte_count=response_bytes,
+                failure_cause=failure_cause,
             )
         if observation.status != "completed":
             raise RemoteProviderProtocolErrorV4(

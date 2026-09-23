@@ -30,12 +30,23 @@ from tests.integration._support import pinned_database_environment
 
 
 _SERVICE_ROOT = Path(__file__).resolve().parents[2]
-_MINERU_RUNTIME_ENV_KEYS = (
-    "DISCLOSURE_MINERU_BIN",
-    "DISCLOSURE_MINERU_BACKEND",
-    "DISCLOSURE_MINERU_API_URL",
-    "DISCLOSURE_MINERU_OBSERVABILITY_URL",
-    "DISCLOSURE_MINERU_INFERENCE_UPSTREAM_URL",
+_MINERU_RUNTIME_ENV_PREFIXES = (
+    "DISCLOSURE_MINERU_",
+    "DISCLOSURE_V4_",
+    "DISCLOSURE_GPU_",
+    "DISCLOSURE_DCGM_",
+    "WORKER_GPU_",
+    "WORKER_MINERU_",
+)
+_MINERU_RUNTIME_ENV_KEYS = frozenset(
+    {
+        "WORKER_PARSE_EXECUTION_MODE",
+        "WORKER_PARSE_CONCURRENCY",
+        "MINERU_PROCESSING_WINDOW_SIZE",
+        "MINERU_MODEL_CACHE",
+        "HF_HOME",
+        "MODELSCOPE_CACHE",
+    }
 )
 
 class ScratchIntegrationDatabase(ManagedScratchDatabase):
@@ -92,8 +103,17 @@ class ScratchIntegrationDatabase(ManagedScratchDatabase):
             }
         )
         if not self._real_mineru:
-            for key in _MINERU_RUNTIME_ENV_KEYS:
-                environment.pop(key, None)
+            # Serving configuration is one coupled unit: leaving an attested
+            # capacity/stream profile after removing its endpoints makes even
+            # scratch migrations fail settings validation. Drop the complete
+            # serving namespace, including case-insensitive Settings aliases,
+            # while preserving unrelated business and retry policy settings.
+            environment = {
+                key: value
+                for key, value in environment.items()
+                if key.upper() not in _MINERU_RUNTIME_ENV_KEYS
+                and not key.upper().startswith(_MINERU_RUNTIME_ENV_PREFIXES)
+            }
             # MinerU has a PATH fallback when its explicit binary is absent.
             # A known-missing scratch path makes accidental parser execution
             # fail locally instead of reaching the resident GPU service.

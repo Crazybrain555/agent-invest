@@ -660,6 +660,29 @@ receipt 把三件事分开，不给单一的「成功」：`decision_recorded`�
 `contract-class parse failures without requeue decision` 只看队列会考虑的文档（status 为 registered / parse_failed），
 已发布的文档不算积压。诊断 SQL 本身失败时报 FAIL，不会静默报 0。
 
+### 5.2 已接受 PDF 的暂时性终态失败：自动有限重排
+
+staged V4 下，Windows API 已接受的任务以 `failed` 结束时，默认仍是上一节的 `provider_terminal`（不自动重试）。唯一例外：
+API 在失败发生处给出了 typed 暂时原因——VLM 最终 chat 请求最终观察到的结果是 HTTP 429/502/503/504，或该 POST 抛出
+`ConnectError/ConnectTimeout/ReadTimeout/WriteTimeout/PoolTimeout`。只按这个最终结果分类，不代表内层 httpx-retries
+已用完（响应体读取超时在 transport 返回后只发生一次、不经内层重试），也不新增重试层。该事实与 failed 状态、原 `error` 同一次写入 registry，
+经状态接口的 `failure_cause`（`mineru-task-failure-cause.v1`）送到 Mac。此时失败 run 记为
+`error_code=provider_terminal_transient_failure`、`retryable=true`、`retry_budget_class=infrastructure`，message 以
+`mineru-task-failure-cause.v1:transient:<code>:<status|错误类>` 开头，附状态响应 sha256 和原 provider error。
+
+- 顺序不变：失败 receipt → 本地清理 → ACK → 失败 run 终态；之后普通 worker 扫描 `pending_parse` 才会给新 attempt/fence/key。
+  失败处理本身从不 POST；POST 结果不明仍按原 key 对账，不换 key。
+- 上限沿用既有计数：infrastructure 只计入合计上限 `5 × max_retries`（默认同一文档 15 个 item+infrastructure 失败 run），
+  item 失败另受 3 次上限；计数来自保留的失败 run，重启/重排不清零。耗尽后进入 doctor `parse dead letters`，按上表处置；
+  infrastructure 不是 `parse-requeue` 可放行类，命令会拒绝。
+- 不会自动重排：解析/内容错误、其他 HTTP 状态或传输错误（含 ReadError、RemoteProtocolError）、OOM/资源、取消、
+  finalizer 失败、同一异常上后来附加的清理失败、字段缺失（旧 API/旧记录）、未知版本或未知 code。这些仍按 5.1 值守处理，
+  且按错误文本（包括 "timeout"）判断暂时性一律无效。
+- 长时间推理服务故障且队列很短时，文档可能较快用完合计上限；排查以失败 run 的 message 与 doctor 为准，恢复后用 `make process`。
+- 部署顺序：先部署能识别该可选字段的 Mac worker，再部署新 API 镜像；旧 Mac 会把带 `failure_cause` 的 failed 状态当协议违约
+  （仍清理并 ACK，不自动重试）。新 API 的 registry 只有在 typed failed 任务尚未 ACK 时才含该字段；旧 API 可读已排空的
+  registry，遇到未 ACK 的 typed failed 记录会 fail closed，回滚前先让 Mac ACK 完。
+
 ## 6. TCC / launchd 假死
 
 worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_worker_once.sh` 头部注释）。

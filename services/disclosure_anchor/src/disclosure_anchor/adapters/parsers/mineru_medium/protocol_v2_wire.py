@@ -19,11 +19,16 @@ from urllib.parse import SplitResult, quote, urljoin, urlsplit
 
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.remote_provider_v4 import (
+    PROVIDER_FAILURE_CAUSE_V1,
+    RemoteProviderFailureCauseV4,
+)
 
 TASK_PROTOCOL_V2 = "mineru-task-protocol.v2"
 RETAINED_RESULT_V1 = "mineru-retained-result.v1"
 STAGED_REQUEST_V2 = "mineru-staged-request.v2"
 TASK_LOOKUP_REQUEST_V1 = "mineru-task-lookup-request.v1"
+TASK_FAILURE_CAUSE_V1 = PROVIDER_FAILURE_CAUSE_V1
 MAX_WIRE_JSON_BYTES = 1024 * 1024
 
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -81,7 +86,11 @@ TASK_PAYLOAD_FIELDS_V2 = frozenset(
         "result_artifact_bytes",
         "result_artifact_owner",
         "protocol_state",
+        "failure_cause",
     }
+)
+TASK_FAILURE_CAUSE_FIELDS_V1 = frozenset(
+    {"schema", "task_id", "retry_class", "code", "http_status", "transport_error"}
 )
 
 
@@ -375,6 +384,33 @@ def parse_task_payload_v2(
     expected_result_url: str | None = None,
     artifact_byte_limit: int | None = None,
 ) -> TaskProtocolV2Observation:
+    observation, _failure_cause = parse_task_payload_with_failure_cause_v2(
+        exact_bytes,
+        api_origin=api_origin,
+        idempotency_key=idempotency_key,
+        attempt_identity=attempt_identity,
+        fence_identity=fence_identity,
+        expected_task_id=expected_task_id,
+        expected_status_url=expected_status_url,
+        expected_result_url=expected_result_url,
+        artifact_byte_limit=artifact_byte_limit,
+    )
+    return observation
+
+
+def parse_task_payload_with_failure_cause_v2(
+    exact_bytes: bytes,
+    *,
+    api_origin: str,
+    idempotency_key: str,
+    attempt_identity: str,
+    fence_identity: str,
+    expected_task_id: str | None = None,
+    expected_status_url: str | None = None,
+    expected_result_url: str | None = None,
+    artifact_byte_limit: int | None = None,
+) -> tuple[TaskProtocolV2Observation, RemoteProviderFailureCauseV4 | None]:
+    """Parse one closed status payload and the typed cause of a failed task."""
     payload = decode_closed_json_v2(
         exact_bytes,
         required=frozenset(
@@ -496,7 +532,19 @@ def parse_task_payload_v2(
     if status == "failed" and not error:
         error = "MinerU remote task failed without provider detail"
     _validate_optional_task_fields_v2(payload)
-    return TaskProtocolV2Observation(
+    failure_cause: RemoteProviderFailureCauseV4 | None = None
+    raw_failure_cause = payload.get("failure_cause")
+    if raw_failure_cause is not None:
+        if status != "failed":
+            raise MinerUProtocolV2WireError("non-failed task carries a failure cause")
+        response_sha256, response_byte_count = response_identity_v2(exact_bytes)
+        failure_cause = decode_task_failure_cause_v2(
+            raw_failure_cause,
+            task_id=task_id,
+            response_sha256=response_sha256,
+            response_byte_count=response_byte_count,
+        )
+    observation = TaskProtocolV2Observation(
         task_id=task_id,
         status=status,
         protocol_state=protocol_state,
@@ -510,6 +558,36 @@ def parse_task_payload_v2(
         artifact_owner_identity=artifact_owner,
         provider_error=error,
     )
+    return observation, failure_cause
+
+
+def decode_task_failure_cause_v2(
+    value: object,
+    *,
+    task_id: str,
+    response_sha256: str,
+    response_byte_count: int,
+) -> RemoteProviderFailureCauseV4:
+    """Accept only the closed cause bound to its task and exact status response."""
+    if type(value) is not dict or set(value) != TASK_FAILURE_CAUSE_FIELDS_V1:
+        raise MinerUProtocolV2WireError("task failure cause fields are not closed")
+    if value["task_id"] != task_id:
+        raise MinerUProtocolV2WireError("task failure cause identity drifted")
+    try:
+        return RemoteProviderFailureCauseV4(
+            remote_task_identity=value["task_id"],
+            response_sha256=response_sha256,
+            response_byte_count=response_byte_count,
+            retry_class=value["retry_class"],
+            code=value["code"],
+            http_status=value["http_status"],
+            transport_error=value["transport_error"],
+            schema=value["schema"],
+        )
+    except ValueError as exc:
+        raise MinerUProtocolV2WireError(
+            "task failure cause is outside the closed contract"
+        ) from exc
 
 
 def parse_result_lease_v2(
@@ -642,6 +720,8 @@ __all__ = [
     "RETAINED_RESULT_V1",
     "ResultLeaseV2",
     "STAGED_REQUEST_V2",
+    "TASK_FAILURE_CAUSE_FIELDS_V1",
+    "TASK_FAILURE_CAUSE_V1",
     "TASK_LOOKUP_REQUEST_V1",
     "TASK_PAYLOAD_FIELDS_V2",
     "TASK_PROTOCOL_V2",
@@ -650,10 +730,12 @@ __all__ = [
     "canonical_client_submit_key_v2",
     "canonical_result_owner_v2",
     "decode_closed_json_v2",
+    "decode_task_failure_cause_v2",
     "lookup_request_exact_bytes_v2",
     "normalize_api_origin_v2",
     "parse_result_lease_v2",
     "parse_task_payload_v2",
+    "parse_task_payload_with_failure_cause_v2",
     "response_identity_v2",
     "result_lease_url_v2",
     "same_origin_url_v2",

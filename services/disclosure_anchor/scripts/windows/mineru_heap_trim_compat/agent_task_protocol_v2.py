@@ -82,6 +82,129 @@ class TaskRegistryPersistenceError(OSError):
         )
 
 
+TASK_FAILURE_CAUSE_SCHEMA = "mineru-task-failure-cause.v1"
+# The generated http_client's final-request owner attaches this literal marker
+# to the exception instance that left the VLM request; nothing else is evidence.
+VLM_REQUEST_FAILURE_ATTRIBUTE = "_agent_vlm_request_failure"
+VLM_REQUEST_FAILURE_SCHEMA = "mineru-vlm-request-failure.v1"
+TRANSIENT_VLM_HTTP_STATUSES = frozenset({429, 502, 503, 504})
+TRANSIENT_VLM_TRANSPORT_ERRORS = frozenset(
+    {"ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"}
+)
+VLM_TRANSPORT_ERRORS = TRANSIENT_VLM_TRANSPORT_ERRORS | frozenset(
+    {
+        "ReadError",
+        "WriteError",
+        "CloseError",
+        "RemoteProtocolError",
+        "LocalProtocolError",
+        "ProxyError",
+        "UnsupportedProtocol",
+        "TransportError",
+    }
+)
+_TASK_FAILURE_CAUSE_FIELDS = frozenset(
+    {"schema", "task_id", "retry_class", "code", "http_status", "transport_error"}
+)
+
+
+def _vlm_http_status_retry_class(status: int) -> str:
+    if status in TRANSIENT_VLM_HTTP_STATUSES:
+        return "transient"
+    if 400 <= status <= 499 and status not in {408, 425}:
+        return "permanent"
+    return "unknown"
+
+
+def _exception_note_count(failure: BaseException) -> int:
+    notes = getattr(failure, "__notes__", None)
+    return len(notes) if type(notes) is list else 0
+
+
+def task_failure_cause(failure: BaseException, *, task_id: str) -> dict[str, Any]:
+    """Classify one terminal task failure from its typed request origin only.
+
+    Messages and exception classes are never evidence. A marker whose explicit
+    cause or notes changed after the request owner set it now also carries a
+    later secondary failure, so it no longer proves a transient request outcome.
+    """
+    cause: dict[str, Any] = {
+        "schema": TASK_FAILURE_CAUSE_SCHEMA,
+        "task_id": task_id,
+        "retry_class": "unknown",
+        "code": "unclassified",
+        "http_status": None,
+        "transport_error": None,
+    }
+    marker = getattr(failure, VLM_REQUEST_FAILURE_ATTRIBUTE, None)
+    if (
+        type(marker) is not tuple
+        or len(marker) != 5
+        or type(marker[0]) is not str
+        or marker[0] != VLM_REQUEST_FAILURE_SCHEMA
+        or type(marker[4]) is not int
+        or failure.__cause__ is not marker[3]
+        or _exception_note_count(failure) != marker[4]
+    ):
+        return cause
+    kind, detail = marker[1], marker[2]
+    if (
+        kind == "http_status"
+        and type(detail) is int
+        and 100 <= detail <= 599
+        and detail != 200
+    ):
+        return {
+            **cause,
+            "retry_class": _vlm_http_status_retry_class(detail),
+            "code": "vlm_http_status",
+            "http_status": detail,
+        }
+    if kind == "transport" and type(detail) is str and detail in VLM_TRANSPORT_ERRORS:
+        return {
+            **cause,
+            "retry_class": (
+                "transient" if detail in TRANSIENT_VLM_TRANSPORT_ERRORS else "unknown"
+            ),
+            "code": "vlm_transport_error",
+            "transport_error": detail,
+        }
+    return cause
+
+
+def validate_task_failure_cause(value: object, *, task_id: str) -> dict[str, Any]:
+    """Return one closed, task-bound failure cause or refuse it."""
+    if type(value) is not dict or set(value) != _TASK_FAILURE_CAUSE_FIELDS:
+        raise TaskProtocolConflict("task failure cause fields are not closed")
+    if value["schema"] != TASK_FAILURE_CAUSE_SCHEMA or value["task_id"] != task_id:
+        raise TaskProtocolConflict("task failure cause identity is invalid")
+    code = value["code"]
+    status = value["http_status"]
+    transport = value["transport_error"]
+    if (
+        code == "vlm_http_status"
+        and type(status) is int
+        and 100 <= status <= 599
+        and status != 200
+        and transport is None
+    ):
+        expected = _vlm_http_status_retry_class(status)
+    elif (
+        code == "vlm_transport_error"
+        and status is None
+        and type(transport) is str
+        and transport in VLM_TRANSPORT_ERRORS
+    ):
+        expected = "transient" if transport in TRANSIENT_VLM_TRANSPORT_ERRORS else "unknown"
+    elif code == "unclassified" and status is None and transport is None:
+        expected = "unknown"
+    else:
+        raise TaskProtocolConflict("task failure cause code shape is invalid")
+    if value["retry_class"] != expected:
+        raise TaskProtocolConflict("task failure cause retry class drifted")
+    return value
+
+
 @dataclass(slots=True)
 class DurableTaskRecord:
     idempotency_key: str
@@ -102,6 +225,7 @@ class DurableTaskRecord:
     consumed_at_unix: float | None = None
     cleanup_kind: CleanupKind | None = None
     ingress_owner: dict[str, Any] | None = None
+    failure_cause: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for value in (
@@ -213,6 +337,13 @@ class DurableTaskRecord:
             has_result_identity or self.result_path is not None
         ):
             raise TaskProtocolConflict("task-tree cleanup carried result identity")
+        if self.failure_cause is not None:
+            validate_task_failure_cause(self.failure_cause, task_id=self.task_id)
+            if not (
+                self.state == "failed"
+                or (self.state == "cleanup_pending" and self.cleanup_kind == "task_tree")
+            ):
+                raise TaskProtocolConflict("task failure cause escaped its failed state")
         if self.state == "consumed" and any(value is not None for value in identities) != has_result_identity:
             raise TaskProtocolConflict("consumed result identity is incomplete")
         if (
@@ -273,6 +404,14 @@ def admission_counts(
             for r in counted
         ),
     }
+
+
+def registry_record_payload(record: DurableTaskRecord) -> dict[str, Any]:
+    """Encode one record; without a failure cause the v3 bytes stay unchanged."""
+    payload = asdict(record)
+    if payload["failure_cause"] is None:
+        del payload["failure_cause"]
+    return payload
 
 
 class DurableTaskRegistry:
@@ -1035,15 +1174,27 @@ class DurableTaskRegistry:
         del self._records[key]
         self._persist()
 
-    def fail(self, idempotency_key: str, *, error: str) -> None:
+    def fail(
+        self,
+        idempotency_key: str,
+        *,
+        error: str,
+        failure_cause: dict[str, Any] | None = None,
+    ) -> None:
+        """Commit the terminal failure, its original error and typed cause at once."""
         if not error.strip():
             raise ValueError("task failure must be visible")
         with self._lock:
             record = self._required(idempotency_key)
             if record.state not in {"pending", "processing", "finalizing"}:
                 raise TaskProtocolConflict("terminal task cannot fail again")
+            if failure_cause is not None:
+                failure_cause = validate_task_failure_cause(
+                    copy.deepcopy(failure_cause), task_id=record.task_id
+                )
             record.state = "failed"
             record.error = error
+            record.failure_cause = failure_cause
             self._persist()
 
     def acknowledge_terminal_intent(self, idempotency_key: str) -> str:
@@ -1347,6 +1498,7 @@ class DurableTaskRegistry:
         record.task_payload = None
         record.lease_until_unix = None
         record.error = None
+        record.failure_cause = None
         record.reserved_result_bytes = 0
         record.state = "consumed"
         record.consumed_at_unix = self._clock()
@@ -1645,11 +1797,17 @@ class DurableTaskRegistry:
         records = payload.get("records")
         if not isinstance(records, list) or len(records) > _MAX_RECORDS + _MAX_TOMBSTONES:
             raise TaskProtocolConflict("task registry records are invalid")
-        expected = {item.name for item in fields(DurableTaskRecord)}
+        # A v3 record carries failure_cause only while a typed failed task awaits
+        # ACK; every other record keeps the exact pre-cause v3 field set.
+        expected = {item.name for item in fields(DurableTaskRecord)} - {"failure_cause"}
         legacy = payload["schema"] == "mineru-task-registry.v2"
         if legacy:
             expected -= {"ingress_owner"}
-        if any(not isinstance(item, dict) or set(item) != expected for item in records):
+        allowed = expected if legacy else expected | {"failure_cause"}
+        if any(
+            not isinstance(item, dict) or not expected <= set(item) <= allowed
+            for item in records
+        ):
             raise TaskProtocolConflict("task registry record fields are not closed")
         loaded = {}
         task_ids = set()
@@ -1665,7 +1823,7 @@ class DurableTaskRegistry:
                 or record.consumed_at_unix < 0
                 or any(value is not None for value in (
                     record.result_path, record.task_payload, record.lease_until_unix,
-                    record.error, record.cleanup_kind,
+                    record.error, record.cleanup_kind, record.failure_cause,
                 ))
             ):
                 raise TaskProtocolConflict("output registry still owns task resources")
@@ -2357,7 +2515,7 @@ class DurableTaskRegistry:
                     },
                     "submission_watermark_bucket": self._submission_watermark_bucket,
                     "records": [
-                        asdict(record)
+                        registry_record_payload(record)
                         for record in sorted(
                             self._records.values(), key=lambda item: item.idempotency_key
                         )
@@ -2781,8 +2939,11 @@ class SplitTaskExecutor:
                     sort_keys=True,
                     separators=(",", ":"),
                 )
+                failure_cause = task_failure_cause(exc, task_id=record.task_id)
                 try:
-                    await write(registry.fail, key, error=failure)
+                    await write(
+                        registry.fail, key, error=failure, failure_cause=failure_cause
+                    )
                 except BaseException as persistence_error:
                     persistence_error.add_note(
                         "original parse/finalize failure: " + type(exc).__name__[:64]

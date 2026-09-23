@@ -37,6 +37,27 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_INT = (1 << 63) - 1
 
+PROVIDER_FAILURE_CAUSE_V1 = "mineru-task-failure-cause.v1"
+ProviderFailureRetryClassV4 = Literal["transient", "permanent", "unknown"]
+# The only table that can make an accepted-task failure automatically
+# retryable: a final inference-request outcome typed where it happened.
+TRANSIENT_PROVIDER_HTTP_STATUSES_V4 = frozenset({429, 502, 503, 504})
+TRANSIENT_PROVIDER_TRANSPORT_ERRORS_V4 = frozenset(
+    {"ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout"}
+)
+PROVIDER_TRANSPORT_ERRORS_V4 = TRANSIENT_PROVIDER_TRANSPORT_ERRORS_V4 | frozenset(
+    {
+        "ReadError",
+        "WriteError",
+        "CloseError",
+        "RemoteProtocolError",
+        "LocalProtocolError",
+        "ProxyError",
+        "UnsupportedProtocol",
+        "TransportError",
+    }
+)
+
 
 class PinnedSnapshotSourceV4(Protocol):
     """Opaque, claim-bound stream issued by the sole V4 scratch-root owner."""
@@ -265,12 +286,87 @@ class RemoteProviderCompletedV4:
         )
 
 
+def provider_failure_retry_class_v4(
+    *,
+    code: str,
+    http_status: int | None,
+    transport_error: str | None,
+) -> ProviderFailureRetryClassV4:
+    """Derive the retry class of one closed provider failure fact."""
+    if (
+        code == "vlm_http_status"
+        and type(http_status) is int
+        and 100 <= http_status <= 599
+        and http_status != 200
+        and transport_error is None
+    ):
+        if http_status in TRANSIENT_PROVIDER_HTTP_STATUSES_V4:
+            return "transient"
+        if 400 <= http_status <= 499 and http_status not in {408, 425}:
+            return "permanent"
+        return "unknown"
+    if (
+        code == "vlm_transport_error"
+        and http_status is None
+        and type(transport_error) is str
+        and transport_error in PROVIDER_TRANSPORT_ERRORS_V4
+    ):
+        if transport_error in TRANSIENT_PROVIDER_TRANSPORT_ERRORS_V4:
+            return "transient"
+        return "unknown"
+    if code == "unclassified" and http_status is None and transport_error is None:
+        return "unknown"
+    raise ValueError("remote provider failure cause is outside the closed table")
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteProviderFailureCauseV4:
+    """Typed cause the provider recorded with one failed task.
+
+    It is bound to the task and to the exact status response it was read from,
+    so it cannot be carried onto another task or observation.
+    """
+
+    remote_task_identity: str
+    response_sha256: str
+    response_byte_count: int
+    retry_class: ProviderFailureRetryClassV4
+    code: str
+    http_status: int | None
+    transport_error: str | None
+    schema: str = PROVIDER_FAILURE_CAUSE_V1
+
+    def __post_init__(self) -> None:
+        if type(self.schema) is not str or self.schema != PROVIDER_FAILURE_CAUSE_V1:
+            raise ValueError("remote provider failure cause version is unsupported")
+        _identity(self.remote_task_identity, "failure cause task")
+        _response_identity(self.response_sha256, self.response_byte_count)
+        if type(self.retry_class) is not str or self.retry_class != (
+            provider_failure_retry_class_v4(
+                code=self.code,
+                http_status=self.http_status,
+                transport_error=self.transport_error,
+            )
+        ):
+            raise ValueError("remote provider failure cause class drifted")
+
+    @property
+    def descriptor(self) -> str:
+        detail = (
+            str(self.http_status)
+            if self.http_status is not None
+            else self.transport_error or "-"
+        )
+        return f"{self.schema}:{self.retry_class}:{self.code}:{detail}"
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteProviderFailedV4:
     remote_task_identity: str
     provider_error: str = field(repr=False)
     response_sha256: str
     response_byte_count: int
+    failure_cause: RemoteProviderFailureCauseV4 | None = None
 
     def __post_init__(self) -> None:
         _identity(self.remote_task_identity, "failed remote task")
@@ -281,6 +377,15 @@ class RemoteProviderFailedV4:
         ):
             raise ValueError("remote provider failure message is invalid")
         _response_identity(self.response_sha256, self.response_byte_count)
+        if self.failure_cause is not None and (
+            type(self.failure_cause) is not RemoteProviderFailureCauseV4
+            or self.failure_cause.remote_task_identity != self.remote_task_identity
+            or self.failure_cause.response_sha256 != self.response_sha256
+            or self.failure_cause.response_byte_count != self.response_byte_count
+        ):
+            raise ValueError(
+                "remote provider failure cause is not bound to its task response"
+            )
 
 
 RemoteProviderPollOutcomeV4 = (
@@ -333,10 +438,14 @@ def _response_identity(sha256: str, byte_count: int) -> None:
 
 __all__ = [
     "AcceptedProviderSubmissionV4",
+    "PROVIDER_FAILURE_CAUSE_V1",
+    "PROVIDER_TRANSPORT_ERRORS_V4",
     "PinnedSnapshotSourceV4",
+    "ProviderFailureRetryClassV4",
     "RemotePollCommandV4",
     "RemoteProviderCompletedV4",
     "RemoteProviderFailedV4",
+    "RemoteProviderFailureCauseV4",
     "RemoteProviderPollOutcomeV4",
     "RemoteProviderProtocolErrorV4",
     "RemoteProviderUnavailableV4",
@@ -345,4 +454,7 @@ __all__ = [
     "RemoteProviderWaitingV4",
     "RemoteSubmissionAmbiguousV4",
     "RemoteSubmissionCommandV4",
+    "TRANSIENT_PROVIDER_HTTP_STATUSES_V4",
+    "TRANSIENT_PROVIDER_TRANSPORT_ERRORS_V4",
+    "provider_failure_retry_class_v4",
 ]

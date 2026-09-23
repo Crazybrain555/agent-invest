@@ -980,23 +980,57 @@ class DurableStagedCoordinatorBackendV4:
             )
         if type(outcome) is not RemoteProviderFailedV4:
             raise ValueError("provider poll returned a forged V4 outcome")
+        failure = self._provider_terminal_failure(outcome, accepted)
         stage_guard.note(
             "remote_terminal_failed", fence_identity=accepted.fence_identity,
             remote_task_identity_sha256=remote_task_identity_sha256(outcome.remote_task_identity),
-            error_code="provider_terminal_failure",
+            error_code=failure.error_code,
         )
         return self._fail_attempt(
             work,
             authority,
             outcome="remote_failure",
-            error=ExpectedV4AttemptFailure(
-                error_code="provider_terminal_failure",
-                message=outcome.provider_error,
-                retry_budget_class="provider_terminal",
-            ),
+            error=failure,
             error_stage="poll",
             credit_allowance=credit_allowance,
             stage_guard=stage_guard,
+        )
+
+    @staticmethod
+    def _provider_terminal_failure(
+        outcome: RemoteProviderFailedV4,
+        accepted: AcceptedSubmissionReceiptV4,
+    ) -> ExpectedV4AttemptFailure:
+        """Classify one accepted-task failure; only a proven transient cause retries.
+
+        A transient cause is charged to the existing infrastructure budget. The
+        attempt still closes through cleanup and ACK; only the ordinary queue can
+        later admit a new attempt, fence and request key.
+        """
+        if outcome.remote_task_identity != accepted.remote_task_identity:
+            raise ValueError("provider failure is not bound to the accepted task")
+        cause = outcome.failure_cause
+        if cause is None:
+            return ExpectedV4AttemptFailure(
+                error_code="provider_terminal_failure",
+                message=outcome.provider_error,
+                retry_budget_class="provider_terminal",
+            )
+        message = (
+            f"{cause.descriptor}; response {outcome.response_sha256}; "
+            f"provider error: {outcome.provider_error}"
+        )[:4096]
+        if cause.retry_class == "transient":
+            return ExpectedV4AttemptFailure(
+                error_code="provider_terminal_transient_failure",
+                message=message,
+                retryable=True,
+                retry_budget_class="infrastructure",
+            )
+        return ExpectedV4AttemptFailure(
+            error_code="provider_terminal_failure",
+            message=message,
+            retry_budget_class="provider_terminal",
         )
 
     def _remote_runaway_failure(

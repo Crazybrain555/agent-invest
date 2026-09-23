@@ -2021,6 +2021,43 @@ class _ProcessAsyncRequestLimiter:
             _PROCESS_ASYNC_REQUEST_STATS["active"] -= 1
         self.semaphore.release()
 
+    # The final request owner types its own terminal outcome on the exception
+    # instance. mineru.cli.agent_task_protocol_v2 validates this literal marker;
+    # the exception type, message and propagation stay unchanged.
+    FAILURE_ATTRIBUTE = "_agent_vlm_request_failure"
+    FAILURE_SCHEMA = "mineru-vlm-request-failure.v1"
+    TRANSPORT_FAILURES = (
+        "ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout",
+        "ReadError", "WriteError", "CloseError", "RemoteProtocolError",
+        "LocalProtocolError", "ProxyError", "UnsupportedProtocol",
+    )
+
+    @classmethod
+    def _mark_request_failure(cls, failure, kind, detail):
+        notes = getattr(failure, "__notes__", None)
+        setattr(failure, cls.FAILURE_ATTRIBUTE, (
+            cls.FAILURE_SCHEMA, kind, detail, failure.__cause__,
+            len(notes) if type(notes) is list else 0,
+        ))
+        return failure
+
+    @classmethod
+    def type_final_post_failure(cls, failure):
+        """Mark only an httpx transport failure raised by the final POST itself."""
+        import httpx as _agent_httpx
+        if not isinstance(failure, _agent_httpx.TransportError):
+            return
+        name = next(
+            (candidate for candidate in cls.TRANSPORT_FAILURES
+             if type(failure) is getattr(_agent_httpx, candidate, None)),
+            "TransportError",
+        )
+        cls._mark_request_failure(failure, "transport", name)
+
+    @classmethod
+    def type_final_response_status(cls, failure, status_code):
+        return cls._mark_request_failure(failure, "http_status", status_code)
+
 
 import os as _agent_request_os
 import threading as _agent_request_threading
@@ -2148,6 +2185,28 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             count=1,
             label="HTTP global request limiter",
         )
+        response_data_signature = (
+            "    def get_response_data(self, response: httpx.Response) -> dict:\n"
+        )
+        # The reduced unit fixture has no response checks; a real install is
+        # protected by the full-file preimage digest before any patch runs.
+        if response_data_signature in source:
+            source = _replace_exact(
+                source,
+                response_data_signature
+                + "        if response.status_code != 200:\n"
+                '            raise ServerError(f"Unexpected status code: [{response.status_code}], '
+                'response body: {response.text}")\n',
+                response_data_signature
+                + "        if response.status_code != 200:\n"
+                "            raise _ProcessAsyncRequestLimiter.type_final_response_status(\n"
+                '                ServerError(f"Unexpected status code: [{response.status_code}], '
+                'response body: {response.text}"),\n'
+                "                response.status_code,\n"
+                "            )\n",
+                count=1,
+                label="HTTP final response status typing",
+            )
         return _replace_exact(
             source,
             "        client = await self._aio_client()\n"
@@ -2155,7 +2214,11 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             "        limiter = _process_async_request_limiter(self.max_concurrency)\n"
             "        client = await self._aio_client()\n"
             "        async with limiter:\n"
-            "            response = await client.post(self.chat_url, json=request_body)\n",
+            "            try:\n"
+            "                response = await client.post(self.chat_url, json=request_body)\n"
+            "            except Exception as failure:\n"
+            "                limiter.type_final_post_failure(failure)\n"
+            "                raise\n",
             count=1,
             label="HTTP final async POST ownership",
         )
@@ -2775,6 +2838,10 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
             '        payload["task_protocol_schema"] = "mineru-task-protocol.v2"\n'
             '        payload["protocol_state"] = record.state\n'
             '        payload["idempotency_key"] = record.idempotency_key\n'
+            "        if record.failure_cause is not None:\n"
+            '            if payload.get("status") != "failed":\n'
+            '                raise RuntimeError("Task failure cause escaped its failed status")\n'
+            '            payload["failure_cause"] = record.failure_cause\n'
             "        return payload\n",
             count=1,
             label="FastAPI task protocol status identity",
