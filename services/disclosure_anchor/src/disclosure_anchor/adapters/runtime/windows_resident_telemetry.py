@@ -108,6 +108,10 @@ class WindowsResidentTelemetrySampler:
     def collector_identity_sha256(self) -> str:
         return self._config.collector_identity_sha256
 
+    def adopt_supervisor_interruption(self) -> None:
+        """Called only by the spawned collector entry whose parent kills it at the deadline."""
+        self._client.adopt_supervisor_interruption()
+
     def snapshot(self, *, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot | HostLaneSnapshot:
         if self._terminal_continuity_lost:
             raise TelemetrySnapshotContinuityLost(
@@ -117,12 +121,13 @@ class WindowsResidentTelemetrySampler:
         if remaining <= 0:
             raise TelemetrySnapshotDeadlineExceeded("snapshot deadline already expired")
         if self._config.pull_protocol is not None:
-            return self._pull_snapshot(remaining)
+            return self._pull_snapshot(deadline)
         try:
             status, payload = self._client.get_bytes(
                 f"{self._config.path}/after/{self._last_sequence}",
                 timeout_seconds=remaining,
                 transport_attempts=1,
+                absolute_deadline=deadline.monotonic_ns / 1_000_000_000,
             )
         except BoundedHTTPTransportError as exc:
             raise TelemetrySnapshotTransportUnavailable(str(exc)) from exc
@@ -193,7 +198,7 @@ class WindowsResidentTelemetrySampler:
             resident_exporter_provenance=_provenance(sample),
         )
 
-    def _pull_snapshot(self, remaining: float) -> GpuLaneSnapshot | HostLaneSnapshot:
+    def _pull_snapshot(self, deadline: TelemetrySnapshotDeadline) -> GpuLaneSnapshot | HostLaneSnapshot:
         """Fresh-per-request: one nonce, one request bracket, one native capture inside it.
 
         The request bracket [s, f] is this collector's own monotonic clock; the
@@ -203,11 +208,15 @@ class WindowsResidentTelemetrySampler:
         nonce = secrets.token_hex(16)
         cursor = self._last_sequence
         request_ns = time.monotonic_ns()
+        remaining = (deadline.monotonic_ns - request_ns) / 1_000_000_000
+        if remaining <= 0:
+            raise TelemetrySnapshotDeadlineExceeded("snapshot deadline expired before dispatch")
         try:
             status, payload = self._client.get_bytes(
                 f"{self._config.path}/after/{cursor}/request/{nonce}",
                 timeout_seconds=remaining,
                 transport_attempts=1,
+                absolute_deadline=deadline.monotonic_ns / 1_000_000_000,
             )
         except BoundedHTTPTransportError as exc:
             raise TelemetrySnapshotTransportUnavailable(str(exc)) from exc

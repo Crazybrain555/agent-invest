@@ -504,6 +504,12 @@ class _ResidentSamplerProcess:
         connection = self._connection
         if connection is None or not self._started or not self._process.is_alive():
             raise TelemetrySnapshotTransportUnavailable("resident collector is unavailable")
+        if cancel_event.is_set():
+            self._terminate()
+            raise _InvocationCancelled
+        if monotonic_ns() >= deadline.monotonic_ns:
+            self._terminate()
+            raise TelemetrySnapshotDeadlineExceeded("resident snapshot deadline exceeded before dispatch")
         connection.send(("snapshot", deadline))
         while True:
             if cancel_event.is_set():
@@ -679,6 +685,11 @@ def _resident_sampler_main(
         identity = getattr(sampler, "collector_identity_sha256", None)
         if not isinstance(identity, str):
             raise ValueError("collector factory omitted identity")
+        adopt_supervisor_interruption = getattr(sampler, "adopt_supervisor_interruption", None)
+        if callable(adopt_supervisor_interruption):
+            # This process is ended by _ResidentSamplerProcess at the same absolute
+            # deadline; a per-attempt transport watchdog thread would only duplicate it.
+            adopt_supervisor_interruption()
         descendants = tuple(child.pid for child in multiprocessing.active_children())
         connection.send(("ready", (identity, process_group_ready, descendants)))
         while True:

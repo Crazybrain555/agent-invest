@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import math
 import socket
 import threading
 import time
@@ -89,6 +90,20 @@ class ThreadOwnedPersistentHTTPClient:
         self._clock = monotonic_clock
         self._connection: http.client.HTTPConnection | None = None
         self._owner_thread_id: int | None = None
+        self._supervisor_interruption = False
+
+    def adopt_supervisor_interruption(self) -> None:
+        """Let an owning process supervisor, not a per-attempt Timer, end a stuck attempt.
+
+        Only an owner that ends this client's whole process at the same absolute
+        deadline may call this (the spawned resident collector under
+        ``_ResidentSamplerProcess``). Every socket operation keeps its own
+        remaining-budget timeout and the attempt deadline check is unchanged; what
+        stops is creating, cancelling and joining one watchdog thread per attempt on
+        the success path. A direct client keeps the default watchdog.
+        """
+        self._bind_owner()
+        self._supervisor_interruption = True
 
     @staticmethod
     def _validate_base_url(parsed: SplitResult) -> SplitResult:
@@ -244,6 +259,7 @@ class ThreadOwnedPersistentHTTPClient:
         timeout_seconds: float,
         transport_attempts: int = 1,
         maximum_attempt_timeout_seconds: float | None = None,
+        absolute_deadline: float | None = None,
     ) -> tuple[int, bytes]:
         self._bind_owner()
         if (
@@ -252,6 +268,7 @@ class ThreadOwnedPersistentHTTPClient:
             or (method == "POST" and body is None)
             or timeout_seconds <= 0
             or transport_attempts <= 0
+            or (absolute_deadline is not None and not math.isfinite(absolute_deadline))
             or (
                 maximum_attempt_timeout_seconds is not None
                 and maximum_attempt_timeout_seconds <= 0
@@ -266,6 +283,9 @@ class ThreadOwnedPersistentHTTPClient:
         }
         target = self._request_target(path)
         deadline = self._clock() + timeout_seconds
+        if absolute_deadline is not None:
+            # An upstream deadline must not be renewed by dispatch latency.
+            deadline = min(deadline, absolute_deadline)
         last_error: BaseException | None = None
         for attempt in range(1, transport_attempts + 1):
             attempt_started = self._clock()
@@ -281,9 +301,10 @@ class ThreadOwnedPersistentHTTPClient:
             if self._connection is None:
                 self._connection = self._new_connection(attempt_timeout)
             connection = self._connection
-            active_watchdog = _AttemptDeadlineWatchdog(
-                connection,
-                timeout_seconds=attempt_timeout,
+            active_watchdog: _AttemptDeadlineWatchdog | None = (
+                None
+                if self._supervisor_interruption
+                else _AttemptDeadlineWatchdog(connection, timeout_seconds=attempt_timeout)
             )
             watchdog: _AttemptDeadlineWatchdog | None = active_watchdog
             try:
@@ -307,7 +328,7 @@ class ThreadOwnedPersistentHTTPClient:
                     connection,
                     attempt_deadline=attempt_deadline,
                 )
-                expired = active_watchdog.finish()
+                expired = active_watchdog.finish() if active_watchdog is not None else False
                 watchdog = None
                 if expired or self._clock() > attempt_deadline:
                     raise BoundedHTTPTransportError(
@@ -331,6 +352,13 @@ class ThreadOwnedPersistentHTTPClient:
                 if attempt == transport_attempts:
                     break
             except Exception as exc:
+                if active_watchdog is None:
+                    # No watchdog could have closed the reader under this attempt: a
+                    # supervised attempt keeps an unexpected error visible instead of
+                    # relabelling it as transport unavailability, before or after the deadline.
+                    watchdog = None
+                    self._drop_connection()
+                    raise
                 expired = active_watchdog.finish()
                 watchdog = None
                 self._drop_connection()
@@ -353,10 +381,14 @@ class ThreadOwnedPersistentHTTPClient:
         timeout_seconds: float,
         transport_attempts: int = 1,
         maximum_attempt_timeout_seconds: float | None = None,
+        absolute_deadline: float | None = None,
     ) -> tuple[int, bytes]:
         """Return one complete bounded GET, reconnecting only on transport.
 
         ``timeout_seconds`` is a logical deadline shared by all attempts.
+        ``absolute_deadline``, when given, is an instant in this client's monotonic
+        clock domain that caps that logical budget so an upstream deadline is never
+        renewed by dispatch latency; it does not replace the per-attempt caps.
         HTTP status handling stays with the endpoint-specific caller.
         """
 
@@ -368,6 +400,7 @@ class ThreadOwnedPersistentHTTPClient:
             timeout_seconds=timeout_seconds,
             transport_attempts=transport_attempts,
             maximum_attempt_timeout_seconds=maximum_attempt_timeout_seconds,
+            absolute_deadline=absolute_deadline,
         )
 
     def post_bytes(

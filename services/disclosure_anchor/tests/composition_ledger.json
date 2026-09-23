@@ -1088,9 +1088,17 @@
    ],
    "tests": 7
   },
+  "tests/unit/test_resident_supervision_independent.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_resident_telemetry_owner.py": {
    "private_imports": [],
    "tests": 10
+  },
+  "tests/unit/test_resident_transport_deadline_independent.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
