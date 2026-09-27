@@ -339,6 +339,77 @@ class PreBodyIngressTests(StorageApiCase):
             bind(fixture.policy)
 
 
+class StorageOutputQuiescenceTests(StorageApiCase):
+    """The installer's output witness across the actual storage-managed startup.
+
+    Installer, rollback and collector read ``inspect_quiescent_output_root``
+    before and after replacing the API; a storage-managed startup adds its
+    ingress spool to the output root before any task arrives.
+    """
+
+    async def test_startup_spool_and_a_consumed_task_leave_a_quiescent_output_root(self) -> None:
+        fixture = self.fixture()
+        root = fixture.root / "output"
+        # The actual startup created only its empty ingress spool.
+        self.assertEqual([item.name for item in root.iterdir()], [".agent-ingress-spool"])
+        fresh = protocol.inspect_quiescent_output_root(root, allow_empty=True)
+        self.assertEqual((fresh["file_count"], fresh["total_bytes"]), (0, 0))
+        self.assertIsNone(fresh["quiescence"]["registry_sha256"])
+        with self.assertRaisesRegex(protocol.TaskProtocolConflict, "commissioned task registry is absent"):
+            protocol.inspect_quiescent_output_root(root)
+        await fixture.manager.start()
+        task = await fixture.create(fixture.options("one"))
+        self.assertEqual(await self.terminal_or_held(fixture, task.task_id), "completed")
+        with self.assertRaises(protocol.TaskProtocolConflict):
+            protocol.inspect_quiescent_output_root(root)  # The unacknowledged task root is retained.
+        await fixture.module.ack_async_task_result(task.task_id)
+        self.assertEqual(fixture.manager.task_protocol_v2.get_by_task_id(task.task_id).state, "consumed")
+        raw = (root / ".agent-task-protocol-v2" / "registry.json").read_bytes()
+        proof = protocol.inspect_quiescent_output_root(root)
+        self.assertEqual(proof["quiescence"]["registry_sha256"], "sha256:" + hashlib.sha256(raw).hexdigest())
+        self.assertEqual((proof["file_count"], proof["total_bytes"], proof["quiescence"]["record_count"]),
+                         (1, len(raw), 1))
+        self.assertEqual(protocol.inspect_quiescent_output_root(root, allow_empty=True), proof)
+        self.assertEqual(sorted(item.name for item in root.iterdir()),
+                         [".agent-ingress-spool", ".agent-task-protocol-v2"])
+
+    async def test_storage_managed_startup_keeps_the_deployed_v3_witness(self) -> None:
+        import starlette.formparsers as multipart_forms
+
+        fixture = self.fixture()
+        root = fixture.root / "deployed"
+        root.mkdir()
+        path = root / ".agent-task-protocol-v2" / "registry.json"
+        # A capacity-v1 (registry v3) process left one consumed tombstone here.
+        key = f"{fixture.epoch:x}.{hashlib.sha256(b'v3 tombstone').hexdigest()}"
+        legacy = protocol.DurableTaskRegistry(path, output_root=root, max_unacked_result_bytes=1024)
+        legacy._records[key] = protocol.DurableTaskRecord(
+            key, "task-v3", "attempt", "fence", state="consumed", consumed_at_unix=float(fixture.epoch),
+            result_sha256="a" * 64, result_owner="b" * 64, result_bytes=12,
+        )
+        legacy._submission_watermark_bucket = fixture.epoch
+        legacy._persist()
+        raw = path.read_bytes()
+        # Preflight form against the old API: the candidate source with allow_empty.
+        before = protocol.inspect_quiescent_output_root(root, allow_empty=True)
+        with patch.dict(os.environ, {"MINERU_API_OUTPUT_ROOT": str(root)}), patch.object(
+            multipart_forms, "SpooledTemporaryFile", tempfile.SpooledTemporaryFile,
+        ):
+            manager = fixture.module.AsyncTaskManager(fixture.app)  # The actual replacement startup.
+        try:
+            self.assertEqual(sorted(item.name for item in root.iterdir()),
+                             [".agent-ingress-spool", ".agent-task-protocol-v2"])
+            self.assertEqual(manager.task_protocol_v2.get(key).state, "consumed")
+            self.assertEqual(path.read_bytes(), raw)  # Startup never rewrites the v3 registry.
+            # Post-deployment (installed module, collector) and rollback-witness forms
+            # both equal the preflight proof, so the rollback comparison holds.
+            self.assertEqual(protocol.inspect_quiescent_output_root(root), before)
+            self.assertEqual(protocol.inspect_quiescent_output_root(root, allow_empty=True), before)
+            self.assertEqual((before["file_count"], before["quiescence"]["record_count"]), (1, 1))
+        finally:
+            await asyncio.wait_for(manager.service_io.close(), 2)
+
+
 class GeneratedWriterTests(unittest.TestCase):
     def setUp(self) -> None:
         latch = patch.object(protocol, "_STORAGE_MANAGED_OUTPUT", False)

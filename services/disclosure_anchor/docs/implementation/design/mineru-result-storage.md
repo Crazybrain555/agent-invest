@@ -54,8 +54,11 @@ charges local-header rewrites and the close records and latches the first write 
 refuses a body above `source_pdf_bytes_limit` plus 64 KiB of form framing (413), and charges the framework
 multipart spool plus the upload copy in one decision before any body byte is read (closed 429
 `storage_capacity_wait` with its reason). The endpoint moves the upload share to the key it names; the spool
-share ends with the request. Storage binding places Starlette's multipart spool on the output volume (the
-same device is verified; a non-stdlib spool class refuses startup).
+share ends with the request. Storage binding places Starlette's multipart spool in `.agent-ingress-spool`
+on the output volume (the same device is verified; a non-stdlib spool class refuses startup). The installation
+and collector quiescence check accepts this canonical directory only when it is empty, owned by the same
+user as the output root, on the same device and not a symlink; its identity is pinned and rechecked. Other
+directories and retained spool files still refuse quiescence. The empty spool does not increase file counts.
 
 **Seal, ZIP, recovery.** After parsing, `mineru.result-inventory.v1` seals the selected members by content,
 one member descriptor at a time, binding directory and member (device, inode). The ZIP extent grant is the

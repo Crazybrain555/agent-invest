@@ -102,10 +102,16 @@ function Invoke-BoundedReadback([string]$FilePath,[string[]]$Arguments,[int]$Tim
 
 # Closed idle proof from the explicit-capacity health wire: legacy queued/processing gauges alone are not proof.
 # The literal sets below are the producer's (agent_task_protocol_v2.admission_status + the serving admission
-# binding, agent_capacity_observation.snapshot) exactly as validate_mineru_task_admission /
-# validate_mineru_capacity_wire_health require them: 12 admission integers (nonterminal_limit positive, the
-# other 11 zero when idle), 2 tags, 2 booleans, a null reason; 5 stage and 2 HTTP counters; 4 owner-control
-# fields. An empty, partial, renamed, extra, coerced or string-typed value is a refusal, never an idle proof.
+# binding, agent_capacity_observation.snapshot, DurableTaskRegistry.storage_observation) exactly as
+# validate_mineru_task_admission / validate_mineru_capacity_wire_health require them: 12 admission integers
+# (nonterminal_limit positive, the other 11 zero when idle), 2 tags, 2 booleans, a null reason; the stage and
+# 2 HTTP counters; 4 owner-control fields. The capacity version is one closed family, never a schema string
+# alone: capacity v1 serves observation v1 with registry v3, 5 stage counters and no storage ledger; storage
+# capacity v2 serves observation v2 with registry v4, 7 stage counters, the 9-field result-storage ledger and
+# task runtime v4, which binds the ledger's policy to the expected capacity. Idle means every responsibility,
+# stage, HTTP, ingress, producer, promise, completion, wait and hold count is zero; retained source/result
+# bytes are not work. A cold HTTP limiter reports the same zero counters and needs no other evidence.
+# An empty, partial, renamed, extra, mixed, coerced or string-typed value is a refusal, never an idle proof.
 function Read-IdleCapacityHealth([string]$Docker,[string]$ExpectedCapacitySha256,[string]$Label) {
     $probe=Invoke-BoundedReadback $Docker @('exec','mineru-api','/usr/bin/python3.12','-I','-c','import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://127.0.0.1:8000/health",timeout=5))))')
     if ($probe.ExitCode -ne 0) { throw ($Label + ': API health readback failed') }
@@ -116,15 +122,21 @@ function Read-IdleCapacityHealth([string]$Docker,[string]$ExpectedCapacitySha256
     foreach ($n in @('queued_tasks','processing_tasks')) { $v=$h.$n; if ($v -isnot [int] -and $v -isnot [long]) { throw ($Label + ': ' + $n + ' is not an integer') }; if ([long]$v -ne 0) { throw ($Label + ': API is not idle: ' + $n) } }
     $adm=$h.task_admission; $obs=$h.capacity_observation
     if ($null -eq $adm -or $null -eq $obs) { throw ($Label + ': API health lacks the explicit-capacity admission/observation evidence') }
-    if ($obs -isnot [Management.Automation.PSCustomObject] -or $obs.PSObject.Properties.Name -cnotcontains 'schema' -or $obs.schema -isnot [string] -or $obs.schema -cne 'mineru.capacity-observation.v1') { throw ($Label + ': capacity observation schema is not mineru.capacity-observation.v1') }
+    if ($obs -isnot [Management.Automation.PSCustomObject] -or $obs.PSObject.Properties.Name -cnotcontains 'schema' -or $obs.schema -isnot [string] -or
+        $obs.schema -cnotin @('mineru.capacity-observation.v1','mineru.capacity-observation.v2')) { throw ($Label + ': capacity observation schema is not a supported explicit-capacity version') }
+    $storage=$obs.schema -ceq 'mineru.capacity-observation.v2'
     if ($obs.PSObject.Properties.Name -cnotcontains 'capacity_config_sha256' -or $obs.capacity_config_sha256 -isnot [string] -or $obs.capacity_config_sha256 -cne $ExpectedCapacitySha256) { throw ($Label + ': API capacity identity differs from the expected value') }
     foreach ($n in @('stage_counters','http_counters','owner_control')) { if ($obs.PSObject.Properties.Name -cnotcontains $n) { throw ($Label + ': capacity observation lacks ' + $n) } }
+    if ($storage -ne ($obs.PSObject.Properties.Name -ccontains 'result_storage')) { throw ($Label + ': capacity observation storage ledger does not match its version') }
+    $registrySchema=$(if ($storage) { 'mineru-task-registry.v4' } else { 'mineru-task-registry.v3' })
+    $stageCounters=@('result_capacity_waiting','parse_waiting','parse_active','finalizer_waiting','finalizer_active')
+    if ($storage) { $stageCounters+=@('source_growth_waiting','completion_waiting') }
     $zeroCounters=@('ingress_tasks','accepted_pending_tasks','accepted_processing_tasks','accepted_finalizing_tasks','durable_nonterminal_tasks','routeless_accepted_tasks','ingress_cleanup_tasks','unowned_ingress_tasks','scheduled_tasks','queue_depth','active_processors')
     Assert-Closed $adm (@('schema','registry_schema','nonterminal_limit','recovery_overcommitted','admission_open','blocked_reason') + $zeroCounters) ($Label + ': task_admission')
-    Assert-Closed $obs.stage_counters @('result_capacity_waiting','parse_waiting','parse_active','finalizer_waiting','finalizer_active') ($Label + ': stage_counters')
+    Assert-Closed $obs.stage_counters $stageCounters ($Label + ': stage_counters')
     Assert-Closed $obs.http_counters @('active_requests','pending_requests') ($Label + ': http_counters')
     Assert-Closed $obs.owner_control @('foreign_loop_observed','soft_drain_requested','soft_drain_applied','trigger') ($Label + ': owner_control')
-    if ($adm.schema -isnot [string] -or $adm.schema -cne 'mineru-task-admission.v1' -or $adm.registry_schema -isnot [string] -or $adm.registry_schema -cne 'mineru-task-registry.v3') { throw ($Label + ': task_admission schema tags differ from the serving contract') }
+    if ($adm.schema -isnot [string] -or $adm.schema -cne 'mineru-task-admission.v1' -or $adm.registry_schema -isnot [string] -or $adm.registry_schema -cne $registrySchema) { throw ($Label + ': task_admission schema tags differ from the serving contract') }
     $limit=$adm.nonterminal_limit
     if (($limit -isnot [int] -and $limit -isnot [long]) -or [long]$limit -lt 1 -or [long]$limit -gt 128) { throw ($Label + ': task_admission.nonterminal_limit is not a positive integer') }
     foreach ($flag in @('recovery_overcommitted','admission_open')) { if ($adm.$flag -isnot [bool]) { throw ($Label + ': task_admission.' + $flag + ' is not a boolean') } }
@@ -133,6 +145,42 @@ function Read-IdleCapacityHealth([string]$Docker,[string]$ExpectedCapacitySha256
     foreach ($n in $zeroCounters) { $v=$adm.$n; if ($v -isnot [int] -and $v -isnot [long]) { throw ($Label + ': task_admission.' + $n + ' is not an integer') }; if ([long]$v -ne 0) { $busy+=('task_admission.' + $n) } }
     foreach ($pr in $obs.stage_counters.PSObject.Properties) { if ($pr.Value -isnot [int] -and $pr.Value -isnot [long]) { throw ($Label + ': stage_counters.' + $pr.Name + ' is not an integer') }; if ([long]$pr.Value -ne 0) { $busy+=('stage_counters.' + $pr.Name) } }
     foreach ($pr in $obs.http_counters.PSObject.Properties) { if ($pr.Value -isnot [int] -and $pr.Value -isnot [long]) { throw ($Label + ': http_counters.' + $pr.Name + ' is not an integer') }; if ([long]$pr.Value -ne 0) { $busy+=('http_counters.' + $pr.Name) } }
+    if ($storage) {
+        # Storage capacity: runtime v4 names the expected capacity and the ledger's policy; the ledger is idle.
+        if ($h.PSObject.Properties.Name -cnotcontains 'task_protocol_runtime') { throw ($Label + ': storage-managed API health lacks task_protocol_runtime') }
+        $runtime=$h.task_protocol_runtime; $ledger=$obs.result_storage
+        Assert-Closed $runtime @('schema','enabled','task_registry_max_records','registry_schema','admission_scope','capacity_config_sha256','result_storage_policy_sha256') ($Label + ': task_protocol_runtime')
+        Assert-Closed $ledger @('policy_sha256','source_bytes','ingress_bytes','result_bytes','growing_producers','outstanding_promise_bytes','completion_queue_depth','waiting_tasks','blocked_tasks') ($Label + ': result_storage')
+        Assert-Closed $ledger.waiting_tasks @('completion_capacity','free_floor','source_growth_capacity') ($Label + ': result_storage.waiting_tasks')
+        $records=$runtime.task_registry_max_records
+        if ($runtime.schema -isnot [string] -or $runtime.schema -cne 'mineru-task-runtime.v4' -or $runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
+            $runtime.registry_schema -isnot [string] -or $runtime.registry_schema -cne $registrySchema -or
+            $runtime.admission_scope -isnot [string] -or $runtime.admission_scope -cne 'post_form_owned_upload' -or
+            ($records -isnot [int] -and $records -isnot [long]) -or [long]$records -ne 128 -or
+            $runtime.capacity_config_sha256 -isnot [string] -or $runtime.capacity_config_sha256 -cne $ExpectedCapacitySha256) { throw ($Label + ': storage-managed task runtime differs from the serving contract') }
+        if ($ledger.policy_sha256 -isnot [string] -or $ledger.policy_sha256 -cnotmatch '\Asha256:[0-9a-f]{64}\z' -or
+            $runtime.result_storage_policy_sha256 -isnot [string] -or $runtime.result_storage_policy_sha256 -cne $ledger.policy_sha256) { throw ($Label + ': result storage ledger is not bound to the serving storage policy') }
+        foreach ($n in @('source_bytes','result_bytes')) { $v=$ledger.$n; if (($v -isnot [int] -and $v -isnot [long]) -or [long]$v -lt 0) { throw ($Label + ': result_storage.' + $n + ' is not a non-negative integer') } }
+        foreach ($n in @('ingress_bytes','growing_producers','outstanding_promise_bytes','completion_queue_depth','blocked_tasks')) {
+            $v=$ledger.$n; if ($v -isnot [int] -and $v -isnot [long]) { throw ($Label + ': result_storage.' + $n + ' is not an integer') }; if ([long]$v -ne 0) { $busy+=('result_storage.' + $n) }
+        }
+        foreach ($pr in $ledger.waiting_tasks.PSObject.Properties) {
+            if ($pr.Value -isnot [int] -and $pr.Value -isnot [long]) { throw ($Label + ': result_storage.waiting_tasks.' + $pr.Name + ' is not an integer') }; if ([long]$pr.Value -ne 0) { $busy+=('result_storage.waiting_tasks.' + $pr.Name) }
+        }
+    } else {
+        # Explicit capacity v1 also binds its runtime to the expected capacity.
+        if ($h.PSObject.Properties.Name -cnotcontains 'task_protocol_runtime') { throw ($Label + ': capacity-v1 API health lacks task_protocol_runtime') }
+        $runtime=$h.task_protocol_runtime
+        Assert-Closed $runtime @('schema','enabled','task_registry_max_records','task_result_reservation_bytes','max_unacked_result_bytes','registry_schema','admission_scope','capacity_config_sha256') ($Label + ': task_protocol_runtime')
+        $records=$runtime.task_registry_max_records; $reservation=$runtime.task_result_reservation_bytes; $unacked=$runtime.max_unacked_result_bytes
+        if ($runtime.schema -isnot [string] -or $runtime.schema -cne 'mineru-task-runtime.v3' -or $runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
+            $runtime.registry_schema -isnot [string] -or $runtime.registry_schema -cne $registrySchema -or
+            $runtime.admission_scope -isnot [string] -or $runtime.admission_scope -cne 'post_form_owned_upload' -or
+            $runtime.capacity_config_sha256 -isnot [string] -or $runtime.capacity_config_sha256 -cne $ExpectedCapacitySha256 -or
+            ($records -isnot [int] -and $records -isnot [long]) -or [long]$records -ne 128 -or
+            ($reservation -isnot [int] -and $reservation -isnot [long]) -or [long]$reservation -lt 1 -or
+            ($unacked -isnot [int] -and $unacked -isnot [long]) -or [long]$unacked -lt [long]$reservation) { throw ($Label + ': legacy task runtime differs from the serving contract') }
+    }
     if ($adm.recovery_overcommitted) { $busy+='task_admission.recovery_overcommitted' }
     if (-not $adm.admission_open) { $busy+='task_admission.admission_open=false' }
     if ($null -ne $adm.blocked_reason) { $busy+=('task_admission.blocked_reason=' + [string]$adm.blocked_reason) }

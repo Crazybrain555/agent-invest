@@ -258,24 +258,30 @@ compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurren
 验证配置保护、旧 tag/文件恢复顺序以及健康/镜像不符的失败路径；不调用真实 Docker。
 它是部署前回归，不能替代安装后的实际镜像、服务 identity、容量与输出根验证。
 
-protocol-v2 启动后的输出根并非物理零文件：唯一控制树
+protocol-v2 启动后的输出根并非物理零文件：控制树
 `.agent-task-protocol-v2/registry.json` 保存提交水位与已消费 tombstone，不能删除来通过安装门。
-runtime observation v5 保留真实 `file_count/total_bytes`，另附 `mineru-output-quiescence.v1`：
-在 Linux bind-mount 命名空间固定根/目录/文件身份、读取有界稳定 canonical registry-v2/v3 字节，
-只接受空登记或已完全清理的 consumed 记录；未知目录（包括空目录）、链接、临时文件和任何
-仍持有资源的记录均拒绝。首次旧 API 安装前才允许真正空根；新 API commissioning 必须有登记。
+使用 `mineru.capacity-config.v2` 的 storage-managed API 启动还会创建 `.agent-ingress-spool`；
+检查器只允许它是同卷、属主一致、无链接且为空的目录，
+并在检查前后固定和复核目录身份。空 spool 不计入文件数，不允许残留上传文件。
+对应的 Windows runtime observation v6 保留真实 `file_count/total_bytes`，另附 `mineru-output-quiescence.v1`：
+在 Linux bind-mount 命名空间固定根/目录/文件身份、读取有界稳定 canonical registry-v2/v3/v4 字节，
+只接受空登记或已完全清理的 consumed 记录；除上述规范空 spool 外的未知目录（即使为空）、链接、临时文件和任何
+仍持有资源的记录均拒绝。仅显式 `allow_empty` 的未 commissioning 检查允许空根或仅含合法空 spool；
+严格 commissioning 检查仍必须有登记。
 安装器与 collector 调用同一已绑定源码的只读检查，前后核对 API idle；这不代替停用 producer
 和实际 writer drain，也不把瞬时快照当成防止新提交的锁。排除写入的窗口必须从 preflight 持续到
 部署或回滚结论，覆盖所有调用方已经发出的 submit/ACK/lease/GC 请求，包括尚在 Form 解析、未计入
-ingress 的请求。v3 writer 可以读取旧 v2，但旧 reader 不能读取 v3；即使只有 consumed 记录，也不能
-用旧 registry 备份覆盖新的 tombstone 或水位。旧 v4 observation 不能用于新 attestation。
+ingress 的请求。新 writer 兼容读取旧登记不代表旧 reader 能读取新版本；即使只有 consumed 记录，也不能
+用旧 registry 备份覆盖新的 tombstone 或水位。旧 v4/v5 Windows runtime observation 不能代替本次
+storage-managed v6 attestation；无显式容量的旧部署仍保留自己的 v5 分支。
 
 collector 的独立 Python 进程只检查安装字节/package/marker，不能读取服务进程的
 `get_task_manager()`。真实对象容量由正在服务的 `/health` 返回闭合
-`task_protocol_runtime`（新部署为 `mineru-task-runtime.v2`）以及
-`mineru-task-admission.v1`；包含实际 registry/executor 容量及 durable/ingress/排队/执行责任，
-effective pending 也取自同一 HTTP 证据。新 collector 与部署资格检查要求 v2 admission；明确的
-旧 v1 分支仅用于观察旧服务。collector 有界读取并复核 API container/start epoch。
+`task_protocol_runtime`（storage-managed 新部署为 `mineru-task-runtime.v4`，登记为
+`mineru-task-registry.v4`）以及 `mineru-task-admission.v1`，容量观测为 `mineru.capacity-observation.v2`；
+包含实际 registry/executor 容量及 durable/ingress/排队/执行责任，effective pending 也取自同一 HTTP 证据。
+collector 与部署资格检查按绑定的容量配置验证相应版本；旧版本分支仅用于其匹配的旧服务。
+collector 有界读取并复核 API container/start epoch。
 所有 wire health 消费者先严格验证 protocol-v2 标记与 runtime 子证明，再显式投影为原有
 13 字段 receipt/observer 形状；旧规范化 receipt 可继续读取，但不能冒充 live wire health。
 

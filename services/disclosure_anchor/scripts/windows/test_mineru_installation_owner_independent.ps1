@@ -89,10 +89,14 @@ $CapacityFixtureText = '{"contract_version":"mineru.capacity-config.independent-
 
 $LegacyIdleHealth = '{"status":"healthy","queued_tasks":0,"processing_tasks":0}'
 $LegacyBusyHealth = '{"status":"healthy","queued_tasks":1,"processing_tasks":0}'
-# Literal subset required for the installation owner's closed idle proof, with the
-# actual serving contract's names and strict JSON types (not invented counters).
+# Literal idle proof with the serving capacity-v1 runtime identity, admission,
+# and observation names and strict JSON types (not invented counters).
 function New-ExplicitCapacityHealth([string]$CapacitySha256) {
     return ('{"status":"healthy","queued_tasks":0,"processing_tasks":0,' +
+        '"task_protocol_runtime":{"schema":"mineru-task-runtime.v3","enabled":true,' +
+        '"task_registry_max_records":128,"task_result_reservation_bytes":268435456,' +
+        '"max_unacked_result_bytes":4294967296,"registry_schema":"mineru-task-registry.v3",' +
+        '"admission_scope":"post_form_owned_upload","capacity_config_sha256":"' + $CapacitySha256 + '"},' +
         '"task_admission":{"schema":"mineru-task-admission.v1","registry_schema":"mineru-task-registry.v3",' +
         '"nonterminal_limit":8,"ingress_tasks":0,"accepted_pending_tasks":0,"accepted_processing_tasks":0,' +
         '"accepted_finalizing_tasks":0,"durable_nonterminal_tasks":0,"routeless_accepted_tasks":0,' +

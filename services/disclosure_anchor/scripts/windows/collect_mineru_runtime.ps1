@@ -940,6 +940,7 @@ agent_task_protocol_v2.validate_mineru_task_admission(
     queued_tasks=serving_health["queued_tasks"],
     processing_tasks=serving_health["processing_tasks"],
     nonterminal_limit=serving_health["max_pending_tasks_effective"],
+    registry_schema=registry_schema,
 )
 marker = json.loads(
     Path("/opt/agent-invest/mineru-serial-v1/compatibility.json")

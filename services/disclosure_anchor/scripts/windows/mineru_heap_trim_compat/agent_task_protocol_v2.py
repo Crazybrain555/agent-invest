@@ -3666,13 +3666,23 @@ class DurableTaskRegistry:
 
 
 
+# The storage-managed process's multipart ingress spool on the output root. The
+# generated manager creates it empty at startup (``_bind_result_storage_process``);
+# a spooled request body lives there only while that request is being received.
+_INGRESS_SPOOL_DIRECTORY = ".agent-ingress-spool"
+
+
 def inspect_quiescent_output_root(
     root: Path, *, allow_empty: bool = False
 ) -> dict[str, Any]:
     """Read-only point-in-time proof under operator writer exclusion, not a lock.
 
     Preserve physical inventory and consumed tombstones. Pin/recheck ancestors,
-    both directories and registry; never repair, delete, or recursively scan.
+    every service-owned directory and the registry; never repair, delete, or
+    recursively scan. The root holds only the task control directory and, once a
+    storage-managed process has started on it, that process's ingress spool. The
+    spool must be empty and owned on the root's volume: it then holds no bytes
+    and no task, so the proof is the same with or without it.
     """
     if not root.is_absolute() or ".." in root.parts:
         raise TaskProtocolConflict("output root must be an absolute canonical path")
@@ -3684,13 +3694,15 @@ def inspect_quiescent_output_root(
         return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
                 value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
-    def entries(descriptor: int) -> set[str]:
+    def entries(
+        descriptor: int, limit: int, refusal: str = "output directory has unexpected entries",
+    ) -> set[str]:
         result: set[str] = set()
         with os.scandir(descriptor) as iterator:
             for entry in iterator:
                 result.add(entry.name)
-                if len(result) > 1:
-                    raise TaskProtocolConflict("output directory has unexpected entries")
+                if len(result) > limit:
+                    raise TaskProtocolConflict(refusal)
         return result
 
     try:
@@ -3709,8 +3721,9 @@ def inspect_quiescent_output_root(
             "path": str(root), "device": root_meta.st_dev, "inode": root_meta.st_ino,
             "uid": root_meta.st_uid, "mode": root_meta.st_mode,
         }
-        root_entries = entries(root_fd)
+        root_entries = entries(root_fd, 2)
         control = ".agent-task-protocol-v2"
+        spool = _INGRESS_SPOOL_DIRECTORY
         proof: dict[str, Any] = {
             "schema": "mineru-output-quiescence.v1", "root_identity": root_identity,
             "registry_sha256": None, "record_count": 0,
@@ -3718,17 +3731,27 @@ def inspect_quiescent_output_root(
         }
         file_count = total_bytes = 0
         pinned: list[tuple[int, tuple[int, ...]]] = [(root_fd, identity(root_meta))]
-        if not root_entries:
+        if root_entries - {control, spool}:
+            raise TaskProtocolConflict("output root has unknown or retained task entries")
+        spool_fd: int | None = None
+        if spool in root_entries:
+            spool_fd = os.open(spool, directory_flags, dir_fd=root_fd)
+            opened.append(spool_fd)
+            edges.append((root_fd, spool, spool_fd))
+            spool_meta = os.fstat(spool_fd)
+            if spool_meta.st_uid != os.getuid() or spool_meta.st_dev != root_meta.st_dev:
+                raise TaskProtocolConflict("ingress spool is not owned on the output volume")
+            entries(spool_fd, 0, "ingress spool is not empty")
+            pinned.append((spool_fd, identity(spool_meta)))
+        if control not in root_entries:
             if not allow_empty:
                 raise TaskProtocolConflict("commissioned task registry is absent")
         else:
-            if root_entries != {control}:
-                raise TaskProtocolConflict("output root has unknown or retained task entries")
             control_fd = os.open(control, directory_flags, dir_fd=root_fd)
             opened.append(control_fd)
             edges.append((root_fd, control, control_fd))
             control_meta = os.fstat(control_fd)
-            if control_meta.st_uid != os.getuid() or entries(control_fd) != {"registry.json"}:
+            if control_meta.st_uid != os.getuid() or entries(control_fd, 1) != {"registry.json"}:
                 raise TaskProtocolConflict("task control directory is not quiescent")
             pinned.append((control_fd, identity(control_meta)))
             descriptor = os.open(
@@ -3768,9 +3791,11 @@ def inspect_quiescent_output_root(
                 submission_watermark_bucket=reader._submission_watermark_bucket,
             )
             file_count, total_bytes = 1, len(raw)
-            if entries(control_fd) != {"registry.json"}:
+            if entries(control_fd, 1) != {"registry.json"}:
                 raise TaskProtocolConflict("task control inventory changed")
-        if entries(root_fd) != root_entries:
+        if spool_fd is not None:
+            entries(spool_fd, 0, "ingress spool inventory changed")
+        if entries(root_fd, 2) != root_entries:
             raise TaskProtocolConflict("output inventory changed")
         for descriptor, before in pinned:
             if identity(os.fstat(descriptor)) != before:
@@ -5082,12 +5107,16 @@ class SplitTaskExecutor:
 # The host observer validates the same closed envelope independently.
 def validate_mineru_task_admission(
     decoded: object, *, queued_tasks: int, processing_tasks: int, nonterminal_limit: int,
+    registry_schema: str = "mineru-task-registry.v3",
 ) -> None:
     """Validate durable responsibilities before projecting the legacy load gauges.
 
     queued_tasks covers ingress and accepted pending, not physical queue depth.
     A cold backlog remains readable on the wire but is not qualified healthy.
+    The expected registry schema comes from the caller's selected runtime.
     """
+    if registry_schema not in {"mineru-task-registry.v3", "mineru-task-registry.v4"}:
+        raise ValueError("MinerU admission registry schema expectation is unsupported")
     counters = {
         "nonterminal_limit", "ingress_tasks", "accepted_pending_tasks",
         "accepted_processing_tasks", "accepted_finalizing_tasks", "durable_nonterminal_tasks",
@@ -5100,7 +5129,7 @@ def validate_mineru_task_admission(
             "schema", "registry_schema", "recovery_overcommitted", "admission_open", "blocked_reason",
         }
         or decoded.get("schema") != "mineru-task-admission.v1"
-        or decoded.get("registry_schema") != "mineru-task-registry.v3"
+        or decoded.get("registry_schema") != registry_schema
         or any(type(decoded.get(key)) is not int or not 0 <= decoded[key] <= 128 for key in counters)
         or type(decoded.get("recovery_overcommitted")) is not bool
         or type(decoded.get("admission_open")) is not bool

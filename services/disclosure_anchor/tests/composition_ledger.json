@@ -714,7 +714,7 @@
   },
   "tests/unit/test_mineru_admission_health.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 13
   },
   "tests/unit/test_mineru_admission_pending_failure.py": {
    "private_imports": [],
@@ -1092,7 +1092,7 @@
   },
   "tests/unit/test_mineru_task_protocol_v2.py": {
    "private_imports": [],
-   "tests": 37
+   "tests": 38
   },
   "tests/unit/test_mineru_task_registry_persistence.py": {
    "private_imports": [],
