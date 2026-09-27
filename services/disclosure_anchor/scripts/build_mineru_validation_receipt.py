@@ -5,6 +5,12 @@ receipts for complete, operator-selected PDFs that are not the repository smoke
 fixture.  This command performs no parse and touches no database or queue.  It
 only seals the already-produced receipts into one bounded, new-only artifact
 for resident parse admission.
+
+With the explicit, hash-pinned capacity the receipts ran under, every receipt's
+recorded runtime and API health must belong to that capacity, and a storage
+capacity's own policy bounds each retained diagnostic result. Receipts recorded
+under a storage capacity are refused without it; legacy receipts keep the fixed
+reservation.
 """
 
 from __future__ import annotations
@@ -19,11 +25,21 @@ import stat
 import sys
 from typing import Any
 
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    CAPACITY_CONFIG_CONTRACT_V2,
+    AnyMineruCapacityConfig,
+    MineruResultStoragePolicy,
+)
 from disclosure_anchor.application.contracts.parser_target import (
     ParserTargetIdentity,
     ParserTargetIdentityError,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
+from disclosure_anchor.adapters.runtime.mineru_capacity_config import load_mineru_capacity_config
+from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
+    MinerUDeploymentGateError,
+    verify_recorded_smoke_capacity,
+)
 from disclosure_anchor.adapters.runtime.mineru_diagnostic import validate_diagnostic_disposal
 
 
@@ -102,7 +118,30 @@ def _positive_int(value: object, *, label: str) -> int:
     return value
 
 
-def _validate_smoke(payload: dict[str, Any]) -> tuple[str, str]:
+def _recorded_storage_capacity(payload: dict[str, Any]) -> bool:
+    """Whether the receipt records a storage capacity; used only to refuse, never to widen."""
+    manifest = payload.get("runtime_manifest")
+    orchestrator = manifest.get("orchestrator") if isinstance(manifest, dict) else None
+    capacity = orchestrator.get("capacity_config") if isinstance(orchestrator, dict) else None
+    return isinstance(capacity, dict) and capacity.get("contract_version") == CAPACITY_CONFIG_CONTRACT_V2
+
+
+def _result_storage_policy(
+    payload: dict[str, Any], expected_capacity: AnyMineruCapacityConfig | None,
+) -> MineruResultStoragePolicy | None:
+    if expected_capacity is None:
+        if _recorded_storage_capacity(payload):
+            raise ValueError("a storage-runtime held-out receipt requires its configured capacity")
+        return None
+    try:
+        return verify_recorded_smoke_capacity(payload, expected_capacity=expected_capacity)
+    except MinerUDeploymentGateError as exc:
+        raise ValueError(f"held-out smoke does not belong to the configured capacity: {exc}") from exc
+
+
+def _validate_smoke(
+    payload: dict[str, Any], *, expected_capacity: AnyMineruCapacityConfig | None = None,
+) -> tuple[str, str]:
     if payload.get("schema") != SMOKE_SCHEMA or payload.get("status") != "pass":
         raise ValueError("held-out smoke receipt is not v6 PASS")
     if payload.get("database_access") != "none" or payload.get("queue_access") != "none":
@@ -140,6 +179,7 @@ def _validate_smoke(payload: dict[str, Any]) -> tuple[str, str]:
         payload.get("diagnostic_disposal"), source_pdf_sha256=str(source_sha256),
         runtime_identity=str(manifest_identity), source_page_count=source_pages,
         provider_bundle_sha256=str(provider.get("provider_bundle_sha256")),
+        result_storage_policy=_result_storage_policy(payload, expected_capacity),
     )
     return str(source_sha256), str(manifest_identity)
 
@@ -220,6 +260,7 @@ def build_receipt(
     *,
     epoch_before_path: Path,
     epoch_after_path: Path,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
 ) -> dict[str, Any]:
     if not MIN_DOCUMENTS <= len(paths) <= MAX_DOCUMENTS:
         raise ValueError(
@@ -227,7 +268,9 @@ def build_receipt(
         )
     loaded = [_load(path) for path in paths]
     payloads = [item[0] for item in loaded]
-    identities = [_validate_smoke(payload) for payload in payloads]
+    identities = [
+        _validate_smoke(payload, expected_capacity=expected_capacity) for payload in payloads
+    ]
     source_identities = {value[0] for value in identities}
     if len(source_identities) != len(payloads):
         raise ValueError("held-out validation source PDFs must be distinct")
@@ -322,12 +365,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epoch-before", type=Path, required=True)
     parser.add_argument("--epoch-after", type=Path, required=True)
     parser.add_argument("--receipt-out", type=Path, required=True)
+    parser.add_argument("--capacity-config", type=Path)
+    parser.add_argument("--capacity-config-sha256")
     args = parser.parse_args(argv)
+    if (args.capacity_config is None) != (args.capacity_config_sha256 is None):
+        parser.error("--capacity-config and --capacity-config-sha256 must be supplied together")
     try:
+        expected_capacity = None
+        if args.capacity_config is not None:
+            expected_capacity = load_mineru_capacity_config(
+                args.capacity_config, expected_sha256=args.capacity_config_sha256,
+                expected_owner_uid=os.getuid(),
+            ).config
         receipt = build_receipt(
             args.smoke_receipt,
             epoch_before_path=args.epoch_before,
             epoch_after_path=args.epoch_after,
+            expected_capacity=expected_capacity,
         )
         _write_new(args.receipt_out, receipt)
     except (OSError, ValueError) as exc:

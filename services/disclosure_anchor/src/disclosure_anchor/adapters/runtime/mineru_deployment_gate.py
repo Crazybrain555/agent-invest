@@ -52,6 +52,7 @@ from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
     AnyMineruCapacityConfig,
     MineruCapacityConfigV2,
+    MineruResultStoragePolicy,
 )
 from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
@@ -1181,18 +1182,8 @@ def _verify_smoke_receipt(
     )
     if provider_pages != source_pages:
         raise MinerUDeploymentGateError(f"{label} did not preserve all source pages")
-    try:
-        validate_diagnostic_disposal(
-            receipt.get("diagnostic_disposal"),
-            source_pdf_sha256=str(source_identity),
-            runtime_identity=runtime_identity,
-            source_page_count=provider_pages,
-            provider_bundle_sha256=receipt["provider"]["provider_bundle_sha256"],
-        )
-    except (TypeError, ValueError) as exc:
-        raise MinerUDeploymentGateError(
-            f"{label} diagnostic disposal was not proved: {exc}"
-        ) from exc
+    # The recorded API health must belong to the configured capacity (for a
+    # storage runtime, its policy) before that policy bounds the result.
     _verify_smoke_orchestrator(
         receipt.get("orchestrator"),
         task_retention_seconds=task_retention_seconds,
@@ -1200,6 +1191,19 @@ def _verify_smoke_receipt(
         task_slots=task_slots,
         expected_capacity=expected_capacity,
     )
+    try:
+        validate_diagnostic_disposal(
+            receipt.get("diagnostic_disposal"),
+            source_pdf_sha256=str(source_identity),
+            runtime_identity=runtime_identity,
+            source_page_count=provider_pages,
+            provider_bundle_sha256=receipt["provider"]["provider_bundle_sha256"],
+            result_storage_policy=_result_storage_policy(expected_capacity),
+        )
+    except (TypeError, ValueError) as exc:
+        raise MinerUDeploymentGateError(
+            f"{label} diagnostic disposal was not proved: {exc}"
+        ) from exc
     if receipt.get("cleanup") != _EXPECTED_CLEANUP:
         raise MinerUDeploymentGateError(f"{label} cleanup was not proved")
     if (
@@ -1224,6 +1228,56 @@ def _verify_smoke_receipt(
     ):
         raise MinerUDeploymentGateError(f"{label} timeline is invalid")
     return str(source_identity), started_at, finished_at
+
+
+def verify_recorded_smoke_capacity(
+    receipt: object, *, expected_capacity: AnyMineruCapacityConfig,
+) -> MineruResultStoragePolicy | None:
+    """Bind one sealed smoke's recorded runtime and API health to a configured capacity.
+
+    For a consumer without the live runtime (the held-out receipt builder):
+    the receipt's runtime manifest must hash to its recorded runtime identity
+    and embed exactly this capacity, and both recorded health samples must
+    verify under it, including a storage runtime's policy identity. Only then
+    is the configured policy returned as the diagnostic result bound (``None``
+    keeps the legacy reservation). No size the receipt claims is trusted.
+    """
+    if not isinstance(receipt, dict):
+        raise MinerUDeploymentGateError("MinerU smoke receipt is not an object")
+    manifest = receipt.get("runtime_manifest")
+    identity = receipt.get("identity")
+    orchestrator = manifest.get("orchestrator") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(orchestrator, dict)
+        or identity.get("runtime_manifest_identity_sha256") != canonical_payload_sha256(manifest)
+    ):
+        raise MinerUDeploymentGateError("MinerU smoke runtime manifest identity drifted")
+    if (
+        orchestrator.get("capacity_config_sha256") != expected_capacity.sha256
+        or orchestrator.get("capacity_config") != strict_json_loads(expected_capacity.exact_bytes)
+    ):
+        raise MinerUDeploymentGateError("MinerU smoke runtime differs from the configured capacity")
+    lifetimes: list[int] = []
+    for field in ("task_retention_seconds", "task_cleanup_interval_seconds"):
+        value = orchestrator.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise MinerUDeploymentGateError(f"MinerU smoke runtime {field} is invalid")
+        lifetimes.append(value)
+    _verify_smoke_orchestrator(
+        receipt.get("orchestrator"),
+        task_retention_seconds=lifetimes[0],
+        cleanup_interval_seconds=lifetimes[1],
+        task_slots=expected_capacity.parse_active_limit,
+        expected_capacity=expected_capacity,
+    )
+    return _result_storage_policy(expected_capacity)
+
+
+def _result_storage_policy(
+    capacity: AnyMineruCapacityConfig | None,
+) -> MineruResultStoragePolicy | None:
+    return capacity.result_storage if isinstance(capacity, MineruCapacityConfigV2) else None
 
 
 def _verify_smoke_orchestrator(
@@ -1403,4 +1457,5 @@ __all__ = [
     "verify_mineru_deployment_gate",
     "verify_staged_process_profile_configuration",
     "verify_mineru_heldout_validation",
+    "verify_recorded_smoke_capacity",
 ]

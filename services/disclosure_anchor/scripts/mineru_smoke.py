@@ -24,7 +24,10 @@ from typing import Any
 
 from disclosure_anchor.adapters.runtime.mineru_diagnostic import run_diagnostic_pdf
 from disclosure_anchor.adapters.runtime.mineru_capacity_config import load_mineru_capacity_config
-from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    AnyMineruCapacityConfig,
+    MineruCapacityConfigV2,
+)
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     run_mineru_multimodal_canary,
@@ -531,6 +534,11 @@ def main(argv: list[str] | None = None) -> int:
             input_pdf=input_snapshot, source_pdf_sha256=f"sha256:{input_sha256}",
             source_page_count=input_page_count, api_url=api_url,
             server_url=inference_upstream_url, options=options, journal_root=diagnostic_root,
+            # A storage-managed runtime is read only under its own capacity's policy.
+            result_storage_policy=(
+                expected_capacity.result_storage
+                if isinstance(expected_capacity, MineruCapacityConfigV2) else None
+            ),
         )
     except (DisclosureAnchorError, OSError, ValueError) as exc:
         parse_failure = exc

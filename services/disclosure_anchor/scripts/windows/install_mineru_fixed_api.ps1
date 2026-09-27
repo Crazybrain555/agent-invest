@@ -40,6 +40,7 @@ if ($ApiDeviceProfile -ne "" -and (-not $ApiOnlyCompatibilityUpgrade -or -not $E
 }
 $PreviousApiDeviceProfile = $null
 $CapacityInputs = $null
+$OldApiHealth = $null
 $ProgressPreference = "SilentlyContinue"
 if ($ExpectedApiTaskSlots -ne 1 -or $ExpectedApiMaxPendingTasks -ne 1) {
     throw "serial MinerU requires task slots and pending depth to both equal 1"
@@ -586,10 +587,15 @@ function Get-ExplicitCapacityInputs {
         OMP_NUM_THREADS="omp_num_threads"; MKL_NUM_THREADS="mkl_num_threads"; OPENBLAS_NUM_THREADS="openblas_num_threads";
         MINERU_PDF_RENDER_THREADS="pdf_render_processes_requested"; MINERU_HYBRID_BATCH_RATIO="hybrid_batch_ratio_requested"
     }
-    if (-not $storage) {
-        # A v2 bootstrap refuses these: its budgets live only in the policy.
-        $mapping["MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES"] = "result_reservation_bytes"
-        $mapping["MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES"] = "max_unacked_result_bytes"
+    # The v1 per-task result budgets. v1 projects them; v2 retires them: a v2
+    # bootstrap refuses them because its budgets live only in the policy.
+    $resultBudgets = @{
+        MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES="result_reservation_bytes";
+        MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES="max_unacked_result_bytes"
+    }
+    $retired = [ordered]@{}
+    foreach ($name in ($resultBudgets.Keys | Sort-Object)) {
+        if ($storage) { $retired[$name] = $resultBudgets[$name] } else { $mapping[$name] = $resultBudgets[$name] }
     }
     $environment = [ordered]@{}
     foreach ($name in ($mapping.Keys | Sort-Object)) { $environment[$name] = [string]$config.($mapping[$name]) }
@@ -603,7 +609,7 @@ function Get-ExplicitCapacityInputs {
     return [ordered]@{
         config=$config; config_sha256=$ExpectedCapacityConfigSha256; config_bytes=$raw;
         source_sha256=$sources; sources_sha256=(Get-Sha256Text (Get-CanonicalObjectJson $sources));
-        environment=$environment; build_target="explicit-capacity"; context=$context
+        environment=$environment; retired_environment=$retired; build_target="explicit-capacity"; context=$context
     }
 }
 
@@ -659,6 +665,15 @@ function Assert-CapacityCompose {
     }
     foreach ($name in @("MINERU_CAPACITY_CONFIG_PATH", "MINERU_CAPACITY_CONFIG_SHA256")) {
         if ($null -ne $api.environment.PSObject.Properties[$name]) { throw "compose overrides baked capacity anchor" }
+    }
+    # A field retired by this capacity version is never carried forward (a v2
+    # bootstrap refuses the v1 result budgets); no comparison masks it here.
+    if ($null -ne $CapacityInputs.retired_environment) {
+        foreach ($name in @($CapacityInputs.retired_environment.Keys)) {
+            if ($null -ne $api.environment.PSObject.Properties[$name]) {
+                throw "compose carries a capacity field retired by its capacity version: $name"
+            }
+        }
     }
     $expected = @("--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client", "--max-concurrency",
         [string]$CapacityInputs.config.final_http_limit_per_loop)
@@ -782,6 +797,50 @@ function Assert-ApiOnlyUpgradeInputs {
         }
         # Only the selected API capacity fields may differ. Inference/proxy,
         # networks, mounts, image name and every other setting remain exact.
+        # Each side masks only its own capacity projection. A candidate version
+        # that retires projected fields (v1 -> v2 retires the per-task result
+        # budgets) leaves them on the deployed side, where they are masked only
+        # as the complete canonical v1 pair that the running API actually serves.
+        # The candidate side never masks them: Assert-CapacityCompose refused them.
+        $retired = $CapacityInputs.retired_environment
+        $deployed = $previous.services."mineru-api".environment
+        $carried = @()
+        if ($null -ne $retired) {
+            $carried = @($retired.Keys | Where-Object { $null -ne $deployed.PSObject.Properties[$_] })
+        }
+        if ($carried.Count -ne 0) {
+            if ($carried.Count -ne @($retired.Keys).Count) {
+                throw "deployed compose carries an incomplete retired capacity projection"
+            }
+            $budgets = @{}
+            foreach ($name in $carried) {
+                $value = $deployed.$name
+                $parsed = [long]0
+                if ($value -isnot [string] -or $value -cnotmatch '\A[1-9][0-9]{0,18}\z' -or
+                    -not [long]::TryParse($value, [ref]$parsed)) {
+                    throw "deployed retired capacity field is not a canonical positive integer: $name"
+                }
+                $budgets[$retired[$name]] = $parsed
+            }
+            if ($budgets["result_reservation_bytes"] -gt $budgets["max_unacked_result_bytes"]) {
+                throw "deployed retired capacity budgets are not a valid v1 projection"
+            }
+            # The captured, idle-validated running API is the exact old binding:
+            # a v3 runtime (capacity v1) resolving exactly these budgets.
+            $evidence = $script:OldApiHealth
+            if ($null -eq $evidence -or $null -eq $evidence.task_protocol_runtime -or
+                $evidence.task_protocol_runtime.schema -isnot [string] -or
+                $evidence.task_protocol_runtime.schema -cne "mineru-task-runtime.v3") {
+                throw "retired capacity fields require the running v1 capacity API as evidence"
+            }
+            $served = $evidence.capacity_observation.resolved_limits
+            foreach ($field in @($budgets.Keys)) {
+                $value = $served.$field
+                if (($value -isnot [int] -and $value -isnot [long]) -or [long]$value -ne $budgets[$field]) {
+                    throw "deployed retired capacity field differs from the running API: $field"
+                }
+            }
+        }
         foreach ($item in @($next, $previous)) {
             Remove-ApiStopBudgetProjection -Compose $item
             foreach ($name in $CapacityInputs.environment.Keys) {
@@ -794,6 +853,7 @@ function Assert-ApiOnlyUpgradeInputs {
             }
             $item.services."mineru-api".command = @($command[0..5]) + @("capacity-value")
         }
+        foreach ($name in $carried) { $deployed.PSObject.Properties.Remove($name) }
         if ((Get-CanonicalObjectJson $next) -cne (Get-CanonicalObjectJson $previous)) {
             throw "API-only capacity upgrade changed configuration outside API capacity fields"
         }
@@ -1129,7 +1189,10 @@ function Assert-IdleHealth {
     }
     $runtime = $Health.task_protocol_runtime
     $isV3 = $null -ne $runtime -and $runtime.schema -eq "mineru-task-runtime.v3"
-    if ($isV3) {
+    # A result-storage capacity (v2) serves runtime v4; the explicit capacity
+    # check owns both closed shapes and matches each to the expected config.
+    $isV4 = $null -ne $runtime -and $runtime.schema -is [string] -and $runtime.schema -ceq "mineru-task-runtime.v4"
+    if ($isV3 -or $isV4) {
         Assert-CapacityIdleHealth -Health $Health -ExpectedCapacity $ExpectedCapacity -Label $Label
         return
     }
@@ -1308,6 +1371,7 @@ function Capture-OldRuntimeState {
         }
         $oldHealth = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
         Assert-IdleHealth -Health $oldHealth -Label "old MinerU API"
+        $script:OldApiHealth = $oldHealth
         $oldApi = (Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json
         if (
             $script:OldProjectContainers -notcontains "mineru-api-proxy" -or
@@ -1963,8 +2027,8 @@ try {
         throw "local Docker image does not match the expected repo digest and image ID"
     }
 
-    if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
     Capture-OldRuntimeState
+    if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
     foreach ($directory in @(
         (Split-Path -Parent $ComposeTarget), (Split-Path -Parent $CollectorTarget),
         (Split-Path -Parent $ReceiptTarget), $OutputRoot

@@ -746,7 +746,7 @@
   },
   "tests/unit/test_mineru_capacity_cli_consumers.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 6
   },
   "tests/unit/test_mineru_capacity_collector.py": {
    "private_imports": [],
@@ -806,7 +806,7 @@
   },
   "tests/unit/test_mineru_diagnostic.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 15
   },
   "tests/unit/test_mineru_diagnostic_before_submit.py": {
    "private_imports": [],
@@ -1065,6 +1065,10 @@
   "tests/unit/test_mineru_stage_durable_handoff.py": {
    "private_imports": [],
    "tests": 0
+  },
+  "tests/unit/test_mineru_storage_qualification_consumers.py": {
+   "private_imports": [],
+   "tests": 6
   },
   "tests/unit/test_mineru_stream_activation_loading.py": {
    "private_imports": [],

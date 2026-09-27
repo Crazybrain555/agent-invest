@@ -248,6 +248,8 @@ def qualify_release(
     receipt_argv += [
         "--epoch-before", str(output / "epoch-before.json"), "--epoch-after", str(output / "epoch-after.json"),
         "--receipt-out", str(output / "validation-final.json"),
+        # The same release capacity the smokes ran under seals their receipts.
+        "--capacity-config", str(capacity_path), "--capacity-config-sha256", capacity_sha,
     ]
     result = run_step(output, "validation-receipt", receipt_argv, timeout_seconds=120, environment=step_env)
     steps.append(result)
