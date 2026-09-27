@@ -4609,6 +4609,9 @@ def write_retained_zip(
             pass
         else:
             raise TaskProtocolConflict("a retained ZIP already exists for this task")
+        closing_part_fd = part_fd
+        part_fd = -1
+        os.close(closing_part_fd)
         os.rename(RETAINED_RESULT_PART_NAME, RETAINED_RESULT_NAME, src_dir_fd=task_fd, dst_dir_fd=task_fd)
         sealed = os.stat(RETAINED_RESULT_NAME, dir_fd=task_fd, follow_symlinks=False)
         if (sealed.st_dev, sealed.st_ino) != (part_identity.st_dev, part_identity.st_ino):

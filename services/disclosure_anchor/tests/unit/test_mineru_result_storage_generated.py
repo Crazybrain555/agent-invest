@@ -6,6 +6,7 @@ Synthetic uploads and parser files only; see the fixture for the exact seams.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -483,10 +484,30 @@ class RetainedZipIdentityTests(StorageApiCase):
             task_id="task-zip", task_root=root, root_identity=identity, selections=selections,
             policy=fixture.policy, zip_upper_bound=retained_zip_upper_bound,
         )
-        path, digest, size = protocol.write_retained_zip(
-            task_root=root, root_identity=identity, inventory=inventory, selections=selections,
-            grant_bytes=inventory.zip_upper_bound_bytes,
-        )
+        original_writer = protocol.BudgetedSeekableWriter
+        original_rename = os.rename
+        part_fd = None
+
+        def capture_writer(descriptor, *, grant_bytes):
+            nonlocal part_fd
+            part_fd = descriptor
+            return original_writer(descriptor, grant_bytes=grant_bytes)
+
+        def rename_after_close(source, target, **kwargs):
+            self.assertEqual((source, target), (protocol.RETAINED_RESULT_PART_NAME, protocol.RETAINED_RESULT_NAME))
+            self.assertIsNotNone(part_fd)
+            with self.assertRaises(OSError) as closed:
+                os.fstat(part_fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+            return original_rename(source, target, **kwargs)
+
+        with patch.object(protocol, "BudgetedSeekableWriter", side_effect=capture_writer), patch.object(
+            protocol.os, "rename", side_effect=rename_after_close
+        ):
+            path, digest, size = protocol.write_retained_zip(
+                task_root=root, root_identity=identity, inventory=inventory, selections=selections,
+                grant_bytes=inventory.zip_upper_bound_bytes,
+            )
         self.assertEqual(path.read_bytes(), legacy.read_bytes())
         self.assertEqual(size, legacy.stat().st_size)
         self.assertEqual(digest, hashlib.sha256(legacy.read_bytes()).hexdigest())
