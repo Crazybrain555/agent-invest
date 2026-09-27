@@ -17,7 +17,8 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
     validate_mineru_api_wire_health,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    AnyMineruCapacityConfig, MineruCapacityConfigV2, encode_any_mineru_capacity_config,
+    AnyMineruCapacityConfig, MineruCapacityConfigV2, capacity_environment,
+    encode_any_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_health import (
     validate_mineru_capacity_wire_health,
@@ -70,11 +71,6 @@ CAPACITY_CONFIG_PATH = "/usr/local/etc/mineru/capacity.json"
 CAPACITY_LABEL_KEYS = {
     "io.agent-invest.mineru.capacity-config-sha256",
     "io.agent-invest.mineru.capacity-sources-sha256",
-}
-CAPACITY_ENV_KEYS = {
-    "MINERU_API_FINALIZER_SLOTS",
-    "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
-    "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES",
 }
 EXPECTED_COMPAT_PREIMAGES = {
     "mineru/cli/common.py": (
@@ -230,6 +226,18 @@ def _environment(values: object, *, allowlist: set[str]) -> dict[str, str]:
     ):
         raise ValueError("remote environment observation is invalid")
     return {str(key): str(value) for key, value in values.items()}
+
+
+def _api_environment(
+    values: object,
+    *,
+    expected_capacity: AnyMineruCapacityConfig | None,
+    device_keys: set[str],
+) -> dict[str, str]:
+    capacity_env_keys = (
+        set(capacity_environment(expected_capacity)) if expected_capacity is not None else set()
+    )
+    return _environment(values, allowlist=API_ENV_KEYS | device_keys | capacity_env_keys)
 
 
 def _command(component: dict[str, Any]) -> list[str]:
@@ -603,9 +611,9 @@ def build_manifest(
         if expected_capacity is None or not isinstance(device_mode, str) or device_mode not in {"cpu", "cuda:0"}:
             raise ValueError("remote MinerU API device selection is not explicit CPU/CUDA0 capacity")
         device_keys.add("MINERU_DEVICE_MODE")
-    api_environment = _environment(raw_api_environment, allowlist=API_ENV_KEYS | device_keys | (
-        CAPACITY_ENV_KEYS if expected_capacity is not None else set()
-    ))
+    api_environment = _api_environment(
+        raw_api_environment, expected_capacity=expected_capacity, device_keys=device_keys
+    )
     mounts = api.get("mounts")
     if not isinstance(mounts, list):
         raise ValueError("remote MinerU mount policy drifted")

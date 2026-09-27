@@ -1030,9 +1030,10 @@
   },
   "tests/unit/test_mineru_result_storage_release.py": {
    "private_imports": [
+    "_api_environment",
     "_require_storage_ceilings"
    ],
-   "tests": 2
+   "tests": 3
   },
   "tests/unit/test_mineru_resumable_spool.py": {
    "private_imports": [],

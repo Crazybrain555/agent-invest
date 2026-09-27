@@ -16,6 +16,7 @@ import unittest
 from disclosure_anchor.adapters.runtime.mineru_release_binding import _require_storage_ceilings
 from disclosure_anchor.adapters.runtime.mineru_release_package import ReleaseIdentityError, load_release_inputs
 from disclosure_anchor.application.contracts import mineru_capacity_config as codec
+from scripts.attest_mineru_remote_runtime import API_ENV_KEYS, _api_environment
 from tests.unit.test_mineru_materialize_grant_v5 import MIB, STORAGE_POLICY
 from tests.unit.test_mineru_release_package_independent import LOCAL
 from tests.unit.test_mineru_release_compose_independent import DEPLOYMENT
@@ -36,6 +37,39 @@ def canonical(value: object) -> bytes:
 
 
 class StorageReleaseInputTests(unittest.TestCase):
+    def test_attester_requires_exact_environment_for_each_capacity_version(self) -> None:
+        v1 = _capacity()
+        v2 = storage_capacity()
+        common = {name: "configured" for name in API_ENV_KEYS}
+        for capacity in (v1, v2):
+            environment = {**common, **codec.capacity_environment(capacity), "MINERU_DEVICE_MODE": "cuda:0"}
+            with self.subTest(version=capacity.contract_version):
+                self.assertEqual(
+                    _api_environment(
+                        environment, expected_capacity=capacity, device_keys={"MINERU_DEVICE_MODE"}
+                    ),
+                    environment,
+                )
+                missing_finalizer = dict(environment)
+                del missing_finalizer["MINERU_API_FINALIZER_SLOTS"]
+                with self.assertRaisesRegex(ValueError, "remote environment observation is invalid"):
+                    _api_environment(
+                        missing_finalizer, expected_capacity=capacity, device_keys={"MINERU_DEVICE_MODE"}
+                    )
+                for legacy_name in (
+                    "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
+                    "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES",
+                ):
+                    modified = dict(environment)
+                    if capacity is v2:
+                        modified[legacy_name] = "268435456"
+                    else:
+                        del modified[legacy_name]
+                    with self.assertRaisesRegex(ValueError, "remote environment observation is invalid"):
+                        _api_environment(
+                            modified, expected_capacity=capacity, device_keys={"MINERU_DEVICE_MODE"}
+                        )
+
     def test_release_inputs_decode_v2_and_project_no_legacy_budgets(self) -> None:
         capacity = storage_capacity()
         with tempfile.TemporaryDirectory() as directory:
