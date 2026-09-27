@@ -799,10 +799,7 @@ $apiAllowedEnvironment = @(
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
 if ($ExplicitCapacity) {
-    $apiAllowedEnvironment += @(
-        "MINERU_API_FINALIZER_SLOTS", "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
-        "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES"
-    )
+    $apiAllowedEnvironment += "MINERU_API_FINALIZER_SLOTS"
     $anchorExpected = @{
         MINERU_CAPACITY_CONFIG_PATH = "/usr/local/etc/mineru/capacity.json"
         MINERU_CAPACITY_CONFIG_SHA256 = $ExpectedCapacityConfigSha256
@@ -823,15 +820,6 @@ if ($null -ne $configObject.services."mineru-api".environment.PSObject.Propertie
     if (-not $ExplicitCapacity) { throw 'API device selection requires explicit capacity' }
     $apiAllowedEnvironment += 'MINERU_DEVICE_MODE'
 }
-$apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
-    -ImageValues $apiImageEnvironment `
-    -ResolvedValues $configObject.services."mineru-api".environment -AllowedNames $apiAllowedEnvironment
-$vllmEnvironment = Select-ExactEnvironment -ActualValues @($vllm.Config.Env) `
-    -ImageValues $baseImageEnvironment `
-    -ResolvedValues $configObject.services."mineru-openai-server".environment -AllowedNames $vllmAllowedEnvironment
-$emptyEnvironment = [pscustomobject]@{}
-$proxyEnvironment = Select-ExactEnvironment -ActualValues @($proxy.Config.Env) `
-    -ImageValues $baseImageEnvironment -ResolvedValues $emptyEnvironment -AllowedNames @()
 
 $compatProbeCode = @'
 import hashlib
@@ -1001,6 +989,29 @@ if ([string]$compatProbe.mineru_version -ne "3.4.4") {
 if ([string]$compatProbe.mineru_vl_utils_version -ne "1.0.5") {
     throw "live mineru-vl-utils version drifted"
 }
+# The embedded probe bound the capacity file and serving runtime to the caller
+# anchor. Only a validated v3 runtime projects the legacy per-task budgets;
+# storage-managed v4 retires them from the exact compose environment.
+if ($ExplicitCapacity) {
+    $servingRuntimeSchema = [string]$compatProbe.serving_health.task_protocol_runtime.schema
+    if ($servingRuntimeSchema -ceq "mineru-task-runtime.v3") {
+        $apiAllowedEnvironment += @(
+            "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
+            "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES"
+        )
+    } elseif ($servingRuntimeSchema -cne "mineru-task-runtime.v4") {
+        throw "serving task runtime version is unsupported for compose environment"
+    }
+}
+$apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
+    -ImageValues $apiImageEnvironment `
+    -ResolvedValues $configObject.services."mineru-api".environment -AllowedNames $apiAllowedEnvironment
+$vllmEnvironment = Select-ExactEnvironment -ActualValues @($vllm.Config.Env) `
+    -ImageValues $baseImageEnvironment `
+    -ResolvedValues $configObject.services."mineru-openai-server".environment -AllowedNames $vllmAllowedEnvironment
+$emptyEnvironment = [pscustomobject]@{}
+$proxyEnvironment = Select-ExactEnvironment -ActualValues @($proxy.Config.Env) `
+    -ImageValues $baseImageEnvironment -ResolvedValues $emptyEnvironment -AllowedNames @()
 $compatLabelNames = @(
     "io.agent-invest.mineru.base-image-digest",
     "io.agent-invest.mineru.capacity-policy",

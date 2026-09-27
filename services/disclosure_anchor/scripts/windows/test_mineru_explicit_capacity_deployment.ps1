@@ -73,7 +73,11 @@ function Actual-Slice {param($Ast,[string]$First,[string]$Until)
 $selectionBody=Actual-Slice $InstallerAst 'ExplicitCapacity' 'ProgressPreference'
 $selectionParameters=@($InstallerAst.ParamBlock.Parameters|Where-Object{$_.Name.VariablePath.UserPath-in @('CapacityConfigSource','ExpectedCapacityConfigSha256','ExpectedApiTaskSlots','ExpectedApiMaxPendingTasks')}|ForEach-Object{$_.Extent.Text})
 $Selection=[ScriptBlock]::Create('[CmdletBinding()]param('+($selectionParameters-join ',')+')'+"`n"+$selectionBody.ToString())
-$CollectorEnvironment=Actual-Slice $CollectorAst 'apiAllowedEnvironment' 'compatProbeCode'
+$CollectorEnvironmentSetup=Actual-Slice $CollectorAst 'apiAllowedEnvironment' 'compatProbeCode'
+$collectorSelectionStart=(Statement-Index $CollectorAst 'apiEnvironment')-1
+$collectorSelectionEnd=Statement-Index $CollectorAst 'compatLabelNames'
+if($collectorSelectionStart-lt 0 -or $collectorSelectionEnd-le $collectorSelectionStart){throw 'collector environment selector moved'}
+$CollectorEnvironmentSelect=[ScriptBlock]::Create(($CollectorAst.EndBlock.Statements[$collectorSelectionStart..($collectorSelectionEnd-1)]|ForEach-Object{$_.Extent.Text}) -join "`n")
 $CollectorHealth=Actual-Slice $CollectorAst 'health' 'models'
 $CollectorEpoch=Actual-Slice $CollectorAst 'apiEpochAfter' 'result'
 $resultIndex=Statement-Index $CollectorAst 'result'
@@ -393,12 +397,14 @@ Case 'collector real ENV projection excludes anchors and refuses duplicate overr
             elseif($variant-eq 'image-sha'){$apiImageEnvironment[3]='MINERU_CAPACITY_CONFIG_SHA256=sha256:'+('0'*64)}
             elseif($variant-eq 'compose-anchor'){$configObject.services.'mineru-api'.environment|Add-Member -NotePropertyName MINERU_CAPACITY_CONFIG_PATH -NotePropertyValue '/usr/local/etc/mineru/capacity.json'}
             elseif($variant-eq 'extra'){$api.Config.Env+=,'UNDECLARED=1'}
+            $compatProbe=[pscustomobject]@{serving_health=(Clone $Profile.raw.api_health)}
             if($variant-eq 'positive'){
-                . $CollectorEnvironment
+                . $CollectorEnvironmentSetup
+                . $CollectorEnvironmentSelect
                 Check ((Get-CanonicalObjectJson $apiEnvironment)-ceq (Get-CanonicalObjectJson $Profile.raw.api.environment)) 'twenty selected API ENV values retained exactly'
                 Check (-not $apiEnvironment.Contains('MINERU_CAPACITY_CONFIG_PATH')) 'image anchors are not invented compose ENV'
                 Check ((Get-CanonicalObjectJson $vllmEnvironment)-ceq (Get-CanonicalObjectJson $Profile.raw.inference.environment)) 'inference ENV unchanged'
-            }else{Reject {. $CollectorEnvironment} '.'}
+            }else{Reject {. $CollectorEnvironmentSetup; . $CollectorEnvironmentSelect} '.'}
         }
     }
     Check ($script:Calls.Count-eq 0) 'ENV projection has no external operations'
