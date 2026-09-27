@@ -19,7 +19,9 @@ from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
+    CompletedPdfTransfer,
     DisclosureWindow,
+    PdfDownloadSink,
     SourceSecurity,
 )
 from disclosure_anchor.application.use_cases.download_document import (
@@ -222,13 +224,19 @@ class FakeCninfoSource:
     ) -> list[AnnouncementRef]:
         return self.refs
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+    def download_pdf_to(
+        self, ref: AnnouncementRef, sink: PdfDownloadSink
+    ) -> CompletedPdfTransfer:
         owned = {item.provider_document_id for item in self.refs}
         if ref.provider_document_id not in owned:
             raise AssertionError(
                 f"fake source asked to download foreign ref {ref.provider_document_id}"
             )
-        return self.pdf_bytes
+        sink.begin_attempt(declared_byte_count=len(self.pdf_bytes))
+        sink.write(self.pdf_bytes)
+        return CompletedPdfTransfer(
+            byte_count=len(self.pdf_bytes), declared_byte_count=len(self.pdf_bytes)
+        )
 
 
 def _settings(root: Path) -> Settings:

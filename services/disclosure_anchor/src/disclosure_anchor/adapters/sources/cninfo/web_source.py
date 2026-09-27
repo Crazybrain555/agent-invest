@@ -34,7 +34,15 @@ from disclosure_anchor.adapters.sources.cninfo.client import (
     BACKOFF_BASE_SECONDS,
     BACKOFF_CAP_SECONDS,
     BACKOFF_FACTOR,
+    DEFAULT_DOWNLOAD_DEADLINE_SECONDS,
+    DOWNLOAD_DEADLINE_ERROR_CODE,
+    IO_TIMEOUT_SECONDS,
+    PDF_DOWNLOAD_HEADERS,
+    UNSUPPORTED_CONTENT_ENCODING_ERROR_CODE,
+    DownloadDeadline,
+    MemoryPdfSink,
     TokenBucket,
+    UnsupportedContentEncoding,
 )
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
@@ -45,7 +53,9 @@ from disclosure_anchor.adapters.sources.cninfo.mapper import (
 )
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
+    CompletedPdfTransfer,
     DisclosureWindow,
+    PdfDownloadSink,
     SourceSecurity,
 )
 from disclosure_anchor.domain.errors import SourceRequestError
@@ -92,17 +102,23 @@ class CninfoWebSource:
         *,
         max_qps: float = 1.0,
         max_retries: int = 3,
+        download_deadline_seconds: float = DEFAULT_DOWNLOAD_DEADLINE_SECONDS,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] | None = None,
         jitter: Callable[[float], float] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        if not download_deadline_seconds > 0:
+            raise ValueError("CNINFO download deadline must be greater than zero")
         self._max_retries = max_retries
-        self._bucket = TokenBucket(max_qps=max_qps, sleep=sleep)
+        self._download_deadline_seconds = download_deadline_seconds
+        self._clock = clock or time.monotonic
+        self._bucket = TokenBucket(max_qps=max_qps, clock=clock, sleep=sleep)
         self._sleep = sleep or time.sleep
         self._jitter = jitter or (lambda upper: random.uniform(0.0, upper))
         self._client = httpx.Client(
             transport=transport,
-            timeout=30.0,
+            timeout=IO_TIMEOUT_SECONDS,
             trust_env=False,
             headers={
                 "User-Agent": "Mozilla/5.0",
@@ -162,16 +178,38 @@ class CninfoWebSource:
         del security_code
         return None
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+    def download_pdf_to(
+        self, ref: AnnouncementRef, sink: PdfDownloadSink
+    ) -> CompletedPdfTransfer:
+        # One budget for the whole logical download (see DownloadDeadline).
+        deadline = DownloadDeadline(self._download_deadline_seconds, clock=self._clock)
         attempt = 0
         while True:
             self._bucket.take()
+            timeout = deadline.io_timeout()
+            if timeout is None:
+                raise self._download_deadline_error()
             # Transport failures (connect/read timeouts — routine on the
             # public site) must surface as SourceRequestError like the API
             # channel does (client.py), or they escape the download retry
             # budget entirely (round23 review S1).
+            transfer: CompletedPdfTransfer | None = None
             try:
-                response = self._client.get(ref.download_url)
+                with self._client.stream(
+                    "GET",
+                    ref.download_url,
+                    headers=PDF_DOWNLOAD_HEADERS,
+                    timeout=timeout,
+                ) as response:
+                    status = response.status_code
+                    if status < 400:
+                        transfer = deadline.stream_body(response, sink)
+            except UnsupportedContentEncoding as exc:
+                raise CninfoWebSourceError(
+                    f"CNINFO web download answered with {exc}",
+                    error_code=UNSUPPORTED_CONTENT_ENCODING_ERROR_CODE,
+                    retryable=True,
+                ) from exc
             except httpx.TransportError as exc:
                 if attempt >= self._max_retries:
                     raise CninfoWebSourceError(
@@ -179,20 +217,47 @@ class CninfoWebSource:
                         error_code="transport_error",
                         retryable=True,
                     ) from exc
-                self._sleep(self._next_delay(attempt))
+                self._sleep_before_download_retry(attempt, deadline)
                 attempt += 1
                 continue
-            if response.status_code < 400:
-                return response.content
-            retryable = response.status_code == 429 or response.status_code >= 500
+            if status < 400:
+                if transfer is None:
+                    raise self._download_deadline_error()
+                return transfer
+            retryable = status == 429 or status >= 500
             if not retryable or attempt >= self._max_retries:
                 raise CninfoWebSourceError(
                     "CNINFO web download failed",
-                    error_code=f"http_{response.status_code}",
+                    error_code=f"http_{status}",
                     retryable=retryable,
                 )
-            self._sleep(self._next_delay(attempt))
+            self._sleep_before_download_retry(attempt, deadline)
             attempt += 1
+
+    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+        """Compatibility call returning the whole body; see ``MemoryPdfSink``."""
+
+        sink = MemoryPdfSink()
+        self.download_pdf_to(ref, sink)
+        return sink.payload()
+
+    def _sleep_before_download_retry(
+        self, attempt: int, deadline: DownloadDeadline
+    ) -> None:
+        # A backoff that would outlive the download budget cannot lead to a
+        # completed download, so the budget verdict is final now.
+        delay = self._next_delay(attempt)
+        if not deadline.allows_sleep(delay):
+            raise self._download_deadline_error()
+        self._sleep(delay)
+
+    def _download_deadline_error(self) -> CninfoWebSourceError:
+        return CninfoWebSourceError(
+            "CNINFO web download exceeded its "
+            f"{self._download_deadline_seconds:g}s deadline",
+            error_code=DOWNLOAD_DEADLINE_ERROR_CODE,
+            retryable=True,
+        )
 
     def _query_page(
         self,

@@ -25,7 +25,7 @@ from disclosure_anchor.adapters.runtime.capacity_sources import _gpu_values, _pr
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
     GpuCollectionUnavailableError, GpuSampleStaleError,
 )
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig, AnyMineruCapacityConfig, MineruCapacityConfigV2
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
 from disclosure_anchor.application.contracts.mineru_process_pressure import parse_mineru_process_pressure
 from disclosure_anchor.application.ports.mineru_stream_pressure import StreamPressureSample
@@ -42,7 +42,7 @@ def _canonical(value: object) -> bytes:
 @dataclass(frozen=True, slots=True)
 class PressureBinding:
     runtime_identity_sha256: str
-    capacity: MineruCapacityConfig
+    capacity: AnyMineruCapacityConfig
     owner_json: bytes
     cgroup_identity_sha256: str
     cgroup_max_bytes: int | None
@@ -70,7 +70,7 @@ class PressureBinding:
         for value in (self.runtime_identity_sha256, self.cgroup_identity_sha256):
             if type(value) is not str or len(value) != 71 or not value.startswith("sha256:") or any(c not in "0123456789abcdef" for c in value[7:]):
                 raise ValueError("pressure binding hash is invalid")
-        if type(self.capacity) is not MineruCapacityConfig or not self.gpu_uuid:
+        if type(self.capacity) not in (MineruCapacityConfig, MineruCapacityConfigV2) or not self.gpu_uuid:
             raise ValueError("pressure capacity/device binding is invalid")
         if self.cgroup_max_bytes is not None and (type(self.cgroup_max_bytes) is not int or self.cgroup_max_bytes <= 0):
             raise ValueError("pressure cgroup ceiling is invalid")
@@ -83,7 +83,7 @@ class StreamPressureCache:
     def __init__(self, binding: PressureBinding, *, monotonic: Callable[[], float] = time.monotonic) -> None:
         self.binding, self._clock = binding, monotonic
         self._lock = threading.Lock()
-        self._api: tuple[float, int, int, int, str] | None = None
+        self._api: tuple[float, int, int, int, int, str] | None = None
         self._gpu: tuple[float, int, str] | None = None
         self._events: dict[str, int] | None = None
         self._gpu_timestamp: float | None = None
@@ -116,8 +116,11 @@ class StreamPressureCache:
             self._events = dict(events)
             if any(observation["owner_control"][k] for k in ("foreign_loop_observed", "soft_drain_requested", "soft_drain_applied")):
                 self._unsafe = "api_owner_control_not_open"
+            # The provider's own durable responsibility count, taken from the
+            # same validated health; HTTP zero never stands in for it.
             self._api = (started, pressure.memory.observed_headroom_bytes,
-                         observation["http_counters"]["active_requests"], observation["http_counters"]["pending_requests"], digest)
+                         observation["http_counters"]["active_requests"], observation["http_counters"]["pending_requests"],
+                         health["task_admission"]["durable_nonterminal_tasks"], digest)
             self._failures.pop("api", None)
 
     def publish_gpu(self, payload: bytes, *, started: float, finished: float, received_wall: float) -> None:
@@ -189,6 +192,7 @@ class StreamPressureCache:
                 host_available_bytes=None if api is None else api[1],
                 http_active=None if api is None else api[2], http_pending=None if api is None else api[3],
                 unknown_reason=",".join(reasons) or None, unsafe_reason=self._unsafe,
+                provider_nonterminal_tasks=None if api is None else api[4],
             )
 
     @staticmethod

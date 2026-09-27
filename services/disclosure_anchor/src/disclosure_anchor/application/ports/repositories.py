@@ -6,7 +6,7 @@ Repositories persist and load domain entities. Concrete implementations live in
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields
 
 from typing import Optional, Protocol
@@ -63,12 +63,20 @@ class CompanyIdentifierRepository(Protocol):
     def get_by_scheme_value(
         self, scheme: str, normalized_value: str
     ) -> Optional[CompanyIdentifier]: ...
+    def list_by_scheme_value(
+        self, scheme: str, normalized_value: str
+    ) -> list[CompanyIdentifier]:
+        """Every row for the value, any status; never a first-match answer."""
+        ...
     def update(self, identifier: CompanyIdentifier) -> CompanyIdentifier: ...
 
 
 class SecurityRepository(Protocol):
     def add(self, security: Security) -> Security: ...
     def get(self, security_id: str) -> Optional[Security]: ...
+    def get_for_update(self, security_id: str) -> Optional[Security]:
+        """Row-lock one security (FOR NO KEY UPDATE) inside the active UoW."""
+        ...
     def get_by_code_exchange(self, security_code: str, exchange: str) -> Optional[Security]: ...
 
 
@@ -81,9 +89,83 @@ class TrackedCompanyRepository(Protocol):
     def delete(self, tracked_company_id: str) -> None: ...
 
 
+class PendingDownloadCandidate(Mapping[str, object]):
+    """One queued index candidate plus the index access that carried it.
+
+    It reads as the candidate mapping itself, so field lookups keep working,
+    while ``DownloadDocumentCommand`` takes the exact index access id from it
+    instead of guessing one from the latest snapshot.
+    """
+
+    __slots__ = ("_candidate", "_index_source_access_id")
+
+    def __init__(
+        self, *, candidate: Mapping[str, object], index_source_access_id: str
+    ) -> None:
+        if not isinstance(index_source_access_id, str) or not index_source_access_id:
+            raise ValueError("pending candidate requires its index source access id")
+        self._candidate = candidate
+        self._index_source_access_id = index_source_access_id
+
+    @property
+    def candidate(self) -> Mapping[str, object]:
+        return self._candidate
+
+    @property
+    def index_source_access_id(self) -> str:
+        return self._index_source_access_id
+
+    def __getitem__(self, key: str) -> object:
+        return self._candidate[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._candidate)
+
+    def __len__(self) -> int:
+        return len(self._candidate)
+
+    def __repr__(self) -> str:
+        return (
+            "PendingDownloadCandidate("
+            f"index_source_access_id={self._index_source_access_id!r}, "
+            f"candidate={dict(self._candidate)!r})"
+        )
+
+
+@dataclass(frozen=True)
+class DownloadFailureResolution:
+    """One failed download attempt as ops.download_failure_resolution_v1 sees it."""
+
+    source_access_id: str
+    nonretryable: bool
+    resolved_by_source_access_id: Optional[str]
+
+
 class SourceAccessRepository(Protocol):
     def add(self, source_access: SourceAccess) -> SourceAccess: ...
     def get(self, source_access_id: str) -> Optional[SourceAccess]: ...
+    def get_for_update(self, source_access_id: str) -> Optional[SourceAccess]:
+        """Row-lock one access (FOR NO KEY UPDATE) inside the active UoW."""
+        ...
+    def successful_recovery_for(
+        self, failed_source_access_id: str
+    ) -> Optional[SourceAccess]:
+        """The one access whose recovery link names this failure, if any.
+
+        The caller still proves it is the resolution it expects (provider,
+        interface, status, link, document); the link alone proves nothing.
+        """
+        ...
+    def list_historical_security_bindings(
+        self, *, security_id: str
+    ) -> list[SourceAccess]:
+        """Every binding access recorded for one historical security."""
+        ...
+    def download_failure_resolutions(
+        self, *, provider_document_id: str
+    ) -> list[DownloadFailureResolution]:
+        """Every failed CNINFO download attempt of one provider document."""
+        ...
     def list_candidate_snapshots(
         self, *, provider: str, provider_interface: str, company_id: str
     ) -> list[dict[str, object]]: ...
@@ -95,7 +177,7 @@ class SourceAccessRepository(Protocol):
         download_interface: str,
         max_retries: int,
         overlap_start: object,
-    ) -> list[dict[str, object]]: ...
+    ) -> list[PendingDownloadCandidate]: ...
 
 
 class SourceCheckpointRepository(Protocol):

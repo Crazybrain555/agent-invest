@@ -151,6 +151,10 @@ PARSER_CONTROL_ERROR_CODES = frozenset(
 PROVIDER_INFRASTRUCTURE_ERROR_CODES = frozenset(
     {
         "transport_error",
+        # A logical PDF download that outlived its source-adapter deadline:
+        # the provider is currently too slow, so cool the source down like a
+        # transport failure instead of starting the next slow transfer.
+        "transfer_deadline_exceeded",
         "non_json_response",
         "invalid_response_shape",
         "incomplete_response",
@@ -292,8 +296,9 @@ class WorkerDeps:
     heartbeat: Callable[[], None] = lambda: None
     # Python threads cannot be killed safely. Production injects a
     # process-supervisor handoff that terminates registered MinerU groups and
-    # exits for launchd replacement when the entire parse future (including
-    # artifact read/map/store/DB finish) exceeds the extreme lease.
+    # exits 70 when the entire parse future (including artifact
+    # read/map/store/DB finish) exceeds the extreme lease; launchd keeps that
+    # nonzero exit down until an operator restarts the worker.
     on_parse_runaway: Callable[[str], None] = lambda _document_id: None
     # Resident production wiring re-validates the dedicated PostgreSQL
     # singleton session before every admission boundary and during long
@@ -572,6 +577,9 @@ def _sync_stage(
             attempted.add(str(row.get("company_id")))
         security_code = row.get("security_code")
         exchange = row.get("exchange")
+        # Maintenance liveness is a completed company, not a successful one:
+        # each handled outcome below (sync, recorded failure, deferral)
+        # heartbeats exactly once, while a request that never returns cannot.
         if not security_code or not exchange:
             _record_sync_failure_access(
                 deps,
@@ -586,6 +594,7 @@ def _sync_stage(
                     error_code="tracked_company_without_security",
                 )
             )
+            deps.heartbeat()
             continue
         never_synced = row.get("last_synced_at") is None and not row.get("window_end")
         if never_synced and deps.config.backfill_max_pending_downloads > 0:
@@ -604,6 +613,7 @@ def _sync_stage(
                     )
             if processing_backlog_now >= deps.config.backfill_max_pending_downloads:
                 report.deferred_backfill += 1
+                deps.heartbeat()
                 continue
         window_start = _sync_window_start(
             row.get("window_end"),
@@ -638,6 +648,9 @@ def _sync_stage(
                     retryable=retryable,
                 )
             )
+            # Recorded before any early exit below, so the company that trips
+            # a rate-limit/quota/outage break is still a completed item.
+            deps.heartbeat()
             if _is_rate_limit_error(exc):
                 # Short-window provider verdict: yield the stage now and let
                 # the controller apply a brief cooldown while local download/
@@ -823,6 +836,10 @@ def _download_stage(
             return source
         item_ref = str(row["provider_document_id"])
         candidate = row.get("candidate")
+        # As in sync, every candidate that reaches an outcome heartbeats once:
+        # a registered document, a typed failure DownloadDocument already
+        # recorded, or a handled exception. A download that never returns
+        # does not; its bound is the source adapter's download deadline.
         if not isinstance(candidate, dict):
             report.failed += 1
             report.failures.append(
@@ -830,9 +847,23 @@ def _download_stage(
                     stage="download", item_ref=item_ref, error_code="candidate_shape"
                 )
             )
+            deps.heartbeat()
             continue
+        index_source_access_id = row.get("source_access_id")
         try:
-            result = downloader.execute(DownloadDocumentCommand(candidate=candidate))
+            result = downloader.execute(
+                DownloadDocumentCommand(
+                    candidate=candidate,
+                    # The index access that carried this candidate; a
+                    # historical-code registration cannot be proven without it.
+                    index_source_access_id=(
+                        index_source_access_id
+                        if isinstance(index_source_access_id, str)
+                        and index_source_access_id
+                        else None
+                    ),
+                )
+            )
         except Exception as exc:
             error_code, retryable = _source_error_details(exc)
             report.failed += 1
@@ -845,15 +876,16 @@ def _download_stage(
                     message=str(exc)[:500],
                 )
             )
+            deps.heartbeat()
             if error_code == "DB_POOL_EXHAUSTED":
                 return source
             if _is_provider_infrastructure_error(error_code, retryable):
                 report.source_outage_break = True
                 return source
             continue
+        deps.heartbeat()
         if result.document_id is not None:
             report.downloaded += 1
-            deps.heartbeat()
         else:
             report.failed += 1
             report.failures.append(

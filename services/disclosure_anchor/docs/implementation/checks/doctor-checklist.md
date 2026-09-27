@@ -24,6 +24,22 @@ DISCLOSURE_RUNTIME_ROOT 指向 /Volumes/AgentSSD/agent_system/services/disclosur
 
 失败策略：fail closed。
 
+`worker operational control`（不需要 DB）：`runtime/control/worker-circuit-stop.json` 存在、无效或
+control 存储/runtime 根不可信（含受监督根缺挂载 sentinel 或不在同一设备），或受监督 label 的 launchd
+读回未知 → FAIL（报 SHA、cause、record_origin、native_disable 或读回 detail）；label 被原生 disable 或
+loaded job 以 78 退出但没有记录 → WARN（原生状态本身没有原因，不编造语义故障；启动门仍拒绝）；否则
+PASS。只有 macOS 上的受监督 runtime 根（`DISCLOSURE_WORKER_SUPERVISED_RUNTIME_ROOT`）才读 launchd，
+其它根报 `no native supervisor applies`；生产 label 与非生产根（或生产根与其它 label）配对为
+`label_root_mismatch`，不调用 launchctl，按读回未知 FAIL。合同见 `../design/worker-operational-stop.md`。
+
+`worker execution qualification` / `worker legacy obligations`（仅在配置本地执行升级 U01 时出现；exact 部署不
+增加任何行）：前者用 resident worker 同一 checker 验证 U01，PASS 报 `compatible_parent (inherited)`、父资格原日期、
+R0→R1、W0→W1 与提案 SHA；v2 提案改报 `contract=worker-local-execution-upgrade.v2`、`anchor_qualified_at`/
+`anchor_runtime`（Q0）与 recovery origin→target 的 release/runtime/writer，任何不一致 FAIL；后者（需要 DB）在一个 READ ONLY
+快照中执行 worker 启动时同一范围复核，附 `final_states=`（按终态计数，合法 `local_failed` 与 `acked` 同为终态），
+成员仍未终结 → WARN（新 H0 被保持），全部终结 → PASS；成员未终结时出现的任何清单外 head、非成员 legacy head、
+身份/历史漂移或 staged non-current prepared 行 → FAIL。合同见 `../design/local-execution-upgrade.md`。
+
 ## 2. PostgreSQL 检查
 
 ```text
@@ -78,6 +94,8 @@ MODELSCOPE_CACHE 指向外置盘
 outbox seq 单调递增（空洞 → WARN）
 stale running run（超龄阈值经 queries.py helper 施加）→ WARN
 Unit build retrying / dead letters → WARN / FAIL；修复入口为显式 rebuild-units
+download dead letters（0064，ops.download_failure_resolution_v1）→ 有死信候选 WARN；同行列出不可重试失败
+  总数 / 已由保留原件登记解决数 / 未解决数，失败历史保留；修复入口为 runbook §5.5 的具名 source-recovery
 孤儿 raw/artifact 文件 → 报告不报错（05-S8 的 FS-先行 orphan 是合法状态）
 ```
 

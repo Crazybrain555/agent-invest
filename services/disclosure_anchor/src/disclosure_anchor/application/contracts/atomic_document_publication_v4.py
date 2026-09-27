@@ -126,6 +126,20 @@ class WholeDocumentPublicationV4Error(ValueError):
     """The pre-ID publication request is not one closed whole document."""
 
 
+class PublicationEnvelopeExceededError(WholeDocumentPublicationV4Error):
+    """A private publication record encodes larger than its fixed byte envelope.
+
+    A capacity fact of this document under the current release, raised while
+    encoding and so before any readiness write or transaction P: never content
+    damage, and never a reason to truncate or drop Units.
+    """
+
+    def __init__(self, *, byte_count: int, limit: int) -> None:
+        super().__init__("publication record bytes are outside the envelope")
+        self.byte_count = byte_count
+        self.limit = limit
+
+
 @dataclass(frozen=True, slots=True)
 class UpstreamPublicationEvidenceV4:
     attempt_id: str
@@ -847,6 +861,26 @@ class AtomicPublicationRequestV4:
         return _canonical_json(_request_payload(self))
 
 
+
+def _intent_limits_bound(intent: MaterializationIntentV4, reservation: ResourceReservationV4) -> bool:
+    """A v4 intent's limits are its reservation; a v5 intent's are its grant."""
+    grant = intent.resource_grant
+    if grant is None:
+        limits = reservation.reserved_credit
+        return (
+            intent.result_byte_limit == limits.provider_result_bytes
+            and intent.decoded_byte_limit == limits.decoded_bytes
+            and intent.temporary_disk_byte_limit == limits.temp_disk_bytes
+            and intent.output_byte_limit == limits.output_bytes
+        )
+    return (
+        grant.reservation_sha256 == reservation.sha256
+        and intent.result_byte_limit == grant.limits.provider_result_bytes
+        and intent.decoded_byte_limit == grant.selected_bytes
+        and intent.temporary_disk_byte_limit == grant.limits.temp_disk_bytes
+        and intent.output_byte_limit == grant.limits.output_bytes
+    )
+
 def seal_upstream_publication_evidence_v4(
     *,
     reservation: ResourceReservationV4,
@@ -904,12 +938,7 @@ def seal_upstream_publication_evidence_v4(
             reservation.reservation_input_sha256,
         )
         or intent.reservation_sha256 != reservation.sha256
-        or intent.result_byte_limit
-        != reservation.reserved_credit.provider_result_bytes
-        or intent.decoded_byte_limit != reservation.reserved_credit.decoded_bytes
-        or intent.temporary_disk_byte_limit
-        != reservation.reserved_credit.temp_disk_bytes
-        or intent.output_byte_limit != reservation.reserved_credit.output_bytes
+        or not _intent_limits_bound(intent, reservation)
         or intent.output_page_limit != reservation.source_page_count
         or checkpoint.materialization_intent_sha256 != intent.sha256
         or checkpoint.local_materialization_receipt_sha256 != receipt.sha256
@@ -1321,7 +1350,9 @@ def _canonical_json(value: object) -> bytes:
         raise WholeDocumentPublicationV4Error(
             "publication record is not strict JSON"
         ) from exc
-    if not 1 <= len(encoded) <= _MAX_BYTES:
+    if len(encoded) > _MAX_BYTES:
+        raise PublicationEnvelopeExceededError(byte_count=len(encoded), limit=_MAX_BYTES)
+    if not encoded:
         raise WholeDocumentPublicationV4Error(
             "publication record bytes are outside the envelope"
         )
@@ -1620,6 +1651,7 @@ def _integer_tuple(value: object, label: str) -> tuple[int, ...]:
 __all__ = [
     "ATOMIC_PUBLICATION_REQUEST_V4_CONTRACT",
     "AtomicPublicationRequestV4",
+    "PublicationEnvelopeExceededError",
     "PRE_ID_UNIT_PUBLICATION_V4_CONTRACT",
     "PREVIOUS_ACTIVE_UNIT_V4_CONTRACT",
     "PreIdUnitPublicationV4",

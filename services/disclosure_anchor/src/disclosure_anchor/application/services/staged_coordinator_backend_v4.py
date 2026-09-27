@@ -21,6 +21,14 @@ from disclosure_anchor.application.contracts.provider_secret_envelope_v4 import 
     SealedProviderSecretV4,
     bind_provider_secret_v4,
 )
+from disclosure_anchor.application.contracts.expired_prepared_closure import (
+    ORIGINAL_KEY_EXPIRED_ERROR_CODE,
+    require_frozen_prepared_member,
+)
+from disclosure_anchor.application.contracts.worker_execution_upgrade import LegacyScopeMember
+from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
+    PublicationEnvelopeExceededError,
+)
 from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     AcceptedSubmissionReceiptV4,
     EncodedRemoteParseEvidenceV4,
@@ -30,6 +38,7 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     SnapshotReceiptV4,
     SubmissionIntentV4,
     TerminalReceiptV4,
+    effective_resource_reservation_v4,
     encode_remote_parse_evidence_v4,
 )
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
@@ -44,6 +53,8 @@ from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     ResourceReservationV4,
     advance_remote_parse_checkpoint_v4,
     build_local_cleanup_plan_v4,
+    credit_union_v4,
+    terminal_result_growth_v4,
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
     SemanticRouteLockedCandidateOverflowError,
@@ -71,11 +82,13 @@ from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     V4SuccessorAppend,
 )
 from disclosure_anchor.application.ports.remote_provider_v4 import (
+    STORAGE_HOLD_TERMINATED_CAUSE_CODE,
     PinnedSnapshotSourceV4,
     RemotePollCommandV4,
     RemoteProviderCompletedV4,
     RemoteProviderFailedV4,
     RemoteProviderProtocolErrorV4,
+    RemoteProviderStorageWaitV4,
     RemoteProviderUnavailableV4,
     RemoteProviderV4Port,
     RemoteProviderWaitingV4,
@@ -84,6 +97,12 @@ from disclosure_anchor.application.ports.remote_provider_v4 import (
 )
 from disclosure_anchor.domain.errors import ParserOutputContractError
 from disclosure_anchor.application.ports.staged_provider_parser import (
+    MaterializationCapacityBlockedV4,
+    MaterializationCapacityWaitV4,
+    MaterializationTransferContinuesV4,
+    MaterializationTransferHeldV4,
+    MaterializationHeavyWorkRequiredV4,
+    MaterializationUnpackContinuesV4,
     MaterializedProviderDocumentV4,
     PrivateProviderCapabilityV4,
     V4ClaimGuard,
@@ -91,6 +110,10 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     V4MaterializationPort,
     V4ClaimWitness,
     seal_provider_ack_command_v4,
+)
+from disclosure_anchor.application.services.publication_text_representability_v4 import (
+    PUBLICATION_TEXT_UNREPRESENTABLE_ERROR_CODE,
+    PublicationTextUnrepresentableError,
 )
 from disclosure_anchor.application.services.staged_coordinator_persistence_v4 import (
     DurableStagedCoordinatorPersistenceV4,
@@ -100,12 +123,23 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     CoordinatorWork,
     RetryStage,
     StageLeaseGuard,
+    StageCapacityBlocked,
+    StageHeavyWorkRequired,
+    StageProviderWaiting,
+    StageResourceGrantRequired,
     StageWaiting,
     StageAdmissionDeferred,
 )
 from disclosure_anchor.application.use_cases.prepare_and_publish_whole_document_v4 import (
     PrepareAndPublishWholeDocumentV4,
 )
+
+
+# A refused POST re-uploads its whole source: pace resubmission well above
+# the poll tick, yet far inside every claim lease.
+_STORAGE_SUBMISSION_WAIT_SECONDS = 5.0
+# A transfer that stopped at a durable safe point resumes on the next dispatch.
+_TRANSFER_CONTINUATION_SECONDS = 0.5
 
 
 class V4StageInputResolver(Protocol):
@@ -436,6 +470,16 @@ class DurableStagedCoordinatorBackendV4:
                 credit_allowance=credit_allowance,
                 stage_guard=stage_guard,
             )
+        required = credit_union_v4(
+            work.credit_reservation,
+            effective_resource_reservation_v4(
+                self._reservation(authority), terminal=terminal, intent=intent,
+            ),
+        )
+        if not required.fits(work.credit_reservation):
+            raise StageResourceGrantRequired(
+                "materialization needs its stage grant", required=required,
+            )
         successor = advance_remote_parse_checkpoint_v4(
             authority.checkpoint,
             state="materializing",
@@ -485,12 +529,13 @@ class DurableStagedCoordinatorBackendV4:
             MaterializationIntentV4,
         )
         capability = self._capability(authority, accepted, "result_download")
+        effective = effective_resource_reservation_v4(reservation, terminal=terminal, intent=intent)
         self._require_credit_delta(
             authority.checkpoint.held_resource_credit,
             ResourceCreditVector(
-                output_items=reservation.reserved_credit.output_items,
-                output_bytes=reservation.reserved_credit.output_bytes,
-                output_pages=reservation.reserved_credit.output_pages,
+                output_items=effective.output_items,
+                output_bytes=effective.output_bytes,
+                output_pages=effective.output_pages,
             ),
             credit_allowance,
         )
@@ -510,11 +555,47 @@ class DurableStagedCoordinatorBackendV4:
                 allowance=inputs.materialization_allowance(authority, intent),
                 replay_context=self._replay_context(authority),
             )
+        except MaterializationTransferContinuesV4 as exc:
+            # Durable growth, not a failed try: the same stage resumes later
+            # without spending the retry budget.
+            stage_guard.note(
+                "materialization_transfer_continues",
+                durable_offset=exc.durable_offset,
+                artifact_byte_count=exc.artifact_byte_count,
+            )
+            raise StageWaiting(
+                str(exc), retry_after_seconds=_TRANSFER_CONTINUATION_SECONDS,
+            ) from exc
+        except MaterializationCapacityWaitV4 as exc:
+            # Same attempt, same result, nothing written: a healthy wait that
+            # spends no retry budget, re-checked against live space.
+            stage_guard.note("materialization_capacity_waiting", dimension=exc.dimension)
+            raise StageWaiting(str(exc), retry_after_seconds=_STORAGE_SUBMISSION_WAIT_SECONDS) from exc
+        except MaterializationUnpackContinuesV4 as exc:
+            stage_guard.note(
+                "materialization_unpack_continues",
+                completed_members=exc.completed_members,
+                member_count=exc.member_count,
+            )
+            raise StageWaiting(
+                str(exc), retry_after_seconds=_TRANSFER_CONTINUATION_SECONDS,
+            ) from exc
+        except MaterializationHeavyWorkRequiredV4 as exc:
+            # Transfer and unpack are durable; only the whole-object decode
+            # waits for the shared permit. No retry budget is spent.
+            stage_guard.note("materialization_heavy_work_required")
+            raise StageHeavyWorkRequired(str(exc), retry_after_seconds=self._poll_seconds) from exc
         except RemoteProviderUnavailableV4 as exc:
             raise RetryStage(
                 "provider result materialization was unavailable",
                 retry_after_seconds=self._poll_seconds,
             ) from exc
+        except MaterializationCapacityBlockedV4 as exc:
+            stage_guard.note("materialization_capacity_blocked", dimension=exc.dimension)
+            raise StageCapacityBlocked(str(exc), dimensions=(exc.dimension,)) from exc
+        except MaterializationTransferHeldV4 as exc:
+            stage_guard.note("materialization_transfer_held", reason=exc.reason)
+            raise StageCapacityBlocked(str(exc), dimensions=(exc.reason,)) from exc
         except (ExpectedV4AttemptFailure, ParserOutputContractError) as exc:
             return self._fail_attempt(
                 work,
@@ -563,6 +644,11 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
+        if getattr(stage_guard, "heavy_work_permitted", None) is False:
+            # Reopen, Unit build, readiness and promotion hold whole objects.
+            raise StageHeavyWorkRequired(
+                "commit waits for the shared heavy-work permit", retry_after_seconds=self._poll_seconds,
+            )
         authority, _inputs = self._authority(work, "local_materialized", stage_guard)
         self._require_credit_transition(
             authority.checkpoint,
@@ -592,6 +678,33 @@ class DurableStagedCoordinatorBackendV4:
                 credit_allowance=credit_allowance,
                 stage_guard=stage_guard,
             )
+        except PublicationTextUnrepresentableError as exc:
+            # Candidate content PostgreSQL cannot store, refused before
+            # readiness and transaction P for a fresh or reopened request.
+            # Only this typed content error closes the attempt; every DB,
+            # hash, IO or integrity error still opens the run circuit.
+            return self._fail_attempt(
+                work,
+                authority,
+                outcome="local_failure",
+                error=exc,
+                error_stage="commit",
+                credit_allowance=credit_allowance,
+                stage_guard=stage_guard,
+            )
+        except PublicationEnvelopeExceededError as exc:
+            # This document's private publication records do not fit the fixed
+            # envelope of this release: a capacity fact found while encoding,
+            # before any readiness write or transaction P. The materialized
+            # output stays as it is, the attempt holds visibly, other documents
+            # continue; it is never failed as content damage or truncated.
+            stage_guard.note("publication_envelope_hold", byte_count=exc.byte_count, limit=exc.limit)
+            raise StageCapacityBlocked(str(exc), dimensions=("publication_envelope",)) from exc
+        except MaterializationCapacityWaitV4 as exc:
+            # Live free space cannot take the readiness files now: nothing was
+            # written for them, and the same COMMIT waits without spending budget.
+            stage_guard.note("publication_capacity_waiting", dimension=exc.dimension)
+            raise StageWaiting(str(exc), retry_after_seconds=_STORAGE_SUBMISSION_WAIT_SECONDS) from exc
         stage_guard.checkpoint()
         committed = self._persistence.reload_stage_claim(work, stage_guard=stage_guard)
         if committed.state != "publish_committed":
@@ -650,6 +763,80 @@ class DurableStagedCoordinatorBackendV4:
         if work.state != "cleanup_pending":
             raise ValueError("cleanup lane received an unsupported V4 state")
         authority, _inputs = self._authority(work, "cleanup_pending", stage_guard)
+        return self._finish_cleanup(
+            work, authority, credit_allowance=credit_allowance, stage_guard=stage_guard,
+        )
+
+    def close_prepared_before_submission(
+        self,
+        work: CoordinatorWork,
+        *,
+        member: LegacyScopeMember,
+        failure: ExpectedV4AttemptFailure,
+        stage_guard: StageLeaseGuard,
+    ) -> CoordinatorWork:
+        """Managed closure only: fail one never-submitted prepared H0 before any POST.
+
+        The operator's fixed inventory binds the head (it must still be exactly
+        the member's captured H0) in place of the stage-input resolver, whose
+        runtime fence no longer admits an expired legacy obligation. Nothing is
+        submitted or looked up; the ordinary cleanup then closes the attempt.
+        """
+        if failure.error_code != ORIGINAL_KEY_EXPIRED_ERROR_CODE or failure.retryable:
+            raise ValueError("managed prepared closure requires the typed original-key failure")
+        authority = self._closure_authority(work, "prepared", stage_guard)
+        require_frozen_prepared_member(authority, member)
+        return self._fail_attempt(
+            work,
+            authority,
+            outcome="pre_submission_failure",
+            error=failure,
+            error_stage="managed_closure",
+            credit_allowance=ResourceCreditVector(),
+            stage_guard=stage_guard,
+        )
+
+    def finish_closed_cleanup(
+        self,
+        work: CoordinatorWork,
+        *,
+        stage_guard: StageLeaseGuard,
+    ) -> CoordinatorWork:
+        """Managed closure only: the owned local cleanup; no provider task, no ACK."""
+        authority = self._closure_authority(work, "cleanup_pending", stage_guard)
+        failure = self._evidence(authority, "failure_receipt", FailureReceiptV4)
+        if (
+            failure.outcome != "pre_submission_failure"
+            or failure.submission_was_attempted
+            or failure.source_state != "prepared"
+            or failure.error_code != ORIGINAL_KEY_EXPIRED_ERROR_CODE
+        ):
+            raise ValueError("cleanup head is not a managed prepared closure")
+        return self._finish_cleanup(
+            work, authority, credit_allowance=ResourceCreditVector(), stage_guard=stage_guard,
+        )
+
+    def _closure_authority(
+        self,
+        work: CoordinatorWork,
+        expected_state: str,
+        stage_guard: StageLeaseGuard,
+    ) -> RemoteParseV4Authority:
+        stage_guard.checkpoint()
+        authority = self._persistence.load_owned_authority(work)
+        stage_guard.checkpoint()
+        if authority.state != expected_state:
+            raise ValueError("durable V4 stage state changed before execution")
+        return authority
+
+    def _finish_cleanup(
+        self,
+        work: CoordinatorWork,
+        authority: RemoteParseV4Authority,
+        *,
+        credit_allowance: ResourceCreditVector,
+        stage_guard: StageLeaseGuard,
+    ) -> CoordinatorWork:
         source = authority.checkpoint_history[-2]
         plan = self._evidence(authority, "cleanup_plan", LocalCleanupPlanV4)
         intent = self._optional_evidence(
@@ -834,6 +1021,13 @@ class DurableStagedCoordinatorBackendV4:
                 "provider submission paused by stream pressure: " + str(exc),
                 retry_after_seconds=self._poll_seconds,
             ) from exc
+        except RemoteProviderStorageWaitV4 as exc:
+            # A typed, proved-unaccepted storage refusal: the provider sheds
+            # new work for physical space. The same attempt resubmits the same
+            # request later; the retry budget is for failures, not this.
+            raise StageWaiting(
+                str(exc), retry_after_seconds=_STORAGE_SUBMISSION_WAIT_SECONDS,
+            ) from exc
         except (RemoteProviderUnavailableV4, RemoteSubmissionAmbiguousV4) as exc:
             raise RetryStage(
                 "provider submission episode was unavailable",
@@ -927,6 +1121,25 @@ class DurableStagedCoordinatorBackendV4:
                 stage_guard=stage_guard,
             )
         if type(outcome) is RemoteProviderWaitingV4:
+            # An explicit native storage wait or operator hold is accepted
+            # work the provider keeps on purpose: visible, never a runaway.
+            if outcome.storage_wait_reason is not None:
+                stage_guard.note(
+                    "remote_storage_waiting", fence_identity=accepted.fence_identity,
+                    remote_task_identity_sha256=remote_task_identity_sha256(accepted.remote_task_identity),
+                    reason=outcome.storage_wait_reason, blocked=int(outcome.storage_blocked),
+                )
+                if outcome.storage_blocked:
+                    # A native hold never resumes by itself: the coordinator
+                    # stops the site with the task, bytes and seal retained.
+                    raise StageCapacityBlocked(
+                        f"native storage hold: {outcome.storage_wait_reason}",
+                        dimensions=(outcome.storage_wait_reason,),
+                    )
+                raise StageProviderWaiting(
+                    f"provider task waits for storage: {outcome.storage_wait_reason}",
+                    retry_after_seconds=self._poll_seconds,
+                )
             runaway = self._remote_runaway_failure(authority, intent, inputs=inputs)
             if runaway is not None:
                 return self._fail_attempt(
@@ -938,12 +1151,24 @@ class DurableStagedCoordinatorBackendV4:
                     credit_allowance=credit_allowance,
                     stage_guard=stage_guard,
                 )
-            raise StageWaiting(
+            # Only this authoritative status answer witnesses the task alive;
+            # the stream-pressure pause above stays a plain StageWaiting.
+            raise StageProviderWaiting(
                 f"provider task is {outcome.status}",
                 retry_after_seconds=self._poll_seconds,
             )
         if type(outcome) is RemoteProviderCompletedV4:
             terminal = outcome.receipt
+            if terminal.result_storage is not None:
+                # A verified result beyond the scheduling estimate needs its
+                # grant before the terminal commit; nothing is failed or ACKed.
+                required = terminal_result_growth_v4(
+                    work.credit_reservation, artifact_byte_count=terminal.artifact_byte_count,
+                )
+                if not required.fits(work.credit_reservation):
+                    raise StageResourceGrantRequired(
+                        "verified terminal result exceeds the reserved estimate", required=required,
+                    )
             # The instant this process observed the remote terminal; bound to the
             # accepted task identity the same way the journal's remote_accepted is.
             stage_guard.note(
@@ -1020,6 +1245,14 @@ class DurableStagedCoordinatorBackendV4:
             f"{cause.descriptor}; response {outcome.response_sha256}; "
             f"provider error: {outcome.provider_error}"
         )[:4096]
+        if cause.code == STORAGE_HOLD_TERMINATED_CAUSE_CODE:
+            # An operator's recorded decision ended a native storage hold: a
+            # terminal failure released only by an explicit later requeue.
+            return ExpectedV4AttemptFailure(
+                error_code="provider_storage_hold_terminated",
+                message=message,
+                retry_budget_class="provider_terminal",
+            )
         if cause.retry_class == "transient":
             return ExpectedV4AttemptFailure(
                 error_code="provider_terminal_transient_failure",
@@ -1115,6 +1348,13 @@ class DurableStagedCoordinatorBackendV4:
             retryable = False
             retry_budget_class = "semantic_route_contract"
             message = str(error)
+        elif isinstance(error, PublicationTextUnrepresentableError):
+            # The same sealed bytes fail again, so this is never automatic;
+            # only an explicit parse requeue after a fix may release it.
+            error_code = PUBLICATION_TEXT_UNREPRESENTABLE_ERROR_CODE
+            retryable = False
+            retry_budget_class = "provider_artifact_contract"
+            message = error.safe_summary()
         else:
             raise ValueError("untyped V4 attempt failure cannot be persisted")
         failure = FailureReceiptV4(

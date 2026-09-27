@@ -15,6 +15,9 @@ from disclosure_anchor.application.contracts.provider_table_projection import (
 from disclosure_anchor.application.contracts.document_outline import (
     HeadingPlacementSource,
 )
+from disclosure_anchor.application.contracts.provider_source_semantics import (
+    NUL_SUBSTITUTION_POLICY,
+)
 from disclosure_anchor.application.contracts.retrieval_primary import (
     RetrievalTarget,
     SearchTransform,
@@ -35,6 +38,9 @@ IDENTIFIER_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v6"
 STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v7"
 HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v8"
 PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v9"
+# The current writer emits v10 only for a Unit that carries a U+0000 marker;
+# every other Unit keeps the unchanged v9 bytes and hashes.
+TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION = "provider_unit_locator.v10"
 SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
     {
         LEGACY_PROVIDER_UNIT_LOCATOR_VERSION,
@@ -46,9 +52,16 @@ SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
         HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
-PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v23"
+CURRENT_PROVIDER_UNIT_LOCATOR_VERSIONS = frozenset(
+    {
+        PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION,
+    }
+)
+PROVIDER_UNIT_BUILDER_VERSION = "provider_unit.v24"
 
 _SOURCE_REPAIR_LOCATOR_VERSIONS = frozenset(
     {
@@ -60,6 +73,7 @@ _SOURCE_REPAIR_LOCATOR_VERSIONS = frozenset(
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
         HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
 _PAYLOAD_BOUND_LOCATOR_VERSIONS = frozenset(
@@ -71,6 +85,7 @@ _PAYLOAD_BOUND_LOCATOR_VERSIONS = frozenset(
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
         HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
 _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS = frozenset(
@@ -81,10 +96,15 @@ _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS = frozenset(
         STATUTORY_TEMPLATE_PROVIDER_UNIT_LOCATOR_VERSION,
         HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION,
         PROVIDER_UNIT_LOCATOR_VERSION,
+        TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION,
     }
 )
 _TITLE_FRAGMENT_SEARCH_LOCATOR_VERSIONS = _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS
 _QUALITY_FINDING_LOCATOR_VERSIONS = _CONTINUATION_FRAGMENT_LOCATOR_VERSIONS
+_TEXT_SUBSTITUTION_LOCATOR_VERSIONS = frozenset(
+    {TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION}
+)
+_TEXT_SUBSTITUTION_POLICIES = frozenset({NUL_SUBSTITUTION_POLICY})
 _SOURCE_RECONCILIATION_KINDS_BY_LOCATOR_VERSION = {
     LEGACY_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(),
     SOURCE_REPAIR_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
@@ -128,6 +148,13 @@ _SOURCE_RECONCILIATION_KINDS_BY_LOCATOR_VERSION = {
         }
     ),
     PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_numeric.v1",
+            "source_pdf_native_identifier.v1",
+            "source_pdf_native_identifier.v2",
+        }
+    ),
+    TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
         {
             "source_pdf_native_numeric.v1",
             "source_pdf_native_identifier.v1",
@@ -181,6 +208,15 @@ _SOURCE_QUALITY_KINDS_BY_LOCATOR_VERSION = {
             "source_pdf_native_text_quality.v3",
         }
     ),
+    TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        {
+            "source_pdf_native_table_quality.v1",
+            "source_pdf_native_text_quality.v1",
+            "source_pdf_native_identifier_quality.v1",
+            "source_pdf_native_text_quality.v2",
+            "source_pdf_native_text_quality.v3",
+        }
+    ),
 }
 
 _BASE_HEADING_PLACEMENT_SOURCES = frozenset(
@@ -221,6 +257,9 @@ _HEADING_PLACEMENT_SOURCES_BY_LOCATOR_VERSION = {
         (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
     ),
     PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
+        (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
+    ),
+    TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION: frozenset(
         (*_BASE_HEADING_PLACEMENT_SOURCES, "table_label", "table_container")
     ),
 }
@@ -462,6 +501,37 @@ class ProviderUnitSourceQualityFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderUnitTextSubstitution:
+    """Path-free, text-free provenance for one U+0000 -> U+FFFD payload marker."""
+
+    source_index: int
+    payload_ordinal: int
+    raw_block_sha256: str
+    provider_text_sha256: str
+    substituted_text_sha256: str
+    occurrence_count: int
+    policy: str
+
+    def __post_init__(self) -> None:
+        for value in (self.source_index, self.payload_ordinal, self.occurrence_count):
+            if type(value) is not int:
+                raise ValueError("provider Unit text substitution count is invalid")
+        if min(self.source_index, self.payload_ordinal) < 0 or self.occurrence_count < 1:
+            raise ValueError("provider Unit text substitution index is invalid")
+        if self.policy not in _TEXT_SUBSTITUTION_POLICIES:
+            raise ValueError("provider Unit text substitution policy is unsupported")
+        if not all(
+            type(value) is str and _SHA256_RE.fullmatch(value)
+            for value in (
+                self.raw_block_sha256,
+                self.provider_text_sha256,
+                self.substituted_text_sha256,
+            )
+        ) or self.provider_text_sha256 == self.substituted_text_sha256:
+            raise ValueError("provider Unit text substitution hash is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderUnitLocator:
     """One thin locator; the hash-bound ProviderDocument supplies all detail."""
 
@@ -478,10 +548,17 @@ class ProviderUnitLocator:
     ] = ()
     source_quality_findings: tuple[ProviderUnitSourceQualityFinding, ...] = ()
     contract_version: str = PROVIDER_UNIT_LOCATOR_VERSION
+    text_substitutions: tuple[ProviderUnitTextSubstitution, ...] = ()
 
     def __post_init__(self) -> None:
         if self.contract_version not in SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS:
             raise ValueError("provider unit locator version is unsupported")
+        if (self.contract_version in _TEXT_SUBSTITUTION_LOCATOR_VERSIONS) != bool(
+            self.text_substitutions
+        ):
+            raise ValueError(
+                "provider unit locator v10 must carry exactly its text substitutions"
+            )
         if (
             self.contract_version == LEGACY_PROVIDER_UNIT_LOCATOR_VERSION
             and (self.source_text_reconciliations or self.source_quality_findings)
@@ -564,6 +641,20 @@ class ProviderUnitLocator:
         if set(reconciliation_ids) & set(finding_ids):
             raise ValueError(
                 "provider unit reconciliation and quality finding cannot overlap"
+            )
+        substitution_ids = [
+            (item.source_index, item.payload_ordinal)
+            for item in self.text_substitutions
+        ]
+        if substitution_ids != sorted(substitution_ids) or len(
+            substitution_ids
+        ) != len(set(substitution_ids)):
+            raise ValueError(
+                "provider unit text substitutions must be unique and ordered"
+            )
+        if set(substitution_ids) & set(reconciliation_ids):
+            raise ValueError(
+                "provider unit text substitution cannot overlap a source repair"
             )
         if any(
             part.part.block_source_index is None
@@ -775,6 +866,19 @@ def provider_unit_locator_to_payload(
             }
             for item in locator.source_quality_findings
         ]
+    if locator.contract_version in _TEXT_SUBSTITUTION_LOCATOR_VERSIONS:
+        payload["text_substitutions"] = [
+            {
+                "occurrence_count": item.occurrence_count,
+                "payload_ordinal": item.payload_ordinal,
+                "policy": item.policy,
+                "provider_text_sha256": item.provider_text_sha256,
+                "raw_block_sha256": item.raw_block_sha256,
+                "source_index": item.source_index,
+                "substituted_text_sha256": item.substituted_text_sha256,
+            }
+            for item in locator.text_substitutions
+        ]
     return payload
 
 
@@ -801,6 +905,8 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         raise ValueError("provider unit locator version is unsupported")
     if version in _QUALITY_FINDING_LOCATOR_VERSIONS:
         base_fields.add("source_quality_findings")
+    if version in _TEXT_SUBSTITUTION_LOCATOR_VERSIONS:
+        base_fields.add("text_substitutions")
     root = _closed_mapping(
         payload,
         fields=base_fields,
@@ -851,6 +957,17 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         if version in _QUALITY_FINDING_LOCATOR_VERSIONS
         else ()
     )
+    substitutions = (
+        tuple(
+            _text_substitution_from_payload(item)
+            for item in _array(
+                root["text_substitutions"],
+                label="text substitutions",
+            )
+        )
+        if version in _TEXT_SUBSTITUTION_LOCATOR_VERSIONS
+        else ()
+    )
     return ProviderUnitLocator(
         contract_version=_text(root["contract_version"], label="contract version"),
         provider_document_sha256=_text(
@@ -868,6 +985,7 @@ def provider_unit_locator_from_payload(payload: object) -> ProviderUnitLocator:
         evidence_artifacts=evidence,
         source_text_reconciliations=reconciliations,
         source_quality_findings=quality_findings,
+        text_substitutions=substitutions,
         search_targets=search,
     )
 
@@ -1067,6 +1185,42 @@ def _source_quality_finding_from_payload(
     )
 
 
+def _text_substitution_from_payload(
+    payload: object,
+) -> ProviderUnitTextSubstitution:
+    item = _closed_mapping(
+        payload,
+        fields={
+            "occurrence_count",
+            "payload_ordinal",
+            "policy",
+            "provider_text_sha256",
+            "raw_block_sha256",
+            "source_index",
+            "substituted_text_sha256",
+        },
+        label="provider Unit text substitution",
+    )
+    return ProviderUnitTextSubstitution(
+        source_index=_integer(item["source_index"], label="source index"),
+        payload_ordinal=_integer(item["payload_ordinal"], label="payload ordinal"),
+        raw_block_sha256=_text(item["raw_block_sha256"], label="block hash"),
+        provider_text_sha256=_text(
+            item["provider_text_sha256"],
+            label="provider text hash",
+        ),
+        substituted_text_sha256=_text(
+            item["substituted_text_sha256"],
+            label="substituted text hash",
+        ),
+        occurrence_count=_integer(
+            item["occurrence_count"],
+            label="substitution occurrence count",
+        ),
+        policy=_text(item["policy"], label="substitution policy"),
+    )
+
+
 def _search_binding_from_payload(payload: object) -> ProviderUnitSearchBinding:
     item = _closed_mapping(
         payload,
@@ -1168,6 +1322,7 @@ def _optional_text(value: object, *, label: str) -> str | None:
 
 
 __all__ = [
+    "CURRENT_PROVIDER_UNIT_LOCATOR_VERSIONS",
     "HEADING_EVIDENCE_PROVIDER_UNIT_LOCATOR_VERSION",
     "LEGACY_PROVIDER_UNIT_LOCATOR_VERSION",
     "NATIVE_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION",
@@ -1178,6 +1333,7 @@ __all__ = [
     "TEXT_QUALITY_PROVIDER_UNIT_LOCATOR_VERSION",
     "PROVIDER_UNIT_BUILDER_VERSION",
     "SUPPORTED_PROVIDER_UNIT_LOCATOR_VERSIONS",
+    "TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION",
     "ProviderSearchDestination",
     "ProviderSearchDestinationKind",
     "ProviderUnitBuildResult",
@@ -1194,6 +1350,7 @@ __all__ = [
     "ProviderUnitSearchContractError",
     "ProviderUnitSourceTextReconciliation",
     "ProviderUnitSourceQualityFinding",
+    "ProviderUnitTextSubstitution",
     "provider_unit_locator_from_payload",
     "provider_unit_locator_to_payload",
 ]

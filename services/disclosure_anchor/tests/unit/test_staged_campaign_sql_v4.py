@@ -46,6 +46,45 @@ class StagedCampaignSqlTests(unittest.TestCase):
         for _sql, params in membership_queries:
             self.assertIn(list(self.scope.document_ids), [json.loads(p) for p in params if isinstance(p,str) and p.startswith("[")])
 
+    def test_actual_ordinary_ceiling_and_pages_share_scope_retry_and_company_filters(self):
+        ids, hashes = self.scope.document_ids, self.scope.source_hashes
+        for i in range(3):
+            self.db.add_document(f"doc-zz-outside-{i}", m6.digest(f"outside-high-{i}"))
+        for document, source in zip(ids[:10], hashes[:10]):
+            self.db.add_document(document, source)
+        # Non-retryable (3, 8) and paused-company (5, 9) members, inside and
+        # above the eligible range, drop out before LIMIT and before the max.
+        with self.db.engine.begin() as c:
+            c.exec_driver_sql("INSERT INTO disclosure_core.tracked_company VALUES ('co-paused','paused')")
+            for index in (3, 8):
+                c.execute(sa.text("UPDATE disclosure_ops.pending_parse_v1 SET last_failed_retryable=0 "
+                                  "WHERE document_id=:d"), {"d": ids[index]})
+            for index in (5, 9):
+                c.execute(sa.text("UPDATE disclosure_core.document SET company_id='co-paused' "
+                                  "WHERE document_id=:d"), {"d": ids[index]})
+        self.assertEqual(self.source(None).latest_document_id(), "doc-zz-outside-2")
+        source = self.source(self.scope)
+        self.db.statements.clear()
+        ceiling = source.latest_document_id()
+        self.assertEqual(ceiling, ids[7])
+        self.db.add_document(ids[10], hashes[10])  # eligible arrival above the frozen ceiling
+        pages, cursor = [], None
+        for _ in range(3):
+            page = source.list_candidates(after_document_id=cursor, through_document_id=ceiling, limit=2)
+            pages.append(([item.document_id for item in page.candidates], page.has_more))
+            cursor = page.candidates[-1].document_id
+        self.assertEqual(pages, [([ids[0], ids[1]], True), ([ids[2], ids[4]], True),
+                                 ([ids[6], ids[7]], False)])
+        boundary = source.list_candidates(after_document_id=ids[6], through_document_id=ceiling, limit=1)
+        self.assertEqual(([item.document_id for item in boundary.candidates], boundary.has_more),
+                         ([ids[7]], False))
+        self.assertEqual(source.latest_document_id(), ids[10])
+        membership = [params for sql, params in self.db.statements
+                      if "pending_parse_v1" in sql and sql.lstrip().startswith("SELECT")]
+        self.assertTrue(membership)
+        for params in membership:
+            self.assertIn(list(ids), [json.loads(p) for p in params if isinstance(p, str) and p.startswith("[")])
+
     def test_ordinary_reloads_source_and_rejects_changed_sha_with_zero_writes(self):
         self.db.add_document(self.scope.document_ids[0], m6.digest("changed-source"))
         before = self.db.total_changes()
@@ -61,6 +100,7 @@ class StagedCampaignSqlTests(unittest.TestCase):
         self.assertEqual(page.candidates, ())
         self.assertFalse(page.has_more)
         self.assertEqual(self.db.statements, [])
+        self.assertIsNone(self.source(scope).latest_document_id())
 
     def test_actual_prepared_select_filters_scope_before_limit_and_preserves_clock(self):
         for i in range(20):

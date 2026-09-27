@@ -27,8 +27,9 @@ WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISC
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
 	lint typecheck agent-check api archive pg-init pg-start pg-stop \
-	pg-status db-create migrate register parse build-units publish process rebuild-units parse-requeue rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
-	worker-status worker-restart worker-backfill-publish-kpi mineru-smoke mineru-service-epoch-freeze mineru-validation-receipt mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
+	pg-status db-create migrate register parse build-units publish process rebuild-units parse-requeue source-recovery rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
+	worker-status worker-control-status worker-release-circuit worker-record-circuit-stop \
+	worker-restart worker-backfill-publish-kpi mineru-smoke mineru-service-epoch-freeze mineru-validation-receipt mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
 	generate-current-source-replay audit-live-unit-replay capacity-observe capacity-verify capacity-summary
 
 doctor:
@@ -153,6 +154,13 @@ rebuild-units:
 parse-requeue:
 	@case "$(DRY_RUN)" in ""|1) ;; *) echo 'DRY_RUN must be empty or 1' >&2; exit 2;; esac
 	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.parse_requeue --document-id "$(DOC)" --processing-run-id "$(RUN)" --fixed-by "$(FIXED_BY)" --reason "$(REASON)" --decided-by "$(DECIDED_BY)" $(if $(filter 1,$(DRY_RUN)),--dry-run)
+
+# Historical security binding and retained-archive registration (design:
+# historical-security-retained-registration.md). Previews write nothing; each
+# execute takes the exact plan sha256 it printed. ARGS carries the subcommand.
+source-recovery:
+	@test -n "$(ARGS)" || { echo 'ARGS is required, e.g. ARGS="replay-preview --failed-access-ids FILE ..."' >&2; exit 64; }
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.source_recovery $(ARGS)
 
 # Rebuild the 06R derived search projection (U7): delta by default, ALL=YES for a
 # full recompute + orphan prune after a retrieval rules/dictionary version bump.
@@ -355,9 +363,42 @@ mineru-admission:
 worker-status:
 	@launchctl print gui/$$(id -u)/com.agentinvest.disclosure-worker 2>/dev/null \
 		| grep -E "state|pid|last exit" || echo "[warn] worker job not loaded"
+	-@$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker status --control-only
 	@$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker status
 
+# Operational stop only: control files + launchd readback, no DB/MinerU/model.
+# Exit 0 only when RUNNABLE; FORMAT=json for agents.
+worker-control-status:
+	@case "$(FORMAT)" in ""|json) ;; *) echo 'FORMAT must be empty or json' >&2; exit 2;; esac
+	@$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker status --control-only $(if $(filter json,$(FORMAT)),--format json)
+
+# Release one exact public stop after its cause is fixed (runbook §1.1b).
+# DRY_RUN=1 is read-only: no lock file, DB claim, archive, record or enable.
+# Release never enables or starts the job.
+worker-release-circuit:
+	@case "$(DRY_RUN)" in ""|1) ;; *) echo 'DRY_RUN must be empty or 1' >&2; exit 2;; esac
+	@test -n "$(SHA)" || { echo 'SHA=sha256:<active record hash> is required' >&2; exit 2; }
+	@test -n "$(DECIDED_BY)" || { echo 'DECIDED_BY is required' >&2; exit 2; }
+	@test -n "$(REASON)" || { echo 'REASON is required' >&2; exit 2; }
+	@test -n "$(FIXED_BY)" || { echo 'FIXED_BY is required' >&2; exit 2; }
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker release-circuit --expect-sha256 "$(SHA)" --decided-by "$(DECIDED_BY)" --reason "$(REASON)" --fixed-by "$(FIXED_BY)" $(if $(filter 1,$(DRY_RUN)),--dry-run)
+
+# Reconstruct a stop record for a natively disabled job whose automatic record
+# failed, from hash-bound evidence (the logged STOP_RECORD); never an
+# automatic record. Release it afterwards with worker-release-circuit.
+worker-record-circuit-stop:
+	@case "$(DRY_RUN)" in ""|1) ;; *) echo 'DRY_RUN must be empty or 1' >&2; exit 2;; esac
+	@test -n "$(EVIDENCE)" || { echo 'EVIDENCE=/path/evidence is required' >&2; exit 2; }
+	@test -n "$(EVIDENCE_SHA256)" || { echo 'EVIDENCE_SHA256 is required' >&2; exit 2; }
+	@test -n "$(DECIDED_BY)" || { echo 'DECIDED_BY is required' >&2; exit 2; }
+	@test -n "$(REASON)" || { echo 'REASON is required' >&2; exit 2; }
+	$(WITH_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker record-circuit-stop --from-disabled --evidence "$(EVIDENCE)" --evidence-sha256 "$(EVIDENCE_SHA256)" --decided-by "$(DECIDED_BY)" --reason "$(REASON)" $(if $(filter 1,$(DRY_RUN)),--dry-run)
+
+# Refuses unless control state is RUNNABLE: a restart never bypasses a public
+# stop, an unverifiable control plane, a disabled label or a supervisor-held stop.
 worker-restart:
+	@$(WITH_WORKER_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.worker status --control-only \
+		|| { echo '[refuse] worker control is not RUNNABLE; see the production runbook before restarting' >&2; exit 78; }
 	launchctl kickstart -k gui/$$(id -u)/com.agentinvest.disclosure-worker
 	@sleep 5
 	@launchctl print gui/$$(id -u)/com.agentinvest.disclosure-worker | grep -E "state|pid" || true

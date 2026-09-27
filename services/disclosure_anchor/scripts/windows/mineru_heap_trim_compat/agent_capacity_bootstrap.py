@@ -14,9 +14,10 @@ from threading import Lock
 
 from mineru.cli.agent_capacity_config import (
     MineruCapacityConfig,
+    MineruCapacityConfigV2,
     capacity_environment,
     capacity_http_arguments,
-    decode_mineru_capacity_config,
+    decode_any_mineru_capacity_config,
 )
 from mineru.cli.agent_capacity_file import read_mineru_capacity_file
 
@@ -26,7 +27,14 @@ _HASH_VARIABLE = "MINERU_CAPACITY_CONFIG_SHA256"
 _PROCESS_LOCK = Lock()
 _PROCESS_INITIALIZED = False
 _PROCESS_ID: int | None = None
-_PROCESS_CONFIG: MineruCapacityConfig | None = None
+_PROCESS_CONFIG: MineruCapacityConfig | MineruCapacityConfigV2 | None = None
+# A v2 process manages result storage physically: the legacy B/L variables
+# would be a second, unenforced authority, and seal-OCR debug dumps write
+# outside every growth permit.
+_LEGACY_RESULT_VARIABLES = (
+    "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
+    "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES",
+)
 _PROCESS_ANCHORS: tuple[str | None, str | None] | None = None
 # The projection itself lives in the shared codec (one authority for the host
 # release builder and this bootstrap); it is re-exported here unchanged.
@@ -36,7 +44,7 @@ def read_startup_capacity(
     environment: Mapping[str, str],
     *,
     expected_owner_uid: int,
-) -> MineruCapacityConfig | None:
+) -> MineruCapacityConfig | MineruCapacityConfigV2 | None:
     """Select the explicit new configuration or leave the legacy path intact."""
 
     if _PATH_VARIABLE not in environment and _HASH_VARIABLE not in environment:
@@ -48,15 +56,23 @@ def read_startup_capacity(
     payload = read_mineru_capacity_file(
         Path(path), expected_sha256=digest, expected_owner_uid=expected_owner_uid,
     )
-    config = decode_mineru_capacity_config(payload)
+    config = decode_any_mineru_capacity_config(payload)
     for variable, expected in capacity_environment(config).items():
         actual = environment.get(variable)
         if type(actual) is not str or actual != expected:
             raise ValueError(f"MinerU capacity config conflicts with {variable}")
+    if type(config) is MineruCapacityConfigV2:
+        for variable in _LEGACY_RESULT_VARIABLES:
+            if variable in environment:
+                raise ValueError(f"MinerU result storage policy conflicts with {variable}")
+        if environment.get("MINERU_SEAL_OCR_DEBUG_DIR") or environment.get(
+            "MINERU_SEAL_OCR_DEBUG", ""
+        ).lower() in {"1", "true", "yes", "on"}:
+            raise ValueError("MinerU seal-OCR debug output bypasses result storage permits")
     return config
 
 
-def verify_http_capacity(config: MineruCapacityConfig, requested_limit: int) -> None:
+def verify_http_capacity(config: MineruCapacityConfig | MineruCapacityConfigV2, requested_limit: int) -> None:
     """Check an actual CLI/client value; H is shared within one serving loop."""
 
     if (
@@ -66,7 +82,7 @@ def verify_http_capacity(config: MineruCapacityConfig, requested_limit: int) -> 
         raise ValueError("MinerU HTTP concurrency differs from the capacity config")
 
 
-def get_process_capacity() -> MineruCapacityConfig | None:
+def get_process_capacity() -> MineruCapacityConfig | MineruCapacityConfigV2 | None:
     """Load once before model startup; never silently rebind a process or fork."""
     global _PROCESS_INITIALIZED, _PROCESS_ID, _PROCESS_CONFIG, _PROCESS_ANCHORS
     if _PROCESS_INITIALIZED and _PROCESS_ID != os.getpid():

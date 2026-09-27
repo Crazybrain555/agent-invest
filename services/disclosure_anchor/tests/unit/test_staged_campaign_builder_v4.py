@@ -18,6 +18,7 @@ from tests._mineru_package_a_fixture import gate_fixture
 from tests._staged_campaign_sql import CampaignSqlDatabase, campaign
 from tests.unit import test_mineru_package_a_builder as builder_fixture
 from tests.unit.test_mineru_stream_policy import Pressure
+from tests.unit._codex_model_catalog_fixture import prepare_catalog_sha256
 
 
 def stream_control(runtime=m6.digest("runtime"), maximum=2):
@@ -91,7 +92,9 @@ class StagedCampaignBuilderTests(unittest.TestCase):
             settings, profile, capacity, _ = gate_fixture(root)
             environment = builder_fixture.ExplicitStagedBuilderTests().profile_environment(root, profile)
             settings = Settings(**dict(settings.model_dump(),
-                disclosure_v4_secret_keyring_file=Path(environment["DISCLOSURE_V4_SECRET_KEYRING_FILE"])))
+                disclosure_v4_secret_keyring_file=Path(environment["DISCLOSURE_V4_SECRET_KEYRING_FILE"]),
+                disclosure_semantic_codex_model_catalog_sha256=prepare_catalog_sha256(
+                    settings.disclosure_runtime_root)))
             FileStorePathBuilder(settings).data_path(Path()).mkdir(parents=True)
             control = stream_control(profile.runtime_bundle_identity_sha256, capacity.parse_active_limit)
             calls = []

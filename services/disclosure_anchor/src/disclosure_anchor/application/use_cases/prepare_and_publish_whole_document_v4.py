@@ -31,6 +31,9 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
 from disclosure_anchor.application.services.atomic_publication_request_factory_v4 import (
     RecoverableAtomicPublicationRequestFactoryV4,
 )
+from disclosure_anchor.application.services.publication_text_representability_v4 import (
+    validate_publication_text_representability,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.worker.locks import exclusive_document_producer
 
@@ -78,6 +81,11 @@ class PrepareAndPublishWholeDocumentV4:
                 materialized=materialized,
                 stage_guard=stage_guard,
             )
+            stage_guard.checkpoint()
+            # Fresh and reopened sealed requests both pass here before readiness
+            # seals or promotes anything; text PostgreSQL cannot store is a typed
+            # attempt-local refusal, never a rewrite of the request.
+            validate_publication_text_representability(request)
             stage_guard.checkpoint()
             note_stage(stage_guard, "request_ready", **identity)
             reference = self._readiness.prepare_or_replay(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Protocol, TYPE_CHECKING
 
@@ -48,6 +49,23 @@ class ImmutableArtifactStorePort(Protocol):
         expected_byte_count: int,
         max_byte_count: int,
     ) -> bytes: ...
+
+
+class PublicationWriteSpacePort(Protocol):
+    """Live free space on the work volume for one publication's new readiness files.
+
+    Entering promises ``byte_count`` against the volume's free floor and every
+    other in-flight promise in this process; a shortfall is a wait with nothing
+    written. Leaving retires the promise. Files already present are never
+    promised again.
+    """
+
+    def publication_write_space(
+        self,
+        *,
+        attempt_id: str,
+        byte_count: int,
+    ) -> AbstractContextManager[None]: ...
 
 
 class MaterializedOutputPromotionV4Port(Protocol):
@@ -116,4 +134,5 @@ __all__ = [
     "AtomicPublicationArtifactReadinessV4Port",
     "ImmutableArtifactStorePort",
     "MaterializedOutputPromotionV4Port",
+    "PublicationWriteSpacePort",
 ]

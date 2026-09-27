@@ -10,6 +10,7 @@ from disclosure_anchor.adapters.semantics.codex_cli import (
 from disclosure_anchor.adapters.semantics.claude_cli import (
     ClaudeCliSemanticAdjudicator,
 )
+from disclosure_anchor.adapters.semantics.codex_model_catalog import load_codex_model_catalog
 from disclosure_anchor.adapters.storage.semantic_route_store import (
     SemanticRouteGroupFileCache,
     SemanticRouteReceiptStore,
@@ -51,6 +52,12 @@ def build_semantic_runtime(
     for config in settings.semantic_provider_configs:
         adapter: SemanticAdjudicatorAdapterPort
         if config.kind == "codex_cli":
+            assert config.model_catalog_sha256 is not None  # validated provider configuration
+            catalog = load_codex_model_catalog(
+                settings.disclosure_runtime_root,
+                sha256=config.model_catalog_sha256,
+                model=config.canonical_model,
+            )
             adapter = CodexCliSemanticAdjudicator(
                 executable=config.executable,
                 runtime_tmp_root=(
@@ -61,6 +68,7 @@ def build_semantic_runtime(
                 timeout_seconds=config.timeout_seconds,
                 provider_id=config.id,
                 max_concurrency=config.max_concurrency,
+                model_catalog=catalog,
             )
         elif config.kind == "claude_cli":
             adapter = ClaudeCliSemanticAdjudicator(

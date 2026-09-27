@@ -10,6 +10,14 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
+from disclosure_anchor.application.contracts.expired_prepared_closure import (
+    ORIGINAL_KEY_EXPIRED_ERROR_CODE,
+    ORIGINAL_KEY_LIFETIME_RETRY_CLASS,
+)
+from disclosure_anchor.application.contracts.parse_requeue_decision import (
+    AUTOMATIC_PARSE_RETRY_BUDGET_CLASSES,
+    RELEASABLE_PARSE_RETRY_BUDGET_CLASSES,
+)
 from disclosure_anchor.application.use_cases.parse_requeue import (
     ParseRequeue,
     ParseRequeueCommand,
@@ -106,6 +114,40 @@ class ParseRequeueUseCaseTests(unittest.TestCase):
             stored.reason,
             "locked-candidate overflow now demotes to model candidates",
         )
+
+    def test_a_managed_key_lifetime_closure_is_released_only_by_its_named_decision(self) -> None:
+        # The managed expired-prepared closure fails its run with its own honest
+        # class (0065), not a provider class; only this explicit decision releases it.
+        closure_error = {
+            "stage": "managed_closure",
+            "error_code": ORIGINAL_KEY_EXPIRED_ERROR_CODE,
+            "retryable": False,
+            "retry_budget_class": ORIGINAL_KEY_LIFETIME_RETRY_CLASS,
+        }
+        uow = _uow_with_failed_run(_run(error=closure_error))
+        command = _command(
+            fixed_by="requalified runtime and a new H0 are authorized",
+            reason="the original key expired before any submission",
+        )
+        dry = ParseRequeue(uow_factory=lambda: uow).execute(command, dry_run=True)
+        self.assertEqual(
+            (dry.failure_error_code, dry.failure_retry_budget_class, dry.decision_id, uow.commit_count),
+            ("original_key_expired", "original_key_lifetime", None, 0),
+        )
+        result = ParseRequeue(
+            uow_factory=lambda: uow,
+            decision_id_factory=lambda: "prq_01M2VG1RW16QK0XMYMQQNA7G4C",
+        ).execute(command)
+        self.assertEqual(
+            (result.decision_id, result.failure_retry_budget_class, uow.commit_count),
+            ("prq_01M2VG1RW16QK0XMYMQQNA7G4C", "original_key_lifetime", 1),
+        )
+        released = uow.processing_runs.get("run_failed")
+        assert released is not None
+        self.assertEqual(released.error, closure_error)  # The failed run is never rewritten.
+        # The widening is exactly one class; automatic classes need no decision.
+        self.assertIn(ORIGINAL_KEY_LIFETIME_RETRY_CLASS, RELEASABLE_PARSE_RETRY_BUDGET_CLASSES)
+        self.assertFalse(RELEASABLE_PARSE_RETRY_BUDGET_CLASSES & AUTOMATIC_PARSE_RETRY_BUDGET_CLASSES)
 
     def test_dry_run_evaluates_guardrails_and_writes_nothing(self) -> None:
         uow = _uow_with_failed_run()

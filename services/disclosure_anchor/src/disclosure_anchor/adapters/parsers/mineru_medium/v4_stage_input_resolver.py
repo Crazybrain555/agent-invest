@@ -33,14 +33,20 @@ from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
     SubmissionIntentV4,
     TerminalReceiptV4,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruResultStoragePolicy,
+)
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     MaterializationIntentV4,
     ProviderEnvelopeContextV4,
     ResourceReservationV4,
+    StageResourceGrantV1,
     build_materialization_intent_v4,
+    build_stage_resource_grant_v1,
     validate_resource_reservation_checkpoint_binding_v4,
 )
 from disclosure_anchor.application.contracts.staged_resource_credit import (
+    STAGED_RESOURCE_CREDIT_POLICY_V3,
     PerAttemptResourceAllowance,
     ResourceReservationInput,
     encode_resource_reservation_input,
@@ -49,6 +55,11 @@ from disclosure_anchor.application.contracts.v4_prepared_execution_spec import (
     V4PreparedExecutionSpec,
 )
 from disclosure_anchor.application.contracts.staged_worker_profile_v4 import StagedWorkerProfileV4
+from disclosure_anchor.application.contracts.worker_execution_upgrade import (
+    QualifiedRuntimeUpgrade,
+    VerifiedLegacyExecutionAuthorization,
+    VerifiedQualifiedExecution,
+)
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.application.ports.provider_document_source import (
     ProviderDocumentSourcePort,
@@ -102,12 +113,26 @@ class ProductionV4StageInputResolver:
         paths: FileStorePathPort,
         provider_source: ProviderDocumentSourcePort,
         worker_profile: StagedWorkerProfileV4,
+        legacy_execution: VerifiedQualifiedExecution | None = None,
+        storage_policy: MineruResultStoragePolicy | None = None,
     ) -> None:
         if not callable(uow_factory):
             raise ValueError("V4 input resolver UoW factory is invalid")
+        if storage_policy is not None and type(storage_policy) is not MineruResultStoragePolicy:
+            raise ValueError("V4 input resolver storage policy is not exact")
+        # The bound runtime's result storage policy: its hard result limit
+        # bounds every poll, and its envelope sizes every stage grant.
+        self._storage_policy = storage_policy
         if type(worker_profile) is not StagedWorkerProfileV4:
             raise ValueError("V4 input resolver requires an exact worker profile")
+        if legacy_execution is not None:
+            if type(legacy_execution) is not VerifiedQualifiedExecution:
+                raise ValueError("V4 input resolver legacy execution is not the verified context")
+            legacy_execution.require_active_worker_profile(worker_profile)
         self._worker_profile = worker_profile
+        # The one verified local upgrade, or None: then only the exact
+        # composition that froze H0 may reopen it.
+        self._legacy_execution = legacy_execution
         self._uow_factory = uow_factory
         self._paths = paths
         self._provider_source = provider_source
@@ -186,6 +211,18 @@ class ProductionV4StageInputResolver:
         )
         if request != bound.spec.request_exact_bytes:
             raise ValueError("V4 submission request drifted from exact execution spec")
+        legacy_authorization: VerifiedLegacyExecutionAuthorization | None = None
+        if bound.spec.worker_profile != self._worker_profile or (
+            self._legacy_execution is not None and self._legacy_execution.is_member(authority.attempt_id)
+        ):
+            # Only a verified legacy member reaches here (``_identity``
+            # refused every other profile). Its original request and key are
+            # submitted unchanged; the POST boundary rechecks this proof.
+            if self._legacy_execution is None:
+                raise ValueError("V4 worker composition changed; restore the bound profile before recovery")
+            legacy_authorization = self._legacy_execution.authorize_submission(
+                authority, bound.spec, intent, active_worker_profile=self._worker_profile,
+            )
         return RemoteSubmissionCommandV4(
             submission_intent=intent,
             snapshot_receipt=snapshot,
@@ -196,6 +233,7 @@ class ProductionV4StageInputResolver:
             upload_filename=upload_filename,
             request_exact_bytes=request,
             step_guard=stage_guard,
+            legacy_authorization=legacy_authorization,
         )
 
     def poll_command(
@@ -222,11 +260,18 @@ class ProductionV4StageInputResolver:
             or capability.capability_purpose != "submitted_task_resume"
         ):
             raise ValueError("V4 poll inputs drifted from frozen authority")
+        # A storage-managed runtime may retain any result inside its hard
+        # envelope; the estimate is a scheduling fact, never a poll ceiling.
+        artifact_limit = (
+            bound.reservation.reserved_credit.provider_result_bytes
+            if self._storage_policy is None
+            else self._storage_policy.native_result_hard_limit_bytes
+        )
         return RemotePollCommandV4(
             submission_intent=intent,
             accepted_submission=accepted,
             provider_capability=capability,
-            artifact_byte_limit=bound.reservation.reserved_credit.provider_result_bytes,
+            artifact_byte_limit=artifact_limit,
             result_lease_seconds=bound.spec.result_lease_seconds,
             step_guard=stage_guard,
         )
@@ -263,10 +308,13 @@ class ProductionV4StageInputResolver:
                 task_id=accepted.remote_task_identity,
             )
             != bound.spec.api_origin
-            or terminal.artifact_byte_count
-            > bound.reservation.reserved_credit.provider_result_bytes
             or not capability.validates_accepted_submission(accepted)
             or capability.capability_purpose != "result_download"
+        ):
+            raise ValueError("V4 materialization inputs drifted from frozen authority")
+        grant = self._stage_grant(bound, terminal)
+        if grant is None and (
+            terminal.artifact_byte_count > bound.reservation.reserved_credit.provider_result_bytes
         ):
             raise ValueError("V4 materialization inputs drifted from frozen authority")
         target = bound.spec.parser_options.target_identity(bound.spec.parser_identity)
@@ -285,7 +333,7 @@ class ProductionV4StageInputResolver:
             ),
             parser_target_identity=target,
         )
-        allowance = self._allowance(bound.reservation)
+        allowance = self._allowance(bound.reservation, grant)
         return build_materialization_intent_v4(
             reservation=bound.reservation,
             source_checkpoint=authority.checkpoint,
@@ -304,7 +352,66 @@ class ProductionV4StageInputResolver:
             output_manifest_relpath=LOCAL_MATERIALIZATION_MANIFEST_V4_FILENAME,
             member_count_limit=bound.spec.archive_member_count_limit,
             uncompressed_byte_limit=bound.spec.archive_uncompressed_byte_limit,
+            resource_grant=grant,
         )
+
+    def _stage_grant(
+        self, bound: _BoundV4Inputs, terminal: TerminalReceiptV4,
+    ) -> StageResourceGrantV1 | None:
+        """Size the materialization grant from the verified native envelope.
+
+        Only a storage-managed result carries the envelope; its bounds are the
+        bound policy's own maxima, which every legal native seal satisfies.
+        """
+        storage = terminal.result_storage
+        policy = self._storage_policy
+        if storage is None:
+            if policy is not None:
+                raise ValueError("storage-bound V4 result lacks its native storage envelope")
+            return None
+        if policy is None or storage.policy_sha256 != policy.sha256:
+            raise ValueError("V4 result storage envelope names another storage policy")
+        if (
+            terminal.artifact_byte_count > policy.native_result_hard_limit_bytes
+            or storage.selected_bytes > policy.native_source_single_limit_bytes
+            or storage.member_count > policy.max_members
+        ):
+            raise ValueError("V4 result exceeds the bound storage policy envelope")
+        upgrade_sha256, spec_sha256 = self._legacy_grant_binding(bound)
+        return build_stage_resource_grant_v1(
+            execution_upgrade_sha256=upgrade_sha256,
+            execution_spec_sha256=spec_sha256,
+            reservation=bound.reservation,
+            terminal_receipt_sha256=terminal.sha256,
+            storage_policy_sha256=policy.sha256,
+            inventory_sha256=storage.inventory_sha256,
+            artifact_byte_count=terminal.artifact_byte_count,
+            selected_bytes=storage.selected_bytes,
+            member_count=storage.member_count,
+            decode_working_set_bytes=policy.mac_decode_working_set_budget_bytes,
+            decode_input_limit_bytes=policy.mac_decode_input_limit_bytes,
+        )
+
+    def _legacy_grant_binding(self, bound: _BoundV4Inputs) -> tuple[str | None, str | None]:
+        """The (upgrade, original spec) a grant for this attempt must name.
+
+        A storage-era (v3 credit) reservation names none. A pre-storage one
+        grows beyond its H0 estimate only as a listed obligation of the active
+        reviewed qualified runtime upgrade, and names that approval and spec.
+        """
+        if bound.reservation.credit_policy_sha256 == STAGED_RESOURCE_CREDIT_POLICY_V3.sha256:
+            return None, None
+        execution = self._legacy_execution
+        attempt_id = bound.reservation.attempt_id
+        if (
+            execution is None
+            or not isinstance(execution.upgrade, QualifiedRuntimeUpgrade)
+            or not execution.is_member(attempt_id)
+        ):
+            raise ValueError("a pre-storage reservation is granted storage only under a reviewed qualified upgrade")
+        if execution.member(attempt_id).execution_spec_sha256 != bound.spec.sha256:
+            raise ValueError("legacy grant spec is not the obligation's original spec")
+        return execution.upgrade_sha256, bound.spec.sha256
 
     def materialization_allowance(
         self,
@@ -313,16 +420,27 @@ class ProductionV4StageInputResolver:
     ) -> PerAttemptResourceAllowance:
         bound = self._bound(authority)
         self._require_evidence(authority, "materialization_intent", intent)
-        allowance = self._allowance(bound.reservation)
+        grant = intent.resource_grant
+        if grant is not None and (
+            grant.execution_upgrade_sha256, grant.execution_spec_sha256,
+        ) != self._legacy_grant_binding(bound):
+            # A resumed grant is re-bound to the approval active now, not only
+            # to its own recorded digests.
+            raise ValueError("V4 materialization grant is not bound to the active verified upgrade")
+        allowance = self._allowance(bound.reservation, grant)
         context = intent.provider_envelope_context
         target = bound.spec.parser_options.target_identity(bound.spec.parser_identity)
+        # A v5 intent's archive ceilings are its grant's verified S/M (the
+        # intent itself enforces that); v4 keeps the frozen spec ceilings.
+        archive_limits = (
+            (bound.spec.archive_member_count_limit, bound.spec.archive_uncompressed_byte_limit)
+            if grant is None else (grant.member_count, grant.selected_bytes)
+        )
         if (
             authority.state != "materializing"
             or intent.reservation_sha256 != bound.reservation.sha256
             or intent.allowance_sha256 != allowance.sha256
-            or intent.member_count_limit != bound.spec.archive_member_count_limit
-            or intent.uncompressed_byte_limit
-            != bound.spec.archive_uncompressed_byte_limit
+            or (intent.member_count_limit, intent.uncompressed_byte_limit) != archive_limits
             or intent.output_dir_name != authority.processing_run_id
             or context.document_id != authority.document_id
             or context.processing_run_id != authority.processing_run_id
@@ -354,6 +472,16 @@ class ProductionV4StageInputResolver:
         """
         self._identity(authority)
 
+    def inspect_frozen_identity(self, authority: RemoteParseV4Authority) -> None:
+        """Read-only deployment preflight: the same H0 closure, no claim.
+
+        Never used to execute a stage; it opens no unit of work and reads no
+        source bytes, exactly like ``assert_execution_profile``.
+        """
+        if type(authority) is not RemoteParseV4Authority or not authority.is_current:
+            raise ValueError("V4 identity inspection requires current authority")
+        self._frozen_identity(authority)
+
     def _identity(
         self, authority: RemoteParseV4Authority,
     ) -> tuple[ResourceReservationV4, PreparationIntentV4, V4PreparedExecutionSpec]:
@@ -364,6 +492,11 @@ class ProductionV4StageInputResolver:
             or authority.claim_generation < 1
         ):
             raise ValueError("V4 input resolution requires current claimed authority")
+        return self._frozen_identity(authority)
+
+    def _frozen_identity(
+        self, authority: RemoteParseV4Authority,
+    ) -> tuple[ResourceReservationV4, PreparationIntentV4, V4PreparedExecutionSpec]:
         reservation = authority.reservation
         if type(reservation) is not ResourceReservationV4:
             raise ValueError("V4 input resolution lacks exact resource reservation")
@@ -422,8 +555,18 @@ class ProductionV4StageInputResolver:
         spec: V4PreparedExecutionSpec,
     ) -> None:
         prepared = spec.prepared_submission
-        if spec.worker_profile != self._worker_profile:
-            raise ValueError("V4 worker composition changed; restore the bound profile before recovery")
+        if spec.worker_profile != self._worker_profile or (
+            self._legacy_execution is not None and self._legacy_execution.is_member(authority.attempt_id)
+        ):
+            if self._legacy_execution is None:
+                raise ValueError("V4 worker composition changed; restore the bound profile before recovery")
+            # One verified local upgrade: only an inventory member bound to
+            # the origin profile pair continues, even when it equals the
+            # current profile. Every check below still
+            # runs against its original H0/spec unchanged.
+            self._legacy_execution.require_legacy_execution(
+                authority, spec, active_worker_profile=self._worker_profile,
+            )
         expected_key = canonical_client_submit_key_v2(
             source_pdf_sha256=prepared.source_pdf_sha256,
             attempt_identity=prepared.attempt_identity,
@@ -652,7 +795,9 @@ class ProductionV4StageInputResolver:
         )
 
     @staticmethod
-    def _allowance(reservation: ResourceReservationV4) -> PerAttemptResourceAllowance:
+    def _allowance(
+        reservation: ResourceReservationV4, grant: StageResourceGrantV1 | None = None,
+    ) -> PerAttemptResourceAllowance:
         encoded = encode_resource_reservation_input(
             ResourceReservationInput(
                 source_pdf_sha256=reservation.source_pdf_sha256,
@@ -669,7 +814,8 @@ class ProductionV4StageInputResolver:
         return PerAttemptResourceAllowance(
             reservation_input_sha256=encoded.sha256,
             reservation_input=encoded,
-            limits=reservation.reserved_credit,
+            limits=reservation.reserved_credit if grant is None else grant.limits,
+            stage_grant_sha256=None if grant is None else grant.sha256,
         )
 
     @staticmethod
@@ -731,6 +877,8 @@ class _HydratedStageInputResolver(ProductionV4StageInputResolver):
         super().__init__(
             uow_factory=resolver._uow_factory, paths=resolver._paths,
             provider_source=resolver._provider_source, worker_profile=resolver._worker_profile,
+            legacy_execution=resolver._legacy_execution,
+            storage_policy=resolver._storage_policy,
         )
         self._stage_authority = authority
         self._stage_identity = identity

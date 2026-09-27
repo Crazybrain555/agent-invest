@@ -26,20 +26,20 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
 )
 from tests.unit import test_mineru_http_remote_v4 as wire_fixtures
 from tests.unit import test_staged_coordinator_backend_v4 as durable_fixtures
-from tests.unit.test_mineru_stream_policy import Pressure, config, sample
+from tests.unit.test_mineru_stream_policy import Pressure, config, sample, warm
 from tests.unit.test_staged_parse_coordinator import _Backend, _Clock, _limits, _work
 
 
 REASON = "independent_pressure_owner_changed"
 
 
-def control(pressure, *, runtime=None):
+def control(pressure, *, runtime=None, monotonic=lambda: 10):
     settings = config(
         qualified_max=2,
         **({} if runtime is None else {"runtime_identity_sha256": runtime}),
     )
     return StreamAdmissionControl(
-        MineruStreamPolicy(settings), pressure, monotonic=lambda: 10
+        MineruStreamPolicy(settings), pressure, monotonic=monotonic
     )
 
 
@@ -132,14 +132,20 @@ class FatalPressureHTTPTests(unittest.TestCase):
     def test_pressure_fatal_after_POST_does_not_turn_ambiguous_acceptance_into_absence(
         self,
     ):
-        self.pressure.value = sample(1, 10, runtime_identity_sha256=self.runtime)
+        clock = [0.0]
+        self.control = control(self.pressure, runtime=self.runtime, monotonic=lambda: clock[0])
+        for sequence, when in enumerate(range(11), start=1):
+            clock[0] = float(when)
+            self.pressure.value = sample(sequence, float(when), runtime_identity_sha256=self.runtime)
+            decision = self.control.current()
+        self.assertEqual(decision.target, 1)
 
         def handler(request):
             self.requests.append(request.method)
             if request.method == "POST":
                 self.assertIn(self.wire.source, request.read())
                 self.pressure.value = sample(
-                    2, 10, runtime_identity_sha256=self.runtime, unsafe_reason=REASON
+                    12, 10, runtime_identity_sha256=self.runtime, unsafe_reason=REASON
                 )
                 raise httpx.ReadTimeout("accepted response was lost", request=request)
             if len(self.requests) == 1:
@@ -391,25 +397,29 @@ class KnownLowPressurePolicyTests(unittest.TestCase):
         )
         for index, values in enumerate(cases):
             policy = MineruStreamPolicy(config(qualified_max=5, recovery_seconds=2))
-            self.assertEqual(policy.evaluate(sample(1, 0), now=0).target, 5)
+            warm_at, sequence = warm(policy, 5)
+            self.assertEqual(policy.evaluate(sample(sequence, warm_at), now=warm_at).target, 5)
             with self.subTest(values=values):
+                paused_at = warm_at + (1 if index < 2 else 4)
                 paused = policy.evaluate(
-                    sample(2, 11 if index < 2 else 0, **values), now=11
+                    sample(sequence + 1, paused_at if index < 2 else warm_at, **values),
+                    now=paused_at,
                 )
                 self.assertEqual(paused.target, 0)
                 self.assertFalse(paused.unsafe)
                 self.assertEqual(paused.reason, "memory_pause")
                 self.assertEqual(
                     policy.evaluate(
-                        sample(3, 12, unknown_reason="still_missing"), now=12
+                        sample(sequence + 2, paused_at + 1, unknown_reason="still_missing"),
+                        now=paused_at + 1,
                     ).target,
                     0,
                 )
-                self.assertEqual(policy.evaluate(sample(4, 13), now=13).target, 0)
-                self.assertEqual(policy.evaluate(sample(5, 15), now=15).target, 1)
-                self.assertEqual(policy.evaluate(sample(6, 17), now=17).target, 2)
-                for sequence, now, expected in ((7, 19, 3), (8, 21, 4), (9, 23, 5)):
+                self.assertEqual(policy.evaluate(sample(sequence + 3, paused_at + 2), now=paused_at + 2).target, 0)
+                self.assertEqual(policy.evaluate(sample(sequence + 4, paused_at + 4), now=paused_at + 4).target, 1)
+                self.assertEqual(policy.evaluate(sample(sequence + 5, paused_at + 6), now=paused_at + 6).target, 2)
+                for offset, expected in ((8, 3), (10, 4), (12, 5)):
                     self.assertEqual(
-                        policy.evaluate(sample(sequence, now), now=now).target,
+                        policy.evaluate(sample(sequence + offset // 2 + 2, paused_at + offset), now=paused_at + offset).target,
                         expected,
                     )

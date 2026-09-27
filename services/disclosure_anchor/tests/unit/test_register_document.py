@@ -1,8 +1,15 @@
+import contextlib
+import errno
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
+from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
+from disclosure_anchor.adapters.storage.raw_document_store import RawDocumentStore, VolumeSpace
 from disclosure_anchor.application.ports.file_store import (
+    AcquisitionCapacityError,
     QuarantineResult,
     RawDocumentWriteResult,
 )
@@ -23,6 +30,7 @@ from disclosure_anchor.domain.errors import (
     SubjectIdentityRaceError,
 )
 from disclosure_anchor.domain.value_objects import ReportPeriod
+from tests._pdf_download_fixture import acquisition_settings
 from tests.unit._fakes import FakeUnitOfWork
 
 
@@ -109,6 +117,7 @@ class _RawStore:
             path=Path("runtime/quarantine") / kwargs["input_file"].name,
             reason=kwargs["reason"],
             byte_count=12,
+            transfer_complete=True,
         )
 
 
@@ -340,6 +349,93 @@ class RegisterDocumentTests(unittest.TestCase):
                 )
             )
 
+    def test_archive_storage_failure_is_recorded_without_quarantine(self) -> None:
+        operator_bytes = b"%PDF-1.7\noperator input\n%%EOF\n"
+        failures: dict[str, tuple[str, Exception]] = {
+            "archive_enospc": ("io_error", OSError(
+                errno.ENOSPC, "No space left on device", "/Volumes/AgentSSD/runtime/tmp/raw_x.tmp"
+            )),
+            "archive_floor": ("local_space_shortfall", AcquisitionCapacityError(
+                phase="archive", required_bytes=10, available_bytes=5, floor_bytes=0
+            )),
+            # Real store: one transient EIO opening the operator's own file.
+            "input_read_eio": ("io_error", OSError(errno.EIO, "Input/output error")),
+        }
+        for case, (error_code, failure) in failures.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                file_path = Path("sample.pdf")
+                fault = contextlib.nullcontext()
+                if case == "input_read_eio":
+                    file_path = Path(tmp) / "operator.pdf"
+                    file_path.write_bytes(operator_bytes)
+                    paths = FileStorePathBuilder(acquisition_settings(Path(tmp)))
+                    store = RawDocumentStore(
+                        paths, free_floor_bytes=0,
+                        space_probe=lambda _d: VolumeSpace(available_bytes=1 << 40, total_bytes=1 << 41),
+                    )
+                    store.quarantine_raw_document = mock.Mock(
+                        side_effect=AssertionError("a failed read is not an invalid input")
+                    )
+                    real_open = Path.open
+                    injected = failure
+
+                    def open_(path: Path, mode: str = "r", *args: object, **kwargs: object):
+                        if path == file_path and mode == "rb":
+                            raise injected
+                        return real_open(path, mode, *args, **kwargs)
+
+                    fault = mock.patch.object(Path, "open", open_)
+                else:
+                    raising = failure
+
+                    class _FullArchive(_RawStore):
+                        def put_raw_document(self, **kwargs) -> RawDocumentWriteResult:
+                            raise raising
+
+                        def quarantine_raw_document(self, **kwargs) -> QuarantineResult:
+                            raise AssertionError("a storage failure is not an invalid input")
+
+                    store = _FullArchive()
+
+                uow = FakeUnitOfWork()
+                use_case = RegisterLocalPdf(raw_store=store, uow_factory=lambda: uow)
+                # The failure stays visible to the operator after it is recorded.
+                with self.assertRaises(type(failure)) as raised, fault:
+                    use_case.execute(
+                        RegisterLocalPdfCommand(
+                            file_path=file_path,
+                            company_legal_name="江海股份",
+                            security_code="002484",
+                            exchange="SZSE",
+                            filing_type="other",
+                            title="公告",
+                            announcement_date=date(2026, 7, 5),
+                            provider_document_id="1225000001",
+                            provider="cninfo",
+                        )
+                    )
+                self.assertIs(raised.exception, failure)
+                (access,) = uow.source_accesses.all()
+                self.assertEqual(
+                    (access.provider_interface, access.status),
+                    ("local:register_pdf", "failed"),
+                )
+                snapshot = access.result_snapshot
+                self.assertEqual(
+                    (snapshot["error_code"], snapshot["retryable"], snapshot["failure_phase"]),
+                    (error_code, True, "archive"),
+                )
+                self.assertEqual(snapshot["archive"], {"archive_completed": False})
+                self.assertNotIn("quarantine_filename", snapshot)
+                self.assertNotIn("/Volumes", access.error)
+                if error_code == "local_space_shortfall":
+                    self.assertEqual(snapshot["capacity"]["phase"], "archive")
+                if case == "input_read_eio":
+                    self.assertEqual(access.error, "OSError: [Errno 5] Input/output error")
+                    self.assertEqual(file_path.read_bytes(), operator_bytes)
+                    self.assertFalse(paths.data_path(Path("raw_documents")).exists())
+                self.assertEqual(len(uow.documents.all()), 0)
+
     def test_hash_mismatch_is_quarantined_and_records_failed_source_access(self) -> None:
         uow = FakeUnitOfWork()
         use_case = RegisterLocalPdf(raw_store=_RawStore(), uow_factory=lambda: uow)
@@ -365,6 +461,13 @@ class RegisterDocumentTests(unittest.TestCase):
         self.assertIsNotNone(source_access)
         self.assertEqual(source_access.status, "failed")
         self.assertIn("expected hash mismatch", source_access.error)
+        self.assertEqual(
+            (
+                source_access.result_snapshot["quarantine_complete"],
+                source_access.result_snapshot["input_missing"],
+            ),
+            (True, False),
+        )
         self.assertEqual(len(uow.documents.all()), 0)
 
     def test_report_period_required_only_for_periodic_filings(self) -> None:

@@ -71,6 +71,18 @@ run commits can the ordinary `pending_parse` scan admit a new attempt with a new
 run and its typed message (cause descriptor, status response hash, original provider error) is kept. An unknown POST
 outcome is unaffected: it keeps reconciling the same key.
 
+A closed publication request whose persisted content PostgreSQL cannot store (a U+0000 or lone surrogate in a Unit
+title, heading path or payload key/value) is refused by the pure `publication_text_representability.v1` check after
+the request is built or reopened from its sealed bytes and before readiness or transaction P. Since
+`provider_unit.v24` marks provider U+0000 as U+FFFD before hashing, this is reached only by a request sealed by an
+earlier builder or a native repair text that still holds U+0000. The COMMIT lane maps only that typed error to the
+existing local failure: `publication_text_unrepresentable`, `retryable=false`, `retry_budget_class=provider_artifact_contract`,
+a bounded content-free message, then the same receipt, cleanup, ACK and `local_failed` order. The sealed
+preparation, readiness record and promoted evidence stay under their existing GC ownership; nothing is rewritten,
+re-hashed or deleted, and no Unit, winner or published event is written. Recovery is one explicit `parse-requeue`
+decision followed by an ordinary scan (new attempt, fence and key). The same characters in control fields, and every
+unknown database, hash, locator, IO or integrity error, keep the existing worker stop.
+
 Valid promoted output replays exactly. Invalid promoted output, including a markerless response-loss tree,
 is contained by no-replace output→staging rename under the existing resource lock and claim guard, pinned
 root identity and parent fsync, then stops with ownership unresolved. Simultaneous paths, root substitution

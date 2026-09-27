@@ -12,14 +12,17 @@ from disclosure_anchor.domain.errors import ParserRetryBudgetClass
 
 # The scheduler owns these classes; it retries them under the parse budgets.
 AUTOMATIC_PARSE_RETRY_BUDGET_CLASSES = frozenset(get_args(ParserRetryBudgetClass))
-# The closed set of contract classes the V4 coordinator actually persists
-# (staged_coordinator_backend_v4: provider_terminal, provider_runaway,
-# provider_artifact_contract, provider_protocol, semantic_route_contract).
-# The queue excludes anything it cannot read as a known retry class; that
-# exclusion is not evidence that an operator may re-admit it, so an unknown or
-# malformed class is refused here rather than released.
+# The closed set of non-automatic classes actually persisted on failed parse
+# runs: the V4 coordinator's contract classes (staged_coordinator_backend_v4:
+# provider_terminal, provider_runaway, provider_artifact_contract,
+# provider_protocol, semantic_route_contract) and original_key_lifetime, which
+# only the managed expired-prepared closure writes (0065). The queue excludes
+# anything it cannot read as a known retry class; that exclusion is not
+# evidence that an operator may re-admit it, so an unknown or malformed class
+# is refused here rather than released. The DB CHECK mirrors this set.
 RELEASABLE_PARSE_RETRY_BUDGET_CLASSES = frozenset(
     {
+        "original_key_lifetime",
         "provider_artifact_contract",
         "provider_protocol",
         "provider_runaway",

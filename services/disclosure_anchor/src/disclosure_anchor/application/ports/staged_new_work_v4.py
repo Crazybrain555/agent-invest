@@ -112,14 +112,25 @@ class V4OrdinaryParseCandidatePage:
 
 
 class V4OrdinaryParseCandidateSourcePort(Protocol):
+    """Pending-parse keyset reads under one eligibility predicate and scope.
+
+    ``latest_document_id`` returns the newest currently eligible ID, or None
+    for an empty eligible set, under exactly the predicate/scope of
+    ``list_candidates``. A page's exclusive ``after_document_id`` and
+    inclusive ``through_document_id`` both apply before its limit.
+    """
+
     @property
     def campaign_scope_sha256(self) -> str | None: ...
+
+    def latest_document_id(self) -> str | None: ...
 
     def list_candidates(
         self,
         *,
         after_document_id: str | None,
         limit: int,
+        through_document_id: str | None = None,
     ) -> V4OrdinaryParseCandidatePage: ...
 
 

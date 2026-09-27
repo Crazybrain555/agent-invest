@@ -545,20 +545,31 @@ function Get-ExplicitCapacityInputs {
     $text = $utf8.GetString($raw)
     if ((Get-Sha256Text $text) -cne $ExpectedCapacityConfigSha256) { throw "capacity config SHA differs" }
     $config = $text | ConvertFrom-Json
+    # v2 replaces the per-task result budgets with one nested result storage
+    # policy; the container decoder validates that policy exactly.
+    $storage = $config.contract_version -is [string] -and $config.contract_version -ceq "mineru.capacity-config.v2"
     $limits = @{
         parse_active_limit=128; total_nonterminal_limit=128; finalizer_active_limit=128;
         final_http_limit_per_loop=128; api_process_limit=1; api_event_loop_limit=1;
         processing_window_size=1024; omp_num_threads=256; mkl_num_threads=256;
-        openblas_num_threads=256; pdf_render_processes_requested=256;
-        result_reservation_bytes=[long]::MaxValue; max_unacked_result_bytes=[long]::MaxValue
+        openblas_num_threads=256; pdf_render_processes_requested=256
+    }
+    if (-not $storage) {
+        $limits["result_reservation_bytes"] = [long]::MaxValue
+        $limits["max_unacked_result_bytes"] = [long]::MaxValue
     }
     $names = @($limits.Keys) + @("contract_version", "hybrid_batch_ratio_requested", "pipeline_inference_locks")
+    if ($storage) { $names += "result_storage" }
     if ((@($config.PSObject.Properties.Name | Sort-Object) -join ",") -cne
             (@($names | Sort-Object) -join ",") -or
-        $config.contract_version -isnot [string] -or $config.contract_version -cne "mineru.capacity-config.v1" -or
+        $config.contract_version -isnot [string] -or
+        $config.contract_version -cnotin @("mineru.capacity-config.v1", "mineru.capacity-config.v2") -or
         $config.pipeline_inference_locks -isnot [bool] -or -not $config.pipeline_inference_locks -or
         ($config.hybrid_batch_ratio_requested -isnot [int] -and $config.hybrid_batch_ratio_requested -isnot [long]) -or
         $config.hybrid_batch_ratio_requested -notin @(1,2,4,8)) { throw "capacity config fields or policy differ" }
+    if ($storage -and $config.result_storage -isnot [System.Management.Automation.PSCustomObject]) {
+        throw "capacity config result storage policy is not an object"
+    }
     foreach ($name in $limits.Keys) {
         $value = $config.$name
         if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt 1 -or $value -gt $limits[$name]) {
@@ -567,15 +578,18 @@ function Get-ExplicitCapacityInputs {
     }
     if ($config.parse_active_limit -gt $config.total_nonterminal_limit -or
         $config.finalizer_active_limit -gt $config.total_nonterminal_limit -or
-        $config.result_reservation_bytes -gt $config.max_unacked_result_bytes -or
+        (-not $storage -and $config.result_reservation_bytes -gt $config.max_unacked_result_bytes) -or
         (Get-CanonicalObjectJson $config) -cne $text) { throw "capacity config is not canonical or internally consistent" }
     $mapping = @{
         MINERU_API_MAX_CONCURRENT_REQUESTS="parse_active_limit"; MINERU_API_MAX_PENDING_TASKS="total_nonterminal_limit";
         MINERU_API_FINALIZER_SLOTS="finalizer_active_limit"; MINERU_PROCESSING_WINDOW_SIZE="processing_window_size";
         OMP_NUM_THREADS="omp_num_threads"; MKL_NUM_THREADS="mkl_num_threads"; OPENBLAS_NUM_THREADS="openblas_num_threads";
-        MINERU_PDF_RENDER_THREADS="pdf_render_processes_requested"; MINERU_HYBRID_BATCH_RATIO="hybrid_batch_ratio_requested";
-        MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES="result_reservation_bytes";
-        MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES="max_unacked_result_bytes"
+        MINERU_PDF_RENDER_THREADS="pdf_render_processes_requested"; MINERU_HYBRID_BATCH_RATIO="hybrid_batch_ratio_requested"
+    }
+    if (-not $storage) {
+        # A v2 bootstrap refuses these: its budgets live only in the policy.
+        $mapping["MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES"] = "result_reservation_bytes"
+        $mapping["MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES"] = "max_unacked_result_bytes"
     }
     $environment = [ordered]@{}
     foreach ($name in ($mapping.Keys | Sort-Object)) { $environment[$name] = [string]$config.($mapping[$name]) }
@@ -886,32 +900,59 @@ function Assert-CapacityIdleHealth {
         $Health.processing_tasks -ne 0 -or $Health.task_retention_seconds -ne 600 -or
         $Health.task_cleanup_interval_seconds -ne 30) { throw "$Label capacity API is not healthy and idle" }
     $runtime = $Health.task_protocol_runtime
-    Assert-ClosedProperties $runtime @("schema", "enabled", "task_registry_max_records", "task_result_reservation_bytes",
-        "max_unacked_result_bytes", "registry_schema", "admission_scope", "capacity_config_sha256") "$Label runtime"
+    # A result-storage capacity (v2) serves runtime/registry v4: its per-task
+    # budgets are replaced by the bound storage policy and its idle ledger.
+    $storage = $runtime.schema -is [string] -and $runtime.schema -ceq "mineru-task-runtime.v4"
+    if ($null -ne $ExpectedCapacity -and
+        (($ExpectedCapacity.contract_version -ceq "mineru.capacity-config.v2") -ne $storage)) {
+        throw "$Label runtime storage mode differs from the external config"
+    }
+    if ($storage) {
+        Assert-ClosedProperties $runtime @("schema", "enabled", "task_registry_max_records", "registry_schema",
+            "admission_scope", "capacity_config_sha256", "result_storage_policy_sha256") "$Label runtime"
+        $runtimeSchema = "mineru-task-runtime.v4"; $registrySchema = "mineru-task-registry.v4"
+        $budgetNames = @("task_registry_max_records")
+        if ($runtime.result_storage_policy_sha256 -isnot [string] -or
+            $runtime.result_storage_policy_sha256 -cnotmatch '\Asha256:[a-f0-9]{64}\z' -or
+            ($null -ne $ExpectedCapacity -and
+             (Get-Sha256Text (Get-CanonicalObjectJson $ExpectedCapacity.result_storage)) -cne $runtime.result_storage_policy_sha256)) {
+            throw "$Label runtime result storage policy differs"
+        }
+    } else {
+        Assert-ClosedProperties $runtime @("schema", "enabled", "task_registry_max_records", "task_result_reservation_bytes",
+            "max_unacked_result_bytes", "registry_schema", "admission_scope", "capacity_config_sha256") "$Label runtime"
+        $runtimeSchema = "mineru-task-runtime.v3"; $registrySchema = "mineru-task-registry.v3"
+        $budgetNames = @("task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes")
+    }
     if ($runtime.schema -isnot [string] -or $runtime.registry_schema -isnot [string] -or
         $runtime.admission_scope -isnot [string] -or $runtime.capacity_config_sha256 -isnot [string] -or
-        $runtime.schema -cne "mineru-task-runtime.v3" -or $runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
-        $runtime.registry_schema -cne "mineru-task-registry.v3" -or $runtime.admission_scope -cne "post_form_owned_upload" -or
+        $runtime.schema -cne $runtimeSchema -or $runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
+        $runtime.registry_schema -cne $registrySchema -or $runtime.admission_scope -cne "post_form_owned_upload" -or
         $runtime.capacity_config_sha256 -cnotmatch '\Asha256:[a-f0-9]{64}\z') { throw "$Label runtime identity differs" }
-    foreach ($name in @("task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes")) {
+    foreach ($name in $budgetNames) {
         if (($runtime.$name -isnot [int] -and $runtime.$name -isnot [long]) -or $runtime.$name -lt 1) {
             throw "$Label runtime limit is invalid: $name"
         }
     }
-    if ($runtime.task_registry_max_records -ne 128 -or $runtime.task_result_reservation_bytes -gt $runtime.max_unacked_result_bytes) {
+    if ($runtime.task_registry_max_records -ne 128 -or
+        (-not $storage -and $runtime.task_result_reservation_bytes -gt $runtime.max_unacked_result_bytes)) {
         throw "$Label runtime capacity is inconsistent"
     }
     $observation = $Health.capacity_observation
-    Assert-ClosedProperties $observation @("schema", "capacity_config_sha256", "owner", "resolved_limits",
-        "http_limiter_state", "stage_counters", "http_counters", "owner_control", "framework_limits", "observed_at") "$Label observation"
+    $observationFields = @("schema", "capacity_config_sha256", "owner", "resolved_limits",
+        "http_limiter_state", "stage_counters", "http_counters", "owner_control", "framework_limits", "observed_at")
+    if ($storage) { $observationFields += "result_storage" }
+    Assert-ClosedProperties $observation $observationFields "$Label observation"
+    $observationSchema = if ($storage) { "mineru.capacity-observation.v2" } else { "mineru.capacity-observation.v1" }
     if ($observation.schema -isnot [string] -or $observation.capacity_config_sha256 -isnot [string] -or
         $observation.http_limiter_state -isnot [string] -or
-        $observation.schema -cne "mineru.capacity-observation.v1" -or
+        $observation.schema -cne $observationSchema -or
         $observation.capacity_config_sha256 -cne $runtime.capacity_config_sha256) { throw "$Label config identity differs" }
     $limits = $observation.resolved_limits
-    Assert-ClosedProperties $limits @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit",
-        "result_reservation_bytes", "max_unacked_result_bytes", "final_http_limit_per_loop") "$Label resolved limits"
-    foreach ($name in @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit", "result_reservation_bytes", "max_unacked_result_bytes")) {
+    $limitNames = @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit")
+    if (-not $storage) { $limitNames += @("result_reservation_bytes", "max_unacked_result_bytes") }
+    Assert-ClosedProperties $limits ($limitNames + @("final_http_limit_per_loop")) "$Label resolved limits"
+    foreach ($name in $limitNames) {
         if (($limits.$name -isnot [int] -and $limits.$name -isnot [long]) -or $limits.$name -lt 1) {
             throw "$Label resolved limit is invalid: $name"
         }
@@ -924,8 +965,36 @@ function Assert-CapacityIdleHealth {
         $limits.total_nonterminal_limit -ne $Health.max_pending_tasks_effective -or
         $limits.total_nonterminal_limit -gt 128 -or $limits.parse_active_limit -gt $limits.total_nonterminal_limit -or
         $limits.finalizer_active_limit -gt $limits.total_nonterminal_limit -or
-        $limits.result_reservation_bytes -ne $runtime.task_result_reservation_bytes -or
-        $limits.max_unacked_result_bytes -ne $runtime.max_unacked_result_bytes) { throw "$Label resolved owners disagree" }
+        (-not $storage -and ($limits.result_reservation_bytes -ne $runtime.task_result_reservation_bytes -or
+         $limits.max_unacked_result_bytes -ne $runtime.max_unacked_result_bytes))) { throw "$Label resolved owners disagree" }
+    if ($storage) {
+        $ledger = $observation.result_storage
+        Assert-ClosedProperties $ledger @("policy_sha256", "source_bytes", "ingress_bytes", "result_bytes",
+            "growing_producers", "outstanding_promise_bytes", "completion_queue_depth", "waiting_tasks",
+            "blocked_tasks") "$Label result storage"
+        if ($ledger.policy_sha256 -isnot [string] -or $ledger.policy_sha256 -cne $runtime.result_storage_policy_sha256) {
+            throw "$Label result storage ledger names another policy"
+        }
+        foreach ($name in @("source_bytes", "result_bytes")) {
+            if (($ledger.$name -isnot [int] -and $ledger.$name -isnot [long]) -or $ledger.$name -lt 0) {
+                throw "$Label result storage ledger is invalid: $name"
+            }
+        }
+        # Idle: no ingress, producer, promise, completion wait or hold.
+        foreach ($name in @("ingress_bytes", "growing_producers", "outstanding_promise_bytes",
+            "completion_queue_depth", "blocked_tasks")) {
+            if (($ledger.$name -isnot [int] -and $ledger.$name -isnot [long]) -or $ledger.$name -ne 0) {
+                throw "$Label result storage is not idle: $name"
+            }
+        }
+        Assert-ClosedProperties $ledger.waiting_tasks @("completion_capacity", "free_floor", "source_growth_capacity") "$Label storage waits"
+        foreach ($name in @("completion_capacity", "free_floor", "source_growth_capacity")) {
+            $waiting = $ledger.waiting_tasks.$name
+            if (($waiting -isnot [int] -and $waiting -isnot [long]) -or $waiting -ne 0) {
+                throw "$Label result storage is waiting: $name"
+            }
+        }
+    }
     if ($null -ne $ExpectedCapacity -and
         ((Get-Sha256Text (Get-CanonicalObjectJson $ExpectedCapacity)) -cne $runtime.capacity_config_sha256 -or
         $Health.processing_window_size -ne $ExpectedCapacity.processing_window_size)) { throw "$Label expected config differs" }
@@ -944,6 +1013,7 @@ function Assert-CapacityIdleHealth {
     }
     if ($null -ne $observation.owner_control.trigger) { throw "$Label owner trigger is active" }
     $stages = @("result_capacity_waiting", "parse_waiting", "parse_active", "finalizer_waiting", "finalizer_active")
+    if ($storage) { $stages += @("source_growth_waiting", "completion_waiting") }
     $http = @("active_requests", "pending_requests")
     Assert-ClosedProperties $observation.stage_counters $stages "$Label stages"
     Assert-ClosedProperties $observation.http_counters $http "$Label HTTP"
@@ -960,7 +1030,7 @@ function Assert-CapacityIdleHealth {
         "scheduled_tasks", "queue_depth", "active_processors")
     Assert-ClosedProperties $admission (@("schema", "registry_schema", "nonterminal_limit", "recovery_overcommitted", "admission_open", "blocked_reason") + $counters) "$Label admission"
     if ($admission.schema -isnot [string] -or $admission.registry_schema -isnot [string] -or
-        $admission.schema -cne "mineru-task-admission.v1" -or $admission.registry_schema -cne "mineru-task-registry.v3" -or
+        $admission.schema -cne "mineru-task-admission.v1" -or $admission.registry_schema -cne $registrySchema -or
         ($admission.nonterminal_limit -isnot [int] -and $admission.nonterminal_limit -isnot [long]) -or
         $admission.nonterminal_limit -ne $limits.total_nonterminal_limit -or $admission.recovery_overcommitted -isnot [bool] -or
         $admission.recovery_overcommitted -or $admission.admission_open -isnot [bool] -or -not $admission.admission_open -or
@@ -1015,9 +1085,9 @@ function Assert-CapacityFiles {
 import hashlib,json,sys
 from pathlib import Path
 from mineru.cli.agent_capacity_file import read_mineru_capacity_file
-from mineru.cli.agent_capacity_config import decode_mineru_capacity_config
+from mineru.cli.agent_capacity_config import decode_any_mineru_capacity_config
 raw=read_mineru_capacity_file(Path('/usr/local/etc/mineru/capacity.json'),expected_sha256=sys.argv[1],expected_owner_uid=0)
-config=decode_mineru_capacity_config(raw)
+config=decode_any_mineru_capacity_config(raw)
 sources={}
 for name in ('bootstrap','config','file','observation'):
     relative='mineru/cli/agent_capacity_'+name+'.py'

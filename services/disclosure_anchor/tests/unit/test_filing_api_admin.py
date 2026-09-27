@@ -12,7 +12,9 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentChecker,
     MinerUDeploymentGateError,
 )
+from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.api.errors import FilingApiError, SERVICE_UNAVAILABLE
+from disclosure_anchor.application.ports.file_store import AcquisitionCapacityError
 from disclosure_anchor.api.routers.admin import (
     AdminDeps,
     build_document_units,
@@ -234,6 +236,31 @@ class FilingApiAdminTests(unittest.TestCase):
         self.assertEqual(deps.register_command.provider, "cninfo")
         self.assertEqual(deps.register_command.security_code, "002484")
         self.assertEqual(deps.register_command.exchange, "SZSE")
+
+    def test_admin_register_honors_the_configured_acquisition_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(
+                disclosure_data_root=root / "data",
+                disclosure_shared_root=root / "shared",
+                disclosure_runtime_root=root / "runtime",
+                mineru_model_cache=root / "mineru",
+                hf_home=root / "hf",
+                modelscope_cache=root / "modelscope",
+                disclosure_acquisition_free_floor_bytes=1 << 62,
+            )
+            deps = AdminDeps(settings=settings, engine=mock.MagicMock())
+            with mock.patch("disclosure_anchor.api.routers.admin.RegisterLocalPdf") as use_case:
+                deps.register_local_pdf(mock.sentinel.command)
+            use_case.return_value.execute.assert_called_once_with(mock.sentinel.command)
+            store = use_case.call_args.kwargs["raw_store"]
+            staging = FileStorePathBuilder(settings).runtime_tmp_path("floor-probe.pdf")
+            staging.parent.mkdir(parents=True)
+            # No volume has 4 EiB free: the explicit floor, not the default, decides.
+            with self.assertRaises(AcquisitionCapacityError) as refused:
+                store.open_pdf_download(staging)
+            self.assertEqual(refused.exception.floor_bytes, 1 << 62)
+            self.assertFalse(staging.exists())
 
     def test_register_local_pdf_rejects_non_textid_as_422(self) -> None:
         deps = _Deps()

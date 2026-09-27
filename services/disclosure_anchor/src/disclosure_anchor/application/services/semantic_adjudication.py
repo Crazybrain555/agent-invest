@@ -13,6 +13,7 @@ from typing import Literal
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_FAILOVER_POLICY_VERSION,
     SEMANTIC_ROUTER_VERSION,
+    SemanticDecisionCoverageError,
     SemanticProviderAttempt,
     SemanticProviderIdentity,
     SemanticRouteContractError,
@@ -23,6 +24,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationGroupCachePort,
     SemanticAdjudicationOutcome,
     SemanticAdjudicatorAdapterPort,
+    SemanticDecisionValidator,
     SemanticExecutionGuard,
     SemanticRouteAdjudicatorError,
     SemanticRouteCacheError,
@@ -41,6 +43,8 @@ _AVAILABILITY_REASON_CODES = frozenset(
     }
 )
 _CANCELLED_REASON_CODE = "cancelled"
+_INVALID_CONTRACT_REASON_CODE = "invalid_contract"
+_INVALID_DECISION_REASON_CODE = "invalid_decision"
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
 
@@ -82,12 +86,15 @@ class OrderedSemanticAdjudicationExecutor:
         *,
         group_hash: str,
         stage_guard: SemanticExecutionGuard | None = None,
+        validate: SemanticDecisionValidator | None = None,
     ) -> SemanticAdjudicationOutcome:
         # Measurement only: one group_started/group_ended pair around the
         # real group boundary, whatever path the adjudication takes.
         note_stage(stage_guard, "group_started", group_hash=group_hash, providers=len(self._providers))
         try:
-            outcome = self._adjudicate(batch, group_hash=group_hash, stage_guard=stage_guard)
+            outcome = self._adjudicate(
+                batch, group_hash=group_hash, stage_guard=stage_guard, validate=validate
+            )
         except BaseException as exc:
             note_stage(stage_guard, "group_ended", group_hash=group_hash, outcome=_failure_outcome(exc))
             raise
@@ -103,6 +110,7 @@ class OrderedSemanticAdjudicationExecutor:
         *,
         group_hash: str,
         stage_guard: SemanticExecutionGuard | None,
+        validate: SemanticDecisionValidator | None,
     ) -> SemanticAdjudicationOutcome:
         attempts: list[SemanticProviderAttempt] = []
         for ordinal, configured in enumerate(self._providers, start=1):
@@ -126,6 +134,26 @@ class OrderedSemanticAdjudicationExecutor:
                         group_hash=group_hash,
                         identity=identity,
                     )
+                    if validate is not None:
+                        try:
+                            validate(cached.decisions)
+                        except SemanticRouteContractError as exc:
+                            # Entries are written only after this validation, so
+                            # a stored result that no longer routes is tampering
+                            # or unversioned drift.  It is never served, retried
+                            # on another provider or quarantined: the entry stays
+                            # untouched as evidence and no cache hit is claimed.
+                            reason_code = _validation_reason_code(exc)
+                            note_stage(stage_guard, "cache_hit_invalid", group_hash=group_hash, ordinal=ordinal,
+                                       provider_id=identity.provider_id, reason_code=reason_code)
+                            raise _rejected_result(
+                                f"semantic group cache entry failed routing validation: {exc}",
+                                reason_code=reason_code,
+                                attempts=attempts,
+                                ordinal=ordinal,
+                                identity=identity,
+                                cache_key=cache_key,
+                            ) from exc
                     attempt = SemanticProviderAttempt(
                         ordinal=ordinal,
                         provider=identity,
@@ -161,6 +189,26 @@ class OrderedSemanticAdjudicationExecutor:
                     )
                     note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
                                provider_id=identity.provider_id, outcome=call_outcome, reason_code=exc.reason_code)
+                    if call_outcome == "failed_closed":
+                        # An already recognized typed fault takes precedence
+                        # over a concurrent revocation: raise it before any
+                        # guard checkpoint can replace it with lease loss.
+                        failed = SemanticProviderAttempt(
+                            ordinal=ordinal,
+                            provider=identity,
+                            outcome="failed_closed",
+                            reason_code=exc.reason_code,
+                            cache_key=cache_key,
+                        )
+                        raise SemanticRouteAdjudicatorError(
+                            str(exc),
+                            reason_code=exc.reason_code,
+                            retryable=False,
+                            attempts=(*attempts, failed),
+                        ) from exc
+                    # Cancellation and availability still check the live
+                    # guard first: a revoked or expired stage never falls back
+                    # to the next provider or accepts a late answer.
                     if stage_guard is not None:
                         stage_guard.checkpoint()
                     if exc.reason_code == _CANCELLED_REASON_CODE:
@@ -176,20 +224,6 @@ class OrderedSemanticAdjudicationExecutor:
                             reason_code=exc.reason_code,
                             retryable=True,
                             attempts=(*attempts, cancelled),
-                        ) from exc
-                    if exc.reason_code not in _AVAILABILITY_REASON_CODES:
-                        failed = SemanticProviderAttempt(
-                            ordinal=ordinal,
-                            provider=identity,
-                            outcome="failed_closed",
-                            reason_code=exc.reason_code,
-                            cache_key=cache_key,
-                        )
-                        raise SemanticRouteAdjudicatorError(
-                            str(exc),
-                            reason_code=exc.reason_code,
-                            retryable=False,
-                            attempts=(*attempts, failed),
                         ) from exc
                     attempts.append(
                         SemanticProviderAttempt(
@@ -208,6 +242,30 @@ class OrderedSemanticAdjudicationExecutor:
                     note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
                                provider_id=identity.provider_id, outcome=_failure_outcome(exc))
                     raise
+                if validate is not None:
+                    try:
+                        validate(result.decisions)
+                    except SemanticRouteContractError as exc:
+                        # A protocol-valid answer that cannot be routed is a
+                        # failed-closed attempt of this call: raised before any
+                        # cache write or guard checkpoint and never retried on
+                        # another provider.
+                        reason_code = _validation_reason_code(exc)
+                        note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
+                                   provider_id=identity.provider_id, outcome="failed_closed",
+                                   reason_code=reason_code)
+                        raise _rejected_result(
+                            str(exc),
+                            reason_code=reason_code,
+                            attempts=attempts,
+                            ordinal=ordinal,
+                            identity=identity,
+                            cache_key=cache_key,
+                        ) from exc
+                    except BaseException as exc:
+                        note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
+                                   provider_id=identity.provider_id, outcome=_failure_outcome(exc))
+                        raise
                 note_stage(stage_guard, "provider_call_ended", group_hash=group_hash, ordinal=ordinal,
                            provider_id=identity.provider_id, outcome=call_outcome)
                 entry = SemanticAdjudicationCacheEntry(
@@ -268,6 +326,40 @@ def _failure_outcome(exc: BaseException) -> str:
     if type(exc).__name__ == "StageLeaseLost":
         return "lease_lost"
     return "error:" + type(exc).__name__
+
+
+def _validation_reason_code(exc: SemanticRouteContractError) -> str:
+    # Decisions that do not name exactly the requested Units break the result
+    # contract itself; any other rejection is a decision the router cannot route.
+    if isinstance(exc, SemanticDecisionCoverageError):
+        return _INVALID_CONTRACT_REASON_CODE
+    return _INVALID_DECISION_REASON_CODE
+
+
+def _rejected_result(
+    message: str,
+    *,
+    reason_code: str,
+    attempts: list[SemanticProviderAttempt],
+    ordinal: int,
+    identity: SemanticProviderIdentity,
+    cache_key: str,
+) -> SemanticRouteAdjudicatorError:
+    return SemanticRouteAdjudicatorError(
+        message,
+        reason_code=reason_code,
+        retryable=False,
+        attempts=(
+            *attempts,
+            SemanticProviderAttempt(
+                ordinal=ordinal,
+                provider=identity,
+                outcome="failed_closed",
+                reason_code=reason_code,
+                cache_key=cache_key,
+            ),
+        ),
+    )
 
 
 @contextmanager

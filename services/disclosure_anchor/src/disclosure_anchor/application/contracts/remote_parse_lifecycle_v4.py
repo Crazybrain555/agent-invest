@@ -45,6 +45,9 @@ from disclosure_anchor.application.contracts.strict_json import strict_json_load
 CHECKPOINT_V4_CONTRACT = "remote-parse-checkpoint.v4"
 RESOURCE_RESERVATION_V4_CONTRACT = "remote-parse-resource-reservation.v4"
 MATERIALIZATION_INTENT_V4_CONTRACT = "remote-parse-materialization-intent.v4"
+# v5 binds a coordinator-admitted stage grant; v4 bytes and decoding are unchanged.
+MATERIALIZATION_INTENT_V5_CONTRACT = "remote-parse-materialization-intent.v5"
+STAGE_RESOURCE_GRANT_V1_CONTRACT = "stage-resource-grant.v1"
 PROVIDER_ENVELOPE_CONTEXT_V4_CONTRACT = "provider-envelope-context.v4"
 LOCAL_MATERIALIZATION_V4_CONTRACT = "local-materialization-receipt.v4"
 CLEANUP_PLAN_V4_CONTRACT = "local-cleanup-plan.v4"
@@ -368,6 +371,179 @@ class ProviderEnvelopeContextV4:
         return _digest(self.canonical_bytes)
 
 
+def credit_union_v4(*vectors: ResourceCreditVector) -> ResourceCreditVector:
+    """Dimension-wise maximum: an effective reservation never shrinks."""
+
+    if not vectors or any(type(item) is not ResourceCreditVector for item in vectors):
+        raise ValueError("credit union requires exact credit vectors")
+    return ResourceCreditVector(
+        **{
+            item.name: max(getattr(vector, item.name) for vector in vectors)
+            for item in fields(ResourceCreditVector)
+        }
+    )
+
+
+def terminal_result_growth_v4(
+    reserved: ResourceCreditVector, *, artifact_byte_count: int,
+) -> ResourceCreditVector:
+    """The reservation after a verified storage-managed terminal result Z."""
+
+    _positive(artifact_byte_count, "terminal artifact byte count")
+    return credit_union_v4(
+        reserved,
+        ResourceCreditVector(
+            provider_result_bytes=artifact_byte_count, compressed_bytes=artifact_byte_count,
+        ),
+    )
+
+
+def materialization_grant_limits_v4(
+    reserved: ResourceCreditVector,
+    *,
+    artifact_byte_count: int,
+    selected_bytes: int,
+    decode_working_set_bytes: int,
+) -> ResourceCreditVector:
+    """Effective limits for materializing one verified result.
+
+    Disk: spool Z, unpacked S and the decode-stage outputs W coexist, so the
+    temporary peak is Z + S + W and the closed outputs S + W. RAM: one decode
+    working set W, never the image bytes of S.
+    """
+
+    _positive(artifact_byte_count, "grant artifact byte count")
+    _nonnegative(selected_bytes, "grant selected byte count")
+    _positive(decode_working_set_bytes, "grant decode working set")
+    return credit_union_v4(
+        terminal_result_growth_v4(reserved, artifact_byte_count=artifact_byte_count),
+        ResourceCreditVector(
+            decoded_bytes=decode_working_set_bytes,
+            temp_disk_bytes=_checked_sum((artifact_byte_count, selected_bytes, decode_working_set_bytes)),
+            output_bytes=_checked_sum((selected_bytes, decode_working_set_bytes)),
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StageResourceGrantV1:
+    """One coordinator-admitted materialization grant for one attempt.
+
+    It binds the immutable reservation, the verified terminal receipt and the
+    native storage envelope it was computed from. ``limits`` is the effective
+    reservation once the grant is committed; only the coordinator admits it,
+    before the durable transition that carries it.
+
+    A legacy obligation carried to a newly qualified runtime also names the
+    reviewed upgrade and its original execution spec; both are absent (and
+    omitted from the canonical bytes) for every other grant.
+    """
+
+    attempt_id: str
+    fence_identity: str
+    reservation_sha256: str
+    terminal_receipt_sha256: str
+    storage_policy_sha256: str
+    inventory_sha256: str
+    artifact_byte_count: int
+    selected_bytes: int
+    member_count: int
+    decode_working_set_bytes: int
+    decode_input_limit_bytes: int
+    limits: ResourceCreditVector
+    contract_version: str = STAGE_RESOURCE_GRANT_V1_CONTRACT
+    execution_upgrade_sha256: str | None = None
+    execution_spec_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.contract_version != STAGE_RESOURCE_GRANT_V1_CONTRACT:
+            raise ValueError("stage resource grant contract is unsupported")
+        _identity_tuple(self.attempt_id, self.fence_identity)
+        if (self.execution_upgrade_sha256 is None) != (self.execution_spec_sha256 is None):
+            raise ValueError("a legacy stage grant names both its upgrade and its original spec")
+        if self.execution_upgrade_sha256 is not None and self.execution_spec_sha256 is not None:
+            _require_sha(self.execution_upgrade_sha256, "grant execution upgrade")
+            _require_sha(self.execution_spec_sha256, "grant original execution spec")
+        for digest, label in (
+            (self.reservation_sha256, "grant reservation"),
+            (self.terminal_receipt_sha256, "grant terminal receipt"),
+            (self.storage_policy_sha256, "grant storage policy"),
+            (self.inventory_sha256, "grant inventory"),
+        ):
+            _require_sha(digest, label)
+        for amount, label in (
+            (self.artifact_byte_count, "grant artifact byte count"),
+            (self.member_count, "grant member count"),
+            (self.decode_working_set_bytes, "grant decode working set"),
+            (self.decode_input_limit_bytes, "grant decode input limit"),
+        ):
+            _positive(amount, label)
+        _nonnegative(self.selected_bytes, "grant selected byte count")
+        if type(self.limits) is not ResourceCreditVector:
+            raise ValueError("stage resource grant lacks exact limits")
+        if self.decode_input_limit_bytes > self.decode_working_set_bytes:
+            raise ValueError("stage resource grant decode input exceeds its working set")
+        required = materialization_grant_limits_v4(
+            ResourceCreditVector(),
+            artifact_byte_count=self.artifact_byte_count,
+            selected_bytes=self.selected_bytes,
+            decode_working_set_bytes=self.decode_working_set_bytes,
+        )
+        if not required.fits(self.limits):
+            raise ValueError("stage resource grant limits do not cover its own basis")
+
+    def payload(self) -> dict[str, Any]:
+        value = asdict(self)
+        if self.execution_upgrade_sha256 is None:
+            del value["execution_upgrade_sha256"], value["execution_spec_sha256"]
+        return value
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json(self.payload())
+
+    @property
+    def sha256(self) -> str:
+        return _digest(self.canonical_bytes)
+
+
+def build_stage_resource_grant_v1(
+    *,
+    reservation: ResourceReservationV4,
+    terminal_receipt_sha256: str,
+    storage_policy_sha256: str,
+    inventory_sha256: str,
+    artifact_byte_count: int,
+    selected_bytes: int,
+    member_count: int,
+    decode_working_set_bytes: int,
+    decode_input_limit_bytes: int,
+    execution_upgrade_sha256: str | None = None,
+    execution_spec_sha256: str | None = None,
+) -> StageResourceGrantV1:
+    return StageResourceGrantV1(
+        execution_upgrade_sha256=execution_upgrade_sha256,
+        execution_spec_sha256=execution_spec_sha256,
+        attempt_id=reservation.attempt_id,
+        fence_identity=reservation.fence_identity,
+        reservation_sha256=reservation.sha256,
+        terminal_receipt_sha256=terminal_receipt_sha256,
+        storage_policy_sha256=storage_policy_sha256,
+        inventory_sha256=inventory_sha256,
+        artifact_byte_count=artifact_byte_count,
+        selected_bytes=selected_bytes,
+        member_count=member_count,
+        decode_working_set_bytes=decode_working_set_bytes,
+        decode_input_limit_bytes=decode_input_limit_bytes,
+        limits=materialization_grant_limits_v4(
+            reservation.reserved_credit,
+            artifact_byte_count=artifact_byte_count,
+            selected_bytes=selected_bytes,
+            decode_working_set_bytes=decode_working_set_bytes,
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class MaterializationIntentV4:
     attempt_id: str
@@ -411,10 +587,47 @@ class MaterializationIntentV4:
     output_byte_limit: int
     output_page_limit: int
     contract_version: str = MATERIALIZATION_INTENT_V4_CONTRACT
+    resource_grant: StageResourceGrantV1 | None = None
 
     def __post_init__(self) -> None:
-        if self.contract_version != MATERIALIZATION_INTENT_V4_CONTRACT:
+        if self.contract_version not in {
+            MATERIALIZATION_INTENT_V4_CONTRACT, MATERIALIZATION_INTENT_V5_CONTRACT,
+        }:
             raise ValueError("materialization intent contract is unsupported")
+        grant = self.resource_grant
+        if (self.contract_version == MATERIALIZATION_INTENT_V5_CONTRACT) != (grant is not None):
+            raise ValueError("materialization intent grant contradicts its version")
+        if grant is not None:
+            if type(grant) is not StageResourceGrantV1:
+                raise ValueError("materialization intent grant is not exact")
+            if (
+                (grant.attempt_id, grant.fence_identity, grant.reservation_sha256,
+                 grant.terminal_receipt_sha256, grant.artifact_byte_count)
+                != (self.attempt_id, self.fence_identity, self.reservation_sha256,
+                    self.terminal_receipt_sha256, self.artifact_byte_count)
+            ):
+                raise ValueError("materialization grant is bound to another attempt or result")
+            limits = grant.limits
+            expected_held = ResourceCreditVector(
+                documents=1, snapshot_items=1,
+                snapshot_bytes=self.held_resource_credit.snapshot_bytes,
+                provider_tasks=1, provider_result_bytes=self.artifact_byte_count,
+                materialization_items=1, compressed_bytes=self.artifact_byte_count,
+                decoded_bytes=limits.decoded_bytes, temp_disk_bytes=limits.temp_disk_bytes,
+                ack_items=1,
+            )
+            if (
+                self.held_resource_credit != expected_held
+                or self.result_byte_limit != limits.provider_result_bytes
+                or self.member_count_limit != grant.member_count
+                or self.uncompressed_byte_limit != grant.selected_bytes
+                # Parser files are a subset of the selected members: S bounds
+                # their disk bytes; decoded RAM is the separate W credit.
+                or self.decoded_byte_limit != grant.selected_bytes
+                or self.temporary_disk_byte_limit != limits.temp_disk_bytes
+                or self.output_byte_limit != limits.output_bytes
+            ):
+                raise ValueError("materialization intent limits differ from its grant")
         _identity_tuple(
             self.attempt_id,
             self.fence_identity,
@@ -523,7 +736,12 @@ class MaterializationIntentV4:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(asdict(self))
+        payload = asdict(self)
+        if self.resource_grant is None:
+            del payload["resource_grant"]
+        else:
+            payload["resource_grant"] = self.resource_grant.payload()
+        return _canonical_json(payload)
 
     @property
     def sha256(self) -> str:
@@ -1420,7 +1638,13 @@ def build_materialization_intent_v4(
     output_manifest_relpath: str,
     member_count_limit: int,
     uncompressed_byte_limit: int,
+    resource_grant: StageResourceGrantV1 | None = None,
 ) -> MaterializationIntentV4:
+    """Build a v4 intent from the reservation, or a v5 intent from a grant.
+
+    With a grant, every materialization limit comes from the admitted grant
+    (its verified Z/S/M basis); the reservation stays the unchanged estimate.
+    """
     if (
         source_checkpoint.state != "remote_terminal"
         or source_checkpoint.terminal_receipt_sha256 != terminal_receipt_sha256
@@ -1438,6 +1662,16 @@ def build_materialization_intent_v4(
         artifact_sha256=artifact_sha256,
         output_dir_name=output_dir_name,
     )
+    if resource_grant is None:
+        limits = reservation.reserved_credit
+    else:
+        if (
+            type(resource_grant) is not StageResourceGrantV1
+            or resource_grant.reservation_sha256 != reservation.sha256
+            or resource_grant.terminal_receipt_sha256 != terminal_receipt_sha256
+        ):
+            raise ValueError("materialization grant is not bound to this reservation and result")
+        limits = resource_grant.limits
     return MaterializationIntentV4(
         attempt_id=reservation.attempt_id,
         fence_identity=reservation.fence_identity,
@@ -1467,8 +1701,8 @@ def build_materialization_intent_v4(
             provider_result_bytes=artifact_byte_count,
             materialization_items=1,
             compressed_bytes=artifact_byte_count,
-            decoded_bytes=reservation.reserved_credit.decoded_bytes,
-            temp_disk_bytes=reservation.reserved_credit.temp_disk_bytes,
+            decoded_bytes=limits.decoded_bytes,
+            temp_disk_bytes=limits.temp_disk_bytes,
             ack_items=1,
         ),
         snapshot_relpath=paths["snapshot"],
@@ -1483,13 +1717,22 @@ def build_materialization_intent_v4(
         output_dir_name=output_dir_name,
         provider_envelope_relpath=provider_envelope_relpath,
         output_manifest_relpath=output_manifest_relpath,
-        result_byte_limit=reservation.reserved_credit.provider_result_bytes,
-        member_count_limit=member_count_limit,
-        uncompressed_byte_limit=uncompressed_byte_limit,
-        decoded_byte_limit=reservation.reserved_credit.decoded_bytes,
-        temporary_disk_byte_limit=reservation.reserved_credit.temp_disk_bytes,
-        output_byte_limit=reservation.reserved_credit.output_bytes,
+        result_byte_limit=limits.provider_result_bytes,
+        member_count_limit=member_count_limit if resource_grant is None else resource_grant.member_count,
+        uncompressed_byte_limit=(
+            uncompressed_byte_limit if resource_grant is None else resource_grant.selected_bytes
+        ),
+        decoded_byte_limit=(
+            limits.decoded_bytes if resource_grant is None else resource_grant.selected_bytes
+        ),
+        temporary_disk_byte_limit=limits.temp_disk_bytes,
+        output_byte_limit=limits.output_bytes,
         output_page_limit=reservation.source_page_count,
+        contract_version=(
+            MATERIALIZATION_INTENT_V4_CONTRACT if resource_grant is None
+            else MATERIALIZATION_INTENT_V5_CONTRACT
+        ),
+        resource_grant=resource_grant,
     )
 
 
@@ -2432,9 +2675,31 @@ def decode_resource_reservation_v4(exact_bytes: bytes) -> ResourceReservationV4:
     return value
 
 
+def _decode_stage_resource_grant(value: object) -> StageResourceGrantV1:
+    payload = _mapping(value, "stage resource grant")
+    names = {item.name for item in fields(StageResourceGrantV1)}
+    binding = {"execution_upgrade_sha256", "execution_spec_sha256"}
+    # A legacy binding is present with both digests or omitted entirely.
+    if set(payload) not in (names, names - binding) or any(
+        name in payload and payload[name] is None for name in binding
+    ):
+        raise ValueError("StageResourceGrantV1 fields are not closed")
+    limits = _mapping(payload["limits"], "stage resource grant limits")
+    _closed(limits, ResourceCreditVector)
+    return StageResourceGrantV1(**{**payload, "limits": ResourceCreditVector(**limits)})
+
+
 def decode_materialization_intent_v4(exact_bytes: bytes) -> MaterializationIntentV4:
+    """Decode a v4 intent unchanged, or a v5 intent with its stage grant."""
     payload = _decode_canonical_object(exact_bytes)
-    _closed(payload, MaterializationIntentV4)
+    names = {item.name for item in fields(MaterializationIntentV4)}
+    grant: StageResourceGrantV1 | None = None
+    if payload.get("contract_version") == MATERIALIZATION_INTENT_V5_CONTRACT:
+        if set(payload) != names:
+            raise ValueError("MaterializationIntentV4 fields are not closed")
+        grant = _decode_stage_resource_grant(payload["resource_grant"])
+    elif set(payload) != names - {"resource_grant"}:
+        raise ValueError("MaterializationIntentV4 fields are not closed")
     credit_payload = _mapping(payload["held_resource_credit"], "held resource credit")
     _closed(credit_payload, ResourceCreditVector)
     context_payload = _mapping(
@@ -2456,6 +2721,7 @@ def decode_materialization_intent_v4(exact_bytes: bytes) -> MaterializationInten
             **payload,
             "held_resource_credit": ResourceCreditVector(**credit_payload),
             "provider_envelope_context": context,
+            **({"resource_grant": grant} if grant is not None else {}),
         }
     )
     _canonical_match(value.canonical_bytes, exact_bytes)
@@ -2698,6 +2964,8 @@ __all__ = [
     "CLEANUP_PLAN_V4_CONTRACT",
     "CLEANUP_RECEIPT_V4_CONTRACT",
     "MATERIALIZATION_INTENT_V4_CONTRACT",
+    "MATERIALIZATION_INTENT_V5_CONTRACT",
+    "STAGE_RESOURCE_GRANT_V1_CONTRACT",
     "PROVIDER_ENVELOPE_CONTEXT_V4_CONTRACT",
     "RESOURCE_RESERVATION_V4_CONTRACT",
     "CleanupResourceEntryV4",
@@ -2711,12 +2979,15 @@ __all__ = [
     "ProviderEnvelopeContextV4",
     "RemoteParseCheckpointV4",
     "ResourceReservationV4",
+    "StageResourceGrantV1",
     "advance_remote_parse_checkpoint_v4",
     "build_initial_remote_parse_checkpoint_v4",
     "build_local_cleanup_plan_v4",
     "build_local_cleanup_receipt_v4",
     "build_local_materialization_receipt_v4",
     "build_materialization_intent_v4",
+    "build_stage_resource_grant_v1",
+    "credit_union_v4",
     "build_resource_free_remote_parse_checkpoint_v4",
     "build_resource_reservation_v4",
     "decode_local_cleanup_plan_v4",
@@ -2729,8 +3000,10 @@ __all__ = [
     "deterministic_local_resource_paths_v4",
     "deterministic_local_resource_relpath_v4",
     "local_output_files_sha256_v4",
+    "materialization_grant_limits_v4",
     "provider_ack_request_v4_bytes",
     "provider_ack_request_v4_identity",
+    "terminal_result_growth_v4",
     "validate_local_cleanup_plan_v4",
     "validate_materialized_provider_evidence_v4",
     "validate_remote_parse_checkpoint_successor_v4",

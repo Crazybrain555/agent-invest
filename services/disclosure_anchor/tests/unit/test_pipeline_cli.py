@@ -40,6 +40,43 @@ from tests.unit._fakes import FakeUnitOfWork
 
 
 class PipelineCliTests(unittest.TestCase):
+    def test_manual_web_sync_forwards_download_deadline(self) -> None:
+        deps = pipeline._Deps.__new__(pipeline._Deps)
+        deps.settings = SimpleNamespace(
+            cninfo_max_qps=2.5,
+            cninfo_max_retries=3,
+            cninfo_download_deadline_seconds=900,
+            cninfo_overlap_days=7,
+            disclosure_initial_lookback_days=365,
+            disclosure_processing_policy_path=None,
+        )
+        deps.uow_factory = MagicMock()
+        deps.paths = MagicMock()
+        deps.engine = MagicMock()
+        args = pipeline._parser().parse_args(
+            ["sync", "--company", "000001", "--window", "7", "--channel", "web"]
+        )
+        with (
+            patch.object(pipeline, "datetime_today_shanghai", return_value=date(2026, 9, 26)),
+            patch.object(pipeline, "_sync_window",
+                         return_value=(date(2026, 9, 19), date(2026, 9, 26))),
+            patch.object(pipeline, "CninfoWebSource") as web_source,
+            patch.object(pipeline, "SyncDisclosureIndex") as sync_use_case,
+            patch.object(pipeline, "DownloadDocument"),
+            patch.object(pipeline, "RawDocumentStore"),
+            patch("disclosure_anchor.adapters.sources.cninfo.mapper.load_processing_policy",
+                  return_value=None),
+            patch("disclosure_anchor.application.worker.queries.pending_downloads",
+                  return_value=[]),
+        ):
+            sync_use_case.return_value.execute.return_value = {"status": "ok"}
+            result = deps.sync(args)
+        web_source.assert_called_once_with(
+            max_qps=2.5, max_retries=3, download_deadline_seconds=900
+        )
+        web_source.return_value.close.assert_called_once_with()
+        self.assertEqual(result["download_count"], 0)
+
     def test_production_parser_composition_keeps_api_and_upstream_distinct(
         self,
     ) -> None:

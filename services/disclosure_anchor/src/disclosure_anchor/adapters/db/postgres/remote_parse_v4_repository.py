@@ -379,6 +379,44 @@ class RemoteParseV4Repository:
                 "persisted v4 authority cannot be reconstructed"
             ) from exc
 
+    def observe(self, attempt_id: str) -> RemoteParseV4Authority:
+        """Reconstruct one exact authority without row locks.
+
+        For read-only inspection only (a READ ONLY REPEATABLE READ snapshot
+        cannot take FOR SHARE locks). It uses the same strict decoders as
+        :meth:`load` and can never be used to claim, resume or write.
+        """
+
+        _identity(attempt_id, "attempt")
+        table = models.RemoteParseAttempt.__table__
+        head = self._session.execute(
+            sa.select(table).where(table.c.attempt_id == attempt_id)
+        ).mappings().one_or_none()
+        if head is None:
+            raise V4HeadNotFound("v4 authority head is absent")
+        try:
+            return self._strict_authority(head)
+        except RemoteParseV4AuthorityViolation:
+            raise
+        except (LookupError, TypeError, ValueError) as exc:
+            raise RemoteParseV4AuthorityViolation(
+                "persisted v4 authority cannot be reconstructed"
+            ) from exc
+
+    def count_staged_prepared_heads(self) -> int:
+        """Non-current V4 H0s (staged superseders awaiting activation); read-only."""
+
+        table = models.RemoteParseAttempt.__table__
+        return int(
+            self._session.execute(
+                sa.select(sa.func.count()).select_from(table).where(
+                    table.c.checkpoint_contract_version == 4,
+                    table.c.state == "prepared",
+                    table.c.is_current.is_(False),
+                )
+            ).scalar_one()
+        )
+
     def load_current_for_document(
         self,
         document_id: str,

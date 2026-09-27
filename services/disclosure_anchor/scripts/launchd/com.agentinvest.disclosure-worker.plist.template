@@ -9,11 +9,26 @@
     <string>__REPO__/scripts/run_worker_once.sh</string>
     <string>loop</string>
   </array>
-  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <!-- Restart only after a clean exit 0 (an operator stop that drained with
+       no fault). Every nonzero exit stays down until an operator acts:
+       78 public stop, 75 busy singleton, 70 watchdog, 77 TCC, any crash.
+       A public stop is also guarded across manual start/reboot by the
+       worker's own start gate and native disable. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><true/>
+  </dict>
   <key>ThrottleInterval</key><integer>30</integer>
   <!-- Allow the wrapper to forward SIGTERM and reap MinerU process groups
        before launchd escalates to SIGKILL. -->
   <key>ExitTimeOut</key><integer>90</integer>
+  <!-- The label a public stop disables natively; the worker binds it to
+       the configured supervised runtime root. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DISCLOSURE_WORKER_LAUNCHD_LABEL</key><string>com.agentinvest.disclosure-worker</string>
+  </dict>
   <!-- launchd stdout/err MUST live on the internal disk (~/Library/Logs is
        the macOS LaunchAgent convention): creating files on an external
        volume from a launchd-spawned process is TCC-denied with no prompt,

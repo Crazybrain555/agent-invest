@@ -44,6 +44,18 @@ class SubjectIdentityRaceError(SubjectIdentityConflictError):
     """Raised when a subject unique constraint race should be retried once."""
 
 
+class HistoricalSecurityBindingRequiredError(RegistrationMetadataError):
+    """Raised when a historical security is used without its evidence path.
+
+    A historical security code is never an unconditional alias of its
+    company: only the binding-verified acquisition resolver may use it.
+    """
+
+
+class HistoricalSecurityProvenanceError(RegistrationMetadataError):
+    """Raised when a historical binding, index or anchor cannot be verified."""
+
+
 class DocumentIdentityConflictError(DisclosureAnchorError):
     """Raised when a document identity unique constraint is hit."""
 
@@ -159,3 +171,16 @@ class ParseRequeueError(DisclosureAnchorError):
     def __init__(self, error: dict) -> None:
         self.error = error
         super().__init__(str(error))
+
+
+class SourceRecoveryError(DisclosureAnchorError):
+    """Raised when a historical binding or retained registration is refused.
+
+    ``error_code`` is a stable closed reason; ``message`` carries the exact
+    identities that failed so an operator can act without re-deriving them.
+    """
+
+    def __init__(self, error_code: str, message: str) -> None:
+        self.error_code = error_code
+        self.message = message
+        super().__init__(f"{error_code}: {message}")

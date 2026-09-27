@@ -23,6 +23,24 @@ from disclosure_anchor.application.ports.semantic_routes import (
 )
 
 
+CLAUDE_2_1_280_API_ERROR_ENVELOPE = (
+    '{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"8d6dd2dd-1098-421b-9408'
+    '-5989bf75faaf","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0}'
+    ',"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_to'
+    'kens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier'
+    '":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens"'
+    ':0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_d'
+    'enials":[],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_rea'
+    'son":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"fo'
+    'reground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,'
+    '"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_lim'
+    'it":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"sub'
+    'type":"success","api_error_status":400,"result":"API Error: 400 opus capture only","type'
+    '":"result","duration_ms":17,"uuid":"79fb4cd1-3c45-44b4-89ba-411c21c7f7b5","queued_turn_c'
+    'ount":0,"result_index":0}'
+)
+
+
 def _batch() -> SemanticAdjudicationBatch:
     return SemanticAdjudicationBatch(
         document=SemanticDocumentContext(
@@ -227,6 +245,7 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
         schema = json.loads(args[args.index("--json-schema") + 1])
         self.assertNotIn("$schema", schema)
         self.assertEqual(args[args.index("--tools") + 1], "")
+        self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(
             args[args.index("--mcp-config") + 1],
             '{"mcpServers":{}}',
@@ -620,6 +639,20 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                 "",
                 "forbidden_tool_call",
                 False,
+            ),
+            # Claude Code 2.1.280's complete API-error envelope (captured offline
+            # against a local endpoint): a plain 400 stays a failed command...
+            (json.loads(CLAUDE_2_1_280_API_ERROR_ENVELOPE), "", "command_failed", False),
+            # ...and the same envelope shape still carries capacity to failover.
+            (
+                {
+                    **json.loads(CLAUDE_2_1_280_API_ERROR_ENVELOPE),
+                    "api_error_status": 429,
+                    "result": "API Error: 429 Too Many Requests",
+                },
+                "",
+                "capacity_unavailable",
+                True,
             ),
         )
         for payload, stderr, reason_code, retryable in cases:

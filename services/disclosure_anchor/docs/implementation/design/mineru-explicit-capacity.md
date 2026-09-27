@@ -5,6 +5,10 @@ concurrency in one API process and serving event loop. It preserves the original
 MinerU 3.4.4 Hybrid-medium parsing and output semantics. This path is selected
 explicitly; ordinary installation remains `legacy-runtime`, N=1/P=1/H=7.
 
+`mineru.capacity-config.v2` keeps these compute fields and replaces B and L with one nested result storage
+policy; its physical budgets, grants and recovery are in [result storage](mineru-result-storage.md). The
+v1 contract below is unchanged.
+
 The canonical codec is `application/contracts/mineru_capacity_config.py`. It
 accepts one closed, canonical UTF-8 JSON object with all sixteen fields supplied.
 Its software bounds describe supported input, not qualified machine capacity.

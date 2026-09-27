@@ -292,7 +292,7 @@ class FakeCninfoSource:
         self.calls.append((security, window))
         return self.refs
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+    def download_pdf_to(self, ref: AnnouncementRef, sink: object) -> object:
         raise AssertionError("P4 sync must not download PDFs")
 
 

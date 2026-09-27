@@ -21,7 +21,7 @@ from disclosure_anchor.application.contracts.provider_table_projection import (
     ProviderTablePartRef, UnboundProviderTablePart, UnboundTablePartReason,
 )
 from disclosure_anchor.application.contracts.provider_unit import (
-    PROVIDER_UNIT_BUILDER_VERSION, PROVIDER_UNIT_LOCATOR_VERSION,
+    CURRENT_PROVIDER_UNIT_LOCATOR_VERSIONS, PROVIDER_UNIT_BUILDER_VERSION,
     ProviderUnitApplicability, ProviderUnitBuildResult, ProviderUnitDraft,
     ProviderUnitPayloadKind, provider_unit_locator_from_payload,
     provider_unit_locator_to_payload,
@@ -123,7 +123,7 @@ def _unit_from_payload(value: object) -> ProviderUnitDraft:
     if type(payload) is not dict:
         raise ValueError("source Unit payload must be an object")
     locator = provider_unit_locator_from_payload(obj["locator"])
-    if locator.contract_version != PROVIDER_UNIT_LOCATOR_VERSION:
+    if locator.contract_version not in CURRENT_PROVIDER_UNIT_LOCATOR_VERSIONS:
         raise ValueError("source build requires the current Unit locator")
     unit = ProviderUnitDraft(
         unit_index=_index(obj["unit_index"]),

@@ -19,6 +19,7 @@ from disclosure_anchor.application.contracts.mineru_process_profile import (
 )
 from disclosure_anchor.cli.worker import worker_database_pool_budget
 from disclosure_anchor.settings import load_settings
+from tests.unit._codex_model_catalog_fixture import prepare_catalog_sha256
 from tests.unit.test_mineru_process_profile import _profile
 from tests.unit.test_settings import _env, _mineru_topology
 
@@ -69,6 +70,9 @@ class StagedWorkerV4RuntimeTests(unittest.TestCase):
             environment = {
                 **_env(root),
                 **_mineru_topology(),
+                "DISCLOSURE_SEMANTIC_CODEX_MODEL_CATALOG_SHA256": prepare_catalog_sha256(
+                    Path(_env(root)["DISCLOSURE_RUNTIME_ROOT"])
+                ),
                 "WORKER_PARSE_EXECUTION_MODE": "staged-v4",
                 "DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256": (
                     profile.runtime_bundle_identity_sha256

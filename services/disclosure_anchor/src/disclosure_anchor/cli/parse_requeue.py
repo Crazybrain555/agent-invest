@@ -1,9 +1,10 @@
 """Record one append-only decision that releases a failed parse run.
 
-Contract-class parse failures stay out of the queue until an operator states
-what was fixed. This command writes that decision; it never edits the failed
-run, never re-parses, and refuses anything it cannot prove from the stored
-failure. ``--dry-run`` evaluates every guardrail and writes nothing.
+Contract-class parse failures and managed expired-prepared closures
+(``original_key_lifetime``) stay out of the queue until an operator states what
+was fixed. This command writes that decision; it never edits the failed run,
+never re-parses, and refuses anything it cannot prove from the stored failure.
+``--dry-run`` evaluates every guardrail and writes nothing.
 
 The receipt reports three separate facts: whether the decision was recorded,
 whether the document is eligible for parse right now (asked of the queue's own

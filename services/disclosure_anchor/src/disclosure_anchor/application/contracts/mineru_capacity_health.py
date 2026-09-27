@@ -12,10 +12,15 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
     validate_mineru_task_admission,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig,
+    AnyMineruCapacityConfig,
+    MineruCapacityConfigV2,
     encode_mineru_capacity_config,
+    encode_mineru_capacity_config_v2,
 )
-from disclosure_anchor.application.contracts.mineru_process_profile import MineruProcessProfile
+from disclosure_anchor.application.contracts.mineru_process_profile import (
+    RESULT_STORAGE_PROCESS_PROFILE_CONTRACT,
+    MineruProcessProfile,
+)
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
@@ -43,14 +48,58 @@ def _uuid(value: object) -> None:
         raise ValueError("MinerU capacity observation UUID is invalid")
 
 
+def _encode_any(config: AnyMineruCapacityConfig) -> None:
+    if type(config) is MineruCapacityConfigV2:
+        encode_mineru_capacity_config_v2(config)
+    else:
+        encode_mineru_capacity_config(config)  # type: ignore[arg-type]
+
+
+def _validate_result_storage_observation(
+    value: object, *, config: MineruCapacityConfigV2,
+) -> None:
+    """The native storage ledger, checked against the bound physical policy."""
+    policy = config.result_storage
+    storage = _closed(value, {
+        "policy_sha256", "source_bytes", "ingress_bytes", "result_bytes", "growing_producers",
+        "outstanding_promise_bytes", "completion_queue_depth", "waiting_tasks", "blocked_tasks",
+    }, "result storage")
+    if storage["policy_sha256"] != policy.sha256:
+        raise ValueError("MinerU result storage observation is not bound to the expected policy")
+    source = _integer(storage["source_bytes"])
+    _integer(storage["ingress_bytes"], maximum=source)  # Ingress is part of the source charge.
+    result = _integer(storage["result_bytes"])
+    _integer(storage["growing_producers"], maximum=policy.native_growing_producer_limit)
+    _integer(storage["outstanding_promise_bytes"])
+    _integer(storage["completion_queue_depth"], maximum=config.total_nonterminal_limit)
+    waiting = _closed(storage["waiting_tasks"], {
+        "source_growth_capacity", "completion_capacity", "free_floor",
+    }, "result storage waits")
+    for count in waiting.values():
+        _integer(count, maximum=config.total_nonterminal_limit)
+    _integer(storage["blocked_tasks"], maximum=config.total_nonterminal_limit)
+    # The partition invariants every grant enforces: a violation is not a
+    # healthy runtime, whatever its HTTP status says.
+    if (
+        source > policy.native_source_pool_bytes
+        or source + result > policy.native_source_pool_bytes + policy.native_completion_escrow_bytes
+    ):
+        raise ValueError("MinerU result storage occupancy exceeds its physical partition")
+
+
 def validate_mineru_capacity_wire_health(
-    decoded: object, *, expected_capacity: MineruCapacityConfig,
+    decoded: object, *, expected_capacity: AnyMineruCapacityConfig,
     expected_task_retention_seconds: int = 600,
     expected_cleanup_interval_seconds: int = 30,
 ) -> MineruCapacityHealth:
-    """Retain all serving evidence and compare it with external input authority."""
-    encode_mineru_capacity_config(expected_capacity)
+    """Retain all serving evidence and compare it with external input authority.
+
+    A v2 capacity binds a storage-managed runtime: task runtime v4, registry v4,
+    observation v2 with the physical result-storage ledger, and no B/L limits.
+    """
+    _encode_any(expected_capacity)
     config = expected_capacity
+    storage_managed = type(config) is MineruCapacityConfigV2
     health = _closed(decoded, MINERU_API_HEALTH_FIELDS | {
         "task_protocol_schema", "task_protocol_runtime", "task_admission", "capacity_observation",
     }, "wire health")
@@ -70,15 +119,26 @@ def validate_mineru_capacity_wire_health(
         raise ValueError("MinerU capacity health differs from expected startup identity")
     if health["queued_tasks"] + health["processing_tasks"] > config.total_nonterminal_limit:
         raise ValueError("MinerU accepted responsibility exceeds configured P")
-    runtime_expected = {
-        "schema": "mineru-task-runtime.v3", "enabled": True,
-        "task_registry_max_records": 128,
-        "task_result_reservation_bytes": config.result_reservation_bytes,
-        "max_unacked_result_bytes": config.max_unacked_result_bytes,
-        "registry_schema": "mineru-task-registry.v3",
-        "admission_scope": "post_form_owned_upload",
-        "capacity_config_sha256": config.sha256,
-    }
+    runtime_expected: dict[str, object]
+    if isinstance(config, MineruCapacityConfigV2):
+        runtime_expected = {
+            "schema": "mineru-task-runtime.v4", "enabled": True,
+            "task_registry_max_records": 128,
+            "registry_schema": "mineru-task-registry.v4",
+            "admission_scope": "post_form_owned_upload",
+            "capacity_config_sha256": config.sha256,
+            "result_storage_policy_sha256": config.result_storage.sha256,
+        }
+    else:
+        runtime_expected = {
+            "schema": "mineru-task-runtime.v3", "enabled": True,
+            "task_registry_max_records": 128,
+            "task_result_reservation_bytes": config.result_reservation_bytes,
+            "max_unacked_result_bytes": config.max_unacked_result_bytes,
+            "registry_schema": "mineru-task-registry.v3",
+            "admission_scope": "post_form_owned_upload",
+            "capacity_config_sha256": config.sha256,
+        }
     runtime = _closed(health["task_protocol_runtime"], set(runtime_expected), "task runtime")
     if any(type(runtime[key]) is not type(value) or runtime[key] != value
            for key, value in runtime_expected.items()):
@@ -86,14 +146,19 @@ def validate_mineru_capacity_wire_health(
     validate_mineru_task_admission(
         health["task_admission"], queued_tasks=health["queued_tasks"],
         processing_tasks=health["processing_tasks"], nonterminal_limit=config.total_nonterminal_limit,
+        registry_schema=runtime_expected["registry_schema"],  # type: ignore[arg-type]
     )
     observation = _closed(health["capacity_observation"], {
         "schema", "capacity_config_sha256", "owner", "resolved_limits", "http_limiter_state",
         "stage_counters", "http_counters", "owner_control", "framework_limits", "observed_at",
+        *({"result_storage"} if storage_managed else ()),
     }, "serving observation")
-    if (observation["schema"] != "mineru.capacity-observation.v1"
+    if (observation["schema"] != (
+            "mineru.capacity-observation.v2" if storage_managed else "mineru.capacity-observation.v1")
             or observation["capacity_config_sha256"] != config.sha256):
         raise ValueError("MinerU capacity observation is not bound to the expected config")
+    if isinstance(config, MineruCapacityConfigV2):
+        _validate_result_storage_observation(observation["result_storage"], config=config)
     owner = _closed(observation["owner"], {
         "process_id", "process_start_ticks", "boot_id", "loop_epoch",
     }, "serving owner")
@@ -112,7 +177,8 @@ def validate_mineru_capacity_wire_health(
     _integer(observed_at["completed_ns"], minimum=started)
     limits = _closed(observation["resolved_limits"], {
         "parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit",
-        "result_reservation_bytes", "max_unacked_result_bytes", "final_http_limit_per_loop",
+        *(() if storage_managed else ("result_reservation_bytes", "max_unacked_result_bytes")),
+        "final_http_limit_per_loop",
     }, "resolved limits")
     for field in limits.keys() - {"final_http_limit_per_loop"}:
         if _integer(limits[field], minimum=1) != getattr(config, field):
@@ -129,6 +195,7 @@ def validate_mineru_capacity_wire_health(
         raise ValueError("MinerU HTTP limiter state is invalid")
     stages = _closed(observation["stage_counters"], {
         "result_capacity_waiting", "parse_waiting", "parse_active", "finalizer_waiting", "finalizer_active",
+        *(("source_growth_waiting", "completion_waiting") if storage_managed else ()),
     }, "stage counters")
     for value in stages.values():
         _integer(value, maximum=config.total_nonterminal_limit)
@@ -136,10 +203,16 @@ def validate_mineru_capacity_wire_health(
             or stages["finalizer_active"] > config.finalizer_active_limit):
         raise ValueError("MinerU actual stage owners exceed their capacities")
     admission = health["task_admission"]
+    # Storage waits hold no parse or finalizer slot: a permit wait is accepted
+    # pending work and a completion wait is sealed finalizing work.
+    permit_waiting = stages.get("source_growth_waiting", 0)
+    completion_waiting = stages.get("completion_waiting", 0)
     if (sum(stages.values()) > admission["durable_nonterminal_tasks"]
-            or stages["result_capacity_waiting"] + stages["parse_waiting"] > admission["accepted_pending_tasks"]
+            or stages["result_capacity_waiting"] + stages["parse_waiting"] + permit_waiting
+            > admission["accepted_pending_tasks"]
             or stages["parse_active"] > admission["accepted_processing_tasks"]
-            or stages["finalizer_waiting"] + stages["finalizer_active"] > admission["accepted_finalizing_tasks"]):
+            or stages["finalizer_waiting"] + stages["finalizer_active"] + completion_waiting
+            > admission["accepted_finalizing_tasks"]):
         raise ValueError("MinerU stage owners exceed the corresponding durable responsibility")
     http = _closed(observation["http_counters"], {"active_requests", "pending_requests"}, "HTTP counters")
     _integer(http["active_requests"], maximum=config.final_http_limit_per_loop)
@@ -180,7 +253,7 @@ def validate_mineru_capacity_wire_health(
 
 
 def parse_mineru_capacity_wire_health(
-    payload: bytes, *, expected_capacity: MineruCapacityConfig,
+    payload: bytes, *, expected_capacity: AnyMineruCapacityConfig,
     expected_task_retention_seconds: int = 600,
     expected_cleanup_interval_seconds: int = 30,
 ) -> MineruCapacityHealth:
@@ -211,12 +284,31 @@ PROFILE_CAPACITY_PROJECTION = (
 )
 
 
-def assert_profile_matches_capacity(profile: MineruProcessProfile, capacity: MineruCapacityConfig) -> None:
-    """Refuse a process profile that is not the projection of this exact capacity config."""
-    encode_mineru_capacity_config(capacity)
-    differing = sorted(
-        profile_field for profile_field, capacity_field in PROFILE_CAPACITY_PROJECTION
-        if getattr(profile, profile_field) != getattr(capacity, capacity_field)
-    )
+def assert_profile_matches_capacity(profile: MineruProcessProfile, capacity: AnyMineruCapacityConfig) -> None:
+    """Refuse a process profile that is not the projection of this exact capacity config.
+
+    A v2 capacity projects onto a v3 profile: B/L are absent and the profile
+    binds the exact result storage policy instead.
+    """
+    _encode_any(capacity)
+    if isinstance(capacity, MineruCapacityConfigV2):
+        projection = tuple(
+            item for item in PROFILE_CAPACITY_PROJECTION
+            if item[1] not in {"result_reservation_bytes", "max_unacked_result_bytes"}
+        )
+        differing = sorted(
+            profile_field for profile_field, capacity_field in projection
+            if getattr(profile, profile_field) != getattr(capacity, capacity_field)
+        )
+        if (
+            profile.contract_version != RESULT_STORAGE_PROCESS_PROFILE_CONTRACT
+            or profile.result_storage_policy_sha256 != capacity.result_storage.sha256
+        ):
+            differing.append("result_storage_policy_sha256")
+    else:
+        differing = sorted(
+            profile_field for profile_field, capacity_field in PROFILE_CAPACITY_PROJECTION
+            if getattr(profile, profile_field) != getattr(capacity, capacity_field)
+        )
     if differing:
         raise ValueError("process profile is not the projection of the capacity config: " + ", ".join(differing))

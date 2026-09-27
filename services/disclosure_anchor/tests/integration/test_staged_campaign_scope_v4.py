@@ -136,6 +136,53 @@ class StagedCampaignScopeV4IntegrationTests(unittest.TestCase):
         empty = carry_in.list_candidates(after_document_id=None, limit=2)
         self.assertEqual((empty.candidates, empty.has_more), ((), False))
 
+    def test_ordinary_pass_ceiling_is_scoped_and_bounds_every_page(self):
+        first = build_v4_authority_fixture()
+        prefix = "doc_zzc1_" + self.suffix + "_"
+        selected = [(prefix + "m" + str(i), m6.digest("ceiling-selected-" + str(i))) for i in range(5)]
+        arrival = (prefix + "n", m6.digest("ceiling-arrival"))
+        outside_high = (prefix + "z", m6.digest("ceiling-outside"))
+        self.ordinary_ids = [first.document_id, *(document for document, _ in (*selected, arrival, outside_high))]
+        insert = sa.text(
+            "INSERT INTO disclosure_core.document "
+            "(document_id,security_id,provider,provider_document_id,"
+            "raw_file_relpath,raw_file_hash,status) VALUES "
+            "(:document,:security,'cninfo',:provider_document,"
+            "'raw/c1-scratch.pdf',:source,'registered')"
+        )
+        with self.engine.begin() as connection:
+            security = persistence_fixture.StagedCoordinatorPersistenceV4IntegrationTests._insert_ingress_document(
+                connection, first,
+            )
+            for document, source in (*selected, outside_high):
+                connection.execute(insert, {"document": document, "security": security,
+                                            "provider_document": document, "source": source})
+        source = PostgresV4OrdinaryParseCandidateSource(
+            engine=self.engine, max_retries=3, scope_classes=None,
+            campaign_scope=campaign([*selected, arrival]),
+        )
+        # The member max, not the higher outsider; the member arriving next
+        # belongs to the following pass.
+        ceiling = source.latest_document_id()
+        with self.engine.begin() as connection:
+            connection.execute(insert, {"document": arrival[0], "security": security,
+                                        "provider_document": arrival[0], "source": arrival[1]})
+        observed = []
+        cursor = None
+        for length, more in ((2, True), (2, True), (1, False)):
+            page = source.list_candidates(after_document_id=cursor, through_document_id=ceiling, limit=2)
+            self.assertEqual((len(page.candidates), page.has_more), (length, more))
+            observed.extend((item.document_id, item.raw_file_hash) for item in page.candidates)
+            cursor = page.candidates[-1].document_id
+        self.assertEqual(ceiling, selected[-1][0])
+        self.assertEqual(observed, selected)
+        self.assertEqual(source.latest_document_id(), arrival[0])
+        carry_in = PostgresV4OrdinaryParseCandidateSource(
+            engine=self.engine, max_retries=3, scope_classes=None,
+            campaign_scope=campaign(selected, carry_in=True),
+        )
+        self.assertIsNone(carry_in.latest_document_id())
+
     def test_prepared_scope_filters_before_limit_and_does_not_claim(self):
         prefix = "rpa_c1_" + self.suffix + "_"
         outsiders = [build_v4_authority_fixture(attempt_id=prefix + "a" + str(i)) for i in range(3)]

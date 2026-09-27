@@ -18,7 +18,7 @@ from disclosure_anchor.application.contracts.capacity import (
 from disclosure_anchor.application.contracts.mineru_api_health import (
     parse_mineru_api_health,
 )
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
     GpuCollectionUnavailableError,
@@ -162,7 +162,7 @@ def _alias(
 
 def _api_values(
     payload: bytes, *, expected_task_slots: int | None = None,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
 ) -> ApiSampleValues:
     if expected_capacity is None:
         decoded = parse_mineru_api_health(
@@ -325,7 +325,7 @@ class MineruApiCapacitySampler:
 
     def __init__(
         self, *, url: str, timeout_seconds: float, task_slots: int | None = None,
-        expected_capacity: MineruCapacityConfig | None = None,
+        expected_capacity: AnyMineruCapacityConfig | None = None,
     ) -> None:
         if expected_capacity is not None and task_slots is not None:
             raise ValueError("explicit capacity cannot also use legacy task slots")

@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,6 +38,10 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
 from disclosure_anchor.adapters.parsers.pdf_text_observation import (
     observe_pdf_text_rectangles,
 )
+from disclosure_anchor.adapters.runtime.worker_stop_control import (
+    EXIT_PUBLIC_STOP,
+    require_worker_start_permitted,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
@@ -55,6 +60,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME,
     SEMANTIC_ROUTER_VERSION,
 )
+from disclosure_anchor.application.ports.worker_stop_control import WorkerOperationalStopError
 from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
@@ -322,6 +328,10 @@ def _replay_active_generation(
 
 def generate(*, source_revision: str) -> tuple[dict[str, object], dict[str, object]]:
     settings = load_settings()
+    # A manual semantic entrypoint composes the semantic runtime only while
+    # the worker start gate is runnable (no stop record, trusted root, and a
+    # known-enabled supervised label); there is no override flag.
+    require_worker_start_permitted(settings)
     repository_root = Path(__file__).resolve().parents[1]
     paths = FileStorePathBuilder(settings)
     artifacts = ArtifactStore(paths)
@@ -446,7 +456,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.evaluation_output.resolve() == args.receipt_output.resolve():
         raise ValueError("evaluation and receipt outputs must be distinct")
-    evaluation, receipt = generate(source_revision=args.source_revision)
+    try:
+        evaluation, receipt = generate(source_revision=args.source_revision)
+    except WorkerOperationalStopError as exc:
+        print(f"[FAIL] current-source replay: {exc}", file=sys.stderr)
+        return EXIT_PUBLIC_STOP
     evaluation_bytes = _canonical_json(evaluation)
     receipt["evaluation"] = {
         "path": str(args.evaluation_output.resolve()),

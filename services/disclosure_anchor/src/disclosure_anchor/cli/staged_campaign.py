@@ -38,7 +38,10 @@ from disclosure_anchor.adapters.runtime.m6_e2e_run import (
 )
 from disclosure_anchor.adapters.runtime.m6_owner_protocol import M6_CONTROL_EXCHANGE_TIMEOUT_NS
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import MinerUDeploymentChecker
-from disclosure_anchor.adapters.runtime.mineru_stream_activation import load_mineru_stream_activation
+from disclosure_anchor.adapters.runtime.mineru_stream_activation import (
+    load_mineru_stream_activation,
+    require_executable_stream_activation,
+)
 from disclosure_anchor.adapters.runtime.mineru_stream_worker import owned_mineru_stream_control
 from disclosure_anchor.adapters.runtime.stage_observation import (
     JsonlStageObserver, ProgressRecorder, mac_stage_clock_binding,
@@ -190,6 +193,10 @@ def run_campaign(
     )
     if activation is None:
         raise CampaignInputError("campaign requires an explicit stream activation")
+    try:
+        require_executable_stream_activation(activation)
+    except ValueError as exc:
+        raise CampaignInputError(str(exc)) from exc
     progress_hook = progress if progress is not None else (lambda _snapshot: None)
     committed_hook = publication_committed if publication_committed is not None else (lambda _replaced: None)
     lock_engine = sa.create_engine(_database_url(settings), poolclass=NullPool, isolation_level="AUTOCOMMIT")

@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
     AtomicPublicationRequestV4,
+    PublicationEnvelopeExceededError,
     decode_atomic_publication_request_v4,
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
@@ -56,6 +57,16 @@ _FILE_ROLES = {
 
 class AtomicPublicationArtifactReadinessError(ValueError):
     """Preparation/readiness bytes are not one closed publication bundle."""
+
+
+class PublicationArtifactEnvelopeExceededError(
+    AtomicPublicationArtifactReadinessError, PublicationEnvelopeExceededError,
+):
+    """A preparation or readiness record encodes larger than its fixed envelope.
+
+    The same capacity fact as an oversized request, found while encoding and
+    so before the first readiness write.
+    """
 
 
 class AtomicPublicationArtifactConflict(RuntimeError):
@@ -832,7 +843,9 @@ def _canonical_json(value: object, limit: int) -> bytes:
         raise AtomicPublicationArtifactReadinessError(
             "publication artifact JSON is invalid"
         ) from exc
-    if not 1 <= len(exact) <= limit:
+    if len(exact) > limit:
+        raise PublicationArtifactEnvelopeExceededError(byte_count=len(exact), limit=limit)
+    if not exact:
         raise AtomicPublicationArtifactReadinessError(
             "publication artifact JSON is outside its envelope"
         )
@@ -876,6 +889,7 @@ def _positive(value: int, label: str) -> None:
 
 
 __all__ = [
+    "PublicationArtifactEnvelopeExceededError",
     "ATOMIC_PUBLICATION_PREPARATION_FILENAME",
     "ATOMIC_PUBLICATION_PREPARATION_V1",
     "ATOMIC_PUBLICATION_READINESS_FILENAME",

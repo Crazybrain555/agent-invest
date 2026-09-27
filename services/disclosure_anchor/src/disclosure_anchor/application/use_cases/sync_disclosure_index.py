@@ -16,6 +16,9 @@ from disclosure_anchor.application.ports.disclosure_source import (
     SourceCompanyProfile,
     SourceSecurity,
 )
+from disclosure_anchor.application.contracts.historical_security_registration import (
+    INDEX_IDENTITY_CONTEXT_VERSION,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import (
     SubjectCandidate,
@@ -235,6 +238,7 @@ class SyncDisclosureIndex:
                 company_id=subject.company.company_id,
                 security_id=subject.security.security_id,
                 provider_org_id=profile.provider_org_id if profile else None,
+                profile_source_access_id=profile_access.source_access_id,
                 now=now,
             )
             checkpoint = self._upsert_checkpoint(
@@ -407,6 +411,7 @@ class SyncDisclosureIndex:
         company_id: str,
         security_id: str,
         provider_org_id: str | None,
+        profile_source_access_id: str,
         now: datetime,
     ) -> e.SourceAccess:
         candidates = [
@@ -423,6 +428,16 @@ class SyncDisclosureIndex:
         }
         if candidates:
             snapshot["raw_records"] = [dict(ref.raw_record) for ref in refs]
+            # Candidate ``provider_org_id`` keeps its original meaning: the
+            # query profile's org projected onto every candidate. The
+            # candidate's own provider org is ``candidate_provider_org_id``.
+            # Snapshots without this context are legacy profile-context only.
+            snapshot["identity_context"] = {
+                "version": INDEX_IDENTITY_CONTEXT_VERSION,
+                "query_profile_org_id": provider_org_id,
+                "query_profile_source_access_id": profile_source_access_id,
+                "candidate_org_source": "announcement_ref",
+            }
         return uow.source_accesses.add(
             e.SourceAccess(
                 source_access_id=ids.new_source_access_id(),
@@ -540,6 +555,7 @@ def _candidate_snapshot(
         "exchange": exchange,
         "security_name": ref.security_name,
         "provider_org_id": provider_org_id,
+        "candidate_provider_org_id": ref.provider_org_id,
         "object_id": ref.object_id,
         "rec_id": ref.rec_id,
         "file_signature_hint": {

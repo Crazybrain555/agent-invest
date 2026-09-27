@@ -13,6 +13,7 @@ from disclosure_anchor.adapters.runtime import staged_worker_v4 as builder
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.settings import Settings
 from tests._mineru_package_a_fixture import gate_fixture, private_json
+from tests.unit._codex_model_catalog_fixture import prepare_catalog_sha256
 
 
 class ExplicitStagedBuilderTests(unittest.TestCase):
@@ -54,6 +55,9 @@ class ExplicitStagedBuilderTests(unittest.TestCase):
                     settings.model_dump(),
                     disclosure_v4_secret_keyring_file=Path(
                         environment["DISCLOSURE_V4_SECRET_KEYRING_FILE"]
+                    ),
+                    disclosure_semantic_codex_model_catalog_sha256=prepare_catalog_sha256(
+                        settings.disclosure_runtime_root
                     ),
                 )
             )

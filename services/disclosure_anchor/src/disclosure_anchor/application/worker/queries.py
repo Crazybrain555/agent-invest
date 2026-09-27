@@ -681,6 +681,8 @@ def pending_parse(
     require_active_company_scope: bool = True,
     after_document_id: str | None = None,
     document_ids: tuple[str, ...] | None = None,
+    through_document_id: str | None = None,
+    descending: bool = False,
 ) -> list[dict[str, Any]]:
     """Documents awaiting parse, excluding non-retryable and exhausted ones.
 
@@ -694,6 +696,11 @@ def pending_parse(
     back to the registration filing_type. None → parse everything ('all').
     Current active-company admission is independent of that taxonomy scope;
     only a raw-identity-guarded frozen replay may explicitly bypass it.
+
+    ``after_document_id`` (exclusive) and ``through_document_id`` (inclusive)
+    bound one keyset window, and ``descending`` reverses its order; all apply
+    before ``LIMIT`` with this same predicate, so ``limit=1, descending=True``
+    reads the newest eligible document under an identical scope.
     """
 
     scope_sql = ""
@@ -723,6 +730,10 @@ def pending_parse(
     if after_document_id is not None:
         cursor_sql += " AND q.document_id > :after_document_id"
         params["after_document_id"] = after_document_id
+    if through_document_id is not None:
+        cursor_sql += " AND q.document_id <= :through_document_id"
+        params["through_document_id"] = through_document_id
+    order_sql = "q.document_id DESC" if descending else "q.document_id"
     rows = conn.execute(
         text(
             f"""
@@ -744,7 +755,7 @@ def pending_parse(
                {company_scope_sql}
                {scope_sql}
                {cursor_sql}
-             ORDER BY q.document_id
+             ORDER BY {order_sql}
              LIMIT :limit
             """
         ),
@@ -1199,31 +1210,67 @@ def degraded_build_count(conn: Connection, *, active_only: bool = False) -> int:
 
 
 def download_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
-    """Distinct candidates permanently out of the download queue: a terminal
-    (retryable=false) failure or an exhausted retry budget. Same expressions
-    the 0023 view/queries use — single definition lives here (08 §1)."""
+    """Distinct candidates permanently out of the download queue: an
+    unresolved terminal (retryable=false) failure or an exhausted retry
+    budget. Reads ops.download_failure_resolution_v1, the same facts the
+    pending view, legacy pending path and doctor use (08 §1); a failure
+    resolved by a retained registration no longer counts, every failed
+    attempt still counts toward the budget."""
 
     return int(
         conn.execute(
             text(
                 f"""
                 SELECT count(*) FROM (
-                    SELECT f.query_params->>'provider_document_id' AS pid
-                      FROM {CORE_SCHEMA}.source_access f
-                     WHERE f.provider = 'cninfo'
-                       AND f.provider_interface = 'cninfo:download_pdf'
-                       AND f.status = 'failed'
+                    SELECT f.provider_document_id
+                      FROM {OPS_SCHEMA}.download_failure_resolution_v1 f
                      GROUP BY 1
                     HAVING count(*) >= :max_retries
                         OR bool_or(
-                            f.error IS NOT NULL
-                            AND (f.error)::jsonb->>'retryable' = 'false')
+                            f.nonretryable
+                            AND f.resolved_by_source_access_id IS NULL)
                 ) dead
                 """
             ),
             {"max_retries": max_retries},
         ).scalar_one()
     )
+
+
+def download_failure_resolution_summary(
+    conn: Connection, *, max_retries: int
+) -> dict[str, int]:
+    """Failure history next to its current effect, for doctor.
+
+    Resolution never deletes history: the non-retryable total stays, the
+    resolved part is the retained registrations that still match their
+    Document, and the dead-letter count is what still blocks acquisition.
+    """
+
+    row = conn.execute(
+        text(
+            f"""
+            SELECT count(*) FILTER (WHERE f.nonretryable) AS nonretryable,
+                   count(*) FILTER (
+                       WHERE f.nonretryable
+                         AND f.resolved_by_source_access_id IS NOT NULL
+                   ) AS resolved,
+                   count(*) FILTER (
+                       WHERE f.nonretryable
+                         AND f.resolved_by_source_access_id IS NULL
+                   ) AS unresolved
+              FROM {OPS_SCHEMA}.download_failure_resolution_v1 f
+            """
+        )
+    ).mappings().one()
+    return {
+        "nonretryable_failures": int(row["nonretryable"] or 0),
+        "resolved_failures": int(row["resolved"] or 0),
+        "unresolved_failures": int(row["unresolved"] or 0),
+        "dead_letter_candidates": download_dead_letter_count(
+            conn, max_retries=max_retries
+        ),
+    }
 
 
 def parse_dead_letter_count(conn: Connection, *, max_retries: int) -> int:

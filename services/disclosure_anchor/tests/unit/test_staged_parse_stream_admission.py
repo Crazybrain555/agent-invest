@@ -15,16 +15,37 @@ from disclosure_anchor.application.services.staged_parse_coordinator import (
     StageLeaseGuard,
     StagedParseCoordinator,
 )
-from tests.unit.test_mineru_stream_policy import GIB, Pressure, config, sample
+from tests.unit.test_mineru_stream_policy import GIB, Pressure, config, sample, warm
 from tests.unit.test_staged_parse_coordinator import _Backend, _limits, _work
 
 
 def control(pressure: Pressure, maximum: int = 2) -> StreamAdmissionControl:
+    """A cold control: its first sample starts a recovery window at target 0."""
+
     return StreamAdmissionControl(
         MineruStreamPolicy(config(qualified_max=maximum)),
         pressure,
         monotonic=lambda: 10,
     )
+
+
+def warmed(maximum: int = 2) -> tuple[StreamAdmissionControl, Pressure, list[int]]:
+    """A control already holding ``maximum`` after continuous healthy windows.
+
+    The returned pressure holds the last healthy sample at the frozen clock;
+    ``following`` yields the next sequence for a replacement sample.
+    """
+
+    policy = MineruStreamPolicy(config(qualified_max=maximum))
+    end, sequence = warm(policy, maximum)
+    pressure = Pressure(sample(sequence, end))
+    following = [sequence, int(end)]
+    return StreamAdmissionControl(policy, pressure, monotonic=lambda: end), pressure, following
+
+
+def successor(following: list[int], **changes: object):
+    following[0] += 1
+    return sample(following[0], following[1], **changes)
 
 
 class _HeldPreflightBackend(_Backend):
@@ -79,10 +100,11 @@ class StagedParseStreamAdmissionTests(unittest.TestCase):
             if snapshot.stream_actual == 2 and backend.preflight_entered:
                 filled.set()
 
+        held, _pressure, _following = warmed()
         thread, results, errors = self.start(StagedParseCoordinator(
             backend=backend,
             limits=_limits(preflight_workers=4),
-            stream_control=control(Pressure(sample(1, 10))),
+            stream_control=held,
             progress=progress,
         ))
         try:
@@ -106,7 +128,7 @@ class StagedParseStreamAdmissionTests(unittest.TestCase):
             _work("attempt-d-tail", "ack_pending", 7),
         ))
         backend.block_remote = True
-        pressure = Pressure(sample(1, 10))
+        held, pressure, following = warmed()
         snapshots: list[CoordinatorSnapshot] = []
         two_held = threading.Event()
         reduced_and_tail_done = threading.Event()
@@ -120,15 +142,18 @@ class StagedParseStreamAdmissionTests(unittest.TestCase):
 
         thread, results, errors = self.start(StagedParseCoordinator(
             backend=backend, limits=_limits(),
-            stream_control=control(pressure), progress=progress,
+            stream_control=held, progress=progress,
         ))
         try:
             self.assertTrue(two_held.wait(2), errors)
-            pressure.value = sample(2, 10, gpu_free_bytes=GIB-1)
+            pressure.value = successor(following, gpu_free_bytes=GIB-1)
             self.assertTrue(reduced_and_tail_done.wait(2), errors)
             self.assertNotIn("preflight:attempt-c-prepared", backend.calls)
             self.assertIn("ack:attempt-d-tail:ack_pending", backend.calls)
             self.assertTrue(any(s.stream_target == 1 and s.stream_actual == 2 for s in snapshots))
+            # Reduction closes new POSTs; a fresh clear sample re-opens them
+            # within the held reduced target once the accepted waits drain.
+            pressure.value = successor(following)
         finally:
             backend.remote_release.set()
             thread.join(3)

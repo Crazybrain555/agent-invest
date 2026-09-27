@@ -20,8 +20,8 @@ from disclosure_anchor.application.contracts.diagnostic_json import (
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.contracts.provider_source_semantics import (
-    ProviderSourceSemantics, SourcePdfObservation, SourcePdfTextObservation,
-    SourceQualityFinding, SourceTextReconciliation,
+    ProviderSourceSemantics, ProviderTextSubstitution, SourcePdfObservation,
+    SourcePdfTextObservation, SourceQualityFinding, SourceTextReconciliation,
 )
 from disclosure_anchor.application.services.provider_source_semantics import (
     derive_source_semantics,
@@ -50,13 +50,19 @@ class UntrustedSourceSemanticCandidate(_SourceSemanticData):
 
 @dataclass(frozen=True, slots=True)
 class DecodedSourceSemanticRecord(_SourceSemanticData):
-    """Purely rederived and bound claims; no measured-read or IO capability."""
+    """Purely rederived and bound claims; no measured-read or IO capability.
+
+    U+0000 markers are a pure function of the recorded provider document, so
+    the record stores no claim for them; decoding always rederives them.
+    """
+
+    text_substitutions: tuple[ProviderTextSubstitution, ...] = ()
 
     @property
     def semantics(self) -> ProviderSourceSemantics:
         return ProviderSourceSemantics(
             self.provider_document, self.source_text_reconciliations,
-            self.source_quality_findings,
+            self.source_quality_findings, self.text_substitutions,
         )
 
 
@@ -161,7 +167,7 @@ def decode_source_semantic_record(
     return DecodedSourceSemanticRecord(
         source, candidate.target_identity, document, candidate.native_observations,
         derived.source_text_reconciliations, derived.source_quality_findings,
-        candidate.record_sha256,
+        candidate.record_sha256, derived.text_substitutions,
     )
 
 

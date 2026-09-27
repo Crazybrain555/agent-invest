@@ -13,6 +13,9 @@ from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
     submission_form_v2,
     submission_request_exact_bytes_v2,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruResultStoragePolicy,
+)
 from disclosure_anchor.application.contracts.mineru_process_profile import (
     MineruProcessProfile,
     encode_mineru_process_profile,
@@ -68,6 +71,7 @@ class MinerUV4InitialIngressFactory:
         archive_uncompressed_byte_limit: int,
         max_retries: int,
         scope_classes: tuple[str, ...] | None,
+        storage_policy: MineruResultStoragePolicy | None = None,
         utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
         attempt_id_factory: Callable[[], str] = lambda: ids.new_id("rpa"),
         fence_id_factory: Callable[[], str] = lambda: ids.new_id("fence"),
@@ -116,8 +120,9 @@ class MinerUV4InitialIngressFactory:
         self._process_profile = process_profile
         self._process_profile_exact_bytes = process_profile_exact_bytes
         self._worker_profile = worker_profile
+        self._storage_policy = storage_policy
         self._coordinator_capacity = staged_v4_coordinator_limits(
-            process_profile, worker_profile=worker_profile,
+            process_profile, worker_profile=worker_profile, storage_policy=storage_policy,
         ).credits
         self._result_lease_seconds = result_lease_seconds
         self._remote_runaway_seconds = remote_runaway_seconds
@@ -211,18 +216,28 @@ class MinerUV4InitialIngressFactory:
             source_pdf_sha256=observed.sha256,
             source_byte_count=observed.byte_count,
             source_page_count=observed.page_count,
+            storage_policy=self._storage_policy,
         )
         self._require_capacity(credit.reservation, available_credits=available_credits)
         # The configured archive ceilings are process-wide maxima.  Freeze the
         # exact per-attempt ceilings inside the execution spec so a small
         # document cannot later authorize extraction beyond its own durable
-        # output/temporary-disk reservation.
-        archive_member_count_limit = self._archive_member_count_limit
-        archive_uncompressed_byte_limit = min(
-            self._archive_uncompressed_byte_limit,
-            credit.reservation.temp_disk_bytes,
-            credit.reservation.output_bytes,
-        )
+        # output/temporary-disk reservation. A storage-bound attempt's
+        # reservation is only an estimate: its ceilings are the bound policy's
+        # maxima, and its actual archive is sized by the stage grant.
+        policy = self._storage_policy
+        if policy is None:
+            archive_member_count_limit = self._archive_member_count_limit
+            archive_uncompressed_byte_limit = min(
+                self._archive_uncompressed_byte_limit,
+                credit.reservation.temp_disk_bytes,
+                credit.reservation.output_bytes,
+            )
+        else:
+            archive_member_count_limit = min(self._archive_member_count_limit, policy.max_members)
+            archive_uncompressed_byte_limit = min(
+                self._archive_uncompressed_byte_limit, policy.native_source_single_limit_bytes,
+            )
 
         started_at = self._utc_now()
         if (

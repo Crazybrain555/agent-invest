@@ -16,10 +16,12 @@ from typing import Any
 import yaml
 
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig,
+    AnyMineruCapacityConfig,
+    MineruCapacityConfigV2,
     capacity_environment,
     capacity_http_arguments,
     encode_mineru_capacity_config,
+    encode_mineru_capacity_config_v2,
 )
 from disclosure_anchor.application.contracts.mineru_deployment_profile import MineruDeploymentProfile
 from disclosure_anchor.application.contracts.mineru_local_worker_profile import MineruLocalWorkerProfile
@@ -83,7 +85,7 @@ class ReleasePlan:
     local_profile_admits_full_pending: bool
 
 
-def require_current_runtime_capabilities(capacity: MineruCapacityConfig) -> None:
+def require_current_runtime_capabilities(capacity: AnyMineruCapacityConfig) -> None:
     """Reject capacity requests the current patched runtime cannot honour.
 
     The codec admits a wider envelope than the deployed patch set supports:
@@ -91,7 +93,10 @@ def require_current_runtime_capabilities(capacity: MineruCapacityConfig) -> None
     the only qualified topology.
     """
 
-    encode_mineru_capacity_config(capacity)
+    if isinstance(capacity, MineruCapacityConfigV2):
+        encode_mineru_capacity_config_v2(capacity)
+    else:
+        encode_mineru_capacity_config(capacity)
     if capacity.processing_window_size != CURRENT_RUNTIME_PROCESSING_WINDOW_SIZE:
         raise ValueError(
             f"current runtime supports processing_window_size {CURRENT_RUNTIME_PROCESSING_WINDOW_SIZE} only"
@@ -100,11 +105,11 @@ def require_current_runtime_capabilities(capacity: MineruCapacityConfig) -> None
         raise ValueError("current runtime supports one API process and one event loop only")
 
 
-def api_command_argv(capacity: MineruCapacityConfig) -> tuple[str, ...]:
+def api_command_argv(capacity: AnyMineruCapacityConfig) -> tuple[str, ...]:
     return API_FIXED_ARGV + capacity_http_arguments(capacity)
 
 
-def compose_document(profile: MineruDeploymentProfile, capacity: MineruCapacityConfig) -> dict[str, Any]:
+def compose_document(profile: MineruDeploymentProfile, capacity: AnyMineruCapacityConfig) -> dict[str, Any]:
     """Structured Compose with every capacity consumer projected once."""
 
     profile.__post_init__()
@@ -344,7 +349,7 @@ def parse_compose_yaml(payload: bytes) -> dict[str, Any]:
 
 
 def verify_compose_projection(
-    document: dict[str, Any], capacity: MineruCapacityConfig, profile: MineruDeploymentProfile,
+    document: dict[str, Any], capacity: AnyMineruCapacityConfig, profile: MineruDeploymentProfile,
 ) -> list[str]:
     """Return every mismatch between a parsed Compose and the exact projection."""
 
@@ -374,7 +379,7 @@ def verify_compose_projection(
 
 
 def resolve_release(
-    capacity: MineruCapacityConfig,
+    capacity: AnyMineruCapacityConfig,
     deployment_profile: MineruDeploymentProfile,
     local_profile: MineruLocalWorkerProfile,
 ) -> ReleasePlan:
@@ -390,7 +395,9 @@ def resolve_release(
     # The Mac process-profile contract requires every admitted pending task to
     # hold a full reservation within the retained-result budget; the API
     # registry itself only backpressures. Report the difference; never hide it.
-    admits_full_pending = (
+    # A v2 capacity has no per-task B: its codec already proved that every
+    # admitted upload plus the producers' growth permits fit the source pool.
+    admits_full_pending = isinstance(capacity, MineruCapacityConfigV2) or (
         capacity.result_reservation_bytes * capacity.total_nonterminal_limit <= capacity.max_unacked_result_bytes
     )
     return ReleasePlan(

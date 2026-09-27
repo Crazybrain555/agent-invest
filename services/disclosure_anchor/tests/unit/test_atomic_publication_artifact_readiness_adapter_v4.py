@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
 import json
 from pathlib import Path
 import tempfile
 from threading import Event
 import unittest
+from unittest import mock
 
 from disclosure_anchor.adapters.storage.atomic_publication_artifact_readiness_v4 import (
     FilesystemAtomicPublicationArtifactReadinessV4,
@@ -13,10 +15,17 @@ from disclosure_anchor.adapters.storage.atomic_publication_artifact_readiness_v4
 from disclosure_anchor.adapters.storage.immutable_artifact_store import (
     ImmutableArtifactStore,
 )
+from disclosure_anchor.application.contracts import (
+    atomic_publication_artifact_readiness_v4 as readiness_contract,
+)
+from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
+    PublicationEnvelopeExceededError,
+)
 from disclosure_anchor.application.contracts.atomic_publication_artifact_readiness_v4 import (
     ATOMIC_PUBLICATION_PREPARATION_FILENAME,
     ATOMIC_PUBLICATION_READINESS_FILENAME,
     AtomicPublicationArtifactConflict,
+    PublicationArtifactEnvelopeExceededError,
 )
 from disclosure_anchor.application.ports.file_store import ArtifactWriteResult
 from disclosure_anchor.application.services.staged_parse_coordinator import StageLeaseGuard, StageLeaseLost
@@ -244,6 +253,58 @@ class AtomicPublicationArtifactReadinessAdapterV4Tests(unittest.TestCase):
                     request=self.request,
                     artifacts_ready=replay_witness,
                 )
+
+    def test_envelope_refusal_precedes_every_write_and_replay_promises_no_present_file(self) -> None:
+        promised: list[tuple[str, int]] = []
+
+        class _Space:
+            @contextmanager
+            def publication_write_space(self, *, attempt_id: str, byte_count: int):  # type: ignore[no-untyped-def]
+                promised.append((attempt_id, byte_count))
+                yield
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            paths = _Paths(root)
+            store = _RecordingStore(ImmutableArtifactStore(paths))  # type: ignore[arg-type]
+            events: list[str] = []
+            adapter = FilesystemAtomicPublicationArtifactReadinessV4(
+                paths=paths,  # type: ignore[arg-type]
+                immutable_store=store,
+                output_promotion=_Promotion(events),  # type: ignore[arg-type]
+                write_space=_Space(),
+            )
+            arguments = dict(
+                request=self.request, checkpoint=self.checkpoint, materialized=self.materialized,
+                claim=self.claim, claim_guard=_Guard(), stage_guard=self.stage_guard,
+            )
+            # Every private record is encoded before the first write, so a
+            # record outside its envelope is a capacity fact with no effect.
+            with (
+                mock.patch.object(readiness_contract, "_MAX_READINESS_BYTES", 16),
+                self.assertRaises(PublicationArtifactEnvelopeExceededError) as refused,
+            ):
+                adapter.prepare_or_replay(**arguments)  # type: ignore[arg-type]
+            self.assertIsInstance(refused.exception, PublicationEnvelopeExceededError)
+            self.assertEqual((store.created, events, promised), ([], [], []))
+
+            reference = adapter.prepare_or_replay(**arguments)  # type: ignore[arg-type]
+            witness = adapter.verify_ready(reference=reference, expected_request=self.request)
+            preparation_relpath, readiness_relpath = adapter._authority_paths(self.request)
+            written = sum(
+                (root / relpath).stat().st_size
+                for relpath in (
+                    preparation_relpath,
+                    Path(witness.preparation.provider_document_plan.relpath),
+                    Path(witness.preparation.document_unit_snapshot_plan.relpath),
+                    Path(witness.preparation.semantic_route_receipts_plan.relpath),
+                    readiness_relpath,
+                )
+            )
+            self.assertEqual(promised, [(self.request.identity.attempt_id, written)])
+            # Replaying verifies present files and never promises them again.
+            self.assertEqual(adapter.prepare_or_replay(**arguments), reference)  # type: ignore[arg-type]
+            self.assertEqual(promised[-1], (self.request.identity.attempt_id, 0))
 
     def test_resource_drift_and_different_request_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

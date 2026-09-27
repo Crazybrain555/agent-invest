@@ -20,8 +20,12 @@ from urllib.parse import SplitResult, quote, urljoin, urlsplit
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.remote_provider_v4 import (
+    NATIVE_STORAGE_HOLD_REASONS,
     PROVIDER_FAILURE_CAUSE_V1,
+    STORAGE_HOLD_DECISION_SCHEMA,
+    STORAGE_HOLD_TERMINATED_CAUSE_CODE,
     RemoteProviderFailureCauseV4,
+    StorageHoldDecisionV1,
 )
 
 TASK_PROTOCOL_V2 = "mineru-task-protocol.v2"
@@ -29,6 +33,7 @@ RETAINED_RESULT_V1 = "mineru-retained-result.v1"
 STAGED_REQUEST_V2 = "mineru-staged-request.v2"
 TASK_LOOKUP_REQUEST_V1 = "mineru-task-lookup-request.v1"
 TASK_FAILURE_CAUSE_V1 = PROVIDER_FAILURE_CAUSE_V1
+TASK_STORAGE_STATUS_V1 = "mineru.task-storage-status.v1"
 MAX_WIRE_JSON_BYTES = 1024 * 1024
 
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -92,10 +97,94 @@ TASK_PAYLOAD_FIELDS_V2 = frozenset(
 TASK_FAILURE_CAUSE_FIELDS_V1 = frozenset(
     {"schema", "task_id", "retry_class", "code", "http_status", "transport_error"}
 )
+_STORAGE_HOLD_DECISION_FIELDS = frozenset({"schema", "preview_sha256", "decided_by", "reason", "fixed_by"})
 
 
 class MinerUProtocolV2WireError(ValueError):
     """A request or response escaped the closed task-protocol-v2 envelope."""
+
+
+_STORAGE_STATUS_FIELDS = frozenset(
+    {
+        "schema", "policy_sha256", "phase", "wait_reason", "wait_since_unix", "blocked",
+        "selected_bytes", "member_count", "inventory_sha256", "zip_bytes",
+    }
+)
+_STORAGE_BLOCKED_REASONS = NATIVE_STORAGE_HOLD_REASONS
+_STORAGE_WAIT_REASONS = frozenset(
+    {"source_growth_capacity", "completion_capacity", "free_floor"}
+) | _STORAGE_BLOCKED_REASONS
+# Native protocol state -> the storage phases it may carry.
+_STORAGE_PHASES_BY_PROTOCOL_STATE = {
+    "pending": frozenset({"admitted", "source_growing"}),
+    "processing": frozenset({"source_growing"}),
+    "finalizing": frozenset({"source_sealed", "zip_writing"}),
+    "completed": frozenset({"zip_sealed"}),
+    "failed": frozenset(
+        {"admitted", "source_growing", "source_sealed", "zip_writing", "zip_sealed"}
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class TaskStorageStatusV1:
+    """A storage-managed runtime's closed per-task storage envelope."""
+
+    policy_sha256: str
+    phase: str
+    wait_reason: str | None
+    wait_since_unix: float | None
+    blocked: bool
+    selected_bytes: int
+    member_count: int
+    inventory_sha256: str | None
+    zip_bytes: int
+
+
+def _decode_task_storage_status_v2(
+    value: object, *, protocol_state: str, expected_policy_sha256: str,
+) -> TaskStorageStatusV1:
+    if type(value) is not dict or set(value) != _STORAGE_STATUS_FIELDS:
+        raise MinerUProtocolV2WireError("task storage envelope fields are not closed")
+    if value["schema"] != TASK_STORAGE_STATUS_V1 or value["policy_sha256"] != expected_policy_sha256:
+        raise MinerUProtocolV2WireError("task storage envelope is not bound to the expected policy")
+    phase = value["phase"]
+    if phase not in _STORAGE_PHASES_BY_PROTOCOL_STATE.get(protocol_state, frozenset()):
+        raise MinerUProtocolV2WireError("task storage phase contradicts the task state")
+    reason = value["wait_reason"]
+    since = value["wait_since_unix"]
+    if (reason is None) != (since is None) or (
+        reason is not None and (type(reason) is not str or reason not in _STORAGE_WAIT_REASONS)
+    ):
+        raise MinerUProtocolV2WireError("task storage wait reason is invalid")
+    if since is not None and (
+        isinstance(since, bool) or not isinstance(since, (int, float))
+        or not isfinite(float(since)) or since < 0
+    ):
+        raise MinerUProtocolV2WireError("task storage wait time is invalid")
+    blocked = value["blocked"]
+    if type(blocked) is not bool or blocked != (reason in _STORAGE_BLOCKED_REASONS):
+        raise MinerUProtocolV2WireError("task storage block flag contradicts its reason")
+    if blocked and protocol_state not in {"processing", "finalizing"}:
+        raise MinerUProtocolV2WireError("task storage hold belongs to in-flight work")
+    counts = {name: value[name] for name in ("selected_bytes", "member_count", "zip_bytes")}
+    if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in counts.values()):
+        raise MinerUProtocolV2WireError("task storage counts are invalid")
+    inventory = value["inventory_sha256"]
+    sealed = phase in {"source_sealed", "zip_writing", "zip_sealed"}
+    if sealed:
+        if type(inventory) is not str or _SHA256.fullmatch(inventory) is None or counts["member_count"] < 1:
+            raise MinerUProtocolV2WireError("sealed task storage lacks its inventory facts")
+    elif inventory is not None or counts["member_count"] or counts["selected_bytes"]:
+        raise MinerUProtocolV2WireError("unsealed task storage carries sealed facts")
+    if (phase == "zip_sealed") != (counts["zip_bytes"] > 0):
+        raise MinerUProtocolV2WireError("task storage ZIP extent escaped its phase")
+    return TaskStorageStatusV1(
+        policy_sha256=value["policy_sha256"], phase=phase, wait_reason=reason,
+        wait_since_unix=None if since is None else float(since), blocked=blocked,
+        selected_bytes=counts["selected_bytes"], member_count=counts["member_count"],
+        inventory_sha256=inventory, zip_bytes=counts["zip_bytes"],
+    )
 
 
 class MinerUResultLeaseExpiredV2(MinerUProtocolV2WireError):
@@ -116,6 +205,7 @@ class TaskProtocolV2Observation:
     artifact_byte_count: int | None
     artifact_owner_identity: str | None
     provider_error: str | None
+    storage: TaskStorageStatusV1 | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -383,6 +473,7 @@ def parse_task_payload_v2(
     expected_status_url: str | None = None,
     expected_result_url: str | None = None,
     artifact_byte_limit: int | None = None,
+    storage_policy_sha256: str | None = None,
 ) -> TaskProtocolV2Observation:
     observation, _failure_cause = parse_task_payload_with_failure_cause_v2(
         exact_bytes,
@@ -394,6 +485,7 @@ def parse_task_payload_v2(
         expected_status_url=expected_status_url,
         expected_result_url=expected_result_url,
         artifact_byte_limit=artifact_byte_limit,
+        storage_policy_sha256=storage_policy_sha256,
     )
     return observation
 
@@ -409,8 +501,18 @@ def parse_task_payload_with_failure_cause_v2(
     expected_status_url: str | None = None,
     expected_result_url: str | None = None,
     artifact_byte_limit: int | None = None,
+    storage_policy_sha256: str | None = None,
 ) -> tuple[TaskProtocolV2Observation, RemoteProviderFailureCauseV4 | None]:
-    """Parse one closed status payload and the typed cause of a failed task."""
+    """Parse one closed status payload and the typed cause of a failed task.
+
+    ``storage_policy_sha256`` names the result storage policy of a bound
+    storage-managed runtime: its closed ``storage`` envelope is then required
+    and verified; otherwise the field stays outside the closed payload.
+    """
+    if storage_policy_sha256 is not None and (
+        type(storage_policy_sha256) is not str or _SHA256.fullmatch(storage_policy_sha256) is None
+    ):
+        raise MinerUProtocolV2WireError("expected storage policy identity is invalid")
     payload = decode_closed_json_v2(
         exact_bytes,
         required=frozenset(
@@ -424,9 +526,13 @@ def parse_task_payload_with_failure_cause_v2(
                 "attempt_identity",
                 "fence_identity",
                 "protocol_state",
+                *(("storage",) if storage_policy_sha256 is not None else ()),
             }
         ),
-        allowed=TASK_PAYLOAD_FIELDS_V2,
+        allowed=(
+            TASK_PAYLOAD_FIELDS_V2 | {"storage"} if storage_policy_sha256 is not None
+            else TASK_PAYLOAD_FIELDS_V2
+        ),
     )
     expected = {
         "task_protocol_schema": TASK_PROTOCOL_V2,
@@ -544,6 +650,14 @@ def parse_task_payload_with_failure_cause_v2(
             response_sha256=response_sha256,
             response_byte_count=response_byte_count,
         )
+    storage: TaskStorageStatusV1 | None = None
+    if storage_policy_sha256 is not None:
+        storage = _decode_task_storage_status_v2(
+            payload["storage"], protocol_state=protocol_state,
+            expected_policy_sha256=storage_policy_sha256,
+        )
+        if status == "completed" and storage.zip_bytes != artifact_byte_count:
+            raise MinerUProtocolV2WireError("retained result extent differs from its storage envelope")
     observation = TaskProtocolV2Observation(
         task_id=task_id,
         status=status,
@@ -557,6 +671,7 @@ def parse_task_payload_with_failure_cause_v2(
         artifact_byte_count=artifact_byte_count,
         artifact_owner_identity=artifact_owner,
         provider_error=error,
+        storage=storage,
     )
     return observation, failure_cause
 
@@ -569,10 +684,24 @@ def decode_task_failure_cause_v2(
     response_byte_count: int,
 ) -> RemoteProviderFailureCauseV4:
     """Accept only the closed cause bound to its task and exact status response."""
-    if type(value) is not dict or set(value) != TASK_FAILURE_CAUSE_FIELDS_V1:
+    held = type(value) is dict and value.get("code") == STORAGE_HOLD_TERMINATED_CAUSE_CODE
+    if type(value) is not dict or set(value) != (
+        TASK_FAILURE_CAUSE_FIELDS_V1 | {"hold_reason", "decision_sha256", "decision"}
+        if held
+        else TASK_FAILURE_CAUSE_FIELDS_V1
+    ):
         raise MinerUProtocolV2WireError("task failure cause fields are not closed")
     if value["task_id"] != task_id:
         raise MinerUProtocolV2WireError("task failure cause identity drifted")
+    decision: dict[str, Any] | None = None
+    if held:
+        raw_decision = value["decision"]
+        if (
+            type(raw_decision) is not dict or set(raw_decision) != _STORAGE_HOLD_DECISION_FIELDS
+            or raw_decision["schema"] != STORAGE_HOLD_DECISION_SCHEMA
+        ):
+            raise MinerUProtocolV2WireError("task failure cause hold decision is not closed")
+        decision = raw_decision
     try:
         return RemoteProviderFailureCauseV4(
             remote_task_identity=value["task_id"],
@@ -583,6 +712,12 @@ def decode_task_failure_cause_v2(
             http_status=value["http_status"],
             transport_error=value["transport_error"],
             schema=value["schema"],
+            hold_reason=value.get("hold_reason"),
+            decision_sha256=value.get("decision_sha256"),
+            decision=None if decision is None else StorageHoldDecisionV1(
+                preview_sha256=decision["preview_sha256"], decided_by=decision["decided_by"],
+                reason=decision["reason"], fixed_by=decision["fixed_by"],
+            ),
         )
     except ValueError as exc:
         raise MinerUProtocolV2WireError(
@@ -724,6 +859,8 @@ __all__ = [
     "TASK_FAILURE_CAUSE_V1",
     "TASK_LOOKUP_REQUEST_V1",
     "TASK_PAYLOAD_FIELDS_V2",
+    "TASK_STORAGE_STATUS_V1",
+    "TaskStorageStatusV1",
     "TASK_PROTOCOL_V2",
     "TaskProtocolV2Observation",
     "api_origin_from_task_routes_v2",

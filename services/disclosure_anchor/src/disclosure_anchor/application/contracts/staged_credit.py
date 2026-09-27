@@ -12,6 +12,7 @@ from typing import Literal
 
 from disclosure_anchor.application.contracts.mineru_process_profile import (
     MineruProcessProfile,
+    legacy_result_budgets,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
@@ -507,11 +508,10 @@ def build_staged_credit_envelope(
     if selected is None:
         raise ValueError("source facts do not fit a staged credit bucket")
     bucket, numerator, denominator, result_multiplier, temp_multiplier = selected
-    retained_global_cap = min(
-        profile.terminal_output_bytes_limit, profile.max_unacked_result_bytes
-    )
+    reservation_bytes, unacked_bytes = legacy_result_budgets(profile)
+    retained_global_cap = min(profile.terminal_output_bytes_limit, unacked_bytes)
     retained_cap = _capped_mul(
-        profile.result_reservation_bytes,
+        reservation_bytes,
         result_multiplier,
         retained_global_cap,
     )

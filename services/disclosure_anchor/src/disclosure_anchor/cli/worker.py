@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
 
 
 import argparse
 import hashlib
+import json
 import os
 import queue
+import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import signal
 import sys
@@ -57,6 +60,23 @@ from disclosure_anchor.adapters.runtime.worker_progress import (
     render_worker_progress,
     render_worker_progress_json,
 )
+from disclosure_anchor.adapters.runtime.worker_stop_control import (
+    EXIT_BUSY,
+    EXIT_CONTROL_REFUSED,
+    EXIT_PUBLIC_STOP,
+    RuntimeWorkerStopControl,
+    WorkerControlBusy,
+    WorkerControlRefused,
+    control_status_payload,
+    observe_worker_control,
+    plan_release,
+    read_evidence,
+    reconstruct_worker_circuit_stop,
+    release_worker_circuit,
+    render_control_status_terminal,
+    require_worker_start_permitted,
+    worker_supervision,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.semantics.codex_cli import (
     terminate_active_semantic_processes,
@@ -76,6 +96,15 @@ from disclosure_anchor.application.dto.worker_report import (
 )
 from disclosure_anchor.application.ports.disclosure_source import DisclosureSourcePort
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.worker_stop_control import (
+    PublicStopCause,
+    WakeableWorkerStopControl,
+    WorkerOperationalStopError,
+    WorkerStopControlPort,
+    exception_class_name,
+    exception_fingerprint,
+)
+from disclosure_anchor.application.services.worker_stop_latch import InProcessWorkerStopLatch
 from disclosure_anchor.application.contracts.provider_unit import (
     PROVIDER_UNIT_BUILDER_VERSION,
 )
@@ -100,8 +129,14 @@ if TYPE_CHECKING:
     from disclosure_anchor.adapters.runtime.mineru_process_profile import (
         LoadedMineruProcessProfile,
     )
+    from disclosure_anchor.adapters.db.postgres.staged_upgrade_scope_v4 import LegacyScopeObservation
+    from disclosure_anchor.application.contracts.worker_execution_upgrade import (
+        VerifiedQualifiedExecution,
+    )
 
 SKIP_MESSAGE = "[skip] another worker holds the singleton lock"
+# EX_CONFIG: the deployment preflight found the install not ready.
+EXIT_PREFLIGHT_NOT_READY = 78
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 SYSTEM_ERROR_BASE_SECONDS = 60
 SYNC_COOLDOWN_BASE_SECONDS = 1800
@@ -117,10 +152,96 @@ PROVIDER_ERROR_COOLDOWN_BASE_SECONDS = 60
 # plane may each perform an independent query at the same time.  These are
 # architecture bounds, not machine-specific tuning values.
 WORKER_DB_CONTROL_CONNECTIONS = 4
+# Process-lifetime latch: the liveness watchdog (or the parse runaway lease)
+# has decided to exit 70. Its own termination of owned children cancels
+# in-flight semantic calls, which the coordinator treats as retry-neutral
+# cancellation and ends with an unlatched circuit. Once set, the resident's
+# fallback latches (_trip_worker_fault, _end_staged_resident) record no new
+# cause: a failure seen while the exit completes cannot be told apart from one
+# the exit induced, and exit 70 already keeps the job down. A cause latched
+# earlier stays the immutable first cause, and faults the coordinator
+# classifies and latches itself are unchanged.
+_WEDGED_EXIT = threading.Event()
 
 
 class WorkerSingletonGuardError(RuntimeError):
     """The process-lifetime singleton session can no longer be trusted."""
+
+
+class WorkerPublicStopError(RuntimeError):
+    """The resident ended on a latched public stop (exit 78, never restarted)."""
+
+    def __init__(self, cause: PublicStopCause | None, errors: tuple[str, ...] = ()) -> None:
+        self.cause = cause
+        detail = errors or (("unknown staged failure",) if cause is None else (cause.summary(),))
+        super().__init__("staged V4 coordinator opened its circuit: " + "; ".join(detail))
+
+
+def _trip_worker_fault(
+    control: WorkerStopControlPort,
+    error: BaseException,
+    *,
+    kind: str,
+    origin: str,
+    reason_code: str,
+) -> None:
+    """Latch a plane's fatal error before its cleanup.
+
+    Interrupts are not faults, and nothing latches once the watchdog exit has
+    begun (``_WEDGED_EXIT``).
+    """
+
+    if isinstance(error, (KeyboardInterrupt, SystemExit)) or _WEDGED_EXIT.is_set():
+        return
+    try:
+        control.trip(
+            PublicStopCause(
+                kind=kind,
+                reason_code=reason_code,
+                origin=origin,
+                exception_class=exception_class_name(error),
+                exception_fingerprint=exception_fingerprint(error),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - the plane's own error stays primary
+        try:
+            print(
+                f"[worker-control] failed to latch {reason_code}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 - reporting never replaces the plane's error
+            pass
+
+
+def _refuse_stopped_start(settings: Settings) -> int | None:
+    """Read-only start gate; ``None`` means runnable, else the exit code."""
+
+    try:
+        require_worker_start_permitted(settings)
+    except WorkerOperationalStopError as exc:
+        print(f"[worker-control] refusing to start: {exc}", file=sys.stderr, flush=True)
+        return EXIT_PUBLIC_STOP
+    return None
+
+
+def _public_stop_exit(control: WorkerStopControlPort) -> int:
+    cause = control.first_cause()
+    summary = "cause unknown" if cause is None else cause.summary()
+    persisted = ""
+    if isinstance(control, RuntimeWorkerStopControl):
+        outcome = control.persistence_outcome(timeout=0)
+        if outcome is not None:
+            persisted = (
+                f" native={outcome.native.status} marker={outcome.marker.status}"
+                + ("" if outcome.durable else " NOT DURABLE: this stop survives only in the loaded job")
+            )
+    print(
+        f"[worker-control] PUBLIC_STOP exit {EXIT_PUBLIC_STOP}: {summary}{persisted}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return EXIT_PUBLIC_STOP
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,13 +293,24 @@ def worker_database_pool_budget(settings: Settings) -> WorkerDatabasePoolBudget:
         )
         from disclosure_anchor.settings import load_staged_v4_settings
 
+        from disclosure_anchor.adapters.runtime.mineru_capacity_config import (
+            configured_mineru_capacity,
+        )
+        from disclosure_anchor.application.contracts.mineru_capacity_config import (
+            MineruCapacityConfigV2,
+        )
+
         loaded = _load_staged_process_profile(settings)
+        capacity = configured_mineru_capacity(settings)
         concurrency = staged_v4_database_concurrency(
             loaded.profile,
             worker_profile=load_staged_v4_settings().worker_profile(
                 process_profile_sha256=loaded.profile.sha256,
                 mac_preflight_workers=settings.worker_parse_concurrency,
                 mac_finalize_workers=settings.worker_finalize_concurrency,
+            ),
+            storage_policy=(
+                capacity.result_storage if isinstance(capacity, MineruCapacityConfigV2) else None
             ),
         )
         return WorkerDatabasePoolBudget(
@@ -229,18 +361,77 @@ def main(argv: list[str] | None = None) -> int:
         choices=("terminal", "json"),
         default="terminal",
     )
+    status_parser.add_argument(
+        "--control-only",
+        action="store_true",
+        help="report only worker operational control (files + launchd); no DB/MinerU/model",
+    )
     backfill_parser = subparsers.add_parser("backfill-publish-kpi")
     backfill_parser.add_argument("--limit", type=int, required=True)
+    release_parser = subparsers.add_parser(
+        "release-circuit",
+        help="archive and remove one exact public stop after its cause is fixed",
+    )
+    release_parser.add_argument("--expect-sha256", required=True)
+    release_parser.add_argument("--decided-by", required=True)
+    release_parser.add_argument("--reason", required=True)
+    release_parser.add_argument("--fixed-by", required=True)
+    release_parser.add_argument("--dry-run", action="store_true")
+    record_parser = subparsers.add_parser(
+        "record-circuit-stop",
+        help="reconstruct a stop record for a natively disabled worker whose record failed",
+    )
+    record_parser.add_argument("--from-disabled", action="store_true", required=True)
+    record_parser.add_argument("--evidence", type=Path, required=True)
+    record_parser.add_argument("--evidence-sha256", required=True)
+    record_parser.add_argument("--decided-by", required=True)
+    record_parser.add_argument("--reason", required=True)
+    record_parser.add_argument("--dry-run", action="store_true")
+    preflight_parser = subparsers.add_parser(
+        "deployment-preflight",
+        help="read-only install eligibility (same gate, resolver identity and legacy scope); never starts work",
+    )
+    preflight_parser.add_argument("--format", choices=("terminal", "json"), default="terminal")
+    preflight_parser.add_argument(
+        "--prepared-key-ttl-seconds",
+        type=int,
+        default=None,
+        help="the deployed provider idempotency-key lifetime; without it prepared keys stay unverified",
+    )
     args = parser.parse_args(argv)
+    if args.command == "deployment-preflight" and (
+        args.prepared_key_ttl_seconds is not None and args.prepared_key_ttl_seconds < 1
+    ):
+        parser.error("deployment-preflight --prepared-key-ttl-seconds must be positive")
 
     settings = load_settings()
     if args.command == "status":
+        if args.control_only:
+            return _print_worker_control_status(settings, output_format=args.format)
         return _print_worker_status(settings, output_format=args.format)
+    if args.command == "release-circuit":
+        return _release_circuit_command(settings, args)
+    if args.command == "record-circuit-stop":
+        return _record_circuit_stop_command(settings, args)
+    if args.command == "deployment-preflight":
+        return _deployment_preflight_command(
+            settings,
+            output_format=args.format,
+            prepared_key_ttl_seconds=args.prepared_key_ttl_seconds,
+        )
     if args.command == "once" and settings.worker_parse_execution_mode == "staged-v4":
         parser.error(
             "worker once has no bounded staged-v4 semantic; use worker loop "
             "or select legacy-sync"
         )
+    if args.command in ("loop", "once"):
+        # Before any DB engine, MinerU checker, recovery or dependency build:
+        # a recorded public stop, control state that cannot be trusted, or a
+        # supervised label that is disabled or unreadable refuses the start
+        # with 78 and does no business work.
+        refused = _refuse_stopped_start(settings)
+        if refused is not None:
+            return refused
     if args.command == "loop":
         return run_resident_worker(settings, progress_output=args.progress)
     if args.command == "backfill-publish-kpi" and args.limit < 1:
@@ -365,8 +556,9 @@ def _wedge_watchdog(
     bounds nothing — liveness does. Parse/startup and maintenance use distinct
     timestamps: progress in one plane must never conceal a deadlock in the
     other. Beyond the watchdog threshold the named plane is wedged in something
-    no inner timeout covers. Dump every thread's stack and exit nonzero:
-    launchd KeepAlive restarts clean, and write paths are batch-committed.
+    no inner timeout covers. Dump every thread's stack and exit 70; write paths
+    are batch-committed. launchd restarts only a clean exit 0, so the worker
+    stays down until an operator restarts it.
     """
 
     def _watch() -> None:
@@ -380,7 +572,8 @@ def _wedge_watchdog(
                     f"[watchdog] {plane} plane made no progress for "
                     f"{int(silent)}s "
                     f"(threshold {threshold_seconds}s) — dumping stacks and "
-                    "exiting for a clean relaunch",
+                    "exiting 70; launchd keeps the worker down until an "
+                    "operator restarts it",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -398,26 +591,48 @@ def _wedge_watchdog(
 
 
 def _exit_wedged_worker() -> None:
-    """Kill detached parser groups before launchd replaces this worker."""
+    """Kill owned child groups, then exit 70 without waiting on persistence."""
 
     import os
 
-    # MinerU children intentionally run in their own process groups so an
-    # individual timeout can kill the whole temporary API tree. os._exit()
-    # skips signal handlers/finally blocks, so the watchdog must explicitly
-    # remove those groups; otherwise the replacement singleton worker starts
-    # with orphan requests still consuming the same GPU budget.
-    terminate_active_mineru_processes()
-    terminate_active_semantic_processes()
-    os._exit(70)
+    # Announce the exit before touching children: the termination below
+    # cancels in-flight semantic calls, and the circuit that opens must not
+    # latch as a new public stop (see _WEDGED_EXIT).
+    _WEDGED_EXIT.set()
+    try:
+        # MinerU children intentionally run in their own process groups so an
+        # individual timeout can kill the whole temporary API tree. os._exit()
+        # skips signal handlers/finally blocks, so the watchdog must explicitly
+        # remove those groups; otherwise the next operator-started worker
+        # would find orphan requests still consuming the same GPU budget.
+        for terminate in (
+            terminate_active_mineru_processes,
+            terminate_active_semantic_processes,
+        ):
+            try:
+                terminate()
+            except Exception:  # noqa: BLE001 - visibility only; the next sweep and the exit still run
+                traceback.print_exc()
+    finally:
+        # Unconditional: a watchdog thread that died here would leave a wedged
+        # worker running with every new public stop suppressed.
+        os._exit(70)
 
 
 def run_resident_worker(
     settings: Settings,
     *,
     progress_output: str = "terminal",
+    stop_control: RuntimeWorkerStopControl | None = None,
 ) -> int:
-    """Run the one resident worker."""
+    """Run the one resident worker.
+
+    Exit codes: 0 after a pure operator stop (TERM/INT, no fault, owned work
+    closed) or an idle shutdown; 75 when another owner holds the singleton;
+    78 for a public stop (recorded now or found at start). Any other failure
+    stays a visible nonzero exit. The singleton is released only after the
+    stop control has persisted and every plane has been joined.
+    """
 
     # As in once mode, static identity is checked here; live availability is
     # checked by the resident admission controller after singleton ownership
@@ -430,10 +645,14 @@ def run_resident_worker(
     # Resident parse admission is independent of the bounded worker-once
     # batch size. Even WORKER_BATCH_PARSE=0 must never bypass static or live
     # MinerU proof when a resident parse plane is selected.
+    # The resident loop is the one executor that threads a verified local
+    # upgrade context to every boundary, so it alone (with the read-only
+    # preflight and doctor) may accept one.
     mineru_checker = MinerUDeploymentChecker(
         settings,
         parse_enabled=True,
         process_profile=process_profile,
+        accept_execution_upgrade=True,
     )
     _print_version_banner(settings)
     lock_engine = sqlalchemy.create_engine(
@@ -448,14 +667,39 @@ def run_resident_worker(
             text("SELECT pg_try_advisory_lock(:ns, 0)"), {"ns": WORKER_NS}
         ).scalar_one()
         if not acquired:
+            # A legitimate owner (an attended commission/recovery run or an
+            # old process still draining) is not a fault: no stop record, but
+            # a nonzero exit so launchd does not spin on the busy singleton.
             print(SKIP_MESSAGE)
-            return 0
-        return _run_loop(
-            settings,
-            lock_conn=lock_conn,
-            mineru_checker=mineru_checker,
-            progress_output=progress_output,
+            return EXIT_BUSY
+        # Re-check under the singleton: a stop recorded after the early gate
+        # (or by the owner that just released the lock) still refuses.
+        refused = _refuse_stopped_start(settings)
+        if refused is not None:
+            return refused
+        control = (
+            stop_control if stop_control is not None
+            else RuntimeWorkerStopControl.for_settings(settings)
         )
+        try:
+            status = _run_loop(
+                settings,
+                lock_conn=lock_conn,
+                mineru_checker=mineru_checker,
+                progress_output=progress_output,
+                stop_control=control,
+            )
+        except BaseException as exc:
+            if control.first_cause() is None:
+                raise
+            # The latched first cause decides the exit; a later cleanup error
+            # is secondary and stays visible without replacing it.
+            if not isinstance(exc, WorkerPublicStopError):
+                traceback.print_exception(exc)
+            return _public_stop_exit(control)
+        if control.first_cause() is not None:
+            return _public_stop_exit(control)
+        return status
     finally:
         lock_conn.close()
         lock_engine.dispose()
@@ -467,15 +711,43 @@ def _run_loop(
     lock_conn: Connection,
     mineru_checker: MinerUDeploymentChecker | None = None,
     progress_output: str = "terminal",
+    stop_control: WakeableWorkerStopControl | None = None,
 ) -> int:
-    """Run a resident data plane with independent maintenance/reporting."""
+    """Run a resident data plane with independent maintenance/reporting.
 
+    ``stop_control`` is the one process-wide public-stop latch shared by the
+    stage, maintenance, startup-recovery and outer failure planes. Production
+    passes the durable control; a direct caller without one gets an
+    in-process latch that still halts every plane.
+    """
+
+    control: WakeableWorkerStopControl = (
+        stop_control if stop_control is not None else InProcessWorkerStopLatch()
+    )
+    execution = (
+        mineru_checker.verified_execution
+        if mineru_checker is not None and settings.execution_upgrade_configured
+        else None
+    )
     engine = _create_worker_db_engine(settings)
     try:
         require_runtime_app_engine(engine)
     except BaseException:
         engine.dispose()
         raise
+    execution_scope = None
+    if execution is not None:
+        try:
+            execution_scope = _recheck_execution_upgrade(engine, execution)
+        except BaseException as exc:
+            # Transport-level DB loss before any business effect exits like
+            # every other pre-dependency startup failure; a refused scope or
+            # release is a public stop.
+            if not isinstance(exc, (sqlalchemy.exc.OperationalError, sqlalchemy.exc.InterfaceError)):
+                _trip_worker_fault(control, exc, kind="startup_fatal", origin="startup_recovery",
+                                   reason_code="execution_upgrade_scope_failed")
+            engine.dispose()
+            raise
     stop = _StopFlag()
     stop.install()
     base_limits = _limits(settings)
@@ -544,12 +816,16 @@ def _run_loop(
     )
     report_thread.start()
     work_available = threading.Event()
+    # A public stop on any plane wakes an idle resident immediately.
+    control.add_wake_callback(work_available.set)
     fatal = threading.Event()
     fatal_errors: queue.SimpleQueue[BaseException] = queue.SimpleQueue()
     maintenance_thread: threading.Thread | None = None
 
     def should_stop() -> bool:
-        return stop.is_set() or fatal.is_set()
+        # The operator flag keeps its own provenance; the latch halts every
+        # plane before sync/download/build/publish/projection's next step.
+        return stop.is_set() or fatal.is_set() or control.is_tripped()
 
     def maintenance_target() -> None:
         try:
@@ -563,6 +839,11 @@ def _run_loop(
                 work_available=work_available,
             )
         except BaseException as exc:
+            # Handled temporary source/report outages never reach here; an
+            # escaping maintenance error is fatal and latches first.
+            _trip_worker_fault(control, exc, kind="maintenance_fatal",
+                               origin="maintenance", reason_code="maintenance_loop_failed")
+            traceback.print_exception(exc)
             fatal_errors.put(exc)
             fatal.set()
             work_available.set()
@@ -586,15 +867,27 @@ def _run_loop(
         # prune-capable projection before any new parse admission. Only the
         # legacy mode may reclaim generic running rows: staged V4 owns its
         # running-attempt recovery through the exact V4 checkpoint authority.
-        _run_startup_recovery(
-            settings,
-            lock_conn=lock_conn,
-            deps=deps,
-            base_limits=base_limits,
-            should_stop=should_stop,
-            reports=reports,
-            reclaim_running=not staged_mode,
-        )
+        try:
+            _run_startup_recovery(
+                settings,
+                lock_conn=lock_conn,
+                deps=deps,
+                base_limits=base_limits,
+                should_stop=should_stop,
+                reports=reports,
+                reclaim_running=not staged_mode,
+            )
+        except BaseException as exc:
+            # Temporary outages are retried inside; what escapes is fatal and
+            # latches before any cleanup or process termination below.
+            singleton_lost = isinstance(exc, WorkerSingletonGuardError)
+            _trip_worker_fault(
+                control, exc,
+                kind="ownership_lost" if singleton_lost else "startup_fatal",
+                origin="startup_recovery",
+                reason_code="singleton_lost" if singleton_lost else "startup_recovery_failed",
+            )
+            raise
         if should_stop():
             return 0
         if maintenance_progress is not None:
@@ -622,6 +915,10 @@ def _run_loop(
                 prune_tracker=prune_tracker,
                 progress_output=progress_output,
                 expected_capacity=None if mineru_checker is None else mineru_checker.expected_capacity,
+                stop_control=control,
+                operator_stop_requested=stop.is_set,
+                verified_execution=execution,
+                execution_scope=execution_scope,
             )
         else:
             run_resident_parse(
@@ -669,9 +966,26 @@ def _run_staged_v4_resident(
     work_available: threading.Event,
     prune_tracker: _ProjectionPruneTracker,
     progress_output: str,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
+    stop_control: WorkerStopControlPort | None = None,
+    operator_stop_requested: Callable[[], bool] | None = None,
+    verified_execution: VerifiedQualifiedExecution | None = None,
+    execution_scope: LegacyScopeObservation | None = None,
 ) -> None:
-    """Run only the V4 parse/finalize path until process shutdown."""
+    """Run only the V4 parse/finalize path until process shutdown.
+
+    Returns normally for an idle shutdown or a pure operator drain. Any other
+    non-QUIESCENT coordinator result is a public stop: its first cause is
+    latched (by the coordinator, another plane, or here as a last resort) and
+    ``WorkerPublicStopError`` is raised. There is no restart shortcut.
+    """
+
+    control: WorkerStopControlPort = (
+        stop_control if stop_control is not None else InProcessWorkerStopLatch()
+    )
+    operator_requested = (
+        operator_stop_requested if operator_stop_requested is not None else (lambda: False)
+    )
 
     # Lazy imports are part of the default-off contract: legacy-sync never
     # constructs or even imports the V4 profile/keyring/scratch composition.
@@ -720,6 +1034,7 @@ def _run_staged_v4_resident(
             queued = sum(dict(snapshot.queued).values())
             print(
                 "[staged-v4] "
+                f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
                 f"recovery={'done' if snapshot.recovery_complete else 'scan'} "
                 f"admission={'open' if snapshot.admission_open else 'closed'} "
                 f"active={active} queued={queued} completed={snapshot.completed} "
@@ -742,9 +1057,31 @@ def _run_staged_v4_resident(
             publication_committed=lambda replaced: prune_tracker.mark(1 if replaced else 0),
             expected_capacity=expected_capacity,
             stream_control=stream_control,
+            stop_control=control,
+            verified_execution=verified_execution,
         )
         try:
-            runtime.verify_startup()
+            try:
+                runtime.verify_startup()
+                if verified_execution is not None:
+                    # One create-only receipt per boot, after every startup
+                    # gate and before the coordinator's first effect; a failure
+                    # is a startup stop like the verification above.
+                    from disclosure_anchor.adapters.runtime.mineru_execution_upgrade import (
+                        write_boot_receipt,
+                    )
+
+                    if execution_scope is None:
+                        raise RuntimeError("verified local upgrade boot lacks its in-worker scope recheck")
+                    _path, _digest, audit = write_boot_receipt(
+                        settings, verified_execution, owner_identity=runtime.owner_identity,
+                        scope=execution_scope,
+                    )
+                    print(audit, flush=True)
+            except BaseException as exc:
+                _trip_worker_fault(control, exc, kind="startup_fatal", origin="startup_recovery",
+                                   reason_code="staged_startup_verification_failed")
+                raise
             while not should_stop():
                 # Clear only before the authoritative DB scan. Any acquisition
                 # signal that races with or follows that scan remains set and
@@ -754,18 +1091,86 @@ def _run_staged_v4_resident(
                 # Each run performs an exhaustive V4 recovery barrier before it
                 # can admit from ordinary pending_parse. A quiescent return is an
                 # idle observation, not a resident-process exit.
-                result = runtime.coordinator.run(stop_requested=should_stop)
+                try:
+                    result = runtime.coordinator.run(stop_requested=should_stop)
+                except BaseException as exc:
+                    # The real coordinator latched already; this keeps any
+                    # escaping controller failure a public stop.
+                    _trip_worker_fault(control, exc, kind="coordinator_fault", origin="resident",
+                                       reason_code="coordinator_run_failed")
+                    raise
                 if result.terminal is not CoordinatorTerminal.QUIESCENT:
-                    raise RuntimeError(
-                        "staged V4 coordinator opened its circuit: "
-                        + "; ".join(result.errors or ("unknown staged failure",))
-                    )
+                    _end_staged_resident(result, control, operator_requested)
+                    return
                 if should_stop():
                     return
                 last_snapshot[0] = None
                 work_available.wait(timeout=settings.worker_loop_interval_seconds)
         finally:
             runtime.close()
+
+
+# The coordinator's retry-exhaustion line (`_retry_exhaustion_detail`): ids,
+# counts, a recognized literal or a fingerprint, type names and an HTTP status.
+# Only a line of exactly this shape is logged; nothing else can ride along.
+_RETRY_EXHAUSTION_LINE = re.compile(
+    r"[A-Za-z0-9_.-]{1,128}:[a-z_]{1,32}:retry budget exhausted \("
+    r"attempts=[0-9]{1,10}/[0-9]{1,10}, elapsed=[0-9]{1,12}\.[0-9]s/[0-9.e+]{1,16}s, "
+    r"last=(?:[a-z ]{1,80}|unrecognized sha256:[0-9a-f]{64}), "
+    r"causes=(?:none|[A-Za-z0-9_<-]{1,400})(?:, http_status=[1-5][0-9]{2})?\)"
+)
+
+
+def _end_staged_resident(
+    result: object,
+    control: WorkerStopControlPort,
+    operator_requested: Callable[[], bool],
+) -> None:
+    """Distinguish a pure operator handoff from a public stop; never restart."""
+
+    cause = control.first_cause()
+    if (
+        cause is None
+        and operator_requested()
+        and getattr(result, "termination_kind", None) == "operator_drain"
+    ):
+        print("[staged-v4] operator stop drained with no public fault", flush=True)
+        return
+    errors = tuple(getattr(result, "errors", ()) or ())
+    for error in errors:
+        # A retry-exhaustion line names its bounds and failure category with
+        # no exception text, so it is logged; other entries can carry raw
+        # text and stay out of the log (the cause summary is content-free).
+        if isinstance(error, str) and _RETRY_EXHAUSTION_LINE.fullmatch(error):
+            try:
+                print(f"[staged-v4] {error}", file=sys.stderr, flush=True)
+            except Exception:  # noqa: BLE001 - visibility only; the stop stands
+                pass
+    if cause is None:
+        if _WEDGED_EXIT.is_set():
+            # The watchdog's own child termination cancelled this run; its exit
+            # 70 already ends the process and is never restarted.
+            try:
+                print(
+                    "[staged-v4] circuit opened during watchdog exit; "
+                    "no public stop latched",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:  # noqa: BLE001 - visibility only
+                pass
+        else:
+            # A circuit whose cause was not latched (for example a stop control
+            # that failed) is still a public stop, never a generic restart.
+            _trip_worker_fault(
+                control,
+                RuntimeError("staged V4 coordinator opened an unclassified circuit"),
+                kind="coordinator_circuit",
+                origin="resident",
+                reason_code="unclassified_circuit",
+            )
+        cause = control.first_cause()
+    raise WorkerPublicStopError(cause, errors)
 
 
 class _ProjectionPruneTracker:
@@ -1315,15 +1720,24 @@ def assert_worker_singleton_or_cancel(lock_conn: Connection) -> None:
 
 
 class _StopFlag:
+    """Operator stop request (TERM/INT); kept apart from the public-stop latch.
+
+    It records only operator provenance and can never clear, replace or stand
+    in for a latched public-stop cause.
+    """
+
     def __init__(self) -> None:
         self._stopped = False
+        self.first_signal: int | None = None
 
     def install(self) -> None:
         signal.signal(signal.SIGINT, self._handle)
         signal.signal(signal.SIGTERM, self._handle)
 
     def _handle(self, signum: int, frame: FrameType | None) -> None:
-        del signum, frame
+        del frame
+        if self.first_signal is None:
+            self.first_signal = signum
         self._stopped = True
         terminate_active_mineru_processes()
         terminate_active_semantic_processes()
@@ -1371,6 +1785,9 @@ def _deps(
                     web=CninfoWebSource(
                         max_qps=settings.cninfo_max_qps,
                         max_retries=settings.cninfo_max_retries,
+                        download_deadline_seconds=(
+                            settings.cninfo_download_deadline_seconds
+                        ),
                     ),
                     api_profile_source=(
                         CninfoSource(CninfoClient.from_settings(settings))
@@ -1423,7 +1840,7 @@ def _deps(
         engine=engine,
         uow_factory=unit_of_work_factory(engine),
         path_builder=paths,
-        raw_store=RawDocumentStore(paths),
+        raw_store=RawDocumentStore.from_settings(paths, settings),
         artifact_store=artifacts,
         provider_source=provider_source,
         semantic_router=semantic.router,
@@ -1691,6 +2108,58 @@ def _render_parse_quality_section(report: WorkerReport) -> str:
     return "\n".join(lines)
 
 
+def _recheck_execution_upgrade(
+    engine: Engine, execution: VerifiedQualifiedExecution,
+) -> LegacyScopeObservation:
+    """Under the singleton, before reports, recovery, maintenance or claims.
+
+    The installer preflight is not trusted across the time until this start:
+    the current release's bytes are re-hashed and one READ ONLY snapshot of
+    every current V4 head must still be the verified inventory's exact
+    continuation.
+    """
+
+    from disclosure_anchor.adapters.runtime.mineru_execution_upgrade import (
+        recheck_execution_release,
+        require_legacy_scope,
+    )
+
+    recheck_execution_release(execution)
+    observed = require_legacy_scope(engine, execution)
+    print(
+        "[execution-upgrade] scope verified "
+        f"contract={execution.upgrade_contract_version} "
+        f"inventory={execution.upgrade.legacy_scope.inventory_sha256} "
+        f"members={len(execution.inventory.members)} unresolved={len(observed.unresolved_members)} "
+        f"final={len(observed.closed_members)} final_states={dict(observed.closed_state_counts)} "
+        f"current_work={len(observed.current_execution_heads)}",
+        flush=True,
+    )
+    return observed
+
+
+def _deployment_preflight_command(
+    settings: Settings, *, output_format: str, prepared_key_ttl_seconds: int | None,
+) -> int:
+    """Read-only technical install eligibility; exit 0 ready, 78 not ready."""
+
+    from disclosure_anchor.adapters.runtime.mineru_execution_upgrade import (
+        render_preflight_terminal,
+        run_deployment_preflight,
+    )
+
+    report = run_deployment_preflight(
+        settings,
+        engine_factory=lambda: sqlalchemy.create_engine(_database_url(settings), poolclass=NullPool),
+        prepared_key_ttl_seconds=prepared_key_ttl_seconds,
+    )
+    if output_format == "json":
+        print(json.dumps(report, sort_keys=True), flush=True)
+    else:
+        print(render_preflight_terminal(report), flush=True)
+    return 0 if report["ready_to_install"] else EXIT_PREFLIGHT_NOT_READY
+
+
 def _database_url(settings: Settings) -> str:
     return app_database_url(settings)
 
@@ -1702,8 +2171,19 @@ def worker_database_url(settings: Settings) -> str:
 
 
 def _print_worker_status(settings: Settings, *, output_format: str) -> int:
-    """Print one read-only progress snapshot without requiring GPU admission."""
+    """Print one read-only progress snapshot without requiring GPU admission.
 
+    A recorded or unverifiable stop is reported on stderr before the business
+    query, so it stays visible when the database is down. The stdout shape is
+    unchanged; the exit code is 3 while a stop is recorded.
+    """
+
+    stopped = False
+    try:
+        require_worker_start_permitted(settings)
+    except WorkerOperationalStopError as exc:
+        stopped = True
+        print(f"[worker-control] STOPPED: {exc}", file=sys.stderr, flush=True)
     engine = create_db_engine(_database_url(settings))
     try:
         require_runtime_app_engine(engine)
@@ -1720,6 +2200,112 @@ def _print_worker_status(settings: Settings, *, output_format: str) -> int:
         else render_worker_progress(event)
     )
     print(rendered, flush=True)
+    return EXIT_CONTROL_REFUSED if stopped else 0
+
+
+def _print_worker_control_status(settings: Settings, *, output_format: str) -> int:
+    """Control-only status: files plus launchd readback; no DB, MinerU or model.
+
+    The native readback applies only to the supervised runtime root on macOS,
+    exactly as in the start gate; other roots never run launchctl.
+    """
+
+    snapshot = observe_worker_control(settings)
+    if output_format == "json":
+        print(json.dumps(control_status_payload(snapshot), ensure_ascii=False, sort_keys=True),
+              flush=True)
+    else:
+        print(render_control_status_terminal(snapshot), flush=True)
+    return 0 if snapshot.runnable else EXIT_CONTROL_REFUSED
+
+
+@contextmanager
+def _held_worker_singleton(settings: Settings) -> Iterator[bool]:
+    """Take the worker singleton for a control mutation; yields ``False`` if busy."""
+
+    lock_engine = sqlalchemy.create_engine(
+        _database_url(settings),
+        poolclass=NullPool,
+        isolation_level="AUTOCOMMIT",
+    )
+    lock_conn = lock_engine.connect()
+    try:
+        require_runtime_app_connection(lock_conn)
+        acquired = lock_conn.execute(
+            text("SELECT pg_try_advisory_lock(:ns, 0)"), {"ns": WORKER_NS}
+        ).scalar_one()
+        yield bool(acquired)
+    finally:
+        lock_conn.close()
+        lock_engine.dispose()
+
+
+def _release_circuit_command(settings: Settings, args: argparse.Namespace) -> int:
+    supervision = worker_supervision(settings)
+    try:
+        if args.dry_run:
+            plan = plan_release(
+                settings, expect_sha256=args.expect_sha256, supervision=supervision,
+            )
+            print(json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2), flush=True)
+            return 0 if plan["would_release"] else EXIT_CONTROL_REFUSED
+        with _held_worker_singleton(settings) as acquired:
+            if not acquired:
+                print("[worker-control] refusing release: the worker singleton is held "
+                      "(worker or maintenance owner still live)", file=sys.stderr, flush=True)
+                return EXIT_BUSY
+            receipt = release_worker_circuit(
+                settings,
+                expect_sha256=args.expect_sha256,
+                decided_by=args.decided_by,
+                reason=args.reason,
+                fixed_by=args.fixed_by,
+                supervision=supervision,
+            )
+    except WorkerControlBusy as exc:
+        print(f"[worker-control] refusing release: {exc}", file=sys.stderr, flush=True)
+        return EXIT_BUSY
+    except (WorkerControlRefused, ValueError) as exc:
+        print(f"[worker-control] refusing release: {exc}", file=sys.stderr, flush=True)
+        return EXIT_CONTROL_REFUSED
+    print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2), flush=True)
+    return 0
+
+
+def _record_circuit_stop_command(settings: Settings, args: argparse.Namespace) -> int:
+    supervision = worker_supervision(settings)
+    supervisor = supervision.supervisor
+    try:
+        if supervisor is None:
+            raise WorkerControlRefused(
+                "no supervised launchd job owns this runtime root "
+                f"({supervision.scope}); there is no native stop to record"
+            )
+        evidence = read_evidence(args.evidence, args.evidence_sha256)
+        if args.dry_run:
+            receipt = reconstruct_worker_circuit_stop(
+                settings, evidence=evidence, evidence_sha256=args.evidence_sha256,
+                decided_by=args.decided_by, reason=args.reason, supervisor=supervisor,
+                dry_run=True,
+            )
+            print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2), flush=True)
+            return 0 if receipt.get("would_record") else EXIT_CONTROL_REFUSED
+        with _held_worker_singleton(settings) as acquired:
+            if not acquired:
+                print("[worker-control] refusing reconstruction: the worker singleton is held",
+                      file=sys.stderr, flush=True)
+                return EXIT_BUSY
+            receipt = reconstruct_worker_circuit_stop(
+                settings, evidence=evidence, evidence_sha256=args.evidence_sha256,
+                decided_by=args.decided_by, reason=args.reason, supervisor=supervisor,
+            )
+    except WorkerControlBusy as exc:
+        print(f"[worker-control] refusing reconstruction: {exc}", file=sys.stderr, flush=True)
+        return EXIT_BUSY
+    except (WorkerControlRefused, ValueError) as exc:
+        print(f"[worker-control] refusing reconstruction: {exc}", file=sys.stderr, flush=True)
+        return EXIT_CONTROL_REFUSED
+    print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2), flush=True)
     return 0
 
 

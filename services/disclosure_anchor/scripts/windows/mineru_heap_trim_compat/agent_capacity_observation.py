@@ -12,7 +12,7 @@ import time
 from typing import Any
 import uuid
 
-from mineru.cli.agent_capacity_config import MineruCapacityConfig
+from mineru.cli.agent_capacity_config import AnyMineruCapacityConfig
 
 
 def _unavailable(reason: str) -> dict:
@@ -140,7 +140,7 @@ def _linux_pressure_memory() -> dict:
 class CapacityServingObservation:
     """Process birth is sampled at manager startup; stages remain live samples."""
 
-    def __init__(self, config: MineruCapacityConfig, manager: Any) -> None:
+    def __init__(self, config: AnyMineruCapacityConfig, manager: Any) -> None:
         self.config = config
         self.manager = manager
         self.process_id = os.getpid()
@@ -205,9 +205,15 @@ class CapacityServingObservation:
             "parse_active_limit": executor.parse_slots,
             "total_nonterminal_limit": self.manager.max_nonterminal_tasks,
             "finalizer_active_limit": executor.finalizer_slots,
-            "result_reservation_bytes": executor.result_reservation_bytes,
-            "max_unacked_result_bytes": registry._limit,
         }
+        storage = getattr(self.config, "result_storage", None)
+        if storage is None:
+            limits.update(
+                result_reservation_bytes=executor.result_reservation_bytes,
+                max_unacked_result_bytes=registry._limit,
+            )
+        elif registry.storage_policy is not storage or executor.storage_policy is not storage:
+            raise RuntimeError("serving object capacity drifted: result_storage")
         for field, actual in limits.items():
             if type(actual) is not int or actual != getattr(self.config, field):
                 raise RuntimeError("serving object capacity drifted: " + field)
@@ -217,7 +223,8 @@ class CapacityServingObservation:
         if http["owner_control"]["soft_drain_applied"] and not self.manager.is_shutting_down:
             raise RuntimeError("capacity owner drain was silently reset")
         result = {
-            "schema": "mineru.capacity-observation.v1",
+            "schema": ("mineru.capacity-observation.v1" if storage is None
+                       else "mineru.capacity-observation.v2"),
             "capacity_config_sha256": self.config.sha256,
             "owner": {
                 "process_id": self.process_id,
@@ -232,6 +239,8 @@ class CapacityServingObservation:
             "owner_control": http["owner_control"],
             "framework_limits": _framework_limits(),
         }
+        if storage is not None:
+            result["result_storage"] = registry.storage_observation(registry.durable_view(), executor)
         result["observed_at"] = {
             "clock": "python.monotonic_ns",
             "implementation": time.get_clock_info("monotonic").implementation,

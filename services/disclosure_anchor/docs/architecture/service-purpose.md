@@ -528,7 +528,7 @@ payload 是有序 parts；每个 part 只保存 source-bound 浅内容字段，�
 `payload_kind` 唯一表达。
 视觉 part 额外保存内容型 artifact 的 `{sha256,size_bytes,media_type}`，使图像变化进入
 `content_hash`；路径、crop、bbox、search binding 与 supporting evidence 只在 Unit 顶层
-`provider_unit_locator.v9`，不复制到每个 part，也不形成第二套证据图。
+`provider_unit_locator.v9`（带 U+0000 标记的 Unit 为 v10，见 §7.2），不复制到每个 part，也不形成第二套证据图。
 
 ```json
 {
@@ -614,7 +614,8 @@ Unit-local 受控 witness 产生粗主题 `semantic_keys`；普通 table text/da
 `artifact_locator` 是可选的**技术位置**。新产物使用闭合的
 `provider_unit_locator.v9`，绑定 `provider_document.v1` hash、source block index + payload ordinal、标题链、
 同页换行标题的 source `continuation_fragments`、Unit parts、物理表格段、evidence digest、显式 search target、
-native-PDF text reconciliation 与 table quality finding。`title`、heading_path 或 caption
+native-PDF text reconciliation 与 table quality finding；只有依赖 U+0000 标记的 Unit 使用
+`provider_unit_locator.v10`（v9 全部字段外加 `text_substitutions`）。`title`、heading_path 或 caption
 发生争议时，必须沿 locator 回到 ProviderDocument、MinerU 原始 artifact 和不可变 PDF 查证；
 缺 locator 或源字段不是“保守猜一个值”的理由，而是 parser 质量故障。
 
@@ -628,6 +629,7 @@ parts / physical_table_segment_indices
 evidence_artifacts
 search_targets
 source_text_reconciliations / source_quality_findings（仅命中闭合 native-PDF 规则时）
+text_substitutions（仅 v10：本 Unit 依赖的 U+0000 标记）
 ```
 
 示意：
@@ -683,6 +685,23 @@ v5 才可读取 identifier.v2/text-quality，v6 才可读取上述 identifier/CJ
 v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement，v8/v9 writer 不得
 重新发出 `statutory_template`，v8 也不得声明 v9 quality kind。历史 locator
 不得声明后代 vocabulary。
+
+PostgreSQL TEXT/JSONB 不能存 U+0000，而 provider 在该位置丢失的原字符无法由证据恢复（例如
+`第\x00节` 不能证明是哪个数字）。`provider_text_nul_substitution.v1` 因此在 admission 的有效视图里、
+native 校正之后、Unit 哈希之前，把每个未被 native 校正替换的 provider payload 中的每个 U+0000
+一对一换成 U+FFFD（Unicode 替代字符，只标位置、不猜字）；其他字符，包括字面六字符 `\u0000`、
+TAB/LF/CR 等控制符、U+FFFE/U+FFFF、扩展汉字与 emoji，逐字保留。ProviderDocument、MinerU
+artifact、PDF 与已封存请求不改写、不重算。每个被标记的 payload 形成一条 source-bound
+`ProviderTextSubstitution`（原 payload 与替换后文本的 hash、raw block hash、`occurrence_count`、policy），
+它不是 native-PDF 证明的校正：同一 payload 已有 native reconciliation 时不再标记（其校正文本若仍含
+U+0000，由发布前的 representability gate 按内容失败拒绝），可与 native quality finding 并存。
+locator v10 的 `text_substitutions` 只存 source index、payload ordinal、上述 hash、次数与 policy，
+不存正文。记录按与 reconciliation 相同的依赖挂载（本 Unit source blocks ∪ heading chain ∪
+continuation fragments），并被恰好覆盖；`needs_review` 只在被标记文本真正出现在本 Unit 的
+title、`heading_path`（包括祖先标题，故其后代 Unit 同样标记）或 payload（part owner block 的
+payload）中时设置，page frame 等 evidence-only block 只留记录、不误标。native finding 的作用域不变。
+不依赖任何标记的 Unit 仍发出与 v23 逐字节相同的 v9 locator 与各 hash；只有 run 的
+`builder_rules_version` 变为 `provider_unit.v24`。v1-v9 decoder 与不变量不变，v10 必须至少含一条记录。
 
 MinerU merge-on 输出中的非空 content-list table owner 是唯一逻辑/检索 payload；后续空 table
 stub 不另发正文，只通过 locator 连接其逐页 physical segment、crop、page/bbox 和 raw hash。
@@ -826,6 +845,10 @@ unit 边界、内容归属或删除。不得让 LLM 在 L1 自由判断“这段
   `(exchange, security_code)` 已必填（证券级中键）；美股 / 港股主体接入时同规范采集
   sec_cik / hk_cr / lei；
 - 规范化名称 + 辖区只作弱键，仅产生合并候选，不得自动合并主体。
+- 同一法人换证券代码后，旧代码只作为同 company 下 `status=historical` 的 Security 存在，且只能由
+  有官方证据、以现有 source-bound USCC 为锚、具名确认的绑定创建与使用（批准的索引接口、查询 owner 与
+  公告日期范围）。不得伪造旧代码 profile/USCC、改写候选代码或查询范围，也不得把 provider orgId 或名称
+  当作同主体证明；通用解析遇历史代码一律拒绝。契约见 `implementation/design/historical-security-retained-registration.md`。
 
 ## 10.2 source_access
 
@@ -840,6 +863,10 @@ unit 边界、内容归属或删除。不得让 LLM 在 L1 自由判断“这段
 - 错误和重试信息。
 
 它同时支持“查空”记录。
+
+失败记录永不删除或改写。下载在归档后于注册阶段失败时，失败记录保留已知原件事实；之后可由一条
+成功的保留原件登记（不重新下载、不解析）逐条解决它：解决关系记在该成功访问上，只对仍与其 Document
+一致的回执生效，之后的新失败照常阻断。
 
 ## 10.3 document
 
@@ -1041,7 +1068,9 @@ order_index
 6 列，至 04R-R7 为 32 列（仅历史基线）。
 
 0008 迁移起，`processing_runs_v1` 投影 `builder_rules_version`，用于确定性 Unit builder 归因；
-历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v23`。
+历史 run 可为 NULL 或旧版本，新 Provider writer 成功落库的 run 当前必须等于 `provider_unit.v24`。
+V4 已封存的 preparation 只重开不重建，其请求里记录的 `builder_rules_version`（例如 `provider_unit.v23`）
+原样进入事务 P，因此升级后同时存在 v23 与 v24 run 是正常的，不是漂移。
 
 0031 迁移起，`processing_runs_v1` 只额外暴露不透明的
 `artifact_owner_processing_run_id`：parse run 指向自身，`rebuild_units` 指向实际拥有

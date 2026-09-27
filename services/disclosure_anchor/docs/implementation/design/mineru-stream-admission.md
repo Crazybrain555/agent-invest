@@ -25,6 +25,15 @@
   recovery_seconds、reduction_interval_seconds。
 
 具体字段和严格类型见 `adapters/runtime/mineru_stream_activation.py`。
+
+`mineru.stream-activation.v2` 在 policy 中显式写入 `algorithm=mineru.stream-policy.v2`，这是唯一可执行的算法。
+冷启动与目标降为 0 后的恢复同一规则：GPU/host 原恢复下限在身份有效、新鲜、已知的样本上连续保持满
+`recovery_seconds` 才到 1，之后每个间隔加一，直到 qualified_max；相邻健康样本间隔超过
+`sample_max_age_seconds` 即重新计时，未观测的空档不计入。不直接从 qualified_max 起步，也不在恢复下限之下试探；
+确认无 provider 工作的低余量记为 `idle_memory_deficit`，目标不变。新 POST 另需 `new_post_allowed`（新鲜、已知、
+安全、目标为正且不在 pause/reduce 带），pre-POST 守卫与协调器新许可共用这一判定；已接受任务的尾部发布/ACK
+在准入为 0 时继续。v1 文件（旧的 qualified start）仍可解码以供审计，worker、campaign 组合与 release binding
+都拒绝执行它，release binding 只产出 v2。
 策略样本年龄不得小于任一数据源允许的年龄，qualified_max 不得超过启动容量 N。
 配置中的 qualified_max 是已验证包络的声明；加载器不为该数字提供实机资格。
 N/P/H、模型和 runtime/owner 变化需要新的完整绑定，不能拿旧文件热改后继续发任务。

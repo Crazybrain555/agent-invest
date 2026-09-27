@@ -1479,18 +1479,19 @@ class DurablePublishSupplement(Base):
 
 
 class ParseRequeueDecision(Base):
-    """Explicit, append-only release of one contract-class parse failure.
+    """Explicit, append-only release of one non-automatic parse failure.
 
-    The failed run stays exactly as it was recorded; this row is the only
-    evidence that an operator judged the cause fixed and re-admitted the
-    document to the parse queue.
+    Contract classes and the managed expired-prepared closure's
+    ``original_key_lifetime`` (0065). The failed run stays exactly as it was
+    recorded; this row is the only evidence that an operator judged the cause
+    fixed and re-admitted the document to the parse queue.
     """
 
     __tablename__ = "parse_requeue_decision"
     __table_args__ = (
         UniqueConstraint("processing_run_id", name="uq_parse_requeue_decision_run"),
         CheckConstraint("decision_id ~ '^prq_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_parse_requeue_decision_id"),
-        CheckConstraint("failure_retry_budget_class IN ('provider_artifact_contract','provider_protocol','provider_runaway','provider_terminal','semantic_route_contract')", name="ck_parse_requeue_decision_class"),
+        CheckConstraint("failure_retry_budget_class IN ('original_key_lifetime','provider_artifact_contract','provider_protocol','provider_runaway','provider_terminal','semantic_route_contract')", name="ck_parse_requeue_decision_class"),
         CheckConstraint("btrim(failure_error_code) <> '' AND btrim(fixed_by) <> '' AND btrim(reason) <> '' AND btrim(decided_by) <> ''", name="ck_parse_requeue_decision_evidence"),
         Index("ix_parse_requeue_decision_document", "document_id", "decided_at"),
         {"schema": OPS_SCHEMA},
@@ -1703,6 +1704,38 @@ class SourceAccess(Base):
         Index("ix_source_access_provider", "provider"),
         Index("ix_source_access_company", "company_id"),
         Index("ix_source_access_security", "security_id"),
+        # 0064: a recovery link exists only on a successful retained-archive
+        # registration, and resolves at most one failed attempt.
+        CheckConstraint(
+            "recovery_of_source_access_id IS NULL OR ("
+            "provider_interface IS NOT DISTINCT FROM 'local:register_retained_pdf.v1' "
+            "AND status = 'ok' AND result_hash IS NOT NULL "
+            "AND company_id IS NOT NULL AND security_id IS NOT NULL "
+            "AND recovery_of_source_access_id <> source_access_id)",
+            name="ck_source_access_recovery_receipt",
+        ),
+        Index(
+            "uq_source_access_successful_recovery",
+            "recovery_of_source_access_id",
+            unique=True,
+            postgresql_where=text("recovery_of_source_access_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "provider_interface IS DISTINCT FROM "
+            "'local:historical_security_binding.v1' OR ("
+            "status = 'ok' AND result_hash IS NOT NULL "
+            "AND company_id IS NOT NULL AND security_id IS NOT NULL "
+            "AND recovery_of_source_access_id IS NULL)",
+            name="ck_source_access_historical_binding",
+        ),
+        Index(
+            "uq_source_access_historical_binding_decision",
+            "result_hash",
+            unique=True,
+            postgresql_where=text(
+                "provider_interface = 'local:historical_security_binding.v1'"
+            ),
+        ),
         {"schema": CORE_SCHEMA},
     )
 
@@ -1727,6 +1760,15 @@ class SourceAccess(Base):
     )
     security_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey(f"{CORE_SCHEMA}.security.security_id"), nullable=True
+    )
+    recovery_of_source_access_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey(
+            f"{CORE_SCHEMA}.source_access.source_access_id",
+            name="fk_source_access_recovery_of",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

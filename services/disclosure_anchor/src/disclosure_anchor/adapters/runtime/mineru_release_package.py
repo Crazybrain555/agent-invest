@@ -20,8 +20,8 @@ from typing import Any
 from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
 from disclosure_anchor.application.contracts.closed_document import canonical_bytes, sha256_of
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig,
-    decode_mineru_capacity_config,
+    AnyMineruCapacityConfig,
+    decode_any_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.mineru_deployment_profile import (
     MineruDeploymentProfile,
@@ -99,7 +99,7 @@ class ReleaseIdentityError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ReleaseInputs:
     capacity_bytes: bytes
-    capacity: MineruCapacityConfig
+    capacity: AnyMineruCapacityConfig
     deployment_profile: MineruDeploymentProfile
     local_profile: MineruLocalWorkerProfile
 
@@ -114,7 +114,7 @@ def load_release_inputs(capacity_path: Path, deployment_path: Path, local_path: 
     try:
         return ReleaseInputs(
             capacity_bytes=capacity_bytes,
-            capacity=decode_mineru_capacity_config(capacity_bytes),
+            capacity=decode_any_mineru_capacity_config(capacity_bytes),
             deployment_profile=decode_mineru_deployment_profile(deployment_bytes),
             local_profile=decode_mineru_local_worker_profile(local_bytes),
         )
@@ -455,7 +455,7 @@ def verify_release_package(package: Path, *, check_active_dependencies: bool = F
     try:
         inputs = ReleaseInputs(
             capacity_bytes=present[CAPACITY_INPUT_PATH],
-            capacity=decode_mineru_capacity_config(present[CAPACITY_INPUT_PATH]),
+            capacity=decode_any_mineru_capacity_config(present[CAPACITY_INPUT_PATH]),
             deployment_profile=decode_mineru_deployment_profile(present[DEPLOYMENT_INPUT_PATH]),
             local_profile=decode_mineru_local_worker_profile(present[LOCAL_INPUT_PATH]),
         )

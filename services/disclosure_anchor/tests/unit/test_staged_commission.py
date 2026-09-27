@@ -30,11 +30,15 @@ class StagedCommissionTests(unittest.TestCase):
         connection = mock.MagicMock()
         connection.execute.return_value.mappings.return_value = []
         self.assertEqual(pending_parse(connection, max_retries=3, limit=2,
-                                      document_ids=("chosen",), after_document_id="before"), [])
+                                      document_ids=("chosen",), after_document_id="before",
+                                      through_document_id="ceiling"), [])
         statement, params = connection.execute.call_args.args
         sql = str(statement)
         self.assertLess(sql.index("ANY(:document_ids)"), sql.index("LIMIT :limit"))
         self.assertLess(sql.index("q.document_id > :after_document_id"), sql.index("LIMIT :limit"))
+        through = [name for name, value in params.items() if value == "ceiling"]
+        self.assertEqual(len(through), 1)
+        self.assertLess(sql.index(":" + through[0]), sql.index("LIMIT :limit"))
         self.assertIn("tc_scope.status = 'active'", sql)
         self.assertEqual(params["document_ids"], ["chosen"])
         self.assertEqual(params["after_document_id"], "before")
@@ -45,10 +49,26 @@ class StagedCommissionTests(unittest.TestCase):
             source = PostgresV4OrdinaryParseCandidateSource(engine=engine, max_retries=3,
                         scope_classes=("annual_report",), admission_document_ids=("chosen",))
             with mock.patch("disclosure_anchor.adapters.db.postgres.staged_new_work_v4.pending_parse", return_value=[]) as query:
-                self.assertEqual(source.list_candidates(after_document_id="before", limit=1).candidates, ())
-            self.assertEqual(query.call_args.kwargs["document_ids"], ("chosen",))
-            self.assertEqual(query.call_args.kwargs["after_document_id"], "before")
-            self.assertEqual(query.call_args.kwargs["limit"], 2)
+                self.assertEqual(source.list_candidates(after_document_id="before", limit=1,
+                                                        through_document_id="ceiling").candidates, ())
+                page = query.call_args.kwargs
+                query.return_value = [{"document_id": "chosen", "status": "registered",
+                                       "failed_parse_count": 0, "last_failed_retryable": None,
+                                       "raw_file_relpath": "raw/chosen.pdf",
+                                       "raw_file_hash": "sha256:" + "a" * 64, "raw_byte_count": 1}]
+                self.assertEqual(source.latest_document_id(), "chosen")
+                ceiling = query.call_args.kwargs
+            self.assertEqual(page["document_ids"], ("chosen",))
+            self.assertEqual(page["after_document_id"], "before")
+            self.assertEqual(page["through_document_id"], "ceiling")
+            self.assertEqual(page["limit"], 2)
+            # The ceiling is the unbounded maximum of the very same eligibility.
+            defaults = {"scope_classes": None, "require_active_company_scope": True, "document_ids": None}
+            self.assertEqual({name: ceiling.get(name, value) for name, value in defaults.items()},
+                             {name: page.get(name, value) for name, value in defaults.items()})
+            self.assertEqual(ceiling["max_retries"], page["max_retries"])
+            self.assertEqual((ceiling.get("after_document_id"), ceiling.get("through_document_id")),
+                             (None, None))
         finally:
             engine.dispose()
 

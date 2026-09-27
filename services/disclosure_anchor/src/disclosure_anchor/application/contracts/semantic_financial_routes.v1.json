@@ -1,6 +1,6 @@
 {
-  "version": "semantic-financial-2026-08-r35",
-  "_about": "受控财务披露主题路由词表。labels 来自证监会财务报告一般规定、年报固定章节与银行定期报告监管章节；授权标准化标题精确命中、闭集候选生成，以及正文中指标名紧接数值或变化结果的 Unit 直接主题。历史、风险、条件、计划和因果属于 L2 模态，不抹掉该主题；无相邻主题证据的宽泛数字仍不授权。任何同 scope 的精确 accepted heading_path 可进入独立 section_keys；context_container_keys 只标识不参与直接主题候选的纯结构容器。",
+  "version": "semantic-financial-2026-08-r36",
+  "_about": "受控财务披露主题路由词表。labels 来自证监会财务报告一般规定、年报固定章节与银行定期报告监管章节；授权标准化标题精确命中、闭集候选生成，以及正文中指标名紧接数值或变化结果的 Unit 直接主题。历史、风险、条件、计划和因果属于 L2 模态，不抹掉该主题；无相邻主题证据的宽泛数字仍不授权。任何同 scope 的精确 accepted heading_path 可进入独立 section_keys；context_container_keys 只标识不参与直接主题候选的纯结构容器。composite_context_labels 的精确标题只投影多个结构 section_keys；composite_direct_labels 的精确标题同时点名多个直接主题（如合并及公司报表是合并与母公司两张报表的共同载体），有正文的 Unit 自身标题命中时每个键都确定性成为 direct route，并同样进入 section_keys。",
   "exclusive_container_keys": [
     "balance_sheet",
     "balance_sheet_parent",
@@ -56,6 +56,22 @@
       "keys": [
         "company_profile",
         "company_profile_metrics"
+      ]
+    }
+  ],
+  "composite_direct_labels": [
+    {
+      "label": "存贷款情况",
+      "keys": [
+        "bank_customer_deposits",
+        "bank_loans_advances"
+      ]
+    },
+    {
+      "label": "存、贷款情况",
+      "keys": [
+        "bank_customer_deposits",
+        "bank_loans_advances"
       ]
     },
     {
@@ -126,22 +142,6 @@
       "keys": [
         "equity_statement",
         "equity_statement_parent"
-      ]
-    }
-  ],
-  "composite_direct_labels": [
-    {
-      "label": "存贷款情况",
-      "keys": [
-        "bank_customer_deposits",
-        "bank_loans_advances"
-      ]
-    },
-    {
-      "label": "存、贷款情况",
-      "keys": [
-        "bank_customer_deposits",
-        "bank_loans_advances"
       ]
     }
   ],

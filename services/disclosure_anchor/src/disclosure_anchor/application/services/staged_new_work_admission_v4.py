@@ -67,6 +67,11 @@ class V4PreparedClaimPort(Protocol):
     def claim_recovery(self, candidate: RecoveryCandidate) -> CoordinatorWork: ...
 
 
+class V4LegacyObligationsPort(Protocol):
+    def require_closed(self) -> None:
+        """Raise ``NewWorkAdmissionUnavailable`` while any legacy obligation is open."""
+
+
 class StagedV4NewWorkAdmitter:
     """Prepared claims progress independently of readiness for new ordinary H0.
 
@@ -86,11 +91,15 @@ class StagedV4NewWorkAdmitter:
         admission_document_ids: tuple[str, ...] | None = None,
         campaign_scope: V4CampaignAdmissionScope | None = None,
         lifecycle_facts: StagedLifecycleFactsPort | None = None,
+        legacy_obligations: V4LegacyObligationsPort | None = None,
     ) -> None:
         if (
             not callable(getattr(prepared_claims, "admit_new", None))
+            or (legacy_obligations is not None
+                and not callable(getattr(legacy_obligations, "require_closed", None)))
             or not callable(getattr(prepared_claims, "claim_recovery", None))
             or not callable(getattr(ordinary_candidates, "list_candidates", None))
+            or not callable(getattr(ordinary_candidates, "latest_document_id", None))
             or any(not callable(getattr(ingress_factory, method, None))
                    for method in ("build", "observation_request", "observe", "source_rejection"))
             or type(ingress) is not DurableStagedIngressV4
@@ -106,6 +115,10 @@ class StagedV4NewWorkAdmitter:
         self._candidate_page_size = candidate_page_size
         self._admission_guard = admission_guard
         self._process_guard = process_guard
+        # A verified local upgrade holds every new H0 (and ordinary-source
+        # rejection) until all of its original obligations are final; prepared
+        # claims of existing heads above keep draining them.
+        self._legacy_obligations = legacy_obligations
         validate_v4_admission_scope(
             admission_document_ids=admission_document_ids, campaign_scope=campaign_scope,
         )
@@ -117,7 +130,13 @@ class StagedV4NewWorkAdmitter:
         self._campaign_scope = campaign_scope
         self._admission_document_ids = admission_document_ids
         self._lifecycle_facts = require_lifecycle_facts_port(lifecycle_facts)
+        # One ordinary pass reads (cursor, bound], with the bound frozen at the
+        # newest eligible ID before its first page. IDs arriving above it wait
+        # for the next pass, so a pass ends even while newer IDs keep arriving;
+        # rows below the cursor are read again from the next pass's start.
+        # Only a completed pass clears both; a bound is the active-pass marker.
         self._after_document_id: str | None = None
+        self._pass_through: str | None = None
         self._scan_blocked_at: dict[str, int] = {}
         self._scan_ineligible: set[str] = set()
         self._prepared_complete = False
@@ -178,7 +197,10 @@ class StagedV4NewWorkAdmitter:
             self._prepared_ineligible = set(prior.ineligible_dimensions)
         selected = list(prior.work)
         durably_claimed = list(prior.work)
-        if self._after_document_id is None and self._ready_observation is None:
+        if self._pass_through is None:
+            # The cursor stays None while an active pass's first candidate is
+            # observed, held for credit, deferred or abandoned; only a missing
+            # bound is a new pass.
             self._scan_blocked_at.clear()
             self._scan_ineligible.clear()
         try:
@@ -189,6 +211,8 @@ class StagedV4NewWorkAdmitter:
                 }
             if len(selected) >= limit:
                 return self._outcome(tuple(selected), remaining=remaining, incomplete=True)
+            if self._legacy_obligations is not None:
+                self._legacy_obligations.require_closed()
             if self._ready_observation is not None:
                 ready = self._ready_observation
                 candidate = ready.request.candidate
@@ -216,6 +240,11 @@ class StagedV4NewWorkAdmitter:
                         )
                     except V4InitialIngressCapacityBlocked as exc:
                         self._record_blocked(exc, remaining)
+                        if not exc.ineligible_dimensions:
+                            # The observation proved the size, even one unknown before it.
+                            # Keep the result and the cursor; build() reruns once credit
+                            # drains, without observing the source again.
+                            return self._outcome(tuple(selected), remaining=remaining, incomplete=True)
                     else:
                         if self._campaign_scope is not None:
                             self._campaign_scope.require_ordinary_document_source(
@@ -239,8 +268,18 @@ class StagedV4NewWorkAdmitter:
                     tuple(selected), remaining=remaining, incomplete=self._observation_has_more,
                 )
             self._admission_guard()
+            through = self._pass_through
+            if through is None:
+                through = self._ordinary_candidates.latest_document_id()
+                if through is None:
+                    # Empty eligible set: the pass is complete without a page read.
+                    return self._outcome(tuple(selected), remaining=remaining, incomplete=False)
+                if type(through) is not str or not through:
+                    raise ValueError("V4 ordinary candidate pass bound is invalid")
+                self._pass_through = through
             page = self._ordinary_candidates.list_candidates(
                 after_document_id=self._after_document_id, limit=self._candidate_page_size,
+                through_document_id=through,
             )
             if len(page.candidates) > self._candidate_page_size or (
                 self._after_document_id is not None and any(
@@ -248,6 +287,8 @@ class StagedV4NewWorkAdmitter:
                 )
             ):
                 raise ValueError("V4 ordinary candidate cursor did not advance within its bound")
+            if any(item.document_id > through for item in page.candidates):
+                raise ValueError("V4 ordinary candidate page exceeded its frozen pass bound")
             for index, candidate in enumerate(page.candidates):
                 self._require_candidate_scope(candidate)
                 try:
@@ -255,8 +296,14 @@ class StagedV4NewWorkAdmitter:
                         candidate, available_credits=remaining,
                     )
                 except V4InitialIngressCapacityBlocked as exc:
-                    self._after_document_id = candidate.document_id
                     self._record_blocked(exc, remaining)
+                    if not exc.ineligible_dimensions and candidate.archived_raw_byte_count is not None:
+                        # A known size that the profile can hold waits for credit
+                        # instead of being passed over: the cursor stays before it,
+                        # so no later ID is admitted first. The next call lists this
+                        # page again, which also rechecks that it is still eligible.
+                        return self._outcome(tuple(selected), remaining=remaining, incomplete=True)
+                    self._after_document_id = candidate.document_id
                     continue
                 if (type(request) is not V4AdmissionObservationRequest
                         or request.candidate != candidate or not request.credits.fits(remaining)):
@@ -295,6 +342,7 @@ class StagedV4NewWorkAdmitter:
     ) -> AdmissionOutcome:
         if not incomplete:
             self._after_document_id = None
+            self._pass_through = None
             incomplete = any(
                 getattr(remaining, name) > available
                 for summary in (self._scan_blocked_at, self._prepared_blocked_at)

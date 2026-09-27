@@ -62,6 +62,10 @@ def _staged_environment() -> dict[str, str]:
         "DISCLOSURE_V4_PROCESS_PROFILE_SHA256": "sha256:" + "d" * 64,
         "DISCLOSURE_V4_ARCHIVE_MEMBER_COUNT_LIMIT": "8192",
         "DISCLOSURE_V4_SECRET_KEYRING_FILE": str(root / "placeholder-keyring.json"),
+        "DISCLOSURE_WORKER_EXECUTION_UPGRADE_FILE": str(root / "upgrade.json"),
+        "DISCLOSURE_WORKER_EXECUTION_UPGRADE_SHA256": "sha256:" + "e" * 64,
+        "DISCLOSURE_WORKER_EXECUTION_UPGRADE_REVIEW_FILE": str(root / "upgrade-review.json"),
+        "DISCLOSURE_WORKER_EXECUTION_UPGRADE_REVIEW_SHA256": "sha256:" + "f" * 64,
         # Unrelated business limits must survive serving-environment isolation.
         "WORKER_BATCH_PARSE": "37",
     }
@@ -140,6 +144,10 @@ class IntegrationRunnerStagedEnvironmentIndependentTests(unittest.TestCase):
             settings.disclosure_mineru_capacity_config_sha256,
             settings.disclosure_mineru_stream_pressure_config,
             settings.disclosure_mineru_stream_pressure_config_sha256,
+            settings.disclosure_worker_execution_upgrade_file,
+            settings.disclosure_worker_execution_upgrade_sha256,
+            settings.disclosure_worker_execution_upgrade_review_file,
+            settings.disclosure_worker_execution_upgrade_review_sha256,
         ):
             self.assertIsNone(value)
         self.assertEqual(settings.worker_parse_execution_mode, "legacy-sync")
@@ -170,6 +178,7 @@ class IntegrationRunnerStagedEnvironmentIndependentTests(unittest.TestCase):
         self.assertIsNone(settings.disclosure_dcgm_metrics_url)
         self.assertIsNone(settings.disclosure_mineru_stream_pressure_config)
         self.assertIsNone(settings.disclosure_mineru_capacity_config)
+        self.assertFalse(any(key.upper().startswith("DISCLOSURE_WORKER_EXECUTION_UPGRADE_") for key in environment))
         self.assertEqual(settings.worker_parse_execution_mode, "legacy-sync")
         self.assertEqual(settings.worker_batch_parse, 37)
         self.assertIsNotNone(settings.disclosure_mineru_bin)

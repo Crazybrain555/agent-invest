@@ -11,6 +11,7 @@ import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
@@ -43,6 +44,9 @@ from disclosure_anchor.adapters.runtime.mineru_orchestrator import (
     MinerUOrchestratorError,
     fetch_mineru_orchestrator_health,
 )
+from disclosure_anchor.adapters.runtime.worker_stop_control import (
+    observe_worker_control,
+)
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.adapters.storage.atomic_publication_artifact_readiness_v4 import (
     FilesystemAtomicPublicationArtifactReadinessV4,
@@ -69,6 +73,11 @@ from disclosure_anchor.application.contracts.semantic_routes import (
 from disclosure_anchor.domain.services.unit_hashing import content_hash_aggregate
 from disclosure_anchor.domain.errors import ParserOutputContractError
 from disclosure_anchor.settings import Settings
+
+if TYPE_CHECKING:
+    from disclosure_anchor.application.contracts.worker_execution_upgrade import (
+        VerifiedQualifiedExecution,
+    )
 
 
 PASS = "PASS"
@@ -391,6 +400,136 @@ def _ops_launchd_check() -> CheckResult:
     return _pass("postgres autostart", f"installed and running: {plist.name}")
 
 
+def worker_execution_upgrade_check(
+    settings: Settings,
+) -> tuple[CheckResult | None, VerifiedQualifiedExecution | None]:
+    """The one reviewed local upgrade, only when configured.
+
+    Exact deployments add no line. A verified upgrade reports the inherited
+    parent qualification (never a new PASS of the current runtime); a v2
+    relation names its Q0 anchor, recovery origin and target separately.
+    """
+
+    if not settings.execution_upgrade_configured:
+        return None, None
+    name = "worker execution qualification"
+    try:
+        from disclosure_anchor.adapters.runtime.mineru_execution_upgrade import (
+            verify_configured_execution_upgrade,
+        )
+
+        execution = verify_configured_execution_upgrade(settings)
+    except Exception as exc:  # noqa: BLE001 - reported, never repaired
+        return _fail(name, f"{type(exc).__name__}: {exc}"), None
+    origin, current = execution.recovery_origin, execution.upgrade.current
+    if origin is not None and execution.qualification_origin == "exact":
+        qualification = execution.qualification_anchor
+        return _pass(
+            name,
+            f"exact (new qualification) contract={execution.upgrade_contract_version} "
+            f"qualified_at={qualification.qualified_at_utc} "
+            f"release={origin.release_manifest_sha256}->{current.release_manifest_sha256} "
+            f"runtime={origin.runtime_identity_sha256}->{current.runtime_identity_sha256} "
+            f"legacy_members={len(execution.inventory.members)} upgrade={execution.upgrade_sha256}",
+        ), execution
+    if origin is not None:
+        anchor = execution.qualification_anchor
+        return _pass(
+            name,
+            f"compatible_parent (inherited) contract={execution.upgrade_contract_version} "
+            f"anchor_qualified_at={anchor.qualified_at_utc} anchor_runtime={anchor.runtime_identity_sha256} "
+            f"release={origin.release_manifest_sha256}->{current.release_manifest_sha256} "
+            f"runtime={origin.runtime_identity_sha256}->{current.runtime_identity_sha256} "
+            f"writer={origin.writer_code_sha256}->{current.writer_code_sha256} "
+            f"upgrade={execution.upgrade_sha256}",
+        ), execution
+    parent = execution.qualification_anchor
+    return _pass(
+        name,
+        f"compatible_parent (inherited) parent_qualified_at={parent.qualified_at_utc} "
+        f"runtime={parent.runtime_identity_sha256}->{current.runtime_identity_sha256} "
+        f"writer={parent.writer_code_sha256}->{current.writer_code_sha256} "
+        f"upgrade={execution.upgrade_sha256}",
+    ), execution
+
+
+def worker_legacy_scope_check(engine: Engine, execution: VerifiedQualifiedExecution) -> CheckResult:
+    """The worker's own READ ONLY scope check; open obligations hold new H0."""
+
+    name = "worker legacy obligations"
+    try:
+        from disclosure_anchor.adapters.db.postgres.staged_upgrade_scope_v4 import (
+            require_legacy_scope,
+        )
+
+        observed = require_legacy_scope(engine, execution)
+    except Exception as exc:  # noqa: BLE001 - reported, never repaired
+        return _fail(name, f"{type(exc).__name__}: {exc}")
+    unresolved = len(observed.unresolved_members)
+    detail = (
+        f"unresolved={unresolved} final={len(observed.closed_members)} "
+        f"total={len(execution.inventory.members)} states={dict(observed.state_counts)} "
+        f"final_states={dict(observed.closed_state_counts)} "
+        f"current_work={len(observed.current_execution_heads)}"
+    )
+    if unresolved:
+        return _warn(name, detail + "; new H0 admission is held until every obligation is final")
+    return _pass(name, detail + "; every obligation is final")
+
+
+def worker_operational_control_check(settings: Settings) -> CheckResult:
+    """Report a public stop even with the DB down; never invent a fault.
+
+    A recorded, invalid or unverifiable stop (files or supervised launchd
+    state) FAILs. A natively disabled or supervisor-held job without a record
+    only WARNs: native state alone has no cause, and it may be ordinary
+    maintenance; the start gate still refuses it.
+    """
+
+    name = "worker operational control"
+    try:
+        snapshot = observe_worker_control(settings)
+    except Exception as exc:  # noqa: BLE001 - an unreadable control plane is a stop
+        return _fail(name, f"CONTROL_UNAVAILABLE ({type(exc).__name__}: {exc})")
+    active = snapshot.active
+    native = snapshot.native
+    if snapshot.state in ("PUBLIC_STOP", "INVALID_STOP", "CONTROL_UNAVAILABLE"):
+        detail = f"{snapshot.state} record={active.status}"
+        if active.sha256 is not None:
+            detail += f" sha256={active.sha256}"
+        if active.problem is not None:
+            detail += f" problem={active.problem}"
+        record = active.record
+        if record is not None:
+            cause = "cause unknown" if record.cause is None else record.cause.summary()
+            detail += (
+                f" origin={record.record_origin} recorded_at={record.recorded_at} {cause} "
+                f"native={record.native_disable.status}"
+            )
+        elif active.status == "absent" and native is not None:
+            detail += (
+                f" launchd {native.service_target or 'unbound'} disabled={native.disabled_detail} "
+                f"print={native.print_detail}"
+            )
+        return _fail(name, detail + "; see `make worker-control-status` and the runbook release procedure")
+    if snapshot.state in ("OPERATOR_DISABLED", "SUPERVISOR_ONLY_STOP"):
+        target = "unknown" if native is None else native.service_target
+        return _warn(
+            name,
+            f"{snapshot.state} for {target} with no stop record; business starts refuse "
+            "until an explicit operator action; check the worker log",
+        )
+    if native is None:
+        return _pass(
+            name, f"no public stop recorded (no native supervisor applies: {snapshot.supervision})",
+        )
+    return _pass(
+        name,
+        f"no public stop recorded; {native.service_target} loaded={native.loaded} "
+        f"running={native.running} last_exit={native.last_exit_code}",
+    )
+
+
 def _reader_database_url_checks(settings: Settings) -> list[CheckResult]:
     if settings.disclosure_reader_database_url is not None:
         return [_pass("DISCLOSURE_READER_DATABASE_URL", "configured")]
@@ -438,6 +577,11 @@ def run_doctor(
     checks.append(mineru_remote_inference_check(settings))
     checks.extend(_disk_headroom_checks(settings))
     checks.append(_ops_launchd_check())
+    # Files and launchd only: a public stop stays visible with the DB down.
+    checks.append(worker_operational_control_check(settings))
+    upgrade_check, execution = worker_execution_upgrade_check(settings)
+    if upgrade_check is not None:
+        checks.append(upgrade_check)
     if settings.database_url is None:
         checks.append(_warn("DATABASE_URL", "missing; DB-backed doctor checks skipped"))
         return DoctorReport(results=tuple(checks))
@@ -465,6 +609,8 @@ def run_doctor(
             )
         )
         checks.extend(_orphan_file_checks(settings, engine))
+        if execution is not None:
+            checks.append(worker_legacy_scope_check(engine, execution))
     except Exception as exc:
         checks.append(_fail("database doctor checks", str(exc)))
     finally:
@@ -1040,8 +1186,27 @@ def _database_consistency_checks(
         from disclosure_anchor.application.worker.queries import (
             build_dead_letter_count,
             degraded_build_count,
+            download_failure_resolution_summary,
             parse_dead_letter_count,
             retrying_build_count,
+        )
+
+        downloads = download_failure_resolution_summary(
+            conn, max_retries=settings.cninfo_max_retries
+        )
+        download_detail = (
+            f"non-retryable failures={downloads['nonretryable_failures']} "
+            f"resolved_by_retained_registration={downloads['resolved_failures']} "
+            f"unresolved={downloads['unresolved_failures']}; "
+            "failure history is retained"
+        )
+        checks.append(
+            _pass("download dead letters", f"none; {download_detail}")
+            if downloads["dead_letter_candidates"] == 0
+            else _warn(
+                "download dead letters",
+                f"candidates={downloads['dead_letter_candidates']}; {download_detail}",
+            )
         )
 
         exhausted_parse = parse_dead_letter_count(

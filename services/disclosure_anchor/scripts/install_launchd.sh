@@ -4,7 +4,36 @@
 # launchd stdout/err live in ~/Library/Logs/agent-invest (internal disk —
 # external volumes are TCC-denied for launchd-spawned processes); the real
 # worker log still lands under $DISCLOSURE_RUNTIME_ROOT/logs.
+#
+# The installer never releases a worker public stop and never implicitly
+# re-enables a disabled label: a recorded/invalid/unverifiable stop refuses
+# with 78, and a disabled label is enabled only with the explicit
+# --confirm-operator-disabled confirmation that it is an ordinary maintenance
+# disable (not a native-only public stop whose record failed).
+#
+# Before any plist or launchd mutation the read-only `worker
+# deployment-preflight` runs the resident worker's own deployment checker (and,
+# in staged-v4, its resolver identity closure and legacy scope); not ready
+# refuses with 78. Pass the provider's deployed idempotency-key lifetime (its
+# key TTL, not task retention) with --prepared-key-ttl-seconds N when
+# never-accepted heads exist; an unknown lifetime is never assumed.
 set -euo pipefail
+CONFIRM_OPERATOR_DISABLED=0
+PREPARED_KEY_TTL_SECONDS=""
+USAGE="usage: $0 [--confirm-operator-disabled] [--prepared-key-ttl-seconds N]"
+while (( $# > 0 )); do
+  case "$1" in
+    --confirm-operator-disabled) CONFIRM_OPERATOR_DISABLED=1 ;;
+    --prepared-key-ttl-seconds)
+      if (( $# < 2 )) || [[ ! "$2" =~ '^[1-9][0-9]*$' ]]; then
+        echo "$USAGE" >&2; exit 64
+      fi
+      PREPARED_KEY_TTL_SECONDS="$2"
+      shift ;;
+    *) echo "$USAGE" >&2; exit 64 ;;
+  esac
+  shift
+done
 PLIST="$HOME/Library/LaunchAgents/com.agentinvest.disclosure-worker.plist"
 LABEL="com.agentinvest.disclosure-worker"
 DOMAIN="gui/$(id -u)"
@@ -29,8 +58,60 @@ source "$ENV_DIR/cninfo.env"
 set +a
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
-PYTHONPATH=src .venv/bin/python -c \
-  'from disclosure_anchor.settings import load_settings; load_settings()'
+PYTHONPATH=src .venv/bin/python - <<'PY'
+from disclosure_anchor.settings import load_settings
+
+settings = load_settings()
+if settings.worker_parse_execution_mode == "staged-v4":
+    from disclosure_anchor.adapters.security.provider_secret_keyring import (
+        load_provider_secret_keyring_from_settings,
+    )
+
+    # Validate the actual private keyring before changing launchd state. Basic
+    # Settings validation alone cannot detect a missing or unreadable key file.
+    load_provider_secret_keyring_from_settings(settings)
+PY
+# The worker start gate would refuse anyway; refuse here, before any plist or
+# launchd mutation, so an install can never look like a release.
+PYTHONPATH=src .venv/bin/python - <<'PY'
+import sys
+
+from disclosure_anchor.adapters.runtime.worker_stop_control import (
+    EXIT_PUBLIC_STOP,
+    require_worker_start_permitted,
+)
+from disclosure_anchor.application.ports.worker_stop_control import (
+    WorkerOperationalStopError,
+)
+from disclosure_anchor.settings import load_settings
+
+try:
+    require_worker_start_permitted(load_settings())
+except WorkerOperationalStopError as exc:
+    if exc.state == "OPERATOR_DISABLED":
+        # No record exists; the disabled label itself is decided below, only
+        # with the explicit --confirm-operator-disabled confirmation.
+        raise SystemExit(0)
+    print(f"refusing to install: {exc}", file=sys.stderr)
+    print("inspect `make worker-control-status`; follow the production runbook "
+          "(repair control storage, or release the exact stop) before installing",
+          file=sys.stderr)
+    raise SystemExit(EXIT_PUBLIC_STOP)
+PY
+# Technical install eligibility, never a start authorization: the resident
+# worker's own static checker in every mode, plus (staged-v4) the resolver
+# identity closure and legacy scope. The worker rechecks under its singleton
+# before any business effect.
+PREFLIGHT_ARGS=(--format terminal)
+if [[ -n "$PREPARED_KEY_TTL_SECONDS" ]]; then
+  PREFLIGHT_ARGS+=(--prepared-key-ttl-seconds "$PREPARED_KEY_TTL_SECONDS")
+fi
+if ! PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.worker \
+    deployment-preflight "${PREFLIGHT_ARGS[@]}"; then
+  echo "refusing to install: the worker deployment preflight is not ready" >&2
+  echo "resolve every BLOCKER above (see the production runbook), then rerun this installer" >&2
+  exit 78
+fi
 mkdir -p "$HOME/Library/Logs/agent-invest"
 disabled_snapshot="$(launchctl print-disabled "$DOMAIN")"
 PRIOR_DISABLED=0
@@ -43,6 +124,15 @@ elif grep -Fq '"'"$LABEL"'" => enabled' <<< "$disabled_snapshot" \
 elif grep -Fq '"'"$LABEL"'" =>' <<< "$disabled_snapshot"; then
   echo "unsupported launchctl disabled state for $LABEL" >&2
   exit 76
+fi
+if (( PRIOR_DISABLED == 1 && CONFIRM_OPERATOR_DISABLED == 0 )); then
+  echo "refusing to re-enable disabled $LABEL implicitly" >&2
+  echo "a public stop whose record failed also leaves only this native disable;" \
+    "check the worker log for STOP_PERSISTENCE_FAILED and reconstruct/release it" \
+    "(make worker-record-circuit-stop, make worker-release-circuit)." >&2
+  echo "if this is an ordinary maintenance disable, rerun with" \
+    "--confirm-operator-disabled" >&2
+  exit 78
 fi
 TMP_PLIST="$(mktemp "${PLIST}.XXXXXX")"
 BACKUP_PLIST="$(mktemp "${PLIST}.backup.XXXXXX")"
@@ -171,8 +261,8 @@ if (( EFFECTIVE_EXIT_TIMEOUT < 60 )); then
   exit 1
 fi
 COMMITTED=1
-echo "installed: $PLIST (KeepAlive adaptive loop; idle backoff 15-30m;" \
-  "fresh worker_progress.v2 observed; stable pid $STABLE_PID;" \
+echo "installed: $PLIST (adaptive loop, restarted only after exit 0;" \
+  "idle backoff 15-30m; fresh worker_progress.v2 observed; stable pid $STABLE_PID;" \
   "exit timeout ${EFFECTIVE_EXIT_TIMEOUT}s effective, 90s requested)"
 echo "launchd log: $HOME/Library/Logs/agent-invest/disclosure-worker.{out,err}"
 echo "worker log:  $DISCLOSURE_RUNTIME_ROOT/logs/worker-YYYYMMDD.log"

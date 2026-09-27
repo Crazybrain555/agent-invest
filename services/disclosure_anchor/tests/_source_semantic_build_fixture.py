@@ -55,7 +55,7 @@ def literal_build_record():
     refresh_literal_hashes(unit)
     return {
         "contract_version": "m6.source-semantic-build.v1", "mode": "service_diagnostic",
-        "semantic_record_sha256": reference, "builder_version": "provider_unit.v23",
+        "semantic_record_sha256": reference, "builder_version": "provider_unit.v24",
         "level_hints": [], "negative_hints": [],
         "build": {"provider_document_sha256": reference, "units": [unit], "unassigned_table_parts": []},
         "quality_occurrences": [{"kind": "source_finding", "unit_index": 0, "finding": finding,

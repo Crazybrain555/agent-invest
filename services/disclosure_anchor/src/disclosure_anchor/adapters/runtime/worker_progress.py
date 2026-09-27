@@ -35,7 +35,7 @@ from disclosure_anchor.application.worker.queries import (
     worker_progress_database_snapshot,
 )
 from disclosure_anchor.settings import Settings
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
 from disclosure_anchor.adapters.runtime.mineru_capacity_config import configured_mineru_capacity
 
@@ -300,7 +300,7 @@ def mineru_api_health_snapshot(
     payload: bytes,
     *,
     expected_task_slots: int | None = None,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
 ) -> dict[str, Any]:
     """Parse the exact MinerU 3.4.4 orchestration health contract."""
 

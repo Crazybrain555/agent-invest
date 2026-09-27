@@ -1,9 +1,11 @@
 """Release one contract-class parse failure back into the parse queue.
 
 Contract-class failures (semantic route, provider protocol/artifact contract,
-provider runaway/terminal) are never retried automatically: the scheduler has
-no way to know that the cause was fixed. This use case records that judgement
-as an append-only decision. The failed run is evidence and is never rewritten.
+provider runaway/terminal) and a managed expired-prepared closure
+(``original_key_lifetime``) are never retried automatically: the scheduler has
+no way to know that the cause was fixed or that a new submission is wanted.
+This use case records that judgement as an append-only decision. The failed run
+is evidence and is never rewritten.
 """
 
 from __future__ import annotations

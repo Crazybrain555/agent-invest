@@ -7,8 +7,8 @@ import re
 
 from disclosure_anchor.application.contracts.provider_document import ProviderDocument
 from disclosure_anchor.application.contracts.provider_source_semantics import (
-    ProviderSourceSemantics, SourcePdfTextObservation, SourceQualityFinding,
-    SourceTextReconciliation,
+    ProviderSourceSemantics, ProviderTextSubstitution, SourcePdfTextObservation,
+    SourceQualityFinding, SourceTextReconciliation, substitute_nul_characters,
 )
 from disclosure_anchor.application.contracts.html_visible_text import html_visible_text
 
@@ -16,13 +16,49 @@ from disclosure_anchor.application.contracts.html_visible_text import html_visib
 def derive_source_semantics(
     *, document: ProviderDocument, observations: tuple[SourcePdfTextObservation, ...]
 ) -> ProviderSourceSemantics:
-    """Derive the existing repair/finding policies from ordered observations."""
+    """Derive repairs/findings from observations, then mark unrepaired U+0000."""
 
     reconciliations = _source_text_reconciliations(document, observations)
     findings = _source_quality_findings(
         document, observations, reconciliations=reconciliations
     )
-    return ProviderSourceSemantics(document, reconciliations, findings)
+    substitutions = _text_substitutions(document, reconciliations=reconciliations)
+    return ProviderSourceSemantics(document, reconciliations, findings, substitutions)
+
+
+def _text_substitutions(
+    document: ProviderDocument,
+    *,
+    reconciliations: tuple[SourceTextReconciliation, ...],
+) -> tuple[ProviderTextSubstitution, ...]:
+    """Mark every U+0000 in every provider payload a native repair left alone.
+
+    Native repairs and findings are derived from the original provider text
+    first, so this marker never changes their evidence or their scope.
+    """
+
+    repaired = {
+        (item.source_index, item.payload_ordinal) for item in reconciliations
+    }
+    substitutions: list[ProviderTextSubstitution] = []
+    for block in document.blocks:
+        for payload_ordinal, payload in enumerate(block.payloads):
+            count = payload.text.count("\x00")
+            if not count or (block.source_index, payload_ordinal) in repaired:
+                continue
+            substituted = substitute_nul_characters(payload.text)
+            substitutions.append(
+                ProviderTextSubstitution(
+                    source_index=block.source_index,
+                    payload_ordinal=payload_ordinal,
+                    raw_block_sha256=block.raw_item_sha256,
+                    provider_text_sha256=_sha256(payload.text.encode("utf-8")),
+                    substituted_text_sha256=_sha256(substituted.encode("utf-8")),
+                    substituted_text=substituted,
+                    occurrence_count=count,
+                )
+            )
+    return tuple(substitutions)
 
 
 def _sha256(payload: bytes) -> str:

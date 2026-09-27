@@ -50,7 +50,7 @@ COPY capacity-config.json /tmp/capacity-config.json
 RUN test "${CAPACITY_CONFIG_SHA256}" = "sha256:$(sha256sum /tmp/capacity-config.json | cut -d ' ' -f 1)" \
     && install -d -o root -g root -m 0755 /usr/local/etc/mineru \
     && install -o root -g root -m 0444 /tmp/capacity-config.json /usr/local/etc/mineru/capacity.json \
-    && /usr/bin/python3.12 -I -c "import sys; from pathlib import Path; from mineru.cli.agent_capacity_file import read_mineru_capacity_file; from mineru.cli.agent_capacity_config import decode_mineru_capacity_config; raw=read_mineru_capacity_file(Path('/usr/local/etc/mineru/capacity.json'),expected_sha256=sys.argv[1],expected_owner_uid=0); decode_mineru_capacity_config(raw)" "${CAPACITY_CONFIG_SHA256}" \
+    && /usr/bin/python3.12 -I -c "import sys; from pathlib import Path; from mineru.cli.agent_capacity_file import read_mineru_capacity_file; from mineru.cli.agent_capacity_config import decode_any_mineru_capacity_config; raw=read_mineru_capacity_file(Path('/usr/local/etc/mineru/capacity.json'),expected_sha256=sys.argv[1],expected_owner_uid=0); decode_any_mineru_capacity_config(raw)" "${CAPACITY_CONFIG_SHA256}" \
     && rm /tmp/capacity-config.json
 ENV MINERU_CAPACITY_CONFIG_PATH=/usr/local/etc/mineru/capacity.json
 ENV MINERU_CAPACITY_CONFIG_SHA256=${CAPACITY_CONFIG_SHA256}

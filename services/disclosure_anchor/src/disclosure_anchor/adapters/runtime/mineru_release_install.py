@@ -30,7 +30,7 @@ from disclosure_anchor.adapters.runtime.mineru_release_package import (
     write_new_json,
 )
 from disclosure_anchor.adapters.runtime.mineru_release_private_binding import ReleasePrivateBinding
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
 from disclosure_anchor.adapters.runtime.resident_owner_control import (
     BoundedOwnerCommand,
@@ -178,7 +178,7 @@ def assert_launchd_jobs_unloaded(labels: tuple[str, ...]) -> dict[str, str]:
 
 
 def assert_idle_capacity_health(
-    payload: bytes, *, expected_capacity: MineruCapacityConfig, task_retention_seconds: int, cleanup_interval_seconds: int,
+    payload: bytes, *, expected_capacity: AnyMineruCapacityConfig, task_retention_seconds: int, cleanup_interval_seconds: int,
 ) -> dict[str, Any]:
     """Closed idle proof: the full explicit-capacity wire health with zero durable responsibility.
 
@@ -207,7 +207,7 @@ def assert_idle_capacity_health(
 
 
 def read_idle_health(
-    api_url: str, *, expected_capacity: MineruCapacityConfig | None, task_retention_seconds: int, cleanup_interval_seconds: int,
+    api_url: str, *, expected_capacity: AnyMineruCapacityConfig | None, task_retention_seconds: int, cleanup_interval_seconds: int,
 ) -> tuple[dict[str, Any], bytes, str]:
     """Return the health sample and which idle proof applied.
 

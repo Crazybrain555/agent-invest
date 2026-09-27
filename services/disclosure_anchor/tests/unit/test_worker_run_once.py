@@ -2978,6 +2978,74 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class CompletedAcquisitionProgressTests(unittest.TestCase):
+    def _download(self, outcomes: list[object]) -> tuple[worker_module.WorkerReport, mock.Mock, mock.Mock]:
+        deps = _deps()
+        heartbeat = mock.Mock()
+        object.__setattr__(deps, "heartbeat", heartbeat)
+        pending = [
+            {"provider_document_id": f"pid-{i}", "candidate": {"provider_document_id": f"pid-{i}"}}
+            for i in range(len(outcomes))
+        ]
+        with (
+            mock.patch.object(worker_module.queries, "pending_downloads", return_value=pending),
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.side_effect = outcomes
+            report = worker_module.WorkerReport(started_at=deps.clock())
+            worker_module._download_stage(
+                report, deps, None, limit=len(outcomes), should_stop=lambda: False,
+            )
+            execute = download_cls.return_value.execute
+        return report, heartbeat, execute
+
+    def test_each_completed_download_outcome_advances_progress_once(self) -> None:
+        failed = mock.Mock(document_id=None, error_code="registration_metadata_error",
+                           quarantine_reason=None, retryable=False)
+        succeeded = mock.Mock(document_id="doc-1")
+        report, heartbeat, execute = self._download([failed, failed, succeeded])
+        self.assertEqual((report.failed, report.downloaded), (2, 1))
+        self.assertEqual(execute.call_count, 3)
+        self.assertEqual(heartbeat.call_count, 3)
+
+    def test_exception_and_early_source_outage_advance_once(self) -> None:
+        report, heartbeat, execute = self._download([
+            RuntimeError("local operation failed"), mock.Mock(document_id="doc-after-error"),
+        ])
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(report.failures[0].error_code, "RuntimeError")
+        self.assertEqual(report.downloaded, 1)
+        self.assertEqual(heartbeat.call_count, 2)
+
+        deadline = mock.Mock(document_id=None, error_code="transfer_deadline_exceeded",
+                             quarantine_reason=None, retryable=True)
+        report, heartbeat, execute = self._download([deadline, mock.Mock(document_id="never")])
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(report.failures[0].error_code, "transfer_deadline_exceeded")
+        self.assertTrue(report.source_outage_break)
+        heartbeat.assert_called_once_with()
+
+    def test_unfinished_download_cannot_advance_progress(self) -> None:
+        deps = _deps()
+        heartbeat = mock.Mock()
+        object.__setattr__(deps, "heartbeat", heartbeat)
+        pending = [{"provider_document_id": "pid-1", "candidate": {"provider_document_id": "pid-1"}}]
+        def execute(_command: object) -> object:
+            heartbeat.assert_not_called()
+            return mock.Mock(document_id=None, error_code="registration_metadata_error",
+                             quarantine_reason=None, retryable=False)
+        with (
+            mock.patch.object(worker_module.queries, "pending_downloads", return_value=pending),
+            mock.patch.object(worker_module, "DownloadDocument") as download_cls,
+        ):
+            download_cls.return_value.execute.side_effect = execute
+            worker_module._download_stage(
+                worker_module.WorkerReport(started_at=deps.clock()), deps, None,
+                limit=1, should_stop=lambda: False,
+            )
+        heartbeat.assert_called_once_with()
+
+
 class SyncStageProtectionTests(unittest.TestCase):
     def _run_sync(
         self, due, *, processing_backlog=0, sync_side_effect=None, backfill_cap=2000
@@ -3039,6 +3107,103 @@ class SyncStageProtectionTests(unittest.TestCase):
         self.assertTrue(report.sync_quota_break)
         self.assertEqual(report.failed, 1)
         sync_cls.return_value.execute.assert_called_once()
+
+    def test_completed_sync_failures_heartbeat_before_early_break(self) -> None:
+        due = [
+            {
+                "tracked_company_id": f"tc_{i}",
+                "company_id": f"co_{i}",
+                "security_id": f"sec_{i}",
+                "security_code": f"00000{i}",
+                "exchange": "SZSE",
+                "window_end": "2026-07-01",
+            }
+            for i in range(1, 4)
+        ]
+        for error_code, expected_break in (
+            ("rate_limited", "sync_rate_limited"),
+            ("http_503", "source_outage_break"),
+        ):
+            with self.subTest(error_code=error_code):
+                deps = _deps()
+                heartbeat = mock.Mock()
+                object.__setattr__(deps, "heartbeat", heartbeat)
+                with (
+                    mock.patch.object(worker_module.queries, "sync_due", return_value=due),
+                    mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
+                ):
+                    sync_cls.return_value.execute.side_effect = SourceRequestError(
+                        "provider unavailable", error_code=error_code, retryable=True
+                    )
+                    report = worker_module.WorkerReport(started_at=deps.clock())
+                    worker_module._sync_stage(
+                        report, deps, None, limit=3, stage_seconds=0,
+                        should_stop=lambda: False,
+                    )
+                self.assertTrue(getattr(report, expected_break))
+                sync_cls.return_value.execute.assert_called_once()
+                heartbeat.assert_called_once_with()
+
+    def test_sync_success_invalid_row_and_local_exception_each_advance_once(self) -> None:
+        deps = _deps()
+        heartbeat = mock.Mock()
+        object.__setattr__(deps, "heartbeat", heartbeat)
+        due = [
+            {"tracked_company_id": "tc_1", "company_id": "co_1", "security_id": "sec_1",
+             "security_code": "000001", "exchange": "SZSE", "window_end": "2026-07-01"},
+            {"tracked_company_id": "tc_2", "company_id": "co_2", "security_id": "sec_2",
+             "security_code": None, "exchange": "SZSE", "window_end": "2026-07-01"},
+            {"tracked_company_id": "tc_3", "company_id": "co_3", "security_id": "sec_3",
+             "security_code": "000003", "exchange": "SZSE", "window_end": "2026-07-01"},
+        ]
+        with (
+            mock.patch.object(worker_module.queries, "sync_due", return_value=due),
+            mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
+        ):
+            sync_cls.return_value.execute.side_effect = [
+                mock.Mock(candidate_count=2), RuntimeError("local sync failure"),
+            ]
+            report = worker_module.WorkerReport(started_at=deps.clock())
+            worker_module._sync_stage(
+                report, deps, None, limit=3, stage_seconds=0,
+                should_stop=lambda: False,
+            )
+        self.assertEqual(sync_cls.return_value.execute.call_count, 2)
+        self.assertEqual((report.synced_companies, report.failed), (1, 2))
+        self.assertEqual(heartbeat.call_count, 3)
+
+    def test_deferred_sync_entry_is_completed_work_but_no_unstarted_heartbeat(self) -> None:
+        deps = _deps()
+        object.__setattr__(deps, "config", replace(
+            deps.config, backfill_max_pending_downloads=1,
+        ))
+        heartbeat = mock.Mock()
+        object.__setattr__(deps, "heartbeat", heartbeat)
+        due = [
+            {"tracked_company_id": "tc_1", "company_id": "co_1", "security_id": "sec_1",
+             "security_code": "000001", "exchange": "SZSE"},
+            {"tracked_company_id": "tc_2", "company_id": "co_2", "security_id": "sec_2",
+             "security_code": "000002", "exchange": "SZSE"},
+        ]
+        stopped = False
+        def should_stop() -> bool:
+            nonlocal stopped
+            if stopped:
+                return True
+            stopped = True
+            return False
+        with (
+            mock.patch.object(worker_module.queries, "sync_due", return_value=due),
+            mock.patch.object(worker_module.queries, "pending_processing_backlog_count", return_value=1),
+            mock.patch.object(worker_module, "SyncDisclosureIndex") as sync_cls,
+        ):
+            report = worker_module.WorkerReport(started_at=deps.clock())
+            worker_module._sync_stage(
+                report, deps, None, limit=2, stage_seconds=0, should_stop=should_stop,
+            )
+        self.assertEqual(report.deferred_backfill, 1)
+        sync_cls.return_value.execute.assert_not_called()
+        heartbeat.assert_called_once_with()
 
     def test_wrapped_retryable_provider_error_is_preserved_for_controller(self) -> None:
         cause = SourceRequestError(

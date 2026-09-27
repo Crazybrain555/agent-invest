@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 import json
 import unittest
+from unittest import mock
 
 import httpx
 
@@ -13,6 +15,8 @@ from disclosure_anchor.adapters.sources.cninfo.client import (
     TokenBucket,
     redact_params,
 )
+from disclosure_anchor.application.ports.file_store import AcquisitionCapacityError
+from tests._pdf_download_fixture import ChunkStream, RecordingSink
 
 
 ACCESS_KEY = "unit-access-key"
@@ -130,26 +134,75 @@ class CninfoClientTests(unittest.TestCase):
         self.assertEqual(api_attempts, 2)
         client.close()
 
-    def test_download_transport_error_is_retried(self) -> None:
-        attempts = 0
+    def test_download_retry_restarts_the_sink_after_a_partial_body(self) -> None:
+        body = b"%PDF-1.4\nsecond attempt\n%%EOF\n"
+        encodings: list[str | None] = []
+        streams = [
+            ChunkStream(b"%PDF-1.4\n", b"stale", b"never sent", fail_at=2),
+            ChunkStream(body[:7], body[7:]),
+        ]
 
         def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal attempts
-            attempts += 1
-            if attempts == 1:
-                raise httpx.ReadError("temporary reset", request=request)
-            return httpx.Response(200, content=b"%PDF-1.4\n%%EOF\n")
+            encodings.append(request.headers.get("Accept-Encoding"))
+            # No Content-Length: only the transport's EOF ends the body.
+            return httpx.Response(200, stream=streams[len(encodings) - 1])
 
         client = _client(handler, sleep=lambda _: None, jitter=lambda _: 0.0)
-
-        payload, _ = client.download_bytes(
+        sink = RecordingSink()
+        transfer, audit = client.download_to(
             provider_interface="cninfo:download_pdf",
             url="https://static.cninfo.example/test.PDF",
+            sink=sink,
         )
-
-        self.assertTrue(payload.startswith(b"%PDF-"))
-        self.assertEqual(attempts, 2)
         client.close()
+
+        self.assertEqual(encodings, ["identity", "identity"])
+        self.assertEqual(sink.declared, [None, None])
+        self.assertEqual([bytes(a) for a in sink.attempts], [b"%PDF-1.4\nstale", body])
+        self.assertEqual((transfer.byte_count, transfer.declared_byte_count), (len(body), None))
+        self.assertEqual(audit.http_status, 200)
+        self.assertTrue(streams[0].closed)
+
+    def test_download_refuses_encoded_misframed_or_unfitting_bodies(self) -> None:
+        body = b"%PDF-1.4\nbody\n%%EOF\n"
+        cases = {
+            # Encoded bytes never reach the sink, not even as a first attempt.
+            "gzip": ({"Content-Encoding": "gzip"}, False, "unsupported_content_encoding", 1),
+            # Short or over-long framing is incomplete: retried, then failed.
+            "short": ({"Content-Length": str(len(body) + 5)}, False, "transport_error", 4),
+            "long": ({"Content-Length": str(len(body) - 5)}, False, "transport_error", 4),
+            # A local capacity verdict is not a provider failure to retry.
+            "no_room": ({}, True, None, 1),
+        }
+        for case, (headers, refuse, error_code, requests) in cases.items():
+            with self.subTest(case=case):
+                streams: list[ChunkStream] = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    streams.append(ChunkStream(body))
+                    return httpx.Response(200, headers=headers, stream=streams[-1])
+
+                client = _client(handler, sleep=lambda _: None, jitter=lambda _: 0.0)
+                sink = RecordingSink(refuse_writes=refuse)
+                expected = AcquisitionCapacityError if refuse else CninfoClientError
+                with self.assertRaises(expected) as raised:
+                    client.download_to(
+                        provider_interface="cninfo:download_pdf",
+                        url="https://static.cninfo.example/test.PDF",
+                        sink=sink,
+                    )
+                client.close()
+                self.assertEqual(len(streams), requests)
+                self.assertTrue(all(stream.closed for stream in streams))
+                if error_code is not None:
+                    self.assertEqual(raised.exception.error_code, error_code)
+                    self.assertTrue(raised.exception.retryable)
+                if case == "gzip":
+                    self.assertEqual(sink.attempts, [])
+                if case == "short":
+                    self.assertEqual([bytes(a) for a in sink.attempts], [body] * requests)
+                if case == "long":
+                    self.assertEqual([bytes(a) for a in sink.attempts], [b""] * requests)
 
     def test_400_is_not_retryable(self) -> None:
         calls = 0
@@ -424,3 +477,138 @@ class AdaptiveTokenBucketTests(unittest.TestCase):
         bucket.on_success()
         # The pre-throttle streak must not carry over.
         self.assertAlmostEqual(bucket.current_qps, 0.25)
+
+
+class _TimedDownload(httpx.SyncByteStream):
+    def __init__(
+        self,
+        advance: Callable[[float], None],
+        chunks: tuple[tuple[float, bytes], ...],
+        *,
+        eof_delay: float = 0.0,
+    ) -> None:
+        self.advance = advance
+        self.chunks = chunks
+        self.eof_delay = eof_delay
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for elapsed, chunk in self.chunks:
+            self.advance(elapsed)
+            yield chunk
+        self.advance(self.eof_delay)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ApiDownloadDeadlineAcceptanceTests(unittest.TestCase):
+    def test_slow_body_expires_and_closes_response_without_bytes(self) -> None:
+        now = 0.0
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+        stream = _TimedDownload(advance, ((900.0, b"%PDF-"), (901.0, b"partial")))
+        attempts = 0
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(200, stream=stream)
+        with mock.patch("disclosure_anchor.adapters.sources.cninfo.client.time.monotonic", side_effect=lambda: now):
+            client = _client(handler, sleep=advance)
+            with self.assertRaises(CninfoClientError) as raised:
+                client.download_bytes(provider_interface="cninfo:download_pdf",
+                                      url="https://static.cninfo.example/test.PDF")
+            client.close()
+        self.assertEqual((raised.exception.error_code, raised.exception.retryable),
+                         ("transfer_deadline_exceeded", True))
+        self.assertEqual(attempts, 1)
+        self.assertTrue(stream.closed)
+
+    def test_late_eof_after_valid_prefix_expires_without_returning_bytes(self) -> None:
+        now = 0.0
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+        chunks = ((0.0, b"%PDF-1.4\n"),) + ((29.9, b"x"),) * 60
+        stream = _TimedDownload(advance, chunks, eof_delay=10.0)
+        attempts = 0
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(200, stream=stream)
+        with mock.patch("disclosure_anchor.adapters.sources.cninfo.client.time.monotonic", side_effect=lambda: now):
+            client = _client(handler, sleep=advance)
+            try:
+                with self.assertRaises(CninfoClientError) as raised:
+                    client.download_bytes(provider_interface="cninfo:download_pdf",
+                                          url="https://static.cninfo.example/test.PDF")
+            finally:
+                client.close()
+        self.assertEqual((raised.exception.error_code, raised.exception.retryable),
+                         ("transfer_deadline_exceeded", True))
+        self.assertGreater(now, 1800.0)
+        self.assertEqual(attempts, 1)
+        self.assertTrue(stream.closed)
+
+    def test_retries_do_not_start_another_request_after_budget(self) -> None:
+        now = 0.0
+        sleeps: list[float] = []
+        def sleep(seconds: float) -> None:
+            nonlocal now
+            sleeps.append(seconds)
+            now += seconds
+        attempts = 0
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                sleep(1799.5)
+            return httpx.Response(503 if attempts == 1 else 200, content=b"%PDF-1.4\n%%EOF\n")
+        with mock.patch("disclosure_anchor.adapters.sources.cninfo.client.time.monotonic", side_effect=lambda: now):
+            client = _client(handler, sleep=sleep, jitter=lambda _: 1.0)
+            with self.assertRaises(CninfoClientError) as raised:
+                client.download_bytes(provider_interface="cninfo:download_pdf",
+                                      url="https://static.cninfo.example/test.PDF")
+            client.close()
+        self.assertEqual(raised.exception.error_code, "transfer_deadline_exceeded")
+        self.assertEqual(attempts, 1)
+        self.assertEqual(sleeps, [1799.5])
+
+    def test_normal_download_keeps_exact_bytes(self) -> None:
+        payload = b"%PDF-1.4\nidentity\n%%EOF\n"
+        stream = _TimedDownload(lambda _: None, ((0, payload[:5]), (0, payload[5:])))
+        client = _client(lambda request: httpx.Response(200, stream=stream),
+                         sleep=lambda _: None)
+        result, audit = client.download_bytes(provider_interface="cninfo:download_pdf",
+                                              url="https://static.cninfo.example/test.PDF")
+        self.assertEqual(result, payload)
+        self.assertEqual(audit.http_status, 200)
+        self.assertTrue(stream.closed)
+        client.close()
+
+    def test_late_retry_clamps_request_read_timeout_to_remaining_budget(self) -> None:
+        now = 0.0
+        attempts = 0
+        seen_timeout: list[float] = []
+        def advance(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                advance(1790.0)
+                return httpx.Response(503)
+            seen_timeout.append(request.extensions["timeout"]["read"])
+            return httpx.Response(200, content=b"%PDF-1.4\n%%EOF\n")
+        with mock.patch("disclosure_anchor.adapters.sources.cninfo.client.time.monotonic", side_effect=lambda: now):
+            client = _client(handler, sleep=advance, jitter=lambda _: 1.0)
+            payload, _ = client.download_bytes(provider_interface="cninfo:download_pdf",
+                                               url="https://static.cninfo.example/test.PDF")
+            client.close()
+        self.assertEqual(payload, b"%PDF-1.4\n%%EOF\n")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len(seen_timeout), 1)
+        self.assertGreater(seen_timeout[0], 0)
+        self.assertLessEqual(seen_timeout[0], 9.0)

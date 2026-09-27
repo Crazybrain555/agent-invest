@@ -25,6 +25,7 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentChecker,
     MinerUDeploymentGateError,
 )
+from disclosure_anchor.adapters.runtime.worker_stop_control import require_worker_start_permitted
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.storage.artifact_store import ArtifactStore
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
@@ -58,6 +59,7 @@ from disclosure_anchor.api.schemas.admin import (
     UntrackCompanyResponse,
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
+from disclosure_anchor.application.ports.worker_stop_control import WorkerOperationalStopError
 from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
@@ -171,7 +173,10 @@ def parse_document(
 
 
 def build_document_units(document_id: str, request: Request) -> BuildUnitsResponse:
-    result = _admin_deps(request).build_units(document_id=document_id)
+    try:
+        result = _admin_deps(request).build_units(document_id=document_id)
+    except WorkerOperationalStopError as exc:
+        raise _worker_stop_unavailable(exc) from exc
     return BuildUnitsResponse(
         processing_run_id=result.processing_run_id,
         unit_build_status=result.status,
@@ -184,10 +189,23 @@ def publish_run(
     request: Request,
     command: PublishRunRequest,
 ) -> PublishRunResponse:
-    return _admin_deps(request).publish_run(
-        processing_run_id=processing_run_id,
-        allow_empty=command.allow_empty,
-        reason=command.reason,
+    try:
+        return _admin_deps(request).publish_run(
+            processing_run_id=processing_run_id,
+            allow_empty=command.allow_empty,
+            reason=command.reason,
+        )
+    except WorkerOperationalStopError as exc:
+        raise _worker_stop_unavailable(exc) from exc
+
+
+def _worker_stop_unavailable(exc: WorkerOperationalStopError) -> FilingApiError:
+    # Content-free: the closed state and record hash only, never paths.
+    suffix = "" if exc.active_sha256 is None else f" ({exc.active_sha256})"
+    return FilingApiError(
+        status_code=503,
+        error_code=SERVICE_UNAVAILABLE,
+        message=f"worker operational control is {exc.state}{suffix}; semantic build/publish is stopped",
     )
 
 
@@ -313,7 +331,7 @@ class AdminDeps:
         self, command: RegisterLocalPdfCommand
     ) -> RegisterLocalPdfResult:
         return RegisterLocalPdf(
-            raw_store=RawDocumentStore(self._paths),
+            raw_store=RawDocumentStore.from_settings(self._paths, self._settings),
             uow_factory=self._uow_factory,
         ).execute(command)
 
@@ -359,6 +377,9 @@ class AdminDeps:
         checker.assert_admission()
 
     def build_units(self, *, document_id: str) -> BuildUnitsResult:
+        # Semantic business composition honors the worker start gate (stop
+        # record, trusted root, supervised label state).
+        require_worker_start_permitted(self._settings)
         semantic = build_semantic_runtime(
             settings=self._settings,
             paths=self._paths,
@@ -383,6 +404,7 @@ class AdminDeps:
         allow_empty: bool,
         reason: str | None,
     ) -> PublishRunResponse:
+        require_worker_start_permitted(self._settings)
         semantic = build_semantic_runtime(
             settings=self._settings,
             paths=self._paths,

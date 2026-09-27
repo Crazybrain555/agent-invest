@@ -99,11 +99,25 @@ class PostgresV4OrdinaryParseCandidateSource:
     def campaign_scope_sha256(self) -> str | None:
         return None if self._campaign_scope is None else self._campaign_scope.scope_sha256
 
+    def latest_document_id(self) -> str | None:
+        with self._engine.connect() as connection:
+            rows = pending_parse(
+                connection,
+                max_retries=self._max_retries,
+                limit=1,
+                scope_classes=self._scope_classes,
+                require_active_company_scope=True,
+                document_ids=self._admission_document_ids,
+                descending=True,
+            )
+        return str(rows[0]["document_id"]) if rows else None
+
     def list_candidates(
         self,
         *,
         after_document_id: str | None,
         limit: int,
+        through_document_id: str | None = None,
     ) -> V4OrdinaryParseCandidatePage:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("V4 candidate page limit must be positive")
@@ -116,6 +130,7 @@ class PostgresV4OrdinaryParseCandidateSource:
                 require_active_company_scope=True,
                 after_document_id=after_document_id,
                 document_ids=self._admission_document_ids,
+                through_document_id=through_document_id,
             )
             visible = rows[:limit]
             if not visible:

@@ -40,7 +40,11 @@ from disclosure_anchor.adapters.runtime.mineru_release_package import (
     VerifyReport,
     write_new_json,
 )
-from disclosure_anchor.adapters.runtime.mineru_stream_activation import load_mineru_stream_activation
+from disclosure_anchor.application.services.mineru_stream_policy import STREAM_POLICY_ALGORITHM_V2
+from disclosure_anchor.adapters.runtime.mineru_stream_activation import (
+    load_mineru_stream_activation,
+    require_executable_stream_activation,
+)
 from disclosure_anchor.application.contracts.closed_document import (
     canonical_bytes,
     load_closed_object,
@@ -53,8 +57,13 @@ from disclosure_anchor.application.contracts.mineru_process_pressure import (
     MineruProcessPressure,
     ProcessPressureOwner,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruCapacityConfigV2,
+    mac_document_disk_upper_bound,
+)
 from disclosure_anchor.application.contracts.mineru_process_profile import (
     EXPLICIT_PROCESS_PROFILE_CONTRACT,
+    RESULT_STORAGE_PROCESS_PROFILE_CONTRACT,
     MineruProcessProfile,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
@@ -404,10 +413,43 @@ def assert_structurally_bindable(report: VerifyReport) -> None:
         raise ReleaseIdentityError("local stream ceiling exceeds the capacity nonterminal depth P")
     if deployment.api_memory_limit_bytes is None:
         raise ReleaseIdentityError("binding requires an explicit API memory limit in the deployment profile")
-    if capacity.result_reservation_bytes * capacity.total_nonterminal_limit > capacity.max_unacked_result_bytes:
+    if isinstance(capacity, MineruCapacityConfigV2):
+        _require_storage_ceilings(capacity, local.process_ceilings)
+    elif capacity.result_reservation_bytes * capacity.total_nonterminal_limit > capacity.max_unacked_result_bytes:
         raise ReleaseIdentityError(
             "capacity is not bindable on the Mac: the process-profile contract requires B*P <= L "
             "(API build legality is only B <= L); this release cannot be called fully runnable"
+        )
+
+
+def _require_storage_ceilings(capacity: MineruCapacityConfigV2, ceilings: Any) -> None:
+    """The root-chosen Mac ceilings must hold one maximal result-storage document.
+
+    No value is derived here: a release whose ceilings cannot cash the storage
+    policy's own maximal grant is refused instead of silently clamped.
+    """
+    policy = capacity.result_storage
+    per_document_disk = mac_document_disk_upper_bound(
+        policy, policy.native_result_hard_limit_bytes, policy.native_source_single_limit_bytes,
+    )
+    failures = []
+    if ceilings.source_pdf_bytes_limit != policy.source_pdf_bytes_limit:
+        failures.append("source_pdf_bytes_limit")
+    if ceilings.temporary_disk_bytes_limit < per_document_disk:
+        failures.append("temporary_disk_bytes_limit")
+    if ceilings.decoded_payload_bytes_limit < policy.mac_decode_working_set_budget_bytes:
+        failures.append("decoded_payload_bytes_limit")
+    if ceilings.terminal_output_bytes_limit < (
+        policy.native_source_single_limit_bytes + policy.mac_decode_working_set_budget_bytes
+    ):
+        failures.append("terminal_output_bytes_limit")
+    # Disk ceilings live on the Mac work volume: none may exceed its quota D.
+    for name in ("temporary_disk_bytes_limit", "terminal_output_bytes_limit"):
+        if getattr(ceilings, name) > policy.mac_work_disk_limit_bytes:
+            failures.append(name + " above the Mac work quota")
+    if failures:
+        raise ReleaseIdentityError(
+            "Mac process ceilings cannot hold one maximal result-storage grant: " + ", ".join(failures)
         )
 
 
@@ -452,8 +494,11 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
     declared = deployment.inference_declared_defaults
     ceilings = local.process_ceilings
     effective_ratio = 1 if ceilings.hybrid_ocr_override else capacity.hybrid_batch_ratio_requested
+    storage_managed = isinstance(capacity, MineruCapacityConfigV2)
     return MineruProcessProfile(
-        contract_version=EXPLICIT_PROCESS_PROFILE_CONTRACT,
+        contract_version=(
+            RESULT_STORAGE_PROCESS_PROFILE_CONTRACT if storage_managed else EXPLICIT_PROCESS_PROFILE_CONTRACT
+        ),
         runtime_bundle_identity_sha256=identity,
         orchestrator_image_identity_sha256=str(orchestrator["container_image_digest"]),
         inference_image_identity_sha256=str(inference["container_image_digest"]),
@@ -488,8 +533,12 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
         vllm_enable_prefix_caching=declared.vllm_enable_prefix_caching,
         pipeline_inference_locks=capacity.pipeline_inference_locks,
         finalizer_slots=capacity.finalizer_active_limit,
-        result_reservation_bytes=capacity.result_reservation_bytes,
-        max_unacked_result_bytes=capacity.max_unacked_result_bytes,
+        result_reservation_bytes=(
+            None if isinstance(capacity, MineruCapacityConfigV2) else capacity.result_reservation_bytes
+        ),
+        max_unacked_result_bytes=(
+            None if isinstance(capacity, MineruCapacityConfigV2) else capacity.max_unacked_result_bytes
+        ),
         source_pdf_bytes_limit=ceilings.source_pdf_bytes_limit,
         resident_pages_limit=ceilings.resident_pages_limit,
         rasterized_page_bytes_limit=ceilings.rasterized_page_bytes_limit,
@@ -506,6 +555,9 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
         host_runtime_memory_limit_bytes=live.vm_total_bytes,
         task_retention_seconds=deployment.api_task_retention_seconds,
         task_cleanup_interval_seconds=deployment.api_task_cleanup_interval_seconds,
+        result_storage_policy_sha256=(
+            capacity.result_storage.sha256 if isinstance(capacity, MineruCapacityConfigV2) else None
+        ),
     )
 
 
@@ -521,9 +573,12 @@ def build_activation(report: VerifyReport, identity: str, live: LiveIdentity, gp
             "gpu_pause_bytes", "gpu_reduce_bytes", "gpu_recover_bytes", "host_pause_bytes", "host_recover_bytes",
             "sample_max_age_seconds", "missing_pause_seconds", "recovery_seconds", "reduction_interval_seconds",
         )},
+        # A new release binds the executable algorithm explicitly; a v1 file
+        # would claim the superseded qualified-start rule.
+        "algorithm": STREAM_POLICY_ALGORITHM_V2,
     }
     return {
-        "schema": "mineru.stream-activation.v1",
+        "schema": "mineru.stream-activation.v2",
         "runtime_identity_sha256": identity,
         "capacity_config_sha256": capacity.sha256,
         "owner": live.owner,
@@ -635,6 +690,10 @@ def bind_release(
     )
     if loaded_profile.sha256 != profile.sha256 or loaded_activation is None:
         raise ReleaseIdentityError("bound artifacts did not reload through the product loaders")
+    try:
+        require_executable_stream_activation(loaded_activation)
+    except ValueError as exc:
+        raise ReleaseIdentityError(str(exc)) from exc
     local = report.inputs.local_profile
     overlay = {
         "WORKER_PARSE_EXECUTION_MODE": "staged-v4",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -134,6 +135,14 @@ class SemanticAdjudicationGroupCachePort(Protocol):
     def put(self, entry: SemanticAdjudicationCacheEntry) -> None: ...
 
 
+# Routing validation of one group's decoded decisions.  It raises
+# SemanticRouteContractError when the decisions cannot become receipts for the
+# requested group (SemanticDecisionCoverageError when they do not name exactly
+# the requested Units); the executor runs it before any cache write and on every
+# cache hit, so only routable results are cached or reused.
+SemanticDecisionValidator = Callable[[tuple[SemanticAdjudicationDecision, ...]], None]
+
+
 class SemanticAdjudicationExecutorPort(Protocol):
     @property
     def provider_identities(self) -> tuple[SemanticProviderIdentity, ...]: ...
@@ -144,6 +153,7 @@ class SemanticAdjudicationExecutorPort(Protocol):
         *,
         group_hash: str,
         stage_guard: SemanticExecutionGuard | None = None,
+        validate: SemanticDecisionValidator | None = None,
     ) -> SemanticAdjudicationOutcome: ...
 
 
@@ -182,6 +192,7 @@ __all__ = [
     "SemanticAdjudicationOutcome",
     "SemanticAdjudicatorIdentity",
     "SemanticAdjudicatorAdapterPort",
+    "SemanticDecisionValidator",
     "SemanticProviderResult",
     "SemanticRouteAdjudicatorPort",
     "SemanticRouteAdjudicatorError",

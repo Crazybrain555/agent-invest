@@ -14,6 +14,9 @@ class StreamPressureSample:
 
     Missing required input is unknown. Evidence keeps the original per-lane
     timestamps and errors; the policy never substitutes zeros for them.
+
+    ``provider_nonterminal_tasks`` is the validated API health's durable
+    nonterminal count. ``None`` means unknown and is never read as idle.
     """
 
     sequence: int
@@ -27,6 +30,7 @@ class StreamPressureSample:
     http_pending: int | None
     unknown_reason: str | None = None
     unsafe_reason: str | None = None
+    provider_nonterminal_tasks: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.sequence) is not int or self.sequence < 0:
@@ -36,7 +40,8 @@ class StreamPressureSample:
         for value in (self.runtime_identity_sha256, self.owner_identity_sha256, self.evidence_sha256):
             if type(value) is not str or re.fullmatch(r"sha256:[a-f0-9]{64}", value) is None:
                 raise ValueError("stream sample identity is invalid")
-        for measurement in (self.gpu_free_bytes, self.host_available_bytes, self.http_active, self.http_pending):
+        for measurement in (self.gpu_free_bytes, self.host_available_bytes, self.http_active, self.http_pending,
+                            self.provider_nonterminal_tasks):
             if measurement is not None and (type(measurement) is not int or measurement < 0):
                 raise ValueError("stream pressure value is invalid")
         for reason in (self.unknown_reason, self.unsafe_reason):

@@ -13,6 +13,9 @@ from disclosure_anchor.adapters.db.postgres.classification_refresh import (
     refresh_document_classification,
 )
 from disclosure_anchor.adapters.db.postgres.schema import APP_ROLE
+from disclosure_anchor.adapters.db.postgres.staged_new_work_v4 import (
+    PostgresV4OrdinaryParseCandidateSource,
+)
 from disclosure_anchor.adapters.db.postgres.unit_of_work import SqlAlchemyUnitOfWork
 from disclosure_anchor.adapters.runtime.doctor import parse_requeue_checks
 from disclosure_anchor.application.use_cases.parse_requeue import (
@@ -1036,6 +1039,32 @@ class OpsQueueViewTests(unittest.TestCase):
             txn.rollback()
             conn.close()
 
+    def test_requeue_class_check_admits_the_key_lifetime_closure_only(self) -> None:
+        # 0065 widens 0063's closed class set by exactly the managed
+        # expired-prepared closure's class; an unknown class is still refused
+        # by that CHECK (not merely by the one-decision-per-run UNIQUE).
+        conn = self.engine.connect()
+        txn = conn.begin()
+        try:
+            document_id = self._insert_document(conn, status="parse_failed")
+            closed_run = self._insert_run(conn, document_id, status="failed", error={
+                **_CONTRACT_FAILURE, "stage": "managed_closure", "error_code": "original_key_expired",
+                "retry_budget_class": "original_key_lifetime",
+            })
+            unknown_run = self._insert_run(conn, document_id, status="failed", error=_CONTRACT_FAILURE)
+            conn.execute(text(f'SET ROLE "{APP_ROLE}"'))
+            self._insert_decision(conn, document_id, closed_run, retry_budget_class="original_key_lifetime")
+            savepoint = conn.begin_nested()
+            with self.assertRaises(IntegrityError) as refused:
+                self._insert_decision(conn, document_id, unknown_run, retry_budget_class="deterministic")
+            savepoint.rollback()
+            self.assertEqual(
+                refused.exception.orig.diag.constraint_name, "ck_parse_requeue_decision_class",
+            )
+        finally:
+            txn.rollback()
+            conn.close()
+
     def test_parse_requeue_use_case_appends_one_decision_per_failed_run(self) -> None:
         with self.engine.begin() as conn:
             document_id = self._insert_document(conn, status="parse_failed")
@@ -1188,6 +1217,102 @@ class OpsQueueViewTests(unittest.TestCase):
         self.assertNotIn(document_id, {row["document_id"] for row in after_rows})
         self.assertTrue(all(row["document_id"] > document_id for row in after_rows))
         self.assertEqual([row["document_id"] for row in exact_rows], [document_id])
+
+    def test_pass_ceiling_and_through_pages_share_the_parse_predicate(self) -> None:
+        """A frozen ordinary pass bound neither widens nor narrows eligibility."""
+
+        self.company_id = f"co_qv{self.suffix}"
+        self.tracked_id = f"trk_qv{self.suffix}"
+        non_retryable_error = {
+            "stage": "parse",
+            "error_code": "X",
+            "retryable": False,
+            "retry_budget_class": "item",
+        }
+        item_error = {
+            "stage": "parse",
+            "error_code": "T",
+            "retryable": True,
+            "retry_budget_class": "item",
+        }
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:company_id, :legal_name)"
+                ),
+                {
+                    "company_id": self.company_id,
+                    "legal_name": f"pass ceiling {self.suffix}",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status) "
+                    "VALUES (:tracked_id, :company_id, 'active')"
+                ),
+                {"tracked_id": self.tracked_id, "company_id": self.company_id},
+            )
+            # ID order: low < non_retryable < middle < exhausted < company_high.
+            low = self._insert_document(conn)
+            non_retryable = self._insert_document(conn, status="parse_failed")
+            middle = self._insert_document(conn)
+            exhausted = self._insert_document(conn, status="parse_failed")
+            company_high = self._insert_document(conn, company_id=self.company_id)
+            self._insert_run(
+                conn, non_retryable, status="failed", error=non_retryable_error
+            )
+            for _ in range(3):
+                self._insert_run(conn, exhausted, status="failed", error=item_error)
+        arrival_id = f"doc_qv{self.suffix}{len(self.doc_ids)}"
+        allowlist = (*self.doc_ids, arrival_id)
+        source = PostgresV4OrdinaryParseCandidateSource(
+            engine=self.engine,
+            max_retries=3,
+            scope_classes=None,
+            admission_document_ids=allowlist,
+        )
+        active_ceiling = source.latest_document_id()
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE disclosure_core.tracked_company "
+                    "SET status = 'paused' WHERE tracked_company_id = :tracked_id"
+                ),
+                {"tracked_id": self.tracked_id},
+            )
+        ceiling = source.latest_document_id()
+        with self.engine.begin() as conn:
+            arrival = self._insert_document(conn)
+
+            def eligible(limit: int = 500000, **bounds: str) -> list[str]:
+                return [
+                    row["document_id"]
+                    for row in queries.pending_parse(
+                        conn,
+                        max_retries=3,
+                        limit=limit,
+                        document_ids=allowlist,
+                        **bounds,
+                    )
+                ]
+
+            unbounded = eligible()
+            frozen = eligible(through_document_id=ceiling)
+            bounded = eligible(after_document_id=low, through_document_id=ceiling)
+            first_eligible = eligible(
+                limit=1, after_document_id=low, through_document_id=arrival
+            )
+
+        self.assertEqual(arrival, arrival_id)
+        self.assertEqual(active_ceiling, company_high)
+        self.assertEqual(ceiling, middle)
+        self.assertEqual(unbounded, [low, middle, arrival])
+        self.assertEqual(frozen, [low, middle])
+        self.assertEqual(bounded, [middle])
+        self.assertEqual(first_eligible, [middle])
+        self.assertEqual(source.latest_document_id(), arrival)
 
     def test_processing_backlog_counts_download_and_all_raw_parse_work(self) -> None:
         """GPU outage pressure cannot disappear as downloads become raw files."""

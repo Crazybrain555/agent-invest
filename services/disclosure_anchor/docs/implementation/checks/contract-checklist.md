@@ -809,3 +809,397 @@ processing_run.error 键集合、outbox 事件形状、change_event 契约不变
 重排，上限为既有 item<max_retries、item+infrastructure<5×max_retries（默认 15），跨重启计数，失败 run 不改写。
 部署：先 Mac worker 再 Windows API 镜像（patcher 与 task protocol 源码哈希、镜像身份变化，需要走原发布/资格链）。
 ```
+
+2026-09-24（F5 worker 公共故障持久停止与显式放行）——public view/change feed/migration/公共数据契约不变：
+
+```text
+新增私有 ops 合同（运行根 control 文件，不入 DB、不入 Git）：worker-circuit-stop.v1（scope worker-operational-control，
+record_origin automatic_fault|operator_reconstructed；闭合 cause = kind/reason_code/origin/exception_class/
+exception_fingerprint + 派发时 attempt/lane/state/lifecycle_version/claim_generation/claim_owner + 至多 16 个 provider
+attempt 的身份/结果/原因/cache key；worker pid/started_at；profile/runtime 指纹；native_disable 状态/细节/目标），
+worker-circuit-release.v1（released_stop_sha256/decided_by/reason/fixed_by/decided_at），归档按原字节
+worker-circuit-stop.<sha256hex>.json。目录 0700、文件 0600；记录身份是原始字节 SHA-256，不自哈希；不含异常原文、
+提示词、模型输出、Unit 文本、环境或凭据。
+CLI：worker status 的 stdout 形状不变，存在公共停止/无效/不可信 control 时先在 stderr 报 STOPPED 并退出 3；新增
+worker status --control-only [--format json]（worker-operational-control.v1，不连 DB/MinerU/模型，RUNNABLE→0 否则 3），
+worker release-circuit --expect-sha256 --decided-by --reason --fixed-by [--dry-run]（0/3 拒绝/75 忙），
+worker record-circuit-stop --from-disabled --evidence --evidence-sha256 --decided-by --reason [--dry-run]。
+worker loop|once 在任何 DB/MinerU 之前检查停止，拒绝时 78；loop 拿不到单例锁由 0 改为 75（once 仍 0）；公共故障 78；
+纯操作员 TERM/INT 无故障 0；watchdog 70 不变。pipeline build-units|publish|process|rebuild-units 与
+scripts/generate_current_source_replay.py 在停止时以 78 拒绝；admin API build/publish 返回既有 503 SERVICE_UNAVAILABLE
+（消息只含状态与记录 SHA，不含路径），其余 admin 行为不变。
+Coordinator：CoordinatorResult 追加可选 stop_cause/termination_kind（位置构造兼容）；StageLeaseLost 追加 provenance
+（默认 unspecified，位置消息不变）；StageLeaseGuard.revoke 可带 provenance。执行器先按闭合 reason 分类：failed_closed
+在任何 guard checkpoint 前以原类型抛出；cancelled/availability 仍先检查 guard。
+launchd：worker plist RunAtLoad=true，KeepAlive={SuccessfulExit=true}，ThrottleInterval=30，ExitTimeOut=90，
+EnvironmentVariables.DISCLOSURE_WORKER_LAUNCHD_LABEL；无 PathState/WatchPaths/QueueDirectories/StartInterval。
+install_launchd.sh 在停止/无效/不可信时 78 拒绝，disabled label 需 --confirm-operator-disabled 才 enable（预检只把
+OPERATOR_DISABLED 交给该确认）；make worker-restart 需 control RUNNABLE。doctor 新增 worker operational control 行。
+启动门（所有上述入口共用 require_worker_start_permitted）：latch → 活动记录 → 仅当无记录且 macOS 上
+DISCLOSURE_RUNTIME_ROOT == 新设置 DISCLOSURE_WORKER_SUPERVISED_RUNTIME_ROOT（默认生产 runtime 根）时读回
+label（DISCLOSURE_WORKER_LAUNCHD_LABEL 或生产 label）三态：已知 disabled→OPERATOR_DISABLED、未知→CONTROL_UNAVAILABLE，
+均拒绝；已知 enabled 且非“loaded/未运行/上次 78”才 RUNNABLE（否则 SUPERVISOR_ONLY_STOP 拒绝）。未 loaded 只认 print
+退出 113 + stderr `Could not find service "<label>"`；last exit 按前导整数解析（`78: EX_CONFIG`）。其它根与非 macOS
+不调用 launchctl。runtime 根须 lstat 非 symlink、属 worker uid、组/他人不可写；受监督根另须与挂载 sentinel 同设备。
+worker-operational-control.v1 JSON 追加 supervision（supervised|not_macos|unsupervised_runtime_root）；native_supervisor
+字段为 service_target/available/disabled/disabled_detail/loaded/running/pid/last_exit_code/print_detail/closure
+（closed|running|unknown，null=未知）。release 要求可证明收尾：launchd 未知/运行中、进程表不可读或已知 owned 进程存活→75，
+保持停止；dry-run 追加 supervision/native_closure/process_closure。record-circuit-stop 仅限 macOS 受监督根。
+原生 disable 与启动门共用同一绑定 worker_supervision：仅 macOS 受监督根、对其绑定 label，launchd 或操作员启动相同；
+不再比较 XPC_SERVICE_NAME（原生验收 18/18 个 launchd 子进程为 "0"）。生产 label 只与生产 runtime 根互相绑定，其它配对
+为 supervision=label_root_mismatch：不调用 launchctl、原生状态未知（CONTROL_UNAVAILABLE 拒绝，release 收尾未知），停止
+记录 native_disable=failed:label_root_mismatch；无监督根记录 failed:unsupervised_runtime_root|failed:not_macos（取代
+not_supervised_launchd_job/supervisor_target_unconfigured）。RuntimeWorkerStopControl.for_settings 的 environ= 改为
+supervision=，删除 supervised_launchd_label。
+Coordinator 重试 episode：新增 StageWaiting 子类 StageProviderWaiting（仅 V4 backend 在权威 status pending/processing
+且 runaway 检查之后抛出），清零本 attempt 的 retry 次数与首失败时间；常量、退避、runaway 与全局软熔断不变。retry 耗尽
+错误行追加 (attempts=n/max, elapsed=s/window s, last=<已识别固定字面量|unrecognized sha256:…>, causes=<类型名链>
+[, http_status=nnn])，不含异常原文。worker loop 公共停止时 stderr 输出一行 `[staged-v4] <协调器错误>`（恢复 F5 前的
+可见性）；terminal 进度行 `[staged-v4]` 追加 UTC ISO 秒级时间戳（jsonl 形状不变）。
+语义子进程边界（codex_cli._run_process，Codex/Claude 共用）：清理失败不再以 PermissionError 覆盖原取消/故障（原先被
+适配器当作 executable_unavailable 而降级发布）；EPERM 只在本调用已回收 leader 且 signal-0 探测为 ESRCH 时视为进程组
+已结束。无法证明时仍抛原异常并附 note、stderr 一行 `[semantic-process] …`、stage note process_ended 追加
+closure=unproven，仍存活的 leader 保持登记；关停 sweep 不再抛出，只报告未能发信号且仍在运行的子进程。
+设计 docs/implementation/design/worker-operational-stop.md、worker-dynamic-scheduling.md；运维 runbook §1.1f。独立回归
+测试与 scratch/原生 launchd 验收由独立作者与 root 另行执行，本条不宣称其已通过。
+```
+
+2026-09-25（本地执行升级 U01 与只读部署预检）——public view/change feed/migration/公共数据契约与 API 不变：
+
+```text
+新增私有 ops 合同（运行者私有文件，不入 DB、不入 Git；全部 closed JSON，未知/缺失字段拒绝，SHA-256 为文件原字节）：
+worker-execution-release.v1（E1：source_revision、writer_code_sha256=W1〔沿用 42 成员算法〕、worker_python_version、
+worker_package_set_sha256、files[path,sha256,bytes] 排序唯一；范围固定为 src/disclosure_anchor/**、scripts/*、scripts/launchd/**，
+排除 __pycache__/*.pyc/.DS_Store，symlink/非普通文件拒绝）；worker-legacy-scope-inventory.v1（全部 current V4 head 的
+attempt/document/run/generation/fence/H0/spec/source/target/request/runtime/key/submission_epoch/P/WP/观测状态·版本·checkpoint/
+accepted sha，无能力明文；存在 non-current prepared V4 行时拒绝捕获）；worker-local-execution-upgrade.v1
+（transition_kind=local_operational_compatible；parent_qualification R0/W0/Q0 三文件 SHA/P0 文件+SHA/WP0/A0 文件+SHA/
+qualified_at_utc=canary 原 passed_at_utc/service_epoch；current_execution E1 文件+SHA/revision/W1/M1 文件+SHA/R1/P1/WP1/
+容量/A1；compatibility_basis 三个审计引用；legacy_scope 文件+SHA+成员数）；worker-local-execution-upgrade-review.v1
+（verdict=GO、proposal_sha256=提案文件 SHA、reviewer/decision 引用）；worker-deployment-preflight.v1（只读报告）；
+worker-execution-boot-receipt.v1（每次 resident 启动一份，$DISCLOSURE_RUNTIME_ROOT/reports/execution-boot/<owner>.json，
+create-only 0600，绑定 owner/pid/启动时间/U01/审阅/E1/W0·W1/R0·R1/P0·P1/WP0·WP1/容量/A1/父资格日期/清单/观测范围，只作证据）。
+E1 范围以已加载包的位置为根：__pycache__ 之外的字节码（SourcelessFileLoader 可无源导入）、scripts/ 下未知子目录、
+symlink/非普通文件一律拒绝而非跳过；第三方依赖以解释器分发包名+版本集合绑定，不按字节。
+Settings：DISCLOSURE_WORKER_EXECUTION_UPGRADE_FILE/_SHA256、DISCLOSURE_WORKER_EXECUTION_UPGRADE_REVIEW_FILE/_SHA256，
+四值同设或同空；缺省时 exact 路径（profile 精确相等、writer drift 拒绝、stream guard runtime）逐字节不变。
+Gate：verify_mineru_deployment_gate/MinerUDeploymentChecker 追加 accept_execution_upgrade=False；配置 U01 时只有
+resident worker loop、worker deployment-preflight、doctor 接受，其余入口（once/pipeline/admin/commission/campaign/recover）拒绝；
+VerifiedMinerUDeployment 追加 qualification_origin（exact|compatible_parent）与 execution；compatible_parent 时
+runtime_identity=R1、canary_passed_at_utc=Q0 原值，年龄/缓存/held-out/容量/策略按真实时钟重验。read_owner_only_evidence
+与 ParentQualificationExpectation 导出；_load_evidence 行为与错误文案不变。
+边界：ProductionV4StageInputResolver(legacy_execution=)、inspect_frozen_identity（无 claim 的同一 H0 闭包，只读）；
+RemoteSubmissionCommandV4.legacy_authorization（默认 None，compare=False，不持久化）；MinerUHttpRemoteV4(legacy_execution=)
+在 before_send 核对授权并以 R1 调用 stream guard，原请求字节/key 不改写；StagedV4NewWorkAdmitter(legacy_obligations=)
+在普通扫描前抛 LegacyObligationsOpen（NewWorkAdmissionUnavailable）直到清单成员全部终结；build_staged_worker_v4_runtime
+(verified_execution=) 仅 unscoped resident 且须等于组合出的 P1/WP1/R1/容量/A1；RemoteParseV4Repository 追加只读
+observe() 与 count_staged_prepared_heads()。POST 授权在边界处与清单成员重新比对 fence/H0/spec/source/request/key/P0；
+成员进度要求捕获前缀 history[0..v] 连续且 previous_checkpoint_sha256 逐级相连；清单外的未决 head：任一清单成员
+仍未终结时一律拒绝（过早的新工作，即使绑定 E1）；全部终结后只有精确绑定 E1 的 WP1/P1/R1 才允许，重启无需移除 U01。
+CLI：worker deployment-preflight [--format json|terminal] [--prepared-key-ttl-seconds N]（0 就绪/78 未就绪/64 参数；
+control 停止/无效/不可读时在 checker、DB 与原生探测之前即拒绝；legacy-sync 模式只跑 resident checker）；
+python -m disclosure_anchor.cli.execution_upgrade release-manifest|derive|legacy-scope|propose（0/64/65/70，stdout 一个
+JSON，只新建 0600 文件）。install_launchd.sh 接受 --prepared-key-ttl-seconds N，在 F5 停止预检之后、任何 plist/enable/
+bootstrap 之前运行预检，未就绪 78 且零 launchd 变更（沙箱中无 MinerU 证据时安装器因此在 bootstrap 前拒绝）。
+F5：新增 reason_code execution_upgrade_scope_failed（kind startup_fatal、origin startup_recovery），在单例下、依赖/
+报告/恢复/维护之前的 E1 与清单复核失败时记录；DB 传输层错误非零退出不记停止。doctor 仅在配置 U01 时追加
+worker execution qualification 与 worker legacy obligations 两行。未实现：过期未投递 prepared 的重投分支（待 root 的
+实际 TTL 证据）。设计 docs/implementation/design/local-execution-upgrade.md；运维 runbook §1.1g。独立回归测试与
+scratch/原生验收由独立作者与 root 另行执行，本条不宣称其已通过。
+```
+
+2026-09-25（provider_unit.v24 / locator v10 U+0000 标记、发布文本可表示性兜底、U01 v2 三角色升级）——migration/public view 列/API/change feed 形状不变：
+
+```text
+内容策略 provider_text_nul_substitution.v1：PostgreSQL TEXT/JSONB 不能存 U+0000，provider 丢失的原字符不可证明，
+因此 admission 有效视图在 native 校正之后、Unit 哈希之前，把每个未被 native 校正替换的 payload 中的每个 U+0000
+一对一换成 U+FFFD；其余字符（字面 `\u0000`、TAB/LF/CR/SOH/DEL、U+FFFD/U+FFFE/U+FFFF、扩展汉字、emoji）逐字保留，
+ProviderDocument/MinerU artifact/PDF/已封存请求不改写。ProviderTextSubstitution（source_index、payload_ordinal、
+raw_block_sha256、provider_text_sha256、substituted_text_sha256、substituted_text、occurrence_count、policy）挂在
+ProviderSourceSemantics / AdmittedProviderDocument.text_substitutions；校验要求有序唯一、与 reconciliation 身份不相交、
+hash/次数/逐字替换闭合，且覆盖每个未被校正的含 U+0000 payload（缺、多、改一律拒绝）；可与 native finding 同身份并存。
+native reconciliation/finding 的推导、作用域与 v1-v9 不变量不变；校正文本仍含 U+0000 时由下述 gate 拒绝。
+document_units_v1.artifact_locator：依赖标记的 Unit 为 provider_unit_locator.v10 = v9 全部字段 + 非空 text_substitutions
+（每条 7 个字段：source_index、payload_ordinal、raw_block_sha256、provider_text_sha256、substituted_text_sha256、
+occurrence_count、policy，不含正文）；其余 Unit 仍为逐字节不变的 v9。v10 必须非空、v1-v9 不得含该键；挂载规则与
+reconciliation 相同（本 Unit blocks ∪ heading chain ∪ continuation fragments），builder 验证每条恰被依赖它的 Unit 覆盖。
+quality_status：被标记文本出现在 title、heading_path（含祖先标题，其后代同样）或 part owner block payload 时为
+needs_review；evidence-only（page frame 等）只留记录不标记；逻辑表 continuation 不能携带非空 payload，因此含 U+0000 的
+下一页表块不会被隐藏为 continuation。私有质量 occurrence 新增 kind=text_substitution（reason_id
+text_substitution:provider_text_nul_substitution.v1，携带上述 7 字段）。builder_rules_version = provider_unit.v24；
+已封存 V4 preparation 只重开不重建，按其请求中的原版本（如 v23）发布。m6.source-semantic-record.v1 字节不变（标记由
+记录中的 provider document 纯推导，严格 decoder 重算到 DecodedSourceSemanticRecord.text_substitutions）；
+m6.source-semantic-build.v1 接受当前 v9/v10 locator、固定当前 builder 版本（v24 之前的 build 记录需重生）；source
+comparison 在 finding_binding 下单列 locator_text_substitutions；M6 verifier 的 source_admission 追加
+text_substitution_count。
+发布前兜底 publication_text_representability.v1（纯函数，build_or_reopen 之后、readiness/事务 P 之前、前后各一次
+stage guard checkpoint）：只读已闭合 V4 请求的 title、heading_path、canonical_payload_json（一次解码，含键）中的实际
+U+0000/孤立代理 → PublicationTextUnrepresentableError；control 字段（semantic_keys、section_keys、artifact_locator、
+processing-run projection 持久化字段）出现同类字符 → 既有 WholeDocumentPublicationV4Error（worker 停止）。不改写/
+规范化/重算任何字节；诊断为有界 ASCII：`publication_text_representability.v1: request=<sha> findings=N occurrences=M
+shown=K; unit=U field=title|heading_path|payload [path=/…] [in=key] codepoint=U+XXXX count=C`，路径段数组为十进制下标、
+对象键一律为排序序号 `#n`（不含键文本或 hash），最多 12 条、≤4096 字符。COMMIT lane 只把该 typed 错误映射到既有
+FailureReceiptV4：error_code publication_text_unrepresentable、error_class PublicationTextUnrepresentableError、
+outcome local_failure、error_stage commit、retryable=false、retry_budget_class provider_artifact_contract（0063 的
+parse-requeue 闭集合内），message = safe_summary；随后既有 cleanup/ACK → local_failed。未知 DataError/hash/IO/
+integrity/fence 仍按原路径停止。v24 构建的 NUL 文档不会触发它；可达角色是 v24 之前已封存的请求与校正文本残留 U+0000。
+U01 v2（worker-local-execution-upgrade.v2，v1 编码/解码/校验/文案不变）：qualification_anchor（v1 parent 字段集，
+Q0 原 qualified_at/期限按真实时钟复验）、recovery_origin（release_manifest_file/sha256、source_revision、
+writer_code_sha256、runtime_bundle_file/sha256、runtime_identity_sha256、process_profile_file/sha256、
+worker_profile_sha256、capacity_config_sha256、stream_activation_file/sha256，全部由归档文件按自身 pin 重算、不与当前
+树比较）、current_execution（target）、compatibility_basis、legacy_scope。构造要求 target release ≠ origin release、
+容量相同。两条直接关系：Q0→target 与 origin→target 均为同一计算（manifest 只允许 writer 不同，writer 也可不变），
+P/WP/A 只移动其 runtime/profile 引用；清单成员绑定 origin 的 R/P/WP（v1 仍绑定 parent），anchor 永不进入成员证明。
+新 H0 屏障仍按清单成员 attempt_id：全部成员终结（含合法 local_failed）前拒绝，与 target R 是否等于 origin R 无关。
+decode_execution_upgrade 按 contract_version 精确分派；VerifiedQualifiedExecution 追加 upgrade_contract_version、
+qualification_anchor、recovery_origin、member_* 身份，v2 summary 用 anchor_*/origin_*/无前缀 target 键（v1 summary
+仅追加 upgrade_contract_version）。worker-execution-boot-receipt.v2 写入 v2 summary 全部身份与 scope；preflight 终端
+v2 分三行列出 qualification anchor/recovery origin/target；LegacyScopeObservation 追加 closed_state_counts（按终态
+计数，boot receipt scope、worker 日志 final_states=、doctor 行同步）。CLI：propose --contract-version v1|v2（v2 需
+--anchor-process-profile/--anchor-activation/--origin-release-manifest/--origin-runtime-bundle/--origin-process-profile/
+--origin-activation，混用 v1/v2 角色参数为用法错误 64）；derive --contract-version v1|v2（v2 用 --anchor-*，并允许
+target 保持 Q0 writer；v1 仍要求 writer 变化；输出追加 contract_version，v2 键名为 anchor_*/target_*）。
+设计 docs/implementation/design/local-execution-upgrade.md、provider-source-semantics.md，架构 service-purpose §7.2，
+运维 runbook。独立测试、scratch PostgreSQL 与生产恢复由独立作者与 root 执行，本条不宣称其已通过。
+```
+
+2026-09-25（staged-v4 普通准入有限扫描轮次与容量等待）——migration/public view/API/change feed/公共数据契约不变：
+
+```text
+私有端口 V4OrdinaryParseCandidateSourcePort 追加 latest_document_id()（当前合格集最大 document_id，空集为 None）与
+list_candidates(through_document_id=None)（闭区间上界）；queries.pending_parse 追加可选 through_document_id（含）与
+descending=False，二者与 after_document_id、document_ids、scope/active-company/重试谓词同在 LIMIT 前；其他调用方
+（ingress 事务内资格复核、源拒绝、doctor、legacy worker、parse_admission_diagnosis）用默认参数，SQL 不变。
+PostgresV4OrdinaryParseCandidateSource.latest_document_id 以同一 max_retries/scope_classes/allowlist 调用
+pending_parse(limit=1, descending=True)；campaign 全 carry-in（空 allowlist）不发 SQL。
+StagedV4NewWorkAdmitter 以本轮上界作为唯一“进行中”标记：无上界时，在 legacy gate 与 admission guard 之后、首页之前
+取 latest_document_id 冻结上界（None 即本轮完成、不发页查询；非空字符串以外 fail closed "pass bound is invalid"）。
+每页 fail closed：条数 <= 页大小、全部 > 游标（原文案 "cursor did not advance within its bound"）、全部 <= 上界
+（"page exceeded its frozen pass bound"）。只有 _outcome(incomplete=False)（上界内读完、ready 候选为本轮最后一个、
+或合格集为空）同时清空游标与上界；容量等待、observation 等待/放弃、NewWorkAdmissionUnavailable（readiness/legacy
+obligations）与 prepared claims 未完成均保留本轮上界与游标。
+容量等待：页内 observation_request 抛 V4InitialIngressCapacityBlocked、ineligible_dimensions 为空且候选
+archived_raw_byte_count 非空时，记录 blocked 维度后返回 scan_incomplete=True，游标停在该候选之前；下一次调用按原
+游标与上界重列并重检。ready 观察结果的 build() 抛同类临时阻塞时（不论归档大小原本是否已知）保留 _ready_observation
+与游标，返回 scan_incomplete=True，下一次调用只重跑 build()。ineligible_dimensions 非空（含观察后页数派生维度）、
+ready 源为 V4SourcePdfOverLimit、或观察前大小未知时仍记录后越过。每轮 blocked/ineligible 汇总改为“无上界”时
+重置：容量等待记录阻塞而游标不前进，旧的“游标为空”条件会在首候选等待期间每次调用清空本轮汇总。构造器要求
+ordinary_candidates 同时提供 list_candidates 与 latest_document_id。不新增字段、构造参数、时钟、超时、信用缓存、
+持久状态、队列或 migration，重启即新一轮；AdmissionOutcome 形状与 coordinator 不变，等待期间每个调度 tick 至多
+重列一页。prepared claims 优先（放不下的 prepared head 仍越过）、legacy barrier、admission guard、
+commissioning/campaign scope、事务内 H0 资格/身份复核、容量向量、profile、parser 与 NUL 策略不变。
+保证：持续到达的更高 ID 不再使一轮没有终点，游标之下变为合格的行最迟下一轮被重新检查；已知大小、profile 装得下的
+候选临时放不下时不被越过，其后 ID 不先于它准入。不保证：固定等待时长或持续满载（进展以在途工作继续完成、释放信用
+为条件，等待期间利用率可能下降）；观察前大小未知、按整个字节预算计费观察的 PDF 的有限时间准入。
+设计 docs/implementation/design/worker-dynamic-scheduling.md §10；里程碑 08 §3。独立测试（含既有 fake 候选源的
+端口适配）与 scratch PostgreSQL 由 root 另行编写和执行，本条不宣称其已通过。
+```
+
+2026-09-26（0064 历史证券绑定与保留原件登记）——public view/API 列与 change feed 事件词表不变:
+
+```text
+disclosure_core.source_access 追加可空 recovery_of_source_access_id（FK→source_access RESTRICT），CHECK 限定非空时
+provider_interface IS NOT DISTINCT FROM local:register_retained_pdf.v1（可空接口为 NULL 时 CHECK 失败，不以 UNKNOWN 放行）、
+status=ok、result_hash/company/security 非空且不自指，部分 UNIQUE
+一条失败至多一个成功回执；绑定行 local:historical_security_binding.v1 以 CHECK 封闭形态、result_hash 部分 UNIQUE。
+既有行全部为 NULL，不回填、不改写；0023 原字节不变，downgrade 逐字恢复 0023 pending_download_v1。
+新私有 ops 视图 download_failure_resolution_v1（仅 app SELECT）：失败下载的 nonretryable 与 resolved_by（唯一成功回执且
+Document provider/pid/raw hash/company/security 一致）。pending_download_v1 以 CREATE OR REPLACE 重建、列不变，终态排除改为
+「存在未解决的不可重试失败」；failed_download_count 与 CNINFO_MAX_RETRIES 语义不变。queries.download_dead_letter_count、
+legacy SourceAccessRepository._terminal_download_failure 与 doctor `download dead letters` 读同一视图；health
+queues.download_dead_letters 字段不变，已被回执解决的失败不再计入。
+security.status 新值 historical：只能由具名绑定创建；SubjectResolver 与 RegisterLocalPdf 遇之拒绝
+（HistoricalSecurityBindingRequiredError，不改 identifier 状态）；下载经 resolve_acquisition_subject 的证据链使用。
+closed contracts（application/contracts/historical_security_registration.py）：historical-security-binding.v1、
+historical-security-binding-plan.v1、retained-registration-request.v1、retained-registration-plan.v1；回执快照段
+acquisition_provenance（historical-acquisition-provenance.v1）与 retained_registration（retained-archive-registration.v1）。
+计划 raw_file_relpath 为闭合六段归档路径（pid 段与归档路径构造器同一规则，拒绝空、./../点开头、/、\、控制/格式/
+未分配字符；文件名=raw hash）；execute 另要求其等于由重验候选代码/公告年/pid/hash 推出的本条归档路径，并核对计划全部谱系
+字段。回执“同一义务”在 preview/execute/读回/reconcile 用同一判定，与 download_failure_resolution_v1 的解决关系一致
+（失败行、recovery_of、同 provider、成功保留原件接口、同 pid、Document 一致）。原件读取打开前拒绝非普通文件，O_NONBLOCK
+打开后 fstat 复核类型与身份，FIFO 不阻塞。
+可恢复失败闭集 {registration_metadata_error}；扩集合需新契约。
+索引 snapshot 追加 identity_context（query_profile_org_id/query_profile_source_access_id，仅有候选时）与候选
+candidate_provider_org_id；候选旧 provider_org_id 仍为查询 profile 投影；空 snapshot 形态与 result_hash 规则不变。
+下载失败记录追加 error.failure_phase、query_params.index_source_access_id（已知时）、result_snapshot.candidate_sha256 与
+archive{archive_completed[, raw_file_relpath, raw_file_hash, byte_count, raw_created]}；result_hash 仍为 null。
+DownloadDocumentCommand 追加 index_source_access_id；SourceAccessRepository.list_pending_download_candidates 返回
+PendingDownloadCandidate（映射视图 + index_source_access_id）。register_document 的普通调用输出不变。
+CLI python -m disclosure_anchor.cli.source_recovery（make source-recovery ARGS=...）：binding-preview/binding-execute/
+replay-preview/replay-execute/reconcile；计划为规范 JSON，按 --expect-sha256 与 recovery 代码摘要执行，输出不覆盖，
+0=完成、1=拒绝/停止。设计 docs/implementation/design/historical-security-retained-registration.md；运维 runbook §5.5。
+application/worker/queries.py 在 MinerU writer 指纹内，发布须走既有兼容/资格预检。独立测试与 scratch PostgreSQL 由
+root 另派作者编写执行，本条不宣称其已通过。
+```
+
+2026-09-26（router v105 / taxonomy r66 / prompt v34：合并及公司报表两个报表键均为 direct route；路由校验先于缓存写入并在命中时复验）——public view/API/change feed、receipt 版本与 migration 不变:
+
+```text
+semantic_router.v104 → v105；semantic-taxonomy-2026-08-r65 → r66（semantic-financial r35 → r36，仍 199 条 financial 路由；event r49 不变）；
+semantic_route_adjudication.v33 → v34。
+1. taxonomy：10 个“合并和公司/银行{资产负债表,利润表,现金流量表,所有者权益变动表,股东权益变动表}”标签从 composite_context_labels
+   原序移到 composite_direct_labels，别名不变；另两个 context composite（公司治理、环境和社会；公司简介和主要财务指标）不动。
+   有正文 Unit 的自身标题精确命中（及/和、编号、（续）归一化后）时两个报表键都以 source_heading_exact 锁定，确定性 receipt 为
+   (合并, 母公司)，不调模型；heading-only Unit 仍只得 section_keys；_section_keys 对两类 composite 读法相同，所有 Unit 的
+   section_keys 不变。静态测试：同一规范化标签对应 ≥2 个 exclusive 键时必须是键集相同的 direct composite（当前恰为这 10 个）。
+2. router：_validate_decision 由“多个 exclusive 容器不能并存”改为“exclusive 容器不能与非容器 route 并存”，每个容器仍须有
+   source_heading_exact；_canonicalize_decision 选中任一容器时保留全部被选容器（候选顺序）并去掉行项目。Midea 2025Q3 第 10 页
+   合并及公司现金流量表（Unit 15）的真实双选答案不再被拒；合并及公司资产负债表 + 正文“资产负债表（续）”不再只落母公司。
+3. executor：SemanticAdjudicationExecutorPort.adjudicate 增加可选 validate（SemanticDecisionValidator），router 每次传入组校验
+   （Unit 覆盖、规范化、逐 Unit 规则）。新答案在写缓存前校验：失败为该次调用的 failed_closed attempt（provider_call_ended
+   记 failed_closed），不写缓存、不切备用；决策未恰好覆盖所请求 Unit（新类型 SemanticDecisionCoverageError）保持原
+   invalid_contract 类，其余为 invalid_decision。缓存命中先校验：失败为同形 attempt（该条目 cache_key），无 provider 调用、
+   不记 cache_hit、不隔离也不改写条目，stage note 为 cache_hit_invalid。校验器的其他异常原样抛出；不传 validate 的调用方
+   行为不变。m6 只读 verifier 的拒绝型 executor 只补签名。
+4. prompt：第 5 条删去“exclusive 候选必须是唯一 route”，改为选中容器时全部 route 须为容器，仅当 Unit 标题同时点名多个载体
+   时可多选；第 2 条补上组合标题这一锁定来源。prompt_sha256 与缓存身份随之变化。
+兼容：r65/v104 receipt 在当前 router 下按既有规则报 router/taxonomy stale（与 r64 → r65 相同）；V4 在 commit 时新路由，已封存
+请求按原字节回放；r65 缓存目录（含被拒条目 fb001911…）不再被读取，也不删除。已发布 Unit 原样保留：设计复审 2026-09-26 的只读
+公共视图普查为 55 个合并及公司报表 Unit（49 个有正文：46 个 []、3 个 ["balance_sheet_parent"]），重标需逐文档
+rebuild-units，不在本次范围。
+验证：tests/unit/test_semantic_router.py（composite 列表与静态不变量；10 个标签 × {原样, 编号+（续）} 的确定性双键、
+section_keys 与回放；单一报表标题负例；合成 taxonomy 的模型路径多容器规范化与容器+行项目篡改 receipt）、
+tests/unit/test_semantic_adjudication.py（切备用后被拒、缓存命中被拒、Unit 覆盖错误、校验器异常）、tests/unit/test_semantic_codex_cli.py
+（prompt 第 5 条）；独立测试 test_semantic_enrichment_policy_independent.py 与 test_semantic_adjudication_validation_independent.py。
+```
+
+2026-09-27（大文档结果存储 capacity v2 / 阶段 grant / 可续传 spool / 新合格运行时升级；候选，未部署）——public view、Filing API、change feed 与 migration 不变:
+
+```text
+新增/升版（旧版本字节、解码与校验不变，不重解释旧 B/credit 记录）：
+- mineru.capacity-config.v2（v1 计算字段 + 嵌套 mineru.result-storage-policy.v1，取代 B/L）；mineru.process-profile.v3
+  （B/L 为 null，绑定 result_storage_policy_sha256）；原生 mineru-task-runtime.v4 / mineru-task-registry.v4 /
+  mineru.capacity-observation.v2（result_storage 账本）/ mineru.task-storage.v1 / mineru.task-storage-status.v1 /
+  mineru.result-inventory.v1；Mac staged-resource-credit-policy.v3（v2 字节与 SHA 不变）、remote-terminal-receipt.v5、
+  remote-parse-materialization-intent.v5、stage-resource-grant.v1（可选 execution_upgrade_sha256/execution_spec_sha256，
+  缺省时不进 canonical 字节）、mineru-v4-spool-owner.v2、mineru.stream-activation.v2 / mineru.stream-policy.v2、
+  worker-qualified-runtime-upgrade.v1、worker-legacy-key-lookup.v1、worker-execution-boot-receipt.v3。
+原生 API（仅 capacity v2 进程；v1 进程生成代码行为不变）：
+- POST /tasks：读体前要求唯一 Content-Length（411 content_length_required），超过 source_pdf_bytes_limit+64 KiB 为
+  413 source_upload_too_large，容量不足为闭合 429 {"detail":{"code":"storage_capacity_wait","reason":...}}，均不读体；
+  multipart spool 与上传副本一次计费，spool 位于输出卷；只接受单一上传（400 storage_managed_single_upload）。
+- GET /tasks/{id}：status 增加闭合 storage 信封；hold 任务保持 processing 且可见，不失败、不 ACK。
+- GET /tasks/{id}/result：强 ETag = 结果 SHA-256；Range/If-Range 由 Starlette FileResponse 处理（206/200/416）。
+- 未提供 storage-release 路由（放弃不是续作）；超出硬包络的 hold 本阶段不承诺自动恢复。hold 原因闭合集合新增
+  tree_integrity（路径/根/叶身份拒绝，与容量耗尽 hard_envelope_exceeded 区分；解析器吞掉的拒绝同样 hold，不封存）。
+Mac：存储绑定读方要求 storage 信封（旧读方仍拒绝）；closed 429 storage_capacity_wait 经原 key 查询 404 后为健康
+StageWaiting，普通 429/未知 POST 仍走原失败语义；grant/传输/解码 hold 为 StageCapacityBlocked（可见，不失败）；
+Mac 工作卷总量须等于策略值，实时余量不足以覆盖下限+在途承诺时为同一 attempt 的等待；v5 LOCAL 在解码后、改写 staging 前
+与提升前检查 stage 截止；release binding 拒绝超过 Mac 配额 D 的临时盘/输出上限。
+CLI：python -m disclosure_anchor.cli.execution_upgrade 新增 legacy-key-lookups（只读 GET）与 propose-qualified；
+execution_upgrade 其余子命令与 U01 v1/v2 合同不变。
+策略校验：C 必须容纳硬结果的物理 completion 计费（physical_charge(hard) = 分配单元取整 + 每文件开销 ≤ C），而不只
+是逻辑 hard ≤ C；原生账本按物理计费对 P + C 预留 completion，源可恰好填满 P。
+合格升级 POST 边界：VerifiedQualifiedExecution.require_submission(command, proof, *, now_unix) 对 qualified 升级以批准的
+key 寿命与传输墙钟在 POST 发出前复核（now − submission_epoch_unix ≥ TTL 即拒绝，缺时钟即拒绝）；查询命中任务的对账
+不经此检查；U01 v1/v2 无批准寿命，行为不变。拒绝时 head 保持 reconciling、协调器可见停止，不失败、不 POST、不换 key；
+过期 key 的结案见下文受管入口。
+容量 hold 与 F5：Mac 对原生 storage_blocked、spool_* 完整性 hold 与任何账本都装不下的 grant 以 coordinator_circuit
+首因公共停止（reason native_storage_hold / transfer_integrity_hold / stage_grant_unsatisfiable），decode/传输预算 hold
+保持单 attempt，只有它们自己占满限额为正的账本维度时停止（capacity_holds_exhausted）；不失败、不 cleanup、不 ACK。
+RemoteProviderWaitingV4 的 hold 须恰为闭合原生 hold 原因（NATIVE_STORAGE_HOLD_REASONS，线缆解码器复用）。
+原生 hold 操作员决定：POST /agent/storage-holds/{task_id}（仅操作员；执行与 Mac worker 不调用）preview →
+mineru.storage-hold-preview.v1（含 preview_sha256），execute(expected_preview_sha256, decided_by, reason, fixed_by)
+→ mineru.storage-hold-decision-receipt.v1；task failure cause 新增闭合码 storage_hold_terminated（附 hold_reason、
+decision_sha256，retry_class permanent），原生校验与 Mac 解码器同步；Mac 失败为 provider_storage_hold_terminated /
+provider_terminal。操作员门（路由与 worker 共用隧道 origin）：先要求 Authorization: Bearer，比对容器内登记的
+mineru.storage-hold-operator.v1（/run/agent-invest-operator/storage-hold-operator.json，只存凭据 sha256，0700/0600，
+非 bind mount，enroll_storage_hold_operator / revoke_storage_hold_operator 经 docker exec），常数时间比较摘要；
+未登记或登记不安全 403 storage_hold_operator_disabled / storage_hold_operator_misconfigured，缺失/畸形/错误凭据 401
+storage_hold_operator_unauthorized（WWW-Authenticate: Bearer），均在读请求体与任何 registry 读取之前；之后
+Content-Length > 16384 → 413，请求体分块读取、超过 16 KiB 即 413。Mac CLI：python -m
+disclosure_anchor.cli.storage_hold operator-verifier|preview|execute，preview/execute 必须 --operator-token-file
+（本人所有 0600、一行 43–128 个 URL 安全字符，不来自 settings/环境变量，错误信息不含凭据），operator-verifier
+只打印 credential_sha256、不连 DB/网络（receipt disclosure.storage-hold-preview.v1 /
+disclosure.storage-hold-decision.v1，不覆盖、同决定重放同字节）。
+过期 prepared 受管结案：worker-expired-prepared-closure-plan.v1（固定清单、origin、实际 TTL、成员 H0/key/过期时刻、
+仍有效成员）；CLI python -m disclosure_anchor.cli.expired_prepared_closure preview|execute（receipt
+worker-expired-prepared-closure-receipt.v1）；失败 original_key_expired / original_key_lifetime / error_stage
+managed_closure，经既有 pre_submission_failure → cleanup_pending → pre_submission_failed 与最终失败提交。execute 逐
+成员各自持久 CAS 提交，无批量事务：后面成员被拒时前面成员已结案，同一计划与决定重跑安全续做。结案从不排队；
+放行是既有显式 parse-requeue 决定（0065 起接受 original_key_lifetime，见下条）。public view、Filing API 与 change
+feed 不变。
+设计：docs/implementation/design/mineru-result-storage.md、local-execution-upgrade.md（Qualified result runtime upgrade）、
+mineru-stream-admission.md（v2 算法）。未执行：Windows PowerShell 安装/采集/健康检查、原生实机 Range、scratch
+PostgreSQL、真实 PDF/GPU；独立测试与最终门由 root 执行，本条不宣称已通过部署资格。
+```
+
+2026-09-27（0065 显式 parse-requeue 接受受管过期 prepared 结案类）——public view/API/change feed 不变:
+
+```text
+只增 revision 0065_requeue_key_lifetime（down_revision 0064_retained_registration）在一条 ALTER TABLE 内替换
+disclosure_ops.parse_requeue_decision 的 ck_parse_requeue_decision_class：0063 的五个契约类原样保留，只加
+original_key_lifetime（受管过期 prepared 结案写入的重试类，错误码 original_key_expired）。ORM CheckConstraint 与
+RELEASABLE_PARSE_RETRY_BUDGET_CLASSES 同步为同一六类闭集合；未知/畸形类仍被合同与 DB CHECK 同时拒绝，自动类
+（item/infrastructure/neutral）仍不需要也不接受决定。不加表、不加列、不改授权、不改任何行或视图；队列与 doctor
+共用的 PARSE_UNRELEASED_CONTRACT_FAILURE_SQL 本来就排除所有非自动类直到有指名该 run 的决定，因此不变——结案 run
+在决定之前留在队列外，决定只放行它指名的那一次失败，结案本身从不自动放行。downgrade 在已有 original_key_lifetime
+决定时报错（不删除、不改写），否则恢复 0063 的逐字 CHECK。0063/0064 不改。测试：tests/unit/test_migration_state.py
+（0063 逐字恢复、ORM/合同一致、升降级语句与降级守卫）、tests/unit/test_parse_requeue.py（该类 dry-run/记录/失败 run
+不变）、tests/integration/test_ops_queue_views.py（CHECK 接受该类且以 ck_parse_requeue_decision_class 拒绝未知类）。
+未执行：scratch PostgreSQL 迁移与集成测试、生产 make migrate / 结案 / 重排（root 授权）。
+```
+
+2026-09-27（大文档资源生命周期更正：重活许可、工作配额 D、私有发布包络、原生 hold 决定原文；候选，未部署）——public
+view、Filing API、change feed 与 migration 不变:
+
+```text
+协调器：CoordinatorLimits 新增 heavy_work_permits（正整数，默认 1）、work_disk_bytes（None 或正整数）、
+work_disk_margin_bytes（非负）；capacity v2 组合为 mac_work_disk_limit_bytes 与 mac_work_file_margin_bytes(policy)
+= (max_members + 8) × 4096。work_disk_footprint(credits, margin) = snapshot + max(temp_disk, compressed + output)
++ margin（无占用为 0）；持久 credit 与在途 transition hold 的占用之和只在增长时受 D 检查（缺口 work_disk_bytes）；
+COMMIT/CLEANUP/ACK 不增长、从不被 D 阻塞。work_disk_local_reserve_bytes（非负且小于 D；capacity v2 组合为
+mac_document_disk_upper_bound(policy, hard, single)，即一份最大 grant）：准入只提供 D − reserve − 在用 的余量，
+先为每个可准入文档扣除 margin（documents ≤ 余量 // (margin + 1)，snapshot_bytes = 余量 − documents × margin），
+准入后校验以 D − reserve 为界；D 受阻的队首只让后面尚无 LOCAL 占用的新 grant 等待，且仅当队首在 LOCAL 工作排空后
+装得下（队首增长 ≤ D − 仅源快照占用），否则装得下的 grant 越过队首以排空已恢复的超额快照。重活许可：COMMIT 派发时取得；
+LOCAL 不持许可派发，到解码点抛 StageHeavyWorkRequired（StageWaiting 子类，健康等待）后带许可重派；许可随 Future
+完成释放（成功/错误/等待/取消），CLEANUP/ACK 从不需要，被挡的 lane 在 credit_blocked_by_lane 记 heavy_work。
+执行守卫 StagedExecutionGuard.heavy_work_permitted: bool | None（不参与比较，None = 独立调用方）；端口
+MaterializationHeavyWorkRequiredV4 与 require_heavy_work_permit(stage_guard)（仅守卫明确为 False 时抛出）。后端：
+run_local 映射为 StageHeavyWorkRequired；commit 在守卫为 False 时直接拒绝；PublicationEnvelopeExceededError →
+StageCapacityBlocked(dimensions=("publication_envelope",))；commit 中 MaterializationCapacityWaitV4 → StageWaiting。
+物化器：granted LOCAL 在每个成员与其记录都已持久、记录退役前要求许可（staging 仍精确续做）；重放已提升输出与
+reopen_materialized_v4 前要求许可；cleanup 转移与 promote_or_replay 不再解码，由 receipt 的输出清单（逐文件
+SHA-256、总字节、文件数）在 rename 前后证明；LOCAL 提升后以封存 staging 的文件清单证明，不二次解码；卷绑定拒绝
+f_frsize > 4096；新增 publication_write_space(attempt_id, byte_count)（实时余量承诺，publication_capacity_waiting）。
+就绪：新端口 PublicationWriteSpacePort；适配器可选 write_space，第一次写入前先编码准备与清单，再只为尚不存在的
+文件承诺；同一准备复用刚编码的 artifact 字节；verify_ready 以请求 sha 比较。
+私有包络（8 MiB 请求 / 24 MiB 准备 / 8 MiB 清单，数值不变）：PublicationEnvelopeExceededError（byte_count、limit，
+消息不变）与 PublicationArtifactEnvelopeExceededError（同时是 AtomicPublicationArtifactReadinessError）在编码超限时
+抛出，均早于任何就绪写入与事务 P；读回超包络仍是完整性拒绝。winner 8 MiB DB CHECK 不变，未单独类型化（由请求包络
+支配）。
+策略校验（mineru_capacity_config，原生随镜像分发）：新增 MAC_ALLOCATION_UNIT_BYTES = 4096、mac_work_file_margin_bytes；
+拒绝 maximal grant + source_pdf_bytes_limit + margin > D（原有 maximal grant ≤ D 检查保留）。
+原生 hold 决定（agent_task_protocol_v2，随镜像分发）：storage_hold_terminated 原因新增闭合 decision 对象
+mineru.storage-hold-decision.v1（schema、preview_sha256、decided_by、reason、fixed_by），decision_sha256 为其规范 JSON
+的 sha256，原生校验与 Mac 解码都重算；收据含 decision，重放从持久原因返回。Mac：StorageHoldDecisionV1、
+RemoteProviderFailureCauseV4.decision（hold 码必需且摘要一致，其它码必须为 None），decode_task_failure_cause_v2
+严格解码。路由在把分块并入缓冲前检查 len(raw) + len(chunk) > 16384 → 413。Mac CLI 新增 storage_hold recover
+--attempt-id --out（普通 status 路由，无凭据，只重建收据）；execute 应答丢失时从 status 读回，只有逐字段相同的持久
+决定才完成。已论证无需新锁：hold 任务重启后以 processing 水合，唯一调度点只取 pending。
+测试：tests/unit/test_staged_coordinator_resource_lifetime.py（新：许可互斥与释放、两任务真实调度器缩放文件见证、
+恢复归属只计一次、准入预留与逐文档余量、预留下等待 grant 必然完成（无预留对照停滞）、超额恢复快照先排空、
+footprint 规则、publication_envelope hold），tests/unit/test_staged_v4_capacity.py（存储绑定组合 D/margin/reserve），以及 test_mineru_materialize_grant_v5.py、
+test_mineru_http_staged_v4.py、test_staged_coordinator_backend_v4.py、test_atomic_publication_artifact_readiness_adapter_v4.py、
+test_atomic_document_publication_v4.py、test_mineru_result_storage.py、test_mineru_result_storage_generated.py、
+test_mineru_result_grant_mac.py、test_storage_hold_cli.py 的新增/更新用例。
+未执行：原生镜像重建/attest/资格、scratch PostgreSQL、真实 PDF/GPU、真实内存（W 不是 OS 内存上限，许可只串行化
+重活，不度量 RSS）；独立测试与最终门由 root 执行，本条不宣称已通过部署资格。
+```
+
+
+2026-09-27（R2 采集流式交接与空间错误分类；候选，未部署）——public view、Filing API 和 migration 不变：
+
+- `DisclosureSourcePort.download_pdf_to(ref, sink)` 返回 `CompletedPdfTransfer`；API/web 请求 identity 编码并逐块
+  写入 owned staging，同一逻辑期限包含重试与 EOF。非 identity 响应在正文前拒绝，实际字节数验证完成性。
+- `RawDocumentStore.from_settings` 在 worker、pipeline、本地登记 admin 三个写入口使用同一
+  `DISCLOSURE_ACQUISITION_FREE_FLOOR_BYTES`（未设为卷容量 10%）。归档完整大小预检与逐块余量检查在实际 copy 内；
+  已存在同 hash 原件复用不额外预留副本。检查不是跨进程预留，外部写入量不在保证范围内。
+- 输入不合法、归档身份冲突、目标存储 IO/容量不足分开：目标 ENOSPC/EIO 不能转成 `InvalidRawDocumentError`；
+  下载保持有限可重试失败，本地登记记录失败访问再抛出。同文件登记、no-replace、hash、supersedes 语义保持。
+- 完整 staging 经文件及目录 fsync 后封存；仅在归档或完整已验证 quarantine 接管后删除。
+  quarantine manifest/result 明确 `transfer_complete` / `payload_complete`、`input_missing`、大小/hash；失败访问
+  新增 `transfer`、`capacity`、`quarantine_complete` 和 `retained_*` 身份字段，保留唯一完整输入。
+- 相关验证见 `test_acquisition_streaming_independent`、下载/归档/本地登记/admin 普通测试，以及 managed-scratch
+  `test_cninfo_download`、`test_register_local_pdf`、`test_cninfo_sync`。离线测试不替代实际 provider 编码兼容性或断电证明。

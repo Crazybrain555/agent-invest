@@ -6,6 +6,7 @@ from dataclasses import replace
 from dataclasses import fields
 import unittest
 
+from disclosure_anchor.application.contracts.mineru_capacity_config import mac_document_disk_upper_bound
 from disclosure_anchor.application.contracts.staged_resource_credit import (
     ResourceCreditVector,
 )
@@ -140,6 +141,35 @@ class StagedV4CapacityTests(unittest.TestCase):
         self.assertTrue((terminal_a + submitted_b).fits(limits.credits))
         self.assertEqual(limits.credits.remote_waits, 1)
         self.assertGreaterEqual(limits.credits.provider_tasks, 2)
+
+    def test_storage_bound_limits_bind_the_work_quota_its_margin_and_one_maximal_grant(self) -> None:
+        from tests.unit.test_mineru_materialize_grant_v5 import STORAGE_POLICY as policy
+
+        profile = replace(
+            _profile(), contract_version="mineru.process-profile.v3", result_reservation_bytes=None,
+            max_unacked_result_bytes=None, result_storage_policy_sha256=policy.sha256,
+        )
+        limits = staged_v4_coordinator_limits(
+            profile, worker_profile=StagedWorkerProfileV4(profile.sha256, 1, 1), storage_policy=policy,
+        )
+        maximal_grant = mac_document_disk_upper_bound(
+            policy, policy.native_result_hard_limit_bytes, policy.native_source_single_limit_bytes,
+        )
+        self.assertEqual(
+            (limits.work_disk_bytes, limits.work_disk_margin_bytes, limits.work_disk_local_reserve_bytes),
+            (policy.mac_work_disk_limit_bytes, (policy.max_members + 8) * 4096, maximal_grant),
+        )
+        # Beside the reserve one whole maximal document (source and margin) is still admitted.
+        self.assertLessEqual(
+            maximal_grant + policy.source_pdf_bytes_limit + limits.work_disk_margin_bytes, limits.work_disk_bytes,
+        )
+        legacy = staged_v4_coordinator_limits(
+            _profile(), worker_profile=StagedWorkerProfileV4(_profile().sha256, 1, 1),
+        )
+        self.assertEqual(
+            (legacy.work_disk_bytes, legacy.work_disk_margin_bytes, legacy.work_disk_local_reserve_bytes),
+            (None, 0, 0),
+        )
 
     def test_requires_exact_profile_contract(self) -> None:
         with self.assertRaisesRegex(ValueError, "exact process profile"):

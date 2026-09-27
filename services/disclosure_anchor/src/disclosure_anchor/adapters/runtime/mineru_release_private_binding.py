@@ -16,8 +16,8 @@ import re
 from disclosure_anchor.adapters.runtime.mineru_release_package import ReleaseInputError
 from disclosure_anchor.adapters.runtime.resident_ssh_http import ResidentSSHConfig
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig,
-    decode_mineru_capacity_config,
+    AnyMineruCapacityConfig,
+    decode_any_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.closed_document import (
     SHA256_RE,
@@ -69,7 +69,7 @@ class ReleasePrivateBinding:
     windows: WindowsInstallationTarget
     mac_exclusive_lock_path: Path
     launchd_labels: tuple[str, ...]
-    previous_capacity: MineruCapacityConfig | None
+    previous_capacity: AnyMineruCapacityConfig | None
 
 
 def _optional_sha(value: object, *, label: str) -> str | None:
@@ -142,7 +142,7 @@ def load_release_private_binding(path: Path) -> ReleasePrivateBinding:
             candidate = Path(require_str(previous_path, label="previous_capacity_path"))
             if not candidate.is_absolute() or not candidate.is_file():
                 raise ValueError("previous_capacity_path must be an existing absolute file")
-            previous_capacity = decode_mineru_capacity_config(candidate.read_bytes())
+            previous_capacity = decode_any_mineru_capacity_config(candidate.read_bytes())
             if previous_capacity.sha256 != windows_value["expected_previous_capacity_sha256"]:
                 raise ValueError("previous capacity bytes differ from expected_previous_capacity_sha256")
         windows = WindowsInstallationTarget(

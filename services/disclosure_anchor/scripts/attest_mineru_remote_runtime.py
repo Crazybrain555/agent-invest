@@ -17,7 +17,7 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
     validate_mineru_api_wire_health,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig, encode_mineru_capacity_config,
+    AnyMineruCapacityConfig, MineruCapacityConfigV2, encode_any_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_health import (
     validate_mineru_capacity_wire_health,
@@ -286,9 +286,17 @@ def _verify_api_compatibility(
     expected_patcher_sha256: str,
     expected_dockerfile_sha256: str,
     expected_task_protocol_v2_sha256: str,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
     expected_capacity_source_sha256: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    # A storage-managed (v2) runtime has no B or L: the collector reports null.
+    storage_managed = isinstance(expected_capacity, MineruCapacityConfigV2)
+    expected_budgets: tuple[int | None, int | None] = (
+        (None, None) if isinstance(expected_capacity, MineruCapacityConfigV2)
+        else (MINERU_API_RESULT_RESERVATION_BYTES, MINERU_API_MAX_UNACKED_RESULT_BYTES)
+        if expected_capacity is None
+        else (expected_capacity.result_reservation_bytes, expected_capacity.max_unacked_result_bytes)
+    )
     fields = {
         "marker",
         "actual_source_sha256",
@@ -307,7 +315,7 @@ def _verify_api_compatibility(
         "image_labels",
     }
     if expected_capacity is not None:
-        encode_mineru_capacity_config(expected_capacity)
+        encode_any_mineru_capacity_config(expected_capacity)
         sources = validate_capacity_source_sha256(expected_capacity_source_sha256)
         fields = (fields - {"capacity_runtime"}) | {
             "capacity_sources_actual_sha256", "capacity_config_file",
@@ -366,12 +374,8 @@ def _verify_api_compatibility(
         or value.get("task_protocol_v2_enabled") is not True
         or value.get("task_registry_max_records")
         != MINERU_API_TASK_REGISTRY_MAX_RECORDS
-        or value.get("task_result_reservation_bytes")
-        != (MINERU_API_RESULT_RESERVATION_BYTES if expected_capacity is None
-            else expected_capacity.result_reservation_bytes)
-        or value.get("max_unacked_result_bytes") != (
-            MINERU_API_MAX_UNACKED_RESULT_BYTES if expected_capacity is None
-            else expected_capacity.max_unacked_result_bytes)
+        or value.get("task_result_reservation_bytes") != expected_budgets[0]
+        or value.get("max_unacked_result_bytes") != expected_budgets[1]
     ):
         raise ValueError("remote API heap-return marker or source bytes drifted")
     expected_labels = {
@@ -414,7 +418,9 @@ def _verify_api_compatibility(
             or any(type(value.get(key)) is not int for key in (
                 "hybrid_batch_ratio_requested", "max_pending_tasks_requested",
                 "max_pending_tasks_effective", "task_registry_max_records",
-                "task_result_reservation_bytes", "max_unacked_result_bytes",
+                *(() if storage_managed else (
+                    "task_result_reservation_bytes", "max_unacked_result_bytes",
+                )),
             ))
         ):
             raise ValueError("remote API explicit capacity source or config evidence drifted")
@@ -438,11 +444,11 @@ def build_manifest(
     expected_task_protocol_v2_sha256: str,
     expected_collector_path: str = EXPECTED_COLLECTOR_PATH,
     expected_api_cpu_threads: int | None = None,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
     expected_capacity_source_sha256: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if expected_capacity is not None:
-        encode_mineru_capacity_config(expected_capacity)
+        encode_any_mineru_capacity_config(expected_capacity)
         validate_capacity_source_sha256(expected_capacity_source_sha256)
         if expected_api_cpu_threads is not None:
             raise ValueError("explicit capacity and legacy CPU policy are mutually exclusive")
@@ -714,9 +720,19 @@ def build_manifest(
             "MINERU_API_FINALIZER_SLOTS": str(expected_capacity.finalizer_active_limit),
             "MINERU_PROCESSING_WINDOW_SIZE": str(expected_capacity.processing_window_size),
             "MINERU_HYBRID_BATCH_RATIO": str(expected_capacity.hybrid_batch_ratio_requested),
-            "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": str(expected_capacity.result_reservation_bytes),
-            "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES": str(expected_capacity.max_unacked_result_bytes),
         }
+        if isinstance(expected_capacity, MineruCapacityConfigV2):
+            # Storage-managed: the legacy B/L variables must be absent.
+            for variable in (
+                "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES", "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES",
+            ):
+                if variable in api_environment:
+                    raise ValueError(f"remote API result storage conflicts with {variable}")
+        else:
+            expected_cpu_environment.update({
+                "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES": str(expected_capacity.result_reservation_bytes),
+                "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES": str(expected_capacity.max_unacked_result_bytes),
+            })
     for field, expected in expected_cpu_environment.items():
         if api_environment.get(field) != expected:
             raise ValueError(f"remote API thread policy drifted: {field}")

@@ -3,7 +3,7 @@
 本目录记录当前实现的设计、检查、操作和仍有价值的工程历史。Agent 运行规则只由
 仓库根工作流、服务合同和最近的源目录合同维护；`003-agent-execution-rules.md` 是短期兼容
 指针，不是第三套工作流。已由
-`provider_document.v1` / `provider_unit.v23` 取代的 NormalizedIR writer、旧证明图、
+`provider_document.v1` / `provider_unit.v24` 取代的 NormalizedIR writer、旧证明图、
 旧 unit-builder、phase00 fixture 与 corpus reset/reparse 工具不再保留在工作树；需要
 考古时直接查看 Git 历史。
 
@@ -19,6 +19,7 @@
 - `design/v4-resource-lifetime.md`：H0/spec 原子存储、历史回填/退役、原地资源归属与启动/ACK 门。
 - `design/mineru-throughput-scheduler.md`：MinerU 端到端工作守恒调度、进程级资源所有权、
   vector credits、配置生命周期、Auto 与吞吐验收的当前实施契约；旧 fixed-arm/7GiB 约束不再适用。
+- `design/mineru-result-storage.md`：capacity config v2 的结果存储：原生 D/H/P/C/M 物理预算、写前许可、预读体入口计费、seal/ZIP 恢复与可见 hold；Mac 阶段 grant、可续传 spool、成员级解包续作与有界解码。
 - `design/capacity-observation.md`：旁路、只读、可重放的 MinerU/GPU Observation v1；不含 Advisor/selector/actuator。
 - `design/synchronized-capacity-telemetry.md`：250–500ms/1s 同步遥测、clock-domain、向量信用与 durable-page 进度契约；默认禁用。
 - `design/m6-owner-control.md`：M6 原生测量 owner、控制协议与资源退出边界。
@@ -33,6 +34,12 @@
 - `design/retrieval-and-semantic-keys.md`：检索投影当前契约及其历史演变。
 - `design/semantic-adjudication-runtime.md`：Luna/Sonnet 可配置 provider 链、availability-only
   failover、v2 cache/receipt、终态与修复纪律。
+- `design/worker-operational-stop.md`：F5 公共故障持久停止：first-cause latch、取消与故障区分、
+  协调器/维护/启动边界、control 文件与原生 disable、启动门、status/doctor、hash 绑定放行与重建。
+- `design/local-execution-upgrade.md`：一条经审阅的本地执行升级边 U01：继承（非新 PASS）的父资格 Q0、
+  实际 release E1 与原 H0/spec 义务清单；resolver/POST/新 H0 保持/启动复核/安装预检共用同一上下文。
+- `design/historical-security-retained-registration.md`：同一法人换证券代码后的具名历史证券绑定、
+  获取主体证据链、下载失败归档事实、保留原件登记（preview/execute/reconcile）与 0064 解决关系。
 - `design/classification-facets-and-derived-views.md` 与 `milestones/07-cninfo-sync.md`：分类/CNInfo
   稳定机制；具体语料审查证据保存在 `reviews/`，不进入 AGENTS.md。
 
@@ -46,12 +53,16 @@ docs/implementation/
     document-outline-and-toc.md
     retrieval-and-semantic-keys.md
     semantic-adjudication-runtime.md
+    worker-operational-stop.md
+    local-execution-upgrade.md
+    historical-security-retained-registration.md
     retrieval-scale-hardening.md
     classification-facets-and-derived-views.md
     watchlist-operations.md
     worker-dynamic-scheduling.md
     mineru-throughput-scheduler.md
     capacity-observation.md
+    mineru-result-storage.md
     synchronized-capacity-telemetry.md
   milestones/
     02-postgres-and-migrations.md

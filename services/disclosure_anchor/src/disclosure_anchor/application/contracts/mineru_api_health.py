@@ -167,12 +167,17 @@ def validate_mineru_task_runtime(decoded: object) -> None:
 
 def validate_mineru_task_admission(
     decoded: object, *, queued_tasks: int, processing_tasks: int, nonterminal_limit: int,
+    registry_schema: str = "mineru-task-registry.v3",
 ) -> None:
     """Validate durable responsibilities before projecting the legacy load gauges.
 
     queued_tasks covers ingress and accepted pending, not physical queue depth.
     A cold backlog remains readable on the wire but is not qualified healthy.
+    ``registry_schema`` is the one registry version the caller's bound runtime
+    writes; a storage-managed (capacity v2) runtime writes registry v4.
     """
+    if registry_schema not in {"mineru-task-registry.v3", "mineru-task-registry.v4"}:
+        raise ValueError("MinerU admission registry schema expectation is unsupported")
     counters = {
         "nonterminal_limit", "ingress_tasks", "accepted_pending_tasks",
         "accepted_processing_tasks", "accepted_finalizing_tasks", "durable_nonterminal_tasks",
@@ -185,7 +190,7 @@ def validate_mineru_task_admission(
             "schema", "registry_schema", "recovery_overcommitted", "admission_open", "blocked_reason",
         }
         or decoded.get("schema") != "mineru-task-admission.v1"
-        or decoded.get("registry_schema") != "mineru-task-registry.v3"
+        or decoded.get("registry_schema") != registry_schema
         or any(type(decoded.get(key)) is not int or not 0 <= decoded[key] <= 128 for key in counters)
         or type(decoded.get("recovery_overcommitted")) is not bool
         or type(decoded.get("admission_open")) is not bool

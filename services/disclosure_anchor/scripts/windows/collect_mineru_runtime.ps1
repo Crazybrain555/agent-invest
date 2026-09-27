@@ -898,26 +898,40 @@ else:
     serving_health = json.loads(health_bytes, object_pairs_hook=unique_object,
                                parse_constant=reject_constant)
 runtime = serving_health["task_protocol_runtime"]
-runtime_fields = {"schema", "enabled", "task_registry_max_records",
-                  "task_result_reservation_bytes", "max_unacked_result_bytes",
-                  "registry_schema", "admission_scope"}
-if capacity is not None:
-    runtime_fields.add("capacity_config_sha256")
+# A result-storage capacity (v2) has no per-task budgets: runtime v4 and
+# registry v4 name the bound storage policy instead.
+storage_policy = None if capacity is None else getattr(capacity, "result_storage", None)
+if storage_policy is not None:
+    runtime_fields = {"schema", "enabled", "task_registry_max_records", "registry_schema",
+                      "admission_scope", "capacity_config_sha256", "result_storage_policy_sha256"}
+    budget_fields = ("task_registry_max_records",)
+    runtime_schema, registry_schema = "mineru-task-runtime.v4", "mineru-task-registry.v4"
     if (runtime.get("capacity_config_sha256") != capacity.sha256
             or serving_health.get("capacity_observation", {}).get("capacity_config_sha256") != capacity.sha256
-            or runtime.get("task_result_reservation_bytes") != capacity.result_reservation_bytes
-            or runtime.get("max_unacked_result_bytes") != capacity.max_unacked_result_bytes):
+            or runtime.get("result_storage_policy_sha256") != storage_policy.sha256):
         raise RuntimeError("serving capacity config identity drifted")
+else:
+    runtime_fields = {"schema", "enabled", "task_registry_max_records",
+                      "task_result_reservation_bytes", "max_unacked_result_bytes",
+                      "registry_schema", "admission_scope"}
+    budget_fields = ("task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes")
+    runtime_schema = "mineru-task-runtime.v2" if capacity is None else "mineru-task-runtime.v3"
+    registry_schema = "mineru-task-registry.v3"
+    if capacity is not None:
+        runtime_fields.add("capacity_config_sha256")
+        if (runtime.get("capacity_config_sha256") != capacity.sha256
+                or serving_health.get("capacity_observation", {}).get("capacity_config_sha256") != capacity.sha256
+                or runtime.get("task_result_reservation_bytes") != capacity.result_reservation_bytes
+                or runtime.get("max_unacked_result_bytes") != capacity.max_unacked_result_bytes):
+            raise RuntimeError("serving capacity config identity drifted")
 if (
     serving_health.get("task_protocol_schema") != "mineru-task-protocol.v2"
     or set(runtime) != runtime_fields
-    or runtime["schema"] != ("mineru-task-runtime.v2" if capacity is None else "mineru-task-runtime.v3")
+    or runtime["schema"] != runtime_schema
     or runtime["enabled"] is not True
-    or runtime["registry_schema"] != "mineru-task-registry.v3"
+    or runtime["registry_schema"] != registry_schema
     or runtime["admission_scope"] != "post_form_owned_upload"
-    or any(type(runtime[name]) is not int or runtime[name] < 1 for name in (
-        "task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes"
-    ))
+    or any(type(runtime[name]) is not int or runtime[name] < 1 for name in budget_fields)
     or type(serving_health.get("max_pending_tasks_effective")) is not int
 ):
     raise RuntimeError("serving API task runtime evidence is invalid")
@@ -946,8 +960,8 @@ probe = {
     "pipeline_inference_locks_enabled": PIPELINE_INFERENCE_LOCKS_ENABLED,
     "task_protocol_v2_enabled": runtime["enabled"],
     "task_registry_max_records": runtime["task_registry_max_records"],
-    "task_result_reservation_bytes": runtime["task_result_reservation_bytes"],
-    "max_unacked_result_bytes": runtime["max_unacked_result_bytes"],
+    "task_result_reservation_bytes": runtime.get("task_result_reservation_bytes"),
+    "max_unacked_result_bytes": runtime.get("max_unacked_result_bytes"),
     "mineru_version": importlib.metadata.version("mineru"),
     "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),
 }
@@ -1139,8 +1153,9 @@ $result = [ordered]@{
         pipeline_inference_locks_enabled = [bool]$compatProbe.pipeline_inference_locks_enabled
         task_protocol_v2_enabled = [bool]$compatProbe.task_protocol_v2_enabled
         task_registry_max_records = [int]$compatProbe.task_registry_max_records
-        task_result_reservation_bytes = [long]$compatProbe.task_result_reservation_bytes
-        max_unacked_result_bytes = [long]$compatProbe.max_unacked_result_bytes
+        # null under a result-storage capacity, whose budgets live in its policy
+        task_result_reservation_bytes = if ($null -eq $compatProbe.task_result_reservation_bytes) { $null } else { [long]$compatProbe.task_result_reservation_bytes }
+        max_unacked_result_bytes = if ($null -eq $compatProbe.max_unacked_result_bytes) { $null } else { [long]$compatProbe.max_unacked_result_bytes }
         image_labels = $compatLabels
     }
     proxy = [ordered]@{

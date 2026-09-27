@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from disclosure_anchor.adapters.db.postgres.migration_state import (
     migration_heads,
     single_migration_head,
 )
+from disclosure_anchor.adapters.db.postgres.schema import OPS_SCHEMA
 
 
 class MigrationStateTests(unittest.TestCase):
@@ -29,6 +31,74 @@ class MigrationStateTests(unittest.TestCase):
         heads = migration_heads()
         self.assertEqual(len(heads), 1)
         self.assertEqual(single_migration_head(), heads[0])
+
+    def test_0065_widens_only_the_requeue_class_check_by_the_closure_class(self) -> None:
+        versions = "disclosure_anchor.adapters.db.postgres.migrations.versions."
+        migration = importlib.import_module(versions + "0065_parse_requeue_original_key_lifetime")
+        previous = importlib.import_module(versions + "0063_parse_requeue_decision")
+        models = importlib.import_module("disclosure_anchor.adapters.db.postgres.models")
+        contract = importlib.import_module(
+            "disclosure_anchor.application.contracts.parse_requeue_decision"
+        )
+        closure = importlib.import_module(
+            "disclosure_anchor.application.contracts.expired_prepared_closure"
+        )
+        self.assertEqual(
+            (migration.revision, migration.down_revision),
+            ("0065_requeue_key_lifetime", "0064_retained_registration"),
+        )
+        # Downgrade restores 0063's exact CHECK body; upgrade adds one class.
+        created = [
+            node.args[0].value
+            for node in ast.walk(ast.parse(Path(previous.__file__).read_text(encoding="utf-8")))
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "CheckConstraint"
+            and any(keyword.arg == "name" and getattr(keyword.value, "value", None)
+                    == "ck_parse_requeue_decision_class" for keyword in node.keywords)
+        ]
+        self.assertEqual(created, [migration.class_check_sql(migration.CONTRACT_CLASSES_0063)])
+        upgraded = (*migration.CONTRACT_CLASSES_0063, migration.ADDED_CLASS)
+        self.assertEqual(migration.ADDED_CLASS, closure.ORIGINAL_KEY_LIFETIME_RETRY_CLASS)
+        self.assertEqual(frozenset(upgraded), contract.RELEASABLE_PARSE_RETRY_BUDGET_CLASSES)
+        constraint = next(
+            item for item in models.ParseRequeueDecision.__table__.constraints
+            if item.name == "ck_parse_requeue_decision_class"
+        )
+        self.assertIsInstance(constraint, CheckConstraint)
+        self.assertEqual(str(constraint.sqltext), migration.class_check_sql(upgraded))
+        with patch.object(migration.op, "execute") as execute:
+            migration.upgrade()
+        execute.assert_called_once_with(
+            f"ALTER TABLE {OPS_SCHEMA}.parse_requeue_decision "
+            "DROP CONSTRAINT ck_parse_requeue_decision_class, "
+            "ADD CONSTRAINT ck_parse_requeue_decision_class "
+            f"CHECK ({migration.class_check_sql(upgraded)})"
+        )
+
+    def test_0065_downgrade_refuses_recorded_key_lifetime_decisions(self) -> None:
+        migration = importlib.import_module(
+            "disclosure_anchor.adapters.db.postgres.migrations.versions."
+            "0065_parse_requeue_original_key_lifetime"
+        )
+        for recorded in (True, False):
+            binding = MagicMock()
+            binding.execute.return_value.scalar_one.return_value = recorded
+            with (
+                self.subTest(recorded=recorded),
+                patch.object(migration.op, "get_bind", return_value=binding),
+                patch.object(migration.op, "execute") as execute,
+            ):
+                if recorded:
+                    with self.assertRaisesRegex(RuntimeError, "0065 downgrade would strand"):
+                        migration.downgrade()
+                    execute.assert_not_called()
+                else:
+                    migration.downgrade()
+                    execute.assert_called_once_with(
+                        f"ALTER TABLE {OPS_SCHEMA}.parse_requeue_decision "
+                        "DROP CONSTRAINT ck_parse_requeue_decision_class, "
+                        "ADD CONSTRAINT ck_parse_requeue_decision_class CHECK "
+                        f"({migration.class_check_sql(migration.CONTRACT_CLASSES_0063)})"
+                    )
 
     def test_0053_is_adjacent_to_0052(self) -> None:
         migration = importlib.import_module(

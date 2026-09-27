@@ -98,18 +98,35 @@ class FileStorePathBuilder:
         raw_file_hash: str,
         extension: str = ".pdf",
     ) -> Path:
+        digest = _hash_digest(raw_file_hash)
+        relpath = self.raw_document_dir_relpath(
+            provider=provider,
+            security_code=security_code,
+            year=year,
+            provider_document_id=provider_document_id,
+        ) / f"sha256_{digest}{_safe_extension(extension)}"
+        return _assert_relative(relpath)
+
+    def raw_document_dir_relpath(
+        self,
+        *,
+        provider: str,
+        security_code: str,
+        year: int | str,
+        provider_document_id: str,
+    ) -> Path:
+        """The one directory holding every archived version of a document."""
+
         provider_part = _safe_component(provider, label="provider")
         security_part = _safe_component(security_code, label="security_code")
         year_part = _safe_component(str(year), label="year")
         provider_document_part = _safe_provider_document_id(provider_document_id)
-        digest = _hash_digest(raw_file_hash)
         relpath = (
             Path("raw_documents")
             / provider_part
             / security_part
             / year_part
             / provider_document_part
-            / f"sha256_{digest}{_safe_extension(extension)}"
         )
         return _assert_relative(relpath)
 
@@ -340,6 +357,50 @@ class FileStorePathBuilder:
                 )
         if not _is_relative_to(path, capacity_root):
             raise PathSafetyError(f"capacity observation path escapes root: {path}")
+        return path
+
+    def worker_control_dir(self) -> Path:
+        """Canonical worker operational-control directory under the runtime root."""
+
+        return self._settings.disclosure_runtime_root / "control"
+
+    def worker_circuit_stop_path(self) -> Path:
+        """The one active public-stop record; its presence means stopped."""
+
+        return self.worker_control_dir() / "worker-circuit-stop.json"
+
+    def worker_circuit_stop_archive_path(self, stop_sha256: str) -> Path:
+        """Immutable archive of one released stop's exact raw bytes."""
+
+        digest = _sha256_digest(stop_sha256, label="worker circuit stop sha256")
+        return self.worker_control_dir() / f"worker-circuit-stop.{digest}.json"
+
+    def worker_circuit_release_path(self, stop_sha256: str) -> Path:
+        """Immutable operator release decision bound to one stop's raw bytes."""
+
+        digest = _sha256_digest(stop_sha256, label="worker circuit stop sha256")
+        return self.worker_control_dir() / f"worker-circuit-release.{digest}.json"
+
+    def worker_circuit_lock_path(self) -> Path:
+        """Short control lock taken after the worker singleton, never before."""
+
+        return self.worker_control_dir() / "worker-circuit.lock"
+
+    def execution_boot_receipt_path(self, owner_identity: str) -> Path:
+        """One create-only receipt per resident boot under a verified local upgrade."""
+
+        runtime_root = self._settings.disclosure_runtime_root
+        receipt_root = runtime_root / "reports" / "execution-boot"
+        path = receipt_root / (
+            _safe_component(owner_identity, label="execution_boot_owner") + ".json"
+        )
+        for existing_parent in (runtime_root, runtime_root / "reports", receipt_root):
+            if existing_parent.is_symlink():
+                raise PathSafetyError(
+                    f"execution boot receipt parent is a symlink: {existing_parent}"
+                )
+        if not _is_relative_to(path, receipt_root):
+            raise PathSafetyError(f"execution boot receipt path escapes root: {path}")
         return path
 
     def runtime_quarantine_path(

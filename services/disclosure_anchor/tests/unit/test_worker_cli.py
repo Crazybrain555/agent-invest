@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from contextlib import redirect_stderr, redirect_stdout
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -23,7 +25,29 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
 )
 from disclosure_anchor.cli import worker as worker_cli
 from disclosure_anchor.domain.errors import ConfigurationError
+from disclosure_anchor.application.ports.worker_stop_control import PublicStopCause
+from disclosure_anchor.application.services.worker_stop_latch import InProcessWorkerStopLatch
 from disclosure_anchor.settings import Settings
+from tests.unit._codex_model_catalog_fixture import prepare_catalog_sha256
+
+
+def _unstopped_settings(test: unittest.TestCase) -> mock.MagicMock:
+    """Settings over a trusted temp runtime root with no stop recorded.
+
+    The worker start gate reads the real control directory before any DB or
+    MinerU work; this root is 0700, owned by the test user and never the
+    supervised root, so the gate is RUNNABLE and never runs launchctl.
+    """
+
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    runtime_root = Path(directory.name) / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    runtime_root.chmod(0o700)
+    return mock.MagicMock(
+        disclosure_runtime_root=runtime_root,
+        disclosure_worker_supervised_runtime_root=Path(directory.name) / "supervised-elsewhere",
+    )
 
 
 def _report(**values: int | bool) -> WorkerReport:
@@ -525,6 +549,9 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 disclosure_data_root=root / "service",
                 disclosure_shared_root=root / "shared",
                 disclosure_runtime_root=root / "service" / "runtime",
+                disclosure_semantic_codex_model_catalog_sha256=prepare_catalog_sha256(
+                    root / "service" / "runtime"
+                ),
                 mineru_model_cache=root / "shared" / "mineru",
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
@@ -554,6 +581,9 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 disclosure_data_root=root / "service",
                 disclosure_shared_root=root / "shared",
                 disclosure_runtime_root=root / "service" / "runtime",
+                disclosure_semantic_codex_model_catalog_sha256=prepare_catalog_sha256(
+                    root / "service" / "runtime"
+                ),
                 mineru_model_cache=root / "shared" / "mineru",
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
@@ -763,7 +793,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         engine.dispose.assert_called_once_with()
 
     def test_once_rejects_runtime_role_before_advisory_lock(self) -> None:
-        settings = mock.MagicMock()
+        settings = _unstopped_settings(self)
         checker = mock.MagicMock(spec=worker_cli.MinerUDeploymentChecker)
         lock_conn = mock.MagicMock()
         lock_engine = mock.MagicMock()
@@ -911,7 +941,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         runtime.close.assert_called_once_with()
 
     def test_once_static_mineru_gate_fails_before_database_connection(self) -> None:
-        settings = mock.MagicMock()
+        settings = _unstopped_settings(self)
         gate_error = MinerUDeploymentGateError("GPU identity unavailable")
 
         with (
@@ -958,10 +988,14 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 ):
                     worker_cli.run_resident_worker(settings)
 
+                # The resident loop is the one executor that threads a verified
+                # local-upgrade context to every boundary, so it alone asks the
+                # same gate to accept one (it still refuses without proof).
                 checker.assert_called_once_with(
                     settings,
                     parse_enabled=True,
                     process_profile=(profile if mode == "staged-v4" else None),
+                    accept_execution_upgrade=True,
                 )
                 if mode == "staged-v4":
                     profile_loader.assert_called_once_with(settings)
@@ -1122,6 +1156,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         terminate_semantic.assert_called_once_with()
 
     def test_wedge_exit_terminates_parser_groups_before_hard_exit(self) -> None:
+        self.addCleanup(worker_cli._WEDGED_EXIT.clear)
         events: list[object] = []
         with (
             mock.patch.object(
@@ -1146,3 +1181,103 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchdogStopCauseAcceptanceTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        marker = getattr(worker_cli, "_WEDGED_EXIT", None)
+        if marker is not None:
+            marker.clear()
+
+    def _simulate_watchdog_exit(self, events: list[object]) -> None:
+        with (
+            mock.patch.object(worker_cli, "terminate_active_mineru_processes",
+                              side_effect=lambda: events.append("mineru")),
+            mock.patch.object(worker_cli, "terminate_active_semantic_processes",
+                              side_effect=lambda: events.append("semantic")),
+            mock.patch("os._exit", side_effect=lambda code: events.append(("exit", code))),
+        ):
+            worker_cli._exit_wedged_worker()
+        self.assertEqual(events, ["mineru", "semantic", ("exit", 70)])
+
+    def test_watchdog_induced_cancellation_never_creates_public_stop(self) -> None:
+        persisted: list[PublicStopCause] = []
+        control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+        events: list[object] = []
+        self._simulate_watchdog_exit(events)
+        result = mock.Mock(termination_kind="circuit", errors=("semantic:cancelled:watchdog",))
+        with (
+            redirect_stderr(io.StringIO()),
+            redirect_stdout(io.StringIO()),
+            self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+        ):
+            worker_cli._end_staged_resident(result, control, lambda: False)
+        self.assertIsNone(raised.exception.cause)
+        worker_cli._trip_worker_fault(
+            control, RuntimeError("child exited during watchdog cleanup"),
+            kind="maintenance_fatal", origin="maintenance", reason_code="maintenance_loop_failed",
+        )
+        self.assertIsNone(control.first_cause())
+        self.assertEqual(persisted, [])
+
+    def test_unrelated_unclassified_circuit_still_latches_public_stop(self) -> None:
+        persisted: list[PublicStopCause] = []
+        control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+        with self.assertRaises(worker_cli.WorkerPublicStopError) as raised:
+            worker_cli._end_staged_resident(
+                mock.Mock(termination_kind="circuit", errors=("ordinary failure",)),
+                control, lambda: False,
+            )
+        self.assertEqual(raised.exception.cause.reason_code, "unclassified_circuit")
+        self.assertEqual(persisted, [control.first_cause()])
+
+    def test_genuine_preexisting_first_cause_survives_watchdog_cleanup(self) -> None:
+        persisted: list[PublicStopCause] = []
+        control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+        genuine = PublicStopCause(
+            kind="stage_fault", reason_code="semantic_failed_closed", origin="stage_call"
+        )
+        control.trip(genuine)
+        self._simulate_watchdog_exit([])
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+        ):
+            worker_cli._end_staged_resident(
+                mock.Mock(termination_kind="circuit", errors=("later cancellation",)),
+                control, lambda: False,
+            )
+        self.assertIs(raised.exception.cause, genuine)
+        self.assertIs(control.first_cause(), genuine)
+        self.assertEqual(persisted, [genuine])
+
+    def test_watchdog_marks_exit_before_terminating_children(self) -> None:
+        seen: list[bool] = []
+        def observe() -> None:
+            marker = getattr(worker_cli, "_WEDGED_EXIT", None)
+            seen.append(marker is not None and marker.is_set())
+        with (
+            mock.patch.object(worker_cli, "terminate_active_mineru_processes", side_effect=observe),
+            mock.patch.object(worker_cli, "terminate_active_semantic_processes", side_effect=observe),
+            mock.patch("os._exit"),
+        ):
+            worker_cli._exit_wedged_worker()
+        self.assertEqual(seen, [True, True])
+
+    def test_cleanup_failure_still_attempts_exit_70(self) -> None:
+        for failing_cleanup in ("mineru", "semantic"):
+            with self.subTest(failing_cleanup=failing_cleanup):
+                mineru_error = RuntimeError("mineru cleanup failed") if failing_cleanup == "mineru" else None
+                semantic_error = RuntimeError("semantic cleanup failed") if failing_cleanup == "semantic" else None
+                with (
+                    mock.patch.object(worker_cli, "terminate_active_mineru_processes",
+                                      side_effect=mineru_error),
+                    mock.patch.object(worker_cli, "terminate_active_semantic_processes",
+                                      side_effect=semantic_error),
+                    mock.patch("os._exit") as exit_process,
+                ):
+                    try:
+                        worker_cli._exit_wedged_worker()
+                    except RuntimeError:
+                        pass
+                exit_process.assert_called_once_with(70)

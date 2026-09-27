@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
+import errno
 import gc
 import hashlib
+import hmac
 import json
 import os
 import stat
 import sys
 import tempfile
+import threading
 import time
+import zipfile
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -61,6 +66,43 @@ class TaskExecutionStopped(TaskProtocolConflict):
         self.capacity_wait = capacity_wait
 
 
+class TaskStorageWait(TaskProtocolConflict):
+    """A storage grant is not available now; nothing was committed or written."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in STORAGE_WAIT_REASONS or reason in STORAGE_BLOCKED_REASONS:
+            raise ValueError("task storage wait reason is outside the closed vocabulary")
+        super().__init__("task storage grant waits: " + reason)
+        self.reason = reason
+
+
+class TaskStorageBlocked(TaskProtocolConflict):
+    """The accepted task is held with its bytes for an explicit operator decision."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in STORAGE_BLOCKED_REASONS:
+            raise ValueError("task storage block reason is outside the closed vocabulary")
+        super().__init__("task storage is blocked: " + reason)
+        self.reason = reason
+
+
+class SourceGrowthLimitExceeded(RuntimeError):
+    """A parser write was refused before it could exceed the growth permit."""
+
+
+class SourceTreeIntegrityError(SourceGrowthLimitExceeded, TaskProtocolConflict):
+    """A parser write was refused because its path, root or leaf is not the owned tree.
+
+    An integrity refusal, not byte exhaustion: the task is held as
+    ``tree_integrity``. It remains a growth refusal for callers that only need
+    to stop writing.
+    """
+
+
+class ResultGrantExceeded(RuntimeError):
+    """A ZIP write was refused before its extent could exceed the grant."""
+
+
 class TaskRegistryPersistenceError(OSError):
     """A content-free registry persistence outcome with an explicit commit boundary."""
 
@@ -106,6 +148,335 @@ VLM_TRANSPORT_ERRORS = TRANSIENT_VLM_TRANSPORT_ERRORS | frozenset(
 _TASK_FAILURE_CAUSE_FIELDS = frozenset(
     {"schema", "task_id", "retry_class", "code", "http_status", "transport_error"}
 )
+
+# Result storage (capacity config v2 only). One closed record per accepted task
+# carries its physical occupancy and phase; waits and blocks are reasons inside
+# the phase, never a failed task. ``admitted`` owns only its uploads.
+RETAINED_RESULT_NAME = ".retained-result.zip"
+RETAINED_RESULT_PART_NAME = ".retained-result.zip.part"
+RETAINED_INVENTORY_NAME = ".retained-inventory.json"
+REGISTRY_SCHEMA_V3 = "mineru-task-registry.v3"
+REGISTRY_SCHEMA_V4 = "mineru-task-registry.v4"
+TASK_STORAGE_SCHEMA = "mineru.task-storage.v1"
+TASK_STORAGE_STATUS_SCHEMA = "mineru.task-storage-status.v1"
+RESULT_INVENTORY_SCHEMA = "mineru.result-inventory.v1"
+STORAGE_PHASES = ("admitted", "source_growing", "source_sealed", "zip_writing", "zip_sealed")
+STORAGE_BLOCKED_REASONS = frozenset(
+    {"hard_envelope_exceeded", "codec_bound_exceeded", "seal_integrity", "tree_integrity"}
+)
+STORAGE_WAIT_REASONS = frozenset(
+    {"source_growth_capacity", "completion_capacity", "free_floor", *STORAGE_BLOCKED_REASONS}
+)
+# An operator's explicit terminal decision for one held task, never automatic
+# and never a resume: the task fails with a closed cause naming the decision and
+# keeps its bytes and seal until the ordinary failed-task ACK removes its tree.
+STORAGE_HOLD_PREVIEW_SCHEMA = "mineru.storage-hold-preview.v1"
+STORAGE_HOLD_DECISION_SCHEMA = "mineru.storage-hold-decision.v1"
+STORAGE_HOLD_RECEIPT_SCHEMA = "mineru.storage-hold-decision-receipt.v1"
+STORAGE_HOLD_TERMINATED_CODE = "storage_hold_terminated"
+# The cause keeps the operator's canonical decision beside its digest, so a
+# lost response or a later reader recovers the exact attribution, not a hash.
+_STORAGE_HOLD_CAUSE_FIELDS = _TASK_FAILURE_CAUSE_FIELDS | frozenset(
+    {"hold_reason", "decision_sha256", "decision"}
+)
+_STORAGE_HOLD_DECISION_FIELDS = frozenset({"schema", "preview_sha256", "decided_by", "reason", "fixed_by"})
+_MAX_DECISION_TEXT = 512
+# The hold route is shared with ordinary work (one TCP/SSH origin), so only a
+# presented operator credential reaches it. Its verifier (the credential's
+# sha256, never the credential) lives in the container's own filesystem, not a
+# bind mount: only an operator with docker exec on the host enrolls it, and a
+# recreated container starts with the route disabled.
+STORAGE_HOLD_OPERATOR_SCHEMA = "mineru.storage-hold-operator.v1"
+STORAGE_HOLD_OPERATOR_PATH = Path("/run/agent-invest-operator/storage-hold-operator.json")
+_MAX_OPERATOR_FILE_BYTES = 512
+_TASK_STORAGE_FIELDS = frozenset(
+    {
+        "schema", "policy_sha256", "phase", "upload_bytes", "growth_permit_bytes",
+        "source_bytes", "selected_bytes", "member_count", "inventory_sha256",
+        "zip_upper_bound_bytes", "zip_grant_bytes", "zip_bytes", "wait_reason",
+        "wait_since_unix",
+    }
+)
+_STORAGE_INT_FIELDS = (
+    "upload_bytes", "growth_permit_bytes", "source_bytes", "selected_bytes",
+    "member_count", "zip_upper_bound_bytes", "zip_grant_bytes", "zip_bytes",
+)
+_MAX_STORAGE_INT = (1 << 63) - 1
+
+
+def _canonical_sha256(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _storage_sha256(value: object, *, label: str) -> str:
+    if (
+        type(value) is not str or len(value) != 71 or not value.startswith("sha256:")
+        or any(char not in "0123456789abcdef" for char in value[7:])
+    ):
+        raise TaskProtocolConflict(f"task storage {label} is not a canonical sha256")
+    return value
+
+
+class StorageHoldOperatorRefused(Exception):
+    """The operator gate refused the caller; nothing else was read or run."""
+
+    def __init__(self, code: str, *, status: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status = status
+
+
+def _is_operator_verifier(value: object) -> bool:
+    return (
+        type(value) is str and len(value) == 71 and value.startswith("sha256:")
+        and all(char in "0123456789abcdef" for char in value[7:])
+    )
+
+
+def storage_hold_operator_verifier(credential: str) -> str:
+    """The enrolled identity of one operator credential: its sha256, never the credential."""
+    return "sha256:" + hashlib.sha256(credential.encode("latin-1")).hexdigest()
+
+
+def _misconfigured_operator() -> StorageHoldOperatorRefused:
+    return StorageHoldOperatorRefused("storage_hold_operator_misconfigured", status=403)
+
+
+def _read_storage_hold_operator_verifier(path: Path) -> str | None:
+    """The enrolled verifier, or None when none is enrolled; anything unsafe refuses."""
+    try:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _misconfigured_operator() from None
+    try:
+        parent = os.fstat(directory)
+        if parent.st_uid != os.geteuid() or stat.S_IMODE(parent.st_mode) != 0o700:
+            raise _misconfigured_operator()
+        try:
+            descriptor = os.open(
+                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise _misconfigured_operator() from None
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1
+                or not 0 < metadata.st_size <= _MAX_OPERATOR_FILE_BYTES
+            ):
+                raise _misconfigured_operator()
+            raw = os.read(descriptor, _MAX_OPERATOR_FILE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        document = None
+    if (
+        len(raw) != metadata.st_size or type(document) is not dict
+        or set(document) != {"schema", "credential_sha256"}
+        or document["schema"] != STORAGE_HOLD_OPERATOR_SCHEMA
+        or not _is_operator_verifier(document["credential_sha256"])
+    ):
+        raise _misconfigured_operator()
+    return document["credential_sha256"]
+
+
+def require_storage_hold_operator(authorization: str | None, *, path: Path | None = None) -> None:
+    """Admit only a bearer of the enrolled operator credential, before anything else runs.
+
+    Disabled (403) while no verifier is enrolled or the enrollment is unsafe;
+    unauthorized (401) for a missing, malformed or wrong credential. The digests
+    are compared in constant time.
+    """
+    verifier = _read_storage_hold_operator_verifier(
+        STORAGE_HOLD_OPERATOR_PATH if path is None else path
+    )
+    if verifier is None:
+        raise StorageHoldOperatorRefused("storage_hold_operator_disabled", status=403)
+    scheme, _, presented = (authorization or "").partition(" ")
+    presented = presented.strip()
+    candidate = ""
+    if scheme.lower() == "bearer" and presented:
+        try:
+            candidate = storage_hold_operator_verifier(presented)
+        except UnicodeEncodeError:
+            candidate = ""
+    if not hmac.compare_digest(candidate.encode("ascii"), verifier.encode("ascii")):
+        raise StorageHoldOperatorRefused("storage_hold_operator_unauthorized", status=401)
+
+
+def enroll_storage_hold_operator(credential_sha256: str, *, path: Path | None = None) -> dict[str, str]:
+    """Operator only, inside the API container: enable the hold route for one credential.
+
+    Takes the credential's verifier, never the credential, and atomically
+    replaces any earlier enrollment. Revoke, or recreate the container, to disable.
+    """
+    if not _is_operator_verifier(credential_sha256):
+        raise ValueError("operator credential verifier must be sha256:<64 lowercase hex>")
+    target = STORAGE_HOLD_OPERATOR_PATH if path is None else path
+    document = {"schema": STORAGE_HOLD_OPERATOR_SCHEMA, "credential_sha256": credential_sha256}
+    payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    try:
+        os.mkdir(target.parent, 0o700)
+    except FileExistsError:
+        pass
+    directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(directory).st_uid != os.geteuid():
+            raise ValueError("operator credential directory belongs to another user")
+        os.fchmod(directory, 0o700)
+        temporary = f".{target.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=directory,
+        )
+        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(descriptor, view):]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, target.name, src_dir_fd=directory, dst_dir_fd=directory)
+        except BaseException:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            raise
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return document
+
+
+def revoke_storage_hold_operator(*, path: Path | None = None) -> bool:
+    """Disable the hold route; True when an enrollment was removed."""
+    target = STORAGE_HOLD_OPERATOR_PATH if path is None else path
+    try:
+        directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            os.unlink(target.name, dir_fd=directory)
+        except FileNotFoundError:
+            return False
+        os.fsync(directory)
+        return True
+    finally:
+        os.close(directory)
+
+
+def validate_task_storage(value: object, *, state: str) -> dict[str, Any]:
+    """Return one closed storage record consistent with its task state."""
+    if type(value) is not dict or set(value) != _TASK_STORAGE_FIELDS:
+        raise TaskProtocolConflict("task storage fields are not closed")
+    if value["schema"] != TASK_STORAGE_SCHEMA:
+        raise TaskProtocolConflict("task storage schema is unsupported")
+    _storage_sha256(value["policy_sha256"], label="policy")
+    phase = value["phase"]
+    if phase not in STORAGE_PHASES:
+        raise TaskProtocolConflict("task storage phase is unsupported")
+    for name in _STORAGE_INT_FIELDS:
+        item = value[name]
+        if type(item) is not int or not 0 <= item <= _MAX_STORAGE_INT:
+            raise TaskProtocolConflict(f"task storage {name} is invalid")
+    reason = value["wait_reason"]
+    since = value["wait_since_unix"]
+    if (reason is None) != (since is None):
+        raise TaskProtocolConflict("task storage wait reason and time must be paired")
+    if reason is not None and reason not in STORAGE_WAIT_REASONS:
+        raise TaskProtocolConflict("task storage wait reason is unsupported")
+    if since is not None and (
+        isinstance(since, bool) or not isinstance(since, (int, float)) or since < 0
+    ):
+        raise TaskProtocolConflict("task storage wait time is invalid")
+    sealed = phase in {"source_sealed", "zip_writing", "zip_sealed"}
+    inventory = value["inventory_sha256"]
+    if sealed:
+        _storage_sha256(inventory, label="inventory")
+        if value["member_count"] < 1 or value["zip_upper_bound_bytes"] < 1:
+            raise TaskProtocolConflict("sealed task storage lacks its inventory facts")
+    elif inventory is not None or any(
+        value[name] for name in ("source_bytes", "selected_bytes", "member_count", "zip_upper_bound_bytes")
+    ):
+        raise TaskProtocolConflict("unsealed task storage carries sealed facts")
+    if (phase == "source_growing") != (value["growth_permit_bytes"] > 0):
+        raise TaskProtocolConflict("task storage growth permit escaped its phase")
+    if (phase == "zip_writing") != (value["zip_grant_bytes"] > 0):
+        raise TaskProtocolConflict("task storage completion grant escaped its phase")
+    if (phase == "zip_sealed") != (value["zip_bytes"] > 0):
+        raise TaskProtocolConflict("task storage sealed result escaped its phase")
+    if phase == "zip_writing" and value["zip_grant_bytes"] > value["zip_upper_bound_bytes"]:
+        raise TaskProtocolConflict("task storage completion grant exceeds its bound")
+    allowed_phases = {
+        "pending": {"admitted", "source_growing"},
+        "processing": {"source_growing"},
+        "finalizing": {"source_sealed", "zip_writing"},
+        "completed": {"zip_sealed"},
+        "failed": set(STORAGE_PHASES),
+        "cleanup_pending": set(STORAGE_PHASES),
+    }.get(state)
+    if allowed_phases is None or phase not in allowed_phases:
+        raise TaskProtocolConflict("task storage phase contradicts the task state")
+    if reason in STORAGE_BLOCKED_REASONS and state not in {"processing", "finalizing"}:
+        raise TaskProtocolConflict("a storage block belongs to accepted in-flight work")
+    return value
+
+
+def _require_storage_amount(value: object, label: str) -> None:
+    if type(value) is not int or not 0 <= value <= _MAX_STORAGE_INT:
+        raise ValueError(f"task storage {label} must be a bounded non-negative integer")
+
+
+def storage_occupancy(storage: dict[str, Any], physical: Callable[[int], int]) -> tuple[int, int]:
+    """(source-pool bytes, result bytes) one record owns or has been promised.
+
+    Source amounts are recorded as physical charges already. A ZIP extent is
+    logical, so it is charged at its allocation-rounded size plus file overhead.
+    """
+    phase = storage["phase"]
+    source = storage["upload_bytes"] + (
+        storage["growth_permit_bytes"] if phase == "source_growing" else storage["source_bytes"]
+    )
+    extent = storage["zip_grant_bytes"] if phase == "zip_writing" else storage["zip_bytes"]
+    return source, physical(extent) if extent else 0
+
+
+def storage_status_payload(record: "DurableTaskRecord") -> dict[str, Any] | None:
+    """The closed wire projection of one storage-managed task, else None.
+
+    Carries what a consumer needs to size and verify its own work (selected
+    S/M, inventory and policy identity, the sealed ZIP extent) and makes a
+    capacity wait or an operator hold visible without turning it into failure.
+    """
+    storage = record.storage
+    if storage is None:
+        return None
+    return {
+        "schema": TASK_STORAGE_STATUS_SCHEMA,
+        "policy_sha256": storage["policy_sha256"],
+        "phase": storage["phase"],
+        "wait_reason": storage["wait_reason"],
+        "wait_since_unix": storage["wait_since_unix"],
+        "blocked": storage["wait_reason"] in STORAGE_BLOCKED_REASONS,
+        "selected_bytes": storage["selected_bytes"],
+        "member_count": storage["member_count"],
+        "inventory_sha256": storage["inventory_sha256"],
+        "zip_bytes": storage["zip_bytes"],
+    }
 
 
 def _vlm_http_status_retry_class(status: int) -> str:
@@ -172,9 +543,33 @@ def task_failure_cause(failure: BaseException, *, task_id: str) -> dict[str, Any
     return cause
 
 
+def storage_hold_decision(
+    *, preview_sha256: str, decided_by: str, reason: str, fixed_by: str,
+) -> tuple[dict[str, str], str]:
+    """One operator's canonical hold decision (the exact digest preimage) and its digest."""
+    _storage_sha256(preview_sha256, label="reviewed preview")
+    for label, text in (("decided_by", decided_by), ("reason", reason), ("fixed_by", fixed_by)):
+        if (
+            type(text) is not str or not text.strip() or len(text) > _MAX_DECISION_TEXT
+            or not text.isprintable()
+        ):
+            raise ValueError(f"storage hold decision {label} is invalid")
+    decision = {
+        "schema": STORAGE_HOLD_DECISION_SCHEMA,
+        "preview_sha256": preview_sha256,
+        "decided_by": decided_by,
+        "reason": reason,
+        "fixed_by": fixed_by,
+    }
+    return decision, _canonical_sha256(decision)
+
+
 def validate_task_failure_cause(value: object, *, task_id: str) -> dict[str, Any]:
     """Return one closed, task-bound failure cause or refuse it."""
-    if type(value) is not dict or set(value) != _TASK_FAILURE_CAUSE_FIELDS:
+    if type(value) is not dict or set(value) != (
+        _STORAGE_HOLD_CAUSE_FIELDS if value.get("code") == STORAGE_HOLD_TERMINATED_CODE
+        else _TASK_FAILURE_CAUSE_FIELDS
+    ):
         raise TaskProtocolConflict("task failure cause fields are not closed")
     if value["schema"] != TASK_FAILURE_CAUSE_SCHEMA or value["task_id"] != task_id:
         raise TaskProtocolConflict("task failure cause identity is invalid")
@@ -198,6 +593,29 @@ def validate_task_failure_cause(value: object, *, task_id: str) -> dict[str, Any
         expected = "transient" if transport in TRANSIENT_VLM_TRANSPORT_ERRORS else "unknown"
     elif code == "unclassified" and status is None and transport is None:
         expected = "unknown"
+    elif (
+        code == STORAGE_HOLD_TERMINATED_CODE
+        and status is None
+        and transport is None
+        and type(value["hold_reason"]) is str
+        and value["hold_reason"] in STORAGE_BLOCKED_REASONS
+    ):
+        decision = value["decision"]
+        if (
+            type(decision) is not dict or set(decision) != _STORAGE_HOLD_DECISION_FIELDS
+            or decision["schema"] != STORAGE_HOLD_DECISION_SCHEMA
+        ):
+            raise TaskProtocolConflict("task failure cause hold decision is not closed")
+        try:
+            _, digest = storage_hold_decision(
+                preview_sha256=decision["preview_sha256"], decided_by=decision["decided_by"],
+                reason=decision["reason"], fixed_by=decision["fixed_by"],
+            )
+        except ValueError as exc:
+            raise TaskProtocolConflict("task failure cause hold decision is invalid") from exc
+        if value["decision_sha256"] != digest:
+            raise TaskProtocolConflict("task failure cause hold decision digest drifted")
+        expected = "permanent"
     else:
         raise TaskProtocolConflict("task failure cause code shape is invalid")
     if value["retry_class"] != expected:
@@ -226,6 +644,7 @@ class DurableTaskRecord:
     cleanup_kind: CleanupKind | None = None
     ingress_owner: dict[str, Any] | None = None
     failure_cause: dict[str, Any] | None = None
+    storage: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for value in (
@@ -346,6 +765,12 @@ class DurableTaskRecord:
                 raise TaskProtocolConflict("task failure cause escaped its failed state")
         if self.state == "consumed" and any(value is not None for value in identities) != has_result_identity:
             raise TaskProtocolConflict("consumed result identity is incomplete")
+        if self.storage is not None:
+            validate_task_storage(self.storage, state=self.state)
+            if self.reserved_result_bytes:
+                raise TaskProtocolConflict("storage-managed task carries a legacy reservation")
+            if self.state == "completed" and self.storage["zip_bytes"] != self.result_bytes:
+                raise TaskProtocolConflict("storage result bytes disagree with the result identity")
         if (
             self.state == "completed" or self.cleanup_kind == "result"
         ) and not isinstance(self.result_path, str):
@@ -377,21 +802,26 @@ class DurableRegistryView:
     persistence_event: dict[str, Any] | None
     durability_uncertain: bool
     published_monotonic_ns: int
+    registry_schema: str = REGISTRY_SCHEMA_V3
 
 
 def admission_counts(
     records: Iterable[DurableTaskRecord],
     route_task_ids: set[str],
     live_ingress_ids: set[str] | None = None,
+    *,
+    registry_schema: str = REGISTRY_SCHEMA_V3,
 ) -> dict[str, Any]:
     """Count durable responsibilities independently of the derived route index."""
+    if registry_schema not in {REGISTRY_SCHEMA_V3, REGISTRY_SCHEMA_V4}:
+        raise TaskProtocolConflict("admission registry schema is unsupported")
     counted = tuple(records)
     ingress = sum(r.state in {"ingress", "ingress_cleanup"} for r in counted)
     accepted = [r for r in counted if r.state in {"pending", "processing", "finalizing"}]
     live_ingress_ids = live_ingress_ids or set()
     return {
         "schema": "mineru-task-admission.v1",
-        "registry_schema": "mineru-task-registry.v3",
+        "registry_schema": registry_schema,
         "ingress_tasks": ingress,
         "accepted_pending_tasks": sum(r.state == "pending" for r in accepted),
         "accepted_processing_tasks": sum(r.state == "processing" for r in accepted),
@@ -407,10 +837,12 @@ def admission_counts(
 
 
 def registry_record_payload(record: DurableTaskRecord) -> dict[str, Any]:
-    """Encode one record; without a failure cause the v3 bytes stay unchanged."""
+    """Encode one record; absent optional fields keep the v3 bytes unchanged."""
     payload = asdict(record)
     if payload["failure_cause"] is None:
         del payload["failure_cause"]
+    if payload["storage"] is None:
+        del payload["storage"]
     return payload
 
 
@@ -421,18 +853,39 @@ class DurableTaskRegistry:
         self,
         path: Path,
         *,
-        max_unacked_result_bytes: int,
+        max_unacked_result_bytes: int | None = None,
         output_root: Path | None = None,
         tombstone_retention_seconds: int = 86400,
         enforce_key_lifecycle: bool = False,
         clock: Callable[[], float] = time.time,
+        storage_policy: Any = None,
     ) -> None:
-        if type(max_unacked_result_bytes) is not int or max_unacked_result_bytes < 1:
+        if storage_policy is not None:
+            # Physical storage replaces the aggregate L; accepting one here
+            # would leave a second, unenforced result limit in the process.
+            if max_unacked_result_bytes is not None:
+                raise ValueError("storage-managed registries have no aggregate unacked limit")
+        elif type(max_unacked_result_bytes) is not int or max_unacked_result_bytes < 1:
             raise ValueError("unacked result byte limit must be positive")
+        # A capacity-config-v2 process manages physical result storage and
+        # writes registry v4; every other process keeps the exact v3 behavior.
+        self._storage_policy = storage_policy
+        self._registry_schema = REGISTRY_SCHEMA_V3 if storage_policy is None else REGISTRY_SCHEMA_V4
+        self._storage_policy_sha256: str | None = None
+        if storage_policy is not None:
+            self._storage_policy_sha256 = _storage_sha256(
+                getattr(storage_policy, "sha256", None), label="policy",
+            )
+        # Process-local ingress upload reservations; an interrupted ingress
+        # is aborted on restart, so these never need a durable record.
+        self._ingress_storage: dict[str, int] = {}
+        # Pre-body request charges: token -> [framework body spool, upload copy].
+        self._request_ingress: dict[str, list[int]] = {}
         if not 3600 <= tombstone_retention_seconds <= 30 * 86400:
             raise ValueError("tombstone retention must be between one hour and 30 days")
         self._path = path
-        self._limit = max_unacked_result_bytes
+        # Storage mode refuses every legacy reservation before reading L.
+        self._limit: int = max_unacked_result_bytes or 0
         self._clock = clock
         self._retention = tombstone_retention_seconds
         self._enforce_key_lifecycle = enforce_key_lifecycle
@@ -656,6 +1109,8 @@ class DurableTaskRegistry:
             raise TaskProtocolConflict("ingress cleanup responsibility changed")
         del self._records[key]
         self._persist()
+        # The upload bytes are gone; their process-local charge goes with them.
+        self._ingress_storage.pop(key, None)
 
     def task_payload_for_route(self, idempotency_key: str) -> dict[str, Any] | None:
         """Project one accepted task without replay, cleanup or generation changes."""
@@ -688,7 +1143,8 @@ class DurableTaskRegistry:
         with self._lock:
             self.assert_observation_safe()
             return admission_counts(
-                self._records.values(), route_task_ids, live_ingress_ids
+                self._records.values(), route_task_ids, live_ingress_ids,
+                registry_schema=self._registry_schema,
             )
 
     @classmethod
@@ -702,7 +1158,10 @@ class DurableTaskRegistry:
         cls._raise_view_persistence_error(
             view.persistence_event, durability_uncertain=view.durability_uncertain
         )
-        return admission_counts(view.records, route_task_ids, live_ingress_ids)
+        return admission_counts(
+            view.records, route_task_ids, live_ingress_ids,
+            registry_schema=view.registry_schema,
+        )
 
     def durable_view(self) -> DurableRegistryView:
         """Return the last durable state without acquiring the data lock.
@@ -802,9 +1261,26 @@ class DurableTaskRegistry:
         record = self._required(key)
         if record != expected or record.state not in {"ingress", "pending"}:
             raise TaskProtocolConflict("task ownership changed during upload verification")
+        storage = record.storage
+        policy = self._storage_policy
+        if policy is not None and storage is None:
+            uploads = payload["_agent_protocol"]["uploads"]
+            if any(item["bytes"] > policy.source_pdf_bytes_limit for item in uploads):
+                raise TaskProtocolConflict("task upload exceeds the storage policy source envelope")
+            storage = {
+                "schema": TASK_STORAGE_SCHEMA, "policy_sha256": self._storage_policy_sha256,
+                "phase": "admitted",
+                "upload_bytes": sum(policy.physical_charge(item["bytes"]) for item in uploads),
+                "growth_permit_bytes": 0, "source_bytes": 0, "selected_bytes": 0,
+                "member_count": 0, "inventory_sha256": None, "zip_upper_bound_bytes": 0,
+                "zip_grant_bytes": 0, "zip_bytes": 0, "wait_reason": None, "wait_since_unix": None,
+            }
+            validate_task_storage(storage, state="pending")
         record.task_payload = payload
         record.state = "pending"
         record.ingress_owner = None
+        record.storage = storage
+        self._ingress_storage.pop(key, None)
         self._persist()
 
     def recoverable_payloads(self) -> tuple[dict[str, Any], ...]:
@@ -830,6 +1306,7 @@ class DurableTaskRegistry:
             proposed_records = self._clone_records(self._records)
             changed = False
             replay_keys: list[str] = []
+            unsealed_result_keys: list[str] = []
             for key, record in list(proposed_records.items()):
                 if record.state == "pending" and record.task_payload is None:
                     self._confirm_unowned_task_absent(record)
@@ -841,6 +1318,31 @@ class DurableTaskRegistry:
                         raise TaskProtocolConflict(
                             "nonterminal task has no durable replay payload"
                         )
+                    storage = record.storage
+                    if storage is not None and storage["wait_reason"] in STORAGE_BLOCKED_REASONS:
+                        # Held for an operator decision: bytes, seal and state
+                        # stay exactly as recorded; nothing is replayed.
+                        continue
+                    if storage is not None and record.state == "finalizing":
+                        # A sealed source is re-packed only; the parser never
+                        # reruns. An unsealed ZIP attempt is discarded.
+                        if storage["phase"] == "zip_writing":
+                            record.storage = {
+                                **storage, "phase": "source_sealed", "zip_grant_bytes": 0,
+                                "wait_reason": None, "wait_since_unix": None,
+                            }
+                            validate_task_storage(record.storage, state="finalizing")
+                            changed = True
+                        unsealed_result_keys.append(key)
+                        continue
+                    if storage is not None and storage["phase"] == "source_growing":
+                        # An interrupted parser has no durable intermediate
+                        # state: its permit is released and the source replays.
+                        record.storage = {
+                            **storage, "phase": "admitted", "growth_permit_bytes": 0,
+                            "wait_reason": None, "wait_since_unix": None,
+                        }
+                        changed = True
                     if record.state in {"processing", "finalizing"}:
                         record.state = "pending"
                         record.recovery_generation += 1
@@ -882,6 +1384,11 @@ class DurableTaskRegistry:
                     continue
                 self._prepare_clean_replay(copy.deepcopy(current_record))
                 self._replay_required_keys.discard(key)
+            for key in unsealed_result_keys:
+                current_record = self._records.get(key)
+                if current_record is None or current_record.state != "finalizing":
+                    continue
+                self._discard_unsealed_result(copy.deepcopy(current_record))
 
             hydrated: list[dict[str, Any]] = []
             for record in self._records.values():
@@ -889,8 +1396,13 @@ class DurableTaskRegistry:
                     continue
                 recovered = copy.deepcopy(record.task_payload)
                 recovered.pop("_agent_protocol", None)
+                blocked = (
+                    record.storage is not None
+                    and record.storage["wait_reason"] in STORAGE_BLOCKED_REASONS
+                )
                 recovered["status"] = (
-                    "pending"
+                    "processing" if blocked
+                    else "pending"
                     if record.state in {"pending", "processing", "finalizing"}
                     else record.state
                 )
@@ -960,6 +1472,43 @@ class DurableTaskRegistry:
         finally:
             os.close(task_fd)
             os.close(root_fd)
+
+    def _discard_unsealed_result(self, record: DurableTaskRecord) -> None:
+        """Remove only this task's unrecorded ZIP part/final before re-packing.
+
+        A final ZIP whose commit never became durable is not a result: the
+        sealed source is re-packed. Nothing else in the task tree is touched.
+        """
+        root_fd, task_fd = self._open_task_dir(record.task_id)
+        primary_error: BaseException | None = None
+        try:
+            payload = record.task_payload or {}
+            protocol = payload.get("_agent_protocol")
+            if (
+                not isinstance(protocol, dict)
+                or self._directory_identity(os.fstat(task_fd)) != protocol.get("task_root_identity")
+            ):
+                raise TaskProtocolConflict("unsealed result task directory identity drifted")
+            removed = False
+            for name in (RETAINED_RESULT_PART_NAME, RETAINED_RESULT_NAME):
+                try:
+                    metadata = os.stat(name, dir_fd=task_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise TaskProtocolConflict("unsealed result file identity is unsafe")
+                os.unlink(name, dir_fd=task_fd)
+                removed = True
+            if removed:
+                self._fsync_namespace_directory(task_fd)
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            self._close_namespace_descriptors(
+                ((task_fd, "unsealed result task directory"), (root_fd, "output root")),
+                primary_error,
+            )
 
     @staticmethod
     def _directory_identity(metadata: os.stat_result) -> dict[str, int]:
@@ -1195,6 +1744,10 @@ class DurableTaskRegistry:
             record.state = "failed"
             record.error = error
             record.failure_cause = failure_cause
+            if record.storage is not None:
+                # Owned bytes stay charged until the task-tree cleanup.
+                record.storage = {**record.storage, "wait_reason": None, "wait_since_unix": None}
+                validate_task_storage(record.storage, state="failed")
             self._persist()
 
     def acknowledge_terminal_intent(self, idempotency_key: str) -> str:
@@ -1251,6 +1804,14 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict(
                     f"invalid task transition {record.state}->{target}"
                 )
+            if record.storage is not None:
+                # Storage-managed work enters the parser only under its growth
+                # permit and leaves it only through the source seal.
+                if target == "finalizing" or (
+                    target == "processing" and record.storage["phase"] != "source_growing"
+                ):
+                    raise TaskProtocolConflict("storage-managed transition needs its storage grant")
+                validate_task_storage(record.storage, state=target)
             record.state = target
             self._persist()
 
@@ -1291,6 +1852,8 @@ class DurableTaskRegistry:
 
     def reserve_result_for_parse(self, idempotency_key: str, *, byte_budget: int) -> None:
         """Acquire one durable result budget before invoking the parser."""
+        if self._storage_policy is not None:
+            raise TaskProtocolConflict("storage-managed tasks use growth permits, not B reservations")
         if type(byte_budget) is not int or not 1 <= byte_budget <= self._limit:
             raise ValueError("result reservation must be positive and within its limit")
         with self._lock:
@@ -1332,6 +1895,8 @@ class DurableTaskRegistry:
             self._persist()
 
     def reserve_finalizer(self, idempotency_key: str, *, byte_budget: int) -> None:
+        if self._storage_policy is not None:
+            raise TaskProtocolConflict("storage-managed tasks use completion grants, not B reservations")
         if (
             isinstance(byte_budget, bool)
             or not isinstance(byte_budget, int)
@@ -1386,6 +1951,535 @@ class DurableTaskRegistry:
                 return durable
             return max(durable, usage(self._uncertain_records))
 
+
+    # ----------------------------------------------------------------- storage
+    @property
+    def storage_policy(self) -> Any:
+        return self._storage_policy
+
+    @property
+    def storage_policy_sha256(self) -> str | None:
+        return self._storage_policy_sha256
+
+    @property
+    def registry_schema(self) -> str:
+        return self._registry_schema
+
+    def _require_storage_mode(self) -> Any:
+        policy = self._storage_policy
+        if policy is None:
+            raise TaskProtocolConflict("result storage is not managed by this registry")
+        return policy
+
+    def storage_observation(self, view: DurableRegistryView, executor: "SplitTaskExecutor") -> dict[str, Any]:
+        """Lock-free storage facts from one published durable view.
+
+        Runs on the serving loop, so it never takes the registry data lock;
+        live ingress charges are read as one atomic copy.
+        """
+        policy = self._require_storage_mode()
+        if executor.storage_policy is not policy:
+            raise TaskProtocolConflict("executor and registry storage policies differ")
+        source = result = growing = blocked = 0
+        waiting = {reason: 0 for reason in sorted(STORAGE_WAIT_REASONS - STORAGE_BLOCKED_REASONS)}
+        for record in view.records:
+            if record.storage is None:
+                continue
+            owned_source, owned_result = storage_occupancy(record.storage, policy.physical_charge)
+            source += owned_source
+            result += owned_result
+            growing += record.storage["phase"] == "source_growing"
+            reason = record.storage["wait_reason"]
+            if reason in STORAGE_BLOCKED_REASONS:
+                blocked += 1
+            elif reason is not None:
+                waiting[reason] += 1
+        ingress = sum(tuple(self._ingress_storage.values())) + sum(
+            sum(held) for held in tuple(self._request_ingress.values())
+        )
+        return {
+            "policy_sha256": self._storage_policy_sha256,
+            "source_bytes": source + ingress,
+            "ingress_bytes": ingress,
+            "result_bytes": result,
+            "growing_producers": growing,
+            "outstanding_promise_bytes": executor.outstanding_promise_bytes(),
+            "completion_queue_depth": len(executor.completion_queue_snapshot()),
+            "waiting_tasks": waiting,
+            "blocked_tasks": blocked,
+        }
+
+    def task_root_identity(self, idempotency_key: str) -> dict[str, int]:
+        """The task root identity pinned at acceptance, for descriptor-relative IO."""
+        self._require_storage_mode()
+        with self._lock:
+            self.assert_observation_safe()
+            record = self._required(idempotency_key)
+            protocol = None if record.task_payload is None else record.task_payload.get("_agent_protocol")
+            identity = None if not isinstance(protocol, dict) else protocol.get("task_root_identity")
+            if (
+                record.storage is None or type(identity) is not dict
+                or set(identity) != {"device", "inode", "uid", "mode"}
+                or any(type(value) is not int for value in identity.values())
+            ):
+                raise TaskProtocolConflict("accepted task root identity is absent")
+            return dict(identity)
+
+    def storage_usage(self) -> dict[str, int]:
+        """Durable occupancy (the larger of durable/uncertain) plus live ingress.
+
+        ``source`` is the source pool charge, ``result`` retained/granted ZIP
+        bytes, ``growing`` the producers holding growth permits.
+        """
+        with self._lock:
+            return self._storage_usage_locked()
+
+    def _storage_usage_locked(self) -> dict[str, int]:
+        physical = self._require_storage_mode().physical_charge
+
+        def usage(records: dict[str, DurableTaskRecord]) -> tuple[int, int, int]:
+            source = result = growing = 0
+            for record in records.values():
+                if record.storage is None:
+                    continue
+                owned_source, owned_result = storage_occupancy(record.storage, physical)
+                source += owned_source
+                result += owned_result
+                growing += record.storage["phase"] == "source_growing"
+            return source, result, growing
+
+        source, result, growing = usage(self._records)
+        if self._uncertain_records is not None:
+            other = usage(self._uncertain_records)
+            source, result, growing = (max(source, other[0]), max(result, other[1]), max(growing, other[2]))
+        ingress = sum(self._ingress_storage.values()) + sum(
+            sum(held) for held in self._request_ingress.values()
+        )
+        return {
+            "source": source + ingress,
+            "result": result,
+            "growing": growing,
+            "ingress": ingress,
+        }
+
+    def _admit_ingress_locked(
+        self, policy: Any, charge: int, live_free_bytes: int, outstanding_promise_bytes: int,
+    ) -> None:
+        used = self._storage_usage_locked()
+        if (
+            used["source"] + charge > policy.native_source_pool_bytes
+            or used["source"] + used["result"] + charge
+            > policy.native_source_pool_bytes + policy.native_completion_escrow_bytes
+        ):
+            raise TaskStorageWait("source_growth_capacity")
+        if live_free_bytes < policy.native_free_floor_bytes + outstanding_promise_bytes + charge:
+            raise TaskStorageWait("free_floor")
+
+    def reserve_ingress_storage(
+        self, idempotency_key: str, *, live_free_bytes: int, outstanding_promise_bytes: int,
+    ) -> int:
+        """Charge one maximal upload before any upload byte is written.
+
+        Process-local: an interrupted ingress is aborted and its bytes removed on
+        restart. The acceptance commit replaces it with the actual upload charge.
+        """
+        policy = self._require_storage_mode()
+        _require_storage_amount(live_free_bytes, "live free bytes")
+        _require_storage_amount(outstanding_promise_bytes, "outstanding promises")
+        with self._lock:
+            if idempotency_key in self._ingress_storage:
+                raise TaskProtocolConflict("ingress storage is already reserved")
+            charge = policy.physical_charge(policy.source_pdf_bytes_limit)
+            self._admit_ingress_locked(policy, charge, live_free_bytes, outstanding_promise_bytes)
+            self._ingress_storage[idempotency_key] = charge
+            return charge
+
+    def release_ingress_storage(self, idempotency_key: str) -> None:
+        with self._lock:
+            self._ingress_storage.pop(idempotency_key, None)
+
+    def reserve_request_ingress(
+        self, token: str, *, body_bytes: int, live_free_bytes: int, outstanding_promise_bytes: int,
+    ) -> int:
+        """Charge one request body before any byte of it is read.
+
+        The framework spools the whole multipart body before the endpoint runs
+        and the endpoint then copies its single upload: both copies are charged
+        in this one admission decision, and the upload share later moves to the
+        key the body names. Process-local, like every ingress charge.
+        """
+        policy = self._require_storage_mode()
+        if type(token) is not str or not token:
+            raise ValueError("request ingress token is invalid")
+        _require_storage_amount(body_bytes, "request body bytes")
+        _require_storage_amount(live_free_bytes, "live free bytes")
+        _require_storage_amount(outstanding_promise_bytes, "outstanding promises")
+        spool = policy.physical_charge(body_bytes)
+        upload = policy.physical_charge(min(body_bytes, policy.source_pdf_bytes_limit))
+        with self._lock:
+            if token in self._request_ingress:
+                raise TaskProtocolConflict("request ingress is already reserved")
+            self._admit_ingress_locked(policy, spool + upload, live_free_bytes, outstanding_promise_bytes)
+            self._request_ingress[token] = [spool, upload]
+            return spool + upload
+
+    def transfer_request_ingress(self, token: str, idempotency_key: str) -> int:
+        """Move a request's reserved upload share to the key its body named."""
+        self._require_storage_mode()
+        with self._lock:
+            held = self._request_ingress.get(token)
+            if held is None or held[1] == 0:
+                raise TaskProtocolConflict("request has no reserved upload share")
+            if idempotency_key in self._ingress_storage:
+                raise TaskProtocolConflict("ingress storage is already reserved")
+            charge, held[1] = held[1], 0
+            self._ingress_storage[idempotency_key] = charge
+            return charge
+
+    def release_request_ingress(self, token: str) -> None:
+        with self._lock:
+            self._request_ingress.pop(token, None)
+
+    def reserve_source_growth(
+        self,
+        idempotency_key: str,
+        *,
+        live_free_bytes: int,
+        outstanding_promise_bytes: int,
+        completion_head_waiting: bool,
+    ) -> int:
+        """Grant one producer's whole growth permit before its parser starts.
+
+        Completed results are served first: while a sealed source waits for
+        completion space no new producer may take source-pool space.
+        """
+        policy = self._require_storage_mode()
+        _require_storage_amount(live_free_bytes, "live free bytes")
+        _require_storage_amount(outstanding_promise_bytes, "outstanding promises")
+        if type(completion_head_waiting) is not bool:
+            raise ValueError("completion head flag must be boolean")
+        with self._lock:
+            record = self._required(idempotency_key)
+            storage = record.storage
+            if record.state != "pending" or storage is None:
+                raise TaskProtocolConflict("growth permit requires an accepted storage-managed task")
+            if storage["phase"] == "source_growing":
+                return int(storage["growth_permit_bytes"])
+            if storage["phase"] != "admitted":
+                raise TaskProtocolConflict("growth permit phase is invalid")
+            if any(
+                key in self._records and self._records[key].state != "consumed"
+                for key in self._replay_required_keys
+            ):
+                raise TaskResultCapacityRecoveryRequired(
+                    "cold task responsibility requires successful replay cleanup"
+                )
+            permit = policy.native_source_single_limit_bytes
+            used = self._storage_usage_locked()
+            estimate = policy.initial_result_estimate_bytes
+            unzipped = sum(
+                other.storage is not None
+                and other.storage["phase"] in {"source_growing", "source_sealed"}
+                for other in self._records.values()
+            )
+            reason: str | None = None
+            if completion_head_waiting:
+                reason = "completion_capacity"
+            elif used["growing"] >= policy.native_growing_producer_limit:
+                reason = "source_growth_capacity"
+            elif (
+                used["source"] + permit > policy.native_source_pool_bytes
+                or used["source"] + used["result"] + permit
+                > policy.native_source_pool_bytes + policy.native_completion_escrow_bytes
+            ):
+                reason = "source_growth_capacity"
+            elif used["result"] + estimate * (unzipped + 1) > policy.native_normal_unacked_target_bytes:
+                # Soft back-pressure before the retained results reach their
+                # normal target; admitted work keeps its uploads meanwhile.
+                reason = "completion_capacity"
+            elif live_free_bytes < policy.native_free_floor_bytes + outstanding_promise_bytes + permit:
+                reason = "free_floor"
+            if reason is not None:
+                raise TaskStorageWait(reason)
+            record.storage = {
+                **storage, "phase": "source_growing", "growth_permit_bytes": permit,
+                "wait_reason": None, "wait_since_unix": None,
+            }
+            validate_task_storage(record.storage, state="pending")
+            self._persist()
+            return permit
+
+    def seal_source(
+        self,
+        idempotency_key: str,
+        *,
+        inventory_sha256: str,
+        source_bytes: int,
+        selected_bytes: int,
+        member_count: int,
+        zip_upper_bound_bytes: int,
+    ) -> None:
+        """Commit the verified source tree and release the unused growth promise."""
+        policy = self._require_storage_mode()
+        _storage_sha256(inventory_sha256, label="inventory")
+        for value, label in (
+            (source_bytes, "source bytes"), (selected_bytes, "selected bytes"),
+            (member_count, "member count"), (zip_upper_bound_bytes, "ZIP upper bound"),
+        ):
+            _require_storage_amount(value, label)
+        with self._lock:
+            record = self._required(idempotency_key)
+            storage = record.storage
+            if record.state != "processing" or storage is None or storage["phase"] != "source_growing":
+                raise TaskProtocolConflict("only a growing source may be sealed")
+            if source_bytes > storage["growth_permit_bytes"]:
+                raise TaskProtocolConflict("sealed source exceeds its growth permit")
+            if member_count > policy.max_members or member_count < 1:
+                raise TaskProtocolConflict("sealed source member count is outside the policy")
+            record.storage = {
+                **storage, "phase": "source_sealed", "growth_permit_bytes": 0,
+                "source_bytes": source_bytes, "selected_bytes": selected_bytes,
+                "member_count": member_count, "inventory_sha256": inventory_sha256,
+                "zip_upper_bound_bytes": zip_upper_bound_bytes,
+                "wait_reason": None, "wait_since_unix": None,
+            }
+            validate_task_storage(record.storage, state="finalizing")
+            record.state = "finalizing"
+            self._persist()
+
+    def reserve_completion(
+        self,
+        idempotency_key: str,
+        *,
+        grant_bytes: int,
+        live_free_bytes: int,
+        outstanding_promise_bytes: int,
+    ) -> None:
+        """Grant the completion extent before the ZIP writer creates its part."""
+        policy = self._require_storage_mode()
+        _require_storage_amount(grant_bytes, "completion grant")
+        _require_storage_amount(live_free_bytes, "live free bytes")
+        _require_storage_amount(outstanding_promise_bytes, "outstanding promises")
+        with self._lock:
+            record = self._required(idempotency_key)
+            storage = record.storage
+            if record.state != "finalizing" or storage is None:
+                raise TaskProtocolConflict("completion grant requires a sealed storage-managed task")
+            if storage["phase"] == "zip_writing":
+                if storage["zip_grant_bytes"] != grant_bytes:
+                    raise TaskProtocolConflict("held completion grant differs from the request")
+                return
+            if storage["phase"] != "source_sealed":
+                raise TaskProtocolConflict("completion grant phase is invalid")
+            if not 1 <= grant_bytes <= min(storage["zip_upper_bound_bytes"], policy.native_result_hard_limit_bytes):
+                raise TaskProtocolConflict("completion grant is outside its bound")
+            charge = policy.physical_charge(grant_bytes)
+            used = self._storage_usage_locked()
+            if (
+                used["source"] + used["result"] + charge
+                > policy.native_source_pool_bytes + policy.native_completion_escrow_bytes
+            ):
+                raise TaskStorageWait("completion_capacity")
+            if live_free_bytes < policy.native_free_floor_bytes + outstanding_promise_bytes + charge:
+                raise TaskStorageWait("free_floor")
+            record.storage = {
+                **storage, "phase": "zip_writing", "zip_grant_bytes": grant_bytes,
+                "wait_reason": None, "wait_since_unix": None,
+            }
+            validate_task_storage(record.storage, state="finalizing")
+            self._persist()
+
+    def release_completion(self, idempotency_key: str, *, wait_reason: str) -> None:
+        """Return an unsealed ZIP attempt to its source seal after removing the part."""
+        self._require_storage_mode()
+        if wait_reason not in STORAGE_WAIT_REASONS or wait_reason in STORAGE_BLOCKED_REASONS:
+            raise ValueError("completion release reason is invalid")
+        with self._lock:
+            record = self._required(idempotency_key)
+            storage = record.storage
+            if record.state != "finalizing" or storage is None or storage["phase"] != "zip_writing":
+                raise TaskProtocolConflict("only a writing completion can be released")
+            record.storage = {
+                **storage, "phase": "source_sealed", "zip_grant_bytes": 0,
+                "wait_reason": wait_reason, "wait_since_unix": self._clock(),
+            }
+            validate_task_storage(record.storage, state="finalizing")
+            self._persist()
+
+    def complete_storage(
+        self,
+        idempotency_key: str,
+        *,
+        result_path: Path,
+        result_sha256: str,
+        result_bytes: int,
+        result_owner: str,
+    ) -> None:
+        """Seal the retained ZIP and true-up the grant in one durable commit."""
+        self._require_storage_mode()
+        if (
+            isinstance(result_bytes, bool) or not isinstance(result_bytes, int) or result_bytes < 1
+            or any(
+                not isinstance(value, str) or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+                for value in (result_sha256, result_owner)
+            )
+        ):
+            raise ValueError("result identity is invalid")
+        with self._lock:
+            record = self._required(idempotency_key)
+            storage = record.storage
+            if record.state != "finalizing" or storage is None or storage["phase"] != "zip_writing":
+                raise TaskProtocolConflict("only a writing completion may complete")
+            if result_bytes > storage["zip_grant_bytes"]:
+                raise TaskProtocolConflict("result exceeded its completion grant")
+            record.result_path = str(result_path)
+            record.result_sha256 = result_sha256
+            record.result_bytes = result_bytes
+            record.result_owner = result_owner
+            record.storage = {
+                **storage, "phase": "zip_sealed", "zip_grant_bytes": 0, "zip_bytes": result_bytes,
+                "wait_reason": None, "wait_since_unix": None,
+            }
+            validate_task_storage(record.storage, state="completed")
+            record.state = "completed"
+            self._persist()
+
+    def record_storage_wait(self, idempotency_key: str, *, reason: str) -> None:
+        """Make a capacity wait durable and visible; never a failure."""
+        self._require_storage_mode()
+        if reason not in STORAGE_WAIT_REASONS or reason in STORAGE_BLOCKED_REASONS:
+            raise ValueError("storage wait reason is invalid")
+        with self._lock:
+            record = self._required(idempotency_key)
+            storage = record.storage
+            if storage is None or record.state not in {"pending", "finalizing"}:
+                raise TaskProtocolConflict("only accepted storage-managed work can wait")
+            if storage["wait_reason"] == reason:
+                return
+            record.storage = {**storage, "wait_reason": reason, "wait_since_unix": self._clock()}
+            validate_task_storage(record.storage, state=record.state)
+            self._persist()
+
+    def block_storage(self, idempotency_key: str, *, reason: str) -> None:
+        """Hold accepted in-flight work with its bytes for an operator decision."""
+        self._require_storage_mode()
+        if reason not in STORAGE_BLOCKED_REASONS:
+            raise ValueError("storage block reason is invalid")
+        with self._lock:
+            record = self._required(idempotency_key)
+            storage = record.storage
+            if storage is None or record.state not in {"processing", "finalizing"}:
+                raise TaskProtocolConflict("only accepted in-flight storage-managed work can block")
+            if storage["wait_reason"] == reason:
+                return
+            record.storage = {**storage, "wait_reason": reason, "wait_since_unix": self._clock()}
+            validate_task_storage(record.storage, state=record.state)
+            self._persist()
+
+    def storage_hold_preview(self, idempotency_key: str, *, runtime_identity_sha256: str) -> dict[str, Any]:
+        """The exact reviewable facts of one held task; nothing changes."""
+        self._require_storage_mode()
+        with self._lock:
+            return self._storage_hold_preview_locked(self._required(idempotency_key), runtime_identity_sha256)
+
+    def _storage_hold_preview_locked(
+        self, record: DurableTaskRecord, runtime_identity_sha256: str,
+    ) -> dict[str, Any]:
+        _storage_sha256(runtime_identity_sha256, label="runtime identity")
+        storage = record.storage
+        if (
+            record.state not in {"processing", "finalizing"}
+            or storage is None
+            or storage["wait_reason"] not in STORAGE_BLOCKED_REASONS
+        ):
+            raise TaskProtocolConflict("only a held non-terminal storage task has a hold decision")
+        facts = {
+            "schema": STORAGE_HOLD_PREVIEW_SCHEMA,
+            "task_id": record.task_id,
+            "idempotency_key": record.idempotency_key,
+            "attempt_identity": record.attempt_identity,
+            "fence_identity": record.fence_identity,
+            "state": record.state,
+            "recovery_generation": record.recovery_generation,
+            "hold_reason": storage["wait_reason"],
+            "storage": copy.deepcopy(storage),
+            "registry_schema": self._registry_schema,
+            "runtime_identity_sha256": runtime_identity_sha256,
+        }
+        return {**facts, "preview_sha256": _canonical_sha256(facts)}
+
+    def decide_storage_hold(
+        self,
+        idempotency_key: str,
+        *,
+        runtime_identity_sha256: str,
+        expected_preview_sha256: str,
+        decided_by: str,
+        reason: str,
+        fixed_by: str,
+    ) -> dict[str, Any]:
+        """Fail exactly one reviewed held task with the operator's recorded decision.
+
+        The failure and its closed cause are durable before this returns; the
+        task's bytes and seal stay charged until the ordinary failed-task ACK.
+        The same decision replays to the same receipt; another decision, or a
+        task that is no longer exactly the reviewed hold, is refused.
+        """
+        self._require_storage_mode()
+        decision, decision_sha256 = storage_hold_decision(
+            preview_sha256=expected_preview_sha256, decided_by=decided_by, reason=reason, fixed_by=fixed_by,
+        )
+        with self._cleanup_lock:
+            with self._lock:
+                self._ensure_mutation_allowed("decide_storage_hold")
+                record = self._required(idempotency_key)
+                applied = record.failure_cause
+                if applied is not None and applied["code"] == STORAGE_HOLD_TERMINATED_CODE:
+                    if applied["decision_sha256"] != decision_sha256:
+                        raise TaskProtocolConflict("held task was already terminated by another decision")
+                    return self._storage_hold_receipt(record, applied, replayed=True)
+                preview = self._storage_hold_preview_locked(record, runtime_identity_sha256)
+                if preview["preview_sha256"] != expected_preview_sha256:
+                    raise TaskProtocolConflict("held task no longer matches its reviewed preview")
+                if record.active_readers:
+                    raise TaskProtocolConflict("held task has a live reader")
+                cause = {
+                    "schema": TASK_FAILURE_CAUSE_SCHEMA,
+                    "task_id": record.task_id,
+                    "retry_class": "permanent",
+                    "code": STORAGE_HOLD_TERMINATED_CODE,
+                    "http_status": None,
+                    "transport_error": None,
+                    "hold_reason": preview["hold_reason"],
+                    "decision_sha256": decision_sha256,
+                    "decision": decision,
+                }
+                self.fail(
+                    idempotency_key,
+                    error=f"storage hold {preview['hold_reason']} terminated by operator decision {decision_sha256}",
+                    failure_cause=cause,
+                )
+                return self._storage_hold_receipt(self._required(idempotency_key), cause, replayed=False)
+
+    @staticmethod
+    def _storage_hold_receipt(
+        record: DurableTaskRecord, cause: dict[str, Any], *, replayed: bool,
+    ) -> dict[str, Any]:
+        """Built only from the durable cause: a replay returns the original attribution."""
+        return {
+            "schema": STORAGE_HOLD_RECEIPT_SCHEMA,
+            "task_id": record.task_id,
+            "idempotency_key": record.idempotency_key,
+            "attempt_identity": record.attempt_identity,
+            "fence_identity": record.fence_identity,
+            "hold_reason": cause["hold_reason"],
+            "preview_sha256": cause["decision"]["preview_sha256"],
+            "decision_sha256": cause["decision_sha256"],
+            "decision": dict(cause["decision"]),
+            "state": record.state,
+            "replayed": replayed,
+        }
 
     def lease(self, idempotency_key: str, *, seconds: float) -> float:
         if seconds <= 0:
@@ -1500,6 +2594,7 @@ class DurableTaskRegistry:
         record.error = None
         record.failure_cause = None
         record.reserved_result_bytes = 0
+        record.storage = None
         record.state = "consumed"
         record.consumed_at_unix = self._clock()
         record.cleanup_kind = None
@@ -1768,10 +2863,18 @@ class DurableTaskRegistry:
                 TaskProtocolConflict(f"non-finite registry value: {value}")
             ),
         )
+        storage_mode = getattr(self, "_storage_policy", None) is not None
+        if require_quiescent:
+            # A quiescent proof owns no resources, so every version is readable.
+            accepted_schemas = {"mineru-task-registry.v2", REGISTRY_SCHEMA_V3, REGISTRY_SCHEMA_V4}
+        elif storage_mode:
+            accepted_schemas = {REGISTRY_SCHEMA_V3, REGISTRY_SCHEMA_V4}
+        else:
+            accepted_schemas = {"mineru-task-registry.v2", REGISTRY_SCHEMA_V3}
         if (
             not isinstance(payload, dict)
             or set(payload) != {"schema", "output_root", "submission_watermark_bucket", "records"}
-            or payload.get("schema") not in {"mineru-task-registry.v2", "mineru-task-registry.v3"}
+            or payload.get("schema") not in accepted_schemas
         ):
             raise TaskProtocolConflict("task registry schema is invalid")
         expected_root = {
@@ -1798,12 +2901,16 @@ class DurableTaskRegistry:
         if not isinstance(records, list) or len(records) > _MAX_RECORDS + _MAX_TOMBSTONES:
             raise TaskProtocolConflict("task registry records are invalid")
         # A v3 record carries failure_cause only while a typed failed task awaits
-        # ACK; every other record keeps the exact pre-cause v3 field set.
-        expected = {item.name for item in fields(DurableTaskRecord)} - {"failure_cause"}
+        # ACK; every other record keeps the exact pre-cause v3 field set. Only
+        # v4 records may carry the closed storage field.
+        expected = {item.name for item in fields(DurableTaskRecord)} - {"failure_cause", "storage"}
         legacy = payload["schema"] == "mineru-task-registry.v2"
+        v4 = payload["schema"] == REGISTRY_SCHEMA_V4
         if legacy:
             expected -= {"ingress_owner"}
         allowed = expected if legacy else expected | {"failure_cause"}
+        if v4:
+            allowed = allowed | {"storage"}
         if any(
             not isinstance(item, dict) or not expected <= set(item) <= allowed
             for item in records
@@ -1829,6 +2936,17 @@ class DurableTaskRegistry:
                 raise TaskProtocolConflict("output registry still owns task resources")
             if record.idempotency_key in loaded or record.task_id in task_ids:
                 raise TaskProtocolConflict("task registry identities are not unique")
+            if storage_mode and not require_quiescent and record.state != "consumed":
+                # v3 in-flight work was accepted under the retired B/L rules;
+                # a storage-managed process never adopts it silently.
+                if not v4 or record.storage is None:
+                    raise TaskProtocolConflict(
+                        "storage-managed registry requires every live task to carry storage"
+                    )
+                if record.storage["policy_sha256"] != self._storage_policy_sha256:
+                    raise TaskProtocolConflict(
+                        "live task storage was granted under a different storage policy"
+                    )
             if record.state not in {
                 "ingress",
                 "ingress_cleanup",
@@ -1904,6 +3022,7 @@ class DurableTaskRegistry:
             persistence_event=copy.deepcopy(self._last_persistence_event),
             durability_uncertain=self._uncertain_records is not None,
             published_monotonic_ns=time.monotonic_ns(),
+            registry_schema=self._registry_schema,
         )
         self._durable_view = view
 
@@ -2505,7 +3624,7 @@ class DurableTaskRegistry:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(
                 {
-                    "schema": "mineru-task-registry.v3",
+                    "schema": self._registry_schema,
                     "output_root": {
                         "path": str(self._output_root),
                         "device": self._output_root_identity[0],
@@ -2690,6 +3809,13 @@ _REGISTRY_MUTATOR_NAMES = (
     "reserve_finalizer",
     "reserve_result_for_parse",
     "transition",
+    "reserve_source_growth",
+    "seal_source",
+    "reserve_completion",
+    "release_completion",
+    "complete_storage",
+    "record_storage_wait",
+    "block_storage",
 )
 
 
@@ -2753,6 +3879,753 @@ for _registry_mutator_name in _REGISTRY_MUTATOR_NAMES:
     )
 
 
+# ------------------------------------------------------------ result storage IO
+# Growth is granted before it happens. Every parser output write reaches the
+# granted DataWriter with its full payload, so a write that would pass the
+# producer's permit is refused before ``open``; the ZIP writer refuses any byte
+# past its grant, central directory included. Neither polls the disk.
+
+_SOURCE_GROWTH_PERMIT: contextvars.ContextVar["SourceGrowthPermit | None"] = contextvars.ContextVar(
+    "mineru_source_growth_permit", default=None,
+)
+_STORAGE_MANAGED_OUTPUT = False
+# prepare_env creates the parse and image directories before any writer exists.
+_PERMIT_DIRECTORY_ALLOWANCE = 8
+
+
+def require_storage_managed_output() -> None:
+    """Latch this process: from now on parser output needs a growth permit."""
+    global _STORAGE_MANAGED_OUTPUT
+    _STORAGE_MANAGED_OUTPUT = True
+
+
+def storage_managed_output_required() -> bool:
+    return _STORAGE_MANAGED_OUTPUT
+
+
+def current_source_growth_permit() -> "SourceGrowthPermit | None":
+    return _SOURCE_GROWTH_PERMIT.get()
+
+
+@contextmanager
+def bind_source_growth_permit(permit: "SourceGrowthPermit") -> Iterator["SourceGrowthPermit"]:
+    if type(permit) is not SourceGrowthPermit:
+        raise TaskProtocolConflict("only an exact growth permit can be bound")
+    token = _SOURCE_GROWTH_PERMIT.set(permit)
+    try:
+        yield permit
+    finally:
+        _SOURCE_GROWTH_PERMIT.reset(token)
+
+
+_GRANTED_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_GRANTED_LEAF_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+# What the kernel reports when a no-follow open meets a link, a non-directory
+# component, or a leaf that is not a regular file (FIFO without a reader).
+_GRANTED_IDENTITY_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK, errno.ENOTDIR, errno.EISDIR, errno.ENXIO})
+
+
+class SourceGrowthPermit:
+    """One producer's enforced growth grant for its task tree.
+
+    Charges are physical: each file is rounded up to the allocation unit plus a
+    per-file overhead, and a rewrite only charges its growth. Once a write is
+    refused the permit stays tripped, so the parser cannot continue around it.
+    """
+
+    def __init__(self, *, root: Path, limit_bytes: int, allocation_unit: int, file_overhead: int) -> None:
+        _require_storage_amount(limit_bytes, "growth permit")
+        _require_storage_amount(allocation_unit, "allocation unit")
+        _require_storage_amount(file_overhead, "file overhead")
+        if limit_bytes < 1 or allocation_unit < 1 or not isinstance(root, Path) or not root.is_absolute():
+            raise ValueError("growth permit bounds or root are invalid")
+        self._root = os.path.normpath(str(root))
+        root_metadata = os.lstat(self._root)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise ValueError("growth permit root is not a real directory")
+        self._root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+        self._limit = limit_bytes
+        self._unit = allocation_unit
+        self._overhead = file_overhead
+        self._lock = threading.Lock()
+        self._files: dict[str, int] = {}
+        self._charged = _PERMIT_DIRECTORY_ALLOWANCE * (allocation_unit + file_overhead)
+        self._tripped = False
+        # The first identity refusal, kept even if the parser catches it.
+        self._integrity_failure: str | None = None
+        if self._charged > limit_bytes:
+            raise ValueError("growth permit cannot cover its directory allowance")
+
+    @property
+    def limit_bytes(self) -> int:
+        return self._limit
+
+    @property
+    def charged_bytes(self) -> int:
+        with self._lock:
+            return self._charged
+
+    @property
+    def remaining_bytes(self) -> int:
+        with self._lock:
+            return self._limit - self._charged
+
+    @property
+    def tripped(self) -> bool:
+        with self._lock:
+            return self._tripped
+
+    @property
+    def integrity_failure(self) -> str | None:
+        with self._lock:
+            return self._integrity_failure
+
+    def _integrity_locked(self, message: str) -> SourceTreeIntegrityError:
+        self._tripped = True
+        if self._integrity_failure is None:
+            self._integrity_failure = message
+        return SourceTreeIntegrityError(message)
+
+    def _trip_integrity(self, message: str) -> None:
+        with self._lock:
+            error = self._integrity_locked(message)
+        raise error
+
+    def physical(self, logical_bytes: int) -> int:
+        return -(-logical_bytes // self._unit) * self._unit + self._overhead
+
+    def before_write(self, path: str, size: int) -> None:
+        """Charge a whole-file write of ``size`` bytes before it happens.
+
+        Every existing path component below the root must be a real directory
+        and an existing leaf a single-link regular file: a write through a
+        symlink or into a shared inode would grow or change bytes outside the
+        charged task tree.
+        """
+        if type(size) is not int or size < 0:
+            raise ValueError("granted write size is invalid")
+        target = os.path.normpath(os.path.abspath(path))
+        if os.path.commonpath((self._root, target)) != self._root or target == self._root:
+            self._trip_integrity("parser output escaped its task tree")
+        with self._lock:
+            if self._integrity_failure is not None:
+                raise SourceTreeIntegrityError(self._integrity_failure)
+            if self._tripped:
+                raise SourceGrowthLimitExceeded("growth permit was already exhausted")
+            missing_directories = 0
+            current = self._root
+            components = os.path.relpath(target, self._root).split(os.sep)
+            for index, component in enumerate(components[:-1]):
+                current = os.path.join(current, component)
+                try:
+                    metadata = os.lstat(current)
+                except FileNotFoundError:
+                    missing_directories = len(components) - 1 - index
+                    break
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise self._integrity_locked("parser output path component is not a real directory")
+            previous = self._files.get(target)
+            if previous is None:
+                try:
+                    existing = os.lstat(target) if missing_directories == 0 else None
+                except FileNotFoundError:
+                    existing = None
+                if existing is None:
+                    previous = 0
+                else:
+                    if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+                        raise self._integrity_locked("parser output target is not a single-link regular file")
+                    previous = self.physical(existing.st_size)
+            growth = self.physical(size) - previous + missing_directories * (self._unit + self._overhead)
+            if self._charged + max(0, growth) > self._limit:
+                self._tripped = True
+                raise SourceGrowthLimitExceeded("parser output would exceed its growth permit")
+            self._charged += max(0, growth)
+            self._files[target] = max(previous, self.physical(size))
+
+    def _open_child_directory(self, parent: int, name: str) -> int:
+        for create in (False, True):
+            if create:
+                try:
+                    os.mkdir(name, 0o777, dir_fd=parent)
+                except FileExistsError:
+                    pass  # Created meanwhile: still opened without following a link.
+            try:
+                return os.open(name, _GRANTED_DIRECTORY_FLAGS, dir_fd=parent)
+            except FileNotFoundError:
+                if create:
+                    raise
+            except OSError as exc:
+                if exc.errno in _GRANTED_IDENTITY_ERRNOS:
+                    self._trip_integrity("parser output path component is not a real directory")
+                raise
+        raise AssertionError("unreachable")
+
+    def write_file(self, path: str, data: bytes | bytearray | memoryview) -> None:
+        """Charge one whole-file write, then perform it through descriptors.
+
+        The charge is checked on paths, but the bytes only go through the
+        pinned root descriptor, one no-follow directory at a time, to a leaf
+        opened without following a link and checked on its own descriptor
+        before truncation: a link or swap made after the charge cannot move or
+        alias the write.
+        """
+        view = memoryview(data).cast("B")
+        target = os.path.normpath(os.path.abspath(path))
+        self.before_write(target, view.nbytes)
+        components = os.path.relpath(target, self._root).split(os.sep)
+        current = os.open(self._root, _GRANTED_DIRECTORY_FLAGS)
+        try:
+            metadata = os.fstat(current)
+            if (metadata.st_dev, metadata.st_ino) != self._root_identity:
+                self._trip_integrity("parser output root identity drifted")
+            for component in components[:-1]:
+                child = self._open_child_directory(current, component)
+                previous, current = current, child
+                os.close(previous)
+            try:
+                leaf = os.open(components[-1], _GRANTED_LEAF_FLAGS, 0o666, dir_fd=current)
+            except OSError as exc:
+                if exc.errno in _GRANTED_IDENTITY_ERRNOS:
+                    self._trip_integrity("parser output target is not a single-link regular file")
+                raise
+        finally:
+            os.close(current)
+        try:
+            metadata = os.fstat(leaf)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                self._trip_integrity("parser output target is not a single-link regular file")
+            os.ftruncate(leaf, 0)
+            while view:
+                view = view[os.write(leaf, view):]
+        finally:
+            os.close(leaf)
+
+
+def _permit_hold_reason(permit: SourceGrowthPermit, refused: BaseException | None) -> str:
+    """An identity refusal (raised or latched) is integrity; otherwise exhaustion."""
+    if isinstance(refused, SourceTreeIntegrityError) or permit.integrity_failure is not None:
+        return "tree_integrity"
+    return "hard_envelope_exceeded"
+
+
+class BudgetedSeekableWriter:
+    """A seekable file writer that refuses any byte beyond its granted extent.
+
+    ``zipfile`` rewrites each local header in place and appends its central
+    directory on close; both go through ``write`` and are checked against the
+    high-water extent before any byte reaches the file.
+    """
+
+    def __init__(self, descriptor: int, *, grant_bytes: int) -> None:
+        if type(descriptor) is not int or descriptor < 0:
+            raise ValueError("budgeted writer descriptor is invalid")
+        _require_storage_amount(grant_bytes, "writer grant")
+        self._fd = descriptor
+        self._grant = grant_bytes
+        self._position = 0
+        self._extent = 0
+        # A failed write leaves an unknown descriptor offset: every later
+        # write is refused, so no retry or close record can pass the grant.
+        # The refusal repeats the first errno, so a full disk stays a full disk.
+        self._failed_errno: int | None = None
+        self.name = None
+
+    def _refuse_after_failure(self) -> None:
+        if self._failed_errno is not None:
+            raise OSError(self._failed_errno, "retained ZIP writer failed earlier")
+
+    @property
+    def extent(self) -> int:
+        return self._extent
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        self._refuse_after_failure()
+        if whence == 0:
+            target = offset
+        elif whence == 1:
+            target = self._position + offset
+        elif whence == 2:
+            target = self._extent + offset
+        else:
+            raise ValueError("unsupported seek origin")
+        if type(target) is not int or target < 0:
+            raise ValueError("budgeted writer seek is invalid")
+        os.lseek(self._fd, target, os.SEEK_SET)
+        self._position = target
+        return target
+
+    def write(self, data: Any) -> int:
+        self._refuse_after_failure()
+        view = memoryview(data).cast("B")
+        end = self._position + len(view)
+        if max(self._extent, end) > self._grant:
+            raise ResultGrantExceeded("retained ZIP would exceed its completion grant")
+        written = 0
+        try:
+            while written < len(view):
+                count = os.write(self._fd, view[written:])
+                if count <= 0:
+                    raise OSError(errno.EIO, "retained ZIP write made no progress")
+                written += count
+        except BaseException as exc:
+            failed_errno = getattr(exc, "errno", None)
+            self._failed_errno = failed_errno if type(failed_errno) is int else errno.EIO
+            raise
+        finally:
+            # Bytes that reached the file are accounted even when the write failed.
+            self._extent = max(self._extent, self._position + written)
+            self._position += written
+        return len(view)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        # The descriptor belongs to the caller, which fsyncs and closes it.
+        return None
+
+    def truncate(self, size: int | None = None) -> int:
+        raise OSError(errno.EPERM, "retained ZIP writer never truncates")
+
+
+@dataclass(frozen=True, slots=True)
+class ResultSelection:
+    """One document's selected result files, relative to the task root."""
+
+    pdf_name: str
+    parse_dir_parts: tuple[str, ...]
+    arc_prefix: str
+    named_files: tuple[str, ...]
+    image_suffixes: frozenset[str] | None
+    origin_prefix: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryMember:
+    arcname: str
+    parts: tuple[str, ...]
+    size: int
+    sha256: str
+    identity: tuple[int, int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class ResultInventory:
+    task_id: str
+    policy_sha256: str
+    members: tuple[InventoryMember, ...]
+    directories: tuple[tuple[tuple[str, ...], tuple[int, int]], ...]
+    selected_bytes: int
+    zip_upper_bound_bytes: int
+
+    def exact_bytes(self) -> bytes:
+        # Directory and member inodes are bound too: a replaced parent or leaf
+        # with identical bytes is still not the tree this seal attests.
+        return json.dumps(
+            {
+                "schema": RESULT_INVENTORY_SCHEMA,
+                "task_id": self.task_id,
+                "policy_sha256": self.policy_sha256,
+                "selected_bytes": self.selected_bytes,
+                "zip_upper_bound_bytes": self.zip_upper_bound_bytes,
+                "directories": [
+                    {"path": "/".join(parts), "device": identity[0], "inode": identity[1]}
+                    for parts, identity in self.directories
+                ],
+                "members": [
+                    {"arcname": item.arcname, "path": "/".join(item.parts),
+                     "bytes": item.size, "sha256": item.sha256,
+                     "device": item.identity[0], "inode": item.identity[1]}
+                    for item in self.members
+                ],
+            },
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+
+    def sha256(self) -> str:
+        return "sha256:" + hashlib.sha256(self.exact_bytes()).hexdigest()
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int:
+    if name in {"", ".", ".."} or "/" in name or "\x00" in name:
+        raise TaskProtocolConflict("result directory component is unsafe")
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise TaskProtocolConflict("result directory identity is unsafe")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def _regular_member_stat(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise TaskProtocolConflict("result source tree contains a symlink")
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    if metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
+        raise TaskProtocolConflict("result source tree identity is unsafe")
+    return metadata
+
+
+def _selected_candidates(
+    task_fd: int, selections: tuple[ResultSelection, ...],
+) -> tuple[list[tuple[str, tuple[str, ...]]], list[tuple[tuple[str, ...], tuple[int, int]]]]:
+    """List selected members with one directory FD per level, never following links."""
+    candidates: list[tuple[str, tuple[str, ...]]] = []
+    directories: list[tuple[tuple[str, ...], tuple[int, int]]] = []
+    for selection in selections:
+        opened: list[int] = []
+        try:
+            current = task_fd
+            walked: tuple[str, ...] = ()
+            for component in selection.parse_dir_parts:
+                current = _open_directory_at(current, component)
+                opened.append(current)
+                walked += (component,)
+                metadata = os.fstat(current)
+                directories.append((walked, (metadata.st_dev, metadata.st_ino)))
+            for name in selection.named_files:
+                if _regular_member_stat(current, name) is not None:
+                    candidates.append((f"{selection.arc_prefix}/{name}", walked + (name,)))
+            if selection.image_suffixes is not None:
+                try:
+                    images = _open_directory_at(current, "images")
+                except FileNotFoundError:
+                    images = -1
+                if images >= 0:
+                    opened.append(images)
+                    metadata = os.fstat(images)
+                    directories.append((walked + ("images",), (metadata.st_dev, metadata.st_ino)))
+                    for name in sorted(os.listdir(images)):
+                        if Path(name).suffix.lstrip(".").lower() not in selection.image_suffixes:
+                            continue
+                        if _regular_member_stat(images, name) is not None:
+                            candidates.append(
+                                (f"{selection.arc_prefix}/images/{name}", walked + ("images", name))
+                            )
+            if selection.origin_prefix is not None:
+                for name in sorted(os.listdir(current)):
+                    if name.startswith(selection.origin_prefix) and _regular_member_stat(current, name) is not None:
+                        candidates.append((f"{selection.arc_prefix}/{name}", walked + (name,)))
+        finally:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+    return candidates, directories
+
+
+def _open_member(task_fd: int, parts: tuple[str, ...]) -> tuple[int, list[int]]:
+    opened: list[int] = []
+    try:
+        current = task_fd
+        for component in parts[:-1]:
+            current = _open_directory_at(current, component)
+            opened.append(current)
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+    except BaseException:
+        for item in reversed(opened):
+            os.close(item)
+        raise
+    return descriptor, opened
+
+
+def _hash_member(task_fd: int, parts: tuple[str, ...], sink: Callable[[bytes], Any] | None = None,
+                 ) -> tuple[str, int, tuple[int, int, int, int, int, int]]:
+    """Stream one member through one FD, proving it did not change meanwhile."""
+    descriptor, opened = _open_member(task_fd, parts)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.getuid():
+            raise TaskProtocolConflict("result member identity is unsafe")
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+            total += len(chunk)
+            if total > before.st_size:
+                raise TaskProtocolConflict("result member grew while it was read")
+            if sink is not None:
+                sink(chunk)
+        after = os.fstat(descriptor)
+        if total != before.st_size or _file_identity(after) != _file_identity(before) or after.st_size != total:
+            raise TaskProtocolConflict("result member changed while it was read")
+        return "sha256:" + digest.hexdigest(), total, _file_identity(before)
+    finally:
+        os.close(descriptor)
+        for item in reversed(opened):
+            os.close(item)
+
+
+def _open_owned_task_root(task_root: Path, root_identity: dict[str, int]) -> int:
+    descriptor = os.open(task_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(descriptor)
+        if {
+            "device": metadata.st_dev, "inode": metadata.st_ino,
+            "uid": metadata.st_uid, "mode": metadata.st_mode,
+        } != root_identity:
+            raise TaskProtocolConflict("result task root identity drifted")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def build_result_inventory(
+    *,
+    task_id: str,
+    task_root: Path,
+    root_identity: dict[str, int],
+    selections: tuple[ResultSelection, ...],
+    policy: Any,
+    zip_upper_bound: Callable[[tuple[tuple[int, int], ...]], int],
+) -> ResultInventory:
+    """Seal the selected source members by content, one member FD at a time."""
+    task_fd = _open_owned_task_root(task_root, root_identity)
+    try:
+        candidates, directories = _selected_candidates(task_fd, selections)
+        if not candidates:
+            raise TaskProtocolConflict("retained result has no selected members")
+        names = [name for name, _parts in candidates]
+        if len(set(names)) != len(names):
+            raise TaskProtocolConflict("result ZIP member names are not unique")
+        if len(candidates) > policy.max_members or any(
+            len(name.encode("utf-8")) > policy.max_name_bytes for name in names
+        ):
+            raise TaskStorageBlocked("hard_envelope_exceeded")
+        members: list[InventoryMember] = []
+        for arcname, parts in sorted(candidates):
+            digest, size, identity = _hash_member(task_fd, parts)
+            members.append(InventoryMember(arcname, parts, size, digest, identity))
+        selected = sum(item.size for item in members)
+        bound = zip_upper_bound(tuple((item.size, len(item.arcname.encode("utf-8"))) for item in members))
+        inventory = ResultInventory(
+            task_id=task_id, policy_sha256=policy.sha256, members=tuple(members),
+            directories=tuple(directories), selected_bytes=selected, zip_upper_bound_bytes=bound,
+        )
+        if len(inventory.exact_bytes()) > policy.max_inventory_bytes:
+            raise TaskStorageBlocked("hard_envelope_exceeded")
+        return inventory
+    finally:
+        os.close(task_fd)
+
+
+def verify_result_inventory(
+    *, task_root: Path, root_identity: dict[str, int], inventory: ResultInventory,
+    selections: tuple[ResultSelection, ...],
+) -> None:
+    """Prove the selected tree still is its seal: directories, path set, inodes and content."""
+    task_fd = _open_owned_task_root(task_root, root_identity)
+    try:
+        candidates, directories = _selected_candidates(task_fd, selections)
+        if tuple(directories) != inventory.directories:
+            raise TaskProtocolConflict("sealed result source directories were replaced")
+        if sorted(candidates) != [(item.arcname, item.parts) for item in inventory.members]:
+            raise TaskProtocolConflict("sealed result source path set changed")
+        for item in inventory.members:
+            digest, size, identity = _hash_member(task_fd, item.parts)
+            if (digest, size, identity[:2]) != (item.sha256, item.size, item.identity[:2]):
+                raise TaskProtocolConflict("sealed result source content changed")
+    finally:
+        os.close(task_fd)
+
+
+def write_inventory_file(task_root: Path, root_identity: dict[str, int], inventory: ResultInventory) -> str:
+    """Durably write the seal inventory beside the tree; return its SHA."""
+    raw = inventory.exact_bytes()
+    task_fd = _open_owned_task_root(task_root, root_identity)
+    try:
+        try:
+            os.unlink(RETAINED_INVENTORY_NAME, dir_fd=task_fd)
+        except FileNotFoundError:
+            pass
+        descriptor = os.open(
+            RETAINED_INVENTORY_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=task_fd,
+        )
+        try:
+            view = memoryview(raw)
+            while view:
+                view = view[os.write(descriptor, view):]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(task_fd)
+    finally:
+        os.close(task_fd)
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def load_inventory_file(
+    task_root: Path, root_identity: dict[str, int], *, expected_sha256: str, task_id: str,
+    policy: Any,
+) -> ResultInventory:
+    """Reopen a durable seal only if its exact bytes match the registry record."""
+    task_fd = _open_owned_task_root(task_root, root_identity)
+    try:
+        descriptor = os.open(RETAINED_INVENTORY_NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=task_fd)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > policy.max_inventory_bytes:
+                raise TaskProtocolConflict("sealed inventory identity is unsafe")
+            chunks = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(task_fd)
+    if "sha256:" + hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise TaskProtocolConflict("sealed inventory bytes differ from the registry seal")
+    value = json.loads(raw.decode("utf-8"))
+    if (
+        type(value) is not dict
+        or set(value) != {
+            "schema", "task_id", "policy_sha256", "selected_bytes", "zip_upper_bound_bytes",
+            "directories", "members",
+        }
+        or value["schema"] != RESULT_INVENTORY_SCHEMA or value["task_id"] != task_id
+        or value["policy_sha256"] != policy.sha256
+    ):
+        raise TaskProtocolConflict("sealed inventory identity is invalid")
+    members = tuple(
+        InventoryMember(
+            arcname=item["arcname"], parts=tuple(item["path"].split("/")),
+            size=item["bytes"], sha256=item["sha256"],
+            identity=(item["device"], item["inode"], 0, 0, 0, 0),
+        )
+        for item in value["members"]
+    )
+    directories = tuple(
+        (tuple(item["path"].split("/")), (item["device"], item["inode"]))
+        for item in value["directories"]
+    )
+    inventory = ResultInventory(
+        task_id=task_id, policy_sha256=policy.sha256, members=members, directories=directories,
+        selected_bytes=value["selected_bytes"], zip_upper_bound_bytes=value["zip_upper_bound_bytes"],
+    )
+    if inventory.exact_bytes() != raw:
+        raise TaskProtocolConflict("sealed inventory is not canonical")
+    return inventory
+
+
+def write_retained_zip(
+    *, task_root: Path, root_identity: dict[str, int], inventory: ResultInventory,
+    selections: tuple[ResultSelection, ...], grant_bytes: int,
+) -> tuple[Path, str, int]:
+    """Pack the sealed members inside the grant; return the sealed ZIP identity.
+
+    Order, names, timestamps, permissions and DEFLATE parameters are the
+    retained-result v1 constants, so a fixed tree yields fixed bytes. Only an
+    owned exclusive part is ever written; the final name appears by rename.
+    """
+    task_fd = _open_owned_task_root(task_root, root_identity)
+    part_fd = -1
+    primary: BaseException | None = None
+    try:
+        part_fd = os.open(
+            RETAINED_RESULT_PART_NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=task_fd,
+        )
+        part_identity = os.fstat(part_fd)
+        writer = BudgetedSeekableWriter(part_fd, grant_bytes=grant_bytes)
+        with zipfile.ZipFile(writer, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+            for item in inventory.members:
+                info = zipfile.ZipInfo(item.arcname, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                with archive.open(info, "w", force_zip64=True) as member:
+                    member_sha256, size, identity = _hash_member(task_fd, item.parts, member.write)
+                if (member_sha256, size, identity[:2]) != (item.sha256, item.size, item.identity[:2]):
+                    raise TaskProtocolConflict("sealed result member changed while packing")
+        os.fsync(part_fd)
+        candidates, directories = _selected_candidates(task_fd, selections)
+        if (
+            sorted(candidates) != [(item.arcname, item.parts) for item in inventory.members]
+            or tuple(directories) != inventory.directories
+        ):
+            raise TaskProtocolConflict("sealed result source path set changed while packing")
+        os.lseek(part_fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := os.read(part_fd, 1024 * 1024):
+            digest.update(chunk)
+            total += len(chunk)
+        if total != writer.extent or total < 1:
+            raise TaskProtocolConflict("retained ZIP extent differs from its written bytes")
+        try:
+            os.stat(RETAINED_RESULT_NAME, dir_fd=task_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise TaskProtocolConflict("a retained ZIP already exists for this task")
+        os.rename(RETAINED_RESULT_PART_NAME, RETAINED_RESULT_NAME, src_dir_fd=task_fd, dst_dir_fd=task_fd)
+        sealed = os.stat(RETAINED_RESULT_NAME, dir_fd=task_fd, follow_symlinks=False)
+        if (sealed.st_dev, sealed.st_ino) != (part_identity.st_dev, part_identity.st_ino):
+            raise TaskProtocolConflict("retained ZIP seal was replaced")
+        os.fsync(task_fd)
+        return task_root / RETAINED_RESULT_NAME, digest.hexdigest(), total
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        if part_fd >= 0:
+            try:
+                os.close(part_fd)
+            except BaseException as exc:
+                cleanup_error = exc
+        if primary is not None:
+            # Only this attempt's unsealed part is removed; the source seal stays.
+            try:
+                os.unlink(RETAINED_RESULT_PART_NAME, dir_fd=task_fd)
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+        try:
+            os.close(task_fd)
+        except BaseException as exc:
+            cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            if primary is not None:
+                primary.add_note("retained ZIP cleanup failed: " + repr(cleanup_error))
+            else:
+                raise cleanup_error
+
+
+def live_free_bytes(path: Path) -> int:
+    """Free bytes available to this unprivileged process on ``path``'s volume."""
+    usage = os.statvfs(path)
+    return usage.f_bavail * usage.f_frsize
+
+
+
 class SplitTaskExecutor:
     """Separate parse and finalizer credits with explicit state transitions."""
 
@@ -2762,11 +4635,19 @@ class SplitTaskExecutor:
         parse_slots: int,
         finalizer_slots: int,
         result_reservation_bytes: int = 268435456,
+        storage_policy: Any = None,
+        storage_rescan_seconds: float = 5.0,
     ) -> None:
         if any(type(value) is not int or value < 1 for value in (parse_slots, finalizer_slots)):
             raise ValueError("executor slots must be positive")
         if type(result_reservation_bytes) is not int or result_reservation_bytes < 1:
             raise ValueError("result reservation must be a positive integer")
+        if (
+            isinstance(storage_rescan_seconds, bool)
+            or not isinstance(storage_rescan_seconds, (int, float))
+            or not 0 < storage_rescan_seconds <= 60
+        ):
+            raise ValueError("storage rescan interval is invalid")
         self._parse = asyncio.Semaphore(parse_slots)
         self._finalize = asyncio.Semaphore(finalizer_slots)
         self._parse_slots = parse_slots
@@ -2778,6 +4659,17 @@ class SplitTaskExecutor:
             "finalizer_waiting": 0,
             "finalizer_active": 0,
         }
+        self._storage_policy = storage_policy
+        if storage_policy is not None:
+            # Storage-managed waits hold no parse or finalizer slot; they are
+            # counted separately from the legacy B reservation wait.
+            self._stage_counts.update(source_growth_waiting=0, completion_waiting=0)
+        self._storage_rescan_seconds = float(storage_rescan_seconds)
+        # Live (not yet written) promises of granted permits and ZIP writers.
+        self._active_permits: set[SourceGrowthPermit] = set()
+        self._active_writers: dict[str, int] = {}
+        # Sealed sources wait for completion in acceptance order.
+        self._completion_queue: list[str] = []
         self._result_reservation_bytes = result_reservation_bytes
         self._capacity_changed = asyncio.Event()
         self._stopping = False
@@ -2786,6 +4678,23 @@ class SplitTaskExecutor:
     @property
     def result_reservation_bytes(self) -> int:
         return self._result_reservation_bytes
+
+    @property
+    def storage_policy(self) -> Any:
+        return self._storage_policy
+
+    def outstanding_promise_bytes(self) -> int:
+        """Bytes granted to live producers and writers but not yet on disk."""
+        return (
+            sum(permit.remaining_bytes for permit in tuple(self._active_permits))
+            + sum(self._active_writers.values())
+        )
+
+    def completion_head_waiting(self) -> bool:
+        return bool(self._completion_queue)
+
+    def completion_queue_snapshot(self) -> tuple[str, ...]:
+        return tuple(self._completion_queue)
 
     @property
     def parse_slots(self) -> int:
@@ -2951,6 +4860,224 @@ class SplitTaskExecutor:
                     raise persistence_error from exc
             raise
 
+    async def _storage_wait(self, counter: str) -> None:
+        """Wait for a capacity change, or rescan: external free space moves too."""
+        self._stage_counts[counter] += 1
+        try:
+            try:
+                await asyncio.wait_for(self._capacity_changed.wait(), self._storage_rescan_seconds)
+            except asyncio.TimeoutError:
+                pass
+        finally:
+            self._stage_counts[counter] -= 1
+
+    async def run_storage(
+        self,
+        *,
+        registry: DurableTaskRegistry,
+        key: str,
+        permit_root: Path,
+        parse: Callable[[SourceGrowthPermit], Awaitable[None]],
+        seal: Callable[[], Awaitable[ResultInventory]],
+        reopen_seal: Callable[[str], Awaitable[ResultInventory]],
+        write_seal: Callable[[ResultInventory], Awaitable[str]],
+        finalize: Callable[[ResultInventory, int], Awaitable[tuple[Path, str, int, str]]],
+        probe_free: Callable[[], Awaitable[int]],
+        registry_io: "RegistryServiceIO | None" = None,
+    ) -> None:
+        """Run one storage-managed task: permit, parse, seal, completion grant, ZIP.
+
+        Capacity waits hold no parse or finalizer slot and never fail the task.
+        A source that exceeds its permit, or a ZIP that exceeds its hard grant,
+        is held (blocked) with its bytes instead of being failed and deleted.
+        """
+        policy = self._storage_policy
+        if policy is None or registry.storage_policy is not policy:
+            raise TaskProtocolConflict("storage execution requires one shared storage policy")
+
+        async def read_record() -> DurableTaskRecord | None:
+            if registry_io is None:
+                return registry.get(key)
+            return await registry.observe(lambda: registry.get(key))
+
+        async def write(function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+            if registry_io is None:
+                return function(*args, **kwargs)
+            return await registry_io.call(function, *args, required=True, lane="metadata", **kwargs)
+
+        async def note_wait(reason: str) -> None:
+            current = await read_record()
+            if current is not None and current.storage is not None and current.storage["wait_reason"] != reason:
+                await write(registry.record_storage_wait, key, reason=reason)
+
+        record = await read_record()
+        if record is None or record.storage is None or record.state not in {"pending", "finalizing"}:
+            raise TaskProtocolConflict("only accepted storage-managed work can run")
+        if record.storage["wait_reason"] in STORAGE_BLOCKED_REASONS:
+            raise TaskStorageBlocked(record.storage["wait_reason"])
+        inventory: ResultInventory | None = None
+        try:
+            if record.state == "pending":
+                while True:
+                    if self._abort_pending or self._stopping:
+                        raise TaskExecutionStopped(
+                            "storage capacity wait stopped with pending responsibility", capacity_wait=True,
+                        )
+                    self._capacity_changed.clear()
+                    try:
+                        permit_bytes = await write(
+                            registry.reserve_source_growth, key,
+                            live_free_bytes=await probe_free(),
+                            outstanding_promise_bytes=self.outstanding_promise_bytes(),
+                            completion_head_waiting=self.completion_head_waiting(),
+                        )
+                    except TaskStorageWait as waiting:
+                        await note_wait(waiting.reason)
+                        await self._storage_wait("source_growth_waiting")
+                    else:
+                        break
+                permit = SourceGrowthPermit(
+                    root=permit_root, limit_bytes=permit_bytes,
+                    allocation_unit=policy.native_allocation_unit_bytes,
+                    file_overhead=policy.native_file_overhead_bytes,
+                )
+
+                async def enter_parse() -> None:
+                    if self._abort_pending:
+                        raise TaskExecutionStopped("parse slot wait stopped with pending responsibility")
+                    await write(registry.transition, key, "processing")
+
+                self._active_permits.add(permit)
+                try:
+                    async with self._stage_slot(self._parse, "parse", enter=enter_parse):
+                        try:
+                            await parse(permit)
+                        except SourceGrowthLimitExceeded as refused:
+                            reason = _permit_hold_reason(permit, refused)
+                            await write(registry.block_storage, key, reason=reason)
+                            raise TaskStorageBlocked(reason) from None
+                        if permit.tripped:
+                            # The parser caught a refusal and returned: its
+                            # output is incomplete and is never sealed.
+                            reason = _permit_hold_reason(permit, None)
+                            await write(registry.block_storage, key, reason=reason)
+                            raise TaskStorageBlocked(reason)
+                    try:
+                        inventory = await seal()
+                        # The seal file is output of this producer too: it is
+                        # charged to the same permit before it is written.
+                        permit.before_write(
+                            str(permit_root / RETAINED_INVENTORY_NAME), len(inventory.exact_bytes()),
+                        )
+                    except SourceGrowthLimitExceeded as refused:
+                        reason = _permit_hold_reason(permit, refused)
+                        await write(registry.block_storage, key, reason=reason)
+                        raise TaskStorageBlocked(reason) from None
+                    except TaskStorageBlocked as blocked:
+                        await write(registry.block_storage, key, reason=blocked.reason)
+                        raise
+                    inventory_sha256 = await write_seal(inventory)
+                    await write(
+                        registry.seal_source, key,
+                        inventory_sha256=inventory_sha256,
+                        source_bytes=permit.charged_bytes,
+                        selected_bytes=inventory.selected_bytes,
+                        member_count=len(inventory.members),
+                        zip_upper_bound_bytes=inventory.zip_upper_bound_bytes,
+                    )
+                finally:
+                    self._active_permits.discard(permit)
+                    self.notify_result_capacity_changed()
+            else:
+                sealed = record.storage
+                if sealed["phase"] != "source_sealed" or sealed["inventory_sha256"] is None:
+                    raise TaskProtocolConflict("recovered completion lacks its durable source seal")
+                try:
+                    inventory = await reopen_seal(sealed["inventory_sha256"])
+                except TaskProtocolConflict:
+                    await write(registry.block_storage, key, reason="seal_integrity")
+                    raise TaskStorageBlocked("seal_integrity") from None
+            assert inventory is not None
+            grant = min(inventory.zip_upper_bound_bytes, policy.native_result_hard_limit_bytes)
+            while True:
+                self._completion_queue.append(key)
+                try:
+                    while True:
+                        if self._abort_pending:
+                            raise TaskExecutionStopped(
+                                "completion wait stopped with a sealed source", capacity_wait=True,
+                            )
+                        self._capacity_changed.clear()
+                        if self._completion_queue[0] == key:
+                            try:
+                                await write(
+                                    registry.reserve_completion, key, grant_bytes=grant,
+                                    live_free_bytes=await probe_free(),
+                                    outstanding_promise_bytes=self.outstanding_promise_bytes(),
+                                )
+                            except TaskStorageWait as waiting:
+                                await note_wait(waiting.reason)
+                            else:
+                                break
+                        else:
+                            await note_wait("completion_capacity")
+                        await self._storage_wait("completion_waiting")
+                finally:
+                    self._completion_queue.remove(key)
+                    self.notify_result_capacity_changed()
+                # Promise the allocation-rounded extent until the seal commits.
+                self._active_writers[key] = policy.physical_charge(grant)
+                try:
+                    async with self._stage_slot(self._finalize, "finalizer"):
+                        try:
+                            path, digest, byte_count, owner = await finalize(inventory, grant)
+                        except ResultGrantExceeded:
+                            reason = (
+                                "codec_bound_exceeded" if grant == inventory.zip_upper_bound_bytes
+                                else "hard_envelope_exceeded"
+                            )
+                            await write(registry.release_completion, key, wait_reason="completion_capacity")
+                            await write(registry.block_storage, key, reason=reason)
+                            raise TaskStorageBlocked(reason) from None
+                        except OSError as error:
+                            if error.errno not in {errno.ENOSPC, errno.EDQUOT}:
+                                raise
+                            # External pressure took the space: keep the seal
+                            # and wait for completion capacity again.
+                            await write(registry.release_completion, key, wait_reason="free_floor")
+                            continue
+                    await write(
+                        registry.complete_storage, key, result_path=path, result_sha256=digest,
+                        result_bytes=byte_count, result_owner=owner,
+                    )
+                    return
+                finally:
+                    self._active_writers.pop(key, None)
+                    self.notify_result_capacity_changed()
+        except (TaskRegistryPersistenceError, TaskStorageBlocked, TaskExecutionStopped):
+            raise
+        except BaseException as exc:
+            record = await read_record()
+            if record is not None and record.state in {"processing", "finalizing"}:
+                failure = json.dumps(
+                    {
+                        "code": "parse_or_finalize_failed",
+                        "detail": type(exc).__name__[:64],
+                        "schema": "mineru-task-failure.v1",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                failure_cause = task_failure_cause(exc, task_id=record.task_id)
+                try:
+                    await write(registry.fail, key, error=failure, failure_cause=failure_cause)
+                except BaseException as persistence_error:
+                    persistence_error.add_note(
+                        "original parse/finalize failure: " + type(exc).__name__[:64]
+                    )
+                    raise persistence_error from exc
+            raise
+
 
 # The host observer validates the same closed envelope independently.
 def validate_mineru_task_admission(
@@ -3028,6 +5155,32 @@ def task_protocol_runtime_status(
     """Content-free facts from the serving process's initialized objects."""
     if not isinstance(registry, DurableTaskRegistry) or not isinstance(executor, SplitTaskExecutor):
         raise TaskProtocolConflict("task protocol runtime is not initialized")
+    if registry.storage_policy is not None:
+        # Storage-managed: no per-task B or aggregate L exists; the bound
+        # storage policy and registry v4 are the runtime's result authority.
+        if isinstance(persistence_event, _Unset):
+            registry.assert_persistence_healthy()
+        else:
+            DurableTaskRegistry._raise_view_persistence_error(
+                persistence_event, durability_uncertain=durability_uncertain
+            )
+        if (
+            type(capacity_config_sha256) is not str
+            or len(capacity_config_sha256) != 71
+            or not capacity_config_sha256.startswith("sha256:")
+            or any(ch not in "0123456789abcdef" for ch in capacity_config_sha256[7:])
+        ):
+            raise TaskProtocolConflict("storage-managed runtime requires its capacity config SHA")
+        if executor.storage_policy is not registry.storage_policy:
+            raise TaskProtocolConflict("executor and registry storage policies differ")
+        return {
+            "schema": "mineru-task-runtime.v4", "enabled": True,
+            "task_registry_max_records": _MAX_RECORDS,
+            "registry_schema": REGISTRY_SCHEMA_V4,
+            "admission_scope": "post_form_owned_upload",
+            "capacity_config_sha256": capacity_config_sha256,
+            "result_storage_policy_sha256": registry.storage_policy_sha256,
+        }
     limits = {
         "task_registry_max_records": _MAX_RECORDS,
         "task_result_reservation_bytes": executor._result_reservation_bytes,
@@ -3229,6 +5382,8 @@ class RegistryRequestResources:
         self._extra_reader = False
         self._cleanups: list[tuple[Callable[..., Any], tuple[Any, ...], str]] = []
         self._close_task: asyncio.Task[None] | None = None
+        # The pre-body storage charge of this request, if its route takes one.
+        self.ingress_token: str | None = None
 
     def reserve_reader(self) -> None:
         self.owner._serving_loop()

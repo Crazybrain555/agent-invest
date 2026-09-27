@@ -5,15 +5,22 @@ from __future__ import annotations
 import json
 import hashlib
 import inspect
+import logging
 import os
 from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 
+from disclosure_anchor.adapters.semantics.codex_model_catalog import (
+    CodexModelCatalog,
+    _ClosedJsonError,
+    _strict_json_loads,
+)
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_PROMPT_VERSION,
     SEMANTIC_OUTPUT_SCHEMA_VERSION,
@@ -66,6 +73,7 @@ _DISABLED_FEATURES = (
     "code_mode_only",
     "computer_use",
     "enable_mcp_apps",
+    "goals",
     "hooks",
     "image_generation",
     "mcp_2026_07_28",
@@ -76,6 +84,7 @@ _DISABLED_FEATURES = (
     "shell_tool",
     "skill_mcp_dependency_install",
     "skill_search",
+    "sleep_tool",
     "standalone_web_search",
     "tool_call_mcp_elicitation",
     "tool_suggest",
@@ -115,6 +124,10 @@ _BENIGN_STDERR_NOTICES = tuple(
     for pattern in (
         r"\d{4}-\d{2}-\d{2}T[0-9:.]+Z ERROR codex_models_manager::manager: "
         r"failed to refresh available models: timeout waiting for child process to exit",
+        # A connection attempt's debug diagnostic, paired with the JSONL retry
+        # or terminal event. It is not a second provider verdict (0.156.1).
+        r"\d{4}-\d{2}-\d{2}T[0-9:.]+Z ERROR codex_api::endpoint::responses_websocket: "
+        r"failed to connect to websocket: [^\r\n]+, url: wss?://[^\s]+",
     )
 )
 _CAPACITY_DIAGNOSTICS = tuple(
@@ -135,61 +148,111 @@ _CAPACITY_DIAGNOSTICS = tuple(
         ),
     )
 )
-
-
-class _ClosedJsonError(ValueError):
-    pass
-
-
-def _closed_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    payload: dict[str, object] = {}
-    for key, value in pairs:
-        if key in payload:
-            raise _ClosedJsonError(f"duplicate key: {key}")
-        payload[key] = value
-    return payload
-
-
-def _reject_json_constant(value: str) -> object:
-    raise _ClosedJsonError(f"invalid constant: {value}")
-
-
-def _strict_json_loads(raw: str) -> object:
-    return json.loads(
-        raw,
-        object_pairs_hook=_closed_json_object,
-        parse_constant=_reject_json_constant,
+_CODEX_CAPACITY_DIAGNOSTICS = (
+    *_CAPACITY_DIAGNOSTICS,
+    re.compile(
+        r"exceeded retry limit, last status: 429 Too Many Requests"
+        r"(?:, request id: [^,\s]+)?"
+    ),
+    re.compile(r"We’re currently experiencing high demand, which may cause temporary errors\."),
+    re.compile(r"Selected model is at capacity\. Please try a different model\."),
+)
+_CODEX_TRANSPORT_DIAGNOSTICS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"stream disconnected before completion: stream closed before response\.completed",
+        r"stream disconnected before completion: websocket closed by server before response\.completed",
+        r"request timed out",
+        r"exceeded retry limit, last status: (?:500 Internal Server Error|502 Bad Gateway"
+        r"|503 Service Unavailable|504 Gateway Timeout)(?:, request id: [^,\s]+)?",
     )
+)
+# Codex 0.156.1 UnexpectedResponseError owns the status prefix; its response
+# body may be arbitrary multiline HTML. Only a validated JSONL error message
+# may use this envelope. Do not apply it to joined stderr: that would swallow
+# independent error lines. Protocol/tool events are checked before this step.
+_CODEX_TRANSIENT_HTTP = re.compile(
+    r"unexpected status (?:500 Internal Server Error|502 Bad Gateway"
+    r"|503 Service Unavailable|504 Gateway Timeout): [\s\S]+"
+)
+_CODEX_HTTP_STATUS = re.compile(
+    r"(?:unexpected status |exceeded retry limit, last status: )([1-5][0-9]{2}) "
+)
+_LOGGER = logging.getLogger(__name__)
 
 
 class _SemanticProcessCancelled(RuntimeError):
     pass
 
 
+class _ProcessGroupNotStopped(RuntimeError):
+    """A member of this call's child group could not be signalled, and the
+    group's end is not proven."""
+
+
 def _register_process(process: subprocess.Popen[str]) -> bool:
+    """Register the child; ``True`` when shutdown was already requested.
+
+    The owning call then cancels through its own cleanup, which stops the
+    group and proves it ended; nothing is signalled here.
+    """
+
     with _ACTIVE_PROCESSES_LOCK:
         _ACTIVE_PROCESSES.add(process)
         cancel_now = _SEMANTIC_SHUTDOWN_REQUESTED.is_set()
         if cancel_now:
             _CANCELLED_PROCESSES.add(process)
-    if cancel_now:
-        _signal_process_group(process, signal.SIGTERM)
     return cancel_now
 
 
-def _unregister_process(process: subprocess.Popen[str]) -> bool:
+def _unregister_process(process: subprocess.Popen[str], *, keep: bool = False) -> bool:
+    """Return whether shutdown cancelled the child; ``keep`` leaves a live
+    child that could not be stopped registered for the shutdown sweep."""
+
     with _ACTIVE_PROCESSES_LOCK:
-        _ACTIVE_PROCESSES.discard(process)
         cancelled = process in _CANCELLED_PROCESSES
-        _CANCELLED_PROCESSES.discard(process)
+        if not keep:
+            _ACTIVE_PROCESSES.discard(process)
+            _CANCELLED_PROCESSES.discard(process)
     return cancelled
 
 
+def _group_proven_gone(process: subprocess.Popen[str]) -> bool:
+    """Whether this call's own child group has ended, by proof only.
+
+    Darwin answers EPERM, not ESRCH, for a group whose leader has exited but
+    is not reaped yet (observed on macOS 26; the man page documents EPERM only
+    as a permission failure), sometimes before this process can reap it. So
+    EPERM proves neither a live member nor an ended group. Proof is: the
+    leader is reaped here, and then a signal-0 probe of the group answers
+    ESRCH. The probe delivers nothing, so it cannot touch a reused group.
+    """
+
+    if process.poll() is None:
+        return False
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _signal_process_group(process: subprocess.Popen[str], signum: int) -> None:
+    """Signal this call's own child group; a group proven gone is a no-op.
+
+    Raises ``PermissionError`` when no member could be signalled and the
+    group's end is not proven (see ``_group_proven_gone``).
+    """
+
     try:
         os.killpg(process.pid, signum)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        if not _group_proven_gone(process):
+            raise
 
 
 def _stop_process_group(
@@ -200,22 +263,59 @@ def _stop_process_group(
     # A reaped leader can leave descendants holding stdout/stderr open.
     # The process was spawned in its own session; stop that group and drain
     # both pipes before releasing this call's ownership registration.
-    _signal_process_group(process, signal.SIGTERM)
     try:
-        process.communicate(timeout=max(0.0, grace_seconds))
-    except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGKILL)
-        process.communicate()
-    else:
-        # Pipe closure does not prove that every group member exited.
-        _signal_process_group(process, signal.SIGKILL)
+        _signal_process_group(process, signal.SIGTERM)
+        try:
+            process.communicate(timeout=max(0.0, grace_seconds))
+        except subprocess.TimeoutExpired:
+            _signal_process_group(process, signal.SIGKILL)
+            process.communicate()
+        else:
+            # Pipe closure does not prove that every group member exited.
+            _signal_process_group(process, signal.SIGKILL)
+    except PermissionError as unsignalled:
+        # A member could not be signalled, or the group was caught exiting
+        # before its leader could be reaped. Drain for the grace period only
+        # (never wait unboundedly on a child this process cannot stop), then
+        # require proof that the group ended.
+        try:
+            process.communicate(timeout=max(0.0, grace_seconds))
+        except subprocess.TimeoutExpired:
+            pass
+        if not _group_proven_gone(process):
+            raise _ProcessGroupNotStopped(
+                f"semantic child group {process.pid} could not be signalled "
+                f"({type(unsignalled).__name__}) and is not proven stopped"
+            ) from unsignalled
+
+
+def _report_cleanup_failure(message: str) -> None:
+    # Visibility only: a closed or full stderr never changes the outcome.
+    try:
+        print(f"[semantic-process] {message}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 - see above
+        pass
 
 
 def terminate_active_semantic_processes(
     *,
     grace_seconds: float = _GRACEFUL_STOP_SECONDS,
 ) -> int:
-    """Stop all active semantic chooser groups and close the register race."""
+    """Stop all active semantic chooser groups and close the register race.
+
+    This runs from the worker's signal handler and exit paths, so a group
+    that cannot be signalled never aborts the sweep or escapes it. A child
+    that was not signalled and is still running afterwards is reported; each
+    owning call's cleanup still has to prove that its own group ended.
+    """
+
+    undelivered: dict[subprocess.Popen[str], str] = {}
+
+    def signal_group(process: subprocess.Popen[str], signum: int) -> None:
+        try:
+            _signal_process_group(process, signum)
+        except OSError as exc:
+            undelivered[process] = f"{signal.Signals(signum).name}: {type(exc).__name__}"
 
     _SEMANTIC_SHUTDOWN_REQUESTED.set()
     with _ACTIVE_PROCESSES_LOCK:
@@ -224,7 +324,7 @@ def terminate_active_semantic_processes(
         )
         _CANCELLED_PROCESSES.update(processes)
     for process in processes:
-        _signal_process_group(process, signal.SIGTERM)
+        signal_group(process, signal.SIGTERM)
     deadline = time.monotonic() + max(0.0, grace_seconds)
     while (
         any(process.poll() is None for process in processes)
@@ -233,14 +333,22 @@ def terminate_active_semantic_processes(
         time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
     for process in processes:
         if process.poll() is None:
-            _signal_process_group(process, signal.SIGKILL)
+            signal_group(process, signal.SIGKILL)
     for process in processes:
         try:
             process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
-            # The process group has already received SIGKILL.  The worker is
-            # now safe to exit even if another thread is still reaping it.
+            # The owning call still reaps its child and proves its group
+            # ended, so the worker is safe to exit without blocking here.
             pass
+    for process, failure in undelivered.items():
+        # A child caught exiting also refuses signals; only a leader that
+        # is still running after the sweep is a real failure to report.
+        if process.poll() is None:
+            _report_cleanup_failure(
+                f"semantic child group {process.pid} could not be signalled ({failure}) "
+                "and is still running"
+            )
     return len(processes)
 
 
@@ -281,12 +389,17 @@ def _run_process(
         env=env,
         start_new_session=True,
     )
-    _register_process(process)
+    cancel_at_start = _register_process(process)
     group_hash = current_semantic_group()
     note_stage(stage_guard, "process_started", group_hash=group_hash)
     failure: str | None = None
+    unproven: Exception | None = None
     try:
         try:
+            if cancel_at_start:
+                # Shutdown was requested before this child registered: the
+                # prompt is never handed over; the cleanup below stops it.
+                raise _SemanticProcessCancelled
             if stage_guard is None:
                 stdout, stderr = process.communicate(input=prompt, timeout=timeout_seconds)
             else:
@@ -315,12 +428,30 @@ def _run_process(
                 else "cancelled" if isinstance(exc, _SemanticProcessCancelled)
                 else "error:" + type(exc).__name__
             )
-            _stop_process_group(process)
+            try:
+                _stop_process_group(process)
+            except Exception as cleanup:  # noqa: BLE001 - secondary to ``exc``
+                # The original cancellation or fault is still what propagates
+                # (a cleanup error must never turn it into "unavailable"), and
+                # the group is not claimed stopped.
+                unproven = cleanup
+                cause = cleanup.__cause__
+                detail = (
+                    f"semantic child group {process.pid} cleanup after {failure} failed "
+                    f"({type(cleanup).__name__}"
+                    + ("" if cause is None else f" from {type(cause).__name__}")
+                    + "); not proven stopped"
+                )
+                exc.add_note(detail)
+                _report_cleanup_failure(detail)
             raise
     finally:
-        cancelled = _unregister_process(process)
+        cancelled = _unregister_process(
+            process, keep=unproven is not None and process.poll() is None,
+        )
         note_stage(stage_guard, "process_ended", group_hash=group_hash, returncode=process.returncode,
-                   reason="cancelled" if cancelled else failure)
+                   reason="cancelled" if cancelled else failure,
+                   **({} if unproven is None else {"closure": "unproven"}))
     if cancelled:
         raise _SemanticProcessCancelled
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
@@ -362,17 +493,71 @@ def _event_shape_message(
     )
 
 
+def _router_error_message(stderr: str) -> str:
+    """Keep a durable fingerprint without copying model-authored tool payloads."""
+
+    lines = [line for line in stderr.splitlines() if "codex_core::tools::router" in line]
+    digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    return (
+        "Codex semantic adjudicator attempted a disabled tool: "
+        f"router_events={len(lines)} router_sha256={digest}"
+    )
+
+
+def _is_transport_recovery_notice(event: dict[str, object]) -> bool:
+    """Recognize 0.156.1 retry notifications, never a terminal verdict."""
+
+    event_type = event.get("type")
+    if event_type == "error" and set(event) == {"type", "message"}:
+        message = event.get("message")
+        if not isinstance(message, str):
+            return False
+        match = re.fullmatch(
+            r"Reconnecting\.\.\. (?:(?P<attempt>[1-9][0-9]*)/(?P<limit>[1-9][0-9]*)"
+            r"|waiting for network) \((?P<detail>[\s\S]+)\)",
+            message,
+        )
+        if match is None:
+            return False
+        if match["attempt"] is not None and int(match["attempt"]) > int(match["limit"]):
+            return False
+        detail = match["detail"]
+    elif event_type == "item.completed" and set(event) == {"type", "item"}:
+        item = event.get("item")
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"id", "type", "message"}
+            or not isinstance(item.get("id"), str)
+            or item.get("type") != "error"
+            or not isinstance(item.get("message"), str)
+        ):
+            return False
+        prefix = "Falling back from WebSockets to HTTPS transport. "
+        if not item["message"].startswith(prefix):
+            return False
+        detail = item["message"][len(prefix):]
+    else:
+        return False
+    # In 0.156.1 these exact notification envelopes are emitted by the CLI's
+    # retry handler, after it chooses retry/fallback. The detail is diagnostic
+    # text (including arbitrary IO errors), not another terminal verdict. Do not
+    # reclassify that text; require a later completed turn on the success path,
+    # and independently classify every terminal/sibling error on the exit path.
+    return bool(detail)
+
+
 def _validate_event_stream(stdout: str, stderr: str) -> None:
     """Reject any tool attempt or unrecognized Codex automation event."""
 
     if "codex_core::tools::router" in stderr:
         raise SemanticRouteAdjudicatorError(
-            "Codex semantic adjudicator attempted a disabled tool",
+            _router_error_message(stderr),
             reason_code="forbidden_tool_call",
             retryable=False,
         )
-    disabled_code_mode_warnings = 0
-    for line_number, raw_line in enumerate(stdout.splitlines(), start=1):
+    turn_active = False
+    recovery_pending = False
+    for line_number, raw_line in enumerate(stdout.split("\n"), start=1):
         if not raw_line.strip():
             continue
         try:
@@ -391,6 +576,14 @@ def _validate_event_stream(stdout: str, stderr: str) -> None:
             )
         event_type = event["type"]
         if event_type in {"thread.started", "turn.started", "turn.completed"}:
+            if event_type == "turn.started":
+                turn_active = True
+            elif event_type == "turn.completed":
+                turn_active = False
+                recovery_pending = False
+            continue
+        if turn_active and _is_transport_recovery_notice(event):
+            recovery_pending = True
             continue
         if event_type in {"item.started", "item.completed"}:
             item = event.get("item")
@@ -399,13 +592,10 @@ def _validate_event_stream(stdout: str, stderr: str) -> None:
             if isinstance(item, dict) and item.get("type") == "error":
                 message = item.get("message")
                 if message == _DISABLED_CODE_MODE_WARNING:
-                    disabled_code_mode_warnings += 1
-                    if disabled_code_mode_warnings == 1:
-                        # Luna may request its optional hosted code helper once
-                        # for a large structured prompt.  The disabled helper
-                        # fails closed and no tool runs; accept only this exact
-                        # one-time non-execution receipt.
-                        continue
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex no-tool model catalog was not honored",
+                        reason_code="invalid_runtime_protocol", retryable=False,
+                    )
                 raise SemanticRouteAdjudicatorError(
                     "Codex semantic runtime emitted an error event",
                     reason_code="runtime_event_error",
@@ -425,6 +615,12 @@ def _validate_event_stream(stdout: str, stderr: str) -> None:
             reason_code="invalid_runtime_protocol",
             retryable=False,
         )
+    if recovery_pending:
+        raise SemanticRouteAdjudicatorError(
+            "Codex semantic transport recovery did not complete a turn",
+            reason_code="invalid_runtime_protocol",
+            retryable=False,
+        )
 
 
 def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
@@ -432,13 +628,13 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
 
     if "codex_core::tools::router" in stderr:
         raise SemanticRouteAdjudicatorError(
-            "Codex semantic adjudicator attempted a disabled tool",
+            _router_error_message(stderr),
             reason_code="forbidden_tool_call",
             retryable=False,
         )
     messages: list[str] = []
-    disabled_code_mode_warnings = 0
-    for line_number, raw_line in enumerate(stdout.splitlines(), start=1):
+    turn_active = False
+    for line_number, raw_line in enumerate(stdout.split("\n"), start=1):
         if not raw_line.strip():
             continue
         try:
@@ -456,6 +652,10 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
                 retryable=False,
             )
         event_type = event["type"]
+        if turn_active and _is_transport_recovery_notice(event):
+            # The terminal diagnostic below decides availability. This is only
+            # a retry/fallback notification, not a failed provider attempt.
+            continue
         if event_type == "thread.started":
             if set(event) != {"type", "thread_id"} or not isinstance(
                 event.get("thread_id"), str
@@ -473,6 +673,7 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
                     reason_code="invalid_runtime_protocol",
                     retryable=False,
                 )
+            turn_active = True
             continue
         if event_type == "turn.completed":
             raise SemanticRouteAdjudicatorError(
@@ -529,11 +730,10 @@ def _nonzero_event_error_messages(stdout: str, stderr: str) -> tuple[str, ...]:
                         retryable=False,
                     )
                 if message == _DISABLED_CODE_MODE_WARNING:
-                    disabled_code_mode_warnings += 1
-                    if disabled_code_mode_warnings == 1:
-                        # The same one-time non-execution receipt the success
-                        # path accepts; it is not the provider's failure reason.
-                        continue
+                    raise SemanticRouteAdjudicatorError(
+                        "Codex no-tool model catalog was not honored",
+                        reason_code="invalid_runtime_protocol", retryable=False,
+                    )
                 messages.append(message)
                 continue
             raise SemanticRouteAdjudicatorError(
@@ -600,12 +800,14 @@ def _matched_availability_families(
     *,
     auth_diagnostics: tuple[re.Pattern[str], ...] = _AUTH_DIAGNOSTICS,
     capacity_diagnostics: tuple[re.Pattern[str], ...] = _CAPACITY_DIAGNOSTICS,
+    transport_diagnostics: tuple[re.Pattern[str], ...] = (),
 ) -> frozenset[str]:
     matches = tuple(
         reason
         for reason, patterns in (
             ("not_authenticated", auth_diagnostics),
             ("capacity_unavailable", capacity_diagnostics),
+            ("transport_unavailable", transport_diagnostics),
         )
         for pattern in patterns
         if pattern.fullmatch(line)
@@ -620,6 +822,7 @@ def _known_availability_reason(
     *,
     auth_diagnostics: tuple[re.Pattern[str], ...] = _AUTH_DIAGNOSTICS,
     capacity_diagnostics: tuple[re.Pattern[str], ...] = _CAPACITY_DIAGNOSTICS,
+    transport_diagnostics: tuple[re.Pattern[str], ...] = (),
 ) -> str | None:
     reasons: set[str] = set()
     saw_line = False
@@ -633,6 +836,7 @@ def _known_availability_reason(
                 line,
                 auth_diagnostics=auth_diagnostics,
                 capacity_diagnostics=capacity_diagnostics,
+                transport_diagnostics=transport_diagnostics,
             )
             if not families:
                 return None
@@ -650,6 +854,7 @@ class CodexCliSemanticAdjudicator:
         *,
         executable: Path,
         runtime_tmp_root: Path,
+        model_catalog: CodexModelCatalog,
         model: str = "gpt-5.6-luna",
         reasoning_effort: str = "low",
         timeout_seconds: int = 600,
@@ -660,6 +865,9 @@ class CodexCliSemanticAdjudicator:
             raise ValueError("Codex semantic adjudicator configuration is invalid")
         if timeout_seconds < 1 or max_concurrency < 1:
             raise ValueError("Codex semantic adjudicator timeout is invalid")
+        if model_catalog.model != model:
+            raise ValueError("Codex semantic model catalog does not match configured model")
+        self._model_catalog = model_catalog
         self._executable = executable
         self._runtime_tmp_root = runtime_tmp_root
         self._reasoning_effort = reasoning_effort
@@ -670,7 +878,7 @@ class CodexCliSemanticAdjudicator:
             # part of cache/receipt identity.  Encoding it in the adapter ID
             # keeps the external port small while preventing decisions from
             # one effort tier masquerading as another tier's cache entries.
-            adapter=f"codex_cli.v4.{reasoning_effort}",
+            adapter=f"codex_cli.v5.{reasoning_effort}+catalog.{model_catalog.sha256[7:]}",
             model=model,
             prompt_version=SEMANTIC_PROMPT_VERSION,
         )
@@ -678,7 +886,7 @@ class CodexCliSemanticAdjudicator:
             provider_id=provider_id,
             provider="openai",
             adapter_kind="codex_cli",
-            adapter_version="codex_cli.v6",
+            adapter_version=f"codex_cli.v7+catalog.{model_catalog.sha256[7:]}",
             canonical_model=model,
             inference_profile=reasoning_effort,
             prompt_version=SEMANTIC_PROMPT_VERSION,
@@ -755,6 +963,8 @@ class CodexCliSemanticAdjudicator:
                 tmp = Path(raw_tmp)
                 schema_path = tmp / "output.schema.json"
                 result_path = tmp / "result.json"
+                catalog_path = tmp / "model-catalog.json"
+                catalog_path.write_bytes(self._model_catalog.raw)
                 schema_path.write_text(
                     json.dumps(_output_schema(batch), ensure_ascii=False, indent=2),
                     encoding="utf-8",
@@ -766,6 +976,8 @@ class CodexCliSemanticAdjudicator:
                     self._identity.model,
                     "-c",
                     f"model_reasoning_effort='{self._reasoning_effort}'",
+                    "-c",
+                    "model_catalog_json=" + json.dumps(str(catalog_path)),
                     "--sandbox",
                     "read-only",
                     "--ephemeral",
@@ -782,6 +994,10 @@ class CodexCliSemanticAdjudicator:
                     "plugins={}",
                     "-c",
                     "agents.enabled=false",
+                    "-c",
+                    "tools.experimental_request_user_input.enabled=false",
+                    "-c",
+                    "tools.update_plan.enabled=false",
                     "-c",
                     "features.code_mode.enabled=false",
                     "-c",
@@ -928,7 +1144,8 @@ def _prompt(batch: SemanticAdjudicationBatch) -> str:
         "1. decisions 是以十进制 unit_index 为字段名的对象，每个输入 Unit 必须恰好有一个字段；"
         "verdicts 必须逐个覆盖该 Unit 的所有 candidate key。对 Unit 自身直接主题填 true，"
         "对证据不足、仅背景/原因/影响/条件或顺带提及填 false。不得漏掉任何候选。\n"
-        "2. locked=true 的候选只来自 Unit 自身标题的唯一精确命中、定期报告正文中受控财务项目"
+        "2. locked=true 的候选只来自 Unit 自身标题的唯一精确命中（或同时点名多个主题的受控组合标题）、"
+        "定期报告正文中受控财务项目"
         "标准全称与数值结果的同时出现，或正文明确记载正式审议通过且议案标题包含该主题，"
         "对应 verdict 必须填 true。整张报表中的行项目仍属于报表容器，不能因此锁成 secondary。"
         "带 source_locked_overflow_demoted 证据的候选来自同一 Unit 中数量超过上限的规则可锁定"
@@ -945,9 +1162,10 @@ def _prompt(batch: SemanticAdjudicationBatch) -> str:
         "未提升小节标题而包含多个独立小节或事实，可以有多个 direct route；不能只保留标题所属"
         "的第一个主题。不要把父章节、整份公告类别或相邻 Unit 传播下来；正文中只是一笔带过的"
         "词不足以选择主题。\n"
-        "5. 只要选择了 exclusive_container=true 的候选，它就必须是唯一"
-        "route，绝不能放在 secondary；整张报表/表单中的行项目和问答中顺带出现的主题都不是"
-        "secondary。\n"
+        "5. exclusive_container=true 的候选是目录、完整报表或整表等整体载体。只要选择了这类候选，"
+        "全部 route 都必须是 exclusive_container=true 的候选，绝不能再附加其他 secondary；"
+        "整张报表/表单中的行项目和问答中顺带出现的主题都不是 secondary。只有 Unit 自身标题同时"
+        "点名多个整体载体（如合并及公司报表）时，才可同时选择这几个载体候选。\n"
         "6. 其他 Unit 的 secondary 只保留显式并列标题、独立小节/表单字段，或正文中分别作出"
         "直接事实陈述的主题；同一段内分别报告的多个指标可以各自成为 route，但仅作背景、原因、"
         "影响或顺带提及的词不能成为 secondary。若某个候选只出现在解释另一个主题的原因、背景、"
@@ -1121,6 +1339,67 @@ def _decode_result(
     return tuple(decoded)
 
 
+def _codex_availability_reason(
+    messages: tuple[str, ...], stderr_lines: tuple[str, ...]
+) -> str | None:
+    reasons: set[str] = set()
+    for diagnostic in messages:
+        reason = (
+            "transport_unavailable"
+            if _CODEX_TRANSIENT_HTTP.fullmatch(diagnostic)
+            else _known_availability_reason(
+                (diagnostic,),
+                capacity_diagnostics=_CODEX_CAPACITY_DIAGNOSTICS,
+                transport_diagnostics=_CODEX_TRANSPORT_DIAGNOSTICS,
+            )
+        )
+        if reason is None:
+            return None
+        reasons.add(reason)
+    if stderr_lines:
+        reason = _known_availability_reason(
+            stderr_lines,
+            capacity_diagnostics=_CODEX_CAPACITY_DIAGNOSTICS,
+            transport_diagnostics=_CODEX_TRANSPORT_DIAGNOSTICS,
+        )
+        if reason is None:
+            return None
+        reasons.add(reason)
+    return next(iter(reasons)) if len(reasons) == 1 else None
+
+
+def _log_command_failure(
+    completed: subprocess.CompletedProcess[str],
+    error: SemanticRouteAdjudicatorError,
+    messages: tuple[str, ...],
+) -> None:
+    # The worker captures stderr durably. Keep enough transport evidence for
+    # triage even when temporary call files are removed, without logging model
+    # text, prompts, URLs, server bodies, request headers or credentials.
+    statuses = sorted({
+        int(match[1]) for message in messages
+        if (match := _CODEX_HTTP_STATUS.match(message)) is not None
+    })
+    record: dict[str, object] = {
+        "event": "semantic_provider_failure.v1",
+        "provider": "codex_cli",
+        "observed_at_unix_ns": time.time_ns(),
+        "group_hash": (
+            current_semantic_group()
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", current_semantic_group() or "") else None
+        ),
+        "returncode": completed.returncode,
+        "reason_code": error.reason_code,
+        "terminal_http_statuses": statuses[:8],
+        "terminal_message_count": len(messages),
+    }
+    for channel, value in (("stdout", completed.stdout), ("stderr", completed.stderr)):
+        encoded = value.encode("utf-8")
+        record[channel + "_bytes"] = len(encoded)
+        record[channel + "_sha256"] = hashlib.sha256(encoded).hexdigest()
+    _LOGGER.warning("semantic_provider_failure %s", json.dumps(record, sort_keys=True))
+
+
 def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRouteAdjudicatorError:
     try:
         structured_messages = _nonzero_event_error_messages(
@@ -1128,6 +1407,7 @@ def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRoute
             completed.stderr,
         )
     except SemanticRouteAdjudicatorError as exc:
+        _log_command_failure(completed, exc, ())
         return exc
     stderr_lines = tuple(
         line.strip()
@@ -1143,13 +1423,15 @@ def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRoute
         reason = "invalid_output_schema"
         retryable = False
     else:
-        reason = _known_availability_reason(diagnostics) or "command_failed"
+        reason = _codex_availability_reason(structured_messages, stderr_lines) or "command_failed"
         retryable = reason != "not_authenticated"
-    return SemanticRouteAdjudicatorError(
+    error = SemanticRouteAdjudicatorError(
         f"Codex semantic adjudicator failed with exit {completed.returncode}",
         reason_code=reason,
         retryable=retryable,
     )
+    _log_command_failure(completed, error, structured_messages)
+    return error
 
 
 __all__ = [

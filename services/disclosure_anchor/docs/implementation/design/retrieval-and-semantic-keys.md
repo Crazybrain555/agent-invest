@@ -14,7 +14,8 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 - `provider_document.v1` 保存官方 provider artifact 的闭合投影与 hash-bound inventory；
 - `provider_unit_locator.v9` 保存 Unit 对 source block、标题 payload ordinal/换行 fragment、逻辑表物理段、
   evidence digest、检索目标、source-PDF text reconciliation 与 source-bound quality findings。普通 paragraph
-  即使紧邻 selector 也不能凭整句词面提升为标题；历史 v1-v8 继续只读；
+  即使紧邻 selector 也不能凭整句词面提升为标题；历史 v1-v8 继续只读；依赖 U+0000 标记的 Unit 使用
+  `provider_unit_locator.v10`（v9 外加不含正文的 `text_substitutions`），检索只看到已替换为 U+FFFD 的文本；
 - 历史 `normalized_ir.v4` 只允许通过窄 resolver 读取已发布 evidence，不再 Build、Rebuild、
   Publish 或重建检索投影。
 
@@ -24,14 +25,15 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 
 1. `title`：已接受的 source heading 叶标题；metadata document title 绝不复制到 Unit。
 2. `heading_path`：已接受 heading occurrence 的完整根到叶路径。
-3. body：只回放 `provider_unit_locator.v9.search_targets` 明确列出的 provider payload destination。
+3. body：只回放 `provider_unit_locator.v9.search_targets`（v10 同义）明确列出的 provider payload destination。
 4. `semantic_keys`（公共与私有唯一直接主题面；0047 已删除冗余 scalar）：可选的真实受控
    Unit **直接主题**完整有序集合，所有项都进入 key channel，避免 mixed/长 Unit 的 secondary route 漏召回。
    Provider writer 使用版本化闭集词表和 source-bound candidate gate：Document 的 filing type 和
    authoritative disclosure topics 只负责开放对应 scope，不能独立成为 Unit route 证据；provider
    content categories 只作 facet/模型上下文，绝不授权 scope。
    只有 `body_status=content` 的答案载体可获得 direct route；`heading_only` / `empty` 两列必须为
-   NULL。答案载体自身标题标准化后唯一精确命中可确定性落键；严格两列表单字段与有结构证据的表头也可
+   NULL。答案载体自身标题标准化后唯一精确命中可确定性落键，受控组合标题精确点名的每个主题同样
+   确定性落键（如合并及公司报表，见下文）；严格两列表单字段与有结构证据的表头也可
    形成 Unit-local direct route；标题包含式/字符相似命中只生成候选；其余候选才可能由低成本模型
    逐候选返回闭合布尔裁决。模型不能造 key、决定 Unit 边界，或只凭文档标题、
    父标题、类别传播 route。无充分证据时内部列写 SQL NULL；不以 `document_content` 占位。
@@ -55,9 +57,12 @@ L1 保存 source-bound Unit，并生成可完全重建的检索投影。检索�
 合并是不可逆信息销毁，而并集只需一行 OR。检索的中文桥梁在两处：semantic-routes catalog 的中文
 labels（键规划），以及 search projection `key_tokens` 通道注入的中文规范标签 token（rp v4 起）。
 
-当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r65`、router `semantic_router.v104`、prompt
-`semantic_route_adjudication.v33`。默认 provider 链为 `codex_cli.v4.low` /
-`gpt-5.6-luna` 主用、`claude_cli.v1.low` / `claude-sonnet-5` 备用；仅闭合的 availability
+当前候选身份是 taxonomy `semantic-taxonomy-2026-08-r66`、router `semantic_router.v105`、prompt
+`semantic_route_adjudication.v34`。默认 provider 链为 Codex Luna 主用、Claude Sonnet 备用；
+旧单模型身份为 `codex_cli.v5.<profile>+catalog.<sha256hex>`，当前 provider receipt 身份为
+`codex_cli.v7+catalog.<sha256hex>`。模型和版本化可执行文件由运行配置固定，Codex 的无工具目录
+hash 同时进入缓存和 receipt 身份；具体配置与升级要求见 `semantic-adjudication-runtime.md`。
+Claude 的规范模型为 `claude-sonnet-5`；仅闭合的 availability
 原因允许 failover，取消、协议、模型身份、安全与无效裁决全部 fail closed。Codex 的
 capacity 家族包含 429/限流/配额/余额不足，以及账号用量上限（"You've hit your usage limit"，
 含或不含购买额度与重试时间子句），都归为 `capacity_unavailable`。候选与 direct route
@@ -94,7 +99,16 @@ taxonomy 内部明确区分三类策略：`topic` 是可多标签的粗主题；
 comparison/basis/risk 等精确披露角色，同一 Unit 可同时保留独立粗主题，也可保留由自身精确标题或
 typed field/header 独立证明的另一个角色，但一个角色中的共享数字不能反向制造另一个角色；
 `exclusive_container` 只用于目录、完整报表/整表等机械独占载体。机械
-exclusive 可清掉本载体的偶然行项目，role anchor 不可作为全 Unit topic veto。事件公告允许独立
+exclusive 可清掉本载体的偶然行项目，role anchor 不可作为全 Unit topic veto。一个来源标题可以
+同时点名多个整体载体：“合并及公司/银行{资产负债表,利润表,现金流量表,所有者/股东权益变动表}”
+（及/和两种写法，可带编号与“（续）”）是合并与母公司两张报表的共同载体，taxonomy 以
+`composite_direct_labels` 显式声明（r66 起），有正文 Unit 的自身标题精确命中时两个报表键都确定性
+落 direct route（合并在前），不 tie-break、不调模型；heading-only Unit 仍只得 section_keys。容器
+之间可以并存，容器不与行项目并存：模型若选中 exclusive 候选，程序只保留被选中的容器并按候选顺序
+排列，去掉行项目；缓存中的原始裁决同样先规范化、再校验，失败时保留原条目并报错。
+已冻结的 receipt 若仍将容器与行项目同列，则 fail closed。只有 composite 才能让
+同一标签对应多个 exclusive 键（静态测试守护）；单一报表标题（“合并现金流量表”→合并，
+“母公司现金流量表”/“现金流量表”→母公司）不变。事件公告允许独立
 表单字段或正文 source-bound 主题产生 secondary；仅靠低阈值标题相似度、没有其他直接证据的
 候选在任何 Unit 中都不得成为 secondary；真实 overview Unit 也必须有标题包含、正文或表格的
 直接证据才能保留 secondary。taxonomy 只标识一跳的 overview container，不构建父子图、不传播父键：具体子标题

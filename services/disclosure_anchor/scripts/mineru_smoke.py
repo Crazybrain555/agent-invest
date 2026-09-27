@@ -24,7 +24,7 @@ from typing import Any
 
 from disclosure_anchor.adapters.runtime.mineru_diagnostic import run_diagnostic_pdf
 from disclosure_anchor.adapters.runtime.mineru_capacity_config import load_mineru_capacity_config
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
 from disclosure_anchor.adapters.parsers.pdf_page_probe import count_pdf_pages
 from disclosure_anchor.adapters.runtime.mineru_canary import (
     run_mineru_multimodal_canary,
@@ -173,7 +173,7 @@ def _runtime_manifest(
     local_client_identity: MinerUClientIdentity,
     local_processing_window_size: int,
     local_writer_code_digest: str,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
 ) -> tuple[dict[str, Any], str, str]:
     payload = strict_json_loads(path.read_bytes())
     verified = verify_runtime_manifest_payload(

@@ -57,7 +57,7 @@ core.tracked_company（0001 已有表，单数名；≥500 精选池，本期验
       provider 无可靠 signature 时，重叠窗口内一律重新下载并以 raw_file_hash 复核
       （hash 相同 → register_document 去重键幂等吸收；不同 → 新版本 + supersedes）
   → DownloadDocument use case
-      下载 PDF bytes → RawDocumentStore（不可变归档，既有实现）
+      流式下载到 owned staging，校验完整 EOF/字节数并封存 → RawDocumentStore（不可变归档）
       → register_document 核心（去重 / supersedes / source_access / document / outbox）
       → document.status='registered'，进入 04 的 parse 管道
   → core.source_checkpoint（0001 已有表）记录格式定死：provider='cninfo'、
@@ -71,7 +71,9 @@ core.tracked_company（0001 已有表，单数名；≥500 精选池，本期验
 ## 3. 实施细则
 
 1. `DisclosureSourcePort`：`search_announcements(security, window, categories) -> [AnnouncementRef]`、
-   `download_pdf(ref) -> bytes`。文件落位定死：Port 与 AnnouncementRef 定义在
+   `download_pdf_to(ref, sink: PdfDownloadSink) -> CompletedPdfTransfer`。sink 按次重试重置、逐块写入；
+   完整 EOF 与实际字节数核对后由存储端封存并给出 hash。生产路径不缓存整份 PDF bytes。
+   文件落位定死：Port 与 AnnouncementRef 定义在
    `application/ports/disclosure_source.py`（已存在占位文件）；use case 文件 =
    `application/use_cases/sync_disclosure_index.py` 与 `application/use_cases/download_document.py`；
    adapter 在 `adapters/sources/cninfo/`。categories 语义定死：p_info3015 **无分类过滤参数**，
@@ -104,7 +106,9 @@ core.tracked_company（0001 已有表，单数名；≥500 精选池，本期验
    定死（p_info3015 响应**没有** ORGID/USCC，它们在 p_stock2100）：每次 sync 开始对目标公司调
    一次 p_stock2100（scode 传入，写 source_access，provider_interface='cninfo:p_stock2100'），
    ORGID → candidates[].provider_org_id 与 ledger(scheme='cninfo_org_id'，仅 provider
-   命名空间内稳定，不等同法律身份)；F050V → uscc（有则必填，§6.5.1 规则 4）；结果在本次
+   命名空间内稳定，不等同法律身份)——该字段是查询 profile 的投影，不是候选自身观测；0064 起候选另存
+   公告自身 orgId `candidate_provider_org_id`，有候选的快照另存 `identity_context`（查询 profile org 与其
+   source_access），旧快照一律视为 legacy profile-context；F050V → uscc（有则必填，§6.5.1 规则 4）；结果在本次
    sync 内缓存不逐候选重调；p_stock2100 失败不阻断索引同步，provider_org_id 置 null 记
    warning。source_access.provider_interface 词表统一（08 队列视图按此过滤）：
    索引='cninfo:p_info3015'、档案='cninfo:p_stock2100'、下载='cninfo:download_pdf'。identifier 校验数据只经定时本地快照消费，同步链路禁止实时调外部 identifier
@@ -116,6 +120,11 @@ core.tracked_company（0001 已有表，单数名；≥500 精选池，本期验
    失败记录格式定死：error 列存结构化 JSON
    {"stage":"download"|"index","error_code":...,"retryable":bool,"provider_document_id":...}，
    query_params 含 provider_document_id 与 download_url。不引入外部队列。
+   0064 起下载失败另记 `error.failure_phase`（candidate/download/archive/registration）、
+   `query_params.index_source_access_id`（承载候选的索引访问，已知时）、`result_snapshot.candidate_sha256`
+   与 `archive`（注册阶段失败含已归档 raw 的 relpath/hash/byte_count；其余 `archive_completed=false`）。
+   候选代码是本公司历史代码时，注册须经具名绑定证据链（`design/historical-security-retained-registration.md`），
+   不经查询 owner 兜底、不改候选代码；已归档后注册失败的原件经保留原件登记逐条恢复。
 5. **增量语义**：checkpoint 游标 = 每 (company, 接口) 的最近成功同步时间窗上界，且仅在候选
    持久化后推进（B6）；重叠窗口（回看 N 天，默认 7）承担两职：容忍索引晚到 + B7 的同 ID
    换文件核验；幂等由 register_document 去重键保证。

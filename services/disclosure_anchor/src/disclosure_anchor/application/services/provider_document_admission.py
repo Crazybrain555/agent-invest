@@ -315,6 +315,7 @@ class ProviderDocumentAdmission:
             envelope=envelope,
             source_text_reconciliations=semantics.source_text_reconciliations,
             source_quality_findings=semantics.source_quality_findings,
+            text_substitutions=semantics.text_substitutions,
         )
 
     def _validate_run(

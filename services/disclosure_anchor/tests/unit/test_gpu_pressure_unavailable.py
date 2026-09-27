@@ -143,13 +143,18 @@ class GpuPressureUnavailableTests(unittest.TestCase):
             now = [time.monotonic()]
             good_seen_at = now[0]
             policy = MineruStreamPolicy(StreamPolicyConfig(
-                qualified_max=5,
+                qualified_max=1,
                 runtime_identity_sha256=fixture.binding.runtime_identity_sha256,
                 owner_identity_sha256=fixture.binding.owner_sha256,
                 host_pause_bytes=100, host_recover_bytes=500,
                 missing_pause_seconds=10.0,
+                recovery_seconds=0.1,
             ))
-            self.assertEqual(policy.evaluate(good, now=now[0]).target, 5)
+            self.assertEqual(policy.evaluate(good, now=now[0]).target, 0)
+            # The cached joined observation remains inside the existing 3s
+            # freshness window for this short configured recovery interval.
+            warm_at = now[0] + 0.2
+            self.assertEqual(policy.evaluate(good, now=warm_at).target, 1)
             bad = self.wait_for(
                 fixture, session,
                 lambda sample: fixture.gpu_notifications >= 2 and fixture.api_notifications >= 2 and (sample.unknown_reason is not None or sample.unsafe_reason is not None),
@@ -163,9 +168,9 @@ class GpuPressureUnavailableTests(unittest.TestCase):
             self.assertGreaterEqual(bad.observed_monotonic, good.observed_monotonic)
             self.assertLessEqual(bad.observed_monotonic, good_seen_at)
             now[0] = time.monotonic()
-            first_unknown = now[0]
-            self.assertEqual(policy.evaluate(bad, now=first_unknown).target, 5)
-            self.assertEqual(policy.evaluate(bad, now=first_unknown + 9.999).target, 5)
+            first_unknown = max(now[0], warm_at)
+            self.assertEqual(policy.evaluate(bad, now=first_unknown).target, 1)
+            self.assertEqual(policy.evaluate(bad, now=first_unknown + 9.999).target, 1)
             decision = policy.evaluate(bad, now=first_unknown + 10.0)
             self.assertEqual((decision.target, decision.unsafe, decision.reason), (0, False, "pressure_unknown"))
             now[0] = first_unknown + 10.0

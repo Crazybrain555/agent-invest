@@ -18,8 +18,10 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    AnyMineruCapacityConfig,
     MineruCapacityConfig,
-    decode_mineru_capacity_config,
+    MineruCapacityConfigV2,
+    decode_any_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_health import (
     parse_mineru_capacity_wire_health,
@@ -211,7 +213,7 @@ class HostQueueBinding:
     the retention/cleanup seconds come from the exact process profile.
     """
 
-    expected_capacity: MineruCapacityConfig
+    expected_capacity: AnyMineruCapacityConfig
     serving_namespace_pid: int
     api_boot_id: str
     api_start_ticks: int
@@ -219,7 +221,7 @@ class HostQueueBinding:
     task_cleanup_interval_seconds: int
 
     def __post_init__(self) -> None:
-        if type(self.expected_capacity) is not MineruCapacityConfig:
+        if type(self.expected_capacity) not in (MineruCapacityConfig, MineruCapacityConfigV2):
             raise ValueError("host queue binding requires the exact capacity config type")
         for name in ("serving_namespace_pid", "api_start_ticks", "task_retention_seconds", "task_cleanup_interval_seconds"):
             value = getattr(self, name)
@@ -246,7 +248,7 @@ class HostQueueBinding:
         }
         if type(value) is not dict or set(value) != fields or type(value["capacity_config"]) is not dict:
             raise ValueError("host queue binding config shape is invalid")
-        capacity = decode_mineru_capacity_config(json.dumps(
+        capacity = decode_any_mineru_capacity_config(json.dumps(
             value["capacity_config"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
         ).encode("utf-8"))
         return cls(

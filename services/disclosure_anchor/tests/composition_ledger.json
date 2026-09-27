@@ -22,7 +22,7 @@
   },
   "tests/integration/test_atomic_document_publisher_v4.py": {
    "private_imports": [],
-   "tests": 15
+   "tests": 17
   },
   "tests/integration/test_cninfo_download.py": {
    "private_imports": [],
@@ -36,6 +36,14 @@
    "private_imports": [],
    "tests": 6
   },
+  "tests/integration/test_expired_prepared_closure_independent.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/integration/test_f5_operational_stop_three_boot_independent.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/integration/test_filing_api_runtime.py": {
    "private_imports": [],
    "tests": 5
@@ -43,6 +51,14 @@
   "tests/integration/test_filing_api_views_contract.py": {
    "private_imports": [],
    "tests": 1
+  },
+  "tests/integration/test_historical_security_b1.py": {
+   "private_imports": [],
+   "tests": 7
+  },
+  "tests/integration/test_local_execution_upgrade_recovery_v4.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/integration/test_m6_private_publication.py": {
    "private_imports": [],
@@ -56,9 +72,13 @@
    "private_imports": [],
    "tests": 2
   },
+  "tests/integration/test_nul_recovery_v2_independent.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
-   "tests": 33
+   "tests": 35
   },
   "tests/integration/test_outbox_commit_order.py": {
    "private_imports": [],
@@ -83,6 +103,10 @@
   "tests/integration/test_publish_evidence_ledger.py": {
    "private_imports": [],
    "tests": 7
+  },
+  "tests/integration/test_qualified_upgrade_flow_independent.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/integration/test_register_local_pdf.py": {
    "private_imports": [],
@@ -122,9 +146,13 @@
    "private_imports": [],
    "tests": 14
   },
+  "tests/integration/test_stage_resource_grant_independent.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/integration/test_staged_campaign_scope_v4.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 4
   },
   "tests/integration/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
@@ -135,7 +163,11 @@
     "_documents",
     "_unit_page_numbers"
    ],
-   "tests": 7
+   "tests": 10
+  },
+  "tests/integration/test_storage_result_flow_independent.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/integration/test_tracked_pool_api.py": {
    "private_imports": [],
@@ -153,6 +185,10 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_acquisition_streaming_independent.py": {
+   "private_imports": [],
+   "tests": 15
+  },
   "tests/unit/test_app_startup.py": {
    "private_imports": [],
    "tests": 5
@@ -163,11 +199,11 @@
   },
   "tests/unit/test_atomic_document_publication_v4.py": {
    "private_imports": [],
-   "tests": 18
+   "tests": 19
   },
   "tests/unit/test_atomic_publication_artifact_readiness_adapter_v4.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_atomic_publication_inventory_v4.py": {
    "private_imports": [],
@@ -225,6 +261,10 @@
    "private_imports": [],
    "tests": 11
   },
+  "tests/unit/test_capacity_pressure_independent.py": {
+   "private_imports": [],
+   "tests": 8
+  },
   "tests/unit/test_capacity_progress_relay.py": {
    "private_imports": [],
    "tests": 4
@@ -239,7 +279,7 @@
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 20
   },
   "tests/unit/test_cninfo_mapper.py": {
    "private_imports": [],
@@ -253,11 +293,19 @@
   },
   "tests/unit/test_cninfo_web_source.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 14
+  },
+  "tests/unit/test_codex_model_catalog.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_collect_mineru_phase_trace.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_completion_headroom_independent.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/unit/test_config_check.py": {
    "private_imports": [],
@@ -306,11 +354,55 @@
   },
   "tests/unit/test_download_document.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 17
   },
   "tests/unit/test_durable_publish_kpi.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_expired_prepared_closure.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_expired_prepared_closure_independent.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_f5_coordinator_stop_independent.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_f5_installer_stop_guard_independent.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_f5_release_independent.py": {
+   "private_imports": [],
+   "tests": 14
+  },
+  "tests/unit/test_f5_resident_exit_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_f5_semantic_child_cleanup_independent.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_f5_semantic_failed_closed_independent.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_f5_start_gate_independent.py": {
+   "private_imports": [],
+   "tests": 20
+  },
+  "tests/unit/test_f5_stop_persistence_independent.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_f5_supervision_binding_independent.py": {
+   "private_imports": [],
+   "tests": 4
   },
   "tests/unit/test_fetch_research_watchlist_inputs.py": {
    "private_imports": [],
@@ -318,7 +410,7 @@
   },
   "tests/unit/test_filing_api_admin.py": {
    "private_imports": [],
-   "tests": 25
+   "tests": 26
   },
   "tests/unit/test_filing_api_changes_errors.py": {
    "private_imports": [],
@@ -368,6 +460,22 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_heavy_phase_exclusivity_independent.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_historical_security_binding_acceptance.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_historical_security_contract.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_hold_containment_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
   "tests/unit/test_ids.py": {
    "private_imports": [],
    "tests": 6
@@ -382,7 +490,7 @@
   },
   "tests/unit/test_install_launchd.py": {
    "private_imports": [],
-   "tests": 1
+   "tests": 4
   },
   "tests/unit/test_install_mineru_tunnel_launchd.py": {
    "private_imports": [],
@@ -407,6 +515,26 @@
   "tests/unit/test_linux_resident_host_supervisor.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_local_execution_upgrade_boundaries_independent.py": {
+   "private_imports": [],
+   "tests": 17
+  },
+  "tests/unit/test_local_execution_upgrade_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_local_execution_upgrade_installer_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_local_execution_upgrade_preflight_independent.py": {
+   "private_imports": [],
+   "tests": 9
+  },
+  "tests/unit/test_local_execution_upgrade_verifier_independent.py": {
+   "private_imports": [],
+   "tests": 29
   },
   "tests/unit/test_local_materialization_manifest_v4.py": {
    "private_imports": [],
@@ -568,9 +696,21 @@
    ],
    "tests": 5
   },
+  "tests/unit/test_mac_space_resume_independent.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_materialize_deadline_independent.py": {
+   "private_imports": [],
+   "tests": 3
+  },
+  "tests/unit/test_member_unpack_continuation_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_migration_state.py": {
    "private_imports": [],
-   "tests": 35
+   "tests": 37
   },
   "tests/unit/test_mineru_admission_health.py": {
    "private_imports": [],
@@ -764,7 +904,7 @@
    "private_imports": [
     "_ZipPathCollisionIndex"
    ],
-   "tests": 65
+   "tests": 66
   },
   "tests/unit/test_mineru_http_stream_admission.py": {
    "private_imports": [],
@@ -773,6 +913,10 @@
   "tests/unit/test_mineru_identity.py": {
    "private_imports": [],
    "tests": 15
+  },
+  "tests/unit/test_mineru_materialize_grant_v5.py": {
+   "private_imports": [],
+   "tests": 4
   },
   "tests/unit/test_mineru_medium_artifacts.py": {
    "private_imports": [],
@@ -860,6 +1004,10 @@
    "private_imports": [],
    "tests": 3
   },
+  "tests/unit/test_mineru_result_grant_mac.py": {
+   "private_imports": [],
+   "tests": 7
+  },
   "tests/unit/test_mineru_result_reservation_executor.py": {
    "private_imports": [],
    "tests": 1
@@ -871,6 +1019,28 @@
   "tests/unit/test_mineru_result_reservation_registry.py": {
    "private_imports": [],
    "tests": 21
+  },
+  "tests/unit/test_mineru_result_storage.py": {
+   "private_imports": [],
+   "tests": 27
+  },
+  "tests/unit/test_mineru_result_storage_generated.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_mineru_result_storage_release.py": {
+   "private_imports": [
+    "_require_storage_ceilings"
+   ],
+   "tests": 2
+  },
+  "tests/unit/test_mineru_resumable_spool.py": {
+   "private_imports": [],
+   "tests": 20
+  },
+  "tests/unit/test_mineru_resumable_unpack.py": {
+   "private_imports": [],
+   "tests": 2
   },
   "tests/unit/test_mineru_retained_owned_drain.py": {
    "private_imports": [],
@@ -924,9 +1094,45 @@
    "private_imports": [],
    "tests": 32
   },
+  "tests/unit/test_mineru_tunnel_status.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_native_hold_attribution_independent.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_native_hold_decision_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_native_result_storage_independent.py": {
+   "private_imports": [],
+   "tests": 10
+  },
+  "tests/unit/test_native_storage_endpoint_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_native_storage_recovery_independent.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_new_qualified_runtime_upgrade_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_normalized_ir_v4_evidence.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_nul_recovery_upgrade_v2_independent.py": {
+   "private_imports": [],
+   "tests": 9
+  },
+  "tests/unit/test_owned_disk_budget_independent.py": {
+   "private_imports": [],
+   "tests": 1
   },
   "tests/unit/test_parse_document.py": {
    "private_imports": [],
@@ -934,7 +1140,7 @@
   },
   "tests/unit/test_parse_requeue.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_path_builder.py": {
    "private_imports": [],
@@ -952,7 +1158,7 @@
   },
   "tests/unit/test_pipeline_cli.py": {
    "private_imports": [],
-   "tests": 27
+   "tests": 28
   },
   "tests/unit/test_plan_preproduction_fresh_start.py": {
    "private_imports": [],
@@ -960,7 +1166,7 @@
   },
   "tests/unit/test_prepare_and_publish_whole_document_v4.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 6
   },
   "tests/unit/test_progress_measurement_independent.py": {
    "private_imports": [],
@@ -1020,6 +1226,10 @@
    "private_imports": [],
    "tests": 3
   },
+  "tests/unit/test_provider_text_substitution_independent.py": {
+   "private_imports": [],
+   "tests": 21
+  },
   "tests/unit/test_provider_unit_builder.py": {
    "private_imports": [],
    "tests": 44
@@ -1027,6 +1237,10 @@
   "tests/unit/test_provider_unit_evidence.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_publication_text_representability_independent.py": {
+   "private_imports": [],
+   "tests": 17
   },
   "tests/unit/test_publish_evidence_ledger.py": {
    "private_imports": [],
@@ -1042,13 +1256,25 @@
    "private_imports": [],
    "tests": 3
   },
+  "tests/unit/test_qualified_post_expiry_independent.py": {
+   "private_imports": [],
+   "tests": 1
+  },
+  "tests/unit/test_qualified_resume_binding_independent.py": {
+   "private_imports": [],
+   "tests": 2
+  },
+  "tests/unit/test_qualified_runtime_upgrade.py": {
+   "private_imports": [],
+   "tests": 14
+  },
   "tests/unit/test_r22_measurement_integration_independent.py": {
    "private_imports": [],
    "tests": 48
   },
   "tests/unit/test_raw_document_store.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 9
   },
   "tests/unit/test_rebuild_units.py": {
    "private_imports": [],
@@ -1056,7 +1282,7 @@
   },
   "tests/unit/test_register_document.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_remote_parse_checkpoint.py": {
    "private_imports": [],
@@ -1116,6 +1342,25 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_result_range_transport_independent.py": {
+   "private_imports": [],
+   "tests": 6
+  },
+  "tests/unit/test_result_spool_continuation_independent.py": {
+   "private_imports": [
+    "_SPOOL_OWNER_HEADER_BYTES",
+    "_SPOOL_PROGRESS_SLOT_BYTES"
+   ],
+   "tests": 6
+  },
+  "tests/unit/test_result_storage_policy_independent.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_retained_registration_receipt_acceptance.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/unit/test_retired_mineru_candidate_closure.py": {
    "private_imports": [],
    "tests": 2
@@ -1146,7 +1391,11 @@
   },
   "tests/unit/test_semantic_adjudication.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 13
+  },
+  "tests/unit/test_semantic_adjudication_validation_independent.py": {
+   "private_imports": [],
+   "tests": 4
   },
   "tests/unit/test_semantic_claude_cli.py": {
    "private_imports": [],
@@ -1154,7 +1403,15 @@
   },
   "tests/unit/test_semantic_codex_cli.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 16
+  },
+  "tests/unit/test_semantic_codex_outage_failover.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_semantic_enrichment_policy_independent.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_semantic_execution_guard.py": {
    "private_imports": [],
@@ -1173,7 +1430,7 @@
     "_bounded_locked_keys",
     "_normalize_title"
    ],
-   "tests": 182
+   "tests": 184
   },
   "tests/unit/test_serving_model_identity.py": {
    "private_imports": [],
@@ -1181,7 +1438,7 @@
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 10
   },
   "tests/unit/test_source_semantic_build.py": {
    "private_imports": [],
@@ -1203,9 +1460,17 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_stage_grant_admission_independent.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/unit/test_stage_observation_independent.py": {
    "private_imports": [],
    "tests": 13
+  },
+  "tests/unit/test_stage_resource_grant_independent.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_staged_admission_observation.py": {
    "private_imports": [],
@@ -1225,7 +1490,7 @@
   },
   "tests/unit/test_staged_campaign_sql_v4.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_staged_commission.py": {
    "private_imports": [
@@ -1243,11 +1508,19 @@
   },
   "tests/unit/test_staged_coordinator_backend_v4.py": {
    "private_imports": [],
-   "tests": 15
+   "tests": 17
+  },
+  "tests/unit/test_staged_coordinator_grant.py": {
+   "private_imports": [],
+   "tests": 8
   },
   "tests/unit/test_staged_coordinator_persistence_v4.py": {
    "private_imports": [],
    "tests": 23
+  },
+  "tests/unit/test_staged_coordinator_resource_lifetime.py": {
+   "private_imports": [],
+   "tests": 10
   },
   "tests/unit/test_staged_credit.py": {
    "private_imports": [],
@@ -1255,7 +1528,7 @@
   },
   "tests/unit/test_staged_new_work_admission_v4.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 24
   },
   "tests/unit/test_staged_parse_coordinator.py": {
    "private_imports": [],
@@ -1277,9 +1550,13 @@
    "private_imports": [],
    "tests": 3
   },
+  "tests/unit/test_staged_retry_window_independent.py": {
+   "private_imports": [],
+   "tests": 16
+  },
   "tests/unit/test_staged_v4_capacity.py": {
    "private_imports": [],
-   "tests": 7
+   "tests": 8
   },
   "tests/unit/test_staged_worker_profile_v4.py": {
    "private_imports": [],
@@ -1288,6 +1565,14 @@
   "tests/unit/test_staged_worker_v4_runtime.py": {
    "private_imports": [],
    "tests": 2
+  },
+  "tests/unit/test_storage_hold_cli.py": {
+   "private_imports": [],
+   "tests": 5
+  },
+  "tests/unit/test_storage_submission_wait_independent.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_stream_recovery_pending_independent.py": {
    "private_imports": [],
@@ -1379,7 +1664,7 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 35
+   "tests": 40
   },
   "tests/unit/test_worker_progress.py": {
    "private_imports": [],
@@ -1389,7 +1674,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 71
+   "tests": 77
   }
  },
  "schema": "test-composition-ledger.v1"

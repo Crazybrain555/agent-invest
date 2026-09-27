@@ -77,6 +77,7 @@
 | DISCLOSURE_MINERU_RUNTIME_BUNDLE_IDENTITY_SHA256 | — | 远端 immutable image/model/config 的 operator/provider attested digest；不得用 mutable tag 伪装 |
 | DISCLOSURE_MINERU_BIN | — | pinned 本地 MinerU client venv 的精确 executable |
 | DISCLOSURE_SEMANTIC_PROVIDERS_JSON | Luna low → Sonnet 5 low | 完整有序、无 secret 的 provider 数组；字段/示例见 `docs/implementation/design/semantic-adjudication-runtime.md` |
+| DISCLOSURE_SEMANTIC_CODEX_MODEL_CATALOG_SHA256 | 无；使用默认链前必须准备 | 默认 Codex provider 的无工具模型配置哈希；显式链在 Codex 条目填写 `model_catalog_sha256`，文件按哈希保存在 runtime/semantic/codex_model_catalogs/ |
 | DISCLOSURE_SEMANTIC_FAILOVER_POLICY | availability_only.v1 | 仅已列明的 executable/auth/quota/transport/timeout 可切备用；协议/结果/安全错误 fail closed |
 | DISCLOSURE_BACKFILL_MAX_PENDING_DOWNLOADS | 2000 | 首回补处理总在途水位（兼容旧变量名）：待下载 + 已下载待解析；单公司原子同步可越线一次 |
 | WORKER_BATCH_SYNC | 13 | 每轮到期公司上限；常驻模式零等待轮转，但首回补还受总在途水位约束，不要直接升到 200 |
@@ -92,11 +93,16 @@
 | DISCLOSURE_PARSE_TIMEOUT_* | 3600 / 12-per-page / 14400 | 页数感知的软预期耗时，只告警、不终止正常长文档 |
 | DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS | 86400 | 极端 live-but-stuck 进程保护；整本文档默认可运行 24 小时 |
 | WORKER_LOOP_INTERVAL_SECONDS / MAX | 900 / 1800 | acquisition/project maintenance 的空闲/故障退避；parse 空队列由下载事件或 5 秒 fail-safe poll 唤醒 |
+| WORKER_WEDGE_TIMEOUT_SECONDS | 2700 | parse/startup 与 maintenance 两个平面各自的无进展阈值；超过即 dump 栈并 exit 70，launchd 不自动重启；maintenance 每个已完成的 sync/下载条目（成功或失败）心跳一次；0 关闭 |
+| CNINFO_DOWNLOAD_DEADLINE_SECONDS | 1800 | 网站/API 两条通道单个 PDF 整段逻辑下载的预算（token 等待、全部尝试、退避、流式响应体，重试不重置）；超出记 retryable `transfer_deadline_exceeded`，计入 `CNINFO_MAX_RETRIES`；必须比 `WORKER_WEDGE_TIMEOUT_SECONDS` 至少低 60 秒，否则配置加载失败 |
+| DISCLOSURE_ACQUISITION_FREE_FLOOR_BYTES | 未设 = runtime tmp/raw 归档所在卷总量的 10% | 原材料写入的实时空闲下限（下载暂存、归档复制、quarantine 复制；生产 PGDATA 同卷）：每块写入前按实际字节检查，Content-Length 只作提前拒绝；只限制磁盘增长，不是单文档大小上限，也不是跨进程预留。下载：联系 provider 前已低于下限则不写 source_access、不耗重试预算；之后越线记 retryable `local_space_shortfall`，已封存的下载文件保留。本地登记：记失败 source_access 后报错，原文件不动。未设时与 doctor 的 <10% 空闲告警同线；设字节数则覆盖 |
 | MINERU_PROCESSING_WINDOW_SIZE | 16 | GPU 页窗口红线（round22h OOM 后定案） |
 | DISCLOSURE_MINERU_SMOKE_RECEIPT / CANARY_CACHE | — | runtime bundle v8 的 DB-free smoke v5/canary v2 PASS 对；resident 在连 DB 前强制校验 |
 | DISCLOSURE_MINERU_VALIDATION_RECEIPT | — | 2..8 份不同的完整多页 held-out PDF smoke v5，由同一 clean service epoch 前后夹住；页数、runtime、hash、restart/OOM 全部 fail closed |
 | DISCLOSURE_MINERU_DOCKER_MEMORY_RESERVE_BYTES | 0（未配置） | capacity observation/candidate policy 的显式配置；不再冒充跨机器 deployment gate 常量 |
 | DISCLOSURE_MINERU_CANARY_MAX_AGE_SECONDS | 2592000 | 静态 smoke/held-out validation 的进程启动租约（30 天）；启动后每 300 秒继续核 live API/model，incident 立即关闭 admission |
+| DISCLOSURE_WORKER_EXECUTION_UPGRADE_FILE / _SHA256 | — | 本地执行升级 U01 提案（绝对路径 0600）与其文件 SHA-256；与下一行四值同设或同空，缺省时所有 exact 路径不变 |
+| DISCLOSURE_WORKER_EXECUTION_UPGRADE_REVIEW_FILE / _SHA256 | — | 该提案的独立 GO 审阅文件与其 SHA-256；只有 resident worker、deployment-preflight、doctor 接受，其余入口拒绝（runbook §1.1g） |
 | DISCLOSURE_MINERU_LIVE_PROBE_INTERVAL_SECONDS | 300 | parse admission 限频复核 `/v1/models` 唯一 served-model；首次入场必查 |
 | CNINFO_* | — | 凭据（只进环境，绝不进仓） |
 
@@ -121,10 +127,23 @@ make worker-loop           # 常驻自适应排水；积压时零等待，空闲
 make worker-status         # 单次只读快照：公司/文档两条进度、队列、当前任务、vLLM 与真实 GPU exporter
 # Agent/脚本可直接读取：python -m disclosure_anchor.cli.worker status --format json
 make doctor-full           # 环境+迁移头+分类规则版本 全体检
-make worker-status         # 常驻 worker 状态 + 今日报告尾部
-make worker-restart        # 仅重载代码/env；不会重载 launchd plist
-./scripts/install_launchd.sh  # 仅在 job 已安全 bootout 后安装/更新 plist
+make worker-status         # 常驻 worker 状态 + 今日报告尾部（有公共停止时 stderr 报 STOPPED）
+make worker-control-status # 只看公共停止/launchd 状态，不连 DB/MinerU/模型；RUNNABLE 才退出 0
+make worker-release-circuit SHA=sha256:<...> DECIDED_BY=... REASON=... FIXED_BY=... [DRY_RUN=1]
+make worker-restart        # 仅重载代码/env；control 非 RUNNABLE 时拒绝；不会重载 launchd plist
+./scripts/install_launchd.sh  # 仅在 job 已安全 bootout 后安装/更新 plist；不隐式 enable disabled label
 ```
+
+公共停止（F5）的状态、放行与重建见 production runbook §1.1f 与
+`docs/implementation/design/worker-operational-stop.md`。`DISCLOSURE_WORKER_LAUNCHD_LABEL` 只由 worker
+plist 的 `EnvironmentVariables` 设置，不写入 `worker.env`（未设置时即生产 label）。
+`DISCLOSURE_WORKER_SUPERVISED_RUNTIME_ROOT`（默认
+`/Volumes/AgentSSD/agent_system/services/disclosure_anchor/runtime`）指定受该 label 监督的唯一 runtime
+根：只有 macOS 上 `DISCLOSURE_RUNTIME_ROOT` 与它完全一致时，启动门/status/doctor/放行才读回 label 的
+disabled 状态、要求挂载 sentinel 与根同一设备，公共停止也才原生 disable 该 label（launchd 或操作员启动
+都一样，不看 `XPC_SERVICE_NAME`）；生产 `worker.env` 不需要设置它，其它根从不调用 launchctl。生产 label
+只与生产 runtime 根互相绑定：临时根声明受监督时必须同时设置自己的 label，否则（以及生产根配非生产
+label）为 `label_root_mismatch`，不调用 launchctl 且拒绝启动，测试和 scratch runner 因而不会读写生产 job。
 
 `worker loop` 启动即输出一次进度，之后随 `WORKER_REPORT_INTERVAL_SECONDS` 更新。公司同步分母是
 active 股票池；文档发布分母是“当前已发现且应处理”的文档，会随新公告发现而增长，因此显式标记
@@ -221,7 +240,7 @@ worker 启动时会打印 `[versions]` 行（policy/builder/分类规则版本�
 | 代码（src/） | `make agent-check` 后 | **是** |
 | `watchlist.csv`（仅文件） | `make track`（导入才生效） | 否 |
 
-`worker-restart` 只适用于已安装 plist 就是当前版本的常规代码/env 重载。plist 变化或首次从
-旧 worker 切换，必须按生产 runbook 的 staged drain 执行；安装脚本发现 job 仍 loaded 会
-以 75 fail closed。重启后固定动作：`make doctor-full` 退出 0 + 观察一轮报告
-（`make worker-status`）。
+`worker-restart` 只适用于已安装 plist 就是当前版本的常规代码/env 重载，且 worker control 必须是
+RUNNABLE。plist 变化或首次从旧 worker 切换，必须按生产 runbook 的 staged drain 执行；安装脚本发现
+job 仍 loaded 会以 75 fail closed，存在公共停止或 control 不可信时以 78 拒绝。重启后固定动作：
+`make doctor-full` 退出 0 + 观察一轮报告（`make worker-status`）。

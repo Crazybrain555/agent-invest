@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 import ctypes
 import errno
 import fcntl
@@ -21,6 +21,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import sys
 import threading
+import time
 from typing import Any, BinaryIO, Iterator, NoReturn, Protocol, cast
 import unicodedata
 import zipfile
@@ -66,6 +67,10 @@ from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     build_local_materialization_receipt_v4,
     local_output_files_sha256_v4,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MAC_ALLOCATION_UNIT_BYTES,
+    MineruResultStoragePolicy,
+)
 from disclosure_anchor.application.contracts.staged_resource_credit import (
     PerAttemptResourceAllowance,
 )
@@ -74,6 +79,11 @@ from disclosure_anchor.application.contracts.staged_resource_paths import (
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.ports.staged_provider_parser import (
+    MaterializationCapacityBlockedV4,
+    MaterializationCapacityWaitV4,
+    MaterializationTransferContinuesV4,
+    MaterializationTransferHeldV4,
+    MaterializationUnpackContinuesV4,
     MaterializedProviderDocumentV4,
     PrivateProviderCapabilityV4,
     ProviderAckCommandV4,
@@ -82,12 +92,16 @@ from disclosure_anchor.application.ports.staged_provider_parser import (
     V4EvidenceReplayContext,
     V4StageGuard,
     V4ResourceOwnershipError,
+    require_heavy_work_permit,
     validate_v4_ack_authorization,
     validate_v4_cleanup_authorization,
     validate_v4_materialization_authorization,
 )
 from disclosure_anchor.application.ports.remote_provider_v4 import (
     PinnedSnapshotSourceV4,
+    RemoteProviderUnavailableV4,
+    RemoteResultRangeIgnoredV4,
+    RemoteResultRangeUnsatisfiableV4,
 )
 from disclosure_anchor.application.ports.remote_parse_v4_repository import V4HistoricalLocalResources
 from disclosure_anchor.domain.errors import ParserOutputContractError
@@ -96,10 +110,134 @@ from disclosure_anchor.domain.errors import ParserOutputContractError
 _CHUNK_BYTES = 1024 * 1024
 _LOCK_SCHEMA = "mineru-v4-resource-lock.v1"
 _OWNER_SCHEMA = "mineru-v4-spool-owner.v1"
+# A granted (v5) intent resumes its spool. Its owner receipt is a fixed
+# identity header plus two progress slots written alternately in place: a torn
+# slot write always leaves the previous durable record, and the receipt needs
+# no path outside the intent's own resource set.
+_OWNER_SCHEMA_V2 = "mineru-v4-spool-owner.v2"
+_SPOOL_OWNER_HEADER_BYTES = 1024
+_SPOOL_PROGRESS_SLOT_BYTES = 512
+_SPOOL_OWNER_V2_BYTES = _SPOOL_OWNER_HEADER_BYTES + 2 * _SPOOL_PROGRESS_SLOT_BYTES
+_BLANK_PROGRESS_SLOT = b" " * (_SPOOL_PROGRESS_SLOT_BYTES - 1) + b"\n"
+# Durable progress cadence; every record follows an fsync of the part.
+_SPOOL_PROGRESS_BYTES = 8 * 1024 * 1024
+_SPOOL_PROGRESS_SECONDS = 2.0
+# A transfer segment stops this long before its stage deadline, leaving time
+# to make the received prefix durable.
+_TRANSFER_STOP_MARGIN_SECONDS = 10.0
+# A server that ignores a resumed Range (or finds it unsatisfiable) gets one
+# restart from zero; a second one is held instead of looping on the result.
+_SPOOL_RANGE_RESTART_LIMIT = 1
+# A granted unpack writes its one in-flight member here and publishes it into
+# ``.unpack`` by exclusive rename after fsync: only completed members ever
+# appear there, so a reopen keeps exactly those and redoes the in-flight one.
+_UNPACK_PARTIAL_DIRNAME = ".unpack-partial"
+_UNPACK_PARTIAL_NAME = "member"
+# Before each publishing rename the member's exact size and SHA-256 are
+# appended here and fsynced: a reopen adopts a published member only against
+# its own record, never against the forgeable ZIP CRC.
+_UNPACK_JOURNAL_NAME = "journal"
+_UNPACK_RECORD_FIELDS = frozenset({"bytes", "path", "sha256"})
+_UNPACK_STOP_MARGIN_SECONDS = 10.0
 _MARKER_SCHEMA = "mineru-v4-materialization-marker.v1"
 _MAX_METADATA_BYTES = 64 * 1024
 _MAX_ACK_RESPONSE_BYTES = 64 * 1024
 _MAX_RECOVERY_PATH_PARTS = 32
+
+
+@dataclass(frozen=True, slots=True)
+class _SpoolProgress:
+    """One durable progress record of a resumable spool.
+
+    ``active_ms`` is the transfer's accumulated active time (its logical
+    budget), and the window fields its current minimum-progress window; both
+    survive restarts, so neither a reopen nor a wall-clock jump resets them.
+    """
+
+    sequence: int
+    durable_offset: int
+    prefix_sha256: str
+    part_device: int
+    part_inode: int
+    active_ms: int
+    window_active_ms: int
+    window_start_offset: int
+    restarts: int
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if item.name == "prefix_sha256":
+                if (type(value) is not str or not value.startswith("sha256:") or len(value) != 71
+                        or any(char not in "0123456789abcdef" for char in value[7:])):
+                    raise ValueError("spool progress prefix digest is invalid")
+            elif type(value) is not int or not 0 <= value <= (1 << 63) - 1:
+                raise ValueError("spool progress field is invalid")
+        if self.sequence < 1 or self.window_start_offset > self.durable_offset:
+            raise ValueError("spool progress record is inconsistent")
+
+    def _body(self) -> dict[str, object]:
+        return {item.name: getattr(self, item.name) for item in fields(self)}
+
+    def slot_bytes(self) -> bytes:
+        body = self._body()
+        check = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        exact = json.dumps({**body, "check": check}, sort_keys=True, separators=(",", ":")).encode()
+        if len(exact) >= _SPOOL_PROGRESS_SLOT_BYTES:
+            raise ValueError("spool progress record exceeds its slot")
+        return exact.ljust(_SPOOL_PROGRESS_SLOT_BYTES - 1, b" ") + b"\n"
+
+    @classmethod
+    def from_slot(cls, slot: bytes) -> _SpoolProgress | None:
+        """The slot's record, or None for a never-written slot; torn is ValueError."""
+        if slot == _BLANK_PROGRESS_SLOT:
+            return None
+        if len(slot) != _SPOOL_PROGRESS_SLOT_BYTES or not slot.endswith(b"\n"):
+            raise ValueError("spool progress slot is torn")
+        payload = strict_json_loads(slot.rstrip(b" \n"))
+        names = {item.name for item in fields(cls)}
+        if type(payload) is not dict or set(payload) != names | {"check"}:
+            raise ValueError("spool progress slot fields drifted")
+        check = payload.pop("check")
+        record = cls(**payload)
+        if check != hashlib.sha256(
+            json.dumps(record._body(), sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest():
+            raise ValueError("spool progress slot checksum drifted")
+        return record
+
+
+class _TransferSegmentEnd(Exception):
+    """The transfer segment reached its safe stop before the stage deadline."""
+
+
+class _TransferSegmentGuard:
+    """The stage guard minus the safe-stop margin and the remaining logical budget.
+
+    Every transport read timeout is derived from it, so no read can cross the
+    point where the received prefix still has time to become durable.
+    """
+
+    def __init__(self, stage_guard: V4StageGuard, *, logical_deadline: float,
+                 monotonic: Callable[[], float]) -> None:
+        self._stage_guard = stage_guard
+        self._logical_deadline = logical_deadline
+        self._monotonic = monotonic
+
+    def remaining_seconds(self) -> float:
+        remaining = min(
+            self._stage_guard.remaining_seconds() - _TRANSFER_STOP_MARGIN_SECONDS,
+            self._logical_deadline - self._monotonic(),
+        )
+        if remaining <= 0:
+            raise _TransferSegmentEnd()
+        return remaining
+
+    def checkpoint(self) -> None:
+        self.remaining_seconds()
+
+    def note(self, kind: str, **scalars: int | str | None) -> None:
+        self._stage_guard.note(kind, **scalars)
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +429,63 @@ class _StagingWriteJournal:
             sha256=sha256,
         )
 
+    def adopt_file(self, relative: PurePosixPath, item: Any) -> None:
+        """Journal a file this attempt re-verified from a pinned staging tree."""
+        if relative in self.files:
+            raise ParserOutputContractError(
+                "MinerU v4 backend: staging journal file is duplicated"
+            )
+        identity = item.identity
+        self.files[relative] = _JournalFile(
+            identity=_StableFileStat(
+                device=identity.device, inode=identity.inode, mode=identity.mode, uid=identity.uid,
+                link_count=identity.link_count, byte_count=identity.byte_count,
+                modified_ns=identity.modified_ns, changed_ns=identity.changed_ns,
+            ),
+            sha256=item.sha256,
+        )
+
+    def discard_directory(self, relative: PurePosixPath) -> None:
+        self.directories.discard(relative)
+
+    def record_file(self, relative: PurePosixPath, *, observed: os.stat_result, sha256: str) -> None:
+        """Journal the current exact state of a file this attempt appends to."""
+        self.files[relative] = _JournalFile(identity=_StableFileStat.from_stat(observed), sha256=sha256)
+
+    def discard_file(self, relative: PurePosixPath) -> None:
+        self.files.pop(relative, None)
+
+
+class _SpaceReservation:
+    """One granted attempt's live-space promise, raised only where it will write.
+
+    ``require`` is called after ownership is verified (a prefix re-hashed, a
+    member matched to its record), with only the bytes still to be written;
+    replaying verified output never asks for space.
+    """
+
+    def __init__(self, owner: MinerUHttpStagedV4, attempt_id: str, floor: int) -> None:
+        self._owner = owner
+        self._attempt_id = attempt_id
+        self._floor = floor
+
+    def require(self, remaining: int) -> None:
+        owner = self._owner
+        remaining = max(0, remaining)
+        with owner._promise_lock:
+            others = sum(amount for attempt, amount in owner._promises.items() if attempt != self._attempt_id)
+            usage = os.statvfs(owner._root)
+            if usage.f_bavail * usage.f_frsize < self._floor + others + remaining:
+                raise MaterializationCapacityWaitV4("mac_free_floor")
+            owner._promises[self._attempt_id] = remaining
+
+
+@dataclass(frozen=True, slots=True)
+class _ResumedUnpack:
+    journal: _StagingWriteJournal
+    completed: frozenset[str]
+    records: bytes
+
 
 class _RootLockCoordinator:
     def __init__(self) -> None:
@@ -399,6 +594,8 @@ class MinerUV4Transport(Protocol):
         result_lease_seconds: int,
         step_guard: V4StageGuard,
         before_result_get: Callable[[], None],
+        range_start: int = 0,
+        strong_validator: str | None = None,
     ) -> Iterable[bytes]: ...
 
     def acknowledge(
@@ -423,6 +620,8 @@ class MinerUHttpStagedV4:
         clock: Callable[[], float],
         artifact_reader: MinerUMediumArtifactReader | None = None,
         fault_hook: Callable[[str], None] | None = None,
+        storage_policy: MineruResultStoragePolicy | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if (not isinstance(scratch_root, Path) or not scratch_root.is_absolute()
                 or ".." in scratch_root.parts):
@@ -430,9 +629,22 @@ class MinerUHttpStagedV4:
         self._root = scratch_root
         self._transport = transport
         self._clock = clock
+        self._storage_policy = storage_policy
+        self._monotonic = monotonic
+        # Unmaterialized promises of in-flight granted materializations in
+        # this process: attempt -> bytes it may still write to the work volume.
+        self._promises: dict[str, int] = {}
+        self._promise_lock = threading.Lock()
         self._reader = artifact_reader or MinerUMediumArtifactReader()
         self._fault_hook = fault_hook or (lambda _phase: None)
         self._ensure_root()
+        if storage_policy is not None:
+            usage = os.statvfs(self._root)
+            if usage.f_blocks * usage.f_frsize != storage_policy.mac_volume_total_bytes:
+                raise ValueError("result storage policy does not describe the Mac work volume")
+            if usage.f_frsize > MAC_ALLOCATION_UNIT_BYTES:
+                # The work quota's allocation margin assumes this block size.
+                raise ValueError("Mac work volume allocates in blocks larger than its quota assumes")
         observed_root = self._root.stat(follow_symlinks=False)
         self._root_identity = (
             observed_root.st_dev,
@@ -885,7 +1097,10 @@ class MinerUHttpStagedV4:
         self._require_no_legacy_quarantine(intent)
         # Lock order is a contract: the spool lock is never acquired after the
         # staging lock.  Both remain held through publication/replay.
-        with self._locked(spool_lock, "spool", lock_binding):
+        with (
+            self._locked(spool_lock, "spool", lock_binding),
+            self._mac_space_promise(intent) as space,
+        ):
             self._guard(claim_guard, checkpoint, claim)
             spool_identity = self._ensure_spool(
                 checkpoint=checkpoint,
@@ -900,6 +1115,7 @@ class MinerUHttpStagedV4:
                 spool=spool,
                 part=spool_part,
                 owner=spool_owner,
+                space=space,
             )
             # The same exact, hashed spool fd remains pinned from metadata
             # preflight through extraction.  Entering this context performs
@@ -917,6 +1133,8 @@ class MinerUHttpStagedV4:
                 archive, zip_metadata, verify_spool = zip_session
                 self._guard(claim_guard, checkpoint, claim)
                 if output.exists() or output.is_symlink():
+                    # Replaying a promoted output decodes it whole.
+                    require_heavy_work_permit(stage_guard)
                     replayed = self._replay_or_recover_promoted_output(
                         checkpoint=checkpoint,
                         claim=claim,
@@ -927,21 +1145,38 @@ class MinerUHttpStagedV4:
                     )
                     if replayed is not None:
                         return replayed
-                self._classify_and_resolve_existing_staging(
-                    checkpoint=checkpoint,
-                    claim=claim,
-                    claim_guard=claim_guard,
-                    intent=intent,
-                    staging=staging,
-                    staging_lock=staging_lock,
+                if intent.resource_grant is None:
+                    # A legacy unpack cannot resume, so it runs with its decode.
+                    require_heavy_work_permit(stage_guard)
+                resumed = (
+                    None if intent.resource_grant is None
+                    else self._resume_partial_unpack(
+                        checkpoint=checkpoint, claim=claim, claim_guard=claim_guard, intent=intent,
+                        staging=staging, staging_lock=staging_lock, metadata=zip_metadata,
+                    )
                 )
-                journal = _StagingWriteJournal.empty()
-                self._prepare_staging(
-                    intent=intent,
-                    staging=staging,
-                    marker=marker,
-                    journal=journal,
-                )
+                completed_members: frozenset[str] = frozenset()
+                unpack_records = b""
+                if resumed is None:
+                    self._classify_and_resolve_existing_staging(
+                        checkpoint=checkpoint,
+                        claim=claim,
+                        claim_guard=claim_guard,
+                        intent=intent,
+                        staging=staging,
+                        staging_lock=staging_lock,
+                    )
+                    journal = _StagingWriteJournal.empty()
+                    self._prepare_staging(
+                        intent=intent,
+                        staging=staging,
+                        marker=marker,
+                        journal=journal,
+                    )
+                else:
+                    journal, completed_members, unpack_records = (
+                        resumed.journal, resumed.completed, resumed.records,
+                    )
                 try:
                     try:
                         observations = self._materialize_staging(
@@ -955,6 +1190,10 @@ class MinerUHttpStagedV4:
                             before_destructive=lambda: self._guard(
                                 claim_guard, checkpoint, claim
                             ),
+                            completed_members=completed_members,
+                            unpack_records=unpack_records,
+                            stage_guard=stage_guard,
+                            space=space,
                         )
                     except (ParserOutputContractError, ValueError) as exc:
                         self._resolve_failed_staging_write(
@@ -989,10 +1228,21 @@ class MinerUHttpStagedV4:
                             != observations.uncompressed_byte_count
                         ):
                             raise self._fail("sealed observations drifted")
+                        # The decoded projection is not needed past this check;
+                        # do not keep it alive beside the final decode below.
+                        del projected
                         sealed_identity = sealed_tree.root_identity
+                        sealed_files = tuple(
+                            (item.relative_path, item.sha256, item.size_bytes)
+                            for item in sealed_tree.files
+                        )
                         sealed_tree.fsync_exact()
                         self._fault_hook("after_staging_fsync")
                         sealed_tree.verify_unchanged()
+                        if intent.resource_grant is not None:
+                            # A sealed staging is kept; it is never promoted
+                            # after its stage's logical deadline.
+                            stage_guard.checkpoint()
                         self._guard(claim_guard, checkpoint, claim)
                         if output.exists() or output.is_symlink():
                             raise self._fail("materialization output collision")
@@ -1011,12 +1261,11 @@ class MinerUHttpStagedV4:
                             ),
                         )
                     self._fault_hook("after_promotion")
-                    self._load_exact_output(
+                    self._require_promoted_sealed_tree(
                         intent=intent,
                         output=output,
-                        allow_marker=True,
-                        expected_output_identity=sealed_identity,
-                        fsync_exact=True,
+                        expected_identity=sealed_identity,
+                        expected_files=sealed_files,
                     )
                     self._finish_promoted_marker(
                         checkpoint=checkpoint,
@@ -1235,6 +1484,7 @@ class MinerUHttpStagedV4:
             "local_materialization_receipt", local_receipt
         )
         replay_context.validate_durable_current(checkpoint)
+        require_heavy_work_permit(stage_guard)
         stage_guard.checkpoint()
         source = self._path(intent.output_relpath)
         published = self._published_path(
@@ -1917,16 +2167,12 @@ class MinerUHttpStagedV4:
                         else self._published_path(resource.target_relpath)
                     )
                     source_present = self._try_path_stat(source) is not None
-                    if resource.action == "transfer":
-                        evidence_root = source if source_present else target_candidate
-                        if evidence_root is None:
-                            raise self._fail("cleanup output evidence disappeared")
-                        materialized = self._load_exact_output(
-                            intent=intent,
-                            output=evidence_root,
-                        )
-                        if materialized.receipt != local_receipt:
-                            raise self._fail("cleanup output receipt drifted")
+                    if resource.action == "transfer" and not source_present and target_candidate is None:
+                        raise self._fail("cleanup output evidence disappeared")
+                    # A transfer needs no whole-envelope decode: the plan binds this
+                    # resource to the durable receipt's output inventory (every
+                    # file's SHA-256, total bytes, file count), and the transfer
+                    # proves that inventory before and after the move.
                 if resource.action == "delete":
                     if resource.kind == "staging":
                         if intent is None:
@@ -2097,17 +2343,10 @@ class MinerUHttpStagedV4:
 
         with self._ordered_locks(lock_paths, lock_binding):
             before_promotion()
-            evidence_root = (
-                source
-                if self._try_path_stat(source) is not None
-                else target
-            )
-            loaded = self._load_exact_output(
-                intent=intent,
-                output=evidence_root,
-            )
-            if loaded != materialized:
-                raise self._fail("publication output promotion evidence drifted")
+            # ``materialized`` was reopened against this durable receipt; the
+            # transfer proves the receipt's exact output inventory before and
+            # after the rename, so no second or third whole-envelope decode is
+            # kept alive beside it.
             self._transfer_planned(
                 source=source,
                 target=target,
@@ -2116,12 +2355,6 @@ class MinerUHttpStagedV4:
                 before_effect=before_promotion,
                 max_files=receipt.output_file_count,
             )
-            replayed = self._load_exact_output(
-                intent=intent,
-                output=target,
-            )
-            if replayed != materialized:
-                raise self._fail("published parser output drifted after promotion")
 
     def verify_published(
         self,
@@ -2308,7 +2541,15 @@ class MinerUHttpStagedV4:
         spool: Path,
         part: Path,
         owner: Path,
+        space: _SpaceReservation | None = None,
     ) -> tuple[int, int]:
+        if intent.resource_grant is not None:
+            return self._ensure_resumable_spool(
+                checkpoint=checkpoint, claim=claim, claim_guard=claim_guard, intent=intent,
+                accepted=accepted, terminal=terminal, capability=capability,
+                stage_guard=stage_guard, result_lease_seconds=result_lease_seconds,
+                spool=spool, part=part, owner=owner, space=space,
+            )
         owner_bytes = self._spool_owner_bytes(intent)
         if spool.exists() or spool.is_symlink():
             spool_stat = self._try_path_stat(spool)
@@ -2422,6 +2663,505 @@ class MinerUHttpStagedV4:
         self._fsync_dir(owner.parent)
         return part_identity
 
+    @contextmanager
+    def publication_write_space(self, *, attempt_id: str, byte_count: int) -> Iterator[None]:
+        """Promise one publication's new readiness files against the live free floor.
+
+        The readiness files land on the same volume as the scratch root, so
+        they share the in-process promise table with every materialization; a
+        shortfall is a wait of the same COMMIT with nothing written.
+        """
+        policy = self._storage_policy
+        if policy is None or byte_count <= 0:
+            yield
+            return
+        key = f"{attempt_id}#publication"
+        try:
+            _SpaceReservation(self, key, policy.mac_free_floor_bytes).require(byte_count)
+            yield
+        finally:
+            with self._promise_lock:
+                self._promises.pop(key, None)
+
+    @contextmanager
+    def _mac_space_promise(self, intent: MaterializationIntentV4) -> Iterator[_SpaceReservation | None]:
+        """This granted attempt's live-space promise for one materialization call.
+
+        Live free space must cover the floor plus every in-flight promise in
+        this process before a step writes; a shortfall is a wait of the same
+        attempt with nothing written. The promise is retired when the call
+        ends. Legacy (v4) intents are unchanged.
+        """
+        policy = self._storage_policy
+        if intent.resource_grant is None or policy is None:
+            yield None
+            return
+        try:
+            yield _SpaceReservation(self, intent.attempt_id, policy.mac_free_floor_bytes)
+        finally:
+            with self._promise_lock:
+                self._promises.pop(intent.attempt_id, None)
+
+    def _ensure_resumable_spool(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        intent: MaterializationIntentV4,
+        accepted: AcceptedSubmissionReceiptV4,
+        terminal: TerminalReceiptV4,
+        capability: PrivateProviderCapabilityV4,
+        stage_guard: V4StageGuard,
+        result_lease_seconds: int,
+        spool: Path,
+        part: Path,
+        owner: Path,
+        space: _SpaceReservation | None = None,
+    ) -> tuple[int, int]:
+        """Download a granted result across stages, keeping every durable prefix.
+
+        Each record follows an fsync of the part and names its exact prefix
+        digest, the part identity, and the accumulated active transfer time. A
+        reopen re-verifies the prefix and cuts only an unrecorded tail; a part
+        without a provable owner or prefix is held, never restarted.
+        """
+        grant = intent.resource_grant
+        policy = self._storage_policy
+        if grant is None or policy is None or policy.sha256 != grant.storage_policy_sha256:
+            raise self._fail("resumable result transfer lacks its storage policy")
+        header = self._spool_owner_header_v5(intent)
+        total = intent.artifact_byte_count
+
+        def guard_claim() -> None:
+            self._guard(claim_guard, checkpoint, claim)
+
+        if spool.exists() or spool.is_symlink():
+            spool_stat = self._try_path_stat(spool)
+            if spool_stat is None:
+                raise self._fail("final spool disappeared")
+            self._require_owned_regular_stat(spool_stat, "final spool")
+            if part.exists() or part.is_symlink():
+                raise self._fail("final spool coexists with a partial file")
+            if owner.exists() or owner.is_symlink():
+                if self._read_private(owner)[:_SPOOL_OWNER_HEADER_BYTES] != header:
+                    raise self._fail("final spool owner metadata drifted")
+                self._remove_owned_file(owner, allow_absent=False, before_effect=guard_claim)
+            self._fsync_dir(spool.parent)
+            return self._identity(spool_stat)
+        stage_guard.checkpoint()
+        progress: _SpoolProgress | None = None
+        if owner.exists() or owner.is_symlink():
+            try:
+                exact = self._read_private(owner)
+            except ParserOutputContractError as exc:
+                raise MaterializationTransferHeldV4("spool_owner_unproven") from exc
+            progress = self._spool_progress(intent, exact)
+        elif part.exists() or part.is_symlink():
+            raise MaterializationTransferHeldV4("spool_owner_unproven")
+        else:
+            if space is not None:
+                space.require(grant.limits.temp_disk_bytes)  # Nothing is owned yet.
+            self._ensure_parent(part)
+            self._write_private(owner, header + 2 * _BLANK_PROGRESS_SLOT)
+        stage_guard.checkpoint()
+        with self._parent_fd(owner) as (owner_parent, owner_name):
+            owner_fd = os.open(owner_name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=owner_parent)
+        part_fd: int | None = None
+        try:
+            owner_stat = os.fstat(owner_fd)
+            self._require_owned_regular_stat(owner_stat, "spool owner receipt")
+            owner_identity = self._identity(owner_stat)
+            if owner_stat.st_size != _SPOOL_OWNER_V2_BYTES:
+                raise MaterializationTransferHeldV4("spool_owner_unproven")
+            if progress is not None and (progress.durable_offset > total):
+                raise MaterializationTransferHeldV4("spool_progress_unproven")
+            if progress is None or (progress.durable_offset == 0 and self._try_path_stat(part) is None):
+                # Nothing durable to keep: a fresh part under the proven owner.
+                if part.exists() or part.is_symlink():
+                    part_stat = self._try_path_stat(part)
+                    if part_stat is None:
+                        raise self._fail("spool partial disappeared")
+                    try:
+                        self._require_owned_regular_stat(part_stat, "unrecorded spool partial")
+                    except ParserOutputContractError as exc:
+                        raise MaterializationTransferHeldV4("spool_owner_unproven") from exc
+                    self._remove_owned_file(part, allow_absent=False, before_effect=guard_claim)
+                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+                with self._parent_fd(part, create=True) as (parent_fd, name):
+                    part_fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+                    part_stat = os.fstat(part_fd)
+                    self._require_owned_regular_stat(part_stat, "new spool part")
+                    self._require_entry_identity(parent_fd, name, part_stat, "new spool part")
+                    os.fsync(parent_fd)
+                progress = _SpoolProgress(
+                    sequence=1 if progress is None else progress.sequence + 1,
+                    durable_offset=0, prefix_sha256="sha256:" + hashlib.sha256().hexdigest(),
+                    part_device=part_stat.st_dev, part_inode=part_stat.st_ino,
+                    active_ms=0 if progress is None else progress.active_ms,
+                    window_active_ms=0 if progress is None else progress.window_active_ms,
+                    window_start_offset=0,
+                    restarts=0 if progress is None else progress.restarts,
+                )
+                self._write_spool_progress(owner_fd, owner_identity, progress)
+                digest = hashlib.sha256()
+            else:
+                part_fd, digest = self._reopen_spool_part(part, progress, stage_guard, guard_claim)
+            if space is not None:
+                # Only the re-hashed durable prefix counts as owned.
+                space.require(grant.limits.temp_disk_bytes - progress.durable_offset)
+            part_identity = (progress.part_device, progress.part_inode)
+            return self._transfer_resumable_spool(
+                policy=policy, intent=intent, accepted=accepted, terminal=terminal,
+                capability=capability, stage_guard=stage_guard,
+                result_lease_seconds=result_lease_seconds, guard_claim=guard_claim,
+                spool=spool, part=part, owner=owner, part_fd=part_fd, owner_fd=owner_fd,
+                owner_identity=owner_identity, progress=progress, digest=digest,
+                part_identity=part_identity,
+            )
+        finally:
+            if part_fd is not None:
+                os.close(part_fd)
+            os.close(owner_fd)
+
+    def _transfer_resumable_spool(
+        self,
+        *,
+        policy: MineruResultStoragePolicy,
+        intent: MaterializationIntentV4,
+        accepted: AcceptedSubmissionReceiptV4,
+        terminal: TerminalReceiptV4,
+        capability: PrivateProviderCapabilityV4,
+        stage_guard: V4StageGuard,
+        result_lease_seconds: int,
+        guard_claim: Callable[[], None],
+        spool: Path,
+        part: Path,
+        owner: Path,
+        part_fd: int,
+        owner_fd: int,
+        owner_identity: tuple[int, int],
+        progress: _SpoolProgress,
+        digest: Any,
+        part_identity: tuple[int, int],
+    ) -> tuple[int, int]:
+        total = intent.artifact_byte_count
+        deadline_ms = policy.transfer_logical_deadline_seconds * 1000
+        window_limit_ms = policy.progress_window_seconds * 1000
+        started = self._monotonic()
+        state: dict[str, Any] = {
+            "offset": progress.durable_offset,
+            "recorded_offset": progress.durable_offset,
+            "recorded_at": started,
+            "window_base_ms": progress.window_active_ms,
+            "window_mark": started,
+            "window_start_offset": progress.window_start_offset,
+        }
+        segment_start_offset = progress.durable_offset
+        current: dict[str, Any] = {"progress": progress, "digest": digest}
+
+        def elapsed_ms(now: float) -> int:
+            return max(0, int((now - started) * 1000))
+
+        def window_ms(now: float) -> int:
+            return state["window_base_ms"] + max(0, int((now - state["window_mark"]) * 1000))
+
+        def record(now: float) -> None:
+            os.fsync(part_fd)
+            updated = replace(
+                current["progress"],
+                sequence=current["progress"].sequence + 1,
+                durable_offset=state["offset"],
+                prefix_sha256="sha256:" + current["digest"].hexdigest(),
+                active_ms=progress.active_ms + elapsed_ms(now),
+                window_active_ms=window_ms(now),
+                window_start_offset=state["window_start_offset"],
+            )
+            self._write_spool_progress(owner_fd, owner_identity, updated)
+            current["progress"] = updated
+            state["recorded_offset"] = state["offset"]
+            state["recorded_at"] = now
+            self._fault_hook("after_spool_progress")
+
+        def require_budgets(now: float) -> None:
+            if progress.active_ms + elapsed_ms(now) >= deadline_ms:
+                raise MaterializationTransferHeldV4("transfer_logical_deadline")
+            if window_ms(now) >= window_limit_ms:
+                required = min(policy.minimum_progress_bytes, total - state["window_start_offset"])
+                if state["offset"] - state["window_start_offset"] < required:
+                    raise MaterializationTransferHeldV4("transfer_progress")
+                state["window_base_ms"] = 0
+                state["window_mark"] = now
+                state["window_start_offset"] = state["offset"]
+                record(now)
+
+        def settle(primary: BaseException) -> None:
+            try:
+                record(self._monotonic())
+            except BaseException as exc:
+                primary.add_note("spool progress record after interruption failed: " + repr(exc))
+
+        require_budgets(started)
+        if state["offset"] < total:
+            logical_deadline = started + (deadline_ms - progress.active_ms) / 1000
+            segment_guard = _TransferSegmentGuard(
+                stage_guard, logical_deadline=logical_deadline, monotonic=self._monotonic,
+            )
+            try:
+                self._receive_resumable_spool(
+                    intent=intent, accepted=accepted, terminal=terminal, capability=capability,
+                    stage_guard=stage_guard, segment_guard=segment_guard,
+                    result_lease_seconds=result_lease_seconds, guard_claim=guard_claim,
+                    part_fd=part_fd, state=state, current=current, record=record,
+                    require_budgets=require_budgets,
+                )
+            except _TransferSegmentEnd as exc:
+                settle(exc)
+                require_budgets(self._monotonic())
+                if state["offset"] > segment_start_offset:
+                    raise MaterializationTransferContinuesV4(
+                        durable_offset=state["offset"], artifact_byte_count=total,
+                    ) from None
+                raise RemoteProviderUnavailableV4("result transfer segment ended without progress") from None
+            except RemoteResultRangeIgnoredV4 as exc:
+                settle(exc)
+                if not exc.same_identity:
+                    raise self._fail("provider result identity drifted") from exc
+                self._restart_resumable_spool(part_fd, state, current, record, guard_claim)
+                raise
+            except RemoteResultRangeUnsatisfiableV4 as exc:
+                # A shorter remote representation never completes a local
+                # prefix: restart once from zero under the same identity.
+                settle(exc)
+                self._restart_resumable_spool(part_fd, state, current, record, guard_claim)
+                raise RemoteProviderUnavailableV4("result range was unsatisfiable") from exc
+            except RemoteProviderUnavailableV4 as exc:
+                settle(exc)
+                if state["offset"] > segment_start_offset:
+                    raise MaterializationTransferContinuesV4(
+                        durable_offset=state["offset"], artifact_byte_count=total,
+                    ) from exc
+                raise
+            except BaseException as exc:
+                settle(exc)
+                raise
+            record(self._monotonic())
+        if state["offset"] != total or (
+            "sha256:" + current["digest"].hexdigest()
+        ) != intent.artifact_sha256:
+            raise self._fail("provider result identity drifted")
+        if self._identity(os.fstat(part_fd)) != part_identity or os.fstat(part_fd).st_size != total:
+            raise self._fail("spool part changed while downloading")
+        self._fault_hook("after_spool_fsync")
+        stage_guard.checkpoint()
+        guard_claim()
+        self._exclusive_rename(part, spool, expected_source_identity=part_identity)
+        self._fault_hook("after_spool_rename")
+        stage_guard.checkpoint()
+        self._fsync_dir(spool.parent)
+        self._remove_owned_file(
+            owner, allow_absent=False, before_effect=guard_claim, expected_identity=owner_identity,
+        )
+        self._fsync_dir(owner.parent)
+        return part_identity
+
+    def _receive_resumable_spool(
+        self,
+        *,
+        intent: MaterializationIntentV4,
+        accepted: AcceptedSubmissionReceiptV4,
+        terminal: TerminalReceiptV4,
+        capability: PrivateProviderCapabilityV4,
+        stage_guard: V4StageGuard,
+        segment_guard: _TransferSegmentGuard,
+        result_lease_seconds: int,
+        guard_claim: Callable[[], None],
+        part_fd: int,
+        state: dict[str, Any],
+        current: dict[str, Any],
+        record: Callable[[float], None],
+        require_budgets: Callable[[float], None],
+    ) -> None:
+        total = intent.artifact_byte_count
+        start = state["offset"]
+        os.lseek(part_fd, start, os.SEEK_SET)
+        result_stream = iter(
+            self._transport.stream_result(
+                accepted_submission=accepted,
+                terminal_receipt=terminal,
+                provider_capability=capability,
+                result_lease_seconds=result_lease_seconds,
+                step_guard=segment_guard,
+                before_result_get=guard_claim,
+                range_start=start,
+                strong_validator=(
+                    '"' + intent.artifact_sha256.removeprefix("sha256:") + '"' if start else None
+                ),
+            )
+        )
+        stream_failed = False
+        try:
+            for chunk in result_stream:
+                segment_guard.checkpoint()
+                if type(chunk) is not bytes or not chunk:
+                    raise self._fail("provider result stream yielded an invalid chunk")
+                if state["offset"] + len(chunk) > min(total, intent.result_byte_limit):
+                    raise self._fail("provider result exceeded its byte limit")
+                self._guarded_write_all(part_fd, chunk, stage_guard)
+                current["digest"].update(chunk)
+                state["offset"] += len(chunk)
+                now = self._monotonic()
+                require_budgets(now)
+                if (
+                    state["offset"] - state["recorded_offset"] >= _SPOOL_PROGRESS_BYTES
+                    or now - state["recorded_at"] >= _SPOOL_PROGRESS_SECONDS
+                ):
+                    record(now)
+        except BaseException:
+            stream_failed = True
+            raise
+        finally:
+            close_stream = getattr(result_stream, "close", None)
+            try:
+                if callable(close_stream):
+                    close_stream()
+            except BaseException:
+                if not stream_failed:
+                    raise
+
+    def _restart_resumable_spool(
+        self,
+        part_fd: int,
+        state: dict[str, Any],
+        current: dict[str, Any],
+        record: Callable[[float], None],
+        guard_claim: Callable[[], None],
+    ) -> None:
+        if current["progress"].restarts >= _SPOOL_RANGE_RESTART_LIMIT:
+            raise MaterializationTransferHeldV4("transfer_range_unsupported")
+        guard_claim()
+        os.ftruncate(part_fd, 0)
+        os.fsync(part_fd)
+        state["offset"] = 0
+        state["window_start_offset"] = 0
+        current["digest"] = hashlib.sha256()
+        current["progress"] = replace(current["progress"], restarts=current["progress"].restarts + 1)
+        record(self._monotonic())
+
+    def _reopen_spool_part(
+        self,
+        part: Path,
+        progress: _SpoolProgress,
+        stage_guard: V4StageGuard,
+        guard_claim: Callable[[], None],
+    ) -> tuple[int, Any]:
+        """Reopen a recorded part: same identity, exact recorded prefix, cut tail."""
+        with self._parent_fd(part) as (parent_fd, name):
+            try:
+                part_fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+            except FileNotFoundError:
+                raise MaterializationTransferHeldV4("spool_part_short") from None
+            except OSError as exc:
+                raise MaterializationTransferHeldV4("spool_part_identity") from exc
+            try:
+                observed = os.fstat(part_fd)
+                try:
+                    self._require_owned_regular_stat(observed, "recorded spool partial")
+                    self._require_entry_identity(parent_fd, name, observed, "recorded spool partial")
+                except ParserOutputContractError as exc:
+                    raise MaterializationTransferHeldV4("spool_part_identity") from exc
+                if (observed.st_dev, observed.st_ino) != (progress.part_device, progress.part_inode):
+                    raise MaterializationTransferHeldV4("spool_part_identity")
+                if observed.st_size < progress.durable_offset:
+                    raise MaterializationTransferHeldV4("spool_part_short")
+                digest = hashlib.sha256()
+                position = 0
+                while position < progress.durable_offset:
+                    stage_guard.checkpoint()
+                    chunk = os.pread(part_fd, min(_CHUNK_BYTES, progress.durable_offset - position), position)
+                    if not chunk:
+                        raise MaterializationTransferHeldV4("spool_part_short")
+                    digest.update(chunk)
+                    position += len(chunk)
+                if "sha256:" + digest.hexdigest() != progress.prefix_sha256:
+                    raise MaterializationTransferHeldV4("spool_prefix_mismatch")
+                if observed.st_size > progress.durable_offset:
+                    # Bytes past the durable record were never acknowledged.
+                    guard_claim()
+                    os.ftruncate(part_fd, progress.durable_offset)
+                    os.fsync(part_fd)
+            except BaseException:
+                os.close(part_fd)
+                raise
+        return part_fd, digest
+
+    def _spool_progress(self, intent: MaterializationIntentV4, exact: bytes) -> _SpoolProgress | None:
+        """The newest valid progress record of a proven owner receipt.
+
+        A torn slot leaves the other slot's record; a receipt whose slots are
+        written but none valid proves no prefix and is held, never discarded.
+        """
+        if len(exact) != _SPOOL_OWNER_V2_BYTES or exact[:_SPOOL_OWNER_HEADER_BYTES] != (
+            self._spool_owner_header_v5(intent)
+        ):
+            raise MaterializationTransferHeldV4("spool_owner_unproven")
+        records: list[_SpoolProgress] = []
+        unproven = False
+        for index in (0, 1):
+            start = _SPOOL_OWNER_HEADER_BYTES + index * _SPOOL_PROGRESS_SLOT_BYTES
+            try:
+                record = _SpoolProgress.from_slot(exact[start:start + _SPOOL_PROGRESS_SLOT_BYTES])
+            except (ValueError, TypeError):
+                unproven = True
+                continue
+            if record is None:
+                continue
+            if record.sequence % 2 != index:
+                unproven = True
+                continue
+            records.append(record)
+        if not records:
+            if unproven:
+                raise MaterializationTransferHeldV4("spool_progress_unproven")
+            return None
+        return max(records, key=lambda item: item.sequence)
+
+    def _write_spool_progress(
+        self, owner_fd: int, owner_identity: tuple[int, int], progress: _SpoolProgress,
+    ) -> None:
+        """Write one record into the slot the newest record does not occupy."""
+        observed = os.fstat(owner_fd)
+        self._require_owned_regular_stat(observed, "spool owner receipt")
+        if self._identity(observed) != owner_identity or observed.st_size != _SPOOL_OWNER_V2_BYTES:
+            raise self._fail("spool owner receipt changed while transferring")
+        exact = progress.slot_bytes()
+        position = _SPOOL_OWNER_HEADER_BYTES + (progress.sequence % 2) * _SPOOL_PROGRESS_SLOT_BYTES
+        view = memoryview(exact)
+        while view:
+            written = os.pwrite(owner_fd, view, position)
+            if written <= 0:
+                raise OSError("short spool progress write")
+            view = view[written:]
+            position += written
+        os.fsync(owner_fd)
+
+    def _spool_owner_header_v5(self, intent: MaterializationIntentV4) -> bytes:
+        header = self._canonical(
+            {
+                "artifact_byte_count": intent.artifact_byte_count,
+                "artifact_sha256": intent.artifact_sha256,
+                "attempt_id": intent.attempt_id,
+                "fence_identity": intent.fence_identity,
+                "materialization_intent_sha256": intent.sha256,
+                "part_relpath": intent.spool_part_relpath,
+                "schema": _OWNER_SCHEMA_V2,
+                "spool_relpath": intent.spool_relpath,
+            }
+        )
+        if len(header) >= _SPOOL_OWNER_HEADER_BYTES:
+            raise self._fail("spool owner header exceeds its region")
+        return header.ljust(_SPOOL_OWNER_HEADER_BYTES - 1, b" ") + b"\n"
+
     def _prepare_staging(
         self,
         *,
@@ -2456,31 +3196,66 @@ class MinerUHttpStagedV4:
         marker: Path,
         journal: _StagingWriteJournal,
         before_destructive: Callable[[], None],
+        completed_members: frozenset[str] = frozenset(),
+        unpack_records: bytes = b"",
+        stage_guard: V4StageGuard | None = None,
+        space: _SpaceReservation | None = None,
     ) -> LocalMaterializationObservationsV4:
         unpack = staging / ".unpack"
-        self._mkdir_exact(unpack)
-        journal.add_directory(PurePosixPath(".unpack"))
-        member_count, uncompressed_bytes = self._extract_zip(
-            archive=archive,
-            metadata=zip_metadata,
-            output=unpack,
-            intent=intent,
-            verify_spool=verify_spool,
-            staging=staging,
-            journal=journal,
-        )
+        if PurePosixPath(".unpack") not in journal.directories:
+            self._mkdir_exact(unpack)
+            journal.add_directory(PurePosixPath(".unpack"))
+        if intent.resource_grant is None:
+            member_count, uncompressed_bytes = self._extract_zip(
+                archive=archive,
+                metadata=zip_metadata,
+                output=unpack,
+                intent=intent,
+                verify_spool=verify_spool,
+                staging=staging,
+                journal=journal,
+            )
+        else:
+            grant_before = intent.resource_grant
+            if space is not None and grant_before is not None:
+                # The hashed spool and every record-verified member are owned;
+                # only the rest of the unpack and the decode outputs remain.
+                verified = sum(
+                    member.file_size for member in zip_metadata.members
+                    if not member.is_directory and member.normalized_name in completed_members
+                )
+                space.require(grant_before.limits.temp_disk_bytes - intent.artifact_byte_count - verified)
+            member_count, uncompressed_bytes = self._extract_zip_resumable(
+                archive=archive,
+                metadata=zip_metadata,
+                output=unpack,
+                intent=intent,
+                verify_spool=verify_spool,
+                staging=staging,
+                journal=journal,
+                completed=completed_members,
+                records=unpack_records,
+                stage_guard=stage_guard,
+            )
         self._fault_hook("after_zip_extract")
         with self._pinned_tree(
             unpack,
             max_files=intent.member_count_limit,
             max_bytes=intent.uncompressed_byte_limit,
         ) as unpack_tree:
-            initial_read = self._reader.read_pinned(
+            # File metadata locates the output; the one real read below
+            # decodes it, so no second full document object is ever alive.
+            location = self._reader.locate_pinned(
                 unpack_tree,
                 source_pdf_sha256=intent.source_pdf_sha256,
             )
-            artifact_root = unpack.joinpath(*initial_read.artifact_root_relpath.parts)
+            artifact_root = unpack.joinpath(*location.artifact_root_relpath.parts)
             unpack_tree.verify_unchanged()
+        grant = intent.resource_grant
+        if grant is not None and location.decode_input_bytes > grant.decode_input_limit_bytes:
+            # Outside the supported single-process decode envelope: keep the
+            # verified result and staging for an operator, never fail it.
+            raise MaterializationCapacityBlockedV4("decode_input_bytes")
         with self._pinned_tree(
             artifact_root,
             max_files=intent.member_count_limit,
@@ -2494,6 +3269,10 @@ class MinerUHttpStagedV4:
                 raise self._fail("flattened MinerU artifact root drifted")
             tree.verify_unchanged()
             document = read.document
+        if grant is not None and stage_guard is not None:
+            # The one real decode may cross the frozen LOCAL deadline: nothing
+            # it produced is written or published after that.
+            stage_guard.checkpoint()
         if len(document.pages) != intent.source_page_count:
             raise self._fail("MinerU output page count drifted")
         context = intent.provider_envelope_context
@@ -2588,6 +3367,17 @@ class MinerUHttpStagedV4:
             > intent.output_byte_limit
         ):
             raise self._fail("materialization exceeded its final byte envelope")
+        if grant is not None and (
+            marker_bytes + len(envelope_bytes) + len(manifest.canonical_bytes)
+            > grant.decode_working_set_bytes
+        ):
+            # The serialized outputs live in the decode working set before
+            # they are written; beyond it the grant's disk bound is unproved.
+            raise MaterializationCapacityBlockedV4("decode_output_bytes")
+        if grant is not None and stage_guard is not None:
+            # Serializing a large envelope takes time too: the last safe point
+            # before staging is mutated.
+            stage_guard.checkpoint()
         journal.mutation_started = True
         self._fault_hook("before_flatten")
         self._flatten_artifact_root(
@@ -2629,6 +3419,36 @@ class MinerUHttpStagedV4:
         )
         self._fsync_tree(staging)
         return observations
+
+    def _require_promoted_sealed_tree(
+        self,
+        *,
+        intent: MaterializationIntentV4,
+        output: Path,
+        expected_identity: tuple[int, int],
+        expected_files: tuple[tuple[PurePosixPath, str, int], ...],
+    ) -> None:
+        """The promoted tree is exactly the sealed staging just decoded, made durable.
+
+        Every file's SHA-256 matches the staging that passed the full decode
+        under the same locks, so decoding it whole again proves nothing more.
+        """
+
+        if output.is_symlink() or not output.is_dir():
+            raise self._fail("materialization output is not an owned directory")
+        with self._pinned_tree(
+            output,
+            max_files=intent.member_count_limit + 3,
+            max_bytes=intent.output_byte_limit + _MAX_METADATA_BYTES,
+        ) as tree:
+            if tree.root_identity != expected_identity:
+                raise self._fail("materialization output identity drifted")
+            if tuple(
+                (item.relative_path, item.sha256, item.size_bytes) for item in tree.files
+            ) != expected_files:
+                raise self._fail("promoted materialization output drifted from its sealed staging")
+            tree.fsync_exact()
+            tree.verify_unchanged()
 
     def _finish_promoted_marker(
         self,
@@ -3033,6 +3853,310 @@ class MinerUHttpStagedV4:
             raise self._fail("ZIP uncompressed byte count drifted while extracting")
         return len(metadata.members), written
 
+    def _extract_zip_resumable(
+        self,
+        *,
+        archive: zipfile.ZipFile,
+        metadata: _ValidatedZipMetadata,
+        output: Path,
+        intent: MaterializationIntentV4,
+        verify_spool: Callable[[], None],
+        staging: Path,
+        journal: _StagingWriteJournal,
+        completed: frozenset[str],
+        records: bytes,
+        stage_guard: V4StageGuard | None,
+    ) -> tuple[int, int]:
+        """Unpack member by member, publishing each only once it is complete.
+
+        Completed (re-verified) members are skipped. Between members, a stage
+        close to its deadline stops with every published member durable; the
+        in-flight member is always written aside, recorded with its SHA-256,
+        and only then renamed in.
+        """
+        verify_spool()
+        partial_dir = staging / _UNPACK_PARTIAL_DIRNAME
+        partial_relative = PurePosixPath(_UNPACK_PARTIAL_DIRNAME)
+        if partial_relative not in journal.directories:
+            self._mkdir_exact(partial_dir)
+            journal.add_directory(partial_relative)
+        record_path = partial_dir / _UNPACK_JOURNAL_NAME
+        record_relative = partial_relative / _UNPACK_JOURNAL_NAME
+        record_digest = hashlib.sha256(records)
+        files = [member for member in metadata.members if not member.is_directory]
+        written = sum(member.file_size for member in files if member.normalized_name in completed)
+        done = sum(member.normalized_name in completed for member in files)
+        extracted = 0
+        for member in metadata.members:
+            try:
+                info = archive.getinfo(member.archive_name)
+            except KeyError as exc:
+                raise self._fail("ZIP member metadata drifted") from exc
+            if not member.validates(info):
+                raise self._fail("ZIP member metadata drifted")
+            target = output.joinpath(*PurePosixPath(member.normalized_name).parts)
+            if member.is_directory:
+                self._ensure_dirs_beneath(output, target, journal_root=staging, journal=journal)
+                continue
+            if member.normalized_name in completed:
+                continue
+            if (
+                extracted and stage_guard is not None
+                and stage_guard.remaining_seconds() < _UNPACK_STOP_MARGIN_SECONDS
+            ):
+                # A member boundary: nothing is in flight and every
+                # published member was fsynced with its directory.
+                raise MaterializationUnpackContinuesV4(
+                    completed_members=done + extracted, member_count=len(files),
+                )
+            self._ensure_dirs_beneath(output, target.parent, journal_root=staging, journal=journal)
+            in_flight = partial_dir / _UNPACK_PARTIAL_NAME
+            in_flight_relative = partial_relative / _UNPACK_PARTIAL_NAME
+            with self._parent_fd(in_flight, create=True) as (parent_fd, basename):
+                fd = os.open(
+                    basename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600, dir_fd=parent_fd,
+                )
+                digest = hashlib.sha256()
+                size = 0
+                try:
+                    try:
+                        with archive.open(info, "r") as source:
+                            while chunk := source.read(_CHUNK_BYTES):
+                                size += len(chunk)
+                                if written + size > intent.uncompressed_byte_limit:
+                                    raise self._fail("ZIP stream exceeded its byte limit")
+                                digest.update(chunk)
+                                self._write_all(fd, chunk)
+                        os.fsync(fd)
+                        member_stat = os.fstat(fd)
+                        self._require_owned_regular_stat(member_stat, "extracted ZIP member")
+                        self._require_entry_identity(parent_fd, basename, member_stat, "extracted ZIP member")
+                    except (
+                        ParserOutputContractError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error,
+                    ) as exc:
+                        # The failed in-flight file is journaled like any
+                        # other write, so failure cleanup sees it exactly.
+                        os.fsync(fd)
+                        journal.add_file(
+                            in_flight_relative, observed=os.fstat(fd), sha256="sha256:" + digest.hexdigest(),
+                        )
+                        if isinstance(exc, ParserOutputContractError):
+                            raise
+                        raise self._fail("ZIP member content is invalid") from exc
+                finally:
+                    os.close(fd)
+            if member_stat.st_size != member.file_size:
+                journal.add_file(in_flight_relative, observed=member_stat, sha256="sha256:" + digest.hexdigest())
+                raise self._fail("ZIP member size drifted while extracting")
+            self._append_unpack_record(
+                record_path, record_relative, journal, record_digest,
+                self._canonical({
+                    "bytes": size, "path": member.normalized_name, "sha256": "sha256:" + digest.hexdigest(),
+                }) + b"\n",
+            )
+            self._exclusive_rename(in_flight, target, expected_source_identity=self._identity(member_stat))
+            with self._parent_fd(target) as (target_parent, target_name):
+                published = os.stat(target_name, dir_fd=target_parent, follow_symlinks=False)
+            journal.add_file(
+                PurePosixPath(target.relative_to(staging).as_posix()),
+                observed=published,
+                sha256="sha256:" + digest.hexdigest(),
+            )
+            written += size
+            extracted += 1
+        # Every member is durable with its record, so this staging still
+        # resumes exactly; past this point the records retire and the one
+        # whole-object decode follows, which needs the shared heavy-work permit.
+        require_heavy_work_permit(stage_guard)
+        if record_relative in journal.files:
+            self._remove_owned_file(record_path, allow_absent=False)
+            journal.discard_file(record_relative)
+        with self._parent_fd(partial_dir) as (staging_fd, name):
+            os.rmdir(name, dir_fd=staging_fd)
+            os.fsync(staging_fd)
+        journal.discard_directory(partial_relative)
+        self._fsync_tree(output)
+        verify_spool()
+        if written != metadata.uncompressed_byte_count:
+            raise self._fail("ZIP uncompressed byte count drifted while extracting")
+        return len(metadata.members), written
+
+    def _resume_partial_unpack(
+        self,
+        *,
+        checkpoint: RemoteParseCheckpointV4,
+        claim: V4ClaimWitness,
+        claim_guard: V4ClaimGuard,
+        intent: MaterializationIntentV4,
+        staging: Path,
+        staging_lock: Path,
+        metadata: _ValidatedZipMetadata,
+    ) -> _ResumedUnpack | None:
+        """Adopt a staging that holds only a clean partial unpack of this intent.
+
+        Every published member must match its own durable record (exact size
+        and SHA-256 from the pinned scan) and is kept; only the in-flight
+        member and a torn trailing record are removed. Any other staging (a
+        manifest, a flattened tree, an unknown entry, a member without its
+        record) returns None and is resolved by the unchanged classifier.
+        """
+        observed = self._try_path_stat(staging)
+        if observed is None:
+            return None
+        self._require_owned_dir_stat(observed, "materialization resume staging")
+        self._require_lock_binding(staging_lock, "staging", self._resource_binding(intent))
+        marker_file = PurePosixPath(PurePosixPath(intent.staging_marker_relpath).name)
+        unpack, partial = PurePosixPath(".unpack"), PurePosixPath(_UNPACK_PARTIAL_DIRNAME)
+        members = {
+            unpack.joinpath(*PurePosixPath(member.normalized_name).parts): member
+            for member in metadata.members
+        }
+        allowed_directories = {PurePosixPath("."), unpack, partial} | {
+            parent for path in members for parent in path.parents if parent != PurePosixPath(".")
+        } | {path for path, member in members.items() if member.is_directory}
+        try:
+            with self._pinned_tree(
+                staging,
+                max_files=intent.member_count_limit + 3,
+                max_bytes=self._recovery_scan_max_bytes(intent),
+                allow_empty_directories=True,
+            ) as tree:
+                files = {item.relative_path: item for item in tree.files}
+                directories = set(tree.directory_paths)
+                if (
+                    tree.root_identity != self._identity(observed)
+                    or marker_file not in files
+                    or tree.read_bytes(marker_file, max_bytes=_MAX_METADATA_BYTES) != self._marker_bytes(intent)
+                    or unpack not in directories
+                    or not directories <= allowed_directories
+                ):
+                    return None
+                record_relative = partial / _UNPACK_JOURNAL_NAME
+                in_flight = [path for path in files if path.parent == partial and path != record_relative]
+                completed = {
+                    path: item for path, item in files.items() if path != marker_file and path.parent != partial
+                }
+                if len(in_flight) > 1 or any(path.name != _UNPACK_PARTIAL_NAME for path in in_flight):
+                    return None
+                content = (
+                    tree.read_bytes(record_relative, max_bytes=files[record_relative].size_bytes)
+                    if record_relative in files else b""
+                )
+                records = self._unpack_records(content, members)
+                if records is None:
+                    return None
+                for path, item in completed.items():
+                    member = members.get(path)
+                    if (
+                        member is None or member.is_directory or item.size_bytes != member.file_size
+                        or records.get(member.normalized_name) != (item.size_bytes, item.sha256)
+                    ):
+                        return None
+                tree.verify_unchanged()
+        except ParserOutputContractError:
+            return None
+        journal = _StagingWriteJournal.empty()
+        for directory in directories:
+            journal.add_directory(directory)
+        journal.adopt_file(marker_file, files[marker_file])
+        for path, item in completed.items():
+            journal.adopt_file(path, item)
+        durable = content[: content.rfind(b"\n") + 1]
+        if record_relative in files:
+            recorded = files[record_relative]
+            if len(durable) != len(content):
+                # An append interrupted before its newline recorded nothing:
+                # its member was never renamed in, and is redone.
+                durable_stat = self._truncate_owned_file(
+                    staging / record_relative, len(durable),
+                    expected=(recorded.identity.device, recorded.identity.inode),
+                )
+                journal.record_file(record_relative, observed=durable_stat, sha256=self._digest(durable))
+            else:
+                journal.adopt_file(record_relative, recorded)
+        if in_flight:
+            leftover = files[in_flight[0]].identity
+            self._remove_owned_file(
+                staging / in_flight[0],
+                allow_absent=False,
+                before_effect=lambda: self._guard(claim_guard, checkpoint, claim),
+                expected_identity=(leftover.device, leftover.inode),
+            )
+            self._fsync_dir(staging / partial)
+        return _ResumedUnpack(
+            journal=journal,
+            completed=frozenset(members[path].normalized_name for path in completed),
+            records=durable,
+        )
+
+    @staticmethod
+    def _unpack_records(
+        content: bytes, members: dict[PurePosixPath, _ValidatedZipMember],
+    ) -> dict[str, tuple[int, str]] | None:
+        """Closed complete records (a torn trailing one is ignored); None if any is invalid."""
+        names = {member.normalized_name: member for member in members.values() if not member.is_directory}
+        records: dict[str, tuple[int, str]] = {}
+        for line in content[: content.rfind(b"\n") + 1].splitlines():
+            try:
+                value = strict_json_loads(line)
+            except ValueError:
+                return None
+            if type(value) is not dict or set(value) != _UNPACK_RECORD_FIELDS:
+                return None
+            name, size, digest = value["path"], value["bytes"], value["sha256"]
+            member = names.get(name) if type(name) is str else None
+            if (
+                member is None or type(size) is not int or size != member.file_size
+                or type(digest) is not str or not digest.startswith("sha256:") or len(digest) != 71
+                or records.get(name, (size, digest)) != (size, digest)
+            ):
+                return None
+            records[name] = (size, digest)
+        return records
+
+    def _append_unpack_record(
+        self,
+        path: Path,
+        relative: PurePosixPath,
+        journal: _StagingWriteJournal,
+        digest: Any,
+        line: bytes,
+    ) -> None:
+        created = relative not in journal.files
+        with self._parent_fd(path) as (parent_fd, name):
+            flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open(name, flags | (os.O_CREAT | os.O_EXCL if created else 0), 0o600, dir_fd=parent_fd)
+            try:
+                observed = os.fstat(fd)
+                self._require_owned_regular_stat(observed, "unpack record journal")
+                if not created and self._identity(observed) != (
+                    journal.files[relative].identity.device, journal.files[relative].identity.inode,
+                ):
+                    raise self._fail("unpack record journal was replaced")
+                self._write_all(fd, line)
+                os.fsync(fd)
+                digest.update(line)
+                journal.record_file(relative, observed=os.fstat(fd), sha256="sha256:" + digest.hexdigest())
+            finally:
+                os.close(fd)
+            if created:
+                os.fsync(parent_fd)
+
+    def _truncate_owned_file(self, path: Path, size: int, *, expected: tuple[int, int]) -> os.stat_result:
+        with self._parent_fd(path) as (parent_fd, name):
+            fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+            try:
+                observed = os.fstat(fd)
+                self._require_owned_regular_stat(observed, "unpack record journal")
+                if self._identity(observed) != expected:
+                    raise self._fail("unpack record journal was replaced")
+                os.ftruncate(fd, size)
+                os.fsync(fd)
+                return os.fstat(fd)
+            finally:
+                os.close(fd)
+
     def _flatten_artifact_root(
         self,
         *,
@@ -3318,7 +4442,14 @@ class MinerUHttpStagedV4:
             if part_stat is not None and owner_stat is None:
                 raise self._fail("spool partial lacks its canonical owner proof")
             if owner_stat is not None:
-                if self._read_private(owner) != self._spool_owner_bytes(intent):
+                exact = self._read_private(owner)
+                if intent.resource_grant is None:
+                    proven = exact == self._spool_owner_bytes(intent)
+                else:
+                    proven = len(exact) == _SPOOL_OWNER_V2_BYTES and (
+                        exact[:_SPOOL_OWNER_HEADER_BYTES] == self._spool_owner_header_v5(intent)
+                    )
+                if not proven:
                     raise self._fail("spool partial owner proof drifted")
                 proofs[("spool_part_owner", intent.spool_part_owner_relpath)] = (
                     self._identity(owner_stat)

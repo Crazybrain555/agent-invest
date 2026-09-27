@@ -12,6 +12,10 @@ from disclosure_anchor.application.contracts.strict_json import strict_json_load
 
 PROCESS_PROFILE_CONTRACT = "mineru.process-profile.v1"
 EXPLICIT_PROCESS_PROFILE_CONTRACT = "mineru.process-profile.v2"
+# v3 replaces the v1/v2 per-task result reservation B and aggregate L with one
+# bound result storage policy: their soft roles and the hard budgets are the
+# policy's explicitly named fields. v1/v2 bytes are unchanged.
+RESULT_STORAGE_PROCESS_PROFILE_CONTRACT = "mineru.process-profile.v3"
 _FIELDS = frozenset(
     {
         "contract_version",
@@ -67,6 +71,11 @@ _FIELDS = frozenset(
         "task_cleanup_interval_seconds",
     }
 )
+_LEGACY_RESULT_FIELDS = frozenset({"result_reservation_bytes", "max_unacked_result_bytes"})
+_FIELDS_V3 = (_FIELDS - _LEGACY_RESULT_FIELDS) | {"result_storage_policy_sha256"}
+_CONTRACTS = frozenset(
+    {PROCESS_PROFILE_CONTRACT, EXPLICIT_PROCESS_PROFILE_CONTRACT, RESULT_STORAGE_PROCESS_PROFILE_CONTRACT}
+)
 _HYBRID_BATCH_RATIOS = frozenset({1, 2, 4, 8})
 _MAX_PROFILE_BYTES = 64 * 1024
 _MAX_INT32 = (1 << 31) - 1
@@ -116,8 +125,9 @@ class MineruProcessProfile:
     vllm_enable_prefix_caching: bool
     pipeline_inference_locks: bool
     finalizer_slots: int
-    result_reservation_bytes: int
-    max_unacked_result_bytes: int
+    # v1/v2 only; ``None`` in v3, whose result budgets live in the bound policy.
+    result_reservation_bytes: int | None
+    max_unacked_result_bytes: int | None
     source_pdf_bytes_limit: int
     resident_pages_limit: int
     rasterized_page_bytes_limit: int
@@ -134,10 +144,20 @@ class MineruProcessProfile:
     host_runtime_memory_limit_bytes: int
     task_retention_seconds: int
     task_cleanup_interval_seconds: int
+    # v3 only: the exact ``mineru.result-storage-policy.v1`` this epoch uses.
+    result_storage_policy_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.contract_version not in {PROCESS_PROFILE_CONTRACT, EXPLICIT_PROCESS_PROFILE_CONTRACT}:
+        if self.contract_version not in _CONTRACTS:
             raise ValueError("MinerU process profile contract is unsupported")
+        v3 = self.contract_version == RESULT_STORAGE_PROCESS_PROFILE_CONTRACT
+        if v3:
+            if not _is_sha256(self.result_storage_policy_sha256):
+                raise ValueError("MinerU process profile v3 must bind a result storage policy")
+            if self.result_reservation_bytes is not None or self.max_unacked_result_bytes is not None:
+                raise ValueError("MinerU process profile v3 has no legacy result reservation fields")
+        elif self.result_storage_policy_sha256 is not None:
+            raise ValueError("only MinerU process profile v3 binds a result storage policy")
         for name in (
             "runtime_bundle_identity_sha256",
             "orchestrator_image_identity_sha256",
@@ -176,15 +196,14 @@ class MineruProcessProfile:
         ):
             _validate_positive_bounded_int(name, getattr(self, name), _MAX_INT32)
         if not (
-            self.contract_version == EXPLICIT_PROCESS_PROFILE_CONTRACT
+            self.contract_version in {EXPLICIT_PROCESS_PROFILE_CONTRACT, RESULT_STORAGE_PROCESS_PROFILE_CONTRACT}
             and self.vllm_max_num_batched_tokens is None
         ):
             _validate_positive_bounded_int(
                 "vllm_max_num_batched_tokens", self.vllm_max_num_batched_tokens, _MAX_INT32
             )
         for name in (
-            "result_reservation_bytes",
-            "max_unacked_result_bytes",
+            *(() if v3 else ("result_reservation_bytes", "max_unacked_result_bytes")),
             "source_pdf_bytes_limit",
             "rasterized_page_bytes_limit",
             "decoded_payload_bytes_limit",
@@ -237,8 +256,10 @@ class MineruProcessProfile:
             raise ValueError("MinerU GPU request slots exceed vLLM sequences")
         if self.finalizer_slots > self.api_max_pending_tasks:
             raise ValueError("MinerU finalizer slots exceed pending-task admission")
-        if (
-            self.result_reservation_bytes * self.api_max_pending_tasks
+        if not v3 and (
+            self.result_reservation_bytes is None
+            or self.max_unacked_result_bytes is None
+            or self.result_reservation_bytes * self.api_max_pending_tasks
             > self.max_unacked_result_bytes
         ):
             raise ValueError("MinerU admitted result reservations exceed retained-result budget")
@@ -265,6 +286,22 @@ class MineruProcessProfile:
         return "sha256:" + hashlib.sha256(self.exact_bytes).hexdigest()
 
 
+def legacy_result_budgets(profile: MineruProcessProfile) -> tuple[int, int]:
+    """Return a v1/v2 profile's (B, L); a v3 profile has no such fields.
+
+    The v1/v2 credit policies read B/L as their hard provider-result budget. A
+    v3 epoch must use the storage-policy credit instead, never these readers.
+    """
+
+    if (
+        profile.contract_version == RESULT_STORAGE_PROCESS_PROFILE_CONTRACT
+        or profile.result_reservation_bytes is None
+        or profile.max_unacked_result_bytes is None
+    ):
+        raise ValueError("MinerU process profile v3 has no legacy result budgets; use the storage-policy credit")
+    return profile.result_reservation_bytes, profile.max_unacked_result_bytes
+
+
 def encode_mineru_process_profile(profile: MineruProcessProfile) -> bytes:
     """Return the sole canonical JSON representation of ``profile``."""
 
@@ -280,8 +317,11 @@ def decode_mineru_process_profile(payload: bytes) -> MineruProcessProfile:
         decoded = strict_json_loads(payload)
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("MinerU process profile is not strict UTF-8 JSON") from exc
-    if not isinstance(decoded, dict) or set(decoded) != _FIELDS:
+    v3 = isinstance(decoded, dict) and decoded.get("contract_version") == RESULT_STORAGE_PROCESS_PROFILE_CONTRACT
+    if not isinstance(decoded, dict) or set(decoded) != (_FIELDS_V3 if v3 else _FIELDS):
         raise ValueError("MinerU process profile fields are not closed")
+    if v3:
+        decoded = {**decoded, **{name: None for name in _LEGACY_RESULT_FIELDS}}
     profile = MineruProcessProfile(**decoded)
     if profile.exact_bytes != payload:
         raise ValueError("MinerU process profile bytes are not canonical")
@@ -290,6 +330,10 @@ def decode_mineru_process_profile(payload: bytes) -> MineruProcessProfile:
 
 def _canonical_bytes(profile: MineruProcessProfile) -> bytes:
     payload: dict[str, Any] = asdict(profile)
+    # Each contract version has one closed field set; v1/v2 bytes never gain
+    # the v3 binding and v3 never carries the retired B/L fields.
+    closed = _FIELDS_V3 if profile.contract_version == RESULT_STORAGE_PROCESS_PROFILE_CONTRACT else _FIELDS
+    payload = {name: value for name, value in payload.items() if name in closed}
     return json.dumps(
         payload,
         ensure_ascii=False,
@@ -324,6 +368,8 @@ __all__ = [
     "MineruProcessProfile",
     "PROCESS_PROFILE_CONTRACT",
     "EXPLICIT_PROCESS_PROFILE_CONTRACT",
+    "RESULT_STORAGE_PROCESS_PROFILE_CONTRACT",
     "decode_mineru_process_profile",
     "encode_mineru_process_profile",
+    "legacy_result_budgets",
 ]

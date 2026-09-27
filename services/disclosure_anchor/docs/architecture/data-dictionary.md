@@ -48,7 +48,9 @@ outbox_event（ops；subject_ref 弱引用 document/unit/run）
 security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写入口统一
 `strip + uppercase exchange`；0022 以 CHECK 保证库存键已是规范形态，并校验大陆六位码
 与 SSE/SZSE/BSE 前缀一致（上海 B 股仍属 SSE）。无法从代码前缀可靠判断时必须显式给 exchange，
-不允许悄悄落 SZSE。
+不允许悄悄落 SZSE。status：`active`（resolver 创建）/ `historical`（同一法人换码后的旧代码，只能由具名
+绑定创建；通用 resolver 与本地登记拒用，下载只经绑定证据链使用，见
+`implementation/design/historical-security-retained-registration.md`）。
 
 ### tracked_company（盯盘配置——唯一人工输入的落库形态）
 | 列 | 含义 |
@@ -76,7 +78,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | status | running / succeeded / failed；stale running 由 worker 按阈值回收 |
 | is_active | 每文档唯一 true（发布原子切换） |
 | artifact_owner_processing_run_id | 实际拥有 parser artifact 与 primary parse artifact 字节的根 parse run；parse=self，rebuild 传播根 owner，不能从路径文本反推 |
-| builder_rules_version | 新 writer 当前恒等于 `provider_unit.v23`；历史 run 保留原规则版本，不能回写 |
+| builder_rules_version | 新 writer 当前恒等于 `provider_unit.v24`；历史 run 保留原规则版本，不能回写；已封存的 V4 preparation 重开后按其请求中的原版本（如 `provider_unit.v23`）发布 |
 | parser_target_identity | 产生该 run 的完整 parser target（backend/method/language/runtime bundle identity）；不从零散 parser_* 列反推 |
 | search_projection_error | 当前 retrieval_rules_version 的确定性、非重试检索投影终态；delta 不空转，full 可显式重试，成功替换时同事务清空 |
 | content_hash_aggregate / structure_hash | run 级聚合（U3）；"内容没变"只看前者 |
@@ -93,14 +95,14 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | payload_kind | 闭集 text / table / qa（历史只读）/ **mixed**。新 writer：单一正文块提升为 text，单一逻辑表 owner 提升为 table；多块或视觉块使用 mixed。parts 只存浅内容字段；精确 provider type 留在 ProviderDocument，粗粒度 owner/evidence kind 只留 locator |
 | heading_path | jsonb 完整**源标题路径**（有 heading 时非空；GIN jsonb_path_ops 精确包含）。可检索形态=视图列 heading_path_text；路径来自 typed heading/outline 结构，不来自普通 caption 或 taxonomy；唯一的强编号 table-caption 例外见下一行 |
 | title | 只取已接受 source heading 的叶节点，并与 heading_path 末项相等；无可靠 heading 时为 NULL。登记文档标题只留 document scope。普通 caption、单位、脚注不得填入 title；仅当 Provider 将缺失的强根编号标题并入唯一 `table_caption` 时，locator v3 起以 source index + payload ordinal 将该 caption 作为 source heading，且从 table payload 移出以避免重复。locator v4 还可用 `continuation_fragments` 绑定同页几何闭合的换行标题尾部；每个 fragment 仍对应原 source occurrence |
-| semantic_keys | 可选的受控 Unit **直接主题**路由 JSONB 有序集合（1..8 或 SQL NULL），GIN 支持 any/all recall；0047 已删除冗余私有 scalar。mixed/长 Unit 可保留多个独立粗主题。只有 `body_status=content` 的答案载体可获得 direct route；`heading_only` / `empty` 内部保持 NULL，标题仍由 title/heading_path/section_keys 提供导航。direct 表示 Unit 自身有 source-bound 主题证据，不表示陈述为真、已实现、本期、无条件或可采信；历史、风险、预测、计划、条件、因果、否定、无发生与不适用由 L2 解释，不能抹掉已成立的 L1 主题。有内容 Unit 的唯一精确标题可确定性落键；正文定量 route 只对 versioned positive key allowlist、受控 label 紧邻数值（可经闭合 connector）或定期指标的明确方向结果锁定；严格 typed table field/header 与等价正文产生同一 allowlisted粗主题，普通 table text/data cell 只作 lexical/candidate。内部 `role_anchor` 保存 forecast period/range/comparison/basis/risk 等精确披露角色，可与独立粗主题并存，但一个角色中的数字不得制造另一个角色；`exclusive_container` 仅用于目录、完整报表/整表等机械载体。其余标题/正文/表格只生成至多 8 个 source-bound 候选；provider 链必须逐候选返回闭合布尔裁决，不能造 key、决定边界或判断事实性。Document filing type + authoritative disclosure topics 只开放 scope；provider content categories 只作 facet/context。证据不足时不以 `document_content` 冒充语义；public v1 将内部 NULL 投影为 `[]`。Build 冻结 receipt，Publish 只重放不调模型 |
+| semantic_keys | 可选的受控 Unit **直接主题**路由 JSONB 有序集合（1..8 或 SQL NULL），GIN 支持 any/all recall；0047 已删除冗余私有 scalar。mixed/长 Unit 可保留多个独立粗主题。只有 `body_status=content` 的答案载体可获得 direct route；`heading_only` / `empty` 内部保持 NULL，标题仍由 title/heading_path/section_keys 提供导航。direct 表示 Unit 自身有 source-bound 主题证据，不表示陈述为真、已实现、本期、无条件或可采信；历史、风险、预测、计划、条件、因果、否定、无发生与不适用由 L2 解释，不能抹掉已成立的 L1 主题。有内容 Unit 的唯一精确标题可确定性落键；正文定量 route 只对 versioned positive key allowlist、受控 label 紧邻数值（可经闭合 connector）或定期指标的明确方向结果锁定；严格 typed table field/header 与等价正文产生同一 allowlisted粗主题，普通 table text/data cell 只作 lexical/candidate。内部 `role_anchor` 保存 forecast period/range/comparison/basis/risk 等精确披露角色，可与独立粗主题并存，但一个角色中的数字不得制造另一个角色；`exclusive_container` 仅用于目录、完整报表/整表等机械载体；来源标题精确点名多个载体时（受控组合标题，如合并及公司报表）每个载体都是 direct route，容器之间可并存、不与行项目并存。其余标题/正文/表格只生成至多 8 个 source-bound 候选；provider 链必须逐候选返回闭合布尔裁决，不能造 key、决定边界或判断事实性。Document filing type + authoritative disclosure topics 只开放 scope；provider content categories 只作 facet/context。证据不足时不以 `document_content` 冒充语义；public v1 将内部 NULL 投影为 `[]`。Build 冻结 receipt，Publish 只重放不调模型 |
 | section_keys | 可选的受控**结构位置**路由，与直接主题分离。从已接受 heading_path 的根到叶精确匹配显式结构容器：定期报告使用 `context_container`，事件公告只开放少量命中 filing_type/authoritative disclosure_topics scope 的 `section_container`。一个 versioned exact composite heading 可显式映射多个结构键（如“公司治理、环境和社会”→governance + environment_social）；不做 contains/similarity。无模型、无 Document 类别直接传播；heading-only Unit 可从自身 hash-bound accepted heading path 获得精确结构位置，没有可匹配 heading 的真空 Unit 内部保持 NULL。完整链可让 L2 按“管理层讨论/财务报告/认购方法/交易风险”等章节批量召回，又不与 Unit 直接主题竞争。非空时为 JSONB 数组、GIN、API any/all；0040 起 public v1 的空集合统一为 `[]`；变化进入 query_projection_hash |
 | payload | ProviderDocument 的 source-bound 浅投影：顶层 text 只保存 `{text}`；顶层 table 保存原始 `table_body` HTML 与 caption/footnote 数组；mixed 只保存有序浅内容 fields，不重复 `provider_type`/kind/semantic_type。精确 source type 与粗 owner kind 分别在 ProviderDocument/locator。视觉 part 的 `content_artifacts` 仅含 hash/size/media，使视觉内容进入 content hash；路径、raw JSON、表格 crop 不进入 payload。仅当同一不可变 PDF、同一 MinerU text bbox 中 native text 通过闭合规则证明是 MinerU 漏失的完整数字核心，或同样 source-bound 的窄 identifier 证明数字与至多一个开引号（v1），或恰好一处 `=` 与至少一个完整数字 atom（v2）同时漏失时，才允许把 native PDF text 投影为 payload并记录双侧 hash；其余空白逐字相等，只忽略实际删除的数字/`=` atom 位点所消费的 ASCII 空格/Tab。ProviderDocument 仍保留原 MinerU 文字。L1 不解析 grid、不修复 cell、不用 middle HTML 覆盖 content-list owner；table/native 数字序列异常只产生 `source_pdf_native_table_quality.v1` finding；source-only text omission 若至少漏一个完整数字 atom、又不满足 repair，只产生 `source_pdf_native_text_quality.v1/native_text_omission`；其 proof 只忽略处在矩形首尾或直接紧邻数字 atom 的单个 ASCII 空格/Tab atom，其他正文空白逐字一致。两者均置 `needs_review`，不改对应 payload |
 | content_hash / query_projection_hash / structure_hash | 三哈希分层（U2）；content 绑定 payload（含视觉内容 digest），query 绑定 title/heading/完整直接主题 routes/section routes/quality/applicability，structure 绑定 kind/path/order。locator/page/provider identity 不混入哈希，发布前由 fresh ProviderDocument admission + deterministic rebuild 精确复核；旧快照兼容 lead 只从 `semantic_keys[0]` 派生，不是现行 DB 列 |
 | quality_status | ok / needs_review / unusable（乱码率>30%） |
 | applicability | vc16 CHECK：applicable / not_applicable / NULL；只列化当前叶标题自有 selector，或第一个实质/视觉 part 之前 declaration-only leading part 的受控成对勾选。普通 paragraph 不因整句匹配变成标题或 prompt role；实质、visual/table carrier 之后以及嵌套 child 的 selector 不提升为整个 Unit 状态；不跨 Unit 继承（见 §5 讨论） |
 | page_no | Unit 本身首个 source block 的页码；完整 locator 的祖先标题证据可能在更早页 |
-| artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v9`：保留 v8 的 ProviderDocument hash、source heading block + payload ordinal、parts、逻辑表 owner/physical segment、evidence/search bindings、`continuation_fragments`、native-PDF reconciliation 与 quality findings，不凭普通 paragraph 的整句词面发明标题；只新增 finding-only 的完整 token omission、截断后仍至少两位的单数字末位截断和 cell-scoped 畸形数字分组证据，不改 payload。历史 v1-v8 继续按各自 vocabulary 只读；v7 可解码其历史 `statutory_template` placement，v8/v9 不发出，v8 也不得声明 v9 quality kind；v1-v3 不得声明 v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；上一页表尾 exact `page_footnote` 只可作为 physical boundary，下一页 leading footnote 仍阻断；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
+| artifact_locator | 新 writer 为闭合的 `provider_unit_locator.v9`；只有依赖 U+0000 标记（`provider_text_nul_substitution.v1`，每个 U+0000 一对一换成 U+FFFD）的 Unit 发出 `provider_unit_locator.v10`，即 v9 全部字段外加非空、不含正文的 `text_substitutions`（source index/payload ordinal、raw block hash、原/替换文本 hash、次数、policy），其余 Unit 与 v23 逐字节相同。v9：保留 v8 的 ProviderDocument hash、source heading block + payload ordinal、parts、逻辑表 owner/physical segment、evidence/search bindings、`continuation_fragments`、native-PDF reconciliation 与 quality findings，不凭普通 paragraph 的整句词面发明标题；只新增 finding-only 的完整 token omission、截断后仍至少两位的单数字末位截断和 cell-scoped 畸形数字分组证据，不改 payload。历史 v1-v8 继续按各自 vocabulary 只读；v7 可解码其历史 `statutory_template` placement，v8/v9 不发出，v8 也不得声明 v9 quality kind；v1-v3 不得声明 v4 才引入的 `unit_title_fragment` search destination，v1-v6 不得声明 v7 placement。跨页关系只接受 MinerU merge-on 的 typed owner/stub assertion；上一页表尾 exact `page_footnote` 只可作为 physical boundary，下一页 leading footnote 仍阻断；不按相似度猜、不复制 HTML、不存 raw JSON/path；JSONB(none_as_null) |
 
 ### classification_rule（0016，词表的库内查询副本）
 | 列 | 含义 |
@@ -111,6 +113,10 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 
 ### source_access / source_checkpoint / provider_category
 - source_access：每次 provider 访问一行（**失败也留痕**，含 profile 拉取失败）；query_params 已剔除凭据；error 结构化。下载成功快照中的 `result_snapshot.byte_count` 是归档实测字节数，与 `result_hash`/document raw hash 绑定，可作调度成本；provider 大小提示仍保留原值，不冒充实测字节。worker 捕获的同步失败另写 `cninfo:worker_sync_failure` 调度标记，保证失败公司冷却并移到未尝试公司之后。
+  - 索引快照（有候选时）另含 `identity_context{version, query_profile_org_id, query_profile_source_access_id, candidate_org_source}`，候选另含 `candidate_provider_org_id`（公告自身 orgId）；候选 `provider_org_id` 仍是查询 profile 的投影。
+  - 下载失败（0064 起的新行）：`error.failure_phase`、`query_params.index_source_access_id`、`result_snapshot.candidate_sha256` 与 `archive{archive_completed, raw_file_relpath, raw_file_hash, byte_count, raw_created}`；旧行不补写。
+  - `recovery_of_source_access_id`（0064，可空 FK→source_access RESTRICT）：只在成功的 `local:register_retained_pdf.v1` 回执上非空，指向它解决的那一条失败下载；部分唯一，一条失败至多一个回执。
+  - `local:historical_security_binding.v1`：历史证券具名绑定决定（`result_hash`=决定 sha256、`result_snapshot`=闭合决定、company=目标公司、security=历史 Security），决定 hash 部分唯一。
 - source_checkpoint：scope_key=`company_id:p_info3015`；cursor={window_end, window_start, synced_at}（后两个为审计字段，判定只用 window_end 与 updated_at）；每次 cursor update 必须同步刷新 updated_at，避免已同步公司永久 due。
 - provider_category：F006V 字典 2135 行（p_info3005 快照 seed）。
 
@@ -160,6 +166,10 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 
 ## 3.1 disclosure_ops 运维读面
 
+- `download_failure_resolution_v1`（0064）：每条 cninfo 失败下载的 `nonretryable` 与
+  `resolved_by_source_access_id`（唯一成功回执且其 Document 仍一致时才非空）。`pending_download_v1`、
+  dead-letter 计数、legacy 待下载路径与 doctor 共用它；失败行不删除、不改写。
+
 - `unit_build_terminal_v1`：只列**尚未被后续成功 Unit 代际修复**的 parse 成功但 Unit build 失败，
   或当前未被后续成功代际替代且语义裁决处于
   `degraded_unavailable` / `failed_closed` 的 run；保留 retryable、完整语义终态计数、v2 收据
@@ -178,12 +188,13 @@ seq 单调；event_kind 闭集（document_registered/observed、processing_run_c
 | 文件 | 内容 | 当前版本 |
 |---|---|---|
 | application/contracts/provider_document_envelope.py | 新 writer 的 canonical primary parse artifact codec；必须经独立 PDF 校验与 MinerU bundle 全量重读 admission，codec 本身不是 source trust boundary | provider_document.v1 |
-| application/contracts/provider_unit.py + application/services/provider_unit_builder.py | 闭合 Unit locator/search binding 与 deterministic coarse Unit 投影；不含业务 taxonomy、proof graph 或 cell repair | provider_unit.v23 |
+| application/contracts/provider_unit.py + application/services/provider_unit_builder.py | 闭合 Unit locator/search binding 与 deterministic coarse Unit 投影；不含业务 taxonomy、proof graph 或 cell repair | provider_unit.v24 |
 | application/contracts/normalized_ir_v4_evidence.py | 冻结历史 v4 evidence manifest 的最小只读 resolver；不得被新 writer import，也不支持 Build/Publish/Rebuild | normalized_ir.v4 read-only |
 | adapters/sources/cninfo/class_map.json | **统一 class 词表 31 类**（+correction_supplement 0127 更正件——edgartools amendments 对照；prefixes+priority+zh+std_refs；r6 financing +011711 担保/011713 财务资助、meeting_resolution +01239910；r7 equity_share_change +0115 父级实码） | 2026-07-r7 |
 | adapters/sources/cninfo/facet_map.json | F006V 维度判定（market 精确码/publisher 0101） | 2026-07-r1 |
 | adapters/sources/cninfo/filing_type_map.json | 无码通道标题关键词兜底（intermediary carrier 词最前，briefing/inquiry 在定期报告前）+ 65 个 title_topic 词补码盲区 + 18 个 title_noise hard pattern。r12 金融复核将 41 个事实 pattern 与 26 个待可靠去重 pattern 移出绝对门；r13 恢复 6 条自我标识副本/序次重复项；r14 补齐业绩预告与股权激励的标准公告标题；r15 在定期报告优先级之后补齐事件更正公告，使 Document filing scope 能约束 Unit semantic candidates且不把年度报告更正降成事件件 | 2026-08-r15 |
 | **config/processing_policy.json** | process 20 类=下载+解析；r4 将 equity_share_change 纳入以覆盖当前股数、流通/限售与未来解禁，register_only 11 类=只登记；carrier 类共码不放行，除非其自身在生效集合；按公司覆盖=watchlist process_classes | 2026-07-r4 |
+| application/contracts/mineru_capacity_config.py（capacity-config.json） | MinerU 显式容量：v1 为 N/P/F/H/窗口/线程/比例/锁 + B/L；v2 以嵌套结果存储策略（原生 D/H/P/C/M、单项许可与硬包络、分配单位、Mac 配额/W/J/解码时限、归档界、传输期限与进展窗）取代 B/L；数值由 root 选定，改值=新文件与新 SHA | mineru.capacity-config.v1 / v2（mineru.result-storage-policy.v1） |
 | config/watchlist.csv | 股票池导入/快照文件 + 按公司级联覆盖；运行时真源是 DB `tracked_company`。文件/库行数不等本身不是可自动 prune/import 的授权 | git 即版本 |
 
 运营者旋钮总索引：`config/README.md`（级联模型/命令速查/两类文件边界）。

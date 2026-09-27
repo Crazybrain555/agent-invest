@@ -17,8 +17,9 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
     MINERU_API_MAX_UNACKED_RESULT_BYTES,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig,
-    encode_mineru_capacity_config,
+    AnyMineruCapacityConfig,
+    MineruCapacityConfigV2,
+    encode_any_mineru_capacity_config,
 )
 
 RUNTIME_MANIFEST_CONTRACT = "mineru-runtime-bundle.v8"
@@ -306,7 +307,7 @@ def verify_runtime_manifest_payload(
     local_client_identity: MinerUClientIdentity,
     local_processing_window_size: int,
     local_writer_code_digest: str,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
 ) -> VerifiedMinerURuntimeManifest:
     if not isinstance(payload, dict):
         raise ValueError("runtime attestation root must be an object")
@@ -336,7 +337,7 @@ def verify_runtime_manifest_payload(
     ):
         raise ValueError("runtime explicit capacity selection disagrees with version")
     if expected_capacity is not None:
-        encode_mineru_capacity_config(expected_capacity)
+        encode_any_mineru_capacity_config(expected_capacity)
     local = manifest.get("client")
     orchestrator = manifest.get("orchestrator")
     inference_server = manifest.get("inference_server")
@@ -453,7 +454,7 @@ def _verify_orchestrator_manifest(
     *,
     expected_processing_window_size: int,
     contract_version: str,
-    expected_capacity: MineruCapacityConfig | None = None,
+    expected_capacity: AnyMineruCapacityConfig | None = None,
 ) -> None:
     _require_sha256(
         orchestrator.get("container_image_digest"),
@@ -557,23 +558,35 @@ def _verify_orchestrator_manifest(
         CPU_THREAD_RUNTIME_MANIFEST_CONTRACT,
         EXPLICIT_CAPACITY_RUNTIME_MANIFEST_CONTRACT,
     }:
-        staged_capacity = {
+        staged_capacity: dict[str, int | None] = {
             "task_registry_max_records": MINERU_API_TASK_REGISTRY_MAX_RECORDS,
             "task_result_reservation_bytes": MINERU_API_RESULT_RESERVATION_BYTES,
             "max_unacked_result_bytes": MINERU_API_MAX_UNACKED_RESULT_BYTES,
         }
-        if expected_capacity is not None:
+        if isinstance(expected_capacity, MineruCapacityConfigV2):
+            # A storage-managed runtime has no per-task B or aggregate L; its
+            # result storage policy is bound through the embedded capacity.
+            staged_capacity.update({
+                "task_result_reservation_bytes": None, "max_unacked_result_bytes": None,
+            })
+        elif expected_capacity is not None:
             staged_capacity.update({
                 "task_result_reservation_bytes": expected_capacity.result_reservation_bytes,
                 "max_unacked_result_bytes": expected_capacity.max_unacked_result_bytes,
             })
-        for field, expected in staged_capacity.items():
+        for field, expected_budget in staged_capacity.items():
             value = orchestrator.get(field)
-            if isinstance(value, bool) or value != expected or (
+            if expected_budget is None:
+                if value is not None:
+                    raise ValueError(
+                        f"runtime manifest orchestrator {field} must be null for result storage"
+                    )
+                continue
+            if isinstance(value, bool) or value != expected_budget or (
                 expected_capacity is not None and type(value) is not int
             ):
                 raise ValueError(
-                    f"runtime manifest orchestrator {field} must be {expected}"
+                    f"runtime manifest orchestrator {field} must be {expected_budget}"
                 )
     command = _verified_command(
         orchestrator.get("command"),

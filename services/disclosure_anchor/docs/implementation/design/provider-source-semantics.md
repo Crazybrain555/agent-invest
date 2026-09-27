@@ -18,14 +18,31 @@ the existing ordered repair/finding rules; it performs no IO and does not alter
 their thresholds, precedence or kind/version labels. Original raw blocks, hashes
 and artifact identities remain unchanged when the effective text is repaired.
 
+The same derivation then applies `provider_text_nul_substitution.v1`. PostgreSQL
+TEXT/JSONB cannot store U+0000 and the character the provider lost is unknown, so
+every U+0000 in a payload that no native repair replaced becomes one U+FFFD in the
+effective view, before any Unit hash. Each such payload has one
+`ProviderTextSubstitution` bound to the block's raw hash, both text hashes and the
+exact count; validation refuses a missing, extra, reordered or altered record, so
+the effective view never keeps an unrepaired U+0000. It is not a native repair: it
+cannot share a payload identity with a reconciliation (a repaired text that still
+holds U+0000 stays for the publication gate), and it may share one with a native
+quality finding. Native repairs and findings are still derived from the original
+provider text, so their evidence and scope are unchanged.
+
 `provider_unit_builder.py` has one private input and one build/replay implementation.
 Production entrypoints still require `AdmittedProviderDocument`; they now explicitly
 reject other runtime types before accessing properties. The separate source-only
 entrypoints require `ProviderSourceSemantics`, the pinned `ParserTargetIdentity`,
 and a canonical `semantic_record_sha256`. They validate the original provider
 content before using the effective view. Both replay routes retain source/digest,
-membership, ownership, destination and transform checks. Production Unit hashes,
-locator versions, conservation rules and quality predicates are unchanged.
+membership, ownership, destination and transform checks. Conservation rules and the
+existing quality predicates are unchanged. A Unit that depends on a U+0000 marker
+(its own blocks, heading chain or continuation fragments, exactly the reconciliation
+rule) carries it in `provider_unit_locator.v10`; every other Unit keeps its v9
+locator and hashes byte-identical. The marker sets `needs_review` only where its
+text is exposed in the title, heading path (so descendants of a marked heading) or
+payload; the builder proves that exposure equals the payloads it actually copied.
 
 The source-only builder digest is a caller-supplied reference in that interface,
 not proof that record bytes or a PDF were read. The bounded records and comparison
@@ -46,7 +63,10 @@ independently authored semantic and rejection cases cover the new entrypoints.
 canonical compact UTF-8 record of the source observation, parser target, original
 provider document, native observations, derived repairs and quality findings.
 `decode_source_semantic_record` validates source/page binding and freshly rederives
-the exact claims. The separately typed `parse_source_semantic_candidate` preserves
+the exact claims. U+0000 markers are a pure function of the recorded provider
+document, so the record stores no claim for them and its bytes are unchanged; the
+strict decoder rederives them into `DecodedSourceSemanticRecord.text_substitutions`
+and its `semantics`. The separately typed `parse_source_semantic_candidate` preserves
 structurally valid cross-source and derivation differences for diagnosis. It does
 not return the strict decoded type or expose admission authority. Both parsers
 reject malformed original content, unknown fields and loose scalar types.
@@ -54,7 +74,9 @@ reject malformed original content, unknown fields and loose scalar types.
 `source_semantic_build.py` defines `m6.source-semantic-build.v1`, containing the
 source-record hash, current builder version, explicitly empty hint arrays, complete
 build and ordered quality occurrences. Every Unit retains all fourteen current
-fields and the complete v9 locator. Decoding recomputes the three Unit hashes;
+fields and its complete current (v9, or v10 when it carries a U+0000 marker)
+locator. The builder version it pins is the current constant, so records built
+before `provider_unit.v24` must be regenerated. Decoding recomputes the three Unit hashes;
 it does not run private build validation or replace a divergent candidate with a
 fresh build. Correctly rehashed semantic mistakes therefore reach comparison.
 
@@ -69,7 +91,9 @@ the future runtime owner.
 ## Shared quality and complete comparison
 
 The builder and diagnostics use `services/provider_quality.py`. Existing encoded
-text and truncated-title predicates and their scope are unchanged. Occurrences
+text and truncated-title predicates and their scope are unchanged. A
+`text_substitution` occurrence names each exposed U+0000 marker by its text-free
+locator record. Occurrences
 preserve source-finding preimages, unbound table parts/reasons, encoded block
 identity, or heading occurrence/fragments. Identical evidence is deduplicated;
 different source occurrences remain distinct. Segment-only unassigned evidence
@@ -91,7 +115,7 @@ cannot act as their own oracle. It preserves candidate discrepancies and compare
 | logical table conservation | Ordered owner/continuation partitions and exact unbound reasons. |
 | retrieval target binding | Ordered bindings and actual source-scalar/destination-transform replays. |
 | repair binding | Fresh native derivation, source claims and dependent locator occurrences. |
-| finding binding | Fresh native derivation, source/locator findings, quality occurrences and Unit statuses. |
+| finding binding | Fresh native derivation, source/locator findings and U+0000 markers, quality occurrences and Unit statuses. |
 | reading order | Complete ordered Units, including payload, hashes and locators, plus unassigned parts. |
 | heading occurrence closure | Occurrence chains/fragments, titles and heading paths. |
 

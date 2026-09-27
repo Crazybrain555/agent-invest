@@ -227,6 +227,8 @@ def _compare_units(
     differences.compare("retrieval_target_binding", "ordered_bindings", tuple(u.locator.search_targets for u in units), tuple(u.locator.search_targets for u in reference_units))
     differences.compare("repair_binding", "locator_repairs", tuple(u.locator.source_text_reconciliations for u in units), tuple(u.locator.source_text_reconciliations for u in reference_units))
     differences.compare("finding_binding", "locator_findings", tuple(u.locator.source_quality_findings for u in units), tuple(u.locator.source_quality_findings for u in reference_units))
+    # U+0000 markers are review evidence, never native repairs.
+    differences.compare("finding_binding", "locator_text_substitutions", tuple(u.locator.text_substitutions for u in units), tuple(u.locator.text_substitutions for u in reference_units))
     if candidate_quality_occurrences is not None or reference_quality_occurrences is not None:
         differences.compare("finding_binding", "quality_occurrences", candidate_quality_occurrences, reference_quality_occurrences)
     differences.compare("finding_binding", "unit_quality", tuple(u.quality_status for u in units), tuple(u.quality_status for u in reference_units))
