@@ -982,15 +982,19 @@
   },
   "tests/unit/test_mineru_release_binding_independent.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 5
   },
   "tests/unit/test_mineru_release_compose_independent.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 11
   },
   "tests/unit/test_mineru_release_install_independent.py": {
    "private_imports": [],
    "tests": 5
+  },
+  "tests/unit/test_mineru_release_inference_recreate.py": {
+   "private_imports": [],
+   "tests": 3
   },
   "tests/unit/test_mineru_release_package_independent.py": {
    "private_imports": [],

@@ -12,6 +12,8 @@ param(
     [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [switch]$ReuseCurrentPublishedImage,
     [switch]$ApiOnlyCompatibilityUpgrade,
+    [switch]$InferenceRecreate,
+    [ValidateSet("", "cpu", "cuda0")][string]$ExpectedApiDeviceProfile = "",
     [ValidateSet("", "cpu", "cuda0")][string]$ApiDeviceProfile = "",
     [string]$CampaignApiCompatImageId = "",
     [ValidateSet(1)][int]$ExpectedApiTaskSlots = 1,
@@ -23,8 +25,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ($ReuseCurrentPublishedImage -and $ApiOnlyCompatibilityUpgrade) {
-    throw "API compatibility upgrade and published-image reuse are mutually exclusive"
+if (@(@($ReuseCurrentPublishedImage, $ApiOnlyCompatibilityUpgrade, $InferenceRecreate) | Where-Object { $_ }).Count -gt 1) {
+    throw "installation operation switches are mutually exclusive"
+}
+if ($InferenceRecreate -and ($ExpectedApiDeviceProfile -eq "" -or $ApiDeviceProfile -ne "")) {
+    throw "inference recreation requires an expected API device profile and forbids a transition"
+}
+if (-not $InferenceRecreate -and $ExpectedApiDeviceProfile -ne "") {
+    throw "expected API device profile is only valid for inference recreation"
 }
 $ApiOnlyOperation = $ReuseCurrentPublishedImage -or $ApiOnlyCompatibilityUpgrade
 $ExplicitCapacity = -not [string]::IsNullOrEmpty($CapacityConfigSource)
@@ -415,17 +423,17 @@ $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
 $ComposeBackup = "$ComposeTarget.pre-fixed-api-$Timestamp.bak"
 $CollectorBackup = "$CollectorTarget.pre-fixed-api-$Timestamp.bak"
 $ReceiptBackup = "$ReceiptTarget.pre-fixed-api-$Timestamp.bak"
-if ($ReuseCurrentPublishedImage) {
+if ($ReuseCurrentPublishedImage -or $InferenceRecreate) {
     if ($CampaignApiCompatImageId -notmatch '^sha256:[a-f0-9]{64}$') {
-        throw "reuse mode requires one canonical campaign API compatibility image ID"
+        throw "existing-image mode requires one canonical campaign API compatibility image ID"
     }
     if (-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
-        throw "reuse mode requires one complete existing deployment"
+        throw "existing-image mode requires one complete existing deployment"
     }
     $ExpectedApiCompatImageId = $CampaignApiCompatImageId
 }
 elseif (-not [string]::IsNullOrEmpty($CampaignApiCompatImageId)) {
-    throw "campaign API compatibility image ID is valid only in reuse mode"
+    throw "campaign API compatibility image ID is valid only in existing-image mode"
 }
 
 function Get-OptionalImageId {
@@ -486,6 +494,46 @@ function Get-StableServiceEpochs {
         }
     }
     return $result
+}
+
+function Get-MineruServiceEpochs {
+    $inspect = (Invoke-Docker -Arguments @("inspect", "mineru-api", "mineru-api-proxy", "mineru-openai-server")) | ConvertFrom-Json
+    if (@($inspect).Count -ne 3) { throw "inference recreation requires three inspectable services" }
+    $result = [ordered]@{}
+    foreach ($name in @("mineru-api", "mineru-api-proxy", "mineru-openai-server")) {
+        $matches = @($inspect | Where-Object { $_.Name -ceq "/$name" })
+        if ($matches.Count -ne 1) { throw "inference recreation service $name is not unique" }
+        $container = $matches[0]
+        if (-not [bool]$container.State.Running -or [string]$container.State.Health.Status -cne "healthy" -or
+            [int]$container.RestartCount -ne 0 -or [bool]$container.State.OOMKilled -or
+            [string]$container.Id -cnotmatch '^[a-f0-9]{64}$' -or
+            [string]$container.Image -cnotmatch '^sha256:[a-f0-9]{64}$' -or
+            [string]::IsNullOrWhiteSpace([string]$container.State.StartedAt)) {
+            throw "inference recreation service $name has an invalid epoch"
+        }
+        $result[$name] = [ordered]@{
+            container_id = [string]$container.Id; started_at = [string]$container.State.StartedAt
+            image_id = [string]$container.Image
+        }
+    }
+    return $result
+}
+
+function Assert-InferenceRecreateEpochs {
+    param([Parameter(Mandatory=$true)][object]$Before, [Parameter(Mandatory=$true)][object]$After)
+    foreach ($name in @("mineru-api", "mineru-api-proxy")) {
+        foreach ($field in @("container_id", "started_at", "image_id")) {
+            if ([string]$Before[$name][$field] -cne [string]$After[$name][$field]) {
+                throw "inference recreation changed $name $field"
+            }
+        }
+    }
+    $name = "mineru-openai-server"
+    if ([string]$Before[$name].image_id -cne [string]$After[$name].image_id -or
+        [string]$Before[$name].container_id -ceq [string]$After[$name].container_id -or
+        [string]$Before[$name].started_at -ceq [string]$After[$name].started_at) {
+        throw "inference recreation did not produce exactly the expected new inference epoch"
+    }
 }
 
 function Assert-StableServiceEpochs {
@@ -862,6 +910,14 @@ function Assert-ApiOnlyUpgradeInputs {
             (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash) {
         throw "API-only compatibility upgrade requires unchanged compose bytes"
     }
+}
+
+function Invoke-InferenceRecreate {
+    Invoke-Docker -Arguments @(
+        "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
+        "up", "--detach", "--no-build", "--no-deps", "--force-recreate",
+        "mineru-openai-server"
+    ) -TimeoutMilliseconds 900000 | Out-Null
 }
 
 function Invoke-ApiOnlyRecreate {
@@ -1394,7 +1450,7 @@ function Capture-OldRuntimeState {
             Assert-VllmIdle
         }
     }
-    if ($ApiOnlyOperation) {
+    if ($ApiOnlyOperation -or $InferenceRecreate) {
         $required = @("mineru-api", "mineru-api-proxy", "mineru-openai-server")
         if (
             (@($script:OldProjectContainers | Sort-Object) -join ",") -ne
@@ -1485,6 +1541,7 @@ function Get-ValidatedRuntime {
     }
     $api = $api[0]
     if ($ApiDeviceProfile -ne "") { Assert-ApiDeviceRuntime -Container $api -Profile $ApiDeviceProfile }
+    if ($InferenceRecreate) { Assert-ApiDeviceRuntime -Container $api -Profile $ExpectedApiDeviceProfile }
     $proxy = $proxy[0]
     $inference = $inference[0]
 
@@ -1805,6 +1862,50 @@ function Build-ValidatedApiCompatImage {
         -RequiredImageId $ExpectedApiCompatImageId -BuildIdentity $identity)
 }
 
+function Assert-InferenceRecreateInputs {
+    if (-not $ExplicitCapacity -or -not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
+        throw "inference recreation requires the existing explicit-capacity deployment"
+    }
+    foreach ($pair in @(@{source=$ComposeSource;target=$ComposeTarget}, @{source=$CollectorSource;target=$CollectorTarget})) {
+        $source = [IO.Path]::GetFullPath([string]$pair.source); $target = [IO.Path]::GetFullPath([string]$pair.target)
+        if ($source -ceq $target -or (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash -cne
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash) {
+            throw "inference recreation requires distinct, byte-identical staged and active files"
+        }
+    }
+    $candidate = Get-ResolvedCompose -Path $ComposeSource
+    $active = Get-ResolvedCompose -Path $ComposeTarget
+    Assert-CapacityCompose -Compose $candidate
+    Assert-CapacityCompose -Compose $active
+    if ([string]$candidate.services."mineru-openai-server".pull_policy -cne "never" -or
+        [string]$active.services."mineru-openai-server".pull_policy -cne "never") {
+        throw "inference recreation requires the pinned no-pull Compose policy"
+    }
+    if ((Get-CanonicalObjectJson $candidate) -cne (Get-CanonicalObjectJson $active)) {
+        throw "inference recreation resolved compose differs from active compose"
+    }
+    if ((Get-ApiDeviceProfile -Api $active.services."mineru-api") -cne $ExpectedApiDeviceProfile) {
+        throw "inference recreation API device profile differs from the active compose"
+    }
+    $receiptFile = Get-Item -LiteralPath $ReceiptTarget
+    if ($receiptFile.Length -lt 1 -or $receiptFile.Length -gt 4194304 -or
+        (($receiptFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "existing receipt is not a bounded regular file"
+    }
+    $receiptText = (New-Object Text.UTF8Encoding($false,$true)).GetString([IO.File]::ReadAllBytes($ReceiptTarget))
+    $receipt = $receiptText | ConvertFrom-Json
+    if ($receipt.schema -cne "mineru-windows-install-receipt.v2" -or -not [bool]$receipt.success -or
+        [string]$receipt.compose_sha256 -cne ("sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash.ToLowerInvariant()) -or
+        [string]$receipt.collector_sha256 -cne ("sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $CollectorTarget).Hash.ToLowerInvariant()) -or
+        [string]$receipt.api_compatibility_image.image_id -cne $CampaignApiCompatImageId) {
+        throw "inference recreation existing receipt identity differs"
+    }
+    $api = @(Invoke-Docker -Arguments @("inspect", "mineru-api") | ConvertFrom-Json)
+    if ($api.Count -ne 1 -or [string]$api[0].Image -cne $CampaignApiCompatImageId) {
+        throw "inference recreation running API image differs from existing receipt"
+    }
+}
+
 function Get-ValidatedPublishedApiCompatImage {
     $identity = Get-ApiCompatBuildIdentity
     $publishedImageId = Get-OptionalImageId -Reference $ApiCompatImage
@@ -2028,7 +2129,51 @@ try {
     }
 
     Capture-OldRuntimeState
-    if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
+    if ($InferenceRecreate) {
+        Assert-InferenceRecreateInputs
+        $compatImage = Get-ValidatedPublishedApiCompatImage
+        $PreDeploymentOutputState = Get-QuiescentOutputState -CandidateSource
+        $registryWitnessBefore = Get-RollbackRegistryWitness -State $PreDeploymentOutputState
+        $runtimeBefore = Get-ValidatedRuntime
+        Assert-VllmIdle
+        $beforeEpochs = Get-MineruServiceEpochs
+        $receiptSha = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ReceiptTarget).Hash.ToLowerInvariant()
+        $composeBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash
+        $collectorBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $CollectorTarget).Hash
+        Write-OperationRecord "installer-phase-preflight-complete.json" ([ordered]@{
+            phase = "preflight_complete"; operation_kind = "inference-recreate"
+            receipt_sha256 = $receiptSha; service_epochs_before = $beforeEpochs
+            registry_witness_before = $registryWitnessBefore; runtime_before = $runtimeBefore
+        })
+        Write-OperationRecord "installer-phase-mutation-started.json" ([ordered]@{
+            phase = "mutation_started"; operation_kind = "inference-recreate"
+        })
+        $MutationStarted = $true
+        $DeploymentAttempted = $true
+        Invoke-InferenceRecreate
+        $runtime = Get-ValidatedRuntime
+        Assert-VllmIdle
+        $afterEpochs = Get-MineruServiceEpochs
+        Assert-InferenceRecreateEpochs -Before $beforeEpochs -After $afterEpochs
+        Assert-RollbackRegistryUnchanged
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash -cne $composeBefore -or
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $CollectorTarget).Hash -cne $collectorBefore -or
+            ("sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ReceiptTarget).Hash.ToLowerInvariant()) -cne $receiptSha) {
+            throw "inference recreation changed the existing deployment files"
+        }
+        Write-OperationRecord "installer-result.json" ([ordered]@{
+            phase = "complete"; status = "pass"; first_error = $null
+            operation_kind = "inference-recreate"; receipt_sha256 = $receiptSha
+            compose_sha256 = "sha256:$($composeBefore.ToLowerInvariant())"
+            collector_sha256 = "sha256:$($collectorBefore.ToLowerInvariant())"
+            api_image_id = $compatImage.image_id
+            service_epochs_before = $beforeEpochs; service_epochs_after = $afterEpochs
+            registry_witness_before = $registryWitnessBefore
+            runtime_before = $runtimeBefore; runtime_after = $runtime
+        })
+    }
+    else {
+        if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
     foreach ($directory in @(
         (Split-Path -Parent $ComposeTarget), (Split-Path -Parent $CollectorTarget),
         (Split-Path -Parent $ReceiptTarget), $OutputRoot
@@ -2167,6 +2312,7 @@ try {
         api_image_id = $compatImage.image_id; receipt_sha256 = (Get-Sha256Text $receiptJson)
     })
     $receiptJson
+    }
 }
 catch {
     $originalError = $_.Exception.Message
@@ -2175,8 +2321,15 @@ catch {
     $outcomeUnknown = $originalError -like "native_outcome_unknown:*"
     Write-OperationRecord "installer-first-error.json" ([ordered]@{
         phase = "failed"; first_error = $originalError; mutation_started = [bool]$MutationStarted
-        deployment_attempted = [bool]$DeploymentAttempted; daemon_side_outcome = $(if ($outcomeUnknown) { "unknown" } else { "cli_observed" })
+        deployment_attempted = [bool]$DeploymentAttempted; daemon_side_outcome = $(if ($outcomeUnknown -or ($InferenceRecreate -and $MutationStarted)) { "unknown" } else { "cli_observed" })
     })
+    if ($InferenceRecreate -and $MutationStarted) {
+        Write-OperationRecord "installer-result.json" ([ordered]@{
+            phase = "reconciliation_required"; status = "unknown"; first_error = $originalError
+            operation_kind = "inference-recreate"; rollback = "not_attempted"
+        })
+        throw "inference recreation requires read-only reconciliation; no retry or rollback attempted: $originalError"
+    }
     if ($MutationStarted -and $outcomeUnknown) {
         Write-OperationRecord "installer-result.json" ([ordered]@{
             phase = "unknown"; status = "unknown"; first_error = $originalError; rollback = "not_attempted"

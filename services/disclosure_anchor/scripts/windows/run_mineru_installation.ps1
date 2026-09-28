@@ -31,7 +31,8 @@ $clock=[Diagnostics.Stopwatch]::StartNew()
 $lockStream=$null; $pins=[Collections.Generic.List[IO.FileStream]]::new()
 $firstError=$null; $status='failed'; $daemonSide='unknown'; $writePermission='closed'; $phase='start'
 $manifestSha=$null; $composeSha=$null; $capacitySha=$null; $accounting=$null; $installerResult=$null; $loaded=$null; $installerExit=$null; $recordsDir=$null
-$installationVerified=$false; $idleProofBefore=$null
+$installationVerified=$false; $idleProofBefore=$null; $operationKind="api-compatibility"
+$existingReceiptSha=$null; $epochsBefore=$null; $epochsAfter=$null
 function Fail([int]$Code,[string]$Message) { $script:ExitCode=$Code; throw $Message }
 function Get-Sha256File([string]$Path) { return 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
 function Get-Sha256Bytes([byte[]]$Bytes) { $a=[Security.Cryptography.SHA256]::Create(); try { return 'sha256:' + ([BitConverter]::ToString($a.ComputeHash($Bytes))).Replace('-','').ToLowerInvariant() } finally { $a.Dispose() } }
@@ -98,6 +99,36 @@ function Invoke-BoundedReadback([string]$FilePath,[string[]]$Arguments,[int]$Tim
         try { if (-not $p.HasExited) { $p.Kill(); [void]$p.WaitForExit(10000) } } catch { }
         throw
     } finally { $p.Dispose() }
+}
+
+function Read-MineruEpochs([string]$Docker) {
+    $probe=Invoke-BoundedReadback $Docker @('inspect','mineru-api','mineru-api-proxy','mineru-openai-server')
+    if ($probe.ExitCode -ne 0) { throw 'three-service epoch readback failed' }
+    $inspect=$probe.StandardOutput | ConvertFrom-Json
+    if (@($inspect).Count -ne 3) { throw 'three-service epoch readback is incomplete' }
+    $epochs=[ordered]@{}
+    foreach ($name in @('mineru-api','mineru-api-proxy','mineru-openai-server')) {
+        $matches=@($inspect | Where-Object { $_.Name -ceq ('/' + $name) })
+        if ($matches.Count -ne 1) { throw ('service epoch is not unique: ' + $name) }
+        $c=$matches[0]
+        if (-not [bool]$c.State.Running -or [string]$c.State.Health.Status -cne 'healthy' -or
+            [int]$c.RestartCount -ne 0 -or [bool]$c.State.OOMKilled -or
+            [string]$c.Id -cnotmatch '^[a-f0-9]{64}$' -or [string]$c.Image -cnotmatch '^sha256:[a-f0-9]{64}$' -or
+            [string]::IsNullOrWhiteSpace([string]$c.State.StartedAt)) { throw ('service epoch is invalid: ' + $name) }
+        $epochs[$name]=[ordered]@{container_id=[string]$c.Id;started_at=[string]$c.State.StartedAt;image_id=[string]$c.Image}
+    }
+    return $epochs
+}
+function Assert-InferenceEpochs($Before,$After) {
+    foreach ($name in @('mineru-api','mineru-api-proxy')) {
+        foreach ($field in @('container_id','started_at','image_id')) {
+            if ([string]$Before[$name][$field] -cne [string]$After[$name][$field]) { throw ('untargeted service epoch changed: ' + $name) }
+        }
+    }
+    $name='mineru-openai-server'
+    if ([string]$Before[$name].image_id -cne [string]$After[$name].image_id -or
+        [string]$Before[$name].container_id -ceq [string]$After[$name].container_id -or
+        [string]$Before[$name].started_at -ceq [string]$After[$name].started_at) { throw 'inference service epoch did not change exactly once' }
 }
 
 # Closed idle proof from the explicit-capacity health wire: legacy queued/processing gauges alone are not proof.
@@ -206,8 +237,13 @@ try {
 
     # ---- binding ----------------------------------------------------------------------------------
     $binding=ConvertFrom-StrictJson (Read-BoundedFile $InstallationBinding 65536)
-    Assert-Closed $binding @('contract_version','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256') 'installation binding'
-    if ($binding.contract_version -cne 'm6.installation-binding.v1') { Fail 64 'installation binding contract is unsupported' }
+    if ($binding.contract_version -ceq 'm6.installation-binding.v1') {
+        Assert-Closed $binding @('contract_version','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256') 'installation binding'
+    } elseif ($binding.contract_version -ceq 'm6.installation-binding.v2') {
+        Assert-Closed $binding @('contract_version','operation_kind','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256') 'installation binding'
+        if ($binding.operation_kind -isnot [string] -or $binding.operation_kind -cne 'inference-recreate') { Fail 64 'installation operation kind is unsupported' }
+        $operationKind='inference-recreate'
+    } else { Fail 64 'installation binding contract is unsupported' }
     if ([Environment]::MachineName -cne [string]$binding.expected_hostname) { Fail 65 'native host differs from the installation binding' }
     if ([string]$binding.api_device_profile -cnotin @('cpu','cuda0')) { Fail 64 'installation binding device profile is invalid' }
     foreach ($name in @('expected_active_compose_sha256','expected_previous_capacity_sha256')) {
@@ -250,6 +286,12 @@ try {
         $verified['api-context/capacity-config.json'] -cne [string]$manifest.api_build.capacity_config_sha256) { Fail 65 'release manifest identities disagree with its files' }
     $capacitySha=[string]$manifest.api_build.capacity_config_sha256
     $composeSha=[string]$manifest.projection.compose_sha256
+    if ($operationKind -ceq 'inference-recreate') {
+        if ([string]$binding.expected_active_compose_sha256 -cne $composeSha -or
+            [string]$binding.expected_previous_capacity_sha256 -cne $capacitySha) {
+            Fail 65 'inference recreation must bind the unchanged active compose and capacity'
+        }
+    }
 
     # ---- installation exclusivity: one lock handle next to the target compose ---------------------------
     $lockPath=$ComposeTarget + '.installation.lock'
@@ -276,6 +318,32 @@ try {
         if ([string]$h.status -cne 'healthy' -or [int]$h.queued_tasks -ne 0 -or [int]$h.processing_tasks -ne 0) { Fail 65 'pre-mutation API is not healthy and idle' }
         if ($null -ne $h.PSObject.Properties['capacity_observation']) { Fail 65 'API already runs an explicit capacity; the previous capacity identity must be supplied' }
         $idleProofBefore='legacy_gauges_only'
+    }
+
+    if ($operationKind -ceq 'inference-recreate') {
+        $collectorTarget='C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1'
+        $collectorSource=Join-Path $ReleaseRoot 'windows\collect_mineru_runtime.ps1'
+        if (-not (Test-Path -LiteralPath $collectorTarget -PathType Leaf) -or
+            (Get-Sha256File $collectorTarget) -cne (Get-Sha256File $collectorSource)) { Fail 65 'active collector differs from the release' }
+        if ((Get-Sha256File $ComposeTarget) -cne $composeSha) { Fail 65 'active compose differs from the release' }
+        # Keep the exact existing target files open for read across the Job: no owner may rewrite or replace them.
+        $null=Read-BoundedFile $ComposeTarget 8388608
+        $null=Read-BoundedFile $collectorTarget 8388608
+        if (-not (Test-Path -LiteralPath $ReceiptTarget -PathType Leaf)) { Fail 65 'existing install receipt is absent' }
+        $existingReceiptSha=Get-Sha256File $ReceiptTarget
+        $existingReceipt=ConvertFrom-StrictJson (Read-BoundedFile $ReceiptTarget 4194304)
+        if ([string]$existingReceipt.schema -cne 'mineru-windows-install-receipt.v2' -or
+            -not [bool]$existingReceipt.success -or
+            [string]$existingReceipt.compose_sha256 -cne $composeSha -or
+            [string]$existingReceipt.collector_sha256 -cne (Get-Sha256File $collectorTarget) -or
+            [string]$existingReceipt.api_compatibility_image.image_id -cnotmatch '^sha256:[a-f0-9]{64}$') {
+            Fail 65 'existing install receipt does not bind the active release'
+        }
+        $apiImage=Invoke-BoundedReadback $docker @('inspect','--format','{{.Image}}','mineru-api')
+        if ($apiImage.ExitCode -ne 0 -or $apiImage.StandardOutput.Trim() -cne [string]$existingReceipt.api_compatibility_image.image_id) {
+            Fail 65 'running API image differs from the existing receipt'
+        }
+        $epochsBefore=Read-MineruEpochs $docker
     }
 
     # ---- Job supervisor from packaged production sources (fresh csc child; no Add-Type) ---------------
@@ -306,11 +374,17 @@ try {
         OperationRecordDirectory=$recordsDir
         OperationBudgetSeconds=[string]$budgetSeconds
     }
+    if ($operationKind -ceq 'inference-recreate') {
+        $installerParameters.Remove('ApiOnlyCompatibilityUpgrade')
+        $installerParameters['InferenceRecreate']=$null
+        $installerParameters['ExpectedApiDeviceProfile']=[string]$binding.api_device_profile
+        $installerParameters['CampaignApiCompatImageId']=[string]$existingReceipt.api_compatibility_image.image_id
+    }
     # A release profile declares the desired device, not always a device transition.
     # A changed explicit capacity uses the existing capacity-only comparison, which
     # retains device and all non-capacity fields. Mixed device/capacity edits still fail.
-    if ($null -eq $binding.expected_previous_capacity_sha256 -or
-        [string]$binding.expected_previous_capacity_sha256 -ceq $capacitySha) {
+    if ($operationKind -cne 'inference-recreate' -and ($null -eq $binding.expected_previous_capacity_sha256 -or
+        [string]$binding.expected_previous_capacity_sha256 -ceq $capacitySha)) {
         $installerParameters['ApiDeviceProfile']=[string]$binding.api_device_profile
     }
     $installerArguments=@()
@@ -351,16 +425,32 @@ try {
         Fail 70 ('installer left no result record (child exit ' + $installerExit + ')')
     }
     $installerResult=ConvertFrom-StrictJson (Read-BoundedFile $resultPath 4194304)
+    if ($operationKind -ceq 'inference-recreate' -and [string]$installerResult.status -ceq 'pass' -and [string]$installerResult.operation_kind -cne $operationKind) {
+        $status='unknown'; Fail 70 'installer result operation kind differs from the binding'
+    }
     if ([string]$installerResult.status -cne 'pass') {
         $status=$(if ([string]$installerResult.status -ceq 'unknown') { 'unknown' } else { 'failed' })
         Fail 70 ('installer reported ' + [string]$installerResult.status + ': ' + [string]$installerResult.first_error)
     }
     if ($installerExit -ne 0) { $status='unknown'; Fail 70 ('installer result is pass but child exit is ' + $installerExit) }
     if (-not (Test-Path -LiteralPath $ReceiptTarget -PathType Leaf)) { $status='unknown'; Fail 70 'install receipt target is absent after a pass result' }
+    if ($operationKind -ceq 'inference-recreate') {
+        if ((Get-Sha256File $ReceiptTarget) -cne $existingReceiptSha -or
+            [string]$installerResult.receipt_sha256 -cne $existingReceiptSha) {
+            $status='unknown'; Fail 70 'inference recreation changed the existing install receipt'
+        }
+        $epochsAfter=Read-MineruEpochs $docker
+        try { Assert-InferenceEpochs $epochsBefore $epochsAfter }
+        catch { $status='unknown'; Fail 70 $_.Exception.Message }
+    }
     $receipt=ConvertFrom-StrictJson (Read-BoundedFile $ReceiptTarget 4194304)
     if ([string]$receipt.schema -cne 'mineru-windows-install-receipt.v2' -or -not [bool]$receipt.success -or
         [string]$receipt.compose_sha256 -cne $composeSha -or [string]$receipt.compose_sha256 -cne [string]$installerResult.compose_sha256) {
         $status='unknown'; Fail 70 'persisted install receipt does not bind the release compose'
+    }
+    if ($operationKind -ceq 'inference-recreate' -and
+        (Get-Sha256File 'C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1') -cne $verified['windows/collect_mineru_runtime.ps1']) {
+        $status='unknown'; Fail 70 'inference recreation changed the active collector'
     }
     $activeCompose=Get-Sha256File $ComposeTarget
     if ($activeCompose -cne $composeSha) { $status='unknown'; Fail 70 ('active compose after installation differs from the release: ' + $activeCompose) }
@@ -376,13 +466,19 @@ try {
     if ($ExitCode -eq 0) { $ExitCode=70 }
 } finally {
     $result=[ordered]@{
-        contract_version='m6.installation-operation.v1'; status=$status; first_error=$firstError; phase=$phase
+        contract_version=$(if ($operationKind -ceq 'inference-recreate') { 'm6.installation-operation.v2' } else { 'm6.installation-operation.v1' }); status=$status; first_error=$firstError; phase=$phase
         daemon_side_outcome=$daemonSide; write_permission=$writePermission; installation_verified=$installationVerified
         next_required=$(if ($installationVerified) { @('qualify','bind') } else { @('read_only_recovery_judgement') }); idle_proof_before=$idleProofBefore; exit_code=$ExitCode
         hostname=[Environment]::MachineName; release_root=$ReleaseRoot; release_manifest_sha256=$manifestSha
         installer_child_exit_code=$installerExit; job_accounting=$accounting; installer_result_status=$(if ($null -ne $installerResult) { [string]$installerResult.status } else { $null })
         compose_sha256=$(if ($null -ne $manifestSha) { $composeSha } else { $null }); elapsed_milliseconds=$clock.ElapsedMilliseconds
         finished_utc=[DateTime]::UtcNow.ToString('o')
+    }
+    if ($operationKind -ceq 'inference-recreate') {
+        $result['operation_kind']=$operationKind
+        $result['existing_receipt_sha256']=$existingReceiptSha
+        $result['service_epochs_before']=$epochsBefore
+        $result['service_epochs_after']=$epochsAfter
     }
     $json=$result | ConvertTo-Json -Compress -Depth 8
     $persisted=$false

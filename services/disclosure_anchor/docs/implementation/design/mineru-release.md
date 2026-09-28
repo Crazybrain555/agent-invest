@@ -36,6 +36,18 @@ C（在线 remote-wait 上限）的结构域是 P（`total_nonterminal_limit`）
 发布构建不加 `B×P<=L`；Mac 的 process profile 合同仍要求该关系，因此这类容量会在 `bind` 可见失败，
 `build/verify` 以 `local_profile_admits_full_pending=false` 提前提示。
 
+inference 的 GPU 显存预算只有一个意图输入：部署 profile 的
+`inference_declared_defaults.vllm_gpu_memory_utilization_millionths`（整数 millionths）。
+`mineru_release_plan.inference_command_argv()` 是 inference 完整 argv（entrypoint 在前）的唯一投影：Compose 生成、
+`verify` 对解析回读 Compose 的核对、`bind` 对 runtime bundle 命令的比对都要求与它逐项相等。值为 500000 时保持
+历史无 flag argv——MinerU 3.4.4 的 server 入口只在 argv 未给出该参数（精确参数或 `参数=值`）时追加 helper 默认值，
+在 >8 GiB 的 GPU 上即 0.5——既有 500000 发布的 Compose 与回执字节因此不变。其它值追加且只追加一次
+`--gpu-memory-utilization <整数>.<六位小数>`（400000 → `0.400000`）；缺失、重复、`=`/下划线别名、非规范写法、
+KV bytes/blocks 覆盖或其它附加参数都与投影不等而被拒绝。`bind` 由此只证明声明已进入 argv，不证明 engine
+实际生效值（vLLM `cache_config_info` 尚无 collector/attester 证据）。当前 attester 与 Windows 安装器（API-only
+升级守卫与部署后读回）仍只接受无 flag 的 inference argv，所以非 500000 预算的发布在 install/attest 处失败关闭，
+直至后续切片为它们接入同一投影与生效值证据。
+
 ## 3. 包布局与身份
 
 ```text
@@ -71,7 +83,8 @@ native-m6/{12 份生产 .cs, build_mineru_m6_owner.ps1, run_mineru_m6_owner_host
 4. `qualify`（须显式授权）：`mineru_smoke.py`（fixture）→ `freeze_mineru_campaign_epoch.py` →
    held-out 完整 PDF smoke（≥2 份，manifest 钉住 SHA 与页数）→ epoch after →
    `build_mineru_validation_receipt.py`。每步是自有的有界子进程；不拿 fresh/publication 信用。
-5. `bind`：从 runtime bundle + 容量 + 部署/本地 profile 构造 process profile v2；从实时 health/pressure
+5. `bind`：从 runtime bundle + 容量 + 部署/本地 profile 构造 process profile v2（bundle 的 inference 命令须与
+   发布投影逐项相等，见 §2）；从实时 health/pressure
    取 owner/cgroup 构造 activation；输出私有 overlay 片段（可选合并到 `--base-env`，基值不回显）。
 
 `install_mineru_fixed_api.ps1` 只改资源管理：`-OperationBudgetSeconds` 一个单调预算、逐命令剩余期限、

@@ -1704,7 +1704,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("[switch]$ApiOnlyCompatibilityUpgrade", installer)
         self.assertIn('[string]$CampaignApiCompatImageId = ""', installer)
         self.assertIn(
-            "reuse mode requires one canonical campaign API compatibility image ID",
+            "existing-image mode requires one canonical campaign API compatibility image ID",
             installer,
         )
         self.assertIn("function Get-StableServiceEpochs", installer)
@@ -1853,8 +1853,11 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn(reuse_selection, installer)
         # The API-only upgrade adds identity validation between old-image capture
         # and image build. Preserve published-image reuse as a separate mode.
-        self.assertIn("if ($ReuseCurrentPublishedImage -and $ApiOnlyCompatibilityUpgrade)", installer)
-        self.assertIn("API compatibility upgrade and published-image reuse are mutually exclusive", installer)
+        self.assertIn(
+            "if (@(@($ReuseCurrentPublishedImage, $ApiOnlyCompatibilityUpgrade, $InferenceRecreate) | Where-Object { $_ }).Count -gt 1)",
+            installer,
+        )
+        self.assertIn("installation operation switches are mutually exclusive", installer)
         self.assertIn("$ApiOnlyOperation = $ReuseCurrentPublishedImage -or $ApiOnlyCompatibilityUpgrade", installer)
         validation = installer[
             installer.index("function Assert-ApiOnlyUpgradeInputs") :
@@ -1862,9 +1865,14 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         ]
         self.assertIn("-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted", validation)
         self.assertIn("API-only compatibility upgrade requires unchanged compose bytes", validation)
+        legacy_start = installer.index(
+            "    else {\n        if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }",
+            installer.index("Capture-OldRuntimeState\n"),
+        )
+        legacy_mutation_start = installer.index("    $MutationStarted = $true", legacy_start)
         preparation = installer[
-            installer.index("    if ($ReuseCurrentPublishedImage) {", installer.index("Capture-OldRuntimeState\n")) :
-            installer.index("    $MutationStarted = $true")
+            installer.index("    if ($ReuseCurrentPublishedImage) {", legacy_start) :
+            legacy_mutation_start
         ]
         self.assertLess(
             preparation.index("published tag to match the current API image"),
@@ -1872,8 +1880,8 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         )
         self.assertIn("API image tag drifted before compatibility upgrade", preparation)
         deployment = installer[
-            installer.index("    $DeploymentAttempted = $true") :
-            installer.index("    $runtime = Get-ValidatedRuntime")
+            installer.index("    $DeploymentAttempted = $true", legacy_mutation_start) :
+            installer.index("    $runtime = Get-ValidatedRuntime", legacy_mutation_start)
         ]
         self.assertIn("if ($ApiOnlyOperation) {\n        Invoke-ApiOnlyRecreate", deployment)
         rollback = installer[
@@ -1886,7 +1894,7 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertIn("[string]$restored[0].Image -ne $OldApiCompatImageId", rollback)
         self.assertIn("API-only rollback did not restore the previous API image", rollback)
         self.assertLess(
-            installer.index("$MutationStarted = $true"),
+            legacy_mutation_start,
             installer.index('"tag", $ExpectedApiCompatImageId, $ApiCompatImage'),
         )
         self.assertIn('schema = "mineru-windows-install-receipt.v2"', installer)

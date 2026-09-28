@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from disclosure_anchor.application.contracts.closed_document import require_int
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
     AnyMineruCapacityConfig,
     MineruCapacityConfigV2,
@@ -31,6 +32,15 @@ CURRENT_RUNTIME_PROCESSING_WINDOW_SIZE = 16
 API_FIXED_ARGV = ("--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client")
 API_CONTAINER_OUTPUT_ROOT = "/var/lib/mineru-api-output"
 API_STOP_GRACE_SECONDS = 10
+INFERENCE_ENTRYPOINT = "mineru-openai-server"
+INFERENCE_FIXED_ARGV = ("--host", "0.0.0.0", "--port", "30000")
+GPU_MEMORY_UTILIZATION_OPTION = "--gpu-memory-utilization"
+# MinerU 3.4.4's server entry appends its helper fraction only when the argv
+# names none (exact option or ``option=value``); the helper yields 0.5 on a GPU
+# above 8 GiB. A release declaring exactly that value keeps the flagless argv
+# that existing packages and runtime receipts bind byte for byte; any other
+# declared value must be passed explicitly or the engine silently keeps 0.5.
+MINERU_HELPER_GPU_MEMORY_UTILIZATION_MILLIONTHS = 500_000
 PROXY_PROGRAM = (
     "import asyncio\n"
     "\n"
@@ -109,6 +119,34 @@ def api_command_argv(capacity: AnyMineruCapacityConfig) -> tuple[str, ...]:
     return API_FIXED_ARGV + capacity_http_arguments(capacity)
 
 
+def gpu_memory_utilization_argument(millionths: int) -> str:
+    """Render an integer millionths fraction as its exact six-decimal CLI value."""
+
+    require_int(millionths, label="vllm_gpu_memory_utilization_millionths", maximum=1_000_000)
+    whole, fraction = divmod(millionths, 1_000_000)
+    return f"{whole}.{fraction:06d}"
+
+
+def inference_command_argv(profile: MineruDeploymentProfile) -> tuple[str, ...]:
+    """Complete inference-server argv, entrypoint first, projected from the profile.
+
+    Compose generation, Compose verification and release binding all compare
+    against this one value. A declared GPU memory fraction other than the
+    MinerU helper default is appended once as its exact six-decimal value.
+    """
+
+    profile.__post_init__()
+    argv = (
+        INFERENCE_ENTRYPOINT, *INFERENCE_FIXED_ARGV,
+        "--max-num-seqs", str(profile.inference_max_num_seqs),
+        "--mm-processor-cache-gb", str(profile.inference_mm_processor_cache_gb),
+    )
+    millionths = profile.inference_declared_defaults.vllm_gpu_memory_utilization_millionths
+    if millionths == MINERU_HELPER_GPU_MEMORY_UTILIZATION_MILLIONTHS:
+        return argv
+    return (*argv, GPU_MEMORY_UTILIZATION_OPTION, gpu_memory_utilization_argument(millionths))
+
+
 def compose_document(profile: MineruDeploymentProfile, capacity: AnyMineruCapacityConfig) -> dict[str, Any]:
     """Structured Compose with every capacity consumer projected once."""
 
@@ -165,18 +203,15 @@ def compose_document(profile: MineruDeploymentProfile, capacity: AnyMineruCapaci
         },
         "networks": ["inference"],
     })
+    inference_argv = inference_command_argv(profile)
     inference: dict[str, Any] = {
         "image": profile.base_image_repo_digest,
         "pull_policy": "never",
         "container_name": "mineru-openai-server",
         "restart": "always",
         "environment": {"MINERU_MODEL_SOURCE": "local"},
-        "entrypoint": ["mineru-openai-server"],
-        "command": [
-            "--host", "0.0.0.0", "--port", "30000",
-            "--max-num-seqs", str(profile.inference_max_num_seqs),
-            "--mm-processor-cache-gb", str(profile.inference_mm_processor_cache_gb),
-        ],
+        "entrypoint": list(inference_argv[:1]),
+        "command": list(inference_argv[1:]),
         "ports": [{
             "name": "vllm-observability", "target": 30000, "host_ip": "127.0.0.1",
             "published": str(profile.vllm_observability_published_port), "protocol": "tcp",
@@ -356,7 +391,8 @@ def verify_compose_projection(
     mismatches: list[str] = []
     expected = compose_document(profile, capacity)
     if document != expected:
-        api = document.get("services", {}).get("mineru-api") if type(document.get("services")) is dict else None
+        services = document.get("services")
+        api = services.get("mineru-api") if type(services) is dict else None
         environment = api.get("environment") if type(api) is dict else None
         if type(environment) is not dict:
             mismatches.append("services.mineru-api.environment: missing")
@@ -373,8 +409,16 @@ def verify_compose_projection(
         command = api.get("command") if type(api) is dict else None
         if command != list(api_command_argv(capacity)):
             mismatches.append(f"services.mineru-api.command: {command!r} != {list(api_command_argv(capacity))!r}")
+        inference = services.get("mineru-openai-server") if type(services) is dict else None
+        argv = inference_command_argv(profile)
+        for field, projected in (("entrypoint", list(argv[:1])), ("command", list(argv[1:]))):
+            actual = inference.get(field) if type(inference) is dict else None
+            if actual != projected:
+                mismatches.append(f"services.mineru-openai-server.{field}: {actual!r} != {projected!r}")
         if not mismatches:
-            mismatches.append("compose document differs from the exact projection outside capacity fields")
+            mismatches.append(
+                "compose document differs from the exact projection outside capacity fields and the inference argv"
+            )
     return mismatches
 
 
@@ -416,6 +460,8 @@ __all__ = [
     "ReleasePlan",
     "api_command_argv",
     "compose_document",
+    "gpu_memory_utilization_argument",
+    "inference_command_argv",
     "parse_compose_yaml",
     "render_compose_yaml",
     "require_current_runtime_capabilities",

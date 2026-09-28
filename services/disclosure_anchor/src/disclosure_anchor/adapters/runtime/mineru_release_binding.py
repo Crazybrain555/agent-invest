@@ -40,6 +40,7 @@ from disclosure_anchor.adapters.runtime.mineru_release_package import (
     VerifyReport,
     write_new_json,
 )
+from disclosure_anchor.application.services.mineru_release_plan import inference_command_argv
 from disclosure_anchor.application.services.mineru_stream_policy import STREAM_POLICY_ALGORITHM_V2
 from disclosure_anchor.adapters.runtime.mineru_stream_activation import (
     load_mineru_stream_activation,
@@ -453,13 +454,6 @@ def _require_storage_ceilings(capacity: MineruCapacityConfigV2, ceilings: Any) -
         )
 
 
-def _command_option(command: list[Any], option: str) -> str:
-    for index, item in enumerate(command[:-1]):
-        if item == option and type(command[index + 1]) is str:
-            return command[index + 1]
-    raise ReleaseIdentityError(f"inference command lacks {option}")
-
-
 def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identity: str, live: LiveIdentity) -> MineruProcessProfile:
     capacity = report.inputs.capacity
     deployment = report.inputs.deployment_profile
@@ -479,13 +473,14 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
     registry_records = orchestrator.get("task_registry_max_records")
     if type(registry_records) is not int or registry_records <= capacity.total_nonterminal_limit:
         raise ReleaseIdentityError("runtime bundle task registry does not exceed the nonterminal depth")
+    # Exact equality with the release projection: a declared GPU fraction that
+    # never reached the argv cannot be bound. The effective engine value itself
+    # is not observed here.
     command = inference.get("command")
-    if type(command) is not list:
-        raise ReleaseIdentityError("runtime bundle inference command is missing")
-    max_num_seqs = int(_command_option(command, "--max-num-seqs"))
-    cache_gb = int(_command_option(command, "--mm-processor-cache-gb"))
-    if max_num_seqs != deployment.inference_max_num_seqs or cache_gb != deployment.inference_mm_processor_cache_gb:
-        raise ReleaseIdentityError("runtime bundle inference command differs from the deployment profile")
+    if command != list(inference_command_argv(deployment)):
+        raise ReleaseIdentityError(
+            "runtime bundle inference command is not the release projection of the deployment profile"
+        )
     memory_limit = deployment.api_memory_limit_bytes
     if memory_limit is None:
         raise ReleaseIdentityError("binding requires an explicit API memory limit in the deployment profile")
@@ -522,13 +517,13 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
         effective_hybrid_batch_ratio=effective_ratio,
         hybrid_ocr_override=ceilings.hybrid_ocr_override,
         inference_concurrency=capacity.final_http_limit_per_loop,
-        vllm_max_num_seqs=max_num_seqs,
+        vllm_max_num_seqs=deployment.inference_max_num_seqs,
         vllm_max_model_len=int(inference["max_model_len"]),
         vllm_max_num_batched_tokens=None,
         vllm_gpu_memory_utilization_millionths=declared.vllm_gpu_memory_utilization_millionths,
         vllm_tensor_parallel_size=declared.vllm_tensor_parallel_size,
         vllm_pipeline_parallel_size=declared.vllm_pipeline_parallel_size,
-        vllm_mm_processor_cache_bytes=cache_gb * (1 << 30),
+        vllm_mm_processor_cache_bytes=deployment.inference_mm_processor_cache_gb * (1 << 30),
         vllm_enforce_eager=declared.vllm_enforce_eager,
         vllm_enable_prefix_caching=declared.vllm_enable_prefix_caching,
         pipeline_inference_locks=capacity.pipeline_inference_locks,

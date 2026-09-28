@@ -243,6 +243,18 @@ compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurren
 `up --detach --no-build --no-deps --force-recreate mineru-api`。回滚通过上述 witness 检查后才恢复
 旧 tag 与文件，再重建 API、验证旧 API image、健康状态以及推理服务/代理的原 ID、image、started_at。
 机器断线或监督进程超时仍须核对 daemon 状态；不能把客户端退出当作完成回滚。
+
+如需对**同一配置**做一次推理服务重建以区分 warm residency，使用正式 release owner 的
+`python -m disclosure_anchor.cli.mineru_release install --operation-kind inference-recreate --package <verified-package> --private-binding <unchanged-binding> --output <new-operation-dir>`。
+此操作要求发布包的 compose、容量、collector 和已安装 target 字节相同，现有 receipt 与 API image/context
+仍匹配，三服务健康且 API/vLLM 空闲，并继续持有 Mac 排他锁及 Windows 安装锁/有限 Job。
+安装器只向 Docker 发一次
+`compose --project-name mineru-tailnet --file <active-compose> up --detach --no-build --no-deps --force-recreate mineru-openai-server`；
+它不复制 compose/collector、不重写旧 receipt、不重建 API，也不重建 proxy。
+操作记录保存旧 receipt 哈希、三服务前后 epoch 和输出根/registry witness；成功须证明 API/proxy epoch
+不变、推理 epoch 改变、全部 runtime 与空闲检查通过。任何可能已发出重建请求后的失败都保留原始错误和
+现场，标为需只读核对；**不得自动再执行一次相同重建，也不得把重复重建称为恢复旧 epoch**。
+新推理 epoch 使先前资格失效，必须重新完成相应 qualification/bind；此命令不会开启 producer 或消费验证额度。
 完整项目安装模式保留给明确授权的初装或拓扑变更，不能借 dry-run 代替此 API 单独升级边界。
 以上 compose 字节不变要求描述默认兼容层升级。已显式选择容量配置时，容量参数变化以及
 `-ApiDeviceProfile cpu|cuda0` 的设备变化分别遵循

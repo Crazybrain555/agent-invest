@@ -34,6 +34,23 @@ DEPLOYMENT = {
 }
 API_ARGV = ["--host", "0.0.0.0", "--port", "8000",
             "--allow-public-http-client", "--max-concurrency", "18"]
+LEGACY_INFERENCE_ARGV = ["mineru-openai-server", "--host", "0.0.0.0", "--port", "30000",
+                         "--max-num-seqs", "128", "--mm-processor-cache-gb", "0"]
+# Literal flagless inference block of the Compose bytes a 500000 release binds.
+LEGACY_INFERENCE_YAML = b"""\
+    entrypoint:
+      - "mineru-openai-server"
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "30000"
+      - "--max-num-seqs"
+      - "128"
+      - "--mm-processor-cache-gb"
+      - "0"
+    ports:
+"""
 
 
 def _wire(value):
@@ -53,6 +70,11 @@ class MineruReleaseComposeIndependentTests(unittest.TestCase):
 
     def document(self, capacity=None):
         return self.plan.compose_document(self.deployment, capacity or self.capacity)
+
+    def with_fraction(self, millionths):
+        value = deepcopy(DEPLOYMENT)
+        value["inference_declared_defaults"]["vllm_gpu_memory_utilization_millionths"] = millionths
+        return self.contract.decode_mineru_deployment_profile(_wire(value))
 
     def assert_refused(self, document):
         try:
@@ -116,6 +138,75 @@ class MineruReleaseComposeIndependentTests(unittest.TestCase):
         document = self.document()
         document["services"]["mineru-api"]["environment"]["MINERU_CAPACITY_OTHER"] = "1"
         self.assert_refused(document)
+
+    def test_declared_gpu_fraction_is_projected_once_with_exact_six_decimals(self):
+        for millionths, literal in ((400000, "0.400000"), (900000, "0.900000"), (123457, "0.123457"),
+                                    (1, "0.000001"), (1000000, "1.000000")):
+            with self.subTest(millionths=millionths):
+                profile = self.with_fraction(millionths)
+                raw = self.plan.render_compose_yaml(self.plan.compose_document(profile, self.capacity))
+                parsed = self.plan.parse_compose_yaml(raw)
+                inference = parsed["services"]["mineru-openai-server"]
+                self.assertEqual(inference["entrypoint"] + inference["command"],
+                                 LEGACY_INFERENCE_ARGV + ["--gpu-memory-utilization", literal])
+                self.assertEqual(self.plan.verify_compose_projection(parsed, self.capacity, profile), [])
+        # The budget is the only moving part: every other field of every service is unchanged.
+        legacy = self.plan.compose_document(self.with_fraction(500000), self.capacity)
+        budget = self.plan.compose_document(self.with_fraction(400000), self.capacity)
+        self.assertNotEqual(self.plan.render_compose_yaml(budget), self.plan.render_compose_yaml(legacy))
+        budget_command = budget["services"]["mineru-openai-server"].pop("command")
+        legacy_command = legacy["services"]["mineru-openai-server"].pop("command")
+        self.assertEqual(budget, legacy)
+        self.assertEqual(budget_command, legacy_command + ["--gpu-memory-utilization", "0.400000"])
+
+    def test_mineru_helper_default_fraction_keeps_the_flagless_legacy_bytes(self):
+        raw = self.plan.render_compose_yaml(self.plan.compose_document(self.with_fraction(500000), self.capacity))
+        self.assertIn(LEGACY_INFERENCE_YAML, raw)
+        self.assertNotIn(b"gpu-memory-utilization", raw)
+        self.assertNotIn(b"gpu_memory_utilization", raw)
+        inference = self.plan.parse_compose_yaml(raw)["services"]["mineru-openai-server"]
+        self.assertEqual(inference["entrypoint"] + inference["command"], LEGACY_INFERENCE_ARGV)
+
+    def test_missing_duplicate_alias_or_overriding_gpu_argument_is_refused(self):
+        flagless = LEGACY_INFERENCE_ARGV[1:]
+        explicit = flagless + ["--gpu-memory-utilization", "0.400000"]
+        cases = {
+            400000: (
+                flagless,  # the declared budget never reaches the engine
+                flagless + ["--gpu-memory-utilization", "0.500000"],
+                flagless + ["--gpu-memory-utilization", "0.4"],
+                flagless + ["--gpu-memory-utilization=0.400000"],
+                flagless + ["--gpu_memory_utilization", "0.400000"],
+                explicit + ["--gpu-memory-utilization", "0.400000"],
+                explicit + ["--gpu-memory-utilization", "0.5"],
+                explicit + ["--kv-cache-memory-bytes", "4294967296"],
+                explicit + ["--num-gpu-blocks-override", "4096"],
+                explicit + ["--config", "/tmp/engine.yaml"],
+            ),
+            500000: (
+                flagless + ["--gpu-memory-utilization", "0.500000"],
+                flagless + ["--gpu-memory-utilization", "0.400000"],
+                flagless + ["--gpu_memory_utilization", "0.4"],
+            ),
+        }
+        for millionths, commands in cases.items():
+            profile = self.with_fraction(millionths)
+            for command in commands:
+                with self.subTest(millionths=millionths, command=command):
+                    document = self.plan.compose_document(profile, self.capacity)
+                    document["services"]["mineru-openai-server"]["command"] = command
+                    differences = self.plan.verify_compose_projection(document, self.capacity, profile)
+                    self.assertTrue(any(item.startswith("services.mineru-openai-server.command:")
+                                        for item in differences), differences)
+        # Moving the entrypoint into the command keeps the concatenation, not the projection.
+        profile = self.with_fraction(400000)
+        document = self.plan.compose_document(profile, self.capacity)
+        inference = document["services"]["mineru-openai-server"]
+        inference["command"] = inference.pop("entrypoint") + inference["command"]
+        self.assertTrue(self.plan.verify_compose_projection(document, self.capacity, profile))
+        for value in (True, 0, -1, 1000001, 0.4, "400000", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.plan.gpu_memory_utilization_argument(value)
 
     def test_compose_cannot_override_image_baked_capacity_anchors(self):
         for key, value in (("MINERU_CAPACITY_CONFIG_SHA256", "sha256:" + "f" * 64),

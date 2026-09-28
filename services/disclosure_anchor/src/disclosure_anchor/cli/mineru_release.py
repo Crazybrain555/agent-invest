@@ -133,7 +133,10 @@ def cmd_install(args: argparse.Namespace) -> int:
     if not report.passed:
         return _fail(EX_IDENTITY, "package", "release package did not verify", **_verify_summary(report))
     binding = load_release_private_binding(args.private_binding)
-    summary = install_release(report=report, package=args.package, binding=binding, output=args.output)
+    summary = install_release(
+        report=report, package=args.package, binding=binding, output=args.output,
+        operation_kind=args.operation_kind,
+    )
     _emit({**summary, "output": str(args.output)})
     return EX_OK if summary["status"] == "pass" else EX_FAILURE
 
@@ -179,6 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--package", type=_absolute, required=True)
     install.add_argument("--private-binding", type=_absolute, required=True)
     install.add_argument("--output", type=_absolute, required=True)
+    install.add_argument(
+        "--operation-kind", choices=("api-compatibility", "inference-recreate"),
+        default="api-compatibility",
+    )
     install.set_defaults(handler=cmd_install)
     return parser
 

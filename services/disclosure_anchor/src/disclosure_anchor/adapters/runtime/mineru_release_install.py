@@ -43,7 +43,11 @@ from disclosure_anchor.application.contracts.strict_json import strict_json_load
 
 
 INSTALLATION_BINDING_CONTRACT = "m6.installation-binding.v1"
+INSTALLATION_BINDING_CONTRACT_V2 = "m6.installation-binding.v2"
 INSTALL_RESULT_CONTRACT = "m6.release-install-result.v1"
+INSTALL_RESULT_CONTRACT_V2 = "m6.release-install-result.v2"
+API_COMPATIBILITY = "api-compatibility"
+INFERENCE_RECREATE = "inference-recreate"
 _STAGE_TIMEOUT_SECONDS = 600
 _FETCH_TIMEOUT_SECONDS = 300
 _LAUNCHCTL_TIMEOUT_SECONDS = 30
@@ -230,10 +234,18 @@ def read_idle_health(
     return health, raw, "legacy_gauges_only"
 
 
-def installation_binding_document(binding: ReleasePrivateBinding, *, api_device_profile: str, exclusivity_sha256: str) -> dict[str, Any]:
+def installation_binding_document(
+    binding: ReleasePrivateBinding, *, api_device_profile: str,
+    exclusivity_sha256: str, operation_kind: str = API_COMPATIBILITY,
+) -> dict[str, Any]:
+    if operation_kind not in (API_COMPATIBILITY, INFERENCE_RECREATE):
+        raise ReleaseInputError("installation operation kind is unsupported")
     windows = binding.windows
-    return {
-        "contract_version": INSTALLATION_BINDING_CONTRACT,
+    document = {
+        "contract_version": (
+            INSTALLATION_BINDING_CONTRACT_V2 if operation_kind == INFERENCE_RECREATE
+            else INSTALLATION_BINDING_CONTRACT
+        ),
         "expected_hostname": windows.hostname,
         "api_device_profile": api_device_profile,
         "expected_active_compose_sha256": windows.expected_active_compose_sha256,
@@ -242,6 +254,9 @@ def installation_binding_document(binding: ReleasePrivateBinding, *, api_device_
         "job_cleanup_milliseconds": windows.job_cleanup_milliseconds,
         "mac_exclusivity_receipt_sha256": exclusivity_sha256,
     }
+    if operation_kind == INFERENCE_RECREATE:
+        document["operation_kind"] = operation_kind
+    return document
 
 
 def stage_batch(report: VerifyReport, package: Path, remote_root: PureWindowsPath, binding_local: Path, binding_remote_dir: PureWindowsPath) -> str:
@@ -257,12 +272,24 @@ def stage_batch(report: VerifyReport, package: Path, remote_root: PureWindowsPat
     return "\n".join(lines) + "\n"
 
 
-def install_release(*, report: VerifyReport, package: Path, binding: ReleasePrivateBinding, output: Path) -> dict[str, Any]:
+def install_release(
+    *, report: VerifyReport, package: Path, binding: ReleasePrivateBinding,
+    output: Path, operation_kind: str = API_COMPATIBILITY,
+) -> dict[str, Any]:
+    if operation_kind not in (API_COMPATIBILITY, INFERENCE_RECREATE):
+        raise ReleaseInputError("installation operation kind is unsupported")
     if not output.is_absolute() or output.exists() or output.is_symlink() or not output.parent.is_dir():
         raise ReleaseInputError("install output must be a new absolute directory under an existing parent")
     if not report.passed:
         raise ReleaseIdentityError("release package did not verify; refusing to install")
     manifest = report.manifest
+    if operation_kind == INFERENCE_RECREATE and (
+        binding.windows.expected_active_compose_sha256 != manifest.projection["compose_sha256"]
+        or binding.windows.expected_previous_capacity_sha256 != report.inputs.capacity.sha256
+    ):
+        raise ReleaseIdentityError(
+            "inference recreation requires the already active release compose and capacity"
+        )
     output.mkdir(mode=0o700)
     started = datetime.now(UTC).isoformat(timespec="seconds")
     lock = acquire_exclusivity(binding.mac_exclusive_lock_path, holder={
@@ -305,7 +332,7 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
         remote = {"release_root": str(remote_root), "binding_dir": str(remote_binding_dir), "operation_dir": str(remote_operation)}
         install_binding = installation_binding_document(
             binding, api_device_profile=report.inputs.deployment_profile.api_device_profile,
-            exclusivity_sha256=sha256_of(exclusivity_raw),
+            exclusivity_sha256=sha256_of(exclusivity_raw), operation_kind=operation_kind,
         )
         binding_local = output / "installation-binding.json"
         write_new_exact(binding_local, canonical_bytes(install_binding) + b"\n")
@@ -353,7 +380,13 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
         else:
             daemon_side = str(operation.get("daemon_side_outcome", "unknown"))
             remote_status = operation.get("status")
-            if remote_status == "pass" and wrapper_exit == 0 and daemon_side == "verified":
+            if operation_kind == INFERENCE_RECREATE and (
+                operation.get("contract_version") != "m6.installation-operation.v2"
+                or operation.get("operation_kind") != INFERENCE_RECREATE
+            ):
+                status = "unknown"
+                failure = failure or "Windows inference-recreate result did not bind the requested operation"
+            elif remote_status == "pass" and wrapper_exit == 0 and daemon_side == "verified":
                 health_after, health_after_raw, _ = read_idle_health(
                     binding.api_url, expected_capacity=report.inputs.capacity,
                     task_retention_seconds=deployment.api_task_retention_seconds,
@@ -374,7 +407,10 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
     finally:
         lock.release()
     summary = {
-        "contract_version": INSTALL_RESULT_CONTRACT,
+        "contract_version": (
+            INSTALL_RESULT_CONTRACT_V2 if operation_kind == INFERENCE_RECREATE
+            else INSTALL_RESULT_CONTRACT
+        ),
         "status": status,
         "first_error": failure,
         "daemon_side_outcome": daemon_side,
@@ -390,13 +426,19 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
         "started_utc": started,
         "finished_utc": datetime.now(UTC).isoformat(timespec="seconds"),
     }
+    if operation_kind == INFERENCE_RECREATE:
+        summary["operation_kind"] = operation_kind
     write_new_json(output / "install-result.json", summary)
     return summary
 
 
 __all__ = [
     "INSTALLATION_BINDING_CONTRACT",
+    "INSTALLATION_BINDING_CONTRACT_V2",
     "INSTALL_RESULT_CONTRACT",
+    "INSTALL_RESULT_CONTRACT_V2",
+    "API_COMPATIBILITY",
+    "INFERENCE_RECREATE",
     "InstallationOutcomeUnknown",
     "acquire_exclusivity",
     "assert_launchd_jobs_unloaded",
