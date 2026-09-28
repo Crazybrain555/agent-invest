@@ -84,6 +84,124 @@ class StagedParseStreamAdmissionTests(unittest.TestCase):
         thread.start()
         return thread, results, errors
 
+    def test_one_shot_waits_for_fresh_cold_recovery_before_source_scan(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def tick(self) -> float:
+                self.now += 1.0
+                return self.now
+
+        class FreshPressure:
+            sequence = 0
+
+            def latest(self):
+                self.sequence += 1
+                return sample(self.sequence, clock.now)
+
+        clock = Clock()
+        backend = _Backend(new=(_work("attempt-cold", "prepared"),))
+        snapshots: list[CoordinatorSnapshot] = []
+
+        def progress(snapshot: CoordinatorSnapshot) -> None:
+            snapshots.append(snapshot)
+            if snapshot.stream_target == 0:
+                self.assertFalse(any(call.startswith("admit:") for call in backend.calls))
+
+        result = StagedParseCoordinator(
+            backend=backend, limits=_limits(), progress=progress,
+            stream_control=StreamAdmissionControl(
+                MineruStreamPolicy(config(qualified_max=1)), FreshPressure(),
+                monotonic=clock.tick,
+            ),
+        ).run(wait_for_stream_admission=True)
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual((result.admitted, result.completed), (1, 1))
+        self.assertTrue(any(s.stream_target == 0 and s.blocked_reason == "stream_pause:recovery" for s in snapshots))
+        self.assertTrue(any(s.stream_target == 1 for s in snapshots))
+        self.assertTrue(any(call.startswith("admit:") for call in backend.calls))
+
+    def test_one_shot_pause_obeys_stop_before_recovery(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def tick(self) -> float:
+                self.now += 1.0
+                return self.now
+
+        class FreshPressure:
+            sequence = 0
+
+            def latest(self):
+                self.sequence += 1
+                return sample(self.sequence, clock.now)
+
+        clock = Clock()
+        backend = _Backend(new=(_work("attempt-pending", "prepared"),))
+        snapshots: list[CoordinatorSnapshot] = []
+        deadline = 4.0
+
+        result = StagedParseCoordinator(
+            backend=backend, limits=_limits(), progress=snapshots.append,
+            stream_control=StreamAdmissionControl(
+                MineruStreamPolicy(config(qualified_max=1)), FreshPressure(),
+                monotonic=clock.tick,
+            ),
+        ).run(stop_requested=lambda: clock.now >= deadline, wait_for_stream_admission=True)
+        self.assertGreaterEqual(clock.now, deadline)
+        self.assertLess(clock.now, 11.0)
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(result.admitted, 0)
+        self.assertEqual(len(backend.new), 1)
+        self.assertFalse(any(call.startswith("admit:") for call in backend.calls))
+
+    def test_one_shot_unsafe_pressure_still_stops_without_admission(self) -> None:
+        backend = _Backend(new=(_work("attempt-pending", "prepared"),))
+        result = StagedParseCoordinator(
+            backend=backend, limits=_limits(),
+            stream_control=control(Pressure(sample(1, 10, unsafe_reason="identity_drift"))),
+        ).run(wait_for_stream_admission=True)
+        self.assertEqual(result.terminal, CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
+        self.assertEqual(result.admitted, 0)
+        self.assertFalse(any(call.startswith("admit:") for call in backend.calls))
+
+    def test_default_run_keeps_idle_quiescence_during_cold_pause(self) -> None:
+        backend = _Backend(new=(_work("attempt-pending", "prepared"),))
+        result = StagedParseCoordinator(
+            backend=backend, limits=_limits(),
+            stream_control=control(Pressure(sample(1, 10))),
+        ).run()
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual(result.admitted, 0)
+        self.assertFalse(any(call.startswith("admit:") for call in backend.calls))
+
+    def test_one_shot_exhausted_scope_finishes_after_pressure_drops(self) -> None:
+        held, pressure, following = warmed(maximum=1)
+
+        class DropAfterAck(_Backend):
+            def acknowledge(self, work: CoordinatorWork, *, stage_guard: StageLeaseGuard) -> CoordinatorWork:
+                result = super().acknowledge(work, stage_guard=stage_guard)
+                pressure.value = successor(following, host_available_bytes=0)
+                return result
+
+        backend = DropAfterAck(new=(_work("attempt-only", "prepared"),))
+        snapshots: list[CoordinatorSnapshot] = []
+        forced_stop = threading.Event()
+
+        def progress(snapshot: CoordinatorSnapshot) -> None:
+            snapshots.append(snapshot)
+            if sum(s.stream_reason == "memory_pause" for s in snapshots) >= 2:
+                forced_stop.set()
+
+        result = StagedParseCoordinator(
+            backend=backend, limits=_limits(), stream_control=held,
+            progress=progress,
+        ).run(stop_requested=forced_stop.is_set, wait_for_stream_admission=True)
+        self.assertFalse(forced_stop.is_set())
+        self.assertEqual(result.terminal, CoordinatorTerminal.QUIESCENT)
+        self.assertEqual((result.admitted, result.completed), (1, 1))
+        self.assertTrue(any(s.stream_target == 0 and s.stream_reason == "memory_pause" for s in snapshots))
+
     def test_one_durable_plus_one_provisional_remote_wait_fills_target(self) -> None:
         backend = _HeldPreflightBackend(recoverable=(
             _work("attempt-a-durable", "submitted", 2),

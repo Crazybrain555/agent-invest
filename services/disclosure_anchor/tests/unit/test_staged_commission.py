@@ -131,6 +131,7 @@ class StagedCommissionTests(unittest.TestCase):
                 self.assertEqual(build.call_args.kwargs["admission_document_ids"], ("chosen",))
                 runtime.verify_startup.assert_called_once_with()
                 runtime.coordinator.run.assert_called_once()
+                self.assertIs(runtime.coordinator.run.call_args.kwargs["wait_for_stream_admission"], True)
                 runtime.close.assert_called_once_with()
                 lock_engine.dispose.assert_called_once_with()
 

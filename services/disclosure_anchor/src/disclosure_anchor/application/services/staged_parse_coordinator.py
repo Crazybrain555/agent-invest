@@ -1104,6 +1104,7 @@ class StagedParseCoordinator:
         self,
         *,
         stop_requested: Callable[[], bool] = lambda: False,
+        wait_for_stream_admission: bool = False,
     ) -> CoordinatorResult:
         queues = {lane: deque[CoordinatorWork]() for lane in CoordinatorLane}
         retry_at: dict[str, tuple[float, CoordinatorWork]] = {}
@@ -1124,6 +1125,7 @@ class StagedParseCoordinator:
         admission_open = False
         admission_blocked_dimensions: tuple[str, ...] = ()
         admission_scan_incomplete = False
+        admission_backlog_exhausted = False
         admission_probe_at = 0.0
         admission_deferred = False
         last_admission_available: ResourceCreditVector | None = None
@@ -2229,6 +2231,11 @@ class StagedParseCoordinator:
                                         "backend returned an invalid admission outcome"
                                     )
                                 admitted_batch = admission.work
+                                # A scoped, one-shot run may wait for cold stream
+                                # recovery only until the source has actually
+                                # reported no remaining backlog. Recovery's
+                                # target zero alone says nothing about the source.
+                                admission_backlog_exhausted = not admission.backlog_exists
                                 admission_deferred = admission.deferred_reason is not None
                                 if not admission_deferred and blocked_reason is not None and (
                                     blocked_reason.startswith("admission_deferred:")
@@ -2625,6 +2632,13 @@ class StagedParseCoordinator:
                         and not known
                         and not observation.pending
                         and (not admission_scan_incomplete or stop_requested())
+                        and (
+                            not wait_for_stream_admission
+                            or admission_backlog_exhausted
+                            or stream_decision is None
+                            or stream_decision.new_post_allowed
+                            or stop_requested()
+                        )
                     ):
                         emit()
                         return CoordinatorResult(

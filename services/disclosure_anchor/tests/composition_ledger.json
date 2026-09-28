@@ -1545,7 +1545,7 @@
   },
   "tests/unit/test_staged_parse_stream_admission.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 9
   },
   "tests/unit/test_staged_provider_parser_v4.py": {
    "private_imports": [],
