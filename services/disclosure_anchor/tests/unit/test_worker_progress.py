@@ -5,10 +5,13 @@ import stat
 import tempfile
 import unittest
 from datetime import datetime, timezone
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from disclosure_anchor.adapters.runtime.bounded_http import BoundedHTTPResponse
+from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import GpuClockEvidenceError
 from disclosure_anchor.adapters.runtime import worker_progress as progress_module
 from disclosure_anchor.adapters.runtime.worker_progress import (
     append_worker_progress,
@@ -266,10 +269,13 @@ class WorkerProgressTests(unittest.TestCase):
 
     def test_windows_nvidia_smi_metrics_are_fresh_real_gpu_telemetry(self) -> None:
         payload = _nvidia_smi_payload()
+        # The exporter's own response Date: 1005 on its host clock.
+        dated = ("Thu, 01 Jan 1970 00:16:45 GMT",)
 
         observed = nvidia_smi_metrics_snapshot(
             payload,
-            now_timestamp=1005,
+            response_date=dated,
+            transport_elapsed_seconds=0.25,
             expected_device_uuid="GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )
 
@@ -279,23 +285,21 @@ class WorkerProgressTests(unittest.TestCase):
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         )
         self.assertEqual(observed["device_name"], "NVIDIA GeForce RTX 5080")
-        self.assertEqual(observed["sample_age_seconds"], 5.0)
+        # Conservative bound: both whole-second exporter stamps add one second,
+        # and the local request-to-receipt time is added on top.
+        self.assertEqual(observed["sample_age_seconds"], 6.25)
         self.assertEqual(observed["gpu_utilization_pct_mean"], 87.5)
         self.assertEqual(observed["framebuffer_used_mib_total"], 8853.0)
         self.assertEqual(observed["framebuffer_free_mib_total"], 7456.0)
         self.assertEqual(observed["power_usage_watts_total"], 245.5)
         self.assertEqual(observed["temperature_celsius_max"], 67.0)
-        near_future = nvidia_smi_metrics_snapshot(
-            payload,
-            now_timestamp=999.75,
-            expected_device_uuid="GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        self.assertEqual(
+            gpu_metrics_snapshot(payload, response_date=dated, transport_elapsed_seconds=0.25), observed,
         )
-        self.assertEqual(near_future["sample_age_seconds"], 0.0)
-        with patch(
-            "disclosure_anchor.adapters.runtime.worker_progress.time.time",
-            return_value=1005,
-        ):
-            self.assertEqual(gpu_metrics_snapshot(payload), observed)
+        with self.assertRaises(GpuClockEvidenceError):
+            gpu_metrics_snapshot(payload, transport_elapsed_seconds=0.25)
+        with self.assertRaisesRegex(ValueError, "local transport elapsed"):
+            gpu_metrics_snapshot(payload, response_date=dated)
 
         for invalid in (
             payload.replace(
@@ -315,19 +319,19 @@ class WorkerProgressTests(unittest.TestCase):
             payload.replace(b'index="0"', b'index="1"'),
         ):
             with self.subTest(invalid=invalid[-80:]), self.assertRaises(ValueError):
-                nvidia_smi_metrics_snapshot(invalid, now_timestamp=1005)
+                nvidia_smi_metrics_snapshot(invalid, response_date=dated, transport_elapsed_seconds=0.25)
         with self.assertRaises(ValueError):
             nvidia_smi_metrics_snapshot(
                 payload,
-                now_timestamp=1005,
+                response_date=dated,
+                transport_elapsed_seconds=0.25,
                 expected_device_uuid="GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
             )
-        with patch(
-            "disclosure_anchor.adapters.runtime.worker_progress.time.time",
-            return_value=1005,
-        ), self.assertRaises(ValueError):
+        with self.assertRaises(ValueError):
             gpu_metrics_snapshot(
-                payload + b'DCGM_FI_DEV_GPU_UTIL{gpu="0"} 90\n'
+                payload + b'DCGM_FI_DEV_GPU_UTIL{gpu="0"} 90\n',
+                response_date=dated,
+                transport_elapsed_seconds=0.25,
             )
 
     def test_mineru_api_health_contract_is_exact(self) -> None:
@@ -462,7 +466,12 @@ class WorkerProgressTests(unittest.TestCase):
         ) as fetch_metrics, patch(
             "disclosure_anchor.adapters.runtime.worker_progress."
             "_fetch_gpu_metrics",
-            return_value=b"unrelated_metric 1\n",
+            return_value=BoundedHTTPResponse(
+                status=200,
+                body=b"unrelated_metric 1\n",
+                headers={"Date": ("Thu, 01 Jan 1970 00:16:40 GMT",)},
+                elapsed_seconds=0.1,
+            ),
         ) as fetch_gpu_metrics:
             base_settings = _settings(
                 Path(tmp),
@@ -498,6 +507,62 @@ class WorkerProgressTests(unittest.TestCase):
             "http://127.0.0.1:30004/metrics",
             timeout_seconds=5.0,
         )
+
+    def test_gpu_probe_age_includes_the_local_request_to_receipt_time(self) -> None:
+        # Real probe path: collect -> _probe_snapshot -> _fetch_gpu_metrics,
+        # whose own monotonic marks bracket the request and the full body read.
+        def collect(date: str, monotonic_marks: tuple[float, float]) -> dict[str, object]:
+            headers = Message()
+            headers["Content-Type"] = "text/plain; version=0.0.4"
+            headers["Date"] = date
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.geturl.return_value = "http://127.0.0.1:30004/metrics"
+            response.headers = headers
+            response.read.return_value = _nvidia_smi_payload()
+            response.status = 200
+            opener = MagicMock()
+            opener.open.return_value = response
+            with tempfile.TemporaryDirectory() as tmp, patch(
+                "disclosure_anchor.adapters.runtime.worker_progress."
+                "worker_progress_database_snapshot",
+                return_value={"universe": {}, "documents": {}, "queues": {}, "current_work": []},
+            ), patch(
+                "disclosure_anchor.adapters.runtime.worker_progress.urllib.request.build_opener",
+                return_value=opener,
+            ), patch(
+                "disclosure_anchor.adapters.runtime.worker_progress.time.monotonic",
+                side_effect=monotonic_marks,
+            ), patch("time.time", side_effect=AssertionError("local wall clock read")):
+                settings = self._with_progress_urls(
+                    _settings(
+                        Path(tmp),
+                        disclosure_gpu_metrics_url="http://127.0.0.1:30004/metrics",
+                        disclosure_gpu_expected_uuid="GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    ),
+                    api_url=None,
+                    observability_url=None,
+                )
+                event = collect_worker_progress(
+                    settings=settings,  # type: ignore[arg-type]
+                    engine=MagicMock(),
+                    scope_classes=None,
+                )
+            gpu = event["gpu"]
+            assert isinstance(gpu, dict)
+            return gpu
+
+        # Exporter Date 1028 for token 1000 bounds 29 s; 0.4 s of local
+        # transfer keeps it current, 1.5 s does not. Date 1029 plus a 1.5 s
+        # body read is root's 31.5 s counterexample.
+        current = collect("Thu, 01 Jan 1970 00:17:08 GMT", (100.0, 100.4))
+        self.assertEqual((current["status"], current["sample_age_seconds"]), ("available", 29.4))
+        for date in ("Thu, 01 Jan 1970 00:17:08 GMT", "Thu, 01 Jan 1970 00:17:09 GMT"):
+            with self.subTest(date=date):
+                self.assertEqual(
+                    collect(date, (100.0, 101.5)),
+                    {"status": "unavailable", "source": "nvidia_gpu_metrics", "reason": "metric_contract_unsatisfied"},
+                )
 
     def test_collect_marks_invalid_api_health_as_contract_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch(

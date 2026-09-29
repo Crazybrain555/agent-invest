@@ -8,7 +8,7 @@ in the scheduler or in these readers.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
@@ -21,9 +21,9 @@ from urllib.parse import urlsplit
 from disclosure_anchor.adapters.runtime.bounded_http import (
     BoundedHTTPTransportError, ThreadOwnedPersistentHTTPClient,
 )
-from disclosure_anchor.adapters.runtime.capacity_sources import _gpu_values, _prometheus
+from disclosure_anchor.adapters.runtime.capacity_sources import _nvidia_exporter_reading
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
-    GpuCollectionUnavailableError, GpuSampleStaleError,
+    EXPORTER_DATE_HEADER, GpuCollectionUnavailableError, GpuTelemetryUnavailable,
 )
 from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig, AnyMineruCapacityConfig, MineruCapacityConfigV2
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
@@ -87,6 +87,11 @@ class StreamPressureCache:
         self._gpu: tuple[float, int, str] | None = None
         self._events: dict[str, int] | None = None
         self._gpu_timestamp: float | None = None
+        # (monotonic start, exporter token, exporter Date) of the latest parsed
+        # GPU response, and (start, Date) of the response just before the
+        # current token first appeared.
+        self._gpu_last_response: tuple[float, float | None, int] | None = None
+        self._gpu_token_completed_after: tuple[float, int] | None = None
         self._api_remote_finish = -1
         self._failures: dict[str, str] = {}
         self._unsafe: str | None = None
@@ -123,42 +128,76 @@ class StreamPressureCache:
                          health["task_admission"]["durable_nonterminal_tasks"], digest)
             self._failures.pop("api", None)
 
-    def publish_gpu(self, payload: bytes, *, started: float, finished: float, received_wall: float) -> None:
+    def publish_gpu(self, payload: bytes, *, started: float, finished: float,
+                    response_date: Sequence[str]) -> None:
         self._bracket(started, finished)
-        unavailable = None
-        try:
-            values = _gpu_values(payload, expected_device_uuid=self.binding.gpu_uuid)
-        except GpuCollectionUnavailableError as error:
-            # Failed collections make no new successful-observation claim.
-            # Retain the last valid value, timestamp and age; keep reading.
-            self.record_failure("gpu", error)
-            return
-        except GpuSampleStaleError as error:
-            unavailable = error
-            values = None
-        if values is not None and values.framebuffer_free_bytes is None:
+        # Identity, format, measurement and clock-evidence faults raise here.
+        # Freshness never reads a local wall clock: the exporter's own
+        # Date-minus-success bound plus this read's monotonic duration bounds
+        # the sample's age at ``finished``.
+        reading = _nvidia_exporter_reading(
+            payload, expected_device_uuid=self.binding.gpu_uuid, response_date=response_date,
+            transport_elapsed_seconds=finished - started,
+        )
+        if reading.values is not None and reading.values.framebuffer_free_bytes is None:
             raise ValueError("GPU pressure free memory is unavailable")
-        timestamps = _prometheus(payload).get("nvidia_smi_last_collect_success_timestamp_seconds", ())
-        if len(timestamps) != 1:
-            raise ValueError("GPU pressure timestamp missing")
-        timestamp = timestamps[0]
-        age = received_wall - timestamp
-        if not isfinite(age) or age < -1:
-            raise ValueError("GPU pressure timestamp is from the future")
+        timestamp = reading.success_timestamp
         with self._lock:
+            previous = self._gpu_last_response
+            first_appearance = previous is None or previous[1] != timestamp
+            if first_appearance:
+                # A token first shown now completed after the previous response
+                # was generated, whichever way either host's wall clock moved.
+                self._gpu_token_completed_after = None if previous is None else (previous[0], previous[2])
+            self._gpu_last_response = (started, timestamp, reading.response_date_seconds)
+            if isinstance(reading.unavailable, GpuCollectionUnavailableError):
+                # Failed collections make no new successful-observation claim.
+                # Retain the last valid value, timestamp and age; keep reading.
+                self._failures["gpu"] = f"{type(reading.unavailable).__name__}:{reading.unavailable}"[:200]
+                return
+            assert timestamp is not None
             if self._gpu_timestamp is not None and timestamp < self._gpu_timestamp:
                 self._unsafe = "gpu_sample_clock_regressed"
-            if unavailable is not None:
-                # A stale successful sample still cannot regress its clock.
-                # It never replaces or rejuvenates the last valid GPU value.
-                self._failures["gpu"] = f"{type(unavailable).__name__}:{unavailable}"[:200]
+            if reading.unavailable is not None:
+                # A stale or clock-unordered successful sample still cannot
+                # regress its clock, and never replaces or rejuvenates the
+                # last valid GPU value.
+                self._failures["gpu"] = f"{type(reading.unavailable).__name__}:{reading.unavailable}"[:200]
                 return
-            assert values is not None
-            assert values.framebuffer_free_bytes is not None
-            # Repeated reads of one exporter sample retain its original local
-            # bracket; wall-clock jitter cannot rejuvenate cached GPU bytes.
-            observed = (self._gpu[0] if self._gpu is not None and timestamp == self._gpu_timestamp
-                        else max(0.0, started - max(0.0, age)))
+            values, age_bound = reading.values, reading.age_bound_seconds
+            assert values is not None and values.framebuffer_free_bytes is not None and age_bound is not None
+            if self._gpu is not None and timestamp == self._gpu_timestamp:
+                # Repeated reads of one exporter sample retain its original
+                # local bound; a successful HTTP read cannot rejuvenate it.
+                observed = self._gpu[0]
+            elif first_appearance:
+                # Two lower bounds of the collection's local instant: receipt
+                # minus the age bound at receipt, and the start of the last
+                # response that did not yet show this token. The later one is
+                # tightest. If this Date precedes that response's Date, the
+                # exporter clock stepped back and only the second holds. The
+                # bound stays unclamped, even before the monotonic origin, so
+                # an old first sample is never made fresh by a floor.
+                observed = finished - age_bound
+                if self._gpu_token_completed_after is not None:
+                    preceding_started, preceding_date = self._gpu_token_completed_after
+                    observed = (preceding_started if reading.response_date_seconds < preceding_date
+                                else max(observed, preceding_started))
+            elif self._gpu_token_completed_after is not None:
+                # The token's first responses could not be accepted (clock
+                # unordered or stale). A later Date may come from a stepped-back
+                # exporter clock and would mix epochs, so only the transition
+                # bound captured at its first appearance still holds.
+                observed = self._gpu_token_completed_after[0]
+            else:
+                # First shown, unaccepted, by the reader's first response: no
+                # bound survives an exporter clock step, and waiting for its
+                # Date to catch up proves nothing. Unknown until a newer token.
+                unbounded = GpuTelemetryUnavailable(
+                    "nvidia-smi exporter sample has no age bound since its first response"
+                )
+                self._failures["gpu"] = f"{type(unbounded).__name__}:{unbounded}"[:200]
+                return
             self._gpu_timestamp = timestamp
             self._gpu = (observed, values.framebuffer_free_bytes, _sha(payload))
             self._failures.pop("gpu", None)
@@ -179,12 +218,13 @@ class StreamPressureCache:
             if gpu is None or now - gpu[0] > self.binding.gpu_max_age_seconds:
                 reasons.append("gpu_unavailable_or_stale")
             self._sequence += 1
-            # Partial startup has no joined observation time. Zero cannot
-            # masquerade as fresh, and the first older GPU sample cannot make
-            # a previously reported partial API timestamp regress.
+            # Partial startup has no joined observation time, so none is
+            # reported: no placeholder can masquerade as fresh or be compared
+            # with the first joined bound, which may precede the monotonic
+            # origin. The joined time is the exact conservative bound.
             times = [api[0], gpu[0]] if api is not None and gpu is not None else []
             return StreamPressureSample(
-                sequence=self._sequence, observed_monotonic=min(times, default=0.0),
+                sequence=self._sequence, observed_monotonic=min(times) if times else None,
                 runtime_identity_sha256=self.binding.runtime_identity_sha256,
                 owner_identity_sha256=self.binding.owner_sha256,
                 evidence_sha256=_sha(_canonical({"api": None if api is None else api[-1], "gpu": None if gpu is None else gpu[-1], "failures": self._failures})),
@@ -258,10 +298,17 @@ class StreamPressureSession:
                         self._sink({"lane": lane, "started": started, "finished": finished, "health": health.decode(), "pressure": pressure.decode()})
                         self.cache.publish_api(health, pressure, started=started, finished=finished)
                     else:
-                        raw = read(parsed.path or "/")
+                        response = client.get_response(
+                            parsed.path or "/", response_headers=(EXPORTER_DATE_HEADER,),
+                            timeout_seconds=self._timeout, transport_attempts=1,
+                        )
+                        if response.status != 200:
+                            raise BoundedHTTPTransportError(f"pressure {lane} HTTP {response.status}")
                         finished = time.monotonic()
-                        self._sink({"lane": lane, "started": started, "finished": finished, "metrics": raw.decode()})
-                        self.cache.publish_gpu(raw, started=started, finished=finished, received_wall=time.time())
+                        raw, response_date = response.body, response.headers[EXPORTER_DATE_HEADER]
+                        self._sink({"lane": lane, "started": started, "finished": finished, "metrics": raw.decode(),
+                                    "http_date": list(response_date)})
+                        self.cache.publish_gpu(raw, started=started, finished=finished, response_date=response_date)
                 except BoundedHTTPTransportError as error:
                     self._sink({"lane": lane, "started": started, "finished": time.monotonic(), "error": str(error)})
                     self.cache.record_failure(lane, error)

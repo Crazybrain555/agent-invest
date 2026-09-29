@@ -102,6 +102,8 @@ class MineruStreamPolicy:
         self._target = 0
         self._last_sequence = -1
         self._last_sample: StreamPressureSample | None = None
+        # Latest joined observation time; partial startup samples have none.
+        self._last_observed: float | None = None
         self._last_now = -1.0
         self._missing_since: float | None = None
         self._healthy_since: float | None = None
@@ -122,10 +124,15 @@ class MineruStreamPolicy:
                 self._unsafe_reason = "identity_drift"
             if sample.sequence < self._last_sequence or (sample.sequence == self._last_sequence and sample != self._last_sample):
                 self._unsafe_reason = "sample_sequence_drift"
-            if self._last_sample is not None and sample.observed_monotonic < self._last_sample.observed_monotonic:
-                self._unsafe_reason = "sample_clock_drift"
-            if sample.observed_monotonic > now:
-                self._unsafe_reason = "sample_from_future"
+            observed = sample.observed_monotonic
+            if observed is not None:
+                # Only joined times are ordered. The first may precede the
+                # monotonic origin and follows any number of partial samples.
+                if self._last_observed is not None and observed < self._last_observed:
+                    self._unsafe_reason = "sample_clock_drift"
+                if observed > now:
+                    self._unsafe_reason = "sample_from_future"
+                self._last_observed = observed
             if sample.unsafe_reason:
                 self._unsafe_reason = sample.unsafe_reason
             self._last_sequence = sample.sequence
@@ -145,7 +152,7 @@ class MineruStreamPolicy:
             self._target = 0
             self._healthy_since = None
             return self._decision(sample, "memory_pause")
-        unknown = (sample is None or sample.unknown_reason is not None
+        unknown = (sample is None or sample.unknown_reason is not None or sample.observed_monotonic is None
                    or now - sample.observed_monotonic > c.sample_max_age_seconds
                    or any(value is None for value in (sample.gpu_free_bytes, sample.host_available_bytes, sample.http_active, sample.http_pending)))
         if unknown:
@@ -156,6 +163,7 @@ class MineruStreamPolicy:
                 self._target = 0
             return self._decision(sample, "pressure_unknown")
         assert sample is not None and sample.gpu_free_bytes is not None and sample.host_available_bytes is not None
+        assert sample.observed_monotonic is not None
         self._missing_since = None
         if sample.gpu_free_bytes < c.gpu_reduce_bytes:
             self._healthy_since = None

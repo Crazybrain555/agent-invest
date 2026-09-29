@@ -231,7 +231,7 @@
   },
   "tests/unit/test_bounded_http.py": {
    "private_imports": [],
-   "tests": 18
+   "tests": 19
   },
   "tests/unit/test_bounded_pinned_artifact_tree.py": {
    "private_imports": [],
@@ -279,7 +279,7 @@
   },
   "tests/unit/test_capacity_sources.py": {
    "private_imports": [],
-   "tests": 6
+   "tests": 7
   },
   "tests/unit/test_cninfo_client.py": {
    "private_imports": [],
@@ -1093,7 +1093,7 @@
   },
   "tests/unit/test_mineru_stream_pressure_adapter.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 16
   },
   "tests/unit/test_mineru_stream_worker_lifecycle.py": {
    "private_imports": [],
@@ -1109,7 +1109,7 @@
   },
   "tests/unit/test_mineru_tunnel_status.py": {
    "private_imports": [],
-   "tests": 4
+   "tests": 5
   },
   "tests/unit/test_native_hold_attribution_independent.py": {
    "private_imports": [],
@@ -1689,7 +1689,7 @@
   },
   "tests/unit/test_worker_progress.py": {
    "private_imports": [],
-   "tests": 9
+   "tests": 10
   },
   "tests/unit/test_worker_run_once.py": {
    "private_imports": [

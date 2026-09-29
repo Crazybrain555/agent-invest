@@ -13,6 +13,8 @@ import unittest
 from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime import capacity_sources
+from disclosure_anchor.adapters.runtime.bounded_http import BoundedHTTPResponse
+from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import GpuTelemetryUnavailable
 from disclosure_anchor.application.ports.mineru_stream_pressure import StreamSubmissionDeferred
 from disclosure_anchor.application.services.mineru_stream_policy import (
     MineruStreamPolicy,
@@ -20,16 +22,25 @@ from disclosure_anchor.application.services.mineru_stream_policy import (
     StreamPolicyConfig,
 )
 from tests.unit import test_mineru_stream_pressure_adapter as fixtures
+from tests.unit.test_capacity_sources import _exporter_date, _gpu_health_only_payload
+
+# The exporter host clock is deliberately far from this host's clock: only its
+# own Date and last-success values may be compared with each other.
+EXPORTER_CLOCK_OFFSET_SECONDS = -86_400 * 3 + 1.5
 
 
 def gpu_frame(kind, *, prior_timestamp=None):
-    timestamp = time.time()
+    """Return (last-success token, metrics bytes, Date values) of one response."""
+    now = int(time.time() + EXPORTER_CLOCK_OFFSET_SECONDS)
+    timestamp = float(now)
+    dates = (_exporter_date(now),)
     if kind == "expired":
         timestamp -= 31.0
     elif kind == "rollback":
         timestamp = prior_timestamp - 31.0
-    elif kind in ("future", "failed_future"):
-        timestamp += 10.0
+    elif kind == "clock_unordered":
+        # The exporter host clock stepped back between collection and response.
+        timestamp += 2.0
     raw = fixtures.gpu_payload(timestamp)
     if kind.startswith("failed"):
         raw = raw.replace(b"nvidia_smi_last_collect_success 1\n", b"nvidia_smi_last_collect_success 0\n")
@@ -44,7 +55,19 @@ def gpu_frame(kind, *, prior_timestamp=None):
         required_value = b"} 7818182656\n"
         assert raw.count(required_value) == 1
         raw = raw.replace(required_value, b"} not-a-number\n")
-    return timestamp, raw
+    if kind == "upstream_failed":
+        raw = _gpu_health_only_payload(timestamp - 5.0)
+    if kind == "upstream_warmup":
+        raw = _gpu_health_only_payload(None, failures=0)
+    if kind == "health_only_success":
+        raw = _gpu_health_only_payload(timestamp).replace(b"success 0", b"success 1")
+    if kind in ("missing_date", "failed_missing_date"):
+        dates = ()
+    if kind == "duplicate_date":
+        dates = dates * 2
+    if kind == "obsolete_date":
+        dates = (time.strftime("%A, %d-%b-%y %H:%M:%S GMT", time.gmtime(now)),)
+    return timestamp, raw, dates
 
 
 class GpuPressureUnavailableTests(unittest.TestCase):
@@ -66,16 +89,19 @@ class GpuPressureUnavailableTests(unittest.TestCase):
         def factory(base_url, *, maximum_response_bytes):
             client = fixture.factory(base_url, maximum_response_bytes=maximum_response_bytes)
             if client.lane == "gpu":
-                original = client.get_bytes
+                original = client.get_response
 
-                def read(path, *, timeout_seconds, transport_attempts):
-                    status, _ = original(path, timeout_seconds=timeout_seconds, transport_attempts=transport_attempts)
+                def read(path, *, response_headers, timeout_seconds, transport_attempts):
+                    status = original(
+                        path, response_headers=response_headers,
+                        timeout_seconds=timeout_seconds, transport_attempts=transport_attempts,
+                    ).status
                     kind = kinds[min(len(received), len(kinds) - 1)]
-                    stamp, raw = gpu_frame(kind, prior_timestamp=None if not received else received[0][1])
+                    stamp, raw, dates = gpu_frame(kind, prior_timestamp=None if not received else received[0][1])
                     received.append((kind, stamp, raw))
-                    return status, raw
+                    return BoundedHTTPResponse(status=status, body=raw, headers={"Date": dates}, elapsed_seconds=0.001)
 
-                client.get_bytes = read
+                client.get_response = read
             return client
 
         session = fixture.session(client_factory=factory, wakeup=wakeup)
@@ -130,14 +156,23 @@ class GpuPressureUnavailableTests(unittest.TestCase):
             self.assertFalse(fixture.closed["gpu"].is_set())
         self.assertTrue(all(client.closed for client in fixture.clients))
 
-    def test_expired_over_thirty_seconds_then_fresh_recovers_in_same_reader(self):
-        self.recover_after_initial_unavailable("expired")
+    def test_expired_or_clock_unordered_sample_then_fresh_recovers_in_same_reader(self):
+        # Both verdicts come from the exporter's own Date and last-success
+        # values: over 30 s old, or dated before its own collection because
+        # that host's clock stepped back. Neither is an identity fault.
+        for kind in ("expired", "clock_unordered"):
+            with self.subTest(kind=kind):
+                self.recover_after_initial_unavailable(kind)
 
     def test_unsuccessful_collection_then_success_recovers_in_same_reader(self):
-        self.recover_after_initial_unavailable("failed")
+        # "failed" keeps device rows; the upstream 1.14.0 shapes after a failed
+        # collection and before a first success carry only health families.
+        for kind in ("failed", "upstream_failed", "upstream_warmup"):
+            with self.subTest(kind=kind):
+                self.recover_after_initial_unavailable(kind)
 
     def test_continuous_unknown_retains_old_value_without_refresh_and_policy_pauses(self):
-        fixture, session, received = self.harness(["fresh", "failed", "failed"])
+        fixture, session, received = self.harness(["fresh", "upstream_failed", "upstream_failed"])
         with self.running(session):
             good = self.wait_for(fixture, session, lambda sample: sample.unknown_reason is None)
             now = [time.monotonic()]
@@ -183,12 +218,15 @@ class GpuPressureUnavailableTests(unittest.TestCase):
             self.assertEqual(again.observed_monotonic, bad.observed_monotonic)
             self.assertFalse(fixture.closed["gpu"].is_set())
 
-    def test_identity_future_format_values_and_timestamp_rollback_remain_fatal(self):
+    def test_identity_clock_evidence_format_values_and_timestamp_rollback_remain_fatal(self):
         # Combined unsuccessful/invalid cases prevent a broad catch or an early
         # success=0 shortcut from hiding independent identity/protocol faults.
+        # Clock evidence is protocol: a missing, repeated or obsolete-format
+        # Date is never replaced by the reading host's wall clock.
         variants = (
-            ["wrong_uuid"], ["future"], ["failed_wrong_uuid"],
-            ["failed_future"], ["failed_bad_value"], ["failed_bad_format"],
+            ["wrong_uuid"], ["failed_wrong_uuid"], ["failed_bad_value"],
+            ["failed_bad_format"], ["health_only_success"], ["missing_date"],
+            ["failed_missing_date"], ["duplicate_date"], ["obsolete_date"],
             ["fresh", "rollback"],
         )
         for kinds in variants:
@@ -223,13 +261,22 @@ class GpuPressureUnavailableTests(unittest.TestCase):
             url="http://gpu.invalid/metrics", timeout_seconds=0.2,
             expected_device_uuid=fixtures.GPU,
         )
-        for kind in ("expired", "failed"):
-            _, raw = gpu_frame(kind)
-            with self.subTest(kind=kind), patch.object(capacity_sources, "_fetch_payload", return_value=raw):
-                with self.assertRaises(ValueError):
-                    sampler.sample()
-        _, raw = gpu_frame("fresh")
-        with patch.object(capacity_sources, "_fetch_payload", return_value=raw):
+
+        def served(kind):
+            _, raw, dates = gpu_frame(kind)
+            return patch.object(
+                capacity_sources, "_fetch_response",
+                return_value=BoundedHTTPResponse(status=200, body=raw, headers={"Date": dates}, elapsed_seconds=0.001),
+            )
+
+        for kind in ("expired", "clock_unordered", "failed", "upstream_failed", "upstream_warmup"):
+            with self.subTest(kind=kind), served(kind), self.assertRaises(GpuTelemetryUnavailable):
+                sampler.sample()
+        for kind in ("missing_date", "health_only_success", "wrong_uuid"):
+            with self.subTest(kind=kind), served(kind), self.assertRaises(ValueError) as caught:
+                sampler.sample()
+            self.assertNotIsInstance(caught.exception, GpuTelemetryUnavailable)
+        with served("fresh"):
             self.assertEqual(sampler.sample().framebuffer_free_bytes, 7818182656)
 
 

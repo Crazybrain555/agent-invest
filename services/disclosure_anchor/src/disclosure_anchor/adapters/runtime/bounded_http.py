@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import http.client
 import math
+import re
 import socket
 import threading
 import time
 from typing import Callable, Mapping
 from urllib.parse import SplitResult, urlsplit
+
+
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
 class BoundedHTTPTransportError(RuntimeError):
@@ -17,6 +22,22 @@ class BoundedHTTPTransportError(RuntimeError):
 
 class BoundedHTTPProtocolError(RuntimeError):
     """A direct HTTP response violated the bounded transport contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedHTTPResponse:
+    """One complete bounded response plus only the caller-selected headers.
+
+    Each selected name maps to every received value in order, so an absent or
+    repeated header stays visible to the endpoint-specific caller.
+    ``elapsed_seconds`` is the local monotonic time from starting the request
+    that produced this response to receiving its complete body.
+    """
+
+    status: int
+    body: bytes
+    headers: Mapping[str, tuple[str, ...]]
+    elapsed_seconds: float
 
 
 class _AttemptDeadlineWatchdog:
@@ -260,7 +281,8 @@ class ThreadOwnedPersistentHTTPClient:
         transport_attempts: int = 1,
         maximum_attempt_timeout_seconds: float | None = None,
         absolute_deadline: float | None = None,
-    ) -> tuple[int, bytes]:
+        capture_headers: tuple[str, ...] = (),
+    ) -> tuple[int, bytes, dict[str, tuple[str, ...]], float]:
         self._bind_owner()
         if (
             method not in {"GET", "POST"}
@@ -323,11 +345,16 @@ class ThreadOwnedPersistentHTTPClient:
                     attempt_deadline=attempt_deadline,
                 )
                 response = connection.getresponse()
+                captured = {
+                    name: tuple(response.headers.get_all(name) or ())
+                    for name in capture_headers
+                }
                 payload = self._read_bounded_response(
                     response,
                     connection,
                     attempt_deadline=attempt_deadline,
                 )
+                received = self._clock()
                 expired = active_watchdog.finish() if active_watchdog is not None else False
                 watchdog = None
                 if expired or self._clock() > attempt_deadline:
@@ -337,7 +364,7 @@ class ThreadOwnedPersistentHTTPClient:
                 status = response.status
                 if response.will_close:
                     self._drop_connection()
-                return status, payload
+                return status, payload, captured, received - attempt_started
             except BoundedHTTPProtocolError:
                 self._drop_connection()
                 raise
@@ -392,7 +419,7 @@ class ThreadOwnedPersistentHTTPClient:
         HTTP status handling stays with the endpoint-specific caller.
         """
 
-        return self._request_bytes(
+        status, payload, _, _ = self._request_bytes(
             "GET",
             path,
             body=None,
@@ -401,6 +428,49 @@ class ThreadOwnedPersistentHTTPClient:
             transport_attempts=transport_attempts,
             maximum_attempt_timeout_seconds=maximum_attempt_timeout_seconds,
             absolute_deadline=absolute_deadline,
+        )
+        return status, payload
+
+    def get_response(
+        self,
+        path: str,
+        *,
+        response_headers: tuple[str, ...],
+        timeout_seconds: float,
+        transport_attempts: int = 1,
+        maximum_attempt_timeout_seconds: float | None = None,
+        absolute_deadline: float | None = None,
+    ) -> BoundedHTTPResponse:
+        """Return ``get_bytes`` semantics plus every value of selected headers.
+
+        Header metadata is transport evidence for the caller's own contract; the
+        client neither interprets nor defaults it.
+        """
+
+        if (
+            not isinstance(response_headers, tuple)
+            or not response_headers
+            or len({name.lower() for name in response_headers if isinstance(name, str)})
+            != len(response_headers)
+            or any(
+                not isinstance(name, str) or _HEADER_NAME.fullmatch(name) is None
+                for name in response_headers
+            )
+        ):
+            raise ValueError("persistent HTTP response header selection is invalid")
+        status, payload, captured, elapsed = self._request_bytes(
+            "GET",
+            path,
+            body=None,
+            headers={},
+            timeout_seconds=timeout_seconds,
+            transport_attempts=transport_attempts,
+            maximum_attempt_timeout_seconds=maximum_attempt_timeout_seconds,
+            absolute_deadline=absolute_deadline,
+            capture_headers=response_headers,
+        )
+        return BoundedHTTPResponse(
+            status=status, body=payload, headers=captured, elapsed_seconds=elapsed,
         )
 
     def post_bytes(
@@ -423,7 +493,7 @@ class ThreadOwnedPersistentHTTPClient:
             or "\n" in content_type
         ):
             raise ValueError("persistent HTTP POST payload metadata is invalid")
-        return self._request_bytes(
+        status, body, _, _ = self._request_bytes(
             "POST",
             path,
             body=payload,
@@ -435,6 +505,7 @@ class ThreadOwnedPersistentHTTPClient:
             transport_attempts=transport_attempts,
             maximum_attempt_timeout_seconds=maximum_attempt_timeout_seconds,
         )
+        return status, body
 
     def close(self) -> None:
         """Close the connection from its owner, or an as-yet-unbound client."""
@@ -446,6 +517,7 @@ class ThreadOwnedPersistentHTTPClient:
 
 __all__ = [
     "BoundedHTTPProtocolError",
+    "BoundedHTTPResponse",
     "BoundedHTTPTransportError",
     "ThreadOwnedPersistentHTTPClient",
 ]

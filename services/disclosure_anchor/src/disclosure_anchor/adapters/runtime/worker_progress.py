@@ -12,13 +12,19 @@ import urllib.error
 import urllib.request
 import uuid
 
+from disclosure_anchor.adapters.runtime.bounded_http import BoundedHTTPResponse
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
-    nvidia_smi_sample_age_seconds,
+    EXPORTER_DATE_HEADER,
+    NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS,
+    GpuClockEvidenceError,
+    GpuSampleStaleError,
+    exporter_response_date_seconds,
+    exporter_sample_age_bound_seconds,
 )
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.engine import Engine
@@ -89,6 +95,7 @@ PROMETHEUS_NAME_LABEL_RE = re.compile(r'(?:^|,)name="([^"\\]+)"(?:,|$)')
 WORKER_PROGRESS_PRODUCER_ID = uuid.uuid4().hex
 _SEQUENCE_LOCK = threading.Lock()
 _SEQUENCE = 0
+_Fetched = TypeVar("_Fetched")
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -114,10 +121,28 @@ def _fetch_payload(
     accept: str,
     maximum_bytes: int,
 ) -> bytes:
+    return _fetch_response(
+        url,
+        timeout_seconds=timeout_seconds,
+        accept=accept,
+        maximum_bytes=maximum_bytes,
+        capture_headers=(),
+    ).body
+
+
+def _fetch_response(
+    url: str,
+    *,
+    timeout_seconds: float,
+    accept: str,
+    maximum_bytes: int,
+    capture_headers: tuple[str, ...],
+) -> BoundedHTTPResponse:
     request = urllib.request.Request(
         url,
         headers={"Accept": accept, "User-Agent": "disclosure-anchor-progress/2"},
     )
+    started = time.monotonic()
     try:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
@@ -134,12 +159,20 @@ def _fetch_payload(
             )
             if content_type not in accepted_types:
                 raise RuntimeError("telemetry response content type is invalid")
+            captured = {
+                name: tuple(response.headers.get_all(name) or ())
+                for name in capture_headers
+            }
             payload = response.read(maximum_bytes + 1)
+            received = time.monotonic()
+            status = response.status
     except (OSError, urllib.error.URLError) as exc:
         raise RuntimeError("telemetry endpoint unavailable") from exc
     if not isinstance(payload, bytes) or len(payload) > maximum_bytes:
         raise RuntimeError("telemetry response exceeds safety limit")
-    return payload
+    return BoundedHTTPResponse(
+        status=status, body=payload, headers=captured, elapsed_seconds=received - started,
+    )
 
 
 def _fetch_metrics(url: str, *, timeout_seconds: float) -> bytes:
@@ -160,12 +193,13 @@ def _fetch_api_health(url: str, *, timeout_seconds: float) -> bytes:
     )
 
 
-def _fetch_gpu_metrics(url: str, *, timeout_seconds: float) -> bytes:
-    return _fetch_payload(
+def _fetch_gpu_metrics(url: str, *, timeout_seconds: float) -> BoundedHTTPResponse:
+    return _fetch_response(
         url,
         timeout_seconds=timeout_seconds,
         accept="text/plain",
         maximum_bytes=MAX_GPU_METRICS_BYTES,
+        capture_headers=(EXPORTER_DATE_HEADER,),
     )
 
 
@@ -365,11 +399,22 @@ def dcgm_metrics_snapshot(payload: bytes) -> dict[str, Any]:
 def nvidia_smi_metrics_snapshot(
     payload: bytes,
     *,
-    now_timestamp: float | None = None,
+    response_date: Sequence[str] | None = None,
+    transport_elapsed_seconds: float | None = None,
     expected_device_uuid: str | None = None,
 ) -> dict[str, Any]:
-    """Parse one fresh, successful, single-GPU Windows exporter snapshot."""
+    """Parse one fresh, successful, single-GPU Windows exporter snapshot.
 
+    Freshness uses only the exporter host's own clock: the response's HTTP
+    ``Date`` minus its last-success timestamp, plus this host's monotonic
+    request-to-receipt time. Without both the snapshot fails closed instead
+    of comparing against this host's wall clock.
+    """
+
+    if response_date is None:
+        raise GpuClockEvidenceError("nvidia-smi exporter freshness requires the response HTTP Date")
+    if transport_elapsed_seconds is None:
+        raise ValueError("nvidia-smi exporter freshness requires the local transport elapsed time")
     samples = parse_prometheus_metrics(payload)
     device_uuid, device_name = _nvidia_smi_device_identity(payload)
     normalized_expected_uuid = (
@@ -390,10 +435,13 @@ def nvidia_smi_metrics_snapshot(
         raise ValueError("nvidia-smi exporter collection is not successful")
     if len(timestamps) != 1:
         raise ValueError("nvidia-smi exporter collection timestamp is missing")
-    sample_age = nvidia_smi_sample_age_seconds(
-        now_timestamp=(now_timestamp if now_timestamp is not None else time.time()),
+    sample_age = exporter_sample_age_bound_seconds(
+        response_date_seconds=exporter_response_date_seconds(response_date),
         success_timestamp=timestamps[0],
+        transport_elapsed_seconds=transport_elapsed_seconds,
     )
+    if sample_age > NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS:
+        raise GpuSampleStaleError("nvidia-smi exporter sample is stale")
     if len(utilization) != 1 or not 0 <= utilization[0] <= 1:
         raise ValueError("nvidia-smi exporter GPU identity or utilization is invalid")
 
@@ -440,8 +488,15 @@ def gpu_metrics_snapshot(
     payload: bytes,
     *,
     expected_device_uuid: str | None = None,
+    response_date: Sequence[str] | None = None,
+    transport_elapsed_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Detect exactly one supported GPU exporter family."""
+    """Detect exactly one supported GPU exporter family.
+
+    ``response_date`` carries every received HTTP ``Date`` value and
+    ``transport_elapsed_seconds`` the local monotonic request-to-receipt time;
+    the pinned nvidia-smi family requires both for its freshness bound.
+    """
 
     samples = parse_prometheus_metrics(payload)
     has_dcgm = bool(_alias_values(samples, DCGM_METRIC_NAMES["gpu_utilization_pct"]))
@@ -457,6 +512,8 @@ def gpu_metrics_snapshot(
         return dcgm_metrics_snapshot(payload)
     return nvidia_smi_metrics_snapshot(
         payload,
+        response_date=response_date,
+        transport_elapsed_seconds=transport_elapsed_seconds,
         expected_device_uuid=expected_device_uuid,
     )
 
@@ -464,17 +521,16 @@ def gpu_metrics_snapshot(
 def _probe_snapshot(
     *,
     url: str | None,
-    parser: Callable[[bytes], dict[str, Any]],
+    parser: Callable[[_Fetched], dict[str, Any]],
     timeout_seconds: float,
     source: str,
+    fetcher: Callable[..., _Fetched],
     contract_failure_reason: str = "metric_contract_unsatisfied",
-    fetcher: Callable[..., bytes] | None = None,
 ) -> dict[str, Any]:
     if url is None:
         return {"status": "unavailable", "source": source, "reason": "not_configured"}
-    resolved_fetcher = fetcher or _fetch_metrics
     try:
-        payload = resolved_fetcher(url, timeout_seconds=timeout_seconds)
+        payload = fetcher(url, timeout_seconds=timeout_seconds)
     except RuntimeError:
         return {
             "status": "unavailable",
@@ -565,12 +621,15 @@ def collect_worker_progress(
             parser=vllm_metrics_snapshot,
             timeout_seconds=settings.worker_progress_metrics_timeout_seconds,
             source="vllm_metrics",
+            fetcher=_fetch_metrics,
         ),
         "gpu": _probe_snapshot(
             url=gpu_metrics_url,
-            parser=lambda payload: gpu_metrics_snapshot(
-                payload,
+            parser=lambda response: gpu_metrics_snapshot(
+                response.body,
                 expected_device_uuid=settings.disclosure_gpu_expected_uuid,
+                response_date=response.headers[EXPORTER_DATE_HEADER],
+                transport_elapsed_seconds=response.elapsed_seconds,
             ),
             timeout_seconds=settings.worker_progress_metrics_timeout_seconds,
             source="nvidia_gpu_metrics",

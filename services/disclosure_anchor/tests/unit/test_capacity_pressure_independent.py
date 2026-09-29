@@ -20,6 +20,7 @@ from disclosure_anchor.application.services.mineru_stream_policy import (
     StreamPolicyConfig,
 )
 from tests._mineru_capacity_config_fixture import canonical_payload
+from tests.unit.test_capacity_sources import _exporter_date
 from tests.unit.test_mineru_stream_pressure_adapter import examples, gpu_payload
 from tests.unit import test_mineru_http_remote_v4 as wire_fixtures
 
@@ -152,7 +153,7 @@ class CapacityPressureIndependentTests(unittest.TestCase):
         now = [100.0]
         cache = StreamPressureCache(binding, monotonic=lambda: now[0])
         cache.publish_api(cast(Any, canonical_payload)(health), cast(Any, canonical_payload)(pressure), started=100, finished=100.1)
-        cache.publish_gpu(cast(Any, gpu_payload)(1000.0), started=100, finished=100.1, received_wall=1000.0)
+        cache.publish_gpu(cast(Any, gpu_payload)(1000.0), started=100, finished=100.1, response_date=(_exporter_date(1000),))
         idle = cache.latest()
         self.assertEqual(getattr(idle, "provider_nonterminal_tasks", None), 0)
         health["processing_tasks"] = 1

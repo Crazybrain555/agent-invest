@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tempfile
@@ -23,6 +24,7 @@ from tests._mineru_capacity_config_fixture import (
     capacity_payload,
 )
 from tests._mineru_capacity_health_fixture import capacity_health_payload
+from tests.unit.test_capacity_sources import _gpu_payload
 from tests.unit.test_settings import _env
 
 
@@ -32,8 +34,10 @@ LAUNCHCTL = f"launchctl print gui/{os.getuid()}/com.agentinvest.mineru-tunnel"
 API_HEALTH = CURL + "http://127.0.0.1:30002/health"
 LATER_PROBES = [
     CURL + "http://127.0.0.1:30001/health",
-    CURL + "http://127.0.0.1:30004/metrics",
+    CURL + "--include --output <private-temp-file> --write-out %{time_total} http://127.0.0.1:30004/metrics",
 ]
+# A real pinned-exporter Date on its own host clock (1790697811).
+EXPORTER_DATE = "Tue, 29 Sep 2026 16:03:31 GMT"
 CAPACITY_SHA256 = "sha256:" + hashlib.sha256(CAPACITY_BYTES).hexdigest()
 # Differs only in a limit the health wire never echoes, so the bound hash is
 # the sole evidence separating it from CAPACITY_BYTES.
@@ -57,7 +61,26 @@ launchctl() {
   case "${argv[-1]}" in
     http://127.0.0.1:30002/health) /bin/cat -- "$TUNNEL_STATUS_API_HEALTH" ;;
     http://127.0.0.1:30001/health) print -r -- ok ;;
-    http://127.0.0.1:30004/metrics) print -r -- 'DCGM_FI_DEV_GPU_UTIL{gpu="0"} 80' ;;
+    http://127.0.0.1:30004/metrics)
+      local output=/dev/stdout index
+      for (( index = 1; index < $#; index++ )); do
+        [[ "${argv[index]}" != --output ]] || output="${argv[index + 1]}"
+      done
+      {
+        if (( ${argv[(Ie)--include]} )); then
+          printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n'
+          [[ -z "${TUNNEL_STATUS_GPU_DATE-}" ]] || printf 'Date: %s\r\n' "$TUNNEL_STATUS_GPU_DATE"
+          printf '\r\n'
+        fi
+        if [[ -n "${TUNNEL_STATUS_GPU_BODY-}" ]]; then
+          /bin/cat -- "$TUNNEL_STATUS_GPU_BODY"
+        else
+          print -r -- 'DCGM_FI_DEV_GPU_UTIL{gpu="0"} 80'
+        fi
+      } > "$output"
+      if (( ${argv[(Ie)--write-out]} )); then
+        print -rn -- "${TUNNEL_STATUS_GPU_ELAPSED:-0.050000}"
+      fi ;;
     *) return 7 ;;
   esac
 }
@@ -85,6 +108,7 @@ class MineruTunnelStatusScriptTests(unittest.TestCase):
             "PATH": "/usr/bin:/bin",
             "TUNNEL_STATUS_CALLS": str(self.calls),
             "TUNNEL_STATUS_API_HEALTH": str(self.health),
+            "TUNNEL_STATUS_GPU_DATE": EXPORTER_DATE,
         }
         shadowed = subprocess.run(
             ["/bin/zsh", "-c", "whence -w launchctl /usr/bin/curl"],
@@ -134,7 +158,11 @@ class MineruTunnelStatusScriptTests(unittest.TestCase):
             timeout=120,
         )
         self.assertNotIn(SECRET, completed.stdout + completed.stderr)
-        return completed, self.calls.read_text(encoding="utf-8").splitlines()
+        calls = self.calls.read_text(encoding="utf-8").splitlines()
+        outputs = [match.group(1) for call in calls if (match := re.search(r"--output (\S+)", call))]
+        # The script's private response file never outlives it.
+        self.assertTrue(all(not Path(output).exists() for output in outputs))
+        return completed, [re.sub(r"--output \S+", "--output <private-temp-file>", call) for call in calls]
 
     def assert_completed(
         self, completed: subprocess.CompletedProcess[str], calls: list[str]
@@ -257,6 +285,32 @@ class MineruTunnelStatusScriptTests(unittest.TestCase):
         self.assertEqual(
             snapshot["capacity_observation"]["capacity_config_sha256"], CAPACITY_SHA256
         )
+
+    def test_nvidia_snapshot_ages_by_the_exporter_response_date(self) -> None:
+        self.write_capacity(CAPACITY_BYTES)
+        self.write_env(self.default_env_dir / "worker.env", self.explicit_env(CAPACITY_SHA256))
+        body = self.root / "gpu-metrics.prom"
+        body.write_bytes(
+            _gpu_payload().replace(b"timestamp_seconds 1000", b"timestamp_seconds 1.790697811e+09")
+        )
+        health = canonical(capacity_health_payload())
+
+        completed, calls = self.run_script(
+            health, TUNNEL_STATUS_GPU_BODY=str(body), TUNNEL_STATUS_GPU_ELAPSED="0.250000",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(calls, [LAUNCHCTL, API_HEALTH, *LATER_PROBES])
+        gpu = json.loads(completed.stdout.splitlines()[5])
+        # Same-host bound (Date + 1 - success) plus curl's request-to-receipt time.
+        self.assertEqual((gpu["source"], gpu["sample_age_seconds"]), ("nvidia_smi_exporter", 1.25))
+        # Without the exporter's own Date there is no freshness evidence, and
+        # this host's wall clock is never substituted.
+        completed, _ = self.run_script(
+            health, TUNNEL_STATUS_GPU_BODY=str(body), TUNNEL_STATUS_GPU_DATE="",
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("GpuClockEvidenceError", completed.stderr)
 
 
 if __name__ == "__main__":

@@ -494,8 +494,11 @@ loopback-only 的 nvidia-smi exporter，再经专用 SSH LocalForward 暴露给 
 不得停止健康数据面。
 事件含进程实例 ID 与单调 sequence/event ID，消费方可区分 worker 重启和事件缺口；探针失败区分
 endpoint 不可达与 metric contract 不满足。
-Windows exporter freshness 使用远端整数 Unix 秒，允许最多 1 秒跨机未来偏差；更大的时钟漂移、
-超过 30 秒的旧 sample 或 collection failure 仍显示 unavailable，不得用最近值填补。
+Windows exporter freshness 只用 exporter 自身响应 `Date` 减 last-success 时间戳（同主机、整数秒，
+保守加 1 秒）再加本机请求到收完响应体的 monotonic 耗时，从不与 Mac wall clock 比较，所以两机不需要
+对时，也不要为此调钟；`Date` 缺失/重复/格式错误、上界超过 30 秒的旧 sample、`Date` 早于其 collection
+或 collection failure 仍显示 unavailable，不得用最近值填补。worker progress 与
+`scripts/mineru_tunnel_status.sh` 的 `sample_age_seconds` 就是该保守上界（刚采集的样本约为 1 秒加传输耗时）。
 
 当前 vLLM 0.21 MinerU2.5-Pro 服务还必须把
 `--mm-processor-cache-gb 0` 纳入远端容器命令和上述 manifest。2026-08-13 的 221 页半年度

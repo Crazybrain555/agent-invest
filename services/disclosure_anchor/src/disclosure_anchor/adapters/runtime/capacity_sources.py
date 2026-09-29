@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 import hashlib
 import math
 import re
@@ -20,10 +22,16 @@ from disclosure_anchor.application.contracts.mineru_api_health import (
 )
 from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
+from disclosure_anchor.adapters.runtime.bounded_http import BoundedHTTPResponse
 from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
+    EXPORTER_DATE_HEADER,
+    NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS,
     GpuCollectionUnavailableError,
+    GpuSampleClockUnorderedError,
     GpuSampleStaleError,
-    nvidia_smi_sample_age_seconds,
+    GpuTelemetryUnavailable,
+    exporter_response_date_seconds,
+    exporter_sample_age_bound_seconds,
 )
 
 
@@ -87,6 +95,23 @@ def _fetch_payload(
     accepted_content_types: frozenset[str],
     maximum_bytes: int,
 ) -> bytes:
+    return _fetch_response(
+        url,
+        timeout_seconds=timeout_seconds,
+        accepted_content_types=accepted_content_types,
+        maximum_bytes=maximum_bytes,
+        capture_headers=(),
+    ).body
+
+
+def _fetch_response(
+    url: str,
+    *,
+    timeout_seconds: float,
+    accepted_content_types: frozenset[str],
+    maximum_bytes: int,
+    capture_headers: tuple[str, ...],
+) -> BoundedHTTPResponse:
     request = urllib.request.Request(
         url,
         headers={
@@ -98,18 +123,27 @@ def _fetch_payload(
         urllib.request.ProxyHandler({}),
         _NoRedirectHandler(),
     )
+    started = time.monotonic()
     try:
         with opener.open(request, timeout=timeout_seconds) as response:
             if response.geturl() != url:
                 raise ValueError("telemetry endpoint redirected")
             if response.headers.get_content_type() not in accepted_content_types:
                 raise ValueError("telemetry response content type is invalid")
+            captured = {
+                name: tuple(response.headers.get_all(name) or ())
+                for name in capture_headers
+            }
             payload = response.read(maximum_bytes + 1)
+            received = time.monotonic()
+            status = response.status
     except (OSError, urllib.error.URLError) as exc:
         raise RuntimeError("telemetry endpoint unavailable") from exc
     if not isinstance(payload, bytes) or len(payload) > maximum_bytes:
         raise ValueError("telemetry response exceeds safety limit")
-    return payload
+    return BoundedHTTPResponse(
+        status=status, body=payload, headers=captured, elapsed_seconds=received - started,
+    )
 
 
 def _service_root(url: str, *, remove_v1: bool = False) -> str:
@@ -255,10 +289,57 @@ def gpu_device_identity_sha256(device_uuid: str) -> str:
     return "sha256:" + hashlib.sha256(normalized.encode("ascii")).hexdigest()
 
 
-def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues:
+@dataclass(frozen=True, slots=True)
+class _NvidiaExporterReading:
+    """One validated pinned-exporter response, classified on its own host clock.
+
+    ``success_timestamp`` is the exporter's last-success token (``None`` before
+    its first success) and ``response_date_seconds`` its response Date.
+    ``age_bound_seconds`` bounds the sample's age at complete local receipt.
+    ``values`` exists only for a successful collection whose bound is inside the
+    strict limit; otherwise ``unavailable`` carries the typed transient reason.
+    """
+
+    response_date_seconds: int
+    success_timestamp: float | None
+    age_bound_seconds: float | None
+    values: GpuSampleValues | None
+    unavailable: GpuTelemetryUnavailable | None
+
+
+def _nvidia_device_series_present(payload: bytes) -> bool:
+    for raw_line in payload.decode("utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#") and re.split(r"[{\s]", line, maxsplit=1)[0] in _NVIDIA_DEVICE_METRICS:
+            return True
+    return False
+
+
+def _nvidia_exporter_reading(
+    payload: bytes, *, expected_device_uuid: str, response_date: Sequence[str],
+    transport_elapsed_seconds: float,
+) -> _NvidiaExporterReading:
     samples = _prometheus(payload)
-    has_nvidia = bool(_alias(samples, _NVIDIA_ALIASES["utilization"]))
-    if not has_nvidia:
+    success = _alias(samples, _NVIDIA_ALIASES["success"])
+    timestamps = _alias(samples, _NVIDIA_ALIASES["timestamp"])
+    if not success and not _alias(samples, _NVIDIA_ALIASES["utilization"]):
+        raise ValueError("capacity observation requires the pinned nvidia-smi exporter")
+    # The response Date is transport evidence of every pinned response. When it
+    # is absent, repeated or malformed, no local reading time replaces it.
+    response_date_seconds = exporter_response_date_seconds(response_date)
+    if success not in ((0.0,), (1.0,)) or len(timestamps) > 1 or (timestamps and timestamps[0] <= 0):
+        raise ValueError("nvidia-smi exporter collection status is invalid")
+    token = timestamps[0] if timestamps else None
+    if success == (0.0,) and not _nvidia_device_series_present(payload):
+        # Upstream 1.14.0 renders only its always-present health families after
+        # a failed collection, and no timestamp before the first success.
+        if len(_alias(samples, ("nvidia_smi_failed_scrapes_total",))) != 1:
+            raise ValueError("nvidia-smi exporter collection status is invalid")
+        return _NvidiaExporterReading(
+            response_date_seconds, token, None, None,
+            GpuCollectionUnavailableError("nvidia-smi exporter collection is unsuccessful"),
+        )
+    if not _alias(samples, _NVIDIA_ALIASES["utilization"]):
         raise ValueError("capacity observation requires the pinned nvidia-smi exporter")
 
     device_uuid = _nvidia_uuid(payload)
@@ -268,7 +349,7 @@ def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues
     values = {
         name: _alias(samples, aliases) for name, aliases in _NVIDIA_ALIASES.items()
     }
-    if values["success"] not in ((0.0,), (1.0,)) or len(values["timestamp"]) != 1:
+    if token is None:
         raise ValueError("nvidia-smi exporter collection status is invalid")
     utilization = values["utilization"]
     used = values["used_bytes"]
@@ -294,19 +375,26 @@ def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues
         or not -50 <= temperature[0] <= 150
     ):
         raise ValueError("nvidia-smi GPU measurements are invalid")
-    # Missing evidence cannot hide a separate identity, format, measurement or
-    # future-clock violation. Validate those before classifying a failed/stale
-    # collection as transient. Legacy samplers still reject either condition.
-    try:
-        nvidia_smi_sample_age_seconds(
-            now_timestamp=time.time(), success_timestamp=values["timestamp"][0],
+    # Missing or old evidence cannot hide a separate identity, format or
+    # measurement violation, so those are validated before any transient class.
+    if success == (0.0,):
+        return _NvidiaExporterReading(
+            response_date_seconds, token, None, None,
+            GpuCollectionUnavailableError("nvidia-smi exporter collection is unsuccessful"),
         )
-    except GpuSampleStaleError:
-        if values["success"] == (1.0,):
-            raise
-    if values["success"] == (0.0,):
-        raise GpuCollectionUnavailableError("nvidia-smi exporter collection is unsuccessful")
-    return GpuSampleValues(
+    try:
+        age_bound = exporter_sample_age_bound_seconds(
+            response_date_seconds=response_date_seconds, success_timestamp=token,
+            transport_elapsed_seconds=transport_elapsed_seconds,
+        )
+    except GpuSampleClockUnorderedError as error:
+        return _NvidiaExporterReading(response_date_seconds, token, None, None, error)
+    if age_bound > NVIDIA_SMI_MAX_SAMPLE_AGE_SECONDS:
+        return _NvidiaExporterReading(
+            response_date_seconds, token, age_bound, None,
+            GpuSampleStaleError("nvidia-smi exporter sample is stale"),
+        )
+    return _NvidiaExporterReading(response_date_seconds, token, age_bound, GpuSampleValues(
         exporter_family="nvidia_smi",
         device_count=1,
         device_identity_sha256=gpu_device_identity_sha256(device_uuid),
@@ -316,7 +404,23 @@ def _gpu_values(payload: bytes, *, expected_device_uuid: str) -> GpuSampleValues
         framebuffer_total_bytes=round(total[0]),
         power_usage_watts=power[0],
         temperature_celsius=temperature[0],
+    ), None)
+
+
+def _gpu_values(
+    payload: bytes, *, expected_device_uuid: str, response_date: Sequence[str],
+    transport_elapsed_seconds: float,
+) -> GpuSampleValues:
+    """Strict one-shot sampler: every non-current state raises its typed error."""
+
+    reading = _nvidia_exporter_reading(
+        payload, expected_device_uuid=expected_device_uuid, response_date=response_date,
+        transport_elapsed_seconds=transport_elapsed_seconds,
     )
+    if reading.unavailable is not None:
+        raise reading.unavailable
+    assert reading.values is not None
+    return reading.values
 
 
 class MineruApiCapacitySampler:
@@ -382,17 +486,20 @@ class GpuCapacitySampler:
         self._expected_device_uuid = expected_device_uuid
 
     def sample(self) -> GpuSampleValues:
-        payload = _fetch_payload(
+        response = _fetch_response(
             self._url,
             timeout_seconds=self._timeout,
             accepted_content_types=frozenset(
                 {"application/openmetrics-text", "text/plain"}
             ),
             maximum_bytes=MAX_METRICS_BYTES,
+            capture_headers=(EXPORTER_DATE_HEADER,),
         )
         return _gpu_values(
-            payload,
+            response.body,
             expected_device_uuid=self._expected_device_uuid,
+            response_date=response.headers[EXPORTER_DATE_HEADER],
+            transport_elapsed_seconds=response.elapsed_seconds,
         )
 
 

@@ -172,16 +172,27 @@ class MineruStreamPolicyTests(unittest.TestCase):
             sample(3, 3),  # Future relative to the observing clock.
             sample(3, 2, unsafe_reason="source owner changed"),
         )
+        # A partial startup sample has no joined time; it never anchors the
+        # clock ordering, and every fault after the first join still latches.
+        partial = sample(1, 0, observed_monotonic=None, gpu_free_bytes=None,
+                         unknown_reason="gpu_unavailable_or_stale")
         for bad in bad_samples:
-            with self.subTest(sample=bad):
-                policy = MineruStreamPolicy(config())
-                policy.evaluate(baseline, now=1)
-                decision = policy.evaluate(bad, now=2)
-                self.assertEqual(decision.target, 0)
-                self.assertTrue(decision.unsafe)
-                recovered = policy.evaluate(sample(20, 100), now=100)
-                self.assertEqual(recovered.target, 0)
-                self.assertTrue(recovered.unsafe)
+            for partial_start in (False, True):
+                with self.subTest(sample=bad, partial_start=partial_start):
+                    policy = MineruStreamPolicy(config())
+                    if partial_start:
+                        self.assertEqual(policy.evaluate(partial, now=0.5).reason, "pressure_unknown")
+                    policy.evaluate(baseline, now=1)
+                    decision = policy.evaluate(bad, now=2)
+                    self.assertEqual(decision.target, 0)
+                    self.assertTrue(decision.unsafe)
+                    recovered = policy.evaluate(sample(20, 100), now=100)
+                    self.assertEqual(recovered.target, 0)
+                    self.assertTrue(recovered.unsafe)
+        policy = MineruStreamPolicy(config())
+        policy.evaluate(partial, now=1)
+        self.assertFalse(policy.evaluate(sample(2, -2.0), now=1).unsafe)
+        self.assertEqual(policy.evaluate(sample(3, -2.5), now=1).reason, "unsafe:sample_clock_drift")
 
     def test_post_guard_rechecks_pause_but_does_not_revoke_positive_held_credit(self) -> None:
         policy = MineruStreamPolicy(config())
