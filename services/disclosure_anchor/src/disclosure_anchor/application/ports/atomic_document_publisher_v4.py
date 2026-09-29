@@ -5,16 +5,23 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 import hashlib
-import json
 import re
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
+    PublicationEnvelopeExceededError,
+)
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.contracts.atomic_publication_artifact_readiness_v4 import (
     AtomicPublicationArtifactsReadyV4,
     AtomicPublicationReadinessReferenceV1,
     AtomicPublicationUnitBindingV4,
     validate_preparation_readiness_pair_v1,
+)
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+    PublicationCapacityFactV1,
+    canonical_publication_json,
 )
 from disclosure_anchor.application.ports.staged_provider_parser import V4ClaimWitness, V4StageGuard
 from disclosure_anchor.domain import entities as e
@@ -30,7 +37,6 @@ if TYPE_CHECKING:
 
 
 ATOMIC_PUBLICATION_WINNER_V4_CONTRACT = "atomic-publication-winner.v4"
-_MAX_BYTES = 8 * 1024 * 1024
 _MAX_INT = (1 << 63) - 1
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _ASSET_ID = re.compile(r"du_[0-9A-HJKMNP-TV-Z]{26}\Z")
@@ -300,7 +306,7 @@ class AtomicPublicationWinnerV4:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(_winner_payload(self))
+        return _canonical_json(_winner_payload(self), "winner")
 
     @property
     def sha256(self) -> str:
@@ -485,6 +491,139 @@ def seal_atomic_publication_winner_v4(
     return winner
 
 
+# The only winner values transaction P chooses itself: increasing positive
+# BIGSERIAL outbox sequences and the UTC commit time.  Their widest encodings
+# are the largest signed BIGINTs and a microsecond timestamp with a four-digit
+# year.
+_WIDEST_COMMIT_TIME = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+
+def atomic_publication_winner_byte_upper_bound_v4(
+    *,
+    request: AtomicPublicationRequestV4,
+    unit_bindings: tuple[AtomicPublicationUnitBindingV4, ...],
+    artifact_readiness: AtomicPublicationReadinessReferenceV1,
+) -> int:
+    """Bound the canonical winner bytes transaction P can write for this plan.
+
+    P derives every other winner value from this request, these prepared Unit
+    bindings and this readiness reference through the same projection
+    functions used here; outbox event and asset IDs are fixed-width minted
+    identifiers.  Only the outbox sequence and the commit time are projected,
+    at their widest encodings.  The projection is measured and dropped: it is
+    never a winner, and P still checks its exact winner.  A projected winner
+    component already outside the winner envelope is refused as an upper
+    bound: like the whole bound, it is a conservative refusal, not a count of
+    the winner P would write.
+    """
+
+    try:
+        return _winner_projection_byte_count_v4(
+            request=request,
+            unit_bindings=unit_bindings,
+            artifact_readiness=artifact_readiness,
+            last_event_sequence=_MAX_INT,
+            commit_time=_WIDEST_COMMIT_TIME,
+        )
+    except PublicationEnvelopeExceededError as exc:
+        if exc.record_kind != "winner" or exc.bound == "upper_bound":
+            raise
+        raise PublicationEnvelopeExceededError(
+            PublicationCapacityFactV1(
+                record_kind="winner",
+                bound="upper_bound",
+                byte_count=exc.byte_count,
+                limit=exc.limit,
+                policy_identity=exc.policy_identity,
+            )
+        ) from None
+
+
+def _winner_projection_byte_count_v4(
+    *,
+    request: AtomicPublicationRequestV4,
+    unit_bindings: tuple[AtomicPublicationUnitBindingV4, ...],
+    artifact_readiness: AtomicPublicationReadinessReferenceV1,
+    last_event_sequence: int,
+    commit_time: datetime,
+) -> int:
+    if type(artifact_readiness) is not AtomicPublicationReadinessReferenceV1:
+        raise ValueError("winner projection requires an exact readiness reference")
+    if not isinstance(unit_bindings, tuple) or any(
+        type(item) is not AtomicPublicationUnitBindingV4 for item in unit_bindings
+    ):
+        raise ValueError("winner projection requires exact prepared Unit bindings")
+    unit_assets = tuple(UnitAssetWinnerV4(**asdict(item)) for item in unit_bindings)
+    unit_diff = _derive_unit_diff_v4(request=request, unit_assets=unit_assets)
+    domain_events = _outbox_events_v4(
+        request=request, unit_diff=unit_diff, occurred_at=commit_time,
+    )
+    first_event_sequence = last_event_sequence - len(domain_events) + 1
+    events = tuple(
+        seal_published_outbox_event_v4(
+            event_id=event.event_id,
+            event_sequence=first_event_sequence + offset,
+            event_kind=event.event_kind,
+            change_kind=event.change_kind,
+            subject_kind=event.subject_kind,
+            subject_ref=event.subject_ref,
+            document_id=event.document_id,
+            processing_run_id=event.processing_run_id,
+            asset_id=event.asset_id,
+            canonical_payload_json=canonical_publication_json(event.payload).decode("utf-8"),
+            occurred_at=commit_time,
+        )
+        for offset, event in enumerate(domain_events)
+    )
+    del domain_events
+    identity = request.identity
+    outbox_commit = seal_published_outbox_commit_reference_v4(events=events)
+    updated_count = len(unit_diff.projection_changed)
+    deleted_count = len(unit_diff.removed)
+    projection = AtomicPublicationWinnerV4(
+        attempt_id=identity.attempt_id,
+        fence_identity=identity.fence_identity,
+        document_id=identity.document_id,
+        processing_run_id=identity.processing_run_id,
+        publish_attempt_generation=identity.attempt_generation,
+        local_checkpoint_sha256=identity.expected_checkpoint_sha256,
+        lifecycle_version_before=identity.expected_lifecycle_version,
+        lifecycle_version_after=identity.expected_lifecycle_version + 1,
+        request_sha256=request.request_sha256,
+        upstream_evidence_sha256=request.upstream_evidence.evidence_sha256,
+        final_units_sha256=final_unit_rows_sha256_v4(unit_assets),
+        lineage_sha256=lineage_rows_sha256_v4(unit_assets),
+        processing_run_row_sha256=processing_run_row_sha256_v4(request),
+        previous_active_run_id=identity.expected_previous_processing_run_id,
+        inserted_count=len(unit_assets),
+        updated_count=updated_count,
+        deleted_count=deleted_count,
+        outbox_commit=outbox_commit,
+        durable_base_commit=DurablePublishBaseCommitReference(
+            document_id=identity.document_id,
+            processing_run_id=identity.processing_run_id,
+            publish_attempt_generation=identity.attempt_generation,
+            source_identity_sha256=request.upstream_evidence.source_pdf_sha256,
+            source_page_count=request.source_page_count,
+            publish_precommit_at=commit_time,
+            durable_base_sha256=durable_publish_base_sha256_v4(
+                request=request,
+                unit_assets=unit_assets,
+                previous_active_run_id=identity.expected_previous_processing_run_id,
+                updated_count=updated_count,
+                deleted_count=deleted_count,
+                outbox_commit=outbox_commit,
+                publish_precommit_at=commit_time,
+            ),
+        ),
+        unit_assets=unit_assets,
+        publish_precommit_at=commit_time,
+        artifact_readiness=artifact_readiness,
+        winner_row_version=2,
+    )
+    return len(canonical_publication_json(_winner_payload(projection)))
+
+
 def seal_unit_asset_winners_v4(
     *,
     request: AtomicPublicationRequestV4,
@@ -524,7 +663,9 @@ def seal_published_outbox_event_v4(**values: Any) -> PublishedOutboxEventV4:
         raise ValueError("PublishedOutboxEventV4 fields are not closed")
     exact_values = dict(values)
     exact_values["event_row_sha256"] = _digest(
-        _canonical_json(_published_outbox_event_values_payload(values))
+        _canonical_json(
+            _published_outbox_event_values_payload(values), "winner", bound="lower_bound"
+        )
     )
     return PublishedOutboxEventV4(**exact_values)
 
@@ -532,7 +673,9 @@ def seal_published_outbox_event_v4(**values: Any) -> PublishedOutboxEventV4:
 def published_outbox_event_row_sha256_v4(
     event: PublishedOutboxEventV4,
 ) -> str:
-    return _digest(_canonical_json(_published_outbox_event_payload(event)))
+    return _digest(
+        _canonical_json(_published_outbox_event_payload(event), "winner", bound="lower_bound")
+    )
 
 
 def published_outbox_events_sha256_v4(
@@ -548,7 +691,9 @@ def published_outbox_events_sha256_v4(
                     "event_row_sha256": item.event_row_sha256,
                 }
                 for item in events
-            ]
+            ],
+            "winner",
+            bound="lower_bound",
         )
     )
 
@@ -590,10 +735,19 @@ def build_atomic_publication_outbox_events_v4(
         request=request,
         asset_ids=asset_ids,
     )
-    unit_diff = _derive_unit_diff_v4(
+    return _outbox_events_v4(
         request=request,
-        unit_assets=unit_assets,
+        unit_diff=_derive_unit_diff_v4(request=request, unit_assets=unit_assets),
+        occurred_at=occurred_at,
     )
+
+
+def _outbox_events_v4(
+    *,
+    request: AtomicPublicationRequestV4,
+    unit_diff: _UnitDiffV4,
+    occurred_at: datetime,
+) -> tuple[e.OutboxEvent, ...]:
     events: list[e.OutboxEvent] = []
     for old in unit_diff.removed:
         events.append(
@@ -715,7 +869,9 @@ def durable_publish_base_sha256_v4(
                 "upstream_evidence_sha256": (
                     request.upstream_evidence.evidence_sha256
                 ),
-            }
+            },
+            "winner",
+            bound="lower_bound",
         )
     )
 
@@ -757,7 +913,8 @@ def final_unit_row_sha256_v4(
                 ),
                 "structure_hash": unit.structure_hash,
                 "title": unit.title,
-            }
+            },
+            "unit_row",
         )
     )
 
@@ -792,7 +949,8 @@ def lineage_row_sha256_v4(
                 "upstream_evidence_sha256": (
                     request.upstream_evidence.evidence_sha256
                 ),
-            }
+            },
+            "unit_row",
         )
     )
 
@@ -803,7 +961,7 @@ def processing_run_row_sha256_v4(
     projection = strict_json_loads(
         request.processing_run_projection_json.encode("utf-8")
     )
-    return _digest(_canonical_json(projection))
+    return _digest(_canonical_json(projection, "request", bound="lower_bound"))
 
 
 def final_unit_rows_sha256_v4(
@@ -819,7 +977,8 @@ def final_unit_rows_sha256_v4(
                     "unit_index": item.unit_index,
                 }
                 for item in unit_assets
-            ]
+            ],
+            "unit_bindings",
         )
     ).hexdigest()
 
@@ -836,7 +995,8 @@ def lineage_rows_sha256_v4(
                     "unit_index": item.unit_index,
                 }
                 for item in unit_assets
-            ]
+            ],
+            "unit_bindings",
         )
     ).hexdigest()
 
@@ -906,7 +1066,6 @@ def validate_atomic_publication_winner_v4(
 class _NewActiveUnitProjectionV4:
     unit: PreIdUnitPublicationV4
     asset_id: str
-    query_projection: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -940,11 +1099,7 @@ def _derive_unit_diff_v4(
     new_by_key: dict[tuple[str, str], list[_NewActiveUnitProjectionV4]] = {}
     for asset in unit_assets:
         unit = _request_unit(request, asset.unit_index)
-        new = _NewActiveUnitProjectionV4(
-            unit=unit,
-            asset_id=asset.asset_id,
-            query_projection=_new_unit_query_projection_v4(unit),
-        )
+        new = _NewActiveUnitProjectionV4(unit=unit, asset_id=asset.asset_id)
         new_by_key.setdefault((unit.payload_kind, unit.content_hash), []).append(new)
 
     created: list[_NewActiveUnitProjectionV4] = []
@@ -1054,6 +1209,8 @@ def _changed_projection_fields_v4(
     if not isinstance(old_projection, dict):
         raise ValueError("previous-active Unit projection is not an object")
     old_projection = cast(dict[str, Any], old_projection)
+    # Decoded only for a changed pair: matching needs just the closed hashes.
+    new_projection = _new_unit_query_projection_v4(new.unit)
     field_order = dict.fromkeys(
         (
             "payload_kind",
@@ -1066,14 +1223,14 @@ def _changed_projection_fields_v4(
             "section_keys",
             "mixed_part_annotations",
             *old_projection,
-            *new.query_projection,
+            *new_projection,
         )
     )
     changed = tuple(
         field
         for field in field_order
         if field != "payload_kind"
-        and old_projection.get(field) != new.query_projection.get(field)
+        and old_projection.get(field) != new_projection.get(field)
     )
     if not changed:
         raise ValueError(
@@ -1239,7 +1396,10 @@ def _validate_published_outbox_projection_v4(
 def decode_atomic_publication_winner_v4(
     exact_bytes: bytes,
 ) -> AtomicPublicationWinnerV4:
-    if type(exact_bytes) is not bytes or not 1 <= len(exact_bytes) <= _MAX_BYTES:
+    if (
+        type(exact_bytes) is not bytes
+        or not 1 <= len(exact_bytes) <= PUBLICATION_ENVELOPE_POLICY_V1.winner_bytes
+    ):
         raise ValueError("atomic publication winner bytes are outside the envelope")
     payload = strict_json_loads(exact_bytes)
     if not isinstance(payload, dict):
@@ -1439,16 +1599,11 @@ def _closed(value: dict[str, Any], item_type: type[Any]) -> None:
         raise ValueError(f"{item_type.__name__} fields are not closed")
 
 
-def _canonical_json(value: object) -> bytes:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    if not 1 <= len(encoded) <= _MAX_BYTES:
-        raise ValueError("atomic publication winner bytes are outside the envelope")
+def _canonical_json(value: object, record_kind: str, *, bound: str = "exact") -> bytes:
+    encoded = canonical_publication_json(value)
+    fact = PUBLICATION_ENVELOPE_POLICY_V1.exceeded(record_kind, len(encoded), bound=bound)
+    if fact is not None:
+        raise PublicationEnvelopeExceededError(fact)
     return encoded
 
 
@@ -1457,7 +1612,7 @@ def _canonical_json_text(value: str, label: str) -> None:
         raise ValueError(f"{label} must be canonical JSON text")
     exact = value.encode("utf-8")
     decoded = strict_json_loads(exact)
-    if _canonical_json(decoded) != exact:
+    if _canonical_json(decoded, "winner", bound="lower_bound") != exact:
         raise ValueError(f"{label} is not canonical JSON")
 
 
@@ -1542,6 +1697,7 @@ __all__ = [
     "PublishedOutboxCommitReference",
     "PublishedOutboxEventV4",
     "UnitAssetWinnerV4",
+    "atomic_publication_winner_byte_upper_bound_v4",
     "decode_atomic_publication_winner_v4",
     "durable_publish_base_sha256_v4",
     "final_unit_row_sha256_v4",

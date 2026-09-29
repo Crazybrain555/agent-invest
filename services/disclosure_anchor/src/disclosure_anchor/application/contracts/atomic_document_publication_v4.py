@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
 import hashlib
-import json
 from pathlib import PurePosixPath
 import re
 from typing import Any, cast
 
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+    PublicationCapacityFactV1,
+    canonical_publication_json,
+)
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     LocalMaterializationReceiptV4,
     MaterializationIntentV4,
@@ -63,7 +67,6 @@ ATOMIC_PUBLICATION_REQUEST_V4_CONTRACT = "atomic-publication-request.v4"
 UPSTREAM_PUBLICATION_EVIDENCE_V4_CONTRACT = "publication-upstream-evidence.v4"
 PRE_ID_UNIT_PUBLICATION_V4_CONTRACT = "pre-id-unit-publication.v4"
 PREVIOUS_ACTIVE_UNIT_V4_CONTRACT = "previous-active-unit.v4"
-_MAX_BYTES = 8 * 1024 * 1024
 _MAX_INT = (1 << 63) - 1
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _ASSET_ID = re.compile(r"du_[0-9A-HJKMNP-TV-Z]{26}\Z")
@@ -127,17 +130,41 @@ class WholeDocumentPublicationV4Error(ValueError):
 
 
 class PublicationEnvelopeExceededError(WholeDocumentPublicationV4Error):
-    """A private publication record encodes larger than its fixed byte envelope.
+    """A private publication record is refused by its fixed byte envelope.
 
     A capacity fact of this document under the current release, raised while
-    encoding and so before any readiness write or transaction P: never content
-    damage, and never a reason to truncate or drop Units.
+    encoding or measuring the whole plan before any readiness write, or while
+    encoding the winner inside a transaction P that then rolls back: never
+    content damage, and never a reason to truncate or drop Units.  ``fact``
+    carries only the record kind, the byte count and its bound, the limit and
+    the policy identity; an upper-bound refusal is conservative.
     """
 
-    def __init__(self, *, byte_count: int, limit: int) -> None:
+    def __init__(self, fact: PublicationCapacityFactV1) -> None:
+        if type(fact) is not PublicationCapacityFactV1:
+            raise TypeError("publication envelope refusal requires its exact capacity fact")
         super().__init__("publication record bytes are outside the envelope")
-        self.byte_count = byte_count
-        self.limit = limit
+        self.fact = fact
+
+    @property
+    def record_kind(self) -> str:
+        return self.fact.record_kind
+
+    @property
+    def bound(self) -> str:
+        return self.fact.bound
+
+    @property
+    def byte_count(self) -> int:
+        return self.fact.byte_count
+
+    @property
+    def limit(self) -> int:
+        return self.fact.limit
+
+    @property
+    def policy_identity(self) -> str:
+        return self.fact.policy_identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +266,7 @@ class UpstreamPublicationEvidenceV4:
         _canonical_json_text(
             self.provider_envelope_context_json,
             "provider envelope context",
+            "request",
         )
         context = _provider_envelope_context_v4(
             self.provider_envelope_context_json
@@ -266,7 +294,7 @@ class UpstreamPublicationEvidenceV4:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(asdict(self))
+        return _canonical_json(asdict(self), "request", bound="lower_bound")
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,6 +383,7 @@ class PreviousActiveUnitV4:
         _canonical_json_text(
             self.canonical_query_projection_json,
             "previous-active query projection",
+            "previous_active_inventory",
         )
         projection = strict_json_loads(
             self.canonical_query_projection_json.encode("utf-8")
@@ -470,9 +499,9 @@ class PreIdUnitPublicationV4:
             raise WholeDocumentPublicationV4Error(
                 "pre-ID Unit semantic key invariants failed"
             ) from exc
-        _canonical_json_text(self.canonical_payload_json, "canonical payload")
+        _canonical_json_text(self.canonical_payload_json, "canonical payload", "unit")
         _canonical_json_text(
-            self.canonical_artifact_locator_json, "canonical artifact locator"
+            self.canonical_artifact_locator_json, "canonical artifact locator", "unit"
         )
         for value, label in (
             (self.content_hash, "content"),
@@ -575,7 +604,7 @@ class PreIdUnitPublicationV4:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(_pre_id_unit_payload(self))
+        return _canonical_json(_pre_id_unit_payload(self), "unit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,7 +741,7 @@ class AtomicPublicationRequestV4:
                 "previous-active Unit inventory hash does not close"
             )
         _canonical_json_text(
-            self.processing_run_projection_json, "processing-run projection"
+            self.processing_run_projection_json, "processing-run projection", "request"
         )
         processing_projection = _processing_run_projection_v4(
             self.processing_run_projection_json
@@ -858,7 +887,7 @@ class AtomicPublicationRequestV4:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(_request_payload(self))
+        return _canonical_json(_request_payload(self), "request")
 
 
 
@@ -1035,7 +1064,7 @@ def seal_upstream_publication_evidence_v4(
     }
     return UpstreamPublicationEvidenceV4(
         **values,
-        evidence_sha256=_digest(_canonical_json(values)),
+        evidence_sha256=_digest(_canonical_json(values, "request", bound="lower_bound")),
     )
 
 
@@ -1044,13 +1073,13 @@ def upstream_publication_evidence_sha256_v4(
 ) -> str:
     payload = asdict(value)
     payload.pop("evidence_sha256", None)
-    return _digest(_canonical_json(payload))
+    return _digest(_canonical_json(payload, "request", bound="lower_bound"))
 
 
 def pre_id_unit_routed_draft_sha256_v4(value: PreIdUnitPublicationV4) -> str:
     payload = _pre_id_unit_payload(value)
     payload.pop("routed_draft_sha256", None)
-    return _digest(_canonical_json(payload))
+    return _digest(_canonical_json(payload, "unit", bound="lower_bound"))
 
 
 def atomic_publication_request_sha256_v4(
@@ -1058,7 +1087,7 @@ def atomic_publication_request_sha256_v4(
 ) -> str:
     payload = _request_payload(value)
     payload.pop("request_sha256", None)
-    return _digest(_canonical_json(payload))
+    return _digest(_canonical_json(payload, "request", bound="lower_bound"))
 
 
 def seal_pre_id_unit_publication_v4(**values: Any) -> PreIdUnitPublicationV4:
@@ -1073,7 +1102,9 @@ def seal_pre_id_unit_publication_v4(**values: Any) -> PreIdUnitPublicationV4:
     return PreIdUnitPublicationV4(
         **sealed_values,
         routed_draft_sha256=_digest(
-            _canonical_json(_pre_id_unit_unsealed_payload(sealed_values))
+            _canonical_json(
+                _pre_id_unit_unsealed_payload(sealed_values), "unit", bound="lower_bound"
+            )
         ),
     )
 
@@ -1090,7 +1121,9 @@ def seal_atomic_publication_request_v4(**values: Any) -> AtomicPublicationReques
     return AtomicPublicationRequestV4(
         **sealed_values,
         request_sha256=_digest(
-            _canonical_json(_request_unsealed_payload(sealed_values))
+            _canonical_json(
+                _request_unsealed_payload(sealed_values), "request", bound="lower_bound"
+            )
         ),
     )
 
@@ -1105,14 +1138,20 @@ def previous_active_units_sha256_v4(
             "previous-active Unit inventory must be an exact tuple"
         )
     return _digest(
-        _canonical_json([_previous_active_unit_payload(item) for item in units])
+        _canonical_json(
+            [_previous_active_unit_payload(item) for item in units],
+            "previous_active_inventory",
+        )
     )
 
 
 def decode_atomic_publication_request_v4(
     exact_bytes: bytes,
 ) -> AtomicPublicationRequestV4:
-    if type(exact_bytes) is not bytes or not 1 <= len(exact_bytes) <= _MAX_BYTES:
+    if (
+        type(exact_bytes) is not bytes
+        or not 1 <= len(exact_bytes) <= PUBLICATION_ENVELOPE_POLICY_V1.request_bytes
+    ):
         raise WholeDocumentPublicationV4Error(
             "atomic publication request bytes are outside the envelope"
         )
@@ -1337,34 +1376,27 @@ def _closed(value: dict[str, Any], item_type: type[Any]) -> None:
         )
 
 
-def _canonical_json(value: object) -> bytes:
+def _canonical_json(value: object, record_kind: str, *, bound: str = "exact") -> bytes:
     try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        encoded = canonical_publication_json(value)
     except (TypeError, ValueError) as exc:
         raise WholeDocumentPublicationV4Error(
             "publication record is not strict JSON"
         ) from exc
-    if len(encoded) > _MAX_BYTES:
-        raise PublicationEnvelopeExceededError(byte_count=len(encoded), limit=_MAX_BYTES)
-    if not encoded:
-        raise WholeDocumentPublicationV4Error(
-            "publication record bytes are outside the envelope"
-        )
+    fact = PUBLICATION_ENVELOPE_POLICY_V1.exceeded(record_kind, len(encoded), bound=bound)
+    if fact is not None:
+        raise PublicationEnvelopeExceededError(fact)
     return encoded
 
 
-def _canonical_json_text(value: str, label: str) -> None:
+def _canonical_json_text(value: str, label: str, record_kind: str) -> None:
+    """Require canonical JSON text; its bytes are a lower bound of ``record_kind``."""
+
     if not isinstance(value, str) or not value:
         raise WholeDocumentPublicationV4Error(f"{label} must be canonical JSON text")
     exact = value.encode("utf-8")
     decoded = strict_json_loads(exact)
-    if _canonical_json(decoded) != exact:
+    if _canonical_json(decoded, record_kind, bound="lower_bound") != exact:
         raise WholeDocumentPublicationV4Error(f"{label} is not canonical JSON")
 
 

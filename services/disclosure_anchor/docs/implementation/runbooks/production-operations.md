@@ -805,8 +805,10 @@ upgrade”。所有数值（D/H/P/C/M、单项许可、硬包络、Mac 配额与
      `stage_grant_unsatisfiable`。任务、证据、spool、ZIP 与 credit 原样保留，不失败、不 cleanup、不 ACK。
    - 单文档 hold（decode_input_bytes、decode_output_bytes、transfer_logical_deadline、transfer_progress、
      transfer_range_unsupported、publication_envelope）→ `stage_capacity_hold:<维度>`：该 attempt 保持 claim 可见，其它工作继续；
-     只有这些 hold 自己占满某个限额为正的账本维度（例如 materialization_items = Mac finalize 并发）时才
-     `capacity_holds_exhausted` 停止；限额为 0 的维度不算。
+     只要还有别的工作能推进就不停（含仍有未读准入页、会重探的 readiness 延后或安全 stream 暂停）。无在途、无
+     自唤醒路径而只剩 hold 或被 hold 挡住的排队时，一次以 `capacity_holds_exhausted` 停止：首因点名那份 hold，
+     诊断列出每个短缺维度的 owned/promised/requested/limit 与持有者；legacy obligations 未结不算唤醒。操作员
+     排空（TERM）时只剩 hold 以 operator_drain 结束，不写公共停止；下次启动 hold 仍在则再停一次。
    - 放行后同一 attempt 只重派一次；原因仍在则以同一 reason/指纹再次停止，不循环。不要删文件、不要手工
      ACK、不要改 registry 或重排来“腾空间”。
    - 原生 hold 的唯一受管出口是对这一个任务的显式终止决定（持有 blocked 任务时安装器拒绝 idle 检查，
@@ -841,9 +843,18 @@ upgrade”。所有数值（D/H/P/C/M、单项许可、硬包络、Mac 配额与
      然后按 §1.1f 放行：worker 轮询到失败 → `provider_storage_hold_terminated`（provider_terminal，不自动重试）
      → cleanup → ACK。之后若包络已按新资格提高，再按 §5.1 对该失败 run 做 parse-requeue。
    - Mac 单文档 hold 的出口是更大的已声明包络（新策略/资格）；本阶段没有 Mac 侧放弃命令。
-     `publication_envelope` 表示该文档的规范请求（8 MiB）、准备记录（24 MiB）或就绪清单（8 MiB）超出私有包络：
-     在任何就绪写入与事务 P 之前拒绝，已物化的输出原样保留；出口是包络足够的新发布，不要截断内容、手工改写记录
-     或反复重排。
+     `publication_envelope` 表示该文档某条私有发布记录被源码固定的 `PublicationEnvelopePolicyV1` 拒绝（请求
+     64 MiB、单 Unit 记录/行 hash 输入 64 MiB、准备 160 MiB、就绪与绑定聚合 8 MiB、winner 8 MiB＝已应用的数据库
+     CHECK、快照 128 MiB、语义 64 MiB；没有页数或 Unit 数上限，支持域是各预算同时满足，请求在预算内不等于其它
+     记录也装得下）：就绪在第一次写入前测量整条计划后拒绝，已物化的输出原样保留；出口是包络足够的新发布，不要
+     截断内容、手工改写记录或反复重排。winner 以保守上界（最宽 outbox 序号与提交时间）准入，`upper_bound` 拒绝
+     是保守拒绝，不证明事务 P 实际会写出超过 8 MiB 的 winner。
+     公共停止时 resident 在锁存首因之后只向 stderr 打印内容无关行：重试耗尽行与类型化诊断
+     `[staged-v4] diagnostic {…}`（排序 ASCII JSON，最多 64 条）。`capacity_hold` 的 `detail` 给出
+     `record_kind`、`bound`（exact|lower_bound|upper_bound）、`byte_count`、`limit`、`policy_sha256`；
+     `no_progress` 列出受阻队首、hold 与短缺维度。其它 errors 条目（可能含异常正文）照旧不打印；畸形诊断只计数。
+     回滚边界：新版本写出超过 56abdb93 读取上限（请求 8 MiB、准备 24 MiB、就绪 8 MiB）的记录后，旧版本读不回
+     这些记录，不能盲目回滚到更小包络的版本。
 3. 九个 E7 prepared 责任迁到新原生运行时（只在 Qnew 真实资格通过后）：
    - 旧 API 仍在服务、worker 停止时，只读取得旧 API 实际 key/tombstone TTL，然后
      `PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.execution_upgrade legacy-key-lookups

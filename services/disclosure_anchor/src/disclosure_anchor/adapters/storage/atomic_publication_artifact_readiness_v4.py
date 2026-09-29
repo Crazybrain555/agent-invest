@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import hashlib
 import os
 from pathlib import Path
@@ -31,18 +31,21 @@ from disclosure_anchor.application.contracts.atomic_publication_artifact_readine
     final_unit_bindings_sha256_v4,
     _issue_atomic_publication_artifacts_ready_v4,
     lineage_bindings_sha256_v4,
+    publication_semantic_route_receipts_file_bytes_v3,
     readiness_resource_values_sha256_v1,
 )
 from disclosure_anchor.application.contracts.provider_document_envelope import (
     PROVIDER_DOCUMENT_CONTRACT_VERSION,
     provider_document_envelope_to_bytes,
 )
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+)
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     RemoteParseCheckpointV4,
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPT_V3,
-    semantic_route_receipts_file_bytes_v3,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.ports.atomic_document_publisher_v4 import (
@@ -56,17 +59,29 @@ from disclosure_anchor.application.ports.atomic_publication_artifact_readiness_v
     PublicationWriteSpacePort,
 )
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
+from disclosure_anchor.application.ports.staged_execution import note_stage
 from disclosure_anchor.application.ports.staged_provider_parser import (
     MaterializedProviderDocumentV4,
     V4ClaimGuard,
     V4ClaimWitness,
     V4StageGuard,
 )
+from disclosure_anchor.application.services.publication_envelope_plan_v4 import (
+    PublicationPlanMeasurementV1,
+    measure_atomic_publication_plan_v4,
+)
 from disclosure_anchor.domain.ids import new_asset_id
 
 
-_MAX_PREPARATION_BYTES = 24 * 1024 * 1024
-_MAX_READINESS_BYTES = 8 * 1024 * 1024
+@dataclass(frozen=True, slots=True)
+class _PublicationPlan:
+    """One measured plan: the readiness bytes written last, and the preparation's identity."""
+
+    preparation_sha256: str
+    preparation_byte_count: int
+    manifest_bytes: bytes
+    reference: AtomicPublicationReadinessReferenceV1
+    measurement: PublicationPlanMeasurementV1
 
 
 class FilesystemAtomicPublicationArtifactReadinessV4:
@@ -106,37 +121,70 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         )
         preparation_relpath, readiness_relpath = self._authority_paths(request)
         preparation = self.load_preparation(request=request)
-        fresh: tuple[AtomicPublicationArtifactPreparationV1, dict[str, bytes]] | None = None
+        create_preparation = preparation is None
         if preparation is None:
-            fresh = self._build_preparation_with_payloads(request=request, materialized=materialized)
-        planned = preparation if preparation is not None else cast(tuple[Any, Any], fresh)[0]
+            preparation, payloads = self._build_preparation_with_payloads(
+                request=request, materialized=materialized,
+            )
+        else:
+            payloads = self._artifact_payloads(
+                request=request, materialized=materialized, preparation=preparation,
+            )
+        # Every record of the plan, including a bound of the winner P can
+        # write, is encoded and measured before the first write: a record
+        # outside the envelope is a capacity fact of this document with no
+        # effect on disk.
+        plan, preparation_bytes = self._plan(
+            request=request,
+            preparation=preparation,
+            payloads=payloads,
+            preparation_relpath=preparation_relpath,
+            readiness_relpath=readiness_relpath,
+        )
+        note_stage(stage_guard, "publication_plan_measured", **plan.measurement.note_scalars())
+        # The whole-plan encoding may outlive this stage.
+        stage_guard.checkpoint()
         with self._space_for_missing_files(
             request=request,
-            preparation=planned,
+            preparation=preparation,
+            plan=plan,
             preparation_relpath=preparation_relpath,
             readiness_relpath=readiness_relpath,
         ):
-            if preparation is None:
-                candidate = planned
+            if create_preparation:
                 try:
                     stage_guard.checkpoint()
                     self._store.create_or_verify(
                         relpath=preparation_relpath,
-                        payload=candidate.canonical_bytes,
+                        payload=preparation_bytes,
                     )
-                    preparation = candidate
                 except AtomicPublicationArtifactConflict:
-                    preparation = self.load_preparation(request=request)
-                    if preparation is None:
+                    loaded = self.load_preparation(request=request)
+                    if loaded is None:
                         raise
+                    # Another producer's IDs own the files: its plan is the
+                    # one measured, written and verified from here on.
+                    preparation = loaded
+                    payloads = self._artifact_payloads(
+                        request=request, materialized=materialized, preparation=loaded,
+                    )
+                    plan, preparation_bytes = self._plan(
+                        request=request,
+                        preparation=loaded,
+                        payloads=payloads,
+                        preparation_relpath=preparation_relpath,
+                        readiness_relpath=readiness_relpath,
+                    )
+            del preparation_bytes
             self._require_same_request(preparation=preparation, request=request)
             exact_preparation = self._store.read_exact(
                 relpath=preparation_relpath,
-                expected_sha256=preparation.sha256,
-                expected_byte_count=len(preparation.canonical_bytes),
-                max_byte_count=_MAX_PREPARATION_BYTES,
+                expected_sha256=plan.preparation_sha256,
+                expected_byte_count=plan.preparation_byte_count,
+                max_byte_count=PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes,
             )
             preparation = decode_atomic_publication_preparation_v1(exact_preparation)
+            del exact_preparation
 
             # The parser tree is installed first; each derived file follows using
             # immutable create-or-verify.  Readiness is the sole last write.
@@ -149,47 +197,76 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
                 claim_guard=claim_guard,
                 stage_guard=stage_guard,
             )
-            # Bytes just encoded for a preparation this call created are reused;
-            # a replayed or concurrently created preparation is re-encoded from
-            # its own bindings. Every payload is still checked against its plan.
-            payloads = (
-                fresh[1] if fresh is not None and fresh[0].sha256 == preparation.sha256
-                else self._artifact_payloads(request=request, materialized=materialized, preparation=preparation)
-            )
-            fresh = None
-            for plan, payload in (
+            for resource, payload in (
                 (preparation.provider_document_plan, payloads["provider_document"]),
                 (preparation.document_unit_snapshot_plan, payloads["document_unit_snapshot"]),
                 (preparation.semantic_route_receipts_plan, payloads["semantic_route_receipts"]),
             ):
-                if _digest(payload) != plan.sha256 or len(payload) != plan.byte_count:
+                if _digest(payload) != resource.sha256 or len(payload) != resource.byte_count:
                     raise AtomicPublicationArtifactReadinessError(
-                        f"{plan.role} bytes drifted from preparation"
+                        f"{resource.role} bytes drifted from preparation"
                     )
                 stage_guard.checkpoint()
                 self._store.create_or_verify(
-                    relpath=Path(plan.relpath),
+                    relpath=Path(resource.relpath),
                     payload=payload,
                 )
             del payloads
             self._verify_resources(preparation)
-            manifest = self._build_readiness(
-                preparation=preparation,
-                preparation_relpath=preparation_relpath,
-            )
             stage_guard.checkpoint()
             self._store.create_or_verify(
                 relpath=readiness_relpath,
-                payload=manifest.canonical_bytes,
+                payload=plan.manifest_bytes,
             )
-        reference = AtomicPublicationReadinessReferenceV1(
-            manifest_relpath=readiness_relpath.as_posix(),
-            manifest_sha256=manifest.sha256,
-            manifest_byte_count=len(manifest.canonical_bytes),
-        )
-        # A successful prepare call is itself replay-verified from disk.
+        reference = plan.reference
+        # Only the reference crosses into the from-disk replay verification.
+        del plan, preparation
         self.verify_ready(reference=reference, expected_request=request)
         return reference
+
+    def _plan(
+        self,
+        *,
+        request: AtomicPublicationRequestV4,
+        preparation: AtomicPublicationArtifactPreparationV1,
+        payloads: dict[str, bytes],
+        preparation_relpath: Path,
+        readiness_relpath: Path,
+    ) -> tuple[_PublicationPlan, bytes]:
+        """Encode the preparation and readiness once and measure the whole plan.
+
+        The preparation bytes are returned beside the plan so the caller can
+        drop them as soon as they are on disk.
+        """
+
+        preparation_bytes = preparation.canonical_bytes
+        manifest_bytes = self._build_readiness(
+            preparation=preparation,
+            preparation_relpath=preparation_relpath,
+            preparation_bytes=preparation_bytes,
+        ).canonical_bytes
+        reference = AtomicPublicationReadinessReferenceV1(
+            manifest_relpath=readiness_relpath.as_posix(),
+            manifest_sha256=_digest(manifest_bytes),
+            manifest_byte_count=len(manifest_bytes),
+        )
+        measurement = measure_atomic_publication_plan_v4(
+            request=request,
+            preparation=preparation,
+            preparation_byte_count=len(preparation_bytes),
+            snapshot_byte_count=len(payloads["document_unit_snapshot"]),
+            semantic_byte_count=len(payloads["semantic_route_receipts"]),
+            readiness=reference,
+            policy=PUBLICATION_ENVELOPE_POLICY_V1,
+        )
+        plan = _PublicationPlan(
+            preparation_sha256=_digest(preparation_bytes),
+            preparation_byte_count=len(preparation_bytes),
+            manifest_bytes=manifest_bytes,
+            reference=reference,
+            measurement=measurement,
+        )
+        return plan, preparation_bytes
 
     @contextmanager
     def _space_for_missing_files(
@@ -197,25 +274,25 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         *,
         request: AtomicPublicationRequestV4,
         preparation: AtomicPublicationArtifactPreparationV1,
+        plan: _PublicationPlan,
         preparation_relpath: Path,
         readiness_relpath: Path,
     ) -> Iterator[None]:
-        """Encode every private record, then promise space for the files not yet on disk.
+        """Promise space only for the planned files not yet on disk.
 
-        Encoding first makes an envelope refusal a capacity fact of this
-        document found before the first write. Present files are verified by
-        create-or-verify, never promised again; promoting the parser tree is a
-        rename and needs no space.
+        The plan was encoded and measured first, so an envelope refusal is a
+        capacity fact of this document found before the first write. Present
+        files are verified by create-or-verify, never promised again; promoting
+        the parser tree is a rename and needs no space.
         """
 
-        manifest = self._build_readiness(preparation=preparation, preparation_relpath=preparation_relpath)
         planned = (
-            (preparation_relpath, len(preparation.canonical_bytes)),
+            (preparation_relpath, plan.preparation_byte_count),
             (Path(preparation.provider_document_plan.relpath), preparation.provider_document_plan.byte_count),
             (Path(preparation.document_unit_snapshot_plan.relpath), preparation.document_unit_snapshot_plan.byte_count),
             (Path(preparation.semantic_route_receipts_plan.relpath),
              preparation.semantic_route_receipts_plan.byte_count),
-            (readiness_relpath, len(manifest.canonical_bytes)),
+            (readiness_relpath, len(plan.manifest_bytes)),
         )
         if self._write_space is None:
             yield
@@ -237,7 +314,7 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         preparation_relpath, _ = self._authority_paths(request)
         raw = self._read_untrusted_regular(
             preparation_relpath,
-            max_byte_count=_MAX_PREPARATION_BYTES,
+            max_byte_count=PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes,
         )
         if raw is None:
             return None
@@ -270,7 +347,7 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         )
         raw = self._read_untrusted_regular(
             preparation_relpath,
-            max_byte_count=_MAX_PREPARATION_BYTES,
+            max_byte_count=PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes,
         )
         if raw is None:
             return None
@@ -305,14 +382,14 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
             relpath=Path(reference.manifest_relpath),
             expected_sha256=reference.manifest_sha256,
             expected_byte_count=reference.manifest_byte_count,
-            max_byte_count=_MAX_READINESS_BYTES,
+            max_byte_count=PUBLICATION_ENVELOPE_POLICY_V1.readiness_bytes,
         )
         manifest = decode_atomic_publication_readiness_v1(manifest_bytes)
         preparation_bytes = self._store.read_exact(
             relpath=Path(manifest.preparation_relpath),
             expected_sha256=manifest.preparation_sha256,
             expected_byte_count=manifest.preparation_byte_count,
-            max_byte_count=_MAX_PREPARATION_BYTES,
+            max_byte_count=PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes,
         )
         preparation = decode_atomic_publication_preparation_v1(preparation_bytes)
         request = decode_atomic_publication_request_v4(
@@ -360,7 +437,9 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
             "document_unit_snapshot": document_unit_snapshot_file_bytes_v1(
                 request=request, bindings=preparation.unit_bindings,
             ),
-            "semantic_route_receipts": semantic_route_receipts_file_bytes_v3(request.semantic_route_receipts),
+            "semantic_route_receipts": publication_semantic_route_receipts_file_bytes_v3(
+                request.semantic_route_receipts
+            ),
         }
 
     def _build_preparation_with_payloads(
@@ -387,7 +466,7 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
             request=request,
             bindings=bindings,
         )
-        semantic_bytes = semantic_route_receipts_file_bytes_v3(
+        semantic_bytes = publication_semantic_route_receipts_file_bytes_v3(
             request.semantic_route_receipts
         )
         # One canonical encoding of the request serves both its text and length.
@@ -455,6 +534,7 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
         *,
         preparation: AtomicPublicationArtifactPreparationV1,
         preparation_relpath: Path,
+        preparation_bytes: bytes,
     ) -> AtomicPublicationReadinessManifestV1:
         resources_sha256 = readiness_resource_values_sha256_v1(
             parser_output=preparation.parser_output_plan,
@@ -478,8 +558,8 @@ class FilesystemAtomicPublicationArtifactReadinessV4:
                 preparation.provider_envelope_context_sha256
             ),
             preparation_relpath=preparation_relpath.as_posix(),
-            preparation_sha256=preparation.sha256,
-            preparation_byte_count=len(preparation.canonical_bytes),
+            preparation_sha256=_digest(preparation_bytes),
+            preparation_byte_count=len(preparation_bytes),
             unit_bindings=preparation.unit_bindings,
             final_units_sha256=preparation.final_units_sha256,
             lineage_sha256=preparation.lineage_sha256,

@@ -823,12 +823,13 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   清空游标与上界；容量等待、observation 等待/放弃、readiness 或 legacy obligations 暂停都保留本轮
   上界与游标。上界只是进程内扫描状态，不持久化、不另建队列，重启即从新一轮开始。
 - 普通候选只因临时信用不足放不下时原地等待，不被越过：观察前已知归档字节数、且没有任何维度超过
-  profile 容量的候选，游标停在它之前，本次调用返回扫描未完成并照常上报 `credit_backpressure:<维度>`；
+  profile 容量的候选，游标停在它之前，本次调用返回扫描未完成（`held_for_credit`）并照常上报 `credit_backpressure:<维度>`；
   此后每个调度 tick 仍按原游标与上界重列一页并重新检查，ID 在它之后的候选不会先于它准入；它若在外部
   变得不合格，重列时页首即换成下一个候选。observation 之后 `build()` 临时放不下时，观察已证明大小
-  （归档大小原本未知也一样），保留观察结果与游标，下一次调用直接重跑 `build()`、不再观察；装下后仍由
-  ingress 事务按同一谓词复核资格。永久装不下（任一维度超过 profile 容量，含观察后才知道的页数派生维度）
-  与观察前大小未知的候选仍越过并分开报告；prepared head 放不下仍越过。等待只由游标与保留的观察结果
+  （归档大小原本未知也一样），保留观察结果与游标（同样 `held_for_credit`），下一次调用直接重跑 `build()`、
+  不再观察；装下后仍由 ingress 事务按同一谓词复核资格。永久装不下（任一维度超过 profile 容量，含观察后才
+  知道的页数派生维度）与观察前大小未知的候选仍越过并分开报告，游标照常前进（不算 `held_for_credit`）；
+  prepared head 放不下仍越过。等待只由游标与保留的观察结果
   表达：不设计时器、超时、信用缓存或队列，不改容量、profile 与 parser；prepared 优先、legacy
   obligations 与准入 guard 不变，已接受工作的各车道照常推进、释放信用。
 - 保证与限度：持续到达的更高 ID 不再能让一轮永不结束；可重试失败回流、requeue 放行、公司恢复 active 等
@@ -838,6 +839,14 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   处理，准入层不另设卡死判定。等待会延长本轮，轮次中途出现的未领取 prepared head 要到本轮结束才被扫描。
   未知大小的 PDF 观察时按整个字节预算计费，只有字节预算全部空闲才能观察，放不下仍被越过；这类容量
   饥饿不在本范围内。
+- LOCAL 完成额度：LOCAL_PREPARE 只有连同它促成的 LOCAL 完成所需输出额度（output_items/bytes/pages）
+  一起放得下时才取 decode 额度；materializing head 在自己的 LOCAL 提交实际输出前一直保有这份承诺，重启时
+  由 durable 有效预留减去已持有额度重建，不另设账本。新增长须与全部承诺并存，兑现承诺的 LOCAL 只与已持有
+  和在途额度比较；恢复出的承诺欠额先由 COMMIT/CLEANUP/ACK 释放。站点只在无在途、无任何自唤醒路径而仍有
+  排队或 hold 时停止一次，并点名阻塞者。仍能带来可运行工作的准入（未读扫描位置、会重新探测的 readiness
+  延后、安全的 stream 暂停）算唤醒；原地等信用的扫描（`held_for_credit`）与未结 legacy obligations
+  （`deferred_on_obligations`）不算。操作员排空时只剩 hold 以 `operator_drain` 结束，不新写公共停止。
+  细则见 [V4 资源生命周期](v4-resource-lifetime.md)。
 - 新任务 readiness 的类型化暂不可用只暂停普通源准入；已领取 prepared-H0、远端轮询、
   publication、cleanup、ACK 不以新任务健康检查为执行许可。单例/身份丢失仍立即 fail closed。
   准入暂停按独立探测间隔恢复，遥测在暂停期间保持 closed，成功探测后清除旧原因。

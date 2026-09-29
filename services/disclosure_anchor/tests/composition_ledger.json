@@ -100,6 +100,10 @@
    "private_imports": [],
    "tests": 14
   },
+  "tests/integration/test_publication_large_record_chain_v4.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/integration/test_publish_evidence_ledger.py": {
    "private_imports": [],
    "tests": 7
@@ -199,11 +203,11 @@
   },
   "tests/unit/test_atomic_document_publication_v4.py": {
    "private_imports": [],
-   "tests": 19
+   "tests": 18
   },
   "tests/unit/test_atomic_publication_artifact_readiness_adapter_v4.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 6
   },
   "tests/unit/test_atomic_publication_inventory_v4.py": {
    "private_imports": [],
@@ -988,13 +992,13 @@
    "private_imports": [],
    "tests": 11
   },
-  "tests/unit/test_mineru_release_install_independent.py": {
-   "private_imports": [],
-   "tests": 5
-  },
   "tests/unit/test_mineru_release_inference_recreate.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_mineru_release_install_independent.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_mineru_release_package_independent.py": {
    "private_imports": [],
@@ -1246,6 +1250,10 @@
   "tests/unit/test_provider_unit_evidence.py": {
    "private_imports": [],
    "tests": 3
+  },
+  "tests/unit/test_publication_envelope_policy.py": {
+   "private_imports": [],
+   "tests": 9
   },
   "tests/unit/test_publication_text_representability_independent.py": {
    "private_imports": [],
@@ -1515,6 +1523,10 @@
    "private_imports": [],
    "tests": 13
   },
+  "tests/unit/test_staged_completion_credit.py": {
+   "private_imports": [],
+   "tests": 17
+  },
   "tests/unit/test_staged_coordinator_backend_v4.py": {
    "private_imports": [],
    "tests": 17
@@ -1673,7 +1685,7 @@
   },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 40
+   "tests": 41
   },
   "tests/unit/test_worker_progress.py": {
    "private_imports": [],

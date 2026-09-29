@@ -22,8 +22,13 @@ from disclosure_anchor.application.contracts.atomic_document_publication_v4 impo
     PublicationEnvelopeExceededError,
     decode_atomic_publication_request_v4,
 )
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+    canonical_publication_json,
+)
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPT_V3,
+    SemanticRouteReceiptRowV3,
     semantic_route_receipts_file_bytes_v3,
 )
 from disclosure_anchor.application.contracts.staged_resource_paths import (
@@ -42,8 +47,6 @@ ATOMIC_PUBLICATION_PREPARATION_FILENAME = (
 )
 ATOMIC_PUBLICATION_READINESS_FILENAME = "atomic_publication_readiness.v1.json"
 
-_MAX_PREPARATION_BYTES = 24 * 1024 * 1024
-_MAX_READINESS_BYTES = 8 * 1024 * 1024
 _MAX_IDENTITY_BYTES = 512
 _MAX_COUNT = (1 << 63) - 1
 _SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -193,12 +196,12 @@ class AtomicPublicationArtifactPreparationV1:
         _sha(self.provider_envelope_context_sha256, "provider envelope context")
         _sha(self.final_units_sha256, "final Units")
         _sha(self.lineage_sha256, "lineage")
-        request_bytes = _canonical_request_bytes(self.canonical_request_json)
+        request_bytes, request = _canonical_request(self.canonical_request_json)
         if self.request_byte_count != len(request_bytes):
             raise AtomicPublicationArtifactReadinessError(
                 "publication preparation request identity drifted"
             )
-        request = decode_atomic_publication_request_v4(request_bytes)
+        del request_bytes
         identity = request.identity
         if (
             (
@@ -283,7 +286,7 @@ class AtomicPublicationArtifactPreparationV1:
             != projection["semantic_route_receipts_relpath"]
             or self.semantic_route_receipts_plan.sha256
             != _digest(
-                semantic_route_receipts_file_bytes_v3(
+                publication_semantic_route_receipts_file_bytes_v3(
                     request.semantic_route_receipts
                 )
             )
@@ -294,7 +297,7 @@ class AtomicPublicationArtifactPreparationV1:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(_preparation_payload(self), _MAX_PREPARATION_BYTES)
+        return _canonical_json(_preparation_payload(self), "preparation")
 
     @property
     def sha256(self) -> str:
@@ -393,7 +396,7 @@ class AtomicPublicationReadinessManifestV1:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(_readiness_payload(self), _MAX_READINESS_BYTES)
+        return _canonical_json(_readiness_payload(self), "readiness")
 
     @property
     def sha256(self) -> str:
@@ -529,12 +532,18 @@ def validate_preparation_readiness_pair_v1(
         manifest.document_unit_snapshot,
         manifest.semantic_route_receipts,
     )
+    if common_preparation != common_manifest:
+        raise AtomicPublicationArtifactReadinessError(
+            "publication readiness does not bind one exact preparation"
+        )
+    # One encoding of each record serves both its digest and its length.
+    preparation_bytes = preparation.canonical_bytes
+    manifest_bytes = manifest.canonical_bytes
     if (
-        common_preparation != common_manifest
-        or manifest.preparation_sha256 != preparation.sha256
-        or manifest.preparation_byte_count != len(preparation.canonical_bytes)
-        or reference.manifest_sha256 != manifest.sha256
-        or reference.manifest_byte_count != len(manifest.canonical_bytes)
+        manifest.preparation_sha256 != _digest(preparation_bytes)
+        or manifest.preparation_byte_count != len(preparation_bytes)
+        or reference.manifest_sha256 != _digest(manifest_bytes)
+        or reference.manifest_byte_count != len(manifest_bytes)
         or request.request_sha256 != preparation.request_sha256
     ):
         raise AtomicPublicationArtifactReadinessError(
@@ -557,7 +566,7 @@ def final_unit_bindings_sha256_v4(
                 }
                 for item in bindings
             ],
-            _MAX_READINESS_BYTES,
+            "unit_bindings",
         )
     )
 
@@ -576,7 +585,7 @@ def lineage_bindings_sha256_v4(
                 }
                 for item in bindings
             ],
-            _MAX_READINESS_BYTES,
+            "unit_bindings",
         )
     )
 
@@ -607,9 +616,20 @@ def readiness_resource_values_sha256_v1(
                 "provider_document": asdict(provider_document),
                 "semantic_route_receipts": asdict(semantic_route_receipts),
             },
-            _MAX_READINESS_BYTES,
+            "readiness",
+            bound="lower_bound",
         )
     )
+
+
+def publication_semantic_route_receipts_file_bytes_v3(
+    rows: tuple[SemanticRouteReceiptRowV3, ...],
+) -> bytes:
+    """Return the sole semantic receipt JSONL bytes, refused past their envelope."""
+
+    encoded = semantic_route_receipts_file_bytes_v3(rows)
+    _require_within_envelope("semantic", len(encoded))
+    return encoded
 
 
 def document_unit_snapshot_file_bytes_v1(
@@ -617,11 +637,17 @@ def document_unit_snapshot_file_bytes_v1(
     request: AtomicPublicationRequestV4,
     bindings: tuple[AtomicPublicationUnitBindingV4, ...],
 ) -> bytes:
-    """Return the legacy-compatible immutable Unit snapshot JSONL bytes."""
+    """Return the legacy-compatible immutable Unit snapshot JSONL bytes.
+
+    Each row is encoded alone, so only one decoded Unit payload lives beside
+    the growing output.  A snapshot past its envelope is refused at the first
+    row that proves it (a lower bound), before the remaining rows are encoded.
+    """
 
     _validate_bindings(request=request, bindings=bindings)
-    rows: list[dict[str, Any]] = []
-    for unit, binding in zip(request.units, bindings, strict=True):
+    encoded = bytearray()
+    last = len(bindings) - 1
+    for index, (unit, binding) in enumerate(zip(request.units, bindings, strict=True)):
         payload = strict_json_loads(unit.canonical_payload_json.encode("utf-8"))
         locator = strict_json_loads(
             unit.canonical_artifact_locator_json.encode("utf-8")
@@ -630,35 +656,38 @@ def document_unit_snapshot_file_bytes_v1(
             raise AtomicPublicationArtifactReadinessError(
                 "Unit snapshot payload or locator is not an object"
             )
-        rows.append(
-            {
-                "applicability": unit.applicability,
-                "artifact_locator": locator,
-                "asset_id": binding.asset_id,
-                "content_hash": unit.content_hash,
-                "document_id": unit.document_id,
-                "heading_path": list(unit.heading_path),
-                "order_index": unit.unit_index,
-                "page_no": unit.page_no,
-                "payload": payload,
-                "payload_kind": unit.payload_kind,
-                "quality_status": unit.quality_status,
-                "section_keys": (
-                    None if unit.section_keys is None else list(unit.section_keys)
-                ),
-                "semantic_key": (
-                    None if not unit.semantic_keys else unit.semantic_keys[0]
-                ),
-                "semantic_keys": (
-                    None if unit.semantic_keys is None else list(unit.semantic_keys)
-                ),
-                "title": unit.title,
-            }
+        row = {
+            "applicability": unit.applicability,
+            "artifact_locator": locator,
+            "asset_id": binding.asset_id,
+            "content_hash": unit.content_hash,
+            "document_id": unit.document_id,
+            "heading_path": list(unit.heading_path),
+            "order_index": unit.unit_index,
+            "page_no": unit.page_no,
+            "payload": payload,
+            "payload_kind": unit.payload_kind,
+            "quality_status": unit.quality_status,
+            "section_keys": (
+                None if unit.section_keys is None else list(unit.section_keys)
+            ),
+            "semantic_key": (
+                None if not unit.semantic_keys else unit.semantic_keys[0]
+            ),
+            "semantic_keys": (
+                None if unit.semantic_keys is None else list(unit.semantic_keys)
+            ),
+            "title": unit.title,
+        }
+        # Legacy JSONL bytes: json's default separators, one row per Unit.
+        encoded += (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        del payload, locator, row
+        _require_within_envelope(
+            "snapshot",
+            len(encoded),
+            bound="exact" if index == last else "lower_bound",
         )
-    return "".join(
-        json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-        for row in rows
-    ).encode("utf-8")
+    return bytes(encoded)
 
 
 def decode_atomic_publication_preparation_v1(
@@ -667,7 +696,7 @@ def decode_atomic_publication_preparation_v1(
     root = _closed_object(
         exact_bytes,
         AtomicPublicationArtifactPreparationV1,
-        _MAX_PREPARATION_BYTES,
+        PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes,
     )
     bindings = _decode_bindings(root["unit_bindings"])
     parser = _decode_nested(root["parser_output_plan"], AtomicPublicationParserOutputPlanV1)
@@ -697,7 +726,7 @@ def decode_atomic_publication_readiness_v1(
     root = _closed_object(
         exact_bytes,
         AtomicPublicationReadinessManifestV1,
-        _MAX_READINESS_BYTES,
+        PUBLICATION_ENVELOPE_POLICY_V1.readiness_bytes,
     )
     bindings = _decode_bindings(root["unit_bindings"])
     parser = _decode_nested(root["parser_output"], AtomicPublicationParserOutputPlanV1)
@@ -754,22 +783,19 @@ def _binding_tuple(bindings: tuple[AtomicPublicationUnitBindingV4, ...]) -> None
         )
 
 
-def _canonical_request_bytes(value: str) -> bytes:
+def _canonical_request(value: str) -> tuple[bytes, AtomicPublicationRequestV4]:
+    """Decode the embedded request once; the decoder proves the exact round trip."""
+
     if not isinstance(value, str) or not value:
         raise AtomicPublicationArtifactReadinessError(
             "canonical publication request is empty"
         )
     exact = value.encode("utf-8")
-    if len(exact) > 8 * 1024 * 1024:
+    if len(exact) > PUBLICATION_ENVELOPE_POLICY_V1.request_bytes:
         raise AtomicPublicationArtifactReadinessError(
             "canonical publication request exceeds its envelope"
         )
-    request = decode_atomic_publication_request_v4(exact)
-    if request.canonical_bytes != exact:
-        raise AtomicPublicationArtifactReadinessError(
-            "canonical publication request does not round-trip exactly"
-        )
-    return exact
+    return exact, decode_atomic_publication_request_v4(exact)
 
 
 def _preparation_payload(
@@ -830,26 +856,21 @@ def _decode_bindings(value: object) -> tuple[AtomicPublicationUnitBindingV4, ...
     )
 
 
-def _canonical_json(value: object, limit: int) -> bytes:
+def _canonical_json(value: object, record_kind: str, *, bound: str = "exact") -> bytes:
     try:
-        exact = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        exact = canonical_publication_json(value)
     except (TypeError, ValueError) as exc:
         raise AtomicPublicationArtifactReadinessError(
             "publication artifact JSON is invalid"
         ) from exc
-    if len(exact) > limit:
-        raise PublicationArtifactEnvelopeExceededError(byte_count=len(exact), limit=limit)
-    if not exact:
-        raise AtomicPublicationArtifactReadinessError(
-            "publication artifact JSON is outside its envelope"
-        )
+    _require_within_envelope(record_kind, len(exact), bound=bound)
     return exact
+
+
+def _require_within_envelope(record_kind: str, byte_count: int, *, bound: str = "exact") -> None:
+    fact = PUBLICATION_ENVELOPE_POLICY_V1.exceeded(record_kind, byte_count, bound=bound)
+    if fact is not None:
+        raise PublicationArtifactEnvelopeExceededError(fact)
 
 
 def _digest(value: bytes) -> str:
@@ -909,6 +930,7 @@ __all__ = [
     "document_unit_snapshot_file_bytes_v1",
     "final_unit_bindings_sha256_v4",
     "lineage_bindings_sha256_v4",
+    "publication_semantic_route_receipts_file_bytes_v3",
     "readiness_resources_sha256_v1",
     "readiness_resource_values_sha256_v1",
     "validate_preparation_readiness_pair_v1",

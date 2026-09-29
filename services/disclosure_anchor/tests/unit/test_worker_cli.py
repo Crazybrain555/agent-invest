@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -17,11 +18,20 @@ from disclosure_anchor.application.dto.worker_report import (
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.services.staged_parse_coordinator import (
+    CapacityHoldDetail,
+    CapacityHoldEvent,
     CoordinatorTerminal,
+    StagedParseCoordinator,
 )
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentGateError,
     MinerUDeploymentUnavailableError,
+)
+from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
+    PublicationEnvelopeExceededError,
+)
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
 )
 from disclosure_anchor.cli import worker as worker_cli
 from disclosure_anchor.domain.errors import ConfigurationError
@@ -29,6 +39,10 @@ from disclosure_anchor.application.ports.worker_stop_control import PublicStopCa
 from disclosure_anchor.application.services.worker_stop_latch import InProcessWorkerStopLatch
 from disclosure_anchor.settings import Settings
 from tests.unit._codex_model_catalog_fixture import prepare_catalog_sha256
+from tests.unit.test_staged_completion_credit import _run as _run_to_end
+from tests.unit.test_staged_coordinator_backend_v4 import _backend_with_publisher_error
+from tests.unit.test_staged_parse_coordinator import _Backend, _limits
+from tests.unit.test_staged_parse_coordinator import _work as _coordinator_work
 
 
 def _unstopped_settings(test: unittest.TestCase) -> mock.MagicMock:
@@ -1220,16 +1234,139 @@ class WatchdogStopCauseAcceptanceTests(unittest.TestCase):
         self.assertIsNone(control.first_cause())
         self.assertEqual(persisted, [])
 
-    def test_unrelated_unclassified_circuit_still_latches_public_stop(self) -> None:
-        persisted: list[PublicStopCause] = []
-        control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
-        with self.assertRaises(worker_cli.WorkerPublicStopError) as raised:
-            worker_cli._end_staged_resident(
-                mock.Mock(termination_kind="circuit", errors=("ordinary failure",)),
-                control, lambda: False,
-            )
-        self.assertEqual(raised.exception.cause.reason_code, "unclassified_circuit")
-        self.assertEqual(persisted, [control.first_cause()])
+    def test_a_publication_hold_alone_stops_once_and_logs_only_its_typed_diagnostics(self) -> None:
+        # The real coordinator dispatches COMMIT into the real V4 backend, whose
+        # publisher refuses a record: the attempt holds with nothing written,
+        # nothing else can progress, and the site stops once. The exit logs
+        # the typed records, never the coordinator's error entries.
+        policy = PUBLICATION_ENVELOPE_POLICY_V1
+        prefix = "[staged-v4] diagnostic "
+        for record_kind, bound, byte_count in (
+            ("request", "exact", policy.request_bytes + 1),
+            # The plan's conservative winner bound: its refusal is named as an
+            # upper bound, not as the size of a winner P would write.
+            ("winner", "upper_bound", policy.winner_bytes + 4096),
+        ):
+            with self.subTest(bound=bound):
+                capacity = policy.exceeded(record_kind, byte_count, bound=bound)
+                assert capacity is not None
+                authority, v4, persistence, publication_committed = _backend_with_publisher_error(
+                    PublicationEnvelopeExceededError(capacity)
+                )
+
+                class _Queue(_Backend):
+                    def commit(self, work, *, credit_allowance, stage_guard):  # type: ignore[no-untyped-def]
+                        self.calls.append(f"commit:{work.attempt_id}")
+                        return v4.commit(work, credit_allowance=credit_allowance, stage_guard=stage_guard)
+
+                queue = _Queue(recoverable=(
+                    _coordinator_work(authority.attempt_id, "local_materialized", authority.lifecycle_version),
+                ))
+                persisted: list[PublicStopCause] = []
+                latch = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+                result = _run_to_end(StagedParseCoordinator(backend=queue, limits=_limits(), stop_control=latch))
+                cause = latch.first_cause()
+                assert cause is not None, result
+                self.assertEqual((cause.reason_code, cause.attempt_id, cause.lane),
+                                 ("capacity_holds_exhausted", authority.attempt_id, "commit"))
+                self.assertEqual(persisted, [cause])
+                self.assertEqual(persistence.appends, [])
+                publication_committed.assert_not_called()
+
+                stderr = io.StringIO()
+                with (
+                    redirect_stderr(stderr),
+                    redirect_stdout(io.StringIO()),
+                    self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+                ):
+                    worker_cli._end_staged_resident(result, latch, lambda: False)
+                self.assertIs(raised.exception.cause, cause)
+                lines = stderr.getvalue().splitlines()
+                self.assertTrue(all(line.startswith(prefix) and line.isascii() for line in lines), lines)
+                hold, stop = (json.loads(line[len(prefix):]) for line in lines)
+                self.assertEqual(
+                    {key: hold[key] for key in ("event", "attempt_id", "lane", "state", "dimensions", "site_stop")},
+                    {"event": "capacity_hold", "attempt_id": authority.attempt_id, "lane": "commit",
+                     "state": "local_materialized", "dimensions": ["publication_envelope"], "site_stop": False},
+                )
+                self.assertEqual(hold["detail"], {
+                    "bound": bound, "byte_count": byte_count, "limit": policy.limit(record_kind),
+                    "policy_sha256": policy.identity, "record_kind": record_kind,
+                })
+                self.assertEqual(hold["exception_fingerprint"], cause.exception_fingerprint)
+                self.assertEqual(
+                    (stop["event"], stop["reason_code"], stop["hold_count"], stop["holds"]),
+                    ("no_progress", "capacity_holds_exhausted", 1, [hold]),
+                )
+                self.assertIn(f"{authority.attempt_id}:commit:stage_capacity_hold:publication_envelope",
+                              result.errors)
+                for error in result.errors:
+                    self.assertNotIn(error, stderr.getvalue())
+                exit_stderr = io.StringIO()
+                with redirect_stderr(exit_stderr):
+                    self.assertEqual(worker_cli._public_stop_exit(latch), 78)
+                self.assertIn("capacity_holds_exhausted", exit_stderr.getvalue())
+
+    def test_an_unlatched_circuit_latches_before_logging_and_logs_only_exact_typed_records(self) -> None:
+        # Any circuit without a latched cause is still a public stop; nothing
+        # it logs, and no failure to log, can keep that stop from latching.
+        secret = "sk-live-HOLDSECRET /Volumes/AgentSSD/secret/request.json 业绩预告正文"
+        policy = PUBLICATION_ENVELOPE_POLICY_V1
+        event = CapacityHoldEvent(
+            attempt_id="rpa_big", lane="commit", state="local_materialized", lifecycle_version=6,
+            dimensions=("publication_envelope",), site_stop=False,
+            detail=CapacityHoldDetail(record_kind="unit", byte_count=policy.unit_bytes + 7,
+                                      limit=policy.unit_bytes, bound="lower_bound",
+                                      policy_sha256=policy.identity),
+        )
+        forged = mock.Mock(to_payload=lambda: {"event": "capacity_hold", "detail": secret})
+        entry = "[staged-v4] diagnostic " + json.dumps(event.to_payload(), sort_keys=True)
+
+        class _BrokenStream(io.StringIO):
+            def write(self, _text: str) -> int:
+                raise OSError("stderr is gone")
+
+        cases = {
+            "unrelated circuit": (
+                mock.Mock(termination_kind="circuit", errors=("ordinary failure",)), io.StringIO(), None, [],
+            ),
+            "typed record beside forged ones": (
+                mock.MagicMock(termination_kind="circuit", errors=(f"rpa_big:commit:RuntimeError:{secret}",),
+                               diagnostics=(forged, event, secret)),
+                io.StringIO(), None, [entry, "[staged-v4] diagnostic omitted=2"],
+            ),
+            "record that cannot encode": (
+                mock.MagicMock(termination_kind="circuit", errors=(), diagnostics=(event,)),
+                io.StringIO(), RuntimeError(secret), ["[staged-v4] diagnostic omitted=1"],
+            ),
+            "broken log stream": (
+                mock.MagicMock(termination_kind="circuit", errors=(), diagnostics=(event,)),
+                _BrokenStream(), None, None,
+            ),
+            "malformed result": (
+                mock.Mock(termination_kind="circuit", errors=5, diagnostics=[event]),
+                io.StringIO(), None, [],
+            ),
+        }
+        for label, (result, stream, encode_error, expected) in cases.items():
+            with self.subTest(label):
+                persisted: list[PublicStopCause] = []
+                control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+                with (
+                    mock.patch.object(CapacityHoldEvent, "to_payload", side_effect=encode_error)
+                    if encode_error is not None else nullcontext(),
+                    redirect_stderr(stream),
+                    self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+                ):
+                    worker_cli._end_staged_resident(result, control, lambda: False)
+                cause = control.first_cause()
+                assert cause is not None
+                self.assertEqual(cause.reason_code, "unclassified_circuit")
+                self.assertIs(raised.exception.cause, cause)
+                self.assertEqual(persisted, [cause])
+                if expected is not None:
+                    self.assertEqual(stream.getvalue().splitlines(), expected)
+                    self.assertNotIn("HOLDSECRET", stream.getvalue())
 
     def test_genuine_preexisting_first_cause_survives_watchdog_cleanup(self) -> None:
         persisted: list[PublicStopCause] = []

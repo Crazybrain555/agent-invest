@@ -102,9 +102,16 @@ composes it from settings when the caller passes none.
   `coordinator_circuit`: a native storage hold (`native_storage_hold`: hard envelope, codec bound, seal or
   tree integrity), an unprovable local transfer prefix (`transfer_integrity_hold`) and a grant no ledger
   can ever hold (`stage_grant_unsatisfiable`). A document-local hold (decode envelope, spent transfer
-  budget, publication envelope) stays a claimed, visible per-attempt hold while other work runs, unless the held attempts
-  alone use up a ledger dimension with a positive limit (`capacity_holds_exhausted`; a zero, unused
-  dimension never counts). The attempt keeps its durable state, evidence, spool, retained result and
+  budget, publication envelope) stays a claimed, visible per-attempt hold while anything else can progress.
+  The coordinator stops once when nothing runs and nothing can wake by itself while holds or queued work
+  remain, holds with an empty queue included. Wake paths are a retry or wait timer, a foreign lease, an
+  admission observation, a stream-deferred candidate, and admission that can still bring runnable work (an
+  unread scan position, a re-probed readiness deferral, a safe stream pause); a scan held in place for
+  credit and open legacy obligations are not. An operator drain that leaves only holds ends as
+  `operator_drain` without a new public stop. `capacity_holds_exhausted` names the hold that owns part of a
+  short dimension (or the only holds left) with that hold's class and fingerprint; otherwise
+  `resource_credit_grant_unavailable` names the first blocked lane head ([V4 resource
+  lifetime](v4-resource-lifetime.md)). The attempt keeps its durable state, evidence, spool, retained result and
   credits; a release re-dispatches it once and a persisting hold re-trips with the same cause. Transient
   space waits, transfer/unpack continuations and admitted grants waiting for capacity stay healthy waits.
 - `CoordinatorResult` gains `stop_cause` and `termination_kind` (`quiescent`, `public_stop`,
@@ -123,7 +130,12 @@ composes it from settings when the caller passes none.
   projection step; an in-flight transaction may finish.
 - `_run_staged_v4_resident`: QUIESCENT stays the idle loop. A non-QUIESCENT result returns normally only
   for a pure operator drain (operator flag set, no latched cause, `termination_kind=operator_drain`);
-  anything else is a public stop, latched as `unclassified_circuit` if nothing latched it.
+  anything else is a public stop, latched as `unclassified_circuit` if nothing latched it. The cause is
+  latched before anything is logged. The exit then logs only content-free lines: the coordinator's
+  retry-exhaustion lines and its typed diagnostics, each `[staged-v4] diagnostic <sorted ASCII JSON>` of
+  an exact `CapacityHoldEvent` or `NoProgressSummary` (at most 64; any other or unencodable record is
+  dropped and only counted). Other `errors` entries can carry raw text and are never logged, and no
+  malformed result or failing log stream can keep the stop from latching.
 - `_StopFlag` keeps operator provenance separately and can never clear a cause. The liveness watchdog
   keeps exit 70 and its bounded owned-child termination and never waits on persistence. It marks its
   exit (`_WEDGED_EXIT`) before that termination, and the exit itself is unconditional even if a sweep

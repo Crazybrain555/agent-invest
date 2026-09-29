@@ -1119,6 +1119,44 @@ _RETRY_EXHAUSTION_LINE = re.compile(
     r"last=(?:[a-z ]{1,80}|unrecognized sha256:[0-9a-f]{64}), "
     r"causes=(?:none|[A-Za-z0-9_<-]{1,400})(?:, http_status=[1-5][0-9]{2})?\)"
 )
+# The coordinator keeps its latest 64 diagnostics; a public stop logs no more.
+_MAX_LOGGED_DIAGNOSTICS = 64
+
+
+def _staged_stop_log_lines(result: object, errors: tuple[str, ...]) -> list[str]:
+    """The content-free lines a public stop logs: retry exhaustion and typed diagnostics.
+
+    A retry-exhaustion line names its bounds and failure category with no
+    exception text. A diagnostic is logged only as an exact coordinator record
+    (identifiers, closed tokens, counts, flags and digests, each validated when
+    it was built), encoded as sorted ASCII JSON. Every other error entry can
+    carry raw text and stays out of the log (the cause summary is
+    content-free); a malformed diagnostic is dropped and only counted.
+    """
+
+    from disclosure_anchor.application.services.staged_parse_coordinator import (
+        CapacityHoldEvent,
+        NoProgressSummary,
+    )
+
+    lines = [f"[staged-v4] {error}" for error in errors if _RETRY_EXHAUSTION_LINE.fullmatch(error)]
+    diagnostics = getattr(result, "diagnostics", ())
+    if type(diagnostics) is not tuple:
+        return lines
+    omitted = 0
+    for item in diagnostics[-_MAX_LOGGED_DIAGNOSTICS:]:
+        if type(item) is not CapacityHoldEvent and type(item) is not NoProgressSummary:
+            omitted += 1
+            continue
+        try:
+            encoded = json.dumps(item.to_payload(), sort_keys=True, ensure_ascii=True, allow_nan=False)
+        except Exception:  # noqa: BLE001 - a record that cannot encode is dropped, never printed raw
+            omitted += 1
+            continue
+        lines.append("[staged-v4] diagnostic " + encoded)
+    if omitted:
+        lines.append(f"[staged-v4] diagnostic omitted={omitted}")
+    return lines
 
 
 def _end_staged_resident(
@@ -1126,7 +1164,11 @@ def _end_staged_resident(
     control: WorkerStopControlPort,
     operator_requested: Callable[[], bool],
 ) -> None:
-    """Distinguish a pure operator handoff from a public stop; never restart."""
+    """Distinguish a pure operator handoff from a public stop; never restart.
+
+    The first cause is latched before anything is logged, so no diagnostic or
+    logging failure can keep the stop from being recorded.
+    """
 
     cause = control.first_cause()
     if (
@@ -1136,16 +1178,6 @@ def _end_staged_resident(
     ):
         print("[staged-v4] operator stop drained with no public fault", flush=True)
         return
-    errors = tuple(getattr(result, "errors", ()) or ())
-    for error in errors:
-        # A retry-exhaustion line names its bounds and failure category with
-        # no exception text, so it is logged; other entries can carry raw
-        # text and stay out of the log (the cause summary is content-free).
-        if isinstance(error, str) and _RETRY_EXHAUSTION_LINE.fullmatch(error):
-            try:
-                print(f"[staged-v4] {error}", file=sys.stderr, flush=True)
-            except Exception:  # noqa: BLE001 - visibility only; the stop stands
-                pass
     if cause is None:
         if _WEDGED_EXIT.is_set():
             # The watchdog's own child termination cancelled this run; its exit
@@ -1170,6 +1202,19 @@ def _end_staged_resident(
                 reason_code="unclassified_circuit",
             )
         cause = control.first_cause()
+    try:
+        errors = tuple(error for error in getattr(result, "errors", ()) or () if isinstance(error, str))
+    except Exception:  # noqa: BLE001 - a malformed result still ends in its latched stop
+        errors = ()
+    try:
+        lines = _staged_stop_log_lines(result, errors)
+    except Exception:  # noqa: BLE001 - visibility only; the stop stands
+        lines = []
+    for line in lines:
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001 - visibility only; the stop stands
+            pass
     raise WorkerPublicStopError(cause, errors)
 
 

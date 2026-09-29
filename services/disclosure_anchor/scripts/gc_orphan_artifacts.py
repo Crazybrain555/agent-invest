@@ -39,6 +39,9 @@ from disclosure_anchor.application.contracts.atomic_publication_artifact_readine
     ATOMIC_PUBLICATION_READINESS_FILENAME,
     decode_atomic_publication_preparation_v1,
 )
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+)
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_ROUTE_RECEIPTS_V1_FILENAME,
     SEMANTIC_ROUTE_RECEIPT_V3,
@@ -162,7 +165,9 @@ def _snapshot_preparation_owners(data_root: Path) -> dict[str, set[str]]:
 
     Preparation is immutable authority created before transaction P, so the DB
     intentionally cannot be its sole owner oracle. Invalid authority files
-    stop GC rather than becoming deletion candidates.
+    stop GC rather than becoming deletion candidates. A preparation is read up
+    to the release's publication envelope, the one limit its writer and every
+    other reader use, so any preparation this release can write stays owned.
     """
 
     expected: dict[str, set[str]] = {family: set() for family in _FAMILY_ROOTS}
@@ -174,6 +179,7 @@ def _snapshot_preparation_owners(data_root: Path) -> dict[str, set[str]]:
     )
     readiness_paths = tuple(sorted(root.rglob(ATOMIC_PUBLICATION_READINESS_FILENAME)))
     preparation_path_set = set(preparation_paths)
+    preparation_limit = PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes
     for readiness_path in readiness_paths:
         if (
             readiness_path.with_name(ATOMIC_PUBLICATION_PREPARATION_FILENAME)
@@ -196,7 +202,7 @@ def _snapshot_preparation_owners(data_root: Path) -> dict[str, set[str]]:
                     not stat.S_ISREG(observed.st_mode)
                     or observed.st_nlink != 1
                     or observed.st_size < 1
-                    or observed.st_size > 24 * 1024 * 1024
+                    or observed.st_size > preparation_limit
                 ):
                     raise ValueError("authority file identity is unsafe")
                 raw = bytearray()

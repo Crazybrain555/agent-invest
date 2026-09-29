@@ -120,6 +120,7 @@ from disclosure_anchor.application.services.staged_coordinator_persistence_v4 im
 )
 from disclosure_anchor.application.services.staged_parse_coordinator import (
     AdmissionOutcome,
+    CapacityHoldDetail,
     CoordinatorWork,
     RetryStage,
     StageLeaseGuard,
@@ -693,13 +694,25 @@ class DurableStagedCoordinatorBackendV4:
                 stage_guard=stage_guard,
             )
         except PublicationEnvelopeExceededError as exc:
-            # This document's private publication records do not fit the fixed
-            # envelope of this release: a capacity fact found while encoding,
-            # before any readiness write or transaction P. The materialized
-            # output stays as it is, the attempt holds visibly, other documents
-            # continue; it is never failed as content damage or truncated.
-            stage_guard.note("publication_envelope_hold", byte_count=exc.byte_count, limit=exc.limit)
-            raise StageCapacityBlocked(str(exc), dimensions=("publication_envelope",)) from exc
+            # This document's private publication records are refused by the
+            # fixed envelope of this release: a capacity fact found while
+            # encoding or measuring the whole plan, before any readiness write,
+            # or inside a transaction P that rolls back. The materialized output
+            # stays as it is, the attempt holds visibly, other documents
+            # continue; it is never failed as content damage or truncated. Its
+            # content-free fact reaches the coordinator's typed diagnostics.
+            capacity = exc.fact
+            raise StageCapacityBlocked(
+                "publication record bytes are outside the envelope",
+                dimensions=("publication_envelope",),
+                detail=CapacityHoldDetail(
+                    record_kind=capacity.record_kind,
+                    byte_count=capacity.byte_count,
+                    limit=capacity.limit,
+                    bound=capacity.bound,
+                    policy_sha256=capacity.policy_identity,
+                ),
+            ) from exc
         except MaterializationCapacityWaitV4 as exc:
             # Live free space cannot take the readiness files now: nothing was
             # written for them, and the same COMMIT waits without spending budget.

@@ -129,31 +129,41 @@ class SiteAndPerAttemptHoldTests(unittest.TestCase):
                     "document-local retained hold", dimensions=(reason,),
                 )
                 limits = _limits(credits=replace(_limits().credits, materialization_items=2))
-                latch = InProcessWorkerStopLatch()
+                calls_at_trip: list[int] = []
+                latch = InProcessWorkerStopLatch(
+                    on_first_trip=lambda _cause: calls_at_trip.append(len(backend.calls)),
+                )
                 result = _run(StagedParseCoordinator(
                     backend=backend, limits=limits, stop_control=latch,
                 ), stop_requested=_bounded_stop())
                 self.assertIn(("other", "acked"), result.final_states, result)
-                self.assertIsNone(latch.first_cause(), result)
                 self.assertNotIn(("held", "acked"), result.final_states)
                 self.assertFalse(any(call.startswith(("cleanup:held", "ack:held"))
                                      for call in backend.calls))
+                # The hold never stopped the site while other work could run:
+                # only the idle state that remains afterwards stops it, once.
+                cause = latch.first_cause()
+                assert cause is not None, result
+                self.assertEqual((cause.reason_code, cause.attempt_id, cause.lane),
+                                 ("capacity_holds_exhausted", "held", "local"))
+                self.assertLess(backend.calls.index("ack:other:ack_pending"), calls_at_trip[0])
 
-    def test_held_only_positive_ledger_exhaustion_stops_but_zero_unused_axes_do_not(self) -> None:
-        result, backend, latch = self._held_result("decode_input_bytes", spare=0)
-        cause = latch.first_cause()
-        assert cause is not None, result
-        self.assertEqual((cause.kind, cause.reason_code),
-                         ("coordinator_circuit", "capacity_holds_exhausted"))
-        self.assertGreater(result.credits_in_use.materialization_items, 0)
-        self.assertEqual(result.credits_in_use.remote_waits, 0)
-        self.assertEqual(result.final_states, ())
-        self.assertFalse(any(call.startswith(("cleanup:held", "ack:held"))
-                             for call in backend.calls))
-        # With one spare materialization credit, zero active remote waits and
-        # other unused dimensions must not fabricate an exhaustion stop.
-        spare, _, spare_latch = self._held_result("decode_input_bytes", spare=1)
-        self.assertIsNone(spare_latch.first_cause(), spare)
+    def test_holds_alone_stop_once_whether_or_not_they_fill_a_dimension(self) -> None:
+        # Nothing but the hold remains, so nothing can progress: the stop does
+        # not wait for the held credit to reach any limit, and it happens once.
+        for spare in (0, 1):
+            with self.subTest(spare=spare):
+                result, backend, latch = self._held_result("decode_input_bytes", spare=spare)
+                cause = latch.first_cause()
+                assert cause is not None, result
+                self.assertEqual((cause.kind, cause.reason_code, cause.attempt_id, cause.lane),
+                                 ("coordinator_circuit", "capacity_holds_exhausted", "held", "local"))
+                self.assertEqual(result.termination_kind, "public_stop")
+                self.assertGreater(result.credits_in_use.materialization_items, 0)
+                self.assertEqual(result.final_states, ())
+                self.assertEqual(backend.calls.count("local-fault:held"), 1)
+                self.assertFalse(any(call.startswith(("cleanup:held", "ack:held"))
+                                     for call in backend.calls))
 
     def test_impossible_grant_uses_site_stop_and_never_commits_or_acks(self) -> None:
         impossible = _grown(_LIFECYCLE_RESERVATION, 20_000)

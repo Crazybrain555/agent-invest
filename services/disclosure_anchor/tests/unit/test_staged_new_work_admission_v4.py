@@ -201,9 +201,11 @@ def _capacity() -> ResourceCreditVector:
     ).credits
 
 
-# A known-size source that fits the profile but not the credit left now.
+# A known-size source that fits the profile but not the credit left now: the
+# scan waits in place for it, so the outcome says it is held for credit.
 _HOLD = AdmissionOutcome(
     work=(), backlog_exists=True, blocked_dimensions=("snapshot_bytes",), scan_incomplete=True,
+    held_for_credit=True,
 )
 
 
@@ -341,20 +343,28 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
         self.assertEqual(claims.claims, ["attempt-1"])
 
     def test_readiness_deferral_keeps_prepared_claims_and_does_not_scan_new_work(self) -> None:
-        admitter, candidates, claims, claimed, credit = self._fixture()
-        claims.admit_new = lambda **_kwargs: AdmissionOutcome(
-            work=(claimed,), backlog_exists=False,
-        )
-        admitter._admission_guard = mock.Mock(
-            side_effect=NewWorkAdmissionUnavailable("provider still draining"),
-        )
-        outcome = self._admit(admitter,
-            limit=2, available_credits=credit.reservation + credit.reservation,
-        )
-        self.assertEqual(outcome.work, (claimed,))
-        self.assertEqual(outcome.deferred_reason, "provider still draining")
-        self.assertFalse(outcome.scan_incomplete)
-        self.assertEqual(candidates.calls, [])
+        for gate in ("readiness", "legacy_obligations"):
+            with self.subTest(gate=gate):
+                admitter, candidates, claims, claimed, credit = self._fixture()
+                claims.admit_new = lambda **_kwargs: AdmissionOutcome(
+                    work=(claimed,), backlog_exists=False,
+                )
+                unavailable = NewWorkAdmissionUnavailable("provider still draining")
+                if gate == "readiness":
+                    admitter._admission_guard = mock.Mock(side_effect=unavailable)
+                else:
+                    admitter._legacy_obligations = mock.Mock(
+                        require_closed=mock.Mock(side_effect=unavailable),
+                    )
+                outcome = self._admit(admitter,
+                    limit=2, available_credits=credit.reservation + credit.reservation,
+                )
+                self.assertEqual(outcome.work, (claimed,))
+                self.assertEqual(outcome.deferred_reason, "provider still draining")
+                self.assertFalse(outcome.scan_incomplete)
+                self.assertEqual(candidates.calls, [])
+                # Only open legacy obligations are a wait no re-probe can end.
+                self.assertEqual(outcome.deferred_on_obligations, gate == "legacy_obligations")
 
     def test_deferral_after_observation_preserves_cursor_for_retry(self) -> None:
         admitter, candidates, claims, claimed, credit = self._fixture(page_size=2)
@@ -615,6 +625,8 @@ class StagedV4NewWorkAdmitterTests(unittest.TestCase):
                 outcomes = [self._admit(admitter, limit=1, available_credits=high)]
                 while outcomes[-1].scan_incomplete and len(outcomes) < 4:
                     outcomes.append(self._admit(admitter, limit=1, available_credits=high))
+                # Passed over, never held: the scan moved on even where credit was short.
+                self.assertFalse(any(item.held_for_credit for item in outcomes))
                 self.assertEqual((candidates.admitted, candidates.reads), (["doc-b"], reads))
                 self.assertEqual(
                     (outcomes[-1].scan_incomplete, outcomes[-1].blocked_dimensions,

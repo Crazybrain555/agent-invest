@@ -1095,8 +1095,14 @@ key 寿命与传输墙钟在 POST 发出前复核（now − submission_epoch_uni
 不经此检查；U01 v1/v2 无批准寿命，行为不变。拒绝时 head 保持 reconciling、协调器可见停止，不失败、不 POST、不换 key；
 过期 key 的结案见下文受管入口。
 容量 hold 与 F5：Mac 对原生 storage_blocked、spool_* 完整性 hold 与任何账本都装不下的 grant 以 coordinator_circuit
-首因公共停止（reason native_storage_hold / transfer_integrity_hold / stage_grant_unsatisfiable），decode/传输预算 hold
-保持单 attempt，只有它们自己占满限额为正的账本维度时停止（capacity_holds_exhausted）；不失败、不 cleanup、不 ACK。
+首因公共停止（reason native_storage_hold / transfer_integrity_hold / stage_grant_unsatisfiable），decode/传输预算/发布包络
+hold 保持单 attempt，只要其它路径还能推进就不停；无在途、无自唤醒路径（重试/等待计时器、外部租约、准入观察、stream
+延后候选、仍能带来可运行工作的准入：未读扫描位置、会重探的 readiness 延后、安全 stream 暂停）而只剩 hold 或被挡住的
+排队时一次停止（capacity_holds_exhausted 点名阻塞 hold，否则 resource_credit_grant_unavailable 点名首个受阻队首）；
+AdmissionOutcome.held_for_credit（原地等信用）与 deferred_on_obligations（未结 legacy obligations）都不算唤醒；操作员
+排空只剩 hold 时以 operator_drain 结束，不新写公共停止；不失败、不 cleanup、不 ACK。LOCAL_PREPARE 连同 LOCAL 完成输出
+额度一起准入，materializing head 的完成承诺由 durable 有效预留减已持有额度重建；StageCapacityBlocked 可带类型化
+CapacityHoldDetail，CoordinatorResult.diagnostics 只含闭合 token/ID/整数/sha256。
 RemoteProviderWaitingV4 的 hold 须恰为闭合原生 hold 原因（NATIVE_STORAGE_HOLD_REASONS，线缆解码器复用）。
 原生 hold 操作员决定：POST /agent/storage-holds/{task_id}（仅操作员；执行与 Mac worker 不调用）preview →
 mineru.storage-hold-preview.v1（含 preview_sha256），execute(expected_preview_sha256, decided_by, reason, fixed_by)
@@ -1203,3 +1209,60 @@ test_mineru_result_grant_mac.py、test_storage_hold_cli.py 的新增/更新用�
   新增 `transfer`、`capacity`、`quarantine_complete` 和 `retained_*` 身份字段，保留唯一完整输入。
 - 相关验证见 `test_acquisition_streaming_independent`、下载/归档/本地登记/admin 普通测试，以及 managed-scratch
   `test_cninfo_download`、`test_register_local_pdf`、`test_cninfo_sync`。离线测试不替代实际 provider 编码兼容性或断电证明。
+
+2026-09-29（发布私有记录单一包络政策 PublicationEnvelopePolicyV1、整计划写前测量与类型化容量诊断；候选，未部署）——public
+view、Filing API、change feed、migration 与 winner 8 MiB DB CHECK 不变:
+
+```text
+application/contracts/publication_envelope_policy.py 是发布链私有记录唯一的源码固定包络：
+PublicationEnvelopePolicyV1（frozen；identity = sha256(canonical JSON)；无 settings/env/fallback）按记录类
+声明预算：request（规范请求、准备记录中的嵌入请求文本、上游证据/处理投影/上下文等组件）、previous_active_inventory
+（前一活动清单，request 预算）、unit/unit_row（单个 pre-ID Unit 记录、routed-draft 与最终 Unit 行/lineage 行
+hash 输入，unit 预算 ≤ request）、preparation、readiness/unit_bindings（清单与 final/lineage 聚合，readiness
+预算）、winner（winner 记录与 outbox 行/聚合/durable base，≤ 已应用 0057 CHECK 8 MiB）、snapshot
+（document_units.v1.jsonl）、semantic（semantic_route_receipts.v3.jsonl）。请求/就绪/winner 三个模块的编码器、
+解码器、存储读回上限与嵌入请求读回全部取自该值；原 8/24/8 MiB 私有常量与就绪合同内的嵌入请求 8 MiB 字面量
+删除，models/0057 的 DB CHECK 仍为独立 DB 事实（测试断言三者一致）。scripts/gc_orphan_artifacts.py 读取
+preparation 所有者的读前上限同样取自 preparation 预算（原 24 MiB 字面量删除）；超出预算、第二硬链接、符号链接、
+他处路径、读取期间变化与无效内容仍使 GC 失败关闭。发布值（root 决定）：request 64 MiB、
+unit 64 MiB（单个 Unit 可接近整个请求）、preparation 160 MiB、readiness 8 MiB、winner 8 MiB、snapshot 128 MiB、
+semantic 64 MiB；identity sha256:04262751b9a70bdb1d4d10bc6c8f47c3557a990f0fca09944e988604de152a0b。
+不设页数或 Unit 数准入上限，原资源配额与 heavy1 不变。支持域是各记录预算与 winner 保守准入同时满足：
+请求在 64 MiB 内不代表其它记录必然装得下（例如 Unit 多时 winner 上界先拒绝）；观测到的密度不构成请求与
+winner 之间的普遍关系。
+规范 JSON 选项、字段、合同版本、hash 与小记录字节均不变（56abdb93 同输入逐字节 sha 一致，已 pin）。
+写前整计划测量 application/services/publication_envelope_plan_v4.py：就绪适配器在第一次写入前编码 preparation
+与 readiness 各一次，按写入顺序测 request/preparation/snapshot/semantic/readiness 精确字节，并以与事务 P 相同
+的投影函数（固定宽度 ID、最宽 BIGINT outbox 序号、最宽 UTC 时间）计算 winner 保守上界；第一条超出即拒绝，
+早于任何 preparation、promotion、资源文件、readiness 写入与 P；P 内仍精确校验 winner。
+类型化事实：PublicationEnvelopeExceededError(fact)；PublicationCapacityFactV1 = record_kind（闭合词表）、
+bound（exact|lower_bound|upper_bound）、byte_count、limit、policy_identity；错误消息与类层次不变
+（PublicationArtifactEnvelopeExceededError 仍兼为就绪错误；winner 编码超限现为同一事实类型且仍是 ValueError）。
+exact/lower_bound 表示记录本身超限；upper_bound 是尚未写出的 winner 的保守投影，其拒绝不证明事务 P 实际
+winner 超过 8 MiB；投影途中 winner 组件超限同样按 upper_bound 报告。读回超限仍是完整性拒绝，不改判为容量 hold。
+诊断接口（与调度器合并为一条）：COMMIT 把事实映射为 StageCapacityBlocked(dimensions=("publication_envelope",),
+detail=CapacityHoldDetail(record_kind, byte_count, limit, bound, policy_sha256))；CapacityHoldDetail.bound 取闭合值
+CAPACITY_HOLD_BYTE_BOUNDS（exact|lower_bound|upper_bound，取代原 lower_bound 布尔），payload/观测标量键为 bound；
+调度器把它放进 CapacityHoldEvent 与 NoProgressSummary（CoordinatorResult.diagnostics 最多 64 条；summary 每 lane
+至多一个队首、每维度至多一条 pressure、hold 至多 8 条）。删除 PublicationCapacityBlocked 子类、后端
+publication_envelope_hold note、safe_line 与 PUBLICATION_CAPACITY_HOLD_LINE。CLI：_end_staged_resident 先锁存首因
+（无首因时 unclassified_circuit），再只打印重试耗尽行与精确类型 CapacityHoldEvent/NoProgressSummary 的
+"[staged-v4] diagnostic " + 排序 ASCII JSON；其它类型或无法编码的记录丢弃并只计数，errors 其它条目不打印；
+畸形结果或日志流失败不阻止首因锁存、原生停用与公共停止（exit 78）。
+表示副本：Preparation 构造只解码嵌入请求一次；快照逐 Unit 行编码并在首个超限前缀处以 lower_bound 停止；
+准备/就绪配对校验对每条记录只编码一次；写前计划的 preparation 字节写入后即释放；diff 只为变化对解码投影。
+回退边界：写出超过 56abdb93 读取上限（请求 8 MiB、准备 24 MiB、就绪 8 MiB）的记录后，旧 reader 读不回，
+不能盲回滚到 56abdb93。
+测试：tests/unit/test_publication_envelope_policy.py（发布值 pin/事实闭合且可映射为 hold detail/读写对称/整计划
+±1 与 winner upper_bound 保守拒绝/winner 上界精确/>8 MiB 多 Unit、>8 MiB 单 Unit（CJK）与转义密集单 Unit 全链/
+小记录字节 pin）、test_atomic_publication_artifact_readiness_adapter_v4.py（winner 上界写前拒绝零写入、测量期间
+阶段失效零写入、测量 note）、test_staged_coordinator_backend_v4.py（三种 bound 的事实映射为 detail）、
+test_staged_completion_credit.py（detail/summary 闭合与上限）、test_worker_cli.py（真实协调器 + V4 后端 commit
+映射到仅 hold 的公共停止与诊断输出；未锁存 circuit 先锁存后记录、伪造/无法编码诊断丢弃、日志流失败）、
+test_gc_orphan_artifacts.py（>24 MiB 有效 preparation 保有其 bundle；越过预算、第二硬链接、符号链接、他处路径、
+读取期间变化、非规范内容与孤立就绪均阻断 GC）；fixture tests/unit/_publication_family_fixture.py。
+root 已用 managed scratch PostgreSQL 验证事务 P、读回、响应丢失重放与跨重启恢复；两个需要旧实机 Q0 环境的
+可选用例未执行，实际部署仍须通过当前 Q0 与全部旧职责的预检。真实材料只有 3 份保留诊断重建的纯解码/配对/整计划
+测量；纯离线 RSS 测量不等于整机最坏情况资格。不宣称 84 项职责全部装得下或 8 MiB DB CHECK 对其足够：它们以原
+身份在普通守卫下恢复，按实际字节准入。独立复审与最终门由 root 执行，本条不宣称已通过部署资格。
+```

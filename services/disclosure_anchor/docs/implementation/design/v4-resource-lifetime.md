@@ -101,6 +101,62 @@ is at most 100; memory is page-bounded, but cold-start time depends on historica
 every quiescent cycle. Any legacy detached entry or false historical absence stops startup without adopting
 or deleting it. The worker singleton is not evidence that an old disconnected filesystem writer has exited.
 
+## LOCAL completion credit and progress
+
+LOCAL_PREPARE takes decode credit (`materialization_items`, `decoded_bytes`, `temp_disk_bytes`, spool) only
+together with the LOCAL completion it enables: its dispatch must also fit the attempt's `output_items`,
+`output_bytes` and `output_pages`. From then on the attempt holds a completion promise. The running
+LOCAL_PREPARE stage carries it; the durable `materializing` head keeps it — queued, retrying, held, deferred or
+recovered — until its own LOCAL stage, whose allowance is exactly the promise, commits the actual output credits.
+The promise is the unheld output part of the durable effective reservation (H0 estimate, verified terminal
+growth, the materialization intent's grant) less the held credits, so a restart rebuilds it from the head alone.
+There is no promise ledger, durable state or business state.
+
+Every new growth, a new promise included, must fit beside owned, running and all promised credit. The LOCAL
+that keeps a promise is checked beside owned and running credit only, so its own promise counts once. A grant
+admitted after a refused LOCAL_PREPARE (`StageResourceGrantRequired`) is checked again with its grown completion
+at the next dispatch, before any side effect. On the work volume a promise is charged when it is made, as the
+union `snapshot + max(temp, compressed + output)`: the LOCAL grant already covers the promoted output, so the
+promise adds no second extent, and the LOCAL that keeps it adds nothing. Only growth waits; COMMIT, CLEANUP and
+ACK never do. Admission offers only what remains beside the promises. Quotas, the single heavy permit, lane
+priority and head-of-lane order are unchanged.
+
+A head recovered from state written before this rule can hold decode credit while its promise no longer fits
+beside other owned output. On 2026-09-29, 3,146 pages were held by three unpublished outputs and a 1,058-page
+promise (the materializing head's reserved page estimate, not a measured output) exceeded the 4,096-page
+limit. Nothing is failed, shrunk or granted again. COMMIT, CLEANUP and ACK run first; admission pauses and no
+new growth starts in the short dimension. The LOCAL that keeps the promise starts as soon as owned and running
+credit leave room. Recovered promises that together exceed a limit convert one after another in dispatch order.
+
+A document-local capacity hold (decode envelope, spent transfer budget, publication envelope) stays claimed
+and visible while anything else can progress. The coordinator stops only in an idle state: nothing runs and
+nothing can wake by itself while queued work or holds remain. Wake paths are a retry or wait timer, a foreign
+lease, an admission observation, a stream-deferred candidate, and admission that can still bring runnable
+work. Admission can when it will run again with room for a document and waits only on an unread scan position,
+a readiness deferral that is re-probed, or a safe (not unsafe) stream pause while backlog may remain. Scanners
+mark the two shapes a scan cannot leave by itself: `held_for_credit` when the cursor stays before a known-size
+candidate waiting for credit (rows passed over for credit leave the scan unfinished but unread), and
+`deferred_on_obligations` when open legacy obligations defer new H0. Neither is a wake path, so holds among the
+84 legacy obligations stop the site instead of waiting forever. Holds with an empty queue stop too, except
+during an operator drain: the drain then ends as `operator_drain` and no new public stop is written. Accepted
+work a hold blocks still stops a drain, as before. The stop latches one `coordinator_circuit` first cause. It
+is `capacity_holds_exhausted`, naming the hold that owns part of a short dimension (or the only holds left) with
+that hold's exception class and fingerprint. Otherwise it is `resource_credit_grant_unavailable`, naming the
+first blocked lane head. A hold that fills a dimension no longer stops the site while other work still runs.
+A safe stream pause that never resolves keeps a holds-only site waiting, as before this rule; the stream
+policy's own unsafe escalation remains its bound.
+
+`CoordinatorResult.diagnostics` keeps the latest 64 typed, content-free records. A `capacity_hold` record has
+the attempt, lane, state, closed dimensions, exception class and fingerprint, and the backend's optional typed
+`CapacityHoldDetail`: record kind, byte count, limit, policy sha256 and `bound`, one of `exact`, `lower_bound`
+(encoding stopped early; the record is at least that large) or `upper_bound` (a conservative projection of a
+record not written yet, such as the publication winner; its refusal does not show that the actual record
+would exceed the limit). A `no_progress` summary has each blocked lane's head and shortages (at most one per
+lane), the holds (at most eight, with their total count), and for each short dimension the owned, promised,
+requested and limit values with up to three holders. A composed stage observer receives the same as scalar
+notes, and each snapshot shows `credits_promised`. Exception text never enters these records; a public stop
+logs them as `[staged-v4] diagnostic` lines ([operational stop](worker-operational-stop.md)).
+
 ## Offline migration and retirement
 
 These are protected runtime operations, not actions authorized by a code merge. Obtain the actual runtime

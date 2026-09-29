@@ -434,34 +434,38 @@ class WorkDiskQuotaTests(unittest.TestCase):
 
 class PublicationEnvelopeHoldTests(unittest.TestCase):
     def test_an_oversized_publication_holds_only_its_own_document(self) -> None:
-        done = threading.Event()
-
         class _Backend2(_Backend):
             def commit(self, work, *, credit_allowance, stage_guard):  # type: ignore[no-untyped-def]
                 if work.attempt_id == "big":
+                    self.calls.append("commit-hold:big")
                     raise StageCapacityBlocked(
                         "publication record bytes are outside the envelope", dimensions=("publication_envelope",),
                     )
                 return super().commit(work, credit_allowance=credit_allowance, stage_guard=stage_guard)
 
-            def acknowledge(self, work, *, stage_guard):  # type: ignore[no-untyped-def]
-                acked = super().acknowledge(work, stage_guard=stage_guard)
-                if work.attempt_id == "small":
-                    done.set()
-                return acked
-
         backend = _Backend2(recoverable=(
             _work("big", "local_materialized", 5), _work("small", "local_materialized", 5),
         ))
-        control = InProcessWorkerStopLatch()
+        calls_at_trip: list[int] = []
+        control = InProcessWorkerStopLatch(on_first_trip=lambda _cause: calls_at_trip.append(len(backend.calls)))
+        stop = threading.Event()
+        timer = threading.Timer(10.0, stop.set)  # A safety bound only; a live run stops long before it.
+        timer.start()
+        self.addCleanup(timer.cancel)
         result = StagedParseCoordinator(backend=backend, limits=_limits(), stop_control=control).run(
-            stop_requested=done.is_set,
+            stop_requested=stop.is_set,
         )
-        # No site stop: the held document keeps its claim and output; the other finishes.
-        self.assertIsNone(control.first_cause())
-        self.assertIn("ack:small:ack_pending", backend.calls)
-        self.assertNotIn("cleanup:big:local_materialized", backend.calls)
+        # The held document keeps its claim and output while the other one
+        # finishes; only when nothing else can run does the site stop, once.
+        self.assertEqual(dict(result.final_states), {"small": "acked"})
+        self.assertLess(backend.calls.index("ack:small:ack_pending"), calls_at_trip[0])
+        self.assertEqual(backend.calls.count("commit-hold:big"), 1)
+        self.assertFalse([call for call in backend.calls if call.startswith(("cleanup:big", "ack:big"))])
         self.assertIn("big:commit:stage_capacity_hold:publication_envelope", result.errors)
+        cause = control.first_cause()
+        assert cause is not None
+        self.assertEqual((cause.kind, cause.reason_code, cause.attempt_id, cause.lane, cause.state_at_dispatch),
+                         ("coordinator_circuit", "capacity_holds_exhausted", "big", "commit", "local_materialized"))
 
 
 if __name__ == "__main__":

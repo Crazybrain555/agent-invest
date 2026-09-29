@@ -1662,34 +1662,5 @@ def _winner(request: AtomicPublicationRequestV4) -> AtomicPublicationWinnerV4:
     )
 
 
-
-class PrivatePublicationEnvelopeTests(unittest.TestCase):
-    """Only encoding past a private record's fixed envelope is the typed capacity fact."""
-
-    def test_encoding_past_the_envelope_is_capacity_and_reading_it_back_is_integrity(self) -> None:
-        from disclosure_anchor.application.contracts import atomic_document_publication_v4 as contract
-        from disclosure_anchor.application.contracts import (
-            atomic_publication_artifact_readiness_v4 as readiness,
-        )
-
-        limit = 8 * 1024 * 1024
-        with self.assertRaises(contract.PublicationEnvelopeExceededError) as exceeded:
-            contract._canonical_json({"text": "x" * limit})
-        self.assertEqual(exceeded.exception.limit, limit)
-        self.assertGreater(exceeded.exception.byte_count, limit)
-        self.assertIsInstance(exceeded.exception, contract.WholeDocumentPublicationV4Error)
-        self.assertEqual(len(contract._canonical_json({"text": "x" * (limit - 11)})), limit)
-        with self.assertRaises(readiness.PublicationArtifactEnvelopeExceededError) as artifact:
-            readiness._canonical_json({"text": "x" * 64}, 32)
-        # Both the old readiness type and the shared capacity type still match.
-        self.assertIsInstance(artifact.exception, readiness.AtomicPublicationArtifactReadinessError)
-        self.assertIsInstance(artifact.exception, contract.PublicationEnvelopeExceededError)
-        # Persisted bytes beyond the envelope are refused as integrity, never
-        # re-classified as a capacity hold.
-        with self.assertRaises(contract.WholeDocumentPublicationV4Error) as decoded:
-            contract.decode_atomic_publication_request_v4(b"{" + b" " * limit + b"}")
-        self.assertNotIsInstance(decoded.exception, contract.PublicationEnvelopeExceededError)
-
-
 if __name__ == "__main__":
     unittest.main()

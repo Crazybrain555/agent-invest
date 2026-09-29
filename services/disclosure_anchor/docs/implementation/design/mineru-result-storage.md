@@ -136,7 +136,8 @@ credits alone bound neither the union of distinct files on the one work volume (
 fits a legal D = 32 GiB policy while two documents own 36 GiB of distinct extents). The coordinator
 therefore charges each attempt its distinct work-volume footprint, computed from its own durable credits
 (verified ownership; recovery counts it once and never reserves it from free space again) plus the
-provisional hold of its in-flight stage (the promise):
+provisional hold of its in-flight stage and its open LOCAL completion promise ([V4 resource
+lifetime](v4-resource-lifetime.md)):
 `snapshot + max(temp, compressed + output)` plus one document's allocation margin
 (`(max_members + 8) × 4 KiB`, the APFS block; the materializer refuses a volume that allocates in larger
 blocks). The source snapshot is its own file; a LOCAL grant covers spool, unpacked tree and serialized
@@ -171,8 +172,10 @@ restarts and wall-clock jumps cannot reset them; exhausting either is a visible 
 **Holds on the Mac.** A native `storage_blocked` answer, a transfer integrity hold and an unsatisfiable grant
 stop the site with a typed first cause (F5 `coordinator_circuit`: `native_storage_hold`,
 `transfer_integrity_hold`, `stage_grant_unsatisfiable`); nothing is failed, cleaned or ACKed. Decode-envelope,
-transfer-budget and publication-envelope holds stay per attempt, claimed and visible, while other work runs,
-unless such holds alone use up a ledger dimension with a positive limit (`capacity_holds_exhausted`).
+transfer-budget and publication-envelope holds stay per attempt, claimed and visible, while anything else can
+progress; the site stops once (`capacity_holds_exhausted`) only when nothing runs or can wake by itself and the
+holds block every remaining path, holds with an empty queue included. An operator drain that leaves only holds
+ends as a drain.
 
 **Unpack and decode.** A v5 unpack writes its one in-flight member aside, appends and fsyncs that member's
 exact size and SHA-256 to a record journal, and only then publishes it into `.unpack` by exclusive rename; it
@@ -201,14 +204,31 @@ staging's file inventory instead of decoding it a second time; readiness reuses 
 encoded for a preparation it created and compares requests by content address. W remains the admitted decode
 working set, not an OS memory limit: the permit serializes the heavy phases, it does not measure their RSS.
 
-**Publication envelope.** The canonical request (8 MiB), its preparation (24 MiB, embedding the request) and
-the readiness manifest (8 MiB, every Unit binding) are fixed private envelopes. Readiness encodes every one of
-them before its first write, so a document whose records do not fit is refused with
-`PublicationEnvelopeExceededError` before any readiness write or transaction P, at the request builder or at
-readiness. COMMIT holds that attempt per document (`stage_capacity_hold:publication_envelope`): the
-materialized output stays exactly as it is, other documents continue, and nothing is truncated, failed as
-content damage or retried in a loop. Its exit is a release whose envelope holds it. Reading bytes beyond an
-envelope back from disk stays an integrity refusal.
+**Publication envelope.** One source-fixed `PublicationEnvelopePolicyV1`
+(`application/contracts/publication_envelope_policy.py`) bounds every private record of the chain with a
+per-kind budget: the canonical request, 64 MiB (also as JSON text inside the preparation); each pre-ID Unit
+record and final Unit/lineage row hash input, 64 MiB, so one Unit may take nearly the whole request; the
+preparation, 160 MiB; the readiness manifest and its Unit-binding aggregates, 8 MiB; the transaction-P winner,
+8 MiB, the applied database CHECK; the Unit snapshot, 128 MiB; the semantic receipt file, 64 MiB. Every writer
+and reader takes its limit from that value; there is no setting or fallback, and no page or Unit-count
+ceiling. The supported domain is what passes every budget together: a request within its own budget can still
+be refused by another record, for example by the winner bound when it has many Units. Before its first write,
+readiness encodes the preparation and readiness once and measures the whole plan, including a conservative
+upper bound of the winner P can write: the same projection functions over fixed-width IDs, with the widest
+outbox sequences and commit time. The first record outside its budget is refused with
+`PublicationEnvelopeExceededError`, whose fact carries only the record kind, the byte count and its bound
+(exact, lower bound or upper bound), the limit and the policy identity; the request builder refuses request and
+Unit records the same way. An upper-bound refusal is conservative: it does not show that the winner P would
+write exceeds 8 MiB. COMMIT holds that attempt per document: the backend raises `StageCapacityBlocked`
+(`publication_envelope`) whose typed `CapacityHoldDetail` carries the fact, bound and policy identity into the
+coordinator's diagnostics ([V4 resource lifetime](v4-resource-lifetime.md)). The materialized output stays
+exactly as it is, other documents continue, nothing is truncated, failed as content damage or retried in a
+loop, and the site stops only as described under "Holds on the Mac". P still checks its exact winner inside the
+transaction. The exit is a release whose envelope holds the document. Reading bytes beyond an envelope back from
+disk stays an integrity refusal, so a release with smaller budgets (56abdb93 read at most an 8 MiB request, 24
+MiB preparation and 8 MiB readiness) cannot read the larger records a later release wrote: rolling back past
+this policy after such writes is not a blind rollback. The budgets bound encoded bytes only; the heavy permit
+serializes the phase and does not bound its RSS.
 
 ## Pressure and remote execution
 

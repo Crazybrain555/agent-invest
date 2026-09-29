@@ -69,7 +69,11 @@ class V4PreparedClaimPort(Protocol):
 
 class V4LegacyObligationsPort(Protocol):
     def require_closed(self) -> None:
-        """Raise ``NewWorkAdmissionUnavailable`` while any legacy obligation is open."""
+        """Raise ``NewWorkAdmissionUnavailable`` while any legacy obligation is open.
+
+        That deferral ends only when those obligations finish; it is reported as
+        such (``deferred_on_obligations``), never as a readiness re-probe.
+        """
 
 
 class StagedV4NewWorkAdmitter:
@@ -212,7 +216,10 @@ class StagedV4NewWorkAdmitter:
             if len(selected) >= limit:
                 return self._outcome(tuple(selected), remaining=remaining, incomplete=True)
             if self._legacy_obligations is not None:
-                self._legacy_obligations.require_closed()
+                try:
+                    self._legacy_obligations.require_closed()
+                except NewWorkAdmissionUnavailable as exc:
+                    return self._deferral(tuple(durably_claimed), exc, on_obligations=True)
             if self._ready_observation is not None:
                 ready = self._ready_observation
                 candidate = ready.request.candidate
@@ -244,7 +251,9 @@ class StagedV4NewWorkAdmitter:
                             # The observation proved the size, even one unknown before it.
                             # Keep the result and the cursor; build() reruns once credit
                             # drains, without observing the source again.
-                            return self._outcome(tuple(selected), remaining=remaining, incomplete=True)
+                            return self._outcome(
+                                tuple(selected), remaining=remaining, incomplete=True, held=True,
+                            )
                     else:
                         if self._campaign_scope is not None:
                             self._campaign_scope.require_ordinary_document_source(
@@ -302,7 +311,11 @@ class StagedV4NewWorkAdmitter:
                         # instead of being passed over: the cursor stays before it,
                         # so no later ID is admitted first. The next call lists this
                         # page again, which also rechecks that it is still eligible.
-                        return self._outcome(tuple(selected), remaining=remaining, incomplete=True)
+                        return self._outcome(
+                            tuple(selected), remaining=remaining, incomplete=True, held=True,
+                        )
+                    # Passed over, not held: the cursor moves on, so an unfinished
+                    # scan still has unread rows even though credit was short here.
                     self._after_document_id = candidate.document_id
                     continue
                 if (type(request) is not V4AdmissionObservationRequest
@@ -316,10 +329,7 @@ class StagedV4NewWorkAdmitter:
                 )
             return self._outcome(tuple(selected), remaining=remaining, incomplete=page.has_more)
         except NewWorkAdmissionUnavailable as exc:
-            self._prepared_complete = False
-            return AdmissionOutcome(
-                work=tuple(durably_claimed), backlog_exists=True, deferred_reason=str(exc),
-            )
+            return self._deferral(tuple(durably_claimed), exc, on_obligations=False)
         except AdmissionInterrupted:
             raise
         except Exception as exc:
@@ -337,8 +347,19 @@ class StagedV4NewWorkAdmitter:
             available = getattr(remaining, name)
             self._scan_blocked_at[name] = min(available, self._scan_blocked_at.get(name, available))
 
+    def _deferral(
+        self, work: tuple[CoordinatorWork, ...], reason: NewWorkAdmissionUnavailable, *,
+        on_obligations: bool,
+    ) -> AdmissionOutcome:
+        self._prepared_complete = False
+        return AdmissionOutcome(
+            work=work, backlog_exists=True, deferred_reason=str(reason),
+            deferred_on_obligations=on_obligations,
+        )
+
     def _outcome(
         self, work: tuple[CoordinatorWork, ...], *, remaining: ResourceCreditVector, incomplete: bool,
+        held: bool = False,
     ) -> AdmissionOutcome:
         if not incomplete:
             self._after_document_id = None
@@ -356,6 +377,7 @@ class StagedV4NewWorkAdmitter:
             blocked_dimensions=tuple(item.name for item in fields(ResourceCreditVector) if item.name in blocked),
             ineligible_dimensions=tuple(item.name for item in fields(ResourceCreditVector) if item.name in ineligible),
             scan_incomplete=incomplete,
+            held_for_credit=held,
         )
 
     def _claim_created_h0(self, authority: RemoteParseV4Authority) -> CoordinatorWork:

@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from math import isfinite
 import re
@@ -47,7 +47,7 @@ from disclosure_anchor.application.ports.staged_new_work_v4 import (
     V4AdmissionObservationPort,
     V4AdmissionObservationRequest,
 )
-from disclosure_anchor.application.ports.staged_execution import StageObserverPort
+from disclosure_anchor.application.ports.staged_execution import StageNote, StageObserverPort
 from disclosure_anchor.application.ports.worker_stop_control import (
     MAX_STOP_PROVIDER_ATTEMPTS,
     PublicStopCause,
@@ -129,6 +129,69 @@ def _credit_union(
             for item in fields(ResourceCreditVector)
         }
     )
+
+
+# The dimensions the next transition out of each nonfinal state may add.
+_STAGE_GROWTH = {
+    "prepared": frozenset({"remote_waits"}),
+    "reconciling": frozenset({"provider_tasks", "ack_items"}),
+    "submitted": frozenset({"provider_result_bytes"}),
+    "remote_terminal": frozenset(
+        {"materialization_items", "compressed_bytes", "decoded_bytes", "temp_disk_bytes"}
+    ),
+    "materializing": frozenset({"output_items", "output_bytes", "output_pages"}),
+    "local_materialized": frozenset(),
+    "publish_committed": frozenset(),
+    "cleanup_pending": frozenset(),
+    "ack_pending": frozenset(),
+}
+
+
+def _unheld(work: CoordinatorWork, names: frozenset[str]) -> ResourceCreditVector:
+    """The part of the effective reservation in ``names`` the attempt does not hold."""
+
+    return ResourceCreditVector(
+        **{
+            item.name: (
+                max(0, getattr(work.credit_reservation, item.name) - getattr(work.credits, item.name))
+                if item.name in names
+                else 0
+            )
+            for item in fields(ResourceCreditVector)
+        }
+    )
+
+
+def _stage_growth(work: CoordinatorWork) -> ResourceCreditVector:
+    """The allowance of this attempt's next stage: what its transition may add."""
+
+    try:
+        names = _STAGE_GROWTH[work.state]
+    except KeyError as exc:
+        raise RuntimeError(f"unsupported credit transition source: {work.state}") from exc
+    return _unheld(work, names)
+
+
+def _completion_promise(work: CoordinatorWork, *, running: bool) -> ResourceCreditVector:
+    """LOCAL output credit promised to this attempt and not held yet.
+
+    LOCAL_PREPARE takes decode credit only together with the LOCAL completion
+    it enables, so its running stage carries that promise. The durable
+    materializing attempt keeps it until its own LOCAL stage runs, whose
+    allowance is exactly the promise, and commits the actual output. It is
+    the unheld output part of the durable effective reservation (estimate,
+    verified terminal growth, the materialization intent's grant), so recovery
+    rebuilds it from the head alone; there is no promise ledger.
+    """
+
+    carried = work.state == ("remote_terminal" if running else "materializing")
+    return _unheld(work, _STAGE_GROWTH["materializing"]) if carried else ResourceCreditVector()
+
+
+def _stage_reservation(work: CoordinatorWork) -> ResourceCreditVector:
+    """What a dispatch must fit: the stage allowance and any promise the stage makes."""
+
+    return _stage_growth(work) + _completion_promise(work, running=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +276,14 @@ class CoordinatorWork:
 
 @dataclass(frozen=True, slots=True)
 class AdmissionOutcome:
-    """One bounded backlog read with exact vector-pressure telemetry."""
+    """One bounded backlog read with exact vector-pressure telemetry.
+
+    ``scan_incomplete`` alone means the next call reads a position this pass has
+    not read yet. ``held_for_credit`` narrows it: the cursor stays before a
+    candidate that waits only for credit, so the next call reads the same place
+    again. ``deferred_on_obligations`` narrows a deferral: it lasts until open
+    legacy obligations finish, never merely until a readiness re-probe.
+    """
 
     work: tuple[CoordinatorWork, ...]
     backlog_exists: bool
@@ -222,6 +292,8 @@ class AdmissionOutcome:
     ineligible_dimensions: tuple[str, ...] = ()
     deferred_reason: str | None = None
     observation_request: V4AdmissionObservationRequest | None = None
+    held_for_credit: bool = False
+    deferred_on_obligations: bool = False
 
     def __post_init__(self) -> None:
         credit_names = tuple(item.name for item in fields(ResourceCreditVector))
@@ -233,6 +305,13 @@ class AdmissionOutcome:
             or any(type(item) is not CoordinatorWork for item in self.work)
             or type(self.backlog_exists) is not bool
             or type(self.scan_incomplete) is not bool
+            or type(self.held_for_credit) is not bool
+            or type(self.deferred_on_obligations) is not bool
+            or (self.held_for_credit and (
+                not self.scan_incomplete or not self.blocked_dimensions
+                or self.observation_request is not None
+            ))
+            or (self.deferred_on_obligations and self.deferred_reason is None)
             or (self.observation_request is not None and (
                 type(self.observation_request) is not V4AdmissionObservationRequest
                 or not self.backlog_exists or not self.scan_incomplete
@@ -394,22 +473,293 @@ class StageHeavyWorkRequired(StageWaiting):
     """
 
 
+_EXCEPTION_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,159}")
+_MAX_DIAGNOSTICS = 64
+_MAX_LISTED_HOLDS = 8
+_MAX_LISTED_HOLDERS = 3
+# What a hold's byte count is: the whole record's exact bytes, a count the
+# record is at least (encoding stopped early), or a conservative projection
+# of a record that is not written yet.
+CAPACITY_HOLD_BYTE_BOUNDS = ("exact", "lower_bound", "upper_bound")
+
+
+def _diagnostic_field(valid: bool, label: str) -> None:
+    if not valid:
+        raise ValueError(f"coordinator diagnostic {label} is invalid")
+
+
+def _closed_tokens(values: Sequence[str]) -> tuple[str, ...]:
+    """Reported dimensions as closed tokens, each once and in order."""
+
+    tokens: list[str] = []
+    for value in values:
+        token = stop_token(value) or "unclassified"
+        if token not in tokens:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def _all_tokens(values: object, *, maximum: int) -> bool:
+    return (
+        type(values) is tuple
+        and len(values) <= maximum
+        and all(stop_token(item) is not None for item in values)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityHoldDetail:
+    """Typed, content-free facts of one capacity hold, for its diagnostic only.
+
+    ``record_kind`` names what was refused as a closed token, ``limit`` is the
+    refused limit and ``policy_sha256`` the identity of the release policy
+    that set it. ``bound`` says what ``byte_count`` is, one of
+    :data:`CAPACITY_HOLD_BYTE_BOUNDS`: ``exact`` and ``lower_bound`` counts
+    show the record itself is larger than the limit; an ``upper_bound`` count
+    is a conservative projection of a record not written yet, so its refusal
+    does not show that the record's actual bytes would exceed the limit.
+    Scheduling never reads these values.
+    """
+
+    record_kind: str
+    byte_count: int
+    limit: int
+    bound: str = "exact"
+    policy_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        _diagnostic_field(stop_token(self.record_kind) is not None, "record kind")
+        _diagnostic_field(stop_count(self.byte_count) is not None, "byte count")
+        _diagnostic_field(stop_count(self.limit) is not None, "limit")
+        _diagnostic_field(
+            type(self.bound) is str and self.bound in CAPACITY_HOLD_BYTE_BOUNDS, "byte bound",
+        )
+        _diagnostic_field(
+            self.policy_sha256 is None or stop_sha256(self.policy_sha256) is not None,
+            "policy identity",
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "bound": self.bound,
+            "byte_count": self.byte_count,
+            "limit": self.limit,
+            "policy_sha256": self.policy_sha256,
+            "record_kind": self.record_kind,
+        }
+
+
 class StageCapacityBlocked(StageWaiting):
     """This attempt cannot proceed under the configured limits at all.
 
     The backend keeps every durable fact and resource. A document-local hold
-    (decode envelope, spent transfer budget) stays claimed and visible, without
-    retries or failure, while other work proceeds. A native storage hold, an
-    unprovable transfer prefix, or local holds that alone use up a ledger
-    dimension stop the site durably instead. ``dimensions`` name what cannot
-    be satisfied.
+    (decode envelope, spent transfer budget, publication envelope) stays
+    claimed and visible, without retries or failure, while other work
+    proceeds; once nothing else can progress the coordinator stops the site
+    once (``capacity_holds_exhausted``). A native storage hold or an
+    unprovable transfer prefix stops the site at once. ``dimensions`` name
+    what cannot be satisfied; the optional typed ``detail`` carries the
+    refused record's safe facts into the coordinator's diagnostics.
     """
 
-    def __init__(self, message: str, *, dimensions: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        dimensions: tuple[str, ...],
+        detail: CapacityHoldDetail | None = None,
+    ) -> None:
         super().__init__(message, retry_after_seconds=0.001)
         if not dimensions or any(type(item) is not str or not item for item in dimensions):
             raise ValueError("capacity block must name its dimensions")
+        if detail is not None and type(detail) is not CapacityHoldDetail:
+            raise ValueError("capacity block detail must be a typed CapacityHoldDetail")
         self.dimensions = dimensions
+        self.detail = detail
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityHoldEvent:
+    """One capacity hold the coordinator classified: closed identities and counts only."""
+
+    attempt_id: str | None
+    lane: str
+    state: str | None
+    lifecycle_version: int
+    dimensions: tuple[str, ...]
+    site_stop: bool
+    exception_class: str | None = None
+    exception_fingerprint: str | None = None
+    detail: CapacityHoldDetail | None = None
+
+    def __post_init__(self) -> None:
+        _diagnostic_field(
+            self.attempt_id is None or stop_identifier(self.attempt_id) is not None, "attempt",
+        )
+        _diagnostic_field(stop_token(self.lane) is not None, "lane")
+        _diagnostic_field(self.state is None or stop_token(self.state) is not None, "state")
+        _diagnostic_field(stop_count(self.lifecycle_version) is not None, "lifecycle version")
+        _diagnostic_field(
+            bool(self.dimensions) and _all_tokens(self.dimensions, maximum=16), "dimensions",
+        )
+        _diagnostic_field(type(self.site_stop) is bool, "site stop flag")
+        _diagnostic_field(
+            self.exception_class is None
+            or (
+                isinstance(self.exception_class, str)
+                and _EXCEPTION_CLASS_RE.fullmatch(self.exception_class) is not None
+            ),
+            "exception class",
+        )
+        _diagnostic_field(
+            self.exception_fingerprint is None
+            or stop_sha256(self.exception_fingerprint) is not None,
+            "exception fingerprint",
+        )
+        _diagnostic_field(
+            self.detail is None or type(self.detail) is CapacityHoldDetail, "detail",
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "attempt_id": self.attempt_id,
+            "detail": None if self.detail is None else self.detail.to_payload(),
+            "dimensions": list(self.dimensions),
+            "event": "capacity_hold",
+            "exception_class": self.exception_class,
+            "exception_fingerprint": self.exception_fingerprint,
+            "lane": self.lane,
+            "lifecycle_version": self.lifecycle_version,
+            "site_stop": self.site_stop,
+            "state": self.state,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedLane:
+    """A lane that could not dispatch: its length, its head and what the head lacked."""
+
+    lane: str
+    queued: int
+    head_attempt_id: str | None
+    head_state: str | None
+    shortages: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _diagnostic_field(stop_token(self.lane) is not None, "blocked lane")
+        _diagnostic_field(
+            stop_count(self.queued) is not None and self.queued > 0, "queued count",
+        )
+        _diagnostic_field(
+            self.head_attempt_id is None or stop_identifier(self.head_attempt_id) is not None,
+            "head attempt",
+        )
+        _diagnostic_field(
+            self.head_state is None or stop_token(self.head_state) is not None, "head state",
+        )
+        _diagnostic_field(_all_tokens(self.shortages, maximum=16), "shortages")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "head_attempt_id": self.head_attempt_id,
+            "head_state": self.head_state,
+            "lane": self.lane,
+            "queued": self.queued,
+            "shortages": list(self.shortages),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CreditPressure:
+    """One short dimension at a no-progress stop.
+
+    ``owned`` is durable credit, ``promised`` LOCAL completion promised but
+    not held, ``requested`` the largest waiting head's need and ``limit`` the
+    quota; ``holders`` name the attempts owning or promised the most of it.
+    For ``work_disk_bytes`` every value is a work-volume footprint.
+    """
+
+    dimension: str
+    owned: int
+    promised: int
+    requested: int
+    limit: int
+    holders: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _diagnostic_field(stop_token(self.dimension) is not None, "pressure dimension")
+        for value, label in (
+            (self.owned, "owned"),
+            (self.promised, "promised"),
+            (self.requested, "requested"),
+            (self.limit, "limit"),
+        ):
+            _diagnostic_field(stop_count(value) is not None, f"pressure {label}")
+        _diagnostic_field(
+            type(self.holders) is tuple
+            and len(self.holders) <= _MAX_LISTED_HOLDERS
+            and all(stop_identifier(item) is not None for item in self.holders),
+            "pressure holders",
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "dimension": self.dimension,
+            "holders": list(self.holders),
+            "limit": self.limit,
+            "owned": self.owned,
+            "promised": self.promised,
+            "requested": self.requested,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NoProgressSummary:
+    """Why the coordinator stopped: nothing ran, nothing could wake, all waited."""
+
+    reason_code: str
+    blocked_lanes: tuple[BlockedLane, ...]
+    holds: tuple[CapacityHoldEvent, ...]
+    hold_count: int
+    pressure: tuple[CreditPressure, ...]
+
+    def __post_init__(self) -> None:
+        _diagnostic_field(stop_token(self.reason_code) is not None, "reason code")
+        _diagnostic_field(
+            type(self.blocked_lanes) is tuple
+            and len(self.blocked_lanes) <= len(CoordinatorLane)
+            and all(type(item) is BlockedLane for item in self.blocked_lanes),
+            "blocked lanes",
+        )
+        _diagnostic_field(
+            type(self.holds) is tuple
+            and len(self.holds) <= _MAX_LISTED_HOLDS
+            and all(type(item) is CapacityHoldEvent for item in self.holds),
+            "listed holds",
+        )
+        _diagnostic_field(
+            stop_count(self.hold_count) is not None and self.hold_count >= len(self.holds),
+            "hold count",
+        )
+        _diagnostic_field(
+            type(self.pressure) is tuple
+            and len(self.pressure) <= len(fields(ResourceCreditVector)) + 1
+            and all(type(item) is CreditPressure for item in self.pressure),
+            "pressure",
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "blocked_lanes": [item.to_payload() for item in self.blocked_lanes],
+            "event": "no_progress",
+            "hold_count": self.hold_count,
+            "holds": [item.to_payload() for item in self.holds],
+            "pressure": [item.to_payload() for item in self.pressure],
+            "reason_code": self.reason_code,
+        }
+
+
+CoordinatorDiagnostic = CapacityHoldEvent | NoProgressSummary
 
 
 class StagedCoordinatorBackend(Protocol):
@@ -676,6 +1026,9 @@ class CoordinatorSnapshot:
     stream_actual: int | None = None
     stream_reason: str | None = None
     stream_evidence_sha256: str | None = None
+    # LOCAL completion promised to materializing attempts (and carried by
+    # running LOCAL_PREPARE stages) beyond ``credits_in_use``.
+    credits_promised: ResourceCreditVector = field(default_factory=ResourceCreditVector)
 
 
 # Why ``run`` returned: an idle observation, a public stop (the injected
@@ -690,7 +1043,8 @@ class CoordinatorResult:
 
     ``stop_cause`` is the control's first cause when one was latched (by this
     coordinator or by another worker plane); ``termination_kind`` is ``None``
-    only for results not produced by this coordinator.
+    only for results not produced by this coordinator. ``diagnostics`` holds
+    the most recent typed, content-free hold and no-progress records.
     """
     terminal: CoordinatorTerminal
     recovery_complete: bool
@@ -701,6 +1055,7 @@ class CoordinatorResult:
     credits_in_use: ResourceCreditVector
     stop_cause: PublicStopCause | None = None
     termination_kind: CoordinatorTermination | None = None
+    diagnostics: tuple[CoordinatorDiagnostic, ...] = ()
 
 
 _FINAL_STATES = frozenset(
@@ -1060,6 +1415,56 @@ class StagedParseCoordinator:
             return f"worker stop control failed to latch {cause.reason_code}:{type(exc).__name__}:{exc}"
         return None
 
+    def _observe(self, event: CoordinatorDiagnostic) -> None:
+        """Mirror one diagnostic to the stage observer as scalars; measurement only."""
+
+        observer = self._stage_observer
+        if observer is None:
+            return
+        scalars: dict[str, int | str | None]
+        try:
+            if isinstance(event, CapacityHoldEvent):
+                attempt_id, lane, kind = event.attempt_id, event.lane, "capacity_hold"
+                scalars = {
+                    "dimensions": ",".join(event.dimensions[:4]),
+                    "exception_fingerprint": event.exception_fingerprint,
+                    "lifecycle_version": event.lifecycle_version,
+                    "site_stop": int(event.site_stop),
+                    "state": event.state,
+                }
+                if event.detail is not None:
+                    scalars.update(
+                        bound=event.detail.bound,
+                        byte_count=event.detail.byte_count,
+                        limit=event.detail.limit,
+                        policy_sha256=event.detail.policy_sha256,
+                        record_kind=event.detail.record_kind,
+                    )
+            else:
+                attempt_id, lane, kind = None, None, "no_progress"
+                scalars = {
+                    "blocked_lanes": ",".join(item.lane for item in event.blocked_lanes),
+                    "first_hold": event.holds[0].attempt_id if event.holds else None,
+                    "hold_count": event.hold_count,
+                    "queued": sum(item.queued for item in event.blocked_lanes),
+                    "reason_code": event.reason_code,
+                }
+                for pressure in event.pressure[:8]:
+                    if pressure.dimension.isidentifier():
+                        scalars[f"{pressure.dimension}_owned"] = pressure.owned
+                        scalars[f"{pressure.dimension}_promised"] = pressure.promised
+                        scalars[f"{pressure.dimension}_requested"] = pressure.requested
+                        scalars[f"{pressure.dimension}_limit"] = pressure.limit
+            observer.note(StageNote(
+                attempt_id=attempt_id, lane=lane, kind=kind,
+                monotonic_ns=time.monotonic_ns(), scalars=tuple(sorted(scalars.items())),
+            ))
+        except Exception as exc:  # noqa: BLE001 - measurement must never fail scheduling
+            try:
+                observer.record_failure(exc)
+            except Exception:  # noqa: BLE001 - a failing observer cannot be reported further
+                pass
+
     def _run_stage_call(
         self,
         call: Callable[..., CoordinatorWork],
@@ -1125,9 +1530,13 @@ class StagedParseCoordinator:
         admission_open = False
         admission_blocked_dimensions: tuple[str, ...] = ()
         admission_scan_incomplete = False
+        # The last scan stopped in place before a candidate waiting for credit.
+        admission_held_for_credit = False
         admission_backlog_exhausted = False
         admission_probe_at = 0.0
         admission_deferred = False
+        # The last deferral lasts until open legacy obligations finish.
+        admission_deferred_on_obligations = False
         last_admission_available: ResourceCreditVector | None = None
         recovery_complete = False
         circuit_open = False
@@ -1178,9 +1587,14 @@ class StagedParseCoordinator:
         # Admitted grants still waiting for dispatch capacity: new admission
         # yields to them so later work cannot take the space they need.
         grant_waiting: set[str] = set()
-        # Document-local holds (decode envelope, spent transfer budget): kept
-        # claimed and visible, never failed or ACKed, while other work runs.
-        capacity_holds: dict[str, tuple[CoordinatorLane, CoordinatorWork, tuple[str, ...]]] = {}
+        # Document-local holds (decode envelope, spent transfer budget,
+        # publication envelope): kept claimed and visible, never failed or
+        # ACKed, while other work runs; each keeps its classified event.
+        capacity_holds: dict[
+            str, tuple[CoordinatorLane, CoordinatorWork, tuple[str, ...], CapacityHoldEvent]
+        ] = {}
+        # The most recent typed hold and no-progress records, content-free.
+        diagnostics: deque[CoordinatorDiagnostic] = deque(maxlen=_MAX_DIAGNOSTICS)
         # Whole-object heavy work shares a small permit set across lanes. Each
         # holder is one in-flight stage, released when its Future completes for
         # any reason. COMMIT takes a permit at dispatch; LOCAL only after its
@@ -1260,7 +1674,27 @@ class StagedParseCoordinator:
                         (lane.value, tuple(sorted(credit_blocked_by_lane[lane])))
                         for lane in CoordinatorLane
                     ),
+                    credits_promised=promised_credit(),
                 )
+            )
+
+        def record_diagnostic(event: CoordinatorDiagnostic) -> None:
+            diagnostics.append(event)
+            self._observe(event)
+
+        def finish(terminal: CoordinatorTerminal) -> CoordinatorResult:
+            emit()
+            return CoordinatorResult(
+                terminal=terminal,
+                recovery_complete=recovery_complete,
+                admitted=admitted,
+                completed=completed,
+                final_states=tuple(sorted(final.items())),
+                errors=tuple(errors),
+                credits_in_use=ledger.in_use,
+                stop_cause=self._stop_control.first_cause(),
+                termination_kind=termination(terminal),
+                diagnostics=tuple(diagnostics),
             )
 
         def track_waiting_lease(work: CoordinatorWork) -> None:
@@ -1624,12 +2058,12 @@ class StagedParseCoordinator:
                     stream_parked[attempt_id] = work = renewed
                 assert work.lease_expires_monotonic is not None
                 next_floor = min(next_floor, work.lease_expires_monotonic)
-            for attempt_id, (hold_lane, work, shortage) in tuple(capacity_holds.items()):
+            for attempt_id, (hold_lane, work, shortage, event) in tuple(capacity_holds.items()):
                 if needs_renewal(work, now):
                     renewed = renew_waiting(work, hold_lane)
                     if renewed is None:
                         return
-                    capacity_holds[attempt_id] = (hold_lane, renewed, shortage)
+                    capacity_holds[attempt_id] = (hold_lane, renewed, shortage, event)
                     work = renewed
                 assert work.lease_expires_monotonic is not None
                 next_floor = min(next_floor, work.lease_expires_monotonic)
@@ -1686,18 +2120,6 @@ class StagedParseCoordinator:
             trip_fault(_stop_cause(kind="coordinator_circuit", reason_code=reason_code,
                                    origin="coordinator", work=work, lane=lane, error=error))
 
-        def exhausted_by_holds() -> tuple[str, ...]:
-            """Positive ledger dimensions that held attempts alone use up."""
-
-            held = ResourceCreditVector()
-            for _hold_lane, held_work, _shortage in capacity_holds.values():
-                held = held + held_work.credits
-            return tuple(
-                item.name
-                for item in fields(ResourceCreditVector)
-                if 0 < getattr(ledger.limit, item.name) <= getattr(held, item.name)
-            )
-
         def positive_dimensions(value: ResourceCreditVector) -> tuple[str, ...]:
             return tuple(
                 item.name
@@ -1705,21 +2127,154 @@ class StagedParseCoordinator:
                 if getattr(value, item.name) > 0
             )
 
-        def work_disk_owned() -> Iterator[ResourceCreditVector]:
-            """Each known attempt's owned plus in-flight promised credits."""
+        def running_projections() -> dict[str, CoordinatorWork]:
+            """The dispatched projection of every attempt with a running stage."""
 
-            promised = {held.attempt_id: hold for _, held, _, hold in in_flight.values()}
-            for attempt_id in set(ledger.by_attempt) | set(promised):
-                yield (
-                    ledger.by_attempt.get(attempt_id, ResourceCreditVector())
-                    + promised.get(attempt_id, ResourceCreditVector())
+            return {running.attempt_id: running for _, running, _, _ in in_flight.values()}
+
+        def promised_credit() -> ResourceCreditVector:
+            """LOCAL completion promised and not yet held, counted once per attempt.
+
+            A running LOCAL_PREPARE carries its attempt's promise; a
+            materializing attempt anywhere but a running stage (queued,
+            retrying, held or deferred) keeps its own. A running LOCAL holds
+            its promise as its stage allowance instead.
+            """
+
+            running = running_projections()
+            total = ResourceCreditVector()
+            for running_work in running.values():
+                if running_work.state == "remote_terminal":
+                    total = total + _completion_promise(running_work, running=True)
+            for attempt_id, durable in known.items():
+                if durable.state == "materializing" and attempt_id not in running:
+                    total = total + _completion_promise(durable, running=False)
+            return total
+
+        def committed_credit(*, with_promises: bool) -> ResourceCreditVector:
+            """Owned, running and transient credit, and optionally every open promise."""
+
+            owned_and_running = ledger.in_use + provisional_local_total + observation.credits
+            return owned_and_running + promised_credit() if with_promises else owned_and_running
+
+        def admission_offer() -> tuple[int, ResourceCreditVector, tuple[str, ...]] | None:
+            """Document count, credits and saturated dimensions admission may offer now.
+
+            New work fits beside owned, running and promised credit, so nothing is
+            offered while a recovered ledger overage or promise deficit drains.
+            """
+
+            committed = committed_credit(with_promises=True)
+            if oversubscribed_recovery or not committed.fits(ledger.limit):
+                return None
+            available = ledger.limit - committed
+            saturated = tuple(
+                item.name for item in fields(ResourceCreditVector) if getattr(available, item.name) == 0
+            )
+            capacity = min(self._limits.admission_batch_size, available.documents)
+            if self._limits.work_disk_bytes is not None:
+                # A new H0 owns its source snapshot on the work volume with one
+                # document's allocation margin. Admission offers only D's
+                # headroom above the LOCAL reserve, each admitted document's
+                # margin set aside first.
+                headroom = max(
+                    0,
+                    self._limits.work_disk_bytes
+                    - self._limits.work_disk_local_reserve_bytes
+                    - work_disk_in_use(),
                 )
+                margin = self._limits.work_disk_margin_bytes
+                capacity = min(capacity, headroom // (margin + 1))
+                snapshot_room = headroom - capacity * margin
+                available = replace(
+                    available,
+                    documents=min(available.documents, capacity),
+                    snapshot_bytes=min(available.snapshot_bytes, snapshot_room),
+                )
+                if capacity == 0 or snapshot_room == 0:
+                    capacity = 0
+                    saturated = ("work_disk_bytes", *saturated)
+            return capacity, available, saturated
 
-        def work_disk_in_use() -> int:
-            """Every known attempt's owned plus in-flight promised work-volume bytes."""
+        def admission_may_resume() -> bool:
+            """Whether admission alone can still bring runnable work.
+
+            It must run again with room for a document and wait only on
+            something that clears by itself: an unread scan position, a
+            readiness deferral that is re-probed, or a safe stream pause while
+            backlog may remain. A scan held in place for credit, open legacy
+            obligations, a drain, an unsafe stream, retry degradation or a
+            waiting grant never qualify.
+            """
+
+            if (
+                not recovery_complete or circuit_open or stop_requested() or retry_degraded
+                or stream_failure is not None or grant_waiting
+            ):
+                return False
+            offer = admission_offer()
+            if offer is None or offer[0] == 0:
+                return False
+            if admission_deferred:
+                return not admission_deferred_on_obligations
+            if stream_decision is not None and not stream_decision.new_post_allowed:
+                return not admission_backlog_exhausted
+            return admission_scan_incomplete and not admission_held_for_credit
+
+        def keeps_promise(work: CoordinatorWork) -> bool:
+            """LOCAL of a materializing attempt converts the promise it already holds.
+
+            Its capacity was reserved when the promise was made, beside every
+            other promise, so it is checked against owned and running credit
+            only: its own promise counts once, and a recovered promise deficit
+            drains in dispatch order within the hard limits. Every other
+            growth, a new promise included, must also fit beside all open
+            promises.
+            """
+
+            return work.state == "materializing"
+
+        def credit_shortages(work: CoordinatorWork, reserved: ResourceCreditVector) -> tuple[str, ...]:
+            """Dimensions, D included, that this dispatch reservation cannot take now.
+
+            Only growth waits: a zero part of the reservation never blocks, so
+            COMMIT, CLEANUP and ACK always run and release what others need.
+            """
+
+            committed = committed_credit(with_promises=not keeps_promise(work))
+            return tuple(
+                item.name
+                for item in fields(ResourceCreditVector)
+                if getattr(reserved, item.name) > 0
+                and getattr(committed, item.name) + getattr(reserved, item.name)
+                > getattr(ledger.limit, item.name)
+            ) + work_disk_shortage(work, reserved)
+
+        def work_disk_owned(*, with_promises: bool) -> Iterator[tuple[str, ResourceCreditVector]]:
+            """Each attempt's owned and running credits, optionally with its open promise."""
+
+            running = running_projections()
+            allowances = {held.attempt_id: hold for _, held, _, hold in in_flight.values()}
+            for attempt_id in set(ledger.by_attempt) | set(allowances):
+                credits = ledger.by_attempt.get(attempt_id, ResourceCreditVector())
+                if attempt_id in allowances:
+                    credits = credits + allowances[attempt_id]
+                if with_promises:
+                    projection = running.get(attempt_id)
+                    if projection is not None:
+                        credits = credits + _completion_promise(projection, running=True)
+                    elif attempt_id in known:
+                        credits = credits + _completion_promise(known[attempt_id], running=False)
+                yield attempt_id, credits
+
+        def work_disk_in_use(*, with_promises: bool = True) -> int:
+            """Work-volume bytes every attempt owns, is running or, optionally, was promised."""
 
             margin = self._limits.work_disk_margin_bytes
-            return sum(work_disk_footprint(credits, margin) for credits in work_disk_owned())
+            return sum(
+                work_disk_footprint(credits, margin)
+                for _attempt_id, credits in work_disk_owned(with_promises=with_promises)
+            )
 
         def work_disk_source_only() -> int:
             """D held by attempts that own only their source snapshot."""
@@ -1727,26 +2282,35 @@ class StagedParseCoordinator:
             margin = self._limits.work_disk_margin_bytes
             return sum(
                 work_disk_footprint(credits, margin)
-                for credits in work_disk_owned()
+                for _attempt_id, credits in work_disk_owned(with_promises=True)
                 if not _local_extent_bytes(credits)
             )
 
         def work_disk_growth(work: CoordinatorWork, hold: ResourceCreditVector) -> int:
+            """New work-volume extents beyond what the attempt owns; overlap counts once."""
+
             margin = self._limits.work_disk_margin_bytes
             current = ledger.by_attempt.get(work.attempt_id, work.credits)
             return work_disk_footprint(current + hold, margin) - work_disk_footprint(current, margin)
 
         def work_disk_shortage(work: CoordinatorWork, hold: ResourceCreditVector) -> tuple[str, ...]:
-            """Refuse a transition whose new promise would carry the volume past D.
+            """Refuse a transition whose new extents would carry the volume past D.
 
             Only growth is checked: a transition that keeps or shrinks the
             footprint (COMMIT, CLEANUP, ACK) is never blocked, so the stages that
-            release space always run.
+            release space always run. A promise is charged when it is made, as
+            the larger of the LOCAL grant and spool plus output; the LOCAL that
+            keeps it is checked, like its credit, beside owned and running
+            extents only, so it adds no new charge.
             """
 
             limit = self._limits.work_disk_bytes
             growth = 0 if limit is None else work_disk_growth(work, hold)
-            if limit is None or growth <= 0 or work_disk_in_use() + growth <= limit:
+            if (
+                limit is None
+                or growth <= 0
+                or work_disk_in_use(with_promises=not keeps_promise(work)) + growth <= limit
+            ):
                 return ()
             return ("work_disk_bytes",)
 
@@ -1773,47 +2337,179 @@ class StagedParseCoordinator:
                 lane == CoordinatorLane.LOCAL and work.attempt_id in heavy_ready
             )
 
-        def transition_hold(work: CoordinatorWork) -> ResourceCreditVector:
-            names_by_state = {
-                "prepared": {"remote_waits"},
-                "reconciling": {"provider_tasks", "ack_items"},
-                "submitted": {"provider_result_bytes"},
-                "remote_terminal": {
-                    "materialization_items",
-                    "compressed_bytes",
-                    "decoded_bytes",
-                    "temp_disk_bytes",
-                },
-                "materializing": {
-                    "output_items",
-                    "output_bytes",
-                    "output_pages",
-                },
-                "local_materialized": set(),
-                "publish_committed": set(),
-                "cleanup_pending": set(),
-                "ack_pending": set(),
-            }
-            try:
-                names = names_by_state[work.state]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"unsupported credit transition source: {work.state}"
-                ) from exc
-            return ResourceCreditVector(
-                **{
-                    item.name: (
-                        max(
-                            0,
-                            getattr(work.credit_reservation, item.name)
-                            - getattr(work.credits, item.name),
-                        )
-                        if item.name in names
-                        else 0
-                    )
-                    for item in fields(ResourceCreditVector)
-                }
+        def dispatch_order(lane: CoordinatorLane) -> list[int]:
+            """Queue positions in dispatch order: state priority, then FIFO."""
+
+            queue = queues[lane]
+            priorities = _STATE_PRIORITY_WITHIN_LANE.get(lane)
+            return sorted(
+                range(len(queue)),
+                key=lambda position: (
+                    priorities.get(queue[position].state, len(priorities)) if priorities else 0,
+                    position,
+                ),
             )
+
+        def capacity_hold_event(
+            work: CoordinatorWork,
+            lane: CoordinatorLane,
+            error: StageCapacityBlocked,
+            *,
+            site_stop: bool,
+        ) -> CapacityHoldEvent:
+            return CapacityHoldEvent(
+                attempt_id=stop_identifier(work.attempt_id),
+                lane=lane.value,
+                state=stop_token(work.state),
+                lifecycle_version=work.lifecycle_version,
+                dimensions=_closed_tokens(error.dimensions)[:16],
+                site_stop=site_stop,
+                exception_class=exception_class_name(error),
+                exception_fingerprint=exception_fingerprint(error),
+                detail=error.detail,
+            )
+
+        def credit_holders(dimension: str) -> tuple[str, ...]:
+            """The attempts owning or promised the most of one dimension."""
+
+            margin = self._limits.work_disk_margin_bytes
+            amounts: list[tuple[int, str]] = []
+            for attempt_id, credits in work_disk_owned(with_promises=True):
+                amount = (
+                    work_disk_footprint(credits, margin)
+                    if dimension == "work_disk_bytes"
+                    else getattr(credits, dimension)
+                )
+                identifier = stop_identifier(attempt_id)
+                if amount > 0 and identifier is not None:
+                    amounts.append((amount, identifier))
+            amounts.sort(key=lambda item: (-item[0], item[1]))
+            return tuple(identifier for _amount, identifier in amounts[:_MAX_LISTED_HOLDERS])
+
+        def no_progress_summary() -> tuple[
+            NoProgressSummary, CoordinatorWork, CoordinatorLane, CapacityHoldEvent | None,
+        ]:
+            """Explain an idle, unwakeable state and name the attempt that blocks it.
+
+            Each nonempty lane reports its dispatch head and what that head
+            lacks. The stop is ``capacity_holds_exhausted`` when capacity holds
+            remain and either nothing else is queued or the holds own part of
+            a dimension a head lacks; it then names that hold. Otherwise it is
+            ``resource_credit_grant_unavailable`` and names the first blocked
+            head in lane priority.
+            """
+
+            blocked: list[BlockedLane] = []
+            heads: list[tuple[CoordinatorLane, CoordinatorWork, ResourceCreditVector, tuple[str, ...]]] = []
+            for lane in _LANE_PRIORITY:
+                queue = queues[lane]
+                if not queue:
+                    continue
+                head = queue[dispatch_order(lane)[0]]
+                reserved = _stage_reservation(head)
+                shortages = credit_shortages(head, reserved)
+                heads.append((lane, head, reserved, shortages))
+                blocked.append(BlockedLane(
+                    lane=lane.value,
+                    queued=len(queue),
+                    head_attempt_id=stop_identifier(head.attempt_id),
+                    head_state=stop_token(head.state),
+                    shortages=shortages,
+                ))
+            owned = ledger.in_use
+            promised = promised_credit()
+            pressure: list[CreditPressure] = []
+            short = {name for _lane, _head, _reserved, shortages in heads for name in shortages}
+            for name in (*(item.name for item in fields(ResourceCreditVector)), "work_disk_bytes"):
+                if name not in short:
+                    continue
+                if name == "work_disk_bytes":
+                    owned_amount = work_disk_in_use(with_promises=False)
+                    promised_amount = work_disk_in_use() - owned_amount
+                    requested = max(
+                        work_disk_growth(head, reserved)
+                        for _lane, head, reserved, shortages in heads if name in shortages
+                    )
+                    limit = self._limits.work_disk_bytes or 0
+                else:
+                    owned_amount = getattr(owned, name)
+                    promised_amount = getattr(promised, name)
+                    requested = max(
+                        getattr(reserved, name)
+                        for _lane, _head, reserved, shortages in heads if name in shortages
+                    )
+                    limit = getattr(ledger.limit, name)
+                pressure.append(CreditPressure(
+                    dimension=name,
+                    owned=owned_amount,
+                    promised=max(0, promised_amount),
+                    requested=requested,
+                    limit=limit,
+                    holders=credit_holders(name),
+                ))
+            margin = self._limits.work_disk_margin_bytes
+            holdings = dict(work_disk_owned(with_promises=True))
+            blocking_hold: tuple[CoordinatorLane, CoordinatorWork, CapacityHoldEvent] | None = None
+            for hold_lane, held_work, _shortage, event in capacity_holds.values():
+                held = holdings.get(held_work.attempt_id, ResourceCreditVector())
+                if not heads or any(
+                    work_disk_footprint(held, margin) > 0
+                    if name == "work_disk_bytes"
+                    else getattr(held, name) > 0
+                    for name in short
+                ):
+                    blocking_hold = (hold_lane, held_work, event)
+                    break
+            listed = tuple(event for *_rest, event in capacity_holds.values())
+            blocker_event: CapacityHoldEvent | None = None
+            if blocking_hold is not None:
+                reason = "capacity_holds_exhausted"
+                blocker_lane, blocker, blocker_event = blocking_hold
+            else:
+                reason = "resource_credit_grant_unavailable"
+                blocker_lane, blocker, _reserved, _shortages = heads[0]
+            summary = NoProgressSummary(
+                reason_code=reason,
+                blocked_lanes=tuple(blocked),
+                holds=listed[:_MAX_LISTED_HOLDS],
+                hold_count=len(listed),
+                pressure=tuple(pressure),
+            )
+            return summary, blocker, blocker_lane, blocker_event
+
+        def stop_without_progress() -> None:
+            """Stop the site once: nothing runs, nothing can wake, every path waits.
+
+            The attempts keep their durable state and credits; nothing is
+            failed, cleaned or ACKed. The first cause names the blocking hold
+            or head, and the typed summary carries the chain in numbers.
+            """
+
+            nonlocal circuit_open, admission_open, blocked_reason
+            summary, blocker, blocker_lane, blocker_event = no_progress_summary()
+            circuit_open = True
+            admission_open = False
+            blocked_reason = summary.reason_code
+            record_diagnostic(summary)
+            if summary.reason_code == "capacity_holds_exhausted":
+                named = sorted(
+                    {name for lane in summary.blocked_lanes for name in lane.shortages}
+                    or {name for event in summary.holds for name in event.dimensions}
+                )
+                errors.append("capacity_holds_exhausted:" + ",".join(named))
+            else:
+                errors.append("durable queued work cannot obtain its next credit grant")
+            cause = _stop_cause(kind="coordinator_circuit", reason_code=summary.reason_code,
+                                origin="coordinator", work=blocker, lane=blocker_lane)
+            if blocker_event is not None:
+                # The hold's own one-way identity, so a persisting hold re-trips
+                # with the same cause after a release.
+                cause = replace(
+                    cause,
+                    exception_class=blocker_event.exception_class,
+                    exception_fingerprint=blocker_event.exception_fingerprint,
+                )
+            trip_fault(cause)
 
         def guard_in_flight(now: float) -> None:
             nonlocal circuit_open, admission_open, blocked_reason
@@ -2130,43 +2826,11 @@ class StagedParseCoordinator:
                     admission_open and not grant_waiting
                     and not circuit_open and not observation.pending
                 ):
-                    committed_and_transient = ledger.in_use + provisional_local_total
-                    if oversubscribed_recovery or not committed_and_transient.fits(ledger.limit):
+                    offer = admission_offer()
+                    if offer is None:
                         blocked_reason = "oversubscribed_recovery_drain"
                     else:
-                        available_credits = ledger.limit - committed_and_transient
-                        saturated = tuple(
-                            item.name
-                            for item in fields(ResourceCreditVector)
-                            if getattr(available_credits, item.name) == 0
-                        )
-                        capacity = min(
-                            self._limits.admission_batch_size,
-                            available_credits.documents,
-                        )
-                        if self._limits.work_disk_bytes is not None:
-                            # A new H0 owns its source snapshot on the work
-                            # volume with one document's allocation margin.
-                            # Admission offers only D's headroom above the
-                            # LOCAL reserve, each admitted document's margin
-                            # set aside first.
-                            headroom = max(
-                                0,
-                                self._limits.work_disk_bytes
-                                - self._limits.work_disk_local_reserve_bytes
-                                - work_disk_in_use(),
-                            )
-                            margin = self._limits.work_disk_margin_bytes
-                            capacity = min(capacity, headroom // (margin + 1))
-                            snapshot_room = headroom - capacity * margin
-                            available_credits = replace(
-                                available_credits,
-                                documents=min(available_credits.documents, capacity),
-                                snapshot_bytes=min(available_credits.snapshot_bytes, snapshot_room),
-                            )
-                            if capacity == 0 or snapshot_room == 0:
-                                capacity = 0
-                                saturated = ("work_disk_bytes", *saturated)
+                        capacity, available_credits, saturated = offer
                         if capacity == 0:
                             admission_blocked_dimensions = saturated or ("documents",)
                             blocked_reason = "credit_backpressure:" + ",".join(
@@ -2237,11 +2901,13 @@ class StagedParseCoordinator:
                                 # target zero alone says nothing about the source.
                                 admission_backlog_exhausted = not admission.backlog_exists
                                 admission_deferred = admission.deferred_reason is not None
+                                admission_deferred_on_obligations = admission.deferred_on_obligations
                                 if not admission_deferred and blocked_reason is not None and (
                                     blocked_reason.startswith("admission_deferred:")
                                 ):
                                     blocked_reason = None
                                 admission_scan_incomplete = admission.scan_incomplete
+                                admission_held_for_credit = admission.held_for_credit
                                 admission_probe_at = (
                                     self._monotonic() + self._limits.admission_probe_seconds
                                     if admission.deferred_reason is not None or (
@@ -2305,10 +2971,10 @@ class StagedParseCoordinator:
                                     last_progress = now
                                 if admission.observation_request is not None:
                                     requested = admission.observation_request.credits
-                                    if not (ledger.in_use + provisional_local_total + requested).fits(ledger.limit):
+                                    if not (committed_credit(with_promises=True) + requested).fits(ledger.limit):
                                         raise RuntimeError("admission observation exceeded shared credit grant")
                                     observation.enqueue(admission.observation_request)
-                                held_after_admission = ledger.in_use + provisional_local_total + observation.credits
+                                held_after_admission = committed_credit(with_promises=True)
                                 last_admission_available = (
                                     ledger.limit - held_after_admission
                                     if held_after_admission.fits(ledger.limit) else None
@@ -2344,7 +3010,7 @@ class StagedParseCoordinator:
                 guard_waiting(self._monotonic())
                 self._guard_process()
                 credit_blocked_by_lane = {lane: set() for lane in CoordinatorLane}
-                for hold_lane, _held_work, shortage in capacity_holds.values():
+                for hold_lane, _held_work, shortage, _event in capacity_holds.values():
                     # A capacity hold stays visible until larger limits
                     # release it; it is re-published every scheduling tick.
                     credit_blocked_by_lane[hold_lane].update(shortage)
@@ -2361,24 +3027,18 @@ class StagedParseCoordinator:
                         active += observation.active_slots
                     while queues[lane] and active < lane_limits[lane]:
                         queue = queues[lane]
-                        priorities = _STATE_PRIORITY_WITHIN_LANE.get(lane)
-                        ordered_indices = sorted(
-                            range(len(queue)),
-                            key=lambda candidate: (
-                                priorities.get(queue[candidate].state, len(priorities))
-                                if priorities
-                                else 0,
-                                candidate,
-                            ),
-                        )
                         selected: (
                             tuple[int, CoordinatorWork, ResourceCreditVector] | None
                         ) = None
                         first_shortages: tuple[str, ...] = ()
                         head_disk_growth = 0
-                        for position, index in enumerate(ordered_indices):
+                        for position, index in enumerate(dispatch_order(lane)):
                             queued_work = queue[index]
-                            candidate_hold = transition_hold(queued_work)
+                            # The stage's own allowance, and what dispatch
+                            # reserves: LOCAL_PREPARE adds the LOCAL
+                            # completion it promises before taking decode.
+                            candidate_hold = _stage_growth(queued_work)
+                            reserved = _stage_reservation(queued_work)
                             if stream_failure is not None and (
                                 lane == CoordinatorLane.PREFLIGHT or candidate_hold.remote_waits > 0
                             ):
@@ -2407,31 +3067,25 @@ class StagedParseCoordinator:
                                 credit_blocked_by_lane[lane].add("heavy_work")
                                 continue
                             if position > 0 and any(
-                                yields_work_disk(queued_work, candidate_hold, head_disk_growth)
+                                yields_work_disk(queued_work, reserved, head_disk_growth)
                                 if name == "work_disk_bytes"
-                                else getattr(candidate_hold, name) > 0
+                                else getattr(reserved, name) > 0
                                 for name in first_shortages
                             ):
                                 continue
                             if queued_work.attempt_id in oversubscribed_recovery:
                                 shortages = (
-                                    positive_dimensions(candidate_hold)
-                                    if candidate_hold != ResourceCreditVector()
+                                    positive_dimensions(reserved)
+                                    if reserved != ResourceCreditVector()
                                     and provisional_local
                                     else ()
                                 )
                             else:
-                                shortages = exceeded_dimensions(
-                                    ledger.in_use
-                                    + provisional_local_total
-                                    + observation.credits
-                                    + candidate_hold,
-                                    ledger.limit,
-                                ) + work_disk_shortage(queued_work, candidate_hold)
+                                shortages = credit_shortages(queued_work, reserved)
                             if shortages:
                                 if position == 0:
                                     first_shortages = shortages
-                                    head_disk_growth = work_disk_growth(queued_work, candidate_hold)
+                                    head_disk_growth = work_disk_growth(queued_work, reserved)
                                     credit_blocked_by_lane[lane].update(shortages)
                                 continue
                             selected = (index, queued_work, candidate_hold)
@@ -2585,7 +3239,7 @@ class StagedParseCoordinator:
                         stream_failure is not None and not observation.pending
                         and not retry_at and not deferred_claims
                         and all(
-                            lane == CoordinatorLane.PREFLIGHT or transition_hold(work).remote_waits > 0
+                            lane == CoordinatorLane.PREFLIGHT or _stage_growth(work).remote_waits > 0
                             for lane, queue in queues.items() for work in queue
                         )
                     ):
@@ -2598,32 +3252,24 @@ class StagedParseCoordinator:
                         trip_fault(_stop_cause(kind="coordinator_circuit",
                                               reason_code="stream_pressure_closed",
                                               origin="coordinator"))
-                        emit()
-                        return CoordinatorResult(
-                            terminal=CoordinatorTerminal.STUCK_OPEN_CIRCUIT,
-                            recovery_complete=recovery_complete, admitted=admitted,
-                            completed=completed, final_states=tuple(sorted(final.items())),
-                            errors=tuple(errors), credits_in_use=ledger.in_use,
-                            stop_cause=self._stop_control.first_cause(),
-                            termination_kind=termination(CoordinatorTerminal.STUCK_OPEN_CIRCUIT),
-                        )
+                        return finish(CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
                     if (
-                        any(queues.values())
+                        # An operator drain that leaves only holds ends as a
+                        # drain below; it is no new public stop.
+                        (any(queues.values()) or (capacity_holds and not stop_requested()))
                         and not circuit_open
                         and not retry_at
                         and not deferred_claims
                         and not observation.pending
                         and not stream_deferred
+                        and not admission_may_resume()
                     ):
-                        circuit_open = True
-                        admission_open = False
-                        blocked_reason = "resource_credit_grant_unavailable"
-                        errors.append(
-                            "durable queued work cannot obtain its next credit grant"
-                        )
-                        trip_fault(_stop_cause(kind="coordinator_circuit",
-                                              reason_code="resource_credit_grant_unavailable",
-                                              origin="coordinator"))
+                        # Nothing runs and nothing can wake by itself: no
+                        # timer, foreign lease, observation, stream decision
+                        # or admission that could still bring runnable work.
+                        # Every remaining path waits on credit or on a hold
+                        # only a decision can clear, so waiting cannot help.
+                        stop_without_progress()
                     if (
                         recovery_complete
                         and not circuit_open
@@ -2640,35 +3286,13 @@ class StagedParseCoordinator:
                             or stop_requested()
                         )
                     ):
-                        emit()
-                        return CoordinatorResult(
-                            terminal=CoordinatorTerminal.QUIESCENT,
-                            recovery_complete=recovery_complete,
-                            admitted=admitted,
-                            completed=completed,
-                            final_states=tuple(sorted(final.items())),
-                            errors=tuple(errors),
-                            credits_in_use=ledger.in_use,
-                            stop_cause=self._stop_control.first_cause(),
-                            termination_kind=termination(CoordinatorTerminal.QUIESCENT),
-                        )
+                        return finish(CoordinatorTerminal.QUIESCENT)
                     if not observation.pending and (circuit_open or (
                         stop_requested()
                         and now - last_progress
                         >= self._limits.idle_open_circuit_seconds
                     )):
-                        emit()
-                        return CoordinatorResult(
-                            terminal=CoordinatorTerminal.STUCK_OPEN_CIRCUIT,
-                            recovery_complete=recovery_complete,
-                            admitted=admitted,
-                            completed=completed,
-                            final_states=tuple(sorted(final.items())),
-                            errors=tuple(errors),
-                            credits_in_use=ledger.in_use,
-                            stop_cause=self._stop_control.first_cause(),
-                            termination_kind=termination(CoordinatorTerminal.STUCK_OPEN_CIRCUIT),
-                        )
+                        return finish(CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
                     time.sleep(self._limits.poll_seconds)
                     emit()
                     continue
@@ -2721,26 +3345,24 @@ class StagedParseCoordinator:
                         observation.cancel()
                     except StageCapacityBlocked as exc:
                         site_hold = _site_hold_reason(exc.dimensions)
+                        event = capacity_hold_event(work, lane, exc, site_stop=site_hold is not None)
+                        record_diagnostic(event)
                         if site_hold is not None:
                             errors.append(
                                 f"{work.attempt_id}:{lane.value}:{site_hold}:"
-                                + ",".join(exc.dimensions)
+                                + ",".join(event.dimensions)
                             )
                             stop_for_hold(work, lane, site_hold, exc)
                         else:
-                            capacity_holds[work.attempt_id] = (lane, work, exc.dimensions)
-                            credit_blocked_by_lane[lane].update(exc.dimensions)
+                            # Kept claimed and visible while other work runs;
+                            # the idle no-progress check alone decides a stop.
+                            capacity_holds[work.attempt_id] = (lane, work, event.dimensions, event)
+                            credit_blocked_by_lane[lane].update(event.dimensions)
                             errors.append(
                                 f"{work.attempt_id}:{lane.value}:stage_capacity_hold:"
-                                + ",".join(exc.dimensions)
+                                + ",".join(event.dimensions)
                             )
                             track_waiting_lease(work)
-                            exhausted = exhausted_by_holds()
-                            if exhausted:
-                                # Held documents alone fill a dimension other
-                                # work needs: nothing more can progress here.
-                                errors.append("capacity_holds_exhausted:" + ",".join(exhausted))
-                                stop_for_hold(work, lane, "capacity_holds_exhausted", exc)
                         last_progress = self._monotonic()
                     except StageResourceGrantRequired as exc:
                         wait_now = self._monotonic()
@@ -2983,12 +3605,19 @@ class StagedParseCoordinator:
 __all__ = [
     "AdmissionInterrupted",
     "AdmissionOutcome",
+    "BlockedLane",
+    "CAPACITY_HOLD_BYTE_BOUNDS",
+    "CapacityHoldDetail",
+    "CapacityHoldEvent",
+    "CoordinatorDiagnostic",
     "CoordinatorLane",
     "CoordinatorLimits",
     "CoordinatorResult",
     "CoordinatorSnapshot",
     "CoordinatorTerminal",
     "CoordinatorWork",
+    "CreditPressure",
+    "NoProgressSummary",
     "ResourceCreditVector",
     "RecoveryCandidate",
     "RecoveryDeferred",
