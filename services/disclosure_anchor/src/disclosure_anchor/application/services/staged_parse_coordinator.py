@@ -893,8 +893,9 @@ class CoordinatorLimits:
     # stage bound: set once at dispatch, with independent claim renewal.
     local_stage_seconds: float | None = None
     # Whole-object heavy work (LOCAL decode, COMMIT reopen/build/readiness/
-    # promotion) shares these permits across lanes. One until real memory
-    # evidence justifies more; separate lane pools never overlap it.
+    # promotion) shares these permits across lanes; separate lane pools never
+    # exceed them. The worker composition sets the count (one, or two for a
+    # v3 composition whose measured peaks justify it).
     heavy_work_permits: int = 1
     # The Mac work volume's business quota D over distinct owned or promised
     # extents (source snapshot, spool, unpacked tree, private output), each
@@ -3311,6 +3312,9 @@ class StagedParseCoordinator:
                     lane, work, stage_guard, granted_delta = in_flight.pop(future)
                     # The permit ends with the stage, whatever its outcome.
                     heavy_holders.discard(future)
+                    # A guard report is already in the errors and the stop
+                    # cause; the set only spares a running stage a second one.
+                    in_flight_failures.discard(future)
                     if lane == CoordinatorLane.LOCAL:
                         heavy_ready.discard(work.attempt_id)
                     released_local_hold = (
@@ -3486,7 +3490,6 @@ class StagedParseCoordinator:
                     except StageLeaseLost as exc:
                         circuit_open = True
                         admission_open = False
-                        in_flight_failures.add(future)
                         if exc.provenance in _DRAIN_PROVENANCES:
                             # Revoked by an already decided stop: the stage
                             # drained at its checkpoint, durable state intact.
@@ -3551,6 +3554,12 @@ class StagedParseCoordinator:
                             consecutive_retries = 0
                             retry_degraded = False
                             last_progress = self._monotonic()
+                # A consumed Future keeps its stage's exception, and the
+                # traceback keeps the stage's frames with their whole objects.
+                # Each outcome is already recorded above as state, text and
+                # causes, so drop the Futures before the next pass can give
+                # their permits to new heavy work.
+                del done, future
                 guard_in_flight(self._monotonic())
                 emit()
         except BaseException as error:

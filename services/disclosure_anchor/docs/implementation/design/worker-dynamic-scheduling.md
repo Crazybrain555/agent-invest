@@ -777,10 +777,11 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
 的页数/主机小时；CPU/GPU 利用率用于解释空档，不能替代完整性或吞吐验证。
 
 - Windows `MineruProcessProfile` 只描述远端进程及资源上限。本机
-  `staged-worker-composition.v2` 另行绑定它的 SHA，以及 preflight/finalize 并发上限、
-  provider 状态轮询、admission 探测间隔与 commit 总预算；七条 lane、物化信用和 DB primary/nested
-  checkout 均从这两个 exact profile 投影。运行时可在上限内按实时信用派工，不固定占满槽数。
-  历史 v1 的规范字节和 SHA 保持不变，解码仍接受其封闭字段集；v2 才包含 commit 预算。
+  `staged-worker-composition.v2`/`v3` 另行绑定它的 SHA，以及 preflight/finalize 并发上限、
+  provider 状态轮询、admission 探测间隔与 commit 总预算（v3 另加重活许可数）；七条 lane、物化信用、
+  重活许可和 DB primary/nested checkout 均从这两个 exact profile 投影。运行时可在上限内按实时信用派工，
+  不固定占满槽数。历史 v1 的规范字节和 SHA 保持不变，解码仍接受其封闭字段集；v2 才包含 commit 预算，
+  v3 才包含重活许可数，v1/v2 一律投影为 1 个许可。
 - `v4-prepared-execution-spec.v2` 将两份 exact profile 与 request/source/runtime 关联，
   由 H0 的 spec SHA/byte count 绑定。未发布的旧 spec v1 不做默默兼容。恢复时所有阶段，
   包括 publish、cleanup、ACK，在副作用前验证当前本机 profile；不同则明确失败。
@@ -809,6 +810,24 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   子进程通信至多每 `0.1s` 检查一次。失去权限不进入下一组、备用 provider 或缓存写入，
   保留原始阶段失权异常；已启动子进程按自有进程组停止并排空管道、实际 reap 后才退出。
   不支持 live guard 的历史 adjudicator 分支不能用于受保护的模型执行，旧无 guard 调用不变。
+- `DISCLOSURE_V4_HEAVY_WORK_PERMITS`（可选，`1..2`）选择 `staged-worker-composition.v3`，把同时运行的
+  整对象重活（LOCAL 解码，COMMIT 的重开/Unit 构建/语义路由/就绪/事务 P）许可数写进本机 profile 身份。
+  - 未设置时仍是 v2 的原字节与 SHA，固定 1 个许可，行为与身份都不变。
+  - 设为 `2` 时，两个 COMMIT 可以同时运行，模型组仍受各 provider 自身并发上限约束；一个解码也可与一个
+    COMMIT 同时运行。解码仍受 decoded_bytes 账本约束。DB 池本就按 `commit_workers` 个 COMMIT 各一个
+    primary 加一个 nested checkout 配置，无需另加。
+  - 同一文档仍由 producer advisory lock 与事务 P 的文档锁串行。
+  - 证据与上限见 [结果存储](mineru-result-storage.md) “Heavy work”。
+  - 改变取值就是改变 profile 身份（含从 v3 回到 v2），只能经 `worker-local-execution-upgrade.v3` 关系迁移
+    （[本地执行升级](local-execution-upgrade.md)“U01 v3”）：
+    - 关系逐个角色写明 heavy-work 许可形态；
+    - 名单内责任以原 H0/spec/key 在新许可数下继续；
+    - 新 H0 等全部成员终结；
+    - 不需要另设排空。
+  - U01 v1/v2 拒绝 v3 组合：它们只允许 process-profile 引用移动，而 Q0 证据不记录 worker profile。
+  - 没有 U01 时，exact 路径要求 Q0 资格覆盖当前 writer/runtime，生产已不满足，所以“关掉 U01 再排空切换”
+    不可行。
+  - release binding 的 overlay 不生成此变量，需写在基础 worker env 中，合并时保留。
 - 单例数据库连接只由协调线程探测；执行线程提交后的 claim 重读使用独立 UoW 与阶段 guard。
   staged 单例探测失败立即抛出，协调器先撤销全部在途阶段许可、等待实际退出，再由 resident
   外层清理进程；不得先等待进程终止而让其他阶段在已知失锁期间继续启动副作用。

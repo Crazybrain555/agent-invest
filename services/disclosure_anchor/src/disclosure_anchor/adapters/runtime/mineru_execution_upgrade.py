@@ -28,6 +28,10 @@ the origin runtime, process profile, worker profile and activation map to the
 target by the same reference-only moves. Its inventory members all bind the
 origin R1/P1/WP1. No older upgrade is read.
 
+A v3 proposal is the v2 relation whose worker profiles may also differ in the
+one declared axis, each role's heavy-work permit form; every other step and
+check is the v2 one. v1 and v2 refuse a v3 worker composition.
+
 A qualified runtime upgrade (``newly_qualified_result_runtime``) is a separate
 branch: the target runtime passes the exact deployment path under its own new
 qualification Qnew (the configured smoke/canary/held-out files must be the
@@ -104,9 +108,11 @@ from disclosure_anchor.application.contracts.worker_execution_upgrade import (
     QUALIFIED_UPGRADE_CONTRACT,
     UPGRADE_CONTRACT,
     UPGRADE_CONTRACT_V2,
+    UPGRADE_CONTRACT_V3,
     CompatibilityBasis,
     CurrentExecution,
     ExecutionReleaseManifest,
+    HeavyWorkPermitForms,
     LegacyScopeReference,
     LocalExecutionUpgrade,
     LocalExecutionUpgradeV2,
@@ -125,6 +131,7 @@ from disclosure_anchor.application.contracts.worker_execution_upgrade import (
     encode_legacy_key_lookup_evidence,
     decode_local_execution_upgrade_review,
     derive_parent_worker_profile,
+    derive_relation_worker_profile,
     require_activation_mapping,
     require_computation_invariance,
     require_key_lookup_coverage,
@@ -142,6 +149,7 @@ PREFLIGHT_CONTRACT = "worker-deployment-preflight.v1"
 BOOT_RECEIPT_CONTRACT = "worker-execution-boot-receipt.v1"
 BOOT_RECEIPT_V2_CONTRACT = "worker-execution-boot-receipt.v2"
 BOOT_RECEIPT_QUALIFIED_CONTRACT = "worker-execution-boot-receipt.v3"
+BOOT_RECEIPT_V4_CONTRACT = "worker-execution-boot-receipt.v4"
 _RELEASE_TREES = ("src/disclosure_anchor", "scripts/launchd")
 _RELEASE_FLAT_DIRECTORIES = ("scripts",)
 _EXCLUDED_DIRECTORIES = frozenset({"__pycache__"})
@@ -528,17 +536,19 @@ def verify_local_execution_upgrade(
                 parent_writer_sha256=parent.writer_code_sha256,
                 current_writer_sha256=current.writer_code_sha256,
             )
+    # v3 only: each role's reviewed heavy-work permit form; None keeps v1/v2.
+    forms = upgrade.heavy_work_permits if isinstance(upgrade, LocalExecutionUpgradeV2) else None
     with _upgrade_step("worker profile"):
         current_worker = _active_worker_profile(process_profile, settings)
         if current_worker.sha256 != current.worker_profile_sha256:
             raise MinerUDeploymentGateError(f"composed worker profile is not the upgrade's {roles.worker}")
-        parent_worker = derive_parent_worker_profile(
-            current_worker, parent_process_profile_sha256=parent_profile.sha256,
+        parent_worker = derive_relation_worker_profile(
+            current_worker, process_profile_sha256=parent_profile.sha256, forms=forms, role="anchor",
         )
         if parent_worker.sha256 != parent.worker_profile_sha256:
             raise MinerUDeploymentGateError(
                 f"{roles.target} worker profile differs from the {roles.reference} beyond the process-profile "
-                "reference"
+                + ("reference" if forms is None else "reference and its declared heavy-work permit form")
             )
     activation_path = _require_settings_path(
         settings.disclosure_mineru_stream_pressure_config, label="current stream activation",
@@ -583,6 +593,7 @@ def verify_local_execution_upgrade(
             target_worker=current_worker,
             target_activation=current_activation,
             capacity=capacity,
+            forms=forms,
         )
 
     # 7. The pinned legacy inventory; the contract binds every member to its
@@ -617,12 +628,14 @@ def _verify_recovery_origin(
     target_worker: StagedWorkerProfileV4,
     target_activation: dict[str, Any],
     capacity: AnyMineruCapacityConfig,
+    forms: HeavyWorkPermitForms | None = None,
 ) -> None:
     """E1 -> target: the origin's identities recomputed from its archived files.
 
     Each archived file is verified against its own pin, never against the
     current tree. The origin manifest must equal the target except the local
-    writer, and P, WP and A may move only their references.
+    writer, and P, WP and A may move only their references; a v3 WP also its
+    declared heavy-work permit form.
     """
 
     uid = os.getuid()
@@ -666,10 +679,14 @@ def _verify_recovery_origin(
             current_runtime_sha256=target.runtime_identity_sha256,
             reference="recovery origin", target="target",
         )
-    origin_worker = derive_parent_worker_profile(target_worker, parent_process_profile_sha256=origin_profile.sha256)
+    with _upgrade_step("recovery origin worker profile"):
+        origin_worker = derive_relation_worker_profile(
+            target_worker, process_profile_sha256=origin_profile.sha256, forms=forms, role="origin",
+        )
     if origin_worker.sha256 != origin.worker_profile_sha256:
         raise MinerUDeploymentGateError(
             "target worker profile differs from the recovery origin beyond the process-profile reference"
+            + ("" if forms is None else " and its declared heavy-work permit form")
         )
     with _upgrade_step("recovery origin stream activation"):
         activation_path = Path(origin.stream_activation_file)
@@ -961,7 +978,9 @@ def write_boot_receipt(
     and the observed scope. It is evidence, never an input to any later
     decision. A v1 edge keeps its v1 receipt; a v2 relation writes
     ``worker-execution-boot-receipt.v2`` with every anchor/origin/target
-    identity from ``VerifiedQualifiedExecution.summary``.
+    identity from ``VerifiedQualifiedExecution.summary``, and a v3 relation
+    ``worker-execution-boot-receipt.v4``, the same plus the three heavy-work
+    permit forms.
     """
 
     booted_at_utc = (booted_at or datetime.now(UTC)).astimezone(UTC).isoformat()
@@ -988,8 +1007,9 @@ def write_boot_receipt(
         )
     if isinstance(upgrade, LocalExecutionUpgradeV2):
         anchor, origin, target = upgrade.qualification_anchor, upgrade.recovery_origin, upgrade.current
+        forms = upgrade.heavy_work_permits
         path, digest = _publish_boot_receipt(settings, owner_identity, {
-            "contract_version": BOOT_RECEIPT_V2_CONTRACT,
+            "contract_version": BOOT_RECEIPT_V2_CONTRACT if forms is None else BOOT_RECEIPT_V4_CONTRACT,
             "booted_at_utc": booted_at_utc,
             "owner_identity": owner_identity,
             "worker_pid": os.getpid(),
@@ -1006,6 +1026,7 @@ def write_boot_receipt(
             f"writer={origin.writer_code_sha256}->{target.writer_code_sha256} "
             f"runtime={origin.runtime_identity_sha256}->{target.runtime_identity_sha256} "
             f"worker_profile={origin.worker_profile_sha256}->{target.worker_profile_sha256}"
+            + ("" if forms is None else f" heavy_work_permits={_permit_forms_text(forms)}")
         )
     parent, current = upgrade.parent, upgrade.current
     payload = {
@@ -1045,6 +1066,13 @@ def write_boot_receipt(
         f"parent_qualified_at={parent.qualified_at_utc}"
     )
     return path, digest, line
+
+
+def _permit_forms_text(forms: HeavyWorkPermitForms) -> str:
+    def form(value: int | None) -> str:
+        return "implied" if value is None else str(value)
+
+    return f"anchor:{form(forms.anchor)},origin:{form(forms.origin)},target:{form(forms.target)}"
 
 
 def _publish_boot_receipt(settings: Settings, owner_identity: str, payload: dict[str, Any]) -> tuple[Path, str]:
@@ -1123,10 +1151,10 @@ class DerivedLocalUpgrade:
         }
 
     def to_payload(self) -> dict[str, Any]:
-        """v1 keeps its historical keys; v2 names the Q0 anchor and the target."""
+        """v1 keeps its historical keys; v2 and v3 name the Q0 anchor and the target."""
 
         fields = {name: str(getattr(self, name)) for name in self.__dataclass_fields__}
-        if self.contract_version == UPGRADE_CONTRACT_V2:
+        if self.contract_version in (UPGRADE_CONTRACT_V2, UPGRADE_CONTRACT_V3):
             fields = {
                 "anchor_" + name.removeprefix("parent_") if name.startswith("parent_")
                 else "target_" + name.removeprefix("current_") if name.startswith("current_")
@@ -1151,12 +1179,13 @@ def derive_local_upgrade(
     measured local client, the recomputed writer and the explicit v11 capacity.
     The v1 edge requires a new writer; a v2 relation may keep Q0's writer (a
     release that changes no fingerprinted writer file), and then R, P and A
-    derive to Q0's own identities.
+    derive to Q0's own identities. A v3 relation derives exactly as v2: its one
+    extra axis is the worker profile, which is composed, never derived.
     """
 
-    if contract_version not in (UPGRADE_CONTRACT, UPGRADE_CONTRACT_V2):
+    if contract_version not in (UPGRADE_CONTRACT, UPGRADE_CONTRACT_V2, UPGRADE_CONTRACT_V3):
         raise MinerUDeploymentGateError("derive contract version is unsupported")
-    v2 = contract_version == UPGRADE_CONTRACT_V2
+    v2 = contract_version in (UPGRADE_CONTRACT_V2, UPGRADE_CONTRACT_V3)
     reference, target = ("qualification anchor", "target") if v2 else ("parent", "current")
 
     if not output_dir.is_absolute() or output_dir.exists() or output_dir.is_symlink() or not output_dir.parent.is_dir():
@@ -1309,8 +1338,8 @@ def build_upgrade_proposal(
             parent_process_profile, expected_sha256=parent_profile_sha, expected_owner_uid=uid,
         ).profile
         current_worker = _active_worker_profile(current_profile, settings)
-        parent_worker = derive_parent_worker_profile(
-            current_worker, parent_process_profile_sha256=parent_profile.sha256,
+        parent_worker = derive_relation_worker_profile(
+            current_worker, process_profile_sha256=parent_profile.sha256, forms=None, role="anchor",
         )
         parent_activation_sha = _observed_sha256(
             parent_activation, label="parent stream activation", max_bytes=_MAX_EVIDENCE_BYTES,
@@ -1400,6 +1429,7 @@ def build_upgrade_proposal_v2(
     exact_change_manifest_sha256: str,
     independent_test_evidence_sha256: str,
     independent_code_review_sha256: str,
+    heavy_work_permits: HeavyWorkPermitForms | None = None,
 ) -> LocalExecutionUpgradeV2:
     """Assemble a v2 proposal: the Q0 anchor, one archived recovery origin and the target.
 
@@ -1410,6 +1440,11 @@ def build_upgrade_proposal_v2(
     bundle, process profile and activation that every inventory member was
     frozen under. This builder only refuses early; the verifier re-checks
     everything.
+
+    ``heavy_work_permits`` makes it a v3 proposal. The target form must be the
+    active composition's; the anchor and origin worker profiles are the target
+    with their process reference and their declared form, and every inventory
+    member must bind that origin profile.
     """
 
     if settings.execution_upgrade_configured:
@@ -1487,7 +1522,12 @@ def build_upgrade_proposal_v2(
         ).profile
         if origin_profile.runtime_bundle_identity_sha256 != origin_runtime:
             raise MinerUDeploymentGateError("recovery origin process profile is not bound to the origin runtime")
-        origin_worker = derive_parent_worker_profile(target_worker, parent_process_profile_sha256=origin_profile.sha256)
+        origin_worker = derive_relation_worker_profile(
+            target_worker, process_profile_sha256=origin_profile.sha256, forms=heavy_work_permits, role="origin",
+        )
+        anchor_worker = derive_relation_worker_profile(
+            target_worker, process_profile_sha256=anchor_profile.sha256, forms=heavy_work_permits, role="anchor",
+        )
         origin_activation_sha = _observed_sha256(
             origin_activation, label="recovery origin stream activation", max_bytes=_MAX_EVIDENCE_BYTES,
         )
@@ -1516,9 +1556,7 @@ def build_upgrade_proposal_v2(
                 validation_receipt_sha256=sha256_of(validation_bytes),
                 process_profile_file=str(anchor_process_profile),
                 process_profile_sha256=anchor_profile.sha256,
-                worker_profile_sha256=derive_parent_worker_profile(
-                    target_worker, parent_process_profile_sha256=anchor_profile.sha256,
-                ).sha256,
+                worker_profile_sha256=anchor_worker.sha256,
                 stream_activation_file=str(anchor_activation),
                 stream_activation_sha256=anchor_activation_sha,
                 qualified_at_utc=_json_object(cache_bytes, label="qualification anchor canary")["passed_at_utc"],
@@ -1563,6 +1601,7 @@ def build_upgrade_proposal_v2(
                 inventory_sha256=sha256_of(inventory_bytes),
                 member_count=len(legacy.members),
             ),
+            heavy_work_permits=heavy_work_permits,
         )
     return upgrade
 
@@ -2137,7 +2176,7 @@ def render_preflight_terminal(report: dict[str, Any]) -> str:
             f"changes={','.join(report['runtime_changes'])}",
             f"  original keys: evidence={report['key_lookup_evidence_sha256']} ttl={report['key_ttl_seconds']}",
         ))
-    elif report.get("upgrade_contract_version") == UPGRADE_CONTRACT_V2:
+    elif report.get("upgrade_contract_version") in (UPGRADE_CONTRACT_V2, UPGRADE_CONTRACT_V3):
         lines.extend((
             f"  qualification anchor: qualified_at={report['anchor_qualified_at_utc']} "
             f"runtime={report['anchor_runtime_identity_sha256']} writer={report['anchor_writer_code_sha256']}",
@@ -2146,6 +2185,12 @@ def render_preflight_terminal(report: dict[str, Any]) -> str:
             f"worker_profile={report['origin_worker_profile_sha256']}",
             f"  target: runtime={report['current_runtime_identity_sha256']}",
         ))
+        if report["upgrade_contract_version"] == UPGRADE_CONTRACT_V3:
+            forms = HeavyWorkPermitForms(
+                anchor=report["anchor_heavy_work_permits"], origin=report["origin_heavy_work_permits"],
+                target=report["heavy_work_permits"],
+            )
+            lines.append("  heavy-work permits: " + _permit_forms_text(forms))
     else:
         lines.append(
             f"  runtime={report.get('parent_runtime_identity_sha256')}->{report['current_runtime_identity_sha256']}"
@@ -2163,6 +2208,7 @@ __all__ = [
     "BOOT_RECEIPT_CONTRACT",
     "BOOT_RECEIPT_QUALIFIED_CONTRACT",
     "BOOT_RECEIPT_V2_CONTRACT",
+    "BOOT_RECEIPT_V4_CONTRACT",
     "DerivedLocalUpgrade",
     "PREFLIGHT_CONTRACT",
     "SERVICE_ROOT",

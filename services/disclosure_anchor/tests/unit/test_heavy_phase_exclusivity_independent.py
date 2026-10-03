@@ -1,4 +1,4 @@
-"""Independent coordinator witness for one shared heavy-work execution permit.
+"""Independent coordinator witness for the shared heavy-work execution permits.
 
 The real coordinator and its recovery/credit scheduler are used. The backend
 marks where LOCAL decode, COMMIT reopen/build and CLEANUP revalidation would
@@ -12,10 +12,12 @@ import threading
 import time
 import unittest
 
+from disclosure_anchor.application.ports.worker_stop_control import PublicStopCause
 from disclosure_anchor.application.services.staged_parse_coordinator import (
     CoordinatorResult, CoordinatorTerminal, StageHeavyWorkRequired, StageWaiting,
     StagedParseCoordinator,
 )
+from disclosure_anchor.application.services.worker_stop_latch import InProcessWorkerStopLatch
 from tests.unit.test_staged_parse_coordinator import _Backend, _Clock, _LIMIT, _limits, _work
 
 
@@ -35,6 +37,11 @@ class _HeavyBackend(_Backend):
         self.wait_renew_for: str | None = None
         self.fail_first_commit_with_wait = False
         self._failed_once = False
+        # Further heavy entries held until ``release``; attempts whose first
+        # heavy entry is interrupted by a recoverable wait; each stage's guard.
+        self.also_block: set[tuple[str, str]] = set()
+        self.wait_once: set[str] = set()
+        self.guards: dict[str, object] = {}
 
     def signal(self, phase: str, attempt: str) -> threading.Event:
         return self.entered.setdefault((phase, attempt), threading.Event())
@@ -52,9 +59,10 @@ class _HeavyBackend(_Backend):
             self.active += 1
             self.peak = max(self.peak, self.active)
             self.order.append((phase, work.attempt_id))
+        self.guards[work.attempt_id] = stage_guard
         self.signal(phase, work.attempt_id).set()
         try:
-            if (phase, work.attempt_id) == self.block:
+            if (phase, work.attempt_id) == self.block or (phase, work.attempt_id) in self.also_block:
                 while not self.release.wait(0.001):
                     stage_guard.checkpoint()
             stage_guard.checkpoint()
@@ -62,6 +70,10 @@ class _HeavyBackend(_Backend):
                     and phase == "commit" and self.fail_first_commit_with_wait
                     and not self._failed_once):
                 self._failed_once = True
+                raise StageWaiting("synthetic recoverable heavy-stage interruption",
+                                   retry_after_seconds=0.05)
+            if work.attempt_id in self.wait_once:
+                self.wait_once.discard(work.attempt_id)
                 raise StageWaiting("synthetic recoverable heavy-stage interruption",
                                    retry_after_seconds=0.05)
             return call(work, credit_allowance=credit_allowance, stage_guard=stage_guard)
@@ -105,7 +117,7 @@ class _HeavyBackend(_Backend):
 
 
 def _start(backend: _HeavyBackend, *, limits, monotonic=time.monotonic,
-           process_guard=lambda: None):
+           process_guard=lambda: None, stop_control=None):
     result: list[CoordinatorResult] = []
     failures: list[BaseException] = []
 
@@ -113,7 +125,7 @@ def _start(backend: _HeavyBackend, *, limits, monotonic=time.monotonic,
         try:
             result.append(StagedParseCoordinator(
                 backend=backend, limits=limits, monotonic=monotonic,
-                process_guard=process_guard,
+                process_guard=process_guard, stop_control=stop_control,
             ).run())
         except BaseException as exc:
             failures.append(exc)
@@ -240,6 +252,114 @@ class HeavyPhaseExclusivityIndependentTests(unittest.TestCase):
         self.assertEqual(second_failures, [])
         self.assertEqual(second_result[0].terminal, CoordinatorTerminal.QUIESCENT)
         self.assertEqual(dict(second_result[0].final_states), {"commit-after-restart": "acked"})
+
+
+class TwoHeavyPermitsIndependentTests(unittest.TestCase):
+    """A v3 composition's two permits: overlap is bounded, released and stoppable."""
+
+    def test_two_commits_overlap_an_interrupted_holder_frees_its_permit_and_a_third_waits(self) -> None:
+        backend = _HeavyBackend(
+            recoverable=(
+                _work("commit-a", "local_materialized", 5),
+                _work("commit-b", "local_materialized", 5),
+                _work("commit-c", "local_materialized", 5),
+            ),
+            block=("commit", "commit-a"),
+        )
+        backend.also_block.add(("commit", "commit-c"))
+        backend.wait_once.add("commit-b")
+        # Three COMMIT workers: only the permits can hold the third back.
+        thread, result, failures = _start(
+            backend, limits=_limits(commit_workers=3, cleanup_workers=1, heavy_work_permits=2),
+        )
+        try:
+            self.assertTrue(backend.signal("commit", "commit-a").wait(1))
+            self.assertTrue(backend.signal("commit", "commit-c").wait(1),
+                            f"the interrupted holder's permit never reached the next COMMIT: {backend.order!r}")
+            # B's retry is due after 0.05 s but both permits stay held by A and C.
+            time.sleep(0.2)
+            self.assertEqual(backend.order.count(("commit", "commit-b")), 1, backend.order)
+        finally:
+            backend.release.set()
+            thread.join(3)
+            self.assertFalse(thread.is_alive(), "coordinator did not drain after release")
+        self.assertEqual(failures, [])
+        self.assertEqual(result[0].terminal, CoordinatorTerminal.QUIESCENT, repr(result[0]))
+        self.assertEqual(backend.peak, 2, backend.order)
+        self.assertEqual(backend.order.count(("commit", "commit-b")), 2, backend.order)
+        self.assertEqual(dict(result[0].final_states),
+                         {"commit-a": "acked", "commit-b": "acked", "commit-c": "acked"})
+
+    def test_local_decode_runs_beside_a_commit_with_the_second_permit(self) -> None:
+        backend = _HeavyBackend(
+            recoverable=(
+                _work("commit-first", "local_materialized", 5),
+                _work("local-next", "materializing", 5),
+            ),
+            block=("commit", "commit-first"),
+        )
+        limits = _limits(
+            credits=replace(_LIMIT, materialization_items=1,
+                            decoded_bytes=400, temp_disk_bytes=500),
+            local_workers=1, commit_workers=1, cleanup_workers=1, ack_workers=1,
+            heavy_work_permits=2,
+        )
+        thread, result, failures = _start(backend, limits=limits)
+        try:
+            self.assertTrue(backend.signal("commit", "commit-first").wait(1))
+            self.assertTrue(backend.signal("local", "local-next").wait(1),
+                            f"LOCAL decode waited behind COMMIT despite a free permit: {backend.order!r}")
+        finally:
+            backend.release.set()
+            thread.join(3)
+            self.assertFalse(thread.is_alive(), "coordinator did not drain after release")
+        self.assertEqual(failures, [])
+        self.assertEqual(result[0].terminal, CoordinatorTerminal.QUIESCENT, repr(result[0]))
+        self.assertEqual(backend.peak, 2, backend.order)
+        self.assertEqual(dict(result[0].final_states),
+                         {"commit-first": "acked", "local-next": "acked"})
+
+    def test_public_stop_revokes_both_heavy_holders_and_dispatches_no_third(self) -> None:
+        backend = _HeavyBackend(
+            recoverable=(
+                _work("commit-a", "local_materialized", 5),
+                _work("commit-b", "local_materialized", 5),
+                _work("commit-c", "local_materialized", 5),
+            ),
+            block=("commit", "commit-a"),
+        )
+        backend.also_block.add(("commit", "commit-b"))
+        latch = InProcessWorkerStopLatch()
+        cause = PublicStopCause(kind="maintenance_fatal", reason_code="maintenance_loop_failed",
+                                origin="maintenance")
+
+        def trip_when_both_hold() -> None:
+            if (backend.signal("commit", "commit-a").wait(2)
+                    and backend.signal("commit", "commit-b").wait(2)):
+                latch.trip(cause)
+
+        tripper = threading.Thread(target=trip_when_both_hold, daemon=True)
+        tripper.start()
+        thread, result, failures = _start(
+            backend, limits=_limits(commit_workers=3, heavy_work_permits=2), stop_control=latch,
+        )
+        try:
+            tripper.join(3)
+            thread.join(3)
+            self.assertFalse(thread.is_alive(), "revoked heavy holders did not drain")
+        finally:
+            # Bound teardown even if revocation failed to reach a holder.
+            backend.release.set()
+            thread.join(3)
+        self.assertEqual(failures, [])
+        self.assertEqual((result[0].terminal, result[0].termination_kind),
+                         (CoordinatorTerminal.STUCK_OPEN_CIRCUIT, "public_stop"))
+        self.assertIs(result[0].stop_cause, cause)
+        for attempt in ("commit-a", "commit-b"):
+            self.assertEqual(getattr(backend.guards[attempt], "revocation_provenance", None),
+                             "public_stop", attempt)
+        self.assertFalse(backend.signal("commit", "commit-c").is_set(), backend.order)
+        self.assertEqual((backend.active, backend.peak), (0, 2), backend.order)
 
 
 if __name__ == "__main__":

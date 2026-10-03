@@ -190,19 +190,62 @@ after the decode, before staging is mutated and before promotion: a decode that 
 nothing, and the good ZIP and staging are kept.
 
 **Heavy work.** LOCAL's one decode, and COMMIT's reopen, Unit build, readiness and promotion, hold whole
-objects; the credits held after LOCAL do not. One coordinator-owned permit (`heavy_work_permits`, 1 until real
-memory evidence justifies more) spans them across the separate lane pools. COMMIT takes it at dispatch; a
-LOCAL stage runs its transfer and unpack without it and, if it reaches the decode without it, stops at the last
+objects; the credits held after LOCAL do not. Coordinator-owned permits (`heavy_work_permits`) span them across
+the separate lane pools. The local worker composition fixes their number: v1 and v2 always one, and
+`staged-worker-composition.v3` declares one or two (`DISCLOSURE_V4_HEAVY_WORK_PERMITS`, see
+[worker dynamic scheduling](worker-dynamic-scheduling.md) §10). COMMIT takes a permit at dispatch; a
+LOCAL stage runs its transfer and unpack without one and, if it reaches the decode without one, stops at the last
 point the unpack still resumes exactly (every member durable with its record, nothing decoded), and is
-dispatched again with the permit when it is free, COMMIT first. The permit ends with its stage whatever the
+dispatched again with a permit when one is free, COMMIT first. A permit ends with its stage whatever the
 outcome (success, error, wait, cancellation), is never held by a waiting durable item, and never gates ACK,
-CLEANUP, claim renewal or remote reconcile. CLEANUP decodes nothing: its transfer is bound by the durable
+CLEANUP, claim renewal or remote reconcile. The stage's whole objects end with it as well. The exception of a
+stage that failed, waited or was revoked keeps the stage's frames in its traceback, and its Future keeps the
+exception. The coordinator therefore drops each consumed Future once the outcome is recorded (state, error
+text, content-free stop cause), before it dispatches again, so it keeps no retired stage beside the stage that
+reuses the permit, with one permit or two. The release is plain reference counting; a stage whose own frames
+keep their exception in a reference cycle still waits for the collector. A stage that still runs, or has
+finished but is not yet consumed, keeps its permit and its objects.
+CLEANUP decodes nothing: its transfer is bound by the durable
 receipt's output inventory (every file's SHA-256, total bytes and file count), exactly as the transfer proves
 it before and after the rename. Promotion is bound the same way and keeps only the one reopened object alive;
 LOCAL releases its decoded projection before the final load and proves the promoted tree by the sealed
 staging's file inventory instead of decoding it a second time; readiness reuses the artifact bytes it just
 encoded for a preparation it created and compares requests by content address. W remains the admitted decode
-working set, not an OS memory limit: the permit serializes the heavy phases, it does not measure their RSS.
+working set, not an OS memory limit: the permits bound how many heavy phases run at once, not their RSS.
+
+COMMIT also waits for its semantic model groups while it holds its permit, so with one permit only one model
+call runs at a time whatever the provider allows. Two permits let two COMMITs (two model groups, still within
+each provider's own concurrency) or one decode beside one COMMIT overlap; decodes stay bounded by the
+decoded-bytes ledger, which holds one at a time when W equals that limit. The count of two rests on measured
+peaks, not on W. On the 16,907 promoted outputs present on 2026-10-02:
+- the provider envelope reaches 18 MiB (p99 5.4 MiB);
+- the decode input reaches 67 MiB of MinerU JSON, against J = 128 MiB.
+
+Replaying the largest real documents offline, read-only and one phase per fresh process, one decode peaked
+about 0.4 GiB and one COMMIT heavy chain about 0.2 GiB above the interpreter baseline. Their sum is an estimate,
+not a concurrent measurement. That COMMIT replay also omitted the document classification priors and real model
+answers. On the largest retained document it formed one adjudication group where production's receipt has
+seven, so it is not an exact semantic replay.
+
+A separate no-DB overlap replay used the two largest retained documents (provider envelopes 18.0 and 16.2 MiB).
+It included their exact classification priors, native text from the real source PDFs and the production route
+validator. A synthetic provider blocked at the model call and then answered every Unit with a valid empty route.
+Each COMMIT formed seven adjudication groups, as many as the original receipts, but the groups and decisions are
+synthetic. Process high-water marks:
+- COMMIT beside the 1,058-page decode: 517.9 MiB (387.8 MiB above the post-import baseline); a rerun reached
+  469.8 MiB (340.1 MiB);
+- two COMMITs: 372.9 MiB (243.8 MiB above the baseline).
+
+Each figure is one pair in its own process, not a bound. None includes transaction P, a real model answer, a
+previous run's active Units or other worker activity, and the lower two-COMMIT figure does not mean a second
+COMMIT is free. Transaction P's own concurrency is tested separately on the scratch database: exact and
+conflicting requests for one document, a lost commit response, and cancellation after the SQL wait. Two
+different documents inside P at the same instant were not measured.
+
+These figures describe the published corpus, not a bound. J and the publication envelopes are the only enforced
+input limits, and a document far outside the measured range still runs beside at most one other heavy phase. A
+larger count needs new evidence and a new composition version. Moving between compositions is a U01 v3
+relation ([local execution upgrade](local-execution-upgrade.md)).
 
 **Publication envelope.** One source-fixed `PublicationEnvelopePolicyV1`
 (`application/contracts/publication_envelope_policy.py`) bounds every private record of the chain with a
@@ -227,8 +270,8 @@ loop, and the site stops only as described under "Holds on the Mac". P still che
 transaction. The exit is a release whose envelope holds the document. Reading bytes beyond an envelope back from
 disk stays an integrity refusal, so a release with smaller budgets (56abdb93 read at most an 8 MiB request, 24
 MiB preparation and 8 MiB readiness) cannot read the larger records a later release wrote: rolling back past
-this policy after such writes is not a blind rollback. The budgets bound encoded bytes only; the heavy permit
-serializes the phase and does not bound its RSS.
+this policy after such writes is not a blind rollback. The budgets bound encoded bytes only; the heavy permits
+bound how many such phases run at once, not their RSS.
 
 ## Pressure and remote execution
 
@@ -256,10 +299,18 @@ E7 obligations through `worker-qualified-runtime-upgrade.v1`; see
   including one that owns only its source snapshot. That is conservative: under the draft policy (D = 64 GiB,
   100,000 members, margin ~391 MiB, maximal grant ~31 GiB), admission holds at most (D − reserve − LOCAL
   work) / (snapshot + margin) documents: about 85 with no LOCAL work in progress, against 128 document credits.
-- One heavy-work permit is a conservative choice, not a measured one: W is the admitted decode working set,
-  not an OS memory limit, and no RSS bound for the heavy phases has been measured. D charges an attempt's
-  output until its cleanup releases the credits; readiness files are covered by the free floor only when the
-  readiness adapter is composed with the materializer's write space.
+- Heavy-work permits are counted, not memory-accounted: W is the admitted decode working set, not an OS memory
+  limit. The two-permit composition rests on measured peaks, not on an enforced RSS bound:
+  - single-phase replays of the largest published documents: envelope reopen, native text, admission, Unit
+    build, route input preparation without document priors or model answers, sealing and readiness-sized
+    encodings;
+  - one overlap pair of each kind (COMMIT beside a decode, two COMMITs) with the documents' priors and a
+    synthetic successful provider.
+
+  Not in either replay: DB reads, transaction P, real model answers and a previous run's active Units on
+  re-publication.
+- D charges an attempt's output until its cleanup releases the credits; readiness files are covered by the free
+  floor only when the readiness adapter is composed with the materializer's write space.
 - The private publication envelopes (8 / 24 / 8 MiB) are unchanged. The published winner row keeps its 8 MiB
   DB check without a typed pre-transaction refusal; it is argued to be dominated by the request envelope,
   not separately witnessed.

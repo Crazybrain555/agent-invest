@@ -83,10 +83,13 @@ from disclosure_anchor.adapters.runtime.worker_stop_control import RuntimeWorker
 from disclosure_anchor.adapters.storage.path_builder import FileStorePathBuilder
 from disclosure_anchor.application.contracts.staged_resource_credit import ResourceCreditVector
 from disclosure_anchor.application.contracts.worker_execution_upgrade import (
+    HeavyWorkPermitForms,
     decode_execution_release_manifest,
+    decode_execution_upgrade,
     decode_legacy_scope_inventory,
     decode_local_execution_upgrade,
     encode_local_execution_upgrade,
+    encode_local_execution_upgrade_v3,
 )
 from disclosure_anchor.application.ports.mineru_stream_pressure import StreamPressureSample
 from disclosure_anchor.application.services.mineru_stream_policy import (
@@ -439,6 +442,50 @@ class LocalExecutionUpgradeRecoveryTests(unittest.TestCase):
             current_environment=current_environment, settings=upgrade_settings,
             inventory=decode_legacy_scope_inventory(inventory_path.read_bytes()),
         )
+
+    def _build_v3_permit_upgrade(self, directory: Path) -> SimpleNamespace:
+        """Use the existing DB inventory, with old Q0/WPv2 as both anchor and origin."""
+
+        base = self._build_upgrade(directory)
+        parent = self.parent
+        archived_bytes = b"scratch archived Q0 writer member"
+        origin_release = json.loads(base.release_path.read_bytes())
+        origin_release.update(source_revision="scratch-archived-q0",
+                              writer_code_sha256=parent.historical_writer)
+        origin_release["files"][0].update(sha256=sha256_bytes(archived_bytes), bytes=len(archived_bytes))
+        origin_release_path = write_private(directory / "origin-release.json", exact_json(origin_release))
+        origin_runtime_path = write_private(directory / "origin-runtime.json", exact_json({
+            "identity_sha256": parent.runtime_identity, "manifest": parent.manifest,
+        }))
+        environment = dict(base.current_environment, DISCLOSURE_V4_HEAVY_WORK_PERMITS="2")
+        with patch.dict(os.environ, environment), self._gate_ports():
+            proposal = upgrade_runtime.build_upgrade_proposal_v2(
+                base.current_settings,
+                release_manifest=base.release_path, runtime_bundle=base.derived.runtime_bundle_file,
+                anchor_process_profile=parent.process_profile_path, anchor_activation=parent.activation_path,
+                origin_release_manifest=origin_release_path, origin_runtime_bundle=origin_runtime_path,
+                origin_process_profile=parent.process_profile_path, origin_activation=parent.activation_path,
+                inventory=base.inventory_path,
+                exact_change_manifest_sha256=sha256_bytes(b"scratch v3 exact change"),
+                independent_test_evidence_sha256=sha256_bytes(b"scratch v3 test evidence"),
+                independent_code_review_sha256=sha256_bytes(b"scratch v3 code review"),
+                heavy_work_permits=HeavyWorkPermitForms(anchor=None, origin=None, target=2),
+            )
+        proposal_path = write_private(directory / "proposal-v3.json", encode_local_execution_upgrade_v3(proposal))
+        review_path = write_private(directory / "review-v3.json", exact_json({
+            "contract_version": REVIEW_CONTRACT, "verdict": "GO",
+            "proposal_sha256": sha256_bytes(proposal_path.read_bytes()),
+            "reviewer_reference": "independent-scratch-v3", "decision_reference": "independent-scratch-v3",
+        }))
+        settings = _settings(
+            base.current_settings,
+            disclosure_worker_execution_upgrade_file=proposal_path,
+            disclosure_worker_execution_upgrade_sha256=sha256_bytes(proposal_path.read_bytes()),
+            disclosure_worker_execution_upgrade_review_file=review_path,
+            disclosure_worker_execution_upgrade_review_sha256=sha256_bytes(review_path.read_bytes()),
+        )
+        return SimpleNamespace(**dict(vars(base), proposal_path=proposal_path, review_path=review_path,
+                                      current_environment=environment, settings=settings))
 
     def _check_upgrade_independently(self, built: SimpleNamespace, heads: tuple[str, ...]) -> None:
         parent = self.parent
@@ -832,6 +879,97 @@ class LocalExecutionUpgradeRecoveryTests(unittest.TestCase):
         self.assertEqual(len(self._receipts()), 4)
         self.assertFalse(self.paths.data_path(tail_document.relpath).exists(), "the tail ACKed without its source")
         self.assertEqual(self._states((tail_attempt,))[tail_attempt], ("acked", False))
+
+    def test_v3_implied_two_permits_recovers_old_v2_prepared_and_submitted(self) -> None:
+        """Real scratch DB H0/spec and resident recovery across the WPv2 -> WPv3 edge."""
+
+        prepared_doc = self._document("v3-prepared", "prepared", 120)
+        submitted_doc = self._document("v3-submitted", "submitted", 121)
+        waiting = self._document("waiting-new", "new", 122)
+        prepared = self.worker.drive(self.worker.admit(prepared_doc, security_id=self.security_id),
+                                     "prepared", fleet=self.fleet)
+        submitted = self.worker.drive(self.worker.admit(submitted_doc, security_id=self.security_id),
+                                      "submitted", fleet=self.fleet)
+        members = (prepared.attempt_id, submitted.attempt_id)
+        self.fleet.complete(self.fleet.task_for_attempt(submitted.attempt_id).client_submit_key)
+        neighbour = self._neighbour()
+        neighbour_before = self._rows_of(neighbour.document_id)
+        before = {attempt: self._authority(attempt) for attempt in members}
+        for attempt in members:
+            authority = before[attempt]
+            self.assertEqual(authority.execution_spec.worker_profile.sha256, self.parent.worker_profile.sha256)
+            self.assertEqual(authority.execution_spec.worker_profile.contract_version,
+                             "staged-worker-composition.v2")
+        original_posts = Counter(self.fleet.posts)
+        self._expire_claims()
+        built = self._build_v3_permit_upgrade(self.root / "u01-v3-permits")
+        proposal = decode_execution_upgrade(built.proposal_path.read_bytes())
+        self.assertEqual((proposal.contract_version, proposal.heavy_work_permits),
+                         ("worker-local-execution-upgrade.v3",
+                          HeavyWorkPermitForms(anchor=None, origin=None, target=2)))
+        self.assertEqual(proposal.qualification_anchor.worker_profile_sha256,
+                         self.parent.worker_profile.sha256)
+        self.assertEqual(proposal.recovery_origin.worker_profile_sha256,
+                         self.parent.worker_profile.sha256)
+        self.assertEqual(self._preflight(built, ttl=86400)["ready_to_install"], True)
+        self.assertEqual(self._attempts_of(waiting.document_id), [], "new H0 must await legacy closure")
+
+        observed_limits: list[int] = []
+        original_limits = staged_worker_v4.staged_v4_coordinator_limits
+
+        def capture_limits(*args: Any, **kwargs: Any) -> Any:
+            limits = original_limits(*args, **kwargs)
+            observed_limits.append(limits.heavy_work_permits)
+            return limits
+
+        violations: list[tuple[int, int]] = []
+        watching = threading.Event()
+        monitor = threading.Thread(target=self._watch_hold, args=(members, waiting.document_id,
+                                                                  violations, watching))
+        monitor.start()
+        try:
+            with patch.object(staged_worker_v4, "staged_v4_coordinator_limits", side_effect=capture_limits):
+                boot = self._u01_boot(built, label="v3 implied to two", done=lambda: self._document_acked(waiting.document_id))
+        finally:
+            watching.set()
+            monitor.join()
+        self.assertEqual(violations, [], "new H0 was admitted while an old duty was open")
+        self.assertTrue(observed_limits and all(value == 2 for value in observed_limits), observed_limits)
+        boot_payload = json.loads(boot["receipt"].read_bytes())
+        self.assertEqual((boot_payload["contract_version"], boot_payload["upgrade_contract_version"],
+                          boot_payload["origin_heavy_work_permits"], boot_payload["heavy_work_permits"]),
+                         (upgrade_runtime.BOOT_RECEIPT_V4_CONTRACT,
+                          "worker-local-execution-upgrade.v3", None, 2))
+        self.assertEqual(self._rows_of(neighbour.document_id), neighbour_before,
+                         "the prior business winner changed")
+
+        for document, attempt in ((prepared_doc, prepared.attempt_id),
+                                  (submitted_doc, submitted.attempt_id)):
+            after = self._authority(attempt)
+            old = before[attempt]
+            self.assertEqual((after.attempt_id, after.processing_run_id, after.fence_identity,
+                              after.client_submit_key, after.request_sha256, after.runtime_epoch_sha256,
+                              after.execution_spec, after.checkpoint_history[0].sha256),
+                             (old.attempt_id, old.processing_run_id, old.fence_identity,
+                              old.client_submit_key, old.request_sha256, old.runtime_epoch_sha256,
+                              old.execution_spec, old.checkpoint_history[0].sha256))
+            self.assertEqual([row[0] for row in self._attempts_of(document.document_id)], [attempt])
+            self.assertEqual((after.state, after.is_current, self._document_status(document.document_id)),
+                             ("acked", False, "published"))
+            self.assertIsNotNone(after.publication_winner)
+            self.assertEqual((after.publication_winner.attempt_id,
+                              after.publication_winner.processing_run_id),
+                             (attempt, old.processing_run_id))
+            key = old.client_submit_key
+            self.assertEqual(self.fleet.posts[key], original_posts[key] + (1 if attempt == prepared.attempt_id else 0))
+            task = self.fleet.task_for_attempt(attempt)
+            self.assertEqual((self.fleet.result_gets[task.task_id], self.fleet.ack_effects[task.task_id]), (1, 1))
+        self.assertEqual(self.fleet.duplicate_posts, [])
+        (new_attempt, new_state, _), = self._attempts_of(waiting.document_id)
+        new_spec = self._authority(new_attempt).execution_spec
+        self.assertEqual((new_state, new_spec.worker_profile.sha256,
+                          new_spec.worker_profile.heavy_work_permits),
+                         ("acked", proposal.current.worker_profile_sha256, 2))
 
     def test_an_extra_old_profile_head_after_capture_is_a_public_stop_before_any_effect(self) -> None:
         seeded = self._seed((("prepared", 1), ("submitted", 1)))

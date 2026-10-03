@@ -799,9 +799,70 @@ upgrade”。所有数值（D/H/P/C/M、单项许可、硬包络、Mac 配额与
    所以只持有源快照的文档不会把 D 占到等待中的 grant 无法开始；排在车道队首等待的 grant 会挡住后面新的 grant，
    只等前面的 LOCAL 工作排空（排空不需要增长）。只有增长受检，COMMIT/cleanup/ACK 不增长，从不被 D 挡住；策略拒绝
    装不下一份最大 grant + 源快照 + 余量的 D。在另一策略下准入、超出 D 减预留的已恢复快照，会让装得下的 grant 越过
-   队首先跑、逐步排空。LOCAL 的那一次解码与 COMMIT 的重开/Unit 构建/就绪/晋升共用一个重活许可（当前 1 个）：
-   等许可的 lane 显示 `heavy_work`，是健康等待，不耗重试预算；ACK、cleanup、续租与远端对账从不需要它。就绪文件
-   写到发布语料目录（D 之外），第一次写入前按实时余量承诺尚未落盘的文件（`publication_capacity_waiting`，健康等待）。
+   队首先跑、逐步排空。LOCAL 的那一次解码与 COMMIT 的重开/Unit 构建/就绪/晋升共用重活许可：
+   - 个数由本机 profile 决定。未设置 `DISCLOSURE_V4_HEAVY_WORK_PERMITS` 时为 1 个；设为 2 即
+     `staged-worker-composition.v3`，见下方“启用两个重活许可”。
+   - 等许可的 lane 显示 `heavy_work`，是健康等待，不耗重试预算。
+   - ACK、cleanup、续租与远端对账从不需要它。
+
+   启用两个重活许可（或回到 1 个）是本机 profile 身份变更。它只能走 U01 v3 关系
+   （`worker-local-execution-upgrade.v3`，合同见 `../design/local-execution-upgrade.md`“U01 v3”），按 §1.1g
+   的同一流程做：
+   1. 停 worker 并只读抓取 `legacy-scope` 清单。在途阶段被取消，head 保持未终结，不 cleanup、不 ACK，
+      作为名单成员在新许可数下继续。
+   2. `derive --contract-version v3`：与 v2 相同的 R/P/A 推导。只改许可数的 release 不动 writer，派生的
+      R/P/A 应与已部署 target 完全相同；不同即停止核查，不改旧资格。
+   3. 在基础 worker env 写入或删除 `DISCLOSURE_V4_HEAVY_WORK_PERMITS=2`（release binding overlay 不生成，
+      合并时保留基础值）。
+   4. `propose --contract-version v3`：在 v2 参数之外，显式写
+      `--anchor-heavy-work-permits implied --origin-heavy-work-permits <implied|2> --target-heavy-work-permits <2|implied>`。
+      输出中的 anchor worker profile 必须等于已部署提案的 anchor 值：Q0 的组合不变。
+      - `--anchor-process-profile`/`--anchor-activation` 用已部署提案 `qualification_anchor` 记录的 P0/A0
+        原路径，不用副本：完整 anchor 含这两个文件路径。
+      - propose 的进程环境不能含任何 `DISCLOSURE_WORKER_EXECUTION_UPGRADE_*`（有一项即 exit 65）。在目标配置
+        副本里去掉这四项、原值归档；这不是关掉生产的 U01 门。
+   5. 独立 GO 审阅：
+      - 旧 proposal 与旧 GO 的 SHA 只取自先前实际部署的记录：已部署私有 env 的
+        `DISCLOSURE_WORKER_EXECUTION_UPGRADE_SHA256`/`_REVIEW_SHA256`，或已有 boot 收据
+        （`$DISCLOSURE_RUNTIME_ROOT/reports/execution-boot/<owner>.json` 的 `upgrade_sha256`/`review_sha256`）。
+        按它们核对原字节以及旧 GO 的 proposal 引用；不能把本次重填并重新计算的文件充当历史批准。
+      - 机械比对新旧完整 qualification_anchor（包括 WP、Q0 日期和全部资格/文件引用）及 anchor form，再比对
+        本次 origin 与所选旧 current_execution 或 recovery_origin。选择必须符合清单冻结身份：成员同属一个
+        来源三元组，混合即停止核查。
+      - Q0 不保存 WP；这仍是已批准 derived claim 的延续，不宣称 Q0 实测了新 WP。
+      - 比较输出与旧 proposal、旧 GO、新 proposal 的哈希冻结为一份审阅记录。GO 的 `decision_reference`（合同
+        上限 256 个可打印字符）写该记录的 `sha256:<摘要>`；不另建业务台账，不重做资格。然后配置四项 U01。
+   6. `worker deployment-preflight --prepared-key-ttl-seconds <TTL>`。终端应显示 contract v3 和
+      `heavy-work permits:` 一行。
+   7. 启动。名单成员终结前不建新 H0，这是既有 hold，不另设排空。
+
+   同一 release 只改许可数时，origin 可以是当前 release（配置专用边）。启用后，之后的每次发布都用 v3：
+   origin 与 target 都写 `2`。v1/v2 会拒绝 v3 组合。不要关掉 U01 去走 exact 路径：Q0 不覆盖当前
+   writer/runtime。
+
+   运行后观察：
+   - worker RSS 与主机内存压力/swap；
+   - provider capacity/timeout 与 semantic degraded 比例；
+   - 事务 P 冲突或锁等待；
+   - 发布/语义漂移。
+
+   发生异常先保留第一原因、材料与原责任，区分正常可恢复等待和需要停止的错误。只有已知安全状态下才回退。
+   回退同样走 derive/propose/独立 GO/preflight/boot；许可回退不解决未知 P 或远端副作用。按停止时的实际责任
+   选分支（“上线提案”指启用两个许可时部署的 v3 提案）：
+   - 旧 WPv2 清单仍有未终态成员，尚无 WPv3 H0：origin 是上线提案的 recovery_origin（E_old/WPv2 的归档原件）；
+     target 是同一新实现 E_new 去掉 `DISCLOSURE_V4_HEAVY_WORK_PERMITS` 的单许可组合。forms 为
+     `{anchor:null,origin:null,target:null}`，E_old 与 E_new 必须不同：同 release 且 form 不变会被拒绝。
+     重新抓取完整未决清单并独立 GO。此时填 origin `2` 会因旧成员的冻结 WPv2 与 origin 不符而被正确拒绝，
+     不能改旧 H0 来绕过。
+   - 旧清单已终结，已有 WPv3/2 的新责任：origin 是上线提案的 current_execution（E_new/WPv3/2），target 是同一
+     E_new 的单许可组合；forms `{null,2,null}`，是配置专用边。
+   - 清单为空：origin 仍取实际最后批准/boot 的 target 及其 form；空清单不自动授权 WP 身份改变。
+   - 同一清单混有两种来源（任何单一 origin 都会拒绝其中一类成员），或提交结果未知：保持停止。不遗漏成员、
+     不篡改 spec，不盲关 U01 退回 exact。
+
+   优先保留新实现的 Future 修复而回到单许可，不退回存在该生命周期问题的旧源码。
+
+   就绪文件写到发布语料目录（D 之外），第一次写入前按实时余量承诺尚未落盘的文件（`publication_capacity_waiting`，健康等待）。
    - 站点级 hold → F5 公共停止（§1.1f，`coordinator_circuit`）：原生 `blocked=true` 为
      `native_storage_hold`；spool_owner_unproven、spool_progress_unproven、spool_part_identity、spool_part_short、
      spool_prefix_mismatch 为 `transfer_integrity_hold`；任何账本都装不下的 grant 为

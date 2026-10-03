@@ -126,6 +126,11 @@ def staged_v4_coordinator_limits(
         claim_lease_seconds=PRODUCTION_CLAIM_LEASE_SECONDS,
         max_stage_step_seconds=PRODUCTION_MAX_STAGE_STEP_SECONDS,
         commit_stage_seconds=worker_profile.commit_stage_seconds,
+        # v1/v2 compositions never declared it and always ran one permit.
+        heavy_work_permits=(
+            1 if worker_profile.heavy_work_permits is None
+            else worker_profile.heavy_work_permits
+        ),
         # Storage-bound: the policy's frozen decode stage bounds one LOCAL
         # stage (download, unpack, one decode) with claim renewal inside it.
         local_stage_seconds=(

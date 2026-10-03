@@ -36,6 +36,15 @@ relation never reads or re-verifies an older upgrade, and there is no
 transitive chain, hash allowlist or ambient authorization. The runtime adapter
 reads and hashes the files; this module performs no IO.
 
+``worker-local-execution-upgrade.v3`` is the v2 relation plus one closed,
+reviewed worker-profile axis: each role's heavy-work permit form (the v2
+composition with its one implied permit, or a v3 composition declaring a
+count). Every other worker-profile field still moves only its process-profile
+reference, and every v2 check runs unchanged. A v1 or v2 relation never
+carries a v3 composition: neither names the form it would be asserting for
+Q0. A v3 target may keep its origin's release only when its form moves, so a
+permit count can change, or return, without a code change.
+
 ``worker-qualified-runtime-upgrade.v1`` (``newly_qualified_result_runtime``)
 is a separate branch, not a loosening of those predicates. The target runtime
 carries its own new qualification Qnew (the exact deployment path verifies it
@@ -69,7 +78,13 @@ from disclosure_anchor.application.contracts.mineru_process_profile import Miner
 from disclosure_anchor.application.contracts.staged_resource_credit import (
     STAGED_RESOURCE_STATE_TRANSITIONS,
 )
-from disclosure_anchor.application.contracts.staged_worker_profile_v4 import StagedWorkerProfileV4
+from disclosure_anchor.application.contracts.staged_worker_profile_v4 import (
+    MAX_HEAVY_WORK_PERMITS,
+    STAGED_WORKER_PROFILE_V4_HEAVY_CONTRACT,
+    StagedWorkerProfileV4,
+    heavy_work_permit_form,
+    with_heavy_work_permit_form,
+)
 from disclosure_anchor.application.ports.new_work_admission import NewWorkAdmissionUnavailable
 
 if TYPE_CHECKING:
@@ -83,6 +98,7 @@ if TYPE_CHECKING:
 
 UPGRADE_CONTRACT = "worker-local-execution-upgrade.v1"
 UPGRADE_CONTRACT_V2 = "worker-local-execution-upgrade.v2"
+UPGRADE_CONTRACT_V3 = "worker-local-execution-upgrade.v3"
 QUALIFIED_UPGRADE_CONTRACT = "worker-qualified-runtime-upgrade.v1"
 QUALIFIED_TRANSITION_KIND = "newly_qualified_result_runtime"
 KEY_LOOKUP_CONTRACT = "worker-legacy-key-lookup.v1"
@@ -327,14 +343,41 @@ class RecoveryOrigin:
 
 
 @dataclass(frozen=True, slots=True)
+class HeavyWorkPermitForms:
+    """The one worker-profile axis a v3 relation moves, named for every role.
+
+    ``None`` is the v2 composition with its one implied heavy-work permit; a
+    count is the v3 composition declaring it. All other worker-profile fields
+    keep the v2 rule: only the process-profile reference moves.
+    """
+
+    anchor: int | None
+    origin: int | None
+    target: int | None
+
+    def __post_init__(self) -> None:
+        for name in ("anchor", "origin", "target"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or not 1 <= value <= MAX_HEAVY_WORK_PERMITS):
+                raise ValueError(
+                    f"{name} heavy-work permits must be null or an integer in 1..{MAX_HEAVY_WORK_PERMITS}"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class LocalExecutionUpgradeV2:
-    """The v2 proposal: Q0 anchor, one recovery origin and the target over one inventory."""
+    """The v2 proposal: Q0 anchor, one recovery origin and the target over one inventory.
+
+    With ``heavy_work_permits`` it is the v3 proposal: the same relation with
+    each role's heavy-work permit form named and checked.
+    """
 
     qualification_anchor: ParentQualification
     recovery_origin: RecoveryOrigin
     current: CurrentExecution
     basis: CompatibilityBasis
     legacy_scope: LegacyScopeReference
+    heavy_work_permits: HeavyWorkPermitForms | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -343,17 +386,27 @@ class LocalExecutionUpgradeV2:
             or type(self.current) is not CurrentExecution
             or type(self.basis) is not CompatibilityBasis
             or type(self.legacy_scope) is not LegacyScopeReference
+            or (self.heavy_work_permits is not None and type(self.heavy_work_permits) is not HeavyWorkPermitForms)
         ):
             raise ValueError("local execution upgrade v2 sections must be exact")
-        origin, current = self.recovery_origin, self.current
+        origin, current, forms = self.recovery_origin, self.current, self.heavy_work_permits
         if current.release_manifest_sha256 == origin.release_manifest_sha256:
-            raise ValueError("a recovery upgrade target must be a new release, not its recovery origin")
+            if forms is None:
+                raise ValueError("a recovery upgrade target must be a new release, not its recovery origin")
+            if forms.origin == forms.target:
+                raise ValueError(
+                    "a v3 target keeps its origin's release only when its heavy-work permit form moves"
+                )
         if current.capacity_config_sha256 != origin.capacity_config_sha256:
             raise ValueError("a recovery upgrade cannot move the recovery origin's explicit capacity")
 
+    @property
+    def contract_version(self) -> str:
+        return UPGRADE_CONTRACT_V2 if self.heavy_work_permits is None else UPGRADE_CONTRACT_V3
+
     def to_payload(self) -> dict[str, Any]:
-        return {
-            "contract_version": UPGRADE_CONTRACT_V2,
+        payload: dict[str, Any] = {
+            "contract_version": self.contract_version,
             "transition_kind": TRANSITION_KIND,
             "qualification_anchor": _dataclass_payload(self.qualification_anchor),
             "recovery_origin": _dataclass_payload(self.recovery_origin),
@@ -361,6 +414,9 @@ class LocalExecutionUpgradeV2:
             "compatibility_basis": _dataclass_payload(self.basis),
             "legacy_scope": _dataclass_payload(self.legacy_scope),
         }
+        if self.heavy_work_permits is not None:
+            payload["heavy_work_permits"] = _dataclass_payload(self.heavy_work_permits)
+        return payload
 
 
 _ORIGIN_SHA_FIELDS = (
@@ -372,14 +428,41 @@ _ORIGIN_FILE_FIELDS = (
 )
 
 
+_RELATION_FIELDS = frozenset({
+    "contract_version", "transition_kind", "qualification_anchor", "recovery_origin",
+    "current_execution", "compatibility_basis", "legacy_scope",
+})
+
+
 def decode_local_execution_upgrade_v2(payload: bytes) -> LocalExecutionUpgradeV2:
     value = load_closed_object(payload, label="local execution upgrade", maximum_bytes=MAX_UPGRADE_BYTES)
-    require_fields(value, {
-        "contract_version", "transition_kind", "qualification_anchor", "recovery_origin",
-        "current_execution", "compatibility_basis", "legacy_scope",
-    }, label="local execution upgrade v2")
+    require_fields(value, _RELATION_FIELDS, label="local execution upgrade v2")
     if value["contract_version"] != UPGRADE_CONTRACT_V2 or value["transition_kind"] != TRANSITION_KIND:
         raise ValueError("local execution upgrade contract or transition kind is unsupported")
+    return LocalExecutionUpgradeV2(**_decode_relation_sections(value))
+
+
+def decode_local_execution_upgrade_v3(payload: bytes) -> LocalExecutionUpgradeV2:
+    """The v2 sections plus the closed heavy-work permit forms; nothing else is accepted."""
+
+    value = load_closed_object(payload, label="local execution upgrade", maximum_bytes=MAX_UPGRADE_BYTES)
+    require_fields(value, _RELATION_FIELDS | {"heavy_work_permits"}, label="local execution upgrade v3")
+    if value["contract_version"] != UPGRADE_CONTRACT_V3 or value["transition_kind"] != TRANSITION_KIND:
+        raise ValueError("local execution upgrade contract or transition kind is unsupported")
+    forms_raw = value["heavy_work_permits"]
+    if type(forms_raw) is not dict:
+        raise ValueError("heavy-work permit forms must be an object")
+    require_fields(forms_raw, {"anchor", "origin", "target"}, label="heavy-work permit forms")
+    for name, form in forms_raw.items():
+        if form is not None and type(form) is not int:
+            raise ValueError(f"{name} heavy-work permit form must be null or an integer")
+    forms = HeavyWorkPermitForms(
+        anchor=forms_raw["anchor"], origin=forms_raw["origin"], target=forms_raw["target"],
+    )
+    return LocalExecutionUpgradeV2(**_decode_relation_sections(value), heavy_work_permits=forms)
+
+
+def _decode_relation_sections(value: dict[str, Any]) -> dict[str, Any]:
     anchor_raw, origin_raw = value["qualification_anchor"], value["recovery_origin"]
     current_raw, basis_raw, scope_raw = value["current_execution"], value["compatibility_basis"], value["legacy_scope"]
     if not all(type(item) is dict for item in (anchor_raw, origin_raw, current_raw, basis_raw, scope_raw)):
@@ -427,14 +510,26 @@ def decode_local_execution_upgrade_v2(payload: bytes) -> LocalExecutionUpgradeV2
         member_count=require_int(scope_raw["member_count"], label="legacy member count", minimum=0,
                                  maximum=_MAX_MEMBERS),
     )
-    return LocalExecutionUpgradeV2(
-        qualification_anchor=anchor, recovery_origin=origin, current=current, basis=basis, legacy_scope=scope,
-    )
+    return {
+        "qualification_anchor": anchor, "recovery_origin": origin, "current": current, "basis": basis,
+        "legacy_scope": scope,
+    }
 
 
 def encode_local_execution_upgrade_v2(upgrade: LocalExecutionUpgradeV2) -> bytes:
+    if upgrade.heavy_work_permits is not None:
+        raise ValueError("a relation that names heavy-work permit forms is a v3 proposal")
     encoded = canonical_bytes(upgrade.to_payload())
     if decode_local_execution_upgrade_v2(encoded) != upgrade:
+        raise ValueError("local execution upgrade does not round-trip")
+    return encoded
+
+
+def encode_local_execution_upgrade_v3(upgrade: LocalExecutionUpgradeV2) -> bytes:
+    if upgrade.heavy_work_permits is None:
+        raise ValueError("a v3 proposal names every role's heavy-work permit form")
+    encoded = canonical_bytes(upgrade.to_payload())
+    if decode_local_execution_upgrade_v3(encoded) != upgrade:
         raise ValueError("local execution upgrade does not round-trip")
     return encoded
 
@@ -657,13 +752,15 @@ AnyExecutionUpgrade = LocalExecutionUpgrade | LocalExecutionUpgradeV2 | Qualifie
 def decode_execution_upgrade(payload: bytes) -> AnyExecutionUpgrade:
     """Select the decoder by the closed contract version.
 
-    Only an exact v2 or qualified contract version selects its decoder; every
-    other payload keeps the unchanged v1 decoder and its refusals.
+    Only an exact v2, v3 or qualified contract version selects its decoder;
+    every other payload keeps the unchanged v1 decoder and its refusals.
     """
 
     value = load_closed_object(payload, label="local execution upgrade", maximum_bytes=MAX_UPGRADE_BYTES)
     if value.get("contract_version") == UPGRADE_CONTRACT_V2:
         return decode_local_execution_upgrade_v2(payload)
+    if value.get("contract_version") == UPGRADE_CONTRACT_V3:
+        return decode_local_execution_upgrade_v3(payload)
     if value.get("contract_version") == QUALIFIED_UPGRADE_CONTRACT:
         return decode_qualified_runtime_upgrade(payload)
     return decode_local_execution_upgrade(payload)
@@ -1171,6 +1268,37 @@ def derive_parent_worker_profile(
     return replace(current, process_profile_sha256=parent_process_profile_sha256)
 
 
+def derive_relation_worker_profile(
+    target: StagedWorkerProfileV4,
+    *,
+    process_profile_sha256: str,
+    forms: HeavyWorkPermitForms | None,
+    role: Literal["anchor", "origin"],
+) -> StagedWorkerProfileV4:
+    """One role's worker profile exactly as the reviewed relation states it.
+
+    Without forms (v1/v2) it is the target with only its process-profile
+    reference moved, and a v3 target is refused: neither relation names the
+    form it would assert for Q0. With forms (v3) the target must have the
+    declared target form, and the role's profile is the target with its
+    process-profile reference moved and the role's declared form, nothing else.
+    """
+
+    if type(target) is not StagedWorkerProfileV4:
+        raise ValueError("worker profile must be exact")
+    if forms is None:
+        if target.contract_version == STAGED_WORKER_PROFILE_V4_HEAVY_CONTRACT:
+            raise ValueError(
+                "a worker composition that declares heavy-work permits is carried only by the v3 relation"
+            )
+        return derive_parent_worker_profile(target, parent_process_profile_sha256=process_profile_sha256)
+    if type(forms) is not HeavyWorkPermitForms or heavy_work_permit_form(target) != forms.target:
+        raise ValueError("the target worker profile does not have the relation's declared heavy-work permit form")
+    return with_heavy_work_permit_form(
+        replace(target, process_profile_sha256=process_profile_sha256), getattr(forms, role),
+    )
+
+
 def require_activation_mapping(
     parent: object,
     current: object,
@@ -1298,7 +1426,7 @@ class VerifiedQualifiedExecution:
     def upgrade_contract_version(self) -> str:
         if isinstance(self.upgrade, QualifiedRuntimeUpgrade):
             return QUALIFIED_UPGRADE_CONTRACT
-        return UPGRADE_CONTRACT_V2 if isinstance(self.upgrade, LocalExecutionUpgradeV2) else UPGRADE_CONTRACT
+        return self.upgrade.contract_version if isinstance(self.upgrade, LocalExecutionUpgradeV2) else UPGRADE_CONTRACT
 
     @property
     def qualification_anchor(self) -> ParentQualification:
@@ -1615,8 +1743,9 @@ class VerifiedQualifiedExecution:
             }
         if isinstance(upgrade, LocalExecutionUpgradeV2):
             anchor, origin, target = upgrade.qualification_anchor, upgrade.recovery_origin, upgrade.current
+            forms = upgrade.heavy_work_permits
             return {
-                "upgrade_contract_version": UPGRADE_CONTRACT_V2,
+                "upgrade_contract_version": upgrade.contract_version,
                 "qualification_origin": self.qualification_origin,
                 "upgrade_sha256": self.upgrade_sha256,
                 "review_sha256": self.review_sha256,
@@ -1643,6 +1772,11 @@ class VerifiedQualifiedExecution:
                 "capacity_config_sha256": target.capacity_config_sha256,
                 "legacy_inventory_sha256": upgrade.legacy_scope.inventory_sha256,
                 "legacy_member_count": len(self.inventory.members),
+                **({} if forms is None else {
+                    "anchor_heavy_work_permits": forms.anchor,
+                    "origin_heavy_work_permits": forms.origin,
+                    "heavy_work_permits": forms.target,
+                }),
             }
         parent, current = upgrade.parent, upgrade.current
         return {
@@ -1672,6 +1806,7 @@ __all__ = [
     "CompatibilityBasis",
     "CurrentExecution",
     "ExecutionReleaseManifest",
+    "HeavyWorkPermitForms",
     "INVENTORY_CONTRACT",
     "KEY_LOOKUP_CONTRACT",
     "KeyLookupEvidenceReference",
@@ -1700,6 +1835,7 @@ __all__ = [
     "TRANSITION_KIND",
     "UPGRADE_CONTRACT",
     "UPGRADE_CONTRACT_V2",
+    "UPGRADE_CONTRACT_V3",
     "VerifiedLegacyExecutionAuthorization",
     "VerifiedQualifiedExecution",
     "decode_execution_release_manifest",
@@ -1716,11 +1852,14 @@ __all__ = [
     "decode_local_execution_upgrade",
     "decode_local_execution_upgrade_review",
     "decode_local_execution_upgrade_v2",
+    "decode_local_execution_upgrade_v3",
     "derive_parent_worker_profile",
+    "derive_relation_worker_profile",
     "encode_execution_release_manifest",
     "encode_legacy_scope_inventory",
     "encode_local_execution_upgrade",
     "encode_local_execution_upgrade_v2",
+    "encode_local_execution_upgrade_v3",
     "require_activation_mapping",
     "require_computation_invariance",
     "require_process_profile_mapping",

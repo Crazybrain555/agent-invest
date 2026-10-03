@@ -235,6 +235,65 @@ v2 builders:
   `--origin-activation` with the usual release, runtime bundle, inventory and evidence arguments. Mixing
   v1 `--parent-*` and v2 flags is a usage error.
 
+## U01 v3: heavy-work permit forms
+
+A `staged-worker-composition.v3` worker profile declares how many whole-object heavy phases may run at once.
+See [worker dynamic scheduling](worker-dynamic-scheduling.md) §10 and
+[result storage](mineru-result-storage.md), "Heavy work". v1 and v2 cannot carry it:
+- their worker-profile rule moves only the process-profile reference;
+- Q0's smoke, canary and held-out evidence records no worker profile.
+
+So a v1 or v2 relation over a v3 composition would silently assert that Q0's composition was v3. Both
+therefore refuse an active v3 composition, and every composition that was valid before keeps its outcome.
+
+`worker-local-execution-upgrade.v3` is the v2 relation plus one closed section that names each role's form:
+
+```json
+"heavy_work_permits": {"anchor": null, "origin": null, "target": 2}
+```
+
+`null` is the v2 composition with its one implied permit; a count `1..2` is the v3 composition declaring it.
+Everything else is v2, unchanged: roles, files, Q0 re-verification with its original date and real-clock
+ages, the origin's archived pins, inventory binding, resolver and POST proofs, the new-H0 hold, the in-worker
+recheck, preflight and summaries.
+
+The worker-profile relation becomes:
+- the active (target) composition must have the declared target form;
+- the anchor's and the origin's worker profiles must be exactly the target with their own process-profile
+  reference and their declared form;
+- no other field may move, so lanes, poll, probe and the commit budget stay where Q0 had them;
+- each role is checked against its own pinned hash, and the origin's is also bound by every inventory member's
+  spec.
+
+The contract (`HeavyWorkPermitForms`, `derive_relation_worker_profile`) and the worker profile's own mapping
+(`heavy_work_permit_form`, `with_heavy_work_permit_form`) are pure functions.
+
+A v3 target may keep its origin's release only when the origin and target forms differ. That allows enabling,
+or rolling back, a permit count as a configuration-only edge: same release, runtime, P and A. Like any U01
+edge it is captured with the producer stopped:
+- in-flight stages are cancelled and keep their nonterminal heads;
+- listed members continue with their original H0, spec and key under the target count;
+- new H0 waits until every member is final.
+
+No separate drain is needed. Once a v3 composition runs, every later release is again a v3 relation, for
+example `{"anchor": null, "origin": 2, "target": 2}`.
+
+Reporting:
+- summaries add `anchor_heavy_work_permits`, `origin_heavy_work_permits` and `heavy_work_permits` (the target);
+- a v3 boot writes `worker-execution-boot-receipt.v4`, and its log line ends with
+  `heavy_work_permits=anchor:…,origin:…,target:…`;
+- the preflight terminal prints a `heavy-work permits:` line;
+- doctor and the worker log show the contract version.
+
+v3 builders:
+- `derive --contract-version v3` derives exactly as v2; the worker profile is composed, never derived.
+- `propose --contract-version v3` takes the v2 flags plus `--anchor-heavy-work-permits`,
+  `--origin-heavy-work-permits` and `--target-heavy-work-permits` (`implied` or a count). It refuses a target
+  form that is not the active composition's, and inventory members not bound to the derived origin worker
+  profile.
+- Its output names the three worker-profile hashes. The anchor's must equal the deployed proposal's anchor
+  worker profile: Q0's composition does not move.
+
 ## Qualified result runtime upgrade
 
 `worker-qualified-runtime-upgrade.v1` (`transition_kind=newly_qualified_result_runtime`) is a separate branch

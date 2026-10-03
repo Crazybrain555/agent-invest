@@ -137,6 +137,15 @@ class StagedV4Settings(BaseSettings):
             "DISCLOSURE_V4_COMMIT_STAGE_SECONDS", "commit_stage_seconds",
         ),
     )
+    # Unset keeps the v2 composition bytes: one heavy-work permit and the same
+    # identity. A value composes v3, a new identity that old heads cannot
+    # continue under, so they drain first.
+    heavy_work_permits: int | None = Field(
+        default=None, ge=1, le=2,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_HEAVY_WORK_PERMITS", "heavy_work_permits",
+        ),
+    )
 
     def worker_profile(
         self, *, process_profile_sha256: str,
@@ -146,8 +155,12 @@ class StagedV4Settings(BaseSettings):
             StagedWorkerProfileV4,
         )
         return StagedWorkerProfileV4(
-            contract_version="staged-worker-composition.v2",
+            contract_version=(
+                "staged-worker-composition.v2" if self.heavy_work_permits is None
+                else "staged-worker-composition.v3"
+            ),
             commit_stage_seconds=self.commit_stage_seconds,
+            heavy_work_permits=self.heavy_work_permits,
             process_profile_sha256=process_profile_sha256,
             mac_preflight_workers=mac_preflight_workers,
             mac_finalize_workers=mac_finalize_workers,

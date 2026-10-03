@@ -89,6 +89,7 @@
 | CNINFO_OVERSIZED_KB | 10240 | 兼容旧名；以归档 actual byte_count 判定 HUGE lane，不是下载/解析上限 |
 | WORKER_PARSE_CANDIDATE_WINDOW | 1000 | 每次公平选择的候选前缀；不是第二份耐久队列 |
 | WORKER_FINALIZE_CONCURRENCY | 2 | parse 后 build/publish 的有界下游池 |
+| DISCLOSURE_V4_HEAVY_WORK_PERMITS | 未设置（v2 身份，1 个） | staged-v4 同时运行的整对象重活（解码、COMMIT 含语义等待）许可数，`1..2`；设置即 `staged-worker-composition.v3` 新身份，只能经 U01 v3 关系（`worker-local-execution-upgrade.v3`）迁移，名单责任在新许可数下继续；release binding overlay 不生成，写在基础 worker.env；见 worker-dynamic-scheduling §10 与 runbook §1.1h |
 | WORKER_REPORT_INTERVAL_SECONDS | 300 | resident 观测快照周期；只轮换 report 对象，绝不关闭 admission 或排空 future |
 | DISCLOSURE_PARSE_TIMEOUT_* | 3600 / 12-per-page / 14400 | 页数感知的软预期耗时，只告警、不终止正常长文档 |
 | DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS | 86400 | 极端 live-but-stuck 进程保护；整本文档默认可运行 24 小时 |

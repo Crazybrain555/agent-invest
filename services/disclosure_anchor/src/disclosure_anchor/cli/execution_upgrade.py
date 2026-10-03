@@ -17,6 +17,13 @@ inventory's obligations were frozen under. ``derive --contract-version v2``
 takes ``--anchor-*`` and, unlike v1, accepts a target that keeps Q0's writer.
 Mixing the two roles' flags is a usage error.
 
+``--contract-version v3`` is v2 plus each role's heavy-work permit form:
+``propose`` then also requires ``--anchor-heavy-work-permits``,
+``--origin-heavy-work-permits`` and ``--target-heavy-work-permits`` (``implied``
+for the v2 composition with its one permit, or a count). The target form must
+be the active composition's. ``derive --contract-version v3`` derives exactly
+as v2.
+
 The newly qualified result runtime (``worker-qualified-runtime-upgrade.v1``)
 has its own two builders. ``legacy-key-lookups`` runs READ ONLY against the
 origin API before it retires and writes ``worker-legacy-key-lookup.v1``: one
@@ -40,15 +47,19 @@ from typing import Any
 from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import MinerUDeploymentGateError
 from disclosure_anchor.application.contracts.closed_document import sha256_of
+from disclosure_anchor.application.contracts.staged_worker_profile_v4 import MAX_HEAVY_WORK_PERMITS
 from disclosure_anchor.application.contracts.worker_execution_upgrade import (
     UPGRADE_CONTRACT,
     UPGRADE_CONTRACT_V2,
+    UPGRADE_CONTRACT_V3,
+    HeavyWorkPermitForms,
     LegacyExecutionRefused,
     encode_execution_release_manifest,
     encode_legacy_scope_inventory,
     encode_legacy_key_lookup_evidence,
     encode_local_execution_upgrade,
     encode_local_execution_upgrade_v2,
+    encode_local_execution_upgrade_v3,
     encode_qualified_runtime_upgrade,
 )
 from disclosure_anchor.settings import load_settings
@@ -89,16 +100,19 @@ def cmd_release_manifest(args: argparse.Namespace) -> int:
     return EX_OK
 
 
+_CONTRACTS = {"v1": UPGRADE_CONTRACT, "v2": UPGRADE_CONTRACT_V2, "v3": UPGRADE_CONTRACT_V3}
+
+
 def cmd_derive(args: argparse.Namespace) -> int:
     from disclosure_anchor.adapters.runtime.mineru_execution_upgrade import derive_local_upgrade
 
-    v2 = args.contract_version == "v2"
+    v2 = args.contract_version != "v1"
     derived = derive_local_upgrade(
         load_settings(),
         parent_process_profile=args.anchor_process_profile if v2 else args.parent_process_profile,
         parent_activation=args.anchor_activation if v2 else args.parent_activation,
         output_dir=args.output_dir,
-        contract_version=UPGRADE_CONTRACT_V2 if v2 else UPGRADE_CONTRACT,
+        contract_version=_CONTRACTS[args.contract_version],
     )
     _emit({"status": "pass", **derived.to_payload()})
     return EX_OK
@@ -136,6 +150,19 @@ _V2_ROLE_FLAGS = {
         "origin_process_profile", "origin_activation",
     ),
 }
+_V3_FORM_FLAGS = ("anchor_heavy_work_permits", "origin_heavy_work_permits", "target_heavy_work_permits")
+
+
+def _permit_form(value: str) -> str:
+    if value != "implied" and value not in {str(count) for count in range(1, MAX_HEAVY_WORK_PERMITS + 1)}:
+        raise argparse.ArgumentTypeError(
+            f"heavy-work permit form must be 'implied' or a count in 1..{MAX_HEAVY_WORK_PERMITS}: {value}"
+        )
+    return value
+
+
+def _form_value(value: str) -> int | None:
+    return None if value == "implied" else int(value)
 
 
 def _require_propose_roles(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -145,9 +172,11 @@ def _require_propose_roles(parser: argparse.ArgumentParser, args: argparse.Names
     if command not in _V2_ROLE_FLAGS:
         return
     v2_flags = _V2_ROLE_FLAGS[command]
+    form_flags = _V3_FORM_FLAGS if command == "propose" else ()
     required, refused = (
-        (v2_flags, _V1_ROLE_FLAGS) if args.contract_version == "v2"
-        else (_V1_ROLE_FLAGS, v2_flags)
+        (v2_flags + form_flags, _V1_ROLE_FLAGS) if args.contract_version == "v3"
+        else (v2_flags, _V1_ROLE_FLAGS + form_flags) if args.contract_version == "v2"
+        else (_V1_ROLE_FLAGS, v2_flags + form_flags)
     )
     missing = [name for name in required if getattr(args, name) is None]
     extra = [name for name in refused if getattr(args, name) is not None]
@@ -160,7 +189,7 @@ def _require_propose_roles(parser: argparse.ArgumentParser, args: argparse.Names
 
 
 def cmd_propose(args: argparse.Namespace) -> int:
-    if args.contract_version == "v2":
+    if args.contract_version in ("v2", "v3"):
         return _cmd_propose_v2(args)
     from disclosure_anchor.adapters.runtime.mineru_execution_upgrade import build_upgrade_proposal
 
@@ -189,6 +218,11 @@ def cmd_propose(args: argparse.Namespace) -> int:
 def _cmd_propose_v2(args: argparse.Namespace) -> int:
     from disclosure_anchor.adapters.runtime.mineru_execution_upgrade import build_upgrade_proposal_v2
 
+    forms = None if args.contract_version == "v2" else HeavyWorkPermitForms(
+        anchor=_form_value(args.anchor_heavy_work_permits),
+        origin=_form_value(args.origin_heavy_work_permits),
+        target=_form_value(args.target_heavy_work_permits),
+    )
     upgrade = build_upgrade_proposal_v2(
         load_settings(),
         release_manifest=args.release_manifest,
@@ -203,12 +237,14 @@ def _cmd_propose_v2(args: argparse.Namespace) -> int:
         exact_change_manifest_sha256=args.exact_change_manifest_sha256,
         independent_test_evidence_sha256=args.test_evidence_sha256,
         independent_code_review_sha256=args.code_review_sha256,
+        heavy_work_permits=forms,
     )
-    sha = _write(args.output, encode_local_execution_upgrade_v2(upgrade))
+    encode = encode_local_execution_upgrade_v2 if forms is None else encode_local_execution_upgrade_v3
+    sha = _write(args.output, encode(upgrade))
     anchor, origin, current = upgrade.qualification_anchor, upgrade.recovery_origin, upgrade.current
     _emit({
         "status": "pass", "output": str(args.output), "proposal_sha256": sha,
-        "contract_version": UPGRADE_CONTRACT_V2,
+        "contract_version": upgrade.contract_version,
         "anchor_runtime_identity_sha256": anchor.runtime_identity_sha256,
         "anchor_qualified_at_utc": anchor.qualified_at_utc,
         "origin_release_manifest_sha256": origin.release_manifest_sha256,
@@ -216,6 +252,13 @@ def _cmd_propose_v2(args: argparse.Namespace) -> int:
         "release_manifest_sha256": current.release_manifest_sha256,
         "current_runtime_identity_sha256": current.runtime_identity_sha256,
         "legacy_member_count": upgrade.legacy_scope.member_count,
+        **({} if forms is None else {
+            # Compare the anchor with the deployed proposal: Q0's composition must not move.
+            "anchor_worker_profile_sha256": anchor.worker_profile_sha256,
+            "origin_worker_profile_sha256": origin.worker_profile_sha256,
+            "worker_profile_sha256": current.worker_profile_sha256,
+            "heavy_work_permits": {"anchor": forms.anchor, "origin": forms.origin, "target": forms.target},
+        }),
         "next": "the reviewer writes worker-local-execution-upgrade-review.v1 binding proposal_sha256",
     })
     return EX_OK
@@ -279,7 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     release.set_defaults(handler=cmd_release_manifest)
 
     derive = commands.add_parser("derive", help="derive the target M/R, P and A from the qualified Q0")
-    derive.add_argument("--contract-version", choices=("v1", "v2"), default="v1")
+    derive.add_argument("--contract-version", choices=("v1", "v2", "v3"), default="v1")
     derive.add_argument("--parent-process-profile", type=_absolute, help="v1: Q0's P0")
     derive.add_argument("--parent-activation", type=_absolute, help="v1: Q0's A0")
     derive.add_argument("--anchor-process-profile", type=_absolute, help="v2: the qualification anchor Q0's P0")
@@ -292,7 +335,7 @@ def build_parser() -> argparse.ArgumentParser:
     scope.set_defaults(handler=cmd_legacy_scope)
 
     propose = commands.add_parser("propose", help="assemble the U01 proposal for independent review")
-    propose.add_argument("--contract-version", choices=("v1", "v2"), default="v1")
+    propose.add_argument("--contract-version", choices=("v1", "v2", "v3"), default="v1")
     propose.add_argument("--release-manifest", type=_absolute, required=True)
     propose.add_argument("--runtime-bundle", type=_absolute, required=True)
     propose.add_argument("--parent-process-profile", type=_absolute, help="v1: Q0's P0 (also its origin)")
@@ -303,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--origin-runtime-bundle", type=_absolute, help="v2: the archived origin runtime bundle")
     propose.add_argument("--origin-process-profile", type=_absolute, help="v2: the archived origin process profile")
     propose.add_argument("--origin-activation", type=_absolute, help="v2: the archived origin stream activation")
+    for role in ("anchor", "origin", "target"):
+        propose.add_argument(
+            f"--{role}-heavy-work-permits", type=_permit_form,
+            help=f"v3: the {role} worker profile's heavy-work permit form ('implied' or a count)",
+        )
     propose.add_argument("--inventory", type=_absolute, required=True)
     propose.add_argument("--exact-change-manifest-sha256", required=True)
     propose.add_argument("--test-evidence-sha256", required=True)

@@ -118,7 +118,7 @@ admitted after a refused LOCAL_PREPARE (`StageResourceGrantRequired`) is checked
 at the next dispatch, before any side effect. On the work volume a promise is charged when it is made, as the
 union `snapshot + max(temp, compressed + output)`: the LOCAL grant already covers the promoted output, so the
 promise adds no second extent, and the LOCAL that keeps it adds nothing. Only growth waits; COMMIT, CLEANUP and
-ACK never do. Admission offers only what remains beside the promises. Quotas, the single heavy permit, lane
+ACK never do. Admission offers only what remains beside the promises. Quotas, the heavy-work permits, lane
 priority and head-of-lane order are unchanged.
 
 A head recovered from state written before this rule can hold decode credit while its promise no longer fits

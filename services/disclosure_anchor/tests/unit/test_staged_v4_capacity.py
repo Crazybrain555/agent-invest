@@ -112,6 +112,23 @@ class StagedV4CapacityTests(unittest.TestCase):
             5,
         )
 
+    def test_heavy_permits_come_only_from_the_composition_and_leave_db_sizing(self) -> None:
+        profile = _profile()
+        v1 = StagedWorkerProfileV4(profile.sha256, 3, 2)
+        v2 = replace(v1, contract_version="staged-worker-composition.v2", commit_stage_seconds=3600)
+        v3 = replace(v2, contract_version="staged-worker-composition.v3", heavy_work_permits=2)
+        self.assertEqual(
+            [staged_v4_coordinator_limits(profile, worker_profile=item).heavy_work_permits
+             for item in (v1, v2, v3)],
+            [1, 1, 2],
+        )
+        # The pool already holds one primary and one nested checkout per COMMIT
+        # worker, so two concurrent COMMITs need no new checkout budget.
+        self.assertEqual(
+            staged_v4_database_concurrency(profile, worker_profile=v3),
+            staged_v4_database_concurrency(profile, worker_profile=v2),
+        )
+
     def test_terminal_document_does_not_block_next_remote_submission(self) -> None:
         profile = replace(
             _profile(),
