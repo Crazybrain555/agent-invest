@@ -462,6 +462,15 @@ PYTHONPATH=src .venv/bin/python scripts/prepare_codex_semantic_model_catalog.py 
 备用 Claude 也应在 provider 条目中固定已验收的版本化可执行文件路径；不要让全局 CLI
 自动升级悄悄改变生产的工具或结果协议。升级后先验证安全模式、结构化输出和错误 envelope。
 
+两个语义 CLI 子进程只拿到登录/运行变量和 provider 进程自己的 HTTP(S) 代理：worker 环境里已设置的
+`HTTPS_PROXY`、`HTTP_PROXY`、`NO_PROXY` 及其小写拼写按原值传入（空值也传，不合并、不补齐，大小写优先级
+由 CLI 自己决定）。`ALL_PROXY`/SOCKS、API key、数据库和业务密钥都不传；Codex 工具子进程的
+`include_only` 仍只含登录/运行变量，代理凭据到不了工具。网络需要代理时，把现有代理值放进 worker 的私有
+环境，并在放行前用 provider probe 分别验证 Luna 和 Sonnet；核对的是 worker 进程实际生效的环境
+（launchd `setenv` 的值也会进入），不只是 worker.env/plist。Claude 非零退出（以及 exit 0 却报错的
+envelope）和 Codex 一样写一条有界的 `semantic_provider_failure.v1`（`provider=claude_cli`）：typed HTTP
+状态只取自通过闭合校验的 envelope，不复制任何文本。403 仍是 `command_failed`，不切备用。
+
 staged V4 的语义 `failed_closed`（协议、安全、结果契约）在 commit 中出现时，worker 以公共停止
 （§1.1f）持久停下，不再被 launchd 重驱到同一个未缓存 group；不要靠反复重启或清理结果掩盖。
 保留原任务、收据和日志，修复并验证后显式放行。本机制不做单文档隔离、跨启动计数或半开探测；

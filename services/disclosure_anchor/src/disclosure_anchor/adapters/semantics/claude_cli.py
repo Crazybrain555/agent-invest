@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 import math
 from pathlib import Path
 import re
 import subprocess
 import threading
+from typing import Any
 
 from disclosure_anchor.adapters.semantics import codex_cli
 from disclosure_anchor.application.contracts.semantic_routes import (
@@ -121,6 +123,7 @@ _MODEL_USAGE_FIELDS = frozenset(
 _ERROR_ENVELOPE_CANONICAL_MODELS = frozenset(
     {"claude-haiku-4-5", "claude-sonnet-5"}
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ClaudeCliSemanticAdjudicator:
@@ -264,7 +267,15 @@ class ClaudeCliSemanticAdjudicator:
             ) from exc
         if completed.returncode != 0:
             raise _command_error(completed)
-        structured = _structured_output(completed.stdout)
+        try:
+            structured = _structured_output(completed.stdout)
+        except SemanticRouteAdjudicatorError as exc:
+            if exc.reason_code == "runtime_event_error":
+                # An exit-0 error envelope fails closed like a nonzero exit. It
+                # never passed the closed error-envelope validation, so the
+                # record trusts none of its fields.
+                _log_command_failure(completed, exc)
+            raise
         canonical = json.dumps(
             structured,
             ensure_ascii=False,
@@ -391,25 +402,51 @@ def _output_schema_contract_hash() -> str:
 def _command_error(
     completed: subprocess.CompletedProcess[str],
 ) -> SemanticRouteAdjudicatorError:
+    envelope: dict[str, Any] | None = None
     if completed.stdout.strip():
         try:
-            reason = _structured_command_reason(completed.stdout, completed.stderr)
+            envelope = _error_envelope(completed.stdout)
         except SemanticRouteAdjudicatorError as exc:
+            _log_command_failure(completed, exc)
             return exc
+        reason = _structured_command_reason(envelope, completed.stderr)
     else:
         diagnostics = (completed.stderr,) if completed.stderr.strip() else ()
         if any("not a valid json schema" in item.casefold() for item in diagnostics):
             reason = "invalid_output_schema"
         else:
             reason = _known_availability_reason(diagnostics) or "command_failed"
-    return SemanticRouteAdjudicatorError(
+    error = SemanticRouteAdjudicatorError(
         f"Claude semantic adjudicator failed with exit {completed.returncode}",
         reason_code=reason,
         retryable=reason in {"not_authenticated", "capacity_unavailable"},
     )
+    _log_command_failure(completed, error, envelope)
+    return error
 
 
-def _structured_command_reason(stdout: str, stderr: str = "") -> str:
+def _log_command_failure(
+    completed: subprocess.CompletedProcess[str],
+    error: SemanticRouteAdjudicatorError,
+    envelope: dict[str, Any] | None = None,
+) -> None:
+    # Only an envelope that passed the closed validation contributes its typed
+    # status and whether it carried a terminal message; no text is copied.
+    status = None if envelope is None else envelope.get("api_error_status")
+    result = None if envelope is None else envelope.get("result")
+    codex_cli._log_provider_failure(
+        _LOGGER,
+        provider="claude_cli",
+        completed=completed,
+        error=error,
+        terminal_http_statuses=(
+            [status] if type(status) is int and 100 <= status <= 599 else []
+        ),
+        terminal_message_count=1 if isinstance(result, str) and result.strip() else 0,
+    )
+
+
+def _error_envelope(stdout: str) -> dict[str, Any]:
     try:
         payload = codex_cli._strict_json_loads(stdout)
     except (json.JSONDecodeError, codex_cli._ClosedJsonError) as exc:
@@ -453,6 +490,12 @@ def _structured_command_reason(stdout: str, stderr: str = "") -> str:
             reason_code="invalid_runtime_protocol",
             retryable=False,
         )
+    return payload
+
+
+def _structured_command_reason(envelope: dict[str, Any], stderr: str = "") -> str:
+    status = envelope.get("api_error_status")
+    result = envelope.get("result")
     diagnostics = tuple(
         item
         for item in (result, stderr)

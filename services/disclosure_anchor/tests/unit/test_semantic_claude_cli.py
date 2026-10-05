@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
+from disclosure_anchor.adapters.semantics import codex_cli
 from disclosure_anchor.adapters.semantics.claude_cli import (
     ClaudeCliSemanticAdjudicator,
 )
@@ -21,8 +26,34 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
     SemanticRouteAdjudicatorError,
 )
+from disclosure_anchor.application.ports.staged_execution import semantic_group_scope
+from tests.unit.test_semantic_codex_cli import (
+    ADVERSARIAL_ENVIRONMENT,
+    LEAK_MARKERS,
+    OPERATOR_NETWORK,
+    OPERATOR_PROCESS_ENVIRONMENT,
+    OPERATOR_RUNTIME,
+    PROVIDER_ENVIRONMENT_CASES,
+)
 
 
+_LOGGER_NAME = "disclosure_anchor.adapters.semantics.claude_cli"
+# Stands in for the Claude CLI: records what the adapter's subprocess received
+# and answers with a fixed success envelope.
+_FAKE_CLAUDE = """#!{python}
+import hashlib, json, os, sys
+prompt = sys.stdin.read()
+with open({record!r}, "w", encoding="utf-8") as handle:
+    json.dump(
+        {{
+            "argv": sys.argv[1:],
+            "env": dict(os.environ),
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        }},
+        handle,
+    )
+sys.stdout.write({stdout!r})
+"""
 CLAUDE_2_1_280_API_ERROR_ENVELOPE = (
     '{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"8d6dd2dd-1098-421b-9408'
     '-5989bf75faaf","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0}'
@@ -199,36 +230,66 @@ def _model_usage(
     return usage
 
 
+def _request_not_allowed_envelope() -> dict[str, object]:
+    # The 2.1.280 API-error envelope carrying the CLI's HTTP 403 result: a
+    # typed status outside the availability set.
+    return {
+        **json.loads(CLAUDE_2_1_280_API_ERROR_ENVELOPE),
+        "api_error_status": 403,
+        "result": "Failed to authenticate. API Error: 403 Request not allowed",
+    }
+
+
+def _failure_records(output: list[str]) -> list[dict[str, object]]:
+    return [json.loads(line.split("semantic_provider_failure ", 1)[1]) for line in output]
+
+
 class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
     def test_uses_closed_noninteractive_cli_and_attests_canonical_model(self) -> None:
-        captured: dict[str, object] = {}
+        # A real child stands in for the CLI, so argv, stdin and environment are
+        # observed exactly as the adapter's subprocess receives them.
+        observed: list[dict[str, object]] = []
+        prompt_sha256 = hashlib.sha256(codex_cli._prompt(_batch()).encode("utf-8")).hexdigest()
+        for label, network in PROVIDER_ENVIRONMENT_CASES:
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                record = Path(tmp) / "observed.json"
+                executable = Path(tmp) / "claude"
+                executable.write_text(
+                    _FAKE_CLAUDE.format(
+                        python=sys.executable, record=str(record), stdout=_stdout()
+                    ),
+                    encoding="utf-8",
+                )
+                executable.chmod(0o700)
+                adapter = ClaudeCliSemanticAdjudicator(
+                    executable=executable,
+                    model="claude-sonnet-5",
+                    reasoning_effort="low",
+                )
+                with mock.patch.dict(
+                    os.environ,
+                    {**OPERATOR_RUNTIME, **network, **ADVERSARIAL_ENVIRONMENT},
+                    clear=True,
+                ):
+                    result = adapter.adjudicate_with_result(_batch())
+                child = json.loads(record.read_text(encoding="utf-8"))
+                self.assertEqual(result.decisions[0].routes[0].key, "forecast_summary")
+                self.assertTrue(result.response_sha256.startswith("sha256:"))
+                self.assertEqual(child["prompt_sha256"], prompt_sha256)
+                # The operator's proxy route arrives verbatim, no worker secret does.
+                self.assertEqual(child["env"], {**OPERATOR_PROCESS_ENVIRONMENT, **network})
+                observed.append(child)
 
-        def run(*, args, prompt, env, timeout_seconds):  # type: ignore[no-untyped-def]
-            captured.update(
-                args=args,
-                prompt=prompt,
-                env=env,
-                timeout_seconds=timeout_seconds,
-            )
-            return subprocess.CompletedProcess(args, 0, _stdout(), "")
-
-        adapter = ClaudeCliSemanticAdjudicator(
-            executable=Path("/opt/claude"),
-            model="claude-sonnet-5",
-            reasoning_effort="low",
-        )
-        with mock.patch(
-            "disclosure_anchor.adapters.semantics.codex_cli._run_process",
-            side_effect=run,
-        ):
-            result = adapter.adjudicate_with_result(_batch())
-
-        self.assertEqual(result.decisions[0].routes[0].key, "forecast_summary")
-        self.assertTrue(result.response_sha256.startswith("sha256:"))
+        self.assertEqual(len(observed), len(PROVIDER_ENVIRONMENT_CASES))
         self.assertEqual(adapter.provider_identity.canonical_model, "claude-sonnet-5")
         self.assertEqual(adapter.provider_identity.adapter_version, "claude_cli.v2")
-        args = captured["args"]
+        # The environment never changes the closed, tool-free argv.
+        args = observed[0]["argv"]
         assert isinstance(args, list)
+        self.assertTrue(all(child["argv"] == args for child in observed))
+        self.assertFalse(
+            [item for item in args if any(marker in item for marker in LEAK_MARKERS)]
+        )
         for flag in (
             "-p",
             "--json-schema",
@@ -250,10 +311,6 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
             args[args.index("--mcp-config") + 1],
             '{"mcpServers":{}}',
         )
-        env = captured["env"]
-        assert isinstance(env, dict)
-        self.assertNotIn("DATABASE_URL", env)
-        self.assertNotIn("CNINFO_ACCESS_SECRET", env)
 
     def test_constructor_rejects_alias_instead_of_silently_resolving_it(self) -> None:
         with self.assertRaisesRegex(ValueError, "canonical claude-sonnet-5"):
@@ -364,6 +421,40 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason_code, "invalid_runtime_protocol")
         self.assertFalse(caught.exception.retryable)
 
+        # An exit-0 error envelope fails closed like a nonzero exit and leaves
+        # one record. It never passed the closed error validation, so even its
+        # well-formed status is not reported.
+        exit_zero_error = json.dumps(_request_not_allowed_envelope())
+        with (
+            mock.patch(
+                "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                return_value=subprocess.CompletedProcess(
+                    ["claude"], 0, exit_zero_error, ""
+                ),
+            ),
+            self.assertLogs(_LOGGER_NAME, level="WARNING") as logs,
+            self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+        ):
+            adapter.adjudicate_with_result(_batch())
+        self.assertEqual(caught.exception.reason_code, "runtime_event_error")
+        self.assertFalse(caught.exception.retryable)
+        (record,) = _failure_records(logs.output)
+        self.assertEqual(
+            {key: record[key] for key in (
+                "provider", "returncode", "reason_code", "terminal_http_statuses",
+                "terminal_message_count", "stdout_bytes", "stdout_sha256",
+            )},
+            {
+                "provider": "claude_cli",
+                "returncode": 0,
+                "reason_code": "runtime_event_error",
+                "terminal_http_statuses": [],
+                "terminal_message_count": 0,
+                "stdout_bytes": len(exit_zero_error.encode("utf-8")),
+                "stdout_sha256": hashlib.sha256(exit_zero_error.encode("utf-8")).hexdigest(),
+            },
+        )
+
     def test_only_known_availability_exit_is_failover_eligible(self) -> None:
         adapter = ClaudeCliSemanticAdjudicator(executable=Path("claude"))
         cases = (
@@ -447,11 +538,30 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                         ["claude"], 1, "", stderr
                     ),
                 ),
+                self.assertLogs(_LOGGER_NAME, level="WARNING") as logs,
                 self.assertRaises(SemanticRouteAdjudicatorError) as caught,
             ):
                 adapter.adjudicate_with_result(_batch())
             self.assertEqual(caught.exception.reason_code, reason_code)
             self.assertEqual(caught.exception.retryable, retryable)
+            # stderr is free text: it never supplies a status and is not copied.
+            (record,) = _failure_records(logs.output)
+            self.assertEqual(
+                {key: record[key] for key in (
+                    "provider", "returncode", "reason_code", "terminal_http_statuses",
+                    "terminal_message_count", "stdout_bytes", "stderr_bytes",
+                )},
+                {
+                    "provider": "claude_cli",
+                    "returncode": 1,
+                    "reason_code": reason_code,
+                    "terminal_http_statuses": [],
+                    "terminal_message_count": 0,
+                    "stdout_bytes": 0,
+                    "stderr_bytes": len(stderr.encode("utf-8")),
+                },
+            )
+            self.assertNotIn(stderr, logs.output[0])
 
     def test_structured_nonzero_envelope_uses_typed_status_and_security_first(
         self,
@@ -654,21 +764,94 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                 "capacity_unavailable",
                 True,
             ),
+            # A typed 403 is not availability: it never fails over.
+            (_request_not_allowed_envelope(), "", "command_failed", False),
+            # An integer outside the HTTP status range is no status to report.
+            (
+                {**_request_not_allowed_envelope(), "api_error_status": 10**30},
+                "",
+                "command_failed",
+                False,
+            ),
         )
         for payload, stderr, reason_code, retryable in cases:
+            stdout = json.dumps(payload)
             with (
                 self.subTest(reason_code=reason_code),
                 mock.patch(
                     "disclosure_anchor.adapters.semantics.codex_cli._run_process",
                     return_value=subprocess.CompletedProcess(
-                        ["claude"], 1, json.dumps(payload), stderr
+                        ["claude"], 1, stdout, stderr
                     ),
                 ),
+                self.assertLogs(_LOGGER_NAME, level="WARNING") as logs,
                 self.assertRaises(SemanticRouteAdjudicatorError) as caught,
             ):
                 adapter.adjudicate_with_result(_batch())
             self.assertEqual(caught.exception.reason_code, reason_code)
             self.assertEqual(caught.exception.retryable, retryable)
+            # A status is reported only from an envelope that passed the closed
+            # validation (the security-first cases stop inside it), and only
+            # within the HTTP status range.
+            validated = reason_code != "forbidden_tool_call"
+            status = payload.get("api_error_status") if validated else None
+            (record,) = _failure_records(logs.output)
+            self.assertEqual(
+                {key: record[key] for key in (
+                    "provider", "returncode", "reason_code", "terminal_http_statuses",
+                    "stdout_bytes", "stdout_sha256",
+                )},
+                {
+                    "provider": "claude_cli",
+                    "returncode": 1,
+                    "reason_code": reason_code,
+                    "terminal_http_statuses": (
+                        [status] if status in range(100, 600) else []
+                    ),
+                    "stdout_bytes": len(stdout.encode("utf-8")),
+                    "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+                },
+            )
+
+        # The record copies no provider text, proxy credential or worker secret.
+        leaky = {
+            **_request_not_allowed_envelope(),
+            "result": (
+                "API Error: 403 via " + OPERATOR_NETWORK["HTTPS_PROXY"]
+                + " " + ADVERSARIAL_ENVIRONMENT["ANTHROPIC_API_KEY"]
+            ),
+        }
+        group_hash = "sha256:" + "7" * 64
+        with (
+            mock.patch.dict(
+                os.environ,
+                {**OPERATOR_RUNTIME, **OPERATOR_NETWORK, **ADVERSARIAL_ENVIRONMENT},
+                clear=True,
+            ),
+            mock.patch(
+                "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                return_value=subprocess.CompletedProcess(
+                    ["claude"], 1, json.dumps(leaky),
+                    "proxy CONNECT failed: " + OPERATOR_NETWORK["HTTP_PROXY"] + "\n",
+                ),
+            ),
+            semantic_group_scope(group_hash),
+            self.assertLogs(_LOGGER_NAME, level="WARNING") as logs,
+            self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+        ):
+            adapter.adjudicate_with_result(_batch())
+        self.assertEqual(caught.exception.reason_code, "command_failed")
+        self.assertFalse(caught.exception.retryable)
+        (record,) = _failure_records(logs.output)
+        self.assertEqual(
+            (record["group_hash"], record["terminal_http_statuses"],
+             record["terminal_message_count"]),
+            (group_hash, [403], 1),
+        )
+        self.assertLess(len(logs.output[0]), 1500)
+        for marker in (*LEAK_MARKERS, "API Error", "CONNECT"):
+            self.assertNotIn(marker, logs.output[0])
+            self.assertNotIn(marker, str(caught.exception))
 
     def test_structured_nonzero_envelope_rejects_malformed_control_fields(self) -> None:
         adapter = ClaudeCliSemanticAdjudicator(executable=Path("claude"))
@@ -685,6 +868,9 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                 "api_error_status": "429",
                 "result": "API Error: 429 Too Many Requests",
             },
+            # A bool is not an int status, and neither is a float.
+            {**_request_not_allowed_envelope(), "api_error_status": True},
+            {**_request_not_allowed_envelope(), "api_error_status": 403.0},
             {
                 "is_error": True,
                 "permission_denials": [],
@@ -891,11 +1077,19 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                             ["claude"], 1, json.dumps(payload), ""
                         ),
                     ),
+                    self.assertLogs(_LOGGER_NAME, level="WARNING") as logs,
                     self.assertRaises(SemanticRouteAdjudicatorError) as caught,
                 ):
                     adapter.adjudicate_with_result(_batch())
                 self.assertEqual(caught.exception.reason_code, expected_reason)
                 self.assertFalse(caught.exception.retryable)
+                # Nothing from a rejected envelope is trusted, not even its status.
+                (record,) = _failure_records(logs.output)
+                self.assertEqual(
+                    (record["reason_code"], record["terminal_http_statuses"],
+                     record["terminal_message_count"]),
+                    (expected_reason, [], 0),
+                )
 
         duplicate_or_nonfinite = (
             (
@@ -931,11 +1125,16 @@ class ClaudeCliSemanticAdjudicatorTests(unittest.TestCase):
                         ["claude"], 1, stdout, ""
                     ),
                 ),
+                self.assertLogs(_LOGGER_NAME, level="WARNING") as logs,
                 self.assertRaises(SemanticRouteAdjudicatorError) as caught,
             ):
                 adapter.adjudicate_with_result(_batch())
             self.assertEqual(caught.exception.reason_code, "invalid_runtime_protocol")
             self.assertFalse(caught.exception.retryable)
+            (record,) = _failure_records(logs.output)
+            self.assertEqual(
+                (record["terminal_http_statuses"], record["terminal_message_count"]), ([], 0)
+            )
 
     def test_missing_executable_is_availability_failure(self) -> None:
         adapter = ClaudeCliSemanticAdjudicator(executable=Path("/missing/claude"))

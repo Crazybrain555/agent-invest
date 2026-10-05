@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -286,6 +287,56 @@ EXHAUSTED_STREAM = "\n".join(
 )
 
 
+# A worker environment for both provider adapters: legitimate runtime keys, the
+# operator's HTTP(S) proxy route, and secrets or other transports that must
+# never reach a provider CLI or one of its tool children.
+OPERATOR_RUNTIME = {
+    "HOME": "/Users/operator",
+    "LANG": "C.UTF-8",
+    # Also keeps a real child Python from coercing its locale into the env.
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/bin:/bin",
+    "TMPDIR": "/tmp",
+    "USER": "operator",
+}
+OPERATOR_PROCESS_ENVIRONMENT = {**OPERATOR_RUNTIME, "CODEX_HOME": "/Users/operator/.codex"}
+OPERATOR_NETWORK = {
+    "HTTPS_PROXY": "http://operator:proxy-secret@proxy.invalid:8443",
+    "https_proxy": "http://lowercase-proxy.invalid:3128",
+    "HTTP_PROXY": "http://operator:proxy-secret@proxy.invalid:8080",
+    "http_proxy": "",
+    "NO_PROXY": "localhost,127.0.0.1,.bypass.invalid",
+    "no_proxy": ".lowercase-bypass.invalid",
+}
+PROVIDER_ENVIRONMENT_CASES = (
+    ("every spelling kept verbatim, an empty one too", OPERATOR_NETWORK),
+    (
+        "one spelling never synthesizes the other",
+        {"https_proxy": "http://lowercase-proxy.invalid:3128", "NO_PROXY": "localhost"},
+    ),
+    ("no proxy configured", {}),
+)
+ADVERSARIAL_ENVIRONMENT = {
+    "ALL_PROXY": "socks5://operator:socks-secret@socks.invalid:1080",
+    "all_proxy": "socks5h://socks-adversarial.invalid:1080",
+    "ANTHROPIC_API_KEY": "sk-ant-adversarial",
+    "ANTHROPIC_BASE_URL": "https://exfiltrate-adversarial.invalid",
+    "CLAUDE_CODE_OAUTH_TOKEN": "oauth-adversarial",
+    "CNINFO_ACCESS_SECRET": "cninfo-adversarial",
+    "CODEX_PROXY_HOST": "proxy-adversarial.invalid",
+    "DATABASE_URL": "postgresql://writer:db-secret@db-adversarial.invalid/invest_engine",
+    "NODE_EXTRA_CA_CERTS": "/tmp/ca-adversarial.pem",
+    "NODE_TLS_REJECT_UNAUTHORIZED": "0",
+    "OPENAI_API_KEY": "sk-adversarial",
+    "WSS_PROXY": "http://ws-adversarial.invalid:8443",
+}
+# Distinctive parts of every proxy and secret value above; none may appear in
+# argv, logs or error messages.
+LEAK_MARKERS = (
+    "adversarial", "proxy-secret", "socks-secret", "db-secret", "proxy.invalid", "bypass.invalid",
+)
+
+
 def _run_writing(stdout: str, *, returncode: int = 0, stderr: str = "", result: str | None = FINAL_RESULT):
     def run(*, args, **_kwargs):  # type: ignore[no-untyped-def]
         if result is not None:
@@ -463,10 +514,6 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
                 model="gpt-6-luna",
                 model_catalog=catalog,
             )
-        env = captured["env"]
-        assert isinstance(env, dict)
-        self.assertNotIn("DATABASE_URL", env)
-        self.assertNotIn("CNINFO_ACCESS_SECRET", env)
         prompt = captured["prompt"]
         assert isinstance(prompt, str)
         self.assertIn("forecast_summary", prompt)
@@ -509,6 +556,39 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
         self.assertEqual(
             verdicts["properties"], {"forecast_summary": {"type": "boolean"}}
         )
+        # The CLI process gets the operator's proxy route verbatim and nothing
+        # else from the worker; its tool children keep the credential-free
+        # allowlist, so proxy credentials never reach them.
+        for label, network in PROVIDER_ENVIRONMENT_CASES:
+            with (
+                self.subTest(label),
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.dict(
+                    os.environ,
+                    {**OPERATOR_RUNTIME, **network, **ADVERSARIAL_ENVIRONMENT},
+                    clear=True,
+                ),
+                mock.patch(
+                    "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                    side_effect=run,
+                ),
+            ):
+                _adapter(tmp).adjudicate(_batch())
+            self.assertEqual(captured["env"], {**OPERATOR_PROCESS_ENVIRONMENT, **network})
+            args = captured["args"]
+            assert isinstance(args, list)
+            self.assertEqual(
+                [item for item in args if item.startswith("shell_environment_policy.")],
+                [
+                    "shell_environment_policy.ignore_default_excludes=false",
+                    "shell_environment_policy.include_only=['CODEX_HOME','HOME','LANG',"
+                    "'LC_ALL','LOGNAME','PATH','SHELL','SSL_CERT_DIR','SSL_CERT_FILE',"
+                    "'TMPDIR','USER']",
+                ],
+            )
+            self.assertFalse(
+                [item for item in args if any(marker in item for marker in LEAK_MARKERS)]
+            )
 
     def test_authentication_failure_is_controlled_and_nonretryable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

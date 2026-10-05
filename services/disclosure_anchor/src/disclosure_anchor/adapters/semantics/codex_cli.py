@@ -50,6 +50,9 @@ _DISABLED_CODE_MODE_WARNING = (
     "install `codex-code-mode-host`."
 )
 
+# Login/runtime mechanics for both provider CLIs. Codex also uses this tuple as
+# its tool-child allowlist (shell_environment_policy.include_only), so it must
+# never carry credentials.
 _SAFE_ENVIRONMENT_KEYS = (
     "CODEX_HOME",
     "HOME",
@@ -62,6 +65,18 @@ _SAFE_ENVIRONMENT_KEYS = (
     "SSL_CERT_FILE",
     "TMPDIR",
     "USER",
+)
+# The provider process's own documented HTTP(S) proxy route. A proxy URL may
+# embed operator credentials, so these reach only the CLI process and never
+# join _SAFE_ENVIRONMENT_KEYS; ALL_PROXY (SOCKS) and other transports are not
+# passed.
+_PROVIDER_NETWORK_ENVIRONMENT_KEYS = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
 )
 
 _DISABLED_FEATURES = (
@@ -353,7 +368,8 @@ def terminate_active_semantic_processes(
 
 
 def _safe_subprocess_environment() -> dict[str, str]:
-    """Expose only login/runtime mechanics, never worker or provider secrets."""
+    """Expose only login/runtime mechanics and the provider's own proxy route,
+    never worker or provider secrets."""
 
     source = os.environ
     home = source.get("HOME") or str(Path.home())
@@ -366,6 +382,14 @@ def _safe_subprocess_environment() -> dict[str, str]:
     values.setdefault("CODEX_HOME", str(Path(home) / ".codex"))
     values.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
     values.setdefault("TMPDIR", "/tmp")
+    # Every spelling that is set passes unchanged, even when empty: the CLIs
+    # resolve upper/lowercase precedence differently per code path, so merging,
+    # synthesizing or dropping one would change which proxy a request uses.
+    values.update({
+        key: source[key]
+        for key in _PROVIDER_NETWORK_ENVIRONMENT_KEYS
+        if key in source
+    })
     return values
 
 
@@ -1373,31 +1397,51 @@ def _log_command_failure(
     error: SemanticRouteAdjudicatorError,
     messages: tuple[str, ...],
 ) -> None:
-    # The worker captures stderr durably. Keep enough transport evidence for
-    # triage even when temporary call files are removed, without logging model
-    # text, prompts, URLs, server bodies, request headers or credentials.
     statuses = sorted({
         int(match[1]) for message in messages
         if (match := _CODEX_HTTP_STATUS.match(message)) is not None
     })
+    _log_provider_failure(
+        _LOGGER,
+        provider="codex_cli",
+        completed=completed,
+        error=error,
+        terminal_http_statuses=statuses,
+        terminal_message_count=len(messages),
+    )
+
+
+def _log_provider_failure(
+    logger: logging.Logger,
+    *,
+    provider: str,
+    completed: subprocess.CompletedProcess[str],
+    error: SemanticRouteAdjudicatorError,
+    terminal_http_statuses: list[int],
+    terminal_message_count: int,
+) -> None:
+    # The worker captures stderr durably. Keep enough transport evidence for
+    # triage even when temporary call files are removed, without logging model
+    # text, prompts, URLs, server bodies, request headers, credentials or the
+    # subprocess environment.
+    group_hash = current_semantic_group()
     record: dict[str, object] = {
         "event": "semantic_provider_failure.v1",
-        "provider": "codex_cli",
+        "provider": provider,
         "observed_at_unix_ns": time.time_ns(),
         "group_hash": (
-            current_semantic_group()
-            if re.fullmatch(r"sha256:[0-9a-f]{64}", current_semantic_group() or "") else None
+            group_hash if re.fullmatch(r"sha256:[0-9a-f]{64}", group_hash or "") else None
         ),
         "returncode": completed.returncode,
         "reason_code": error.reason_code,
-        "terminal_http_statuses": statuses[:8],
-        "terminal_message_count": len(messages),
+        "terminal_http_statuses": terminal_http_statuses[:8],
+        "terminal_message_count": terminal_message_count,
     }
     for channel, value in (("stdout", completed.stdout), ("stderr", completed.stderr)):
         encoded = value.encode("utf-8")
         record[channel + "_bytes"] = len(encoded)
         record[channel + "_sha256"] = hashlib.sha256(encoded).hexdigest()
-    _LOGGER.warning("semantic_provider_failure %s", json.dumps(record, sort_keys=True))
+    logger.warning("semantic_provider_failure %s", json.dumps(record, sort_keys=True))
 
 
 def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRouteAdjudicatorError:
