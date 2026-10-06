@@ -34,7 +34,7 @@ class StagedCampaignBuilderTests(unittest.TestCase):
         self.scope = campaign()
 
     def arguments(self):
-        return dict(settings=SimpleNamespace(worker_parse_execution_mode="staged-v4"),
+        return dict(settings=SimpleNamespace(worker_parse_execution_mode="staged-v4", worker_drain_existing=False),
                     engine=self.db.engine, ownership_guard=mock.Mock(), admission_guard=mock.Mock(),
                     process_scope_classes=None, progress=mock.Mock(), campaign_scope=self.scope,
                     expected_capacity=configuration(), stream_control=stream_control())
@@ -56,6 +56,12 @@ class StagedCampaignBuilderTests(unittest.TestCase):
         with (mock.patch.object(builder, "load_staged_v4_settings") as loader,
               self.assertRaises(ValueError)):
             builder.build_staged_worker_v4_runtime(**args, admission_document_ids=self.scope.document_ids[:8])
+        loader.assert_not_called()
+        args["ownership_guard"].assert_not_called()
+        args["settings"].worker_drain_existing = True
+        with (mock.patch.object(builder, "load_staged_v4_settings") as loader,
+              self.assertRaisesRegex(ValueError, "unscoped resident")):
+            builder.build_staged_worker_v4_campaign_runtime(**args)
         loader.assert_not_called()
         args["ownership_guard"].assert_not_called()
 

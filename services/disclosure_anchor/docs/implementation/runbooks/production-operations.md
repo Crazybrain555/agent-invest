@@ -391,6 +391,25 @@ staged-v4 的默认关闭 source candidate 另有 [V4 资源生命周期与离�
 0060→全历史 spec 回填→0061 验证；实际旧 writer 退出是前置，不可用 PG lease 代替。
 启动历史隔离残留门或 ACK 前残留检查失败时保留证据/信用，不手工伪造清理回执或删除未知树。
 
+临时排空旧职责可以在受控维护启动前设置 `WORKER_DRAIN_EXISTING=true`（默认 `false`，只允许
+`staged-v4` 常驻、无 document/campaign scope）。该开关是启动时的运维控制，不改变 P/WP/Q、
+原 H0/spec/idempotency key 或 resource budget；代码更新本身仍须经过精确 W/E、当前部署门及
+适用 U01 审阅/预检，不能复用不匹配的旧授权。它直接使用 prepared persistence admission，保留
+prepared POST、已提交/接受任务的取回、解析、发布、原 ACK、lease/fence 和 verified U01；不扫描
+普通候选，不做普通 source observation、source rejection 或新 H0。独立 maintenance 线程关闭，
+因此 sync/register/download/acquisition 及 steady-state derived/search projection 暂停；原启动
+recovery/build/publish/prune barrier 保留。排空期间的 derived/search projection 可能滞后，下一次
+正常启动会恢复 startup projection；该模式只用于临时维护，不能替代正常常驻生产。
+
+启动日志和 staged progress 标记 `maintenance=drain_existing ordinary_admission=disabled`；
+`worker status` 的 stderr 只报告 `configured_maintenance_mode`，不是已运行进程的实时模式证明，
+需核对对应 resident boot 日志。worker 在 QUIESCENT 后继续有界轮询，不自动退出触发 launchd
+重启；operator TERM 和 F5 公共停止语义不变。QUIESCENT/无活跃 lane **不等于排空完成**：
+profile-ineligible、credit-blocked、未完成 prepared 或其它原职责必须继续如实报告。进入后续
+原生配置更新前，应由既有只读完整 scope/preflight 核实零剩余职责，再用既有受控维护停止路径
+停下此 resident；不要重置数据、丢弃失败、替换 key、清账或伪造空 scope。正常恢复启动前把
+`WORKER_DRAIN_EXISTING` 改回 `false`，保留原始数据与证据。scratch runner 默认隔离该开关。
+
 上线前有界验证使用 `python -m disclosure_anchor.cli.staged_commission --document-id <id>`
 有界连续供给（超过 8 份、小时级）使用 `python -m disclosure_anchor.cli.staged_campaign --manifest <corpus.json> --manifest-sha256 <sha> --scope <scope.json> --scope-sha256 <sha> --max-seconds <n> --receipt-out <runtime-root/...> [--stop-file <path>]`；准入上限就是冻结 scope 的普通成员本身（不另设配额），截止时间或停止文件只关闭新准入不取消已接受任务；它复用相同的锁、部署门与 stream activation，收据只投影协调器的持久结果，不是正式 M6 计分。
 正式 M6 关闭（owner 绑定）时按顺序使用：`python -m disclosure_anchor.cli.m6_run_control bind|open --run-dir <dir>`（controller；`<dir>` 含 owner 的 `anchor.json`、`roles.json`（四角色各自的 epoch 与 token 文件路径）、`transport.json`，bind 写入 `run-spec.json`）→ `staged_campaign ... --observation-out <dir> --m6-run-dir <dir>`（runner：生命周期事实经本地 spool 由独立线程作为 `e2e_runner` 事件送达 owner，runner 的 lease 上限不单独配置：READY 之后由私有绑定的 `windows.maximum_lease_ticks` 按 READY anchor 的实际 QPC 频率换算写入 `transport.json`（一次、bind/open 之前；绑定的 propagation_reserve_ticks 须等于 intent 的 stop_propagation_reserve_ns），native 与 client 只有这一个来源；runner 先等 sender 拿到首个 lease（上限 2×控制交换截止且不超过 --max-seconds）再装入会锁存的停止判定，拿不到即 `campaign_startup_error`/退出码 3、不写收据（含义：未准入任何文档、runner 未发 admission_closed ACK、owner 侧 run 仍开着，由 controller 既有关闭路径收尾，不是崩溃；spool 记录含 `lease refresh:` 原因）；若首个 lease 在协调器首次判定前已到期，run 会以 admitted 0 / `external_stop` 收尾而非 startup error，读 spool 与 owner-status 区分；刷新在途时旧 lease 仍可见并按同一连续时钟到期，回复到达后原样替换；owner lease 真正失效只关闭新准入（对本次 run 锁存），排空后按序存入 resource_audit / unresolved_claims / admission_reconciliation 收据、ACK `admission_closed`、存入 ownership_closure；收据 `m6_assembly` 块记录全部 sha 与失败步骤）同时（runner 启动后立即）运行 `python -m disclosure_anchor.cli.m6_verifier_supervisor --m6-run-dir <dir> --runner-spool <observation-out>/m6-assembly/spool.jsonl --runner-receipt <receipt> --output-dir <new> --verifier-identity <id> --plan <plan> --deadline-seconds <n>`（进行中校验：tail runner spool，只在 owner 对该 attempt 的 `attempt_admitted` 与 `publication_committed` 都有持久 `delivered` 回执后才派发；每个 attempt 先 public 后 quality，quality 直接绑定本进程产出的公开受理精确字节；两角色各一条长期 sender/序列；runner 收据出现且 `m6_assembly.status` 为 complete、attempt 集合对账一致后，quality 完成、public 写 `drain-receipt.json` 并发唯一 `verifier_drained`；任何失败/超时/不一致 → 双方显式 abort、不 drain）→ `m6_run_control close --run-dir <dir> --campaign-receipt <receipt> --reason ...`。独立 CLI `m6_public_verify` / `m6_qualify_readonly --public-receipts <supervisor 输出的 public-inputs.json> --plan` 只作证据重跑（sender 完成、不 drain）；顺序不可颠倒：quality 依赖 public 的受理文件，drain 依赖两者全部完成。任一装配步骤失败时对应收据/摘要标记 failed，运行记为证据不完整，不得声明正式关闭。边界规则：`bind` 只在 `run-spec.json` 不存在时写入（整体写入，否则失败），已存在且字节与本次输入重算一致时重放 owner 的幂等 bind 并核对回复状态的 `spec_sha256`/`run_id`，字节不同则拒绝且不发远端命令；runner 在加载 profile、持锁、连库、准入之前先要求 spec 的 manifest/scope/campaign/mode 与本次输入一致，再核对 process profile、runtime bundle 与 worker profile 身份；发出 drain 的一方先写入不可变的 `drain-receipt.json`，`verifier_drained` 只引用该文件的摘要，`run-summary.json` 随后单独写入；连库失败、循环未跑到底、spool 尾部损坏/残缺或收据无法整体写入时以显式 abort 关闭发送线程且不产生任何 drain 声明。
@@ -959,6 +978,66 @@ upgrade”。所有数值（D/H/P/C/M、单项许可、硬包络、Mac 配额与
      重排是另一个显式决定，结案从不自动重排：已 `make migrate` 到 0065（`ck_parse_requeue_decision_class` 接受
      `original_key_lifetime`）之后，对每个结案 run 按 §5.1 做 parse-requeue（先 DRY_RUN），`FIXED_BY` 写明允许
      以新 key 重新提交的合格运行时/新 H0 授权；在那之前这些 run 由队列的合同失败闸门保持在队列外。
+
+### 1.1i 同根注册表重确认（零职责 Docker 存储维护）
+
+合同见 `../design/mineru-release.md` §4a。只用于：全部旧责任已终态、Windows 输出根（C 上同一 NTFS 目录）不动、
+只做 Docker Desktop 存储维护（如官方 VHD 迁移）后 Linux 侧 `device`/`inode` 可能变化的情形。路径、uid、mode、
+根/控制目录 FileId、registry 原件或记录有任何其它变化都不是本操作可接管的对象：保持停止并人工判断。
+维护工具与 Windows stand-in 演练未完成前不为“优化”停 Docker；生产继续即可。
+
+前置（每一项都由人按序完成，工具只核验）：
+1. GC 全程保持关闭，只核验既有 not_loaded，不启动也不“恢复” GC。worker 按既有排他停止，**等 worker 与其子进程
+   优雅退出后再 bootout**；不得以风险接受替代恢复路径。
+2. worker 退出后（不早于）：`execution_upgrade legacy-scope --output <新文件>`，必须 0 成员；prestop 只接受
+   采集后 900 秒内的清单。原 scope 的 native 责任须已全部收口，不清空/缩 scope、不强 ACK、不重排。
+3. 用含本工具的已验证包；`--private-binding` 的 `previous_capacity_path` 指向当前在跑的容量字节。
+
+```sh
+REL="python -m disclosure_anchor.cli.mineru_release same-root"
+$REL prestop --package <pkg> --private-binding <bind> --legacy-scope-inventory <清单> --output <新目录>
+#   打印 operation_id（sr-…）。冻结三容器 ID/镜像/restart 策略，先全部 restart=no 再按 proxy→API→inference
+#   停止；记录 R0 与 Windows FileId/ACL；同一 VM 内 helper 基线观察须为 noop。之后不得 install/compose up。
+# —— 人工：Docker 完全停止、处于防自动启动状态后备份旧 VHD，再做官方存储维护；结果不明保持 API/生产者关闭，
+#    不强杀、不盲目重迁。Docker 可启动 daemon，三个业务容器不会自行启动（restart=no）。
+$REL observe --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>
+#   outcome=noop：直接 restore。outcome=reattest：
+$REL approve --package <pkg> --prestop-output <prestop 目录> --observe-output <observe 目录> \
+  --approved-by <人> --decision-reference <审阅记录> --output <新目录>   # 离线，用包内协议重算 R1
+$REL apply   --operation-id <op> --approval <approve 目录>/same-root-approval.json --package <pkg> --private-binding <bind> --output <新目录>
+$REL restore --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>
+#   只启动 inference 与 API；API 自身严格 reader 与闭合空闲 health 须证明新元组与 R1。proxy 保持关闭。
+$REL close   --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>
+#   启动 proxy、恢复冻结的 restart 策略、归档 pending；之后普通安装入口才重新开放。
+$REL status  --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>   # 只读
+```
+
+- 从 prestop 到 close 始终用同一个 `--package`（同一 release manifest）；换包后除 status 外每个阶段都会在任何
+  Docker 调用前拒绝（“was started by release …”），approve 也拒绝。
+- 每阶段结果写在 `--output/same-root-result.json`，`write_permission` 恒为 closed；`unknown`（Job 超时、helper
+  未退出、应答丢失、apply 后读回不符）不是成功：先 `status`，保持 pending 与停止状态，用同一 operation 重跑
+  同一阶段（helper 以同名对象续接；已发布的 R1 只做完成确认）。**不要删除 `pending.json`、不要手改 registry、
+  不要先启动 API“试试看”**。
+- prestop 中断：带同一 `--operation-id` 和一份新的 0 成员清单重跑 prestop 即续做；Windows 侧没有 pending 时仍要求
+  实时空闲与 API proof。若报 “operation directory exists without a pending marker”，说明中断发生在写 marker 之前、
+  尚未冻结或变更任何东西：不带 `--operation-id` 重新 prestop（新 operation），旧目录留作证据。
+- 成对记录（R0 副本→身份记录、apply 后身份记录→apply 记录）中断后由同一阶段重跑自动补齐，前提是与本次读回逐字节
+  或同一物理对象一致；不一致或记录残缺保持失败与 pending，交 root 只读判断，不删除、不手改任何记录。
+- apply 已提交但结果没回到 Mac：用同一 approval 重跑 apply，结果为 `already_recorded`（只确认 registry 仍是记录里
+  的同一对象，不写）。
+- close 一旦写下 `close-intent.json` 就只能继续 close（prestop/observe/apply/restore 都拒绝）：中断后直接重跑 close，
+  已恢复的策略只认该记录里的容器 ID 与策略。若 close 门因某个业务容器未运行而拒绝，经 root 判断后只允许
+  `docker start <close-intent.json 中该容器的 id>` 再重跑 close，不做其它改动。
+- 后续再次挂载（如回退存储）且尚未 close：重新 observe/approve/apply，原件是本操作最新的 registry，绝不回写
+  维护前的 R0。
+
+维护之后（不由本工具执行）：用普通 `install --operation-kind api-compatibility`（真实 live health 门）安装目标容量，
+首个新任务前核验 `min(Windows C 可用, API output-root 可用) >= D + H + X`（零职责物理预算，先扣已知同时写入），
+再按原计划做最终 epoch attest、Qnew 资格与 `bind`。此时 base env 必须是 **exact 隐式单许可**：
+`WORKER_DRAIN_EXISTING=false`，**不设置** `DISCLOSURE_V4_HEAVY_WORK_PERMITS`（不是设为 1），四项
+`DISCLOSURE_WORKER_EXECUTION_UPGRADE_*` 归档不继承。随后以现有 `staged_commission` 处理两份已登记、真实 eligible
+的 pending PDF（正式业务写入、结果保留，不是 scratch 实验）；全部责任收口、legacy-scope 再为零后，才按 §1.1h 走
+U01 v3（`implied/implied/2`、独立 GO、preflight）进入两个重活许可。不支持 Qnew 之后直接 exact heavy2。
 
 ### 1.2 批量重解析与派生重置
 

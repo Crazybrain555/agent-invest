@@ -25,6 +25,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# A pending same-root registry maintenance owns the output root and the three business containers until
+# its own verified close (run_mineru_same_root_maintenance.ps1); no installation may start meanwhile.
+$SameRootPendingMarker = Join-Path (Split-Path -Parent $ReceiptTarget) "same-root-maintenance\pending.json"
+if (Test-Path -LiteralPath $SameRootPendingMarker) {
+    throw "a same-root registry maintenance is pending: $SameRootPendingMarker"
+}
 if (@(@($ReuseCurrentPublishedImage, $ApiOnlyCompatibilityUpgrade, $InferenceRecreate) | Where-Object { $_ }).Count -gt 1) {
     throw "installation operation switches are mutually exclusive"
 }

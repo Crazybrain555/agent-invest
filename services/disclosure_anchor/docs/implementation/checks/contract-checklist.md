@@ -8,6 +8,46 @@ created_at: 2026-06-26
 
 # API / public view / source_ref 契约检查清单
 
+## Temporary resident drain maintenance
+
+- `WORKER_DRAIN_EXISTING` defaults off and requires an unscoped staged-v4 resident. It is an operational
+  startup control; P/WP/Q, original H0/spec/key/lease/fence/ACK, resource budgets and verified U01 remain exact.
+  Prepared admission retains persistence paging/credit outcomes and POST; ordinary source observation,
+  rejection and H0 creation are disabled. Scoped recovery/commission/campaign are never an upgrade bypass.
+- Mandatory startup recovery/projection remains; the independent maintenance/acquisition/projection thread
+  pauses until normal startup. QUIESCENT keeps the resident waiting, with no autonomous exit/restart or
+  completion claim; zero remaining responsibilities requires the existing complete read-only scope proof.
+  Mode appears in resident logs/progress; status stderr labels only its own configured mode, preserving stdout.
+  Offline checks cover unchanged keys/checkpoints, budget deferral, U01 refusal, startup, idle wait and faults.
+  Deployment/live zero-duty verification is separately governed by the [operations runbook](../runbooks/production-operations.md).
+
+## Same-root registry re-attestation (private zero-duty maintenance)
+
+- Private only; no public Unit/Filing/API/view change. Normal registry readers stay strict on any device/inode
+  drift. `observe_same_root_registry`/`apply_same_root_registry` (task protocol) accept only a quiescent v4
+  registry ≤16 MiB: R0 decodes under the approved old tuple, R1 under the measured current tuple, and only
+  `output_root.device/inode` move; records, order, optional members, expired tombstones and watermark are byte
+  equal. An unchanged tuple is a no-op that apply refuses to write. An r1 resume must rebuild the approved R0
+  digest/length. No runtime registry is constructed (no recovery or pruning).
+- Closed private contracts: helper request/failure v1 (exit 0/64/65/70), observation/apply v1, plan
+  `mineru-same-root-plan.v1` (every field restates the helper line exactly), approval `m6.same-root-approval.v1`
+  (binds the plan digest), binding `m6.installation-binding.v3`, operation result `m6.installation-operation.v3`,
+  child result `m6.same-root-child-result.v1`. v1/v2 bindings and their shapes are unchanged.
+- One writer: the one-shot helper with deterministic temp, CAS on inode+bytes+held path chain before one
+  replace, then directory fsync and reopen; failures classify R0/R1/other and never become success. While
+  `same-root-maintenance\pending.json` exists, v1/v2 installation and the installer refuse; only close moves it.
+- Interruption: a record pair cut after its first file completes only from byte-identical (R0 copy) or
+  object-identical (post-apply registry FileId, bytes, ACL and root chain) evidence; plan and helper numbers are
+  never reused; a committed apply re-run only confirms (`already_recorded`). Close writes a deterministic
+  `close-intent.json` (operation, restore record name/digest, frozen names/ids/policies) before its first mutation;
+  from then on only close continues, and a non-`no` restart policy counts as restored only where that record names it.
+- One operation, one release: the pending marker's release manifest must equal the running package in the
+  wrapper's early gate and at the child's phase entry (status excepted) before any Docker call; plan verification
+  requires the prestop/observe summaries, the Windows `prestop.json` and the plan to name the verifying package.
+- Offline gates: native/helper fault cases, Mac plan recomputation from the packaged protocol, binding field
+  parity with the Windows owner, phase gates. Windows Job/Docker lifecycle, NTFS FileId/ACL capture,
+  PowerShell/C# execution and bind-mount power-loss durability require the separate Windows stand-in.
+
 ## Private resident lifecycle backends
 
 - Explicit receipt/seal v3 separates actual API profile/epoch from Mac observer process/clock; original

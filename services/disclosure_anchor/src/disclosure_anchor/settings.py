@@ -808,6 +808,11 @@ class Settings(BaseSettings):
             "worker_parse_execution_mode",
         ),
     )
+    # Startup-only operational maintenance; it does not change P/WP/Q or H0.
+    worker_drain_existing: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("WORKER_DRAIN_EXISTING", "worker_drain_existing"),
+    )
     # Parallel parse chains per round (1 = serial). Meant for the
     # *-http-client backends where the GPU server absorbs concurrency;
     # capped to keep local memory/subprocess fan-out bounded (raised 8→16
@@ -1122,6 +1127,8 @@ class Settings(BaseSettings):
                 "below WORKER_WEDGE_TIMEOUT_SECONDS"
             )
         capacity_path = self.disclosure_mineru_capacity_config
+        if self.worker_drain_existing and self.worker_parse_execution_mode != "staged-v4":
+            raise ValueError("WORKER_DRAIN_EXISTING requires staged-v4 worker mode")
         capacity_hash = self.disclosure_mineru_capacity_config_sha256
         if (capacity_path is None) != (capacity_hash is None):
             raise ValueError("MinerU explicit capacity path and SHA256 must be paired")

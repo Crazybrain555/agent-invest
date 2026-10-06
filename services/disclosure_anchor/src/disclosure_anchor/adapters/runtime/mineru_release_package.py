@@ -72,6 +72,11 @@ RELEASE_SOURCE_FILES: dict[str, str] = {
     "windows/run_mineru_installation.ps1": "scripts/windows/run_mineru_installation.ps1",
     "windows/build_mineru_telemetry_assembly.ps1": "scripts/windows/build_mineru_telemetry_assembly.ps1",
     "windows/load_mineru_telemetry_assembly.ps1": "scripts/windows/load_mineru_telemetry_assembly.ps1",
+    # Same-root registry maintenance: Job child, NTFS identity probe and the one-shot
+    # helper that runs beside api-context/agent_task_protocol_v2.py.
+    "windows/run_mineru_same_root_maintenance.ps1": "scripts/windows/run_mineru_same_root_maintenance.ps1",
+    "windows/mineru_same_root_identity.cs": "scripts/windows/mineru_same_root_identity.cs",
+    "windows/mineru_same_root_registry_helper.py": "scripts/windows/mineru_same_root_registry_helper.py",
     "native-m6/build_mineru_m6_owner.ps1": "scripts/windows/build_mineru_m6_owner.ps1",
     "native-m6/run_mineru_m6_owner_host.ps1": "scripts/windows/run_mineru_m6_owner_host.ps1",
 }

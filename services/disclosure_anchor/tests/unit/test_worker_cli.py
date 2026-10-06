@@ -854,9 +854,13 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         checker.assert_not_called()
         create_engine.assert_not_called()
 
-    def test_staged_loop_drains_legacy_tails_without_legacy_parse_reclaim(
-        self,
-    ) -> None:
+    def test_staged_loop_drains_legacy_tails_without_legacy_parse_reclaim(self) -> None:
+        self._assert_staged_loop(drain_existing=False)
+
+    def test_drain_existing_disables_maintenance_but_keeps_startup_and_resident(self) -> None:
+        self._assert_staged_loop(drain_existing=True)
+
+    def _assert_staged_loop(self, *, drain_existing: bool) -> None:
         stop = mock.MagicMock()
         stop.is_set.return_value = False
         engine = mock.MagicMock()
@@ -864,6 +868,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         deps.config.process_scope_classes = ("annual_report",)
         settings = mock.MagicMock(
             worker_parse_execution_mode="staged-v4",
+            worker_drain_existing=drain_existing,
             worker_loop_interval_seconds=900,
             worker_loop_max_interval_seconds=1800,
             worker_wedge_timeout_seconds=0,
@@ -879,7 +884,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             mock.patch.object(worker_cli, "_deps", return_value=deps),
             mock.patch.object(worker_cli, "_limits", return_value=limits),
             mock.patch.object(worker_cli, "_emit_progress_snapshot"),
-            mock.patch.object(worker_cli, "_run_maintenance_loop"),
+            mock.patch.object(worker_cli, "_run_maintenance_loop") as maintenance,
             mock.patch.object(worker_cli, "_run_startup_recovery") as recovery,
             mock.patch.object(worker_cli, "run_resident_parse") as legacy_parse,
             mock.patch.object(worker_cli, "_run_staged_v4_resident") as staged_parse,
@@ -890,6 +895,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 progress_output="off",
             )
 
+        self.assertEqual(maintenance.call_count, 0 if drain_existing else 1)
         self.assertEqual(result, 0)
         recovery.assert_called_once()
         self.assertFalse(recovery.call_args.kwargs["reclaim_running"])
@@ -953,6 +959,56 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         runtime.verify_startup.assert_called_once_with()
         work_available.wait.assert_called_once_with(timeout=900)
         runtime.close.assert_called_once_with()
+
+    def test_drain_status_marks_configuration_without_claiming_live_mode(self) -> None:
+        settings = mock.MagicMock(worker_drain_existing=True)
+        engine = mock.MagicMock()
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with (mock.patch.object(worker_cli, "require_worker_start_permitted"),
+              mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
+              mock.patch.object(worker_cli, "require_runtime_app_engine"),
+              mock.patch.object(worker_cli, "collect_worker_progress"),
+              mock.patch.object(worker_cli, "_process_scope_classes", return_value=None),
+              mock.patch.object(worker_cli, "render_worker_progress_json", return_value='{"existing": true}'),
+              redirect_stderr(stderr), redirect_stdout(stdout)):
+            self.assertEqual(worker_cli._print_worker_status(settings, output_format="json"), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"existing": True})
+        self.assertIn("configured_maintenance_mode=drain_existing", stderr.getvalue())
+        self.assertIn("configuration only", stderr.getvalue())
+        engine.dispose.assert_called_once_with()
+
+    def test_drain_resident_waits_after_quiescence_and_keeps_public_fault_visible(self) -> None:
+        for fault in (False, True):
+            with self.subTest(fault=fault):
+                runtime = mock.MagicMock()
+                result = mock.MagicMock(terminal=CoordinatorTerminal.QUIESCENT, errors=())
+                runtime.coordinator.run.side_effect = ([RuntimeError("durable head unreadable")] if fault else [result, result])
+                settings = mock.MagicMock(worker_drain_existing=True, worker_loop_interval_seconds=900,
+                                         disclosure_mineru_stream_pressure_config=None,
+                                         disclosure_mineru_stream_pressure_config_sha256=None)
+                event = mock.MagicMock()
+                control = InProcessWorkerStopLatch()
+                stdout = io.StringIO()
+                with (mock.patch("disclosure_anchor.adapters.runtime.staged_worker_v4.build_staged_worker_v4_runtime",
+                                 return_value=runtime), redirect_stdout(stdout)):
+                    args = dict(engine=mock.MagicMock(), deps=mock.MagicMock(),
+                                should_stop=mock.Mock(side_effect=[False, False, False, True]),
+                                ownership_guard=lambda: None, admission_guard=lambda: None,
+                                work_available=event, prune_tracker=worker_cli._ProjectionPruneTracker(),
+                                progress_output="off", stop_control=control)
+                    if fault:
+                        with self.assertRaisesRegex(RuntimeError, "durable head unreadable"):
+                            worker_cli._run_staged_v4_resident(settings, **args)
+                        self.assertIsNotNone(control.first_cause())
+                        event.wait.assert_not_called()
+                    else:
+                        worker_cli._run_staged_v4_resident(settings, **args)
+                        self.assertEqual(runtime.coordinator.run.call_count, 2)
+                        event.wait.assert_called_once_with(timeout=900)
+                        self.assertIsNone(control.first_cause())
+                self.assertIn("maintenance=drain_existing ordinary_admission=disabled acquisition=disabled", stdout.getvalue())
+                runtime.verify_startup.assert_called_once_with()
+                runtime.close.assert_called_once_with()
 
     def test_once_static_mineru_gate_fails_before_database_connection(self) -> None:
         settings = _unstopped_settings(self)

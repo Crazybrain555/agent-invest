@@ -19,7 +19,7 @@ import time
 import zipfile
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, fields
 from functools import wraps
 from pathlib import Path
@@ -3672,6 +3672,214 @@ class DurableTaskRegistry:
 _INGRESS_SPOOL_DIRECTORY = ".agent-ingress-spool"
 
 
+_TASK_CONTROL_DIRECTORY = ".agent-task-protocol-v2"
+_TASK_REGISTRY_NAME = "registry.json"
+_OUTPUT_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _metadata_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _bounded_entries(
+    descriptor: int, limit: int, refusal: str = "output directory has unexpected entries",
+) -> set[str]:
+    result: set[str] = set()
+    with os.scandir(descriptor) as iterator:
+        for entry in iterator:
+            result.add(entry.name)
+            if len(result) > limit:
+                raise TaskProtocolConflict(refusal)
+    return result
+
+
+def _read_registry_descriptor(descriptor: int) -> tuple[bytes, os.stat_result]:
+    """Bounded read of one open registry file whose identity must not move."""
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not 0 < metadata.st_size <= _MAX_REGISTRY_BYTES
+    ):
+        raise TaskProtocolConflict("task registry file identity is unsafe")
+    chunks: list[bytes] = []
+    remaining = metadata.st_size + 1
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    if len(raw) != metadata.st_size:
+        raise TaskProtocolConflict("task registry changed while reading")
+    return raw, metadata
+
+
+def _decode_quiescent_registry(
+    raw: bytes, root: Path, root_identity: tuple[int, int, int, int],
+) -> tuple[dict[str, DurableTaskRecord], int]:
+    """The actual strict reader on a bare object: no recovery, pruning or persistence.
+
+    ``root_identity`` is (device, inode, uid, mode), the same order the normal
+    reader pins at construction. The caller names it explicitly.
+    """
+    reader = object.__new__(DurableTaskRegistry)
+    reader._output_root = root
+    reader._output_root_identity = root_identity
+    records = reader._decode_registry(raw, require_quiescent=True)
+    return records, reader._submission_watermark_bucket
+
+
+class _PinnedOutputWalk:
+    """Read-only pinned walk of one output root shared by every quiescence proof.
+
+    Every component from ``/`` is opened without following links and kept open.
+    The walk never repairs, deletes or recursively scans: the root may hold only
+    the task control directory and an empty ingress spool, the control directory
+    only the registry (and, for the same-root writer, its declared temporary).
+    """
+
+    def __init__(self, root: Path) -> None:
+        if not root.is_absolute() or ".." in root.parts:
+            raise TaskProtocolConflict("output root must be an absolute canonical path")
+        self.root = root
+        self.opened: list[int] = []
+        self.edges: list[tuple[int, str, int, str]] = []
+        self.pinned: list[tuple[int, tuple[int, ...]]] = []
+        self.root_fd = -1
+        self.root_meta: os.stat_result | None = None
+        self.root_entries: set[str] = set()
+        self.spool_fd: int | None = None
+        self.spool_meta: os.stat_result | None = None
+        self.control_fd: int | None = None
+        self.control_meta: os.stat_result | None = None
+        self.control_entries: set[str] = set()
+        self.control_limit = 1
+        self.registry_fd: int | None = None
+        self.registry_meta: os.stat_result | None = None
+        self.raw: bytes | None = None
+
+    def __enter__(self) -> "_PinnedOutputWalk":
+        try:
+            current = os.open("/", _OUTPUT_DIRECTORY_FLAGS)
+            self.opened.append(current)
+            for component in self.root.parts[1:]:
+                current = self._open_at(current, component, _OUTPUT_DIRECTORY_FLAGS, "chain")
+            self.root_fd = current
+            self.root_meta = os.fstat(self.root_fd)
+            if self.root_meta.st_uid != os.getuid():
+                raise TaskProtocolConflict("output root owner drifted")
+            self.root_entries = _bounded_entries(self.root_fd, 2)
+            self.pinned.append((self.root_fd, _metadata_identity(self.root_meta)))
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        while self.opened:
+            os.close(self.opened.pop())
+
+    def _open_at(self, parent: int, name: str, flags: int, kind: str) -> int:
+        descriptor = os.open(name, flags, dir_fd=parent)
+        self.opened.append(descriptor)
+        self.edges.append((parent, name, descriptor, kind))
+        return descriptor
+
+    def live_identity(self) -> dict[str, Any]:
+        assert self.root_meta is not None
+        meta = self.root_meta
+        return {"path": str(self.root), "device": meta.st_dev, "inode": meta.st_ino,
+                "uid": meta.st_uid, "mode": meta.st_mode}
+
+    def read_quiescent_inventory(
+        self, *, allow_empty: bool, control_allowed: frozenset[str] = frozenset({_TASK_REGISTRY_NAME}),
+    ) -> None:
+        assert self.root_meta is not None
+        control, spool = _TASK_CONTROL_DIRECTORY, _INGRESS_SPOOL_DIRECTORY
+        if self.root_entries - {control, spool}:
+            raise TaskProtocolConflict("output root has unknown or retained task entries")
+        if spool in self.root_entries:
+            self.spool_fd = self._open_at(self.root_fd, spool, _OUTPUT_DIRECTORY_FLAGS, "spool")
+            self.spool_meta = os.fstat(self.spool_fd)
+            if self.spool_meta.st_uid != os.getuid() or self.spool_meta.st_dev != self.root_meta.st_dev:
+                raise TaskProtocolConflict("ingress spool is not owned on the output volume")
+            _bounded_entries(self.spool_fd, 0, "ingress spool is not empty")
+            self.pinned.append((self.spool_fd, _metadata_identity(self.spool_meta)))
+        if control not in self.root_entries:
+            if not allow_empty:
+                raise TaskProtocolConflict("commissioned task registry is absent")
+            return
+        self.control_fd = self._open_at(self.root_fd, control, _OUTPUT_DIRECTORY_FLAGS, "control")
+        self.control_meta = os.fstat(self.control_fd)
+        self.control_limit = len(control_allowed)
+        if self.control_meta.st_uid != os.getuid():
+            raise TaskProtocolConflict("task control directory is not quiescent")
+        self.control_entries = _bounded_entries(self.control_fd, self.control_limit)
+        if _TASK_REGISTRY_NAME not in self.control_entries or not self.control_entries <= control_allowed:
+            raise TaskProtocolConflict("task control directory is not quiescent")
+        self.pinned.append((self.control_fd, _metadata_identity(self.control_meta)))
+        self.registry_fd = self._open_at(
+            self.control_fd, _TASK_REGISTRY_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, "registry",
+        )
+        self.raw, self.registry_meta = _read_registry_descriptor(self.registry_fd)
+        self.pinned.append((self.registry_fd, _metadata_identity(self.registry_meta)))
+
+    def verify_unchanged(self) -> None:
+        """The whole read-only inventory, every pinned identity and every edge are unchanged."""
+        if self.control_fd is not None and _bounded_entries(self.control_fd, self.control_limit) != self.control_entries:
+            raise TaskProtocolConflict("task control inventory changed")
+        self._verify_inventory()
+        for descriptor, before in self.pinned:
+            if _metadata_identity(os.fstat(descriptor)) != before:
+                raise TaskProtocolConflict("output evidence changed during inspection")
+        self._verify_edges(kinds=("chain", "spool", "control", "registry"))
+
+    def verify_publish_paths(self, *, registry_edge: bool) -> None:
+        """Around the one same-root replace: root, spool and control stay pinned at their paths.
+
+        The control directory's own times (and, on some file systems, its link
+        count) change with the temporary and the replace, so it keeps only
+        device/inode/uid/mode. Before the replace the registry name must still
+        resolve to the held original; after it the registry edge is the new file.
+        """
+        assert self.root_meta is not None and self.control_meta is not None and self.control_fd is not None
+        self._verify_inventory()
+        for descriptor, before in self.pinned:
+            if descriptor in (self.root_fd, self.spool_fd):
+                if _metadata_identity(os.fstat(descriptor)) != before:
+                    raise TaskProtocolConflict("output evidence changed during inspection")
+        held = os.fstat(self.control_fd)
+        expected = self.control_meta
+        if (held.st_dev, held.st_ino, held.st_uid, held.st_mode) != (
+            expected.st_dev, expected.st_ino, expected.st_uid, expected.st_mode
+        ):
+            raise TaskProtocolConflict("task control directory identity changed")
+        self._verify_edges(kinds=("chain", "spool", "control", "registry") if registry_edge else ("chain", "spool", "control"))
+
+    def _verify_inventory(self) -> None:
+        if self.spool_fd is not None:
+            _bounded_entries(self.spool_fd, 0, "ingress spool inventory changed")
+        if _bounded_entries(self.root_fd, 2) != self.root_entries:
+            raise TaskProtocolConflict("output inventory changed")
+
+    def _verify_edges(self, *, kinds: tuple[str, ...]) -> None:
+        for parent, name, descriptor, kind in self.edges:
+            if kind not in kinds:
+                continue
+            linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            held = os.fstat(descriptor)
+            if (linked.st_dev, linked.st_ino, linked.st_mode, linked.st_uid) != (
+                held.st_dev, held.st_ino, held.st_mode, held.st_uid
+            ):
+                raise TaskProtocolConflict("output evidence path was replaced")
+
+
 def inspect_quiescent_output_root(
     root: Path, *, allow_empty: bool = False
 ) -> dict[str, Any]:
@@ -3684,133 +3892,548 @@ def inspect_quiescent_output_root(
     spool must be empty and owned on the root's volume: it then holds no bytes
     and no task, so the proof is the same with or without it.
     """
-    if not root.is_absolute() or ".." in root.parts:
-        raise TaskProtocolConflict("output root must be an absolute canonical path")
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    opened: list[int] = []
-    edges: list[tuple[int, str, int]] = []
-
-    def identity(value: os.stat_result) -> tuple[int, ...]:
-        return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
-                value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
-
-    def entries(
-        descriptor: int, limit: int, refusal: str = "output directory has unexpected entries",
-    ) -> set[str]:
-        result: set[str] = set()
-        with os.scandir(descriptor) as iterator:
-            for entry in iterator:
-                result.add(entry.name)
-                if len(result) > limit:
-                    raise TaskProtocolConflict(refusal)
-        return result
-
-    try:
-        current = os.open("/", directory_flags)
-        opened.append(current)
-        for component in root.parts[1:]:
-            child = os.open(component, directory_flags, dir_fd=current)
-            opened.append(child)
-            edges.append((current, component, child))
-            current = child
-        root_fd = current
-        root_meta = os.fstat(root_fd)
-        if root_meta.st_uid != os.getuid():
-            raise TaskProtocolConflict("output root owner drifted")
-        root_identity = {
-            "path": str(root), "device": root_meta.st_dev, "inode": root_meta.st_ino,
-            "uid": root_meta.st_uid, "mode": root_meta.st_mode,
-        }
-        root_entries = entries(root_fd, 2)
-        control = ".agent-task-protocol-v2"
-        spool = _INGRESS_SPOOL_DIRECTORY
+    with _PinnedOutputWalk(root) as walk:
         proof: dict[str, Any] = {
-            "schema": "mineru-output-quiescence.v1", "root_identity": root_identity,
+            "schema": "mineru-output-quiescence.v1", "root_identity": walk.live_identity(),
             "registry_sha256": None, "record_count": 0,
             "submission_watermark_bucket": None,
         }
         file_count = total_bytes = 0
-        pinned: list[tuple[int, tuple[int, ...]]] = [(root_fd, identity(root_meta))]
-        if root_entries - {control, spool}:
-            raise TaskProtocolConflict("output root has unknown or retained task entries")
-        spool_fd: int | None = None
-        if spool in root_entries:
-            spool_fd = os.open(spool, directory_flags, dir_fd=root_fd)
-            opened.append(spool_fd)
-            edges.append((root_fd, spool, spool_fd))
-            spool_meta = os.fstat(spool_fd)
-            if spool_meta.st_uid != os.getuid() or spool_meta.st_dev != root_meta.st_dev:
-                raise TaskProtocolConflict("ingress spool is not owned on the output volume")
-            entries(spool_fd, 0, "ingress spool is not empty")
-            pinned.append((spool_fd, identity(spool_meta)))
-        if control not in root_entries:
-            if not allow_empty:
-                raise TaskProtocolConflict("commissioned task registry is absent")
-        else:
-            control_fd = os.open(control, directory_flags, dir_fd=root_fd)
-            opened.append(control_fd)
-            edges.append((root_fd, control, control_fd))
-            control_meta = os.fstat(control_fd)
-            if control_meta.st_uid != os.getuid() or entries(control_fd, 1) != {"registry.json"}:
-                raise TaskProtocolConflict("task control directory is not quiescent")
-            pinned.append((control_fd, identity(control_meta)))
-            descriptor = os.open(
-                "registry.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                dir_fd=control_fd,
+        walk.read_quiescent_inventory(allow_empty=allow_empty)
+        if walk.raw is not None:
+            assert walk.root_meta is not None
+            meta = walk.root_meta
+            records, watermark = _decode_quiescent_registry(
+                walk.raw, root, (meta.st_dev, meta.st_ino, meta.st_uid, meta.st_mode),
             )
-            opened.append(descriptor)
-            edges.append((control_fd, "registry.json", descriptor))
-            metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
-                or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600
-                or not 0 < metadata.st_size <= _MAX_REGISTRY_BYTES
-            ):
-                raise TaskProtocolConflict("task registry file identity is unsafe")
-            pinned.append((descriptor, identity(metadata)))
-            chunks: list[bytes] = []
-            remaining = metadata.st_size + 1
-            while remaining:
-                chunk = os.read(descriptor, min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            raw = b"".join(chunks)
-            if len(raw) != metadata.st_size:
-                raise TaskProtocolConflict("task registry changed while reading")
-            reader = object.__new__(DurableTaskRegistry)
-            reader._output_root = root
-            reader._output_root_identity = (
-                root_meta.st_dev, root_meta.st_ino, root_meta.st_uid, root_meta.st_mode
-            )
-            records = reader._decode_registry(raw, require_quiescent=True)
             proof.update(
-                registry_sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+                registry_sha256="sha256:" + hashlib.sha256(walk.raw).hexdigest(),
                 record_count=len(records),
-                submission_watermark_bucket=reader._submission_watermark_bucket,
+                submission_watermark_bucket=watermark,
             )
-            file_count, total_bytes = 1, len(raw)
-            if entries(control_fd, 1) != {"registry.json"}:
-                raise TaskProtocolConflict("task control inventory changed")
-        if spool_fd is not None:
-            entries(spool_fd, 0, "ingress spool inventory changed")
-        if entries(root_fd, 2) != root_entries:
-            raise TaskProtocolConflict("output inventory changed")
-        for descriptor, before in pinned:
-            if identity(os.fstat(descriptor)) != before:
-                raise TaskProtocolConflict("output evidence changed during inspection")
-        for parent, name, descriptor in edges:
-            linked = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            held = os.fstat(descriptor)
-            if (linked.st_dev, linked.st_ino, linked.st_mode, linked.st_uid) != (
-                held.st_dev, held.st_ino, held.st_mode, held.st_uid
-            ):
-                raise TaskProtocolConflict("output evidence path was replaced")
+            file_count, total_bytes = 1, len(walk.raw)
+        walk.verify_unchanged()
         return {"file_count": file_count, "total_bytes": total_bytes, "quiescence": proof}
+
+
+# ---------------------------------------------------------------------------
+# Same-root registry re-attestation (zero-duty maintenance only).
+#
+# A Docker VM remount can give the unchanged Windows output root a new Linux
+# device/inode. The normal reader keeps refusing that drift. This one explicit,
+# operator-approved path re-attests a fully consumed v4 registry: the original
+# bytes R0 are strictly decoded under the approved old tuple, R1 differs only in
+# ``output_root.device``/``output_root.inode``, and R1 is strictly decoded under
+# the measured current tuple before and after one atomic publish. Path, uid and
+# mode never move; no record, tombstone, optional member or watermark changes.
+# Physical continuity of the Windows directory is proved by the Windows owner,
+# not here: these functions see only the Linux mount.
+# ---------------------------------------------------------------------------
+
+SAME_ROOT_OBSERVATION_SCHEMA = "mineru-same-root-observation.v1"
+SAME_ROOT_APPLY_SCHEMA = "mineru-same-root-apply.v1"
+_SAME_ROOT_TUPLE_FIELDS = ("path", "device", "inode", "uid", "mode")
+
+
+class SameRootRefused(TaskProtocolConflict):
+    """A same-root precondition failed; this call left the registry as it found it."""
+
+
+class SameRootOutcomeUnknown(TaskProtocolConflict):
+    """The one replace was attempted; the visible registry is classified, not assumed."""
+
+    def __init__(self, message: str, *, phase: str, visible: str) -> None:
+        if visible not in {"r0", "r1", "other", "unreadable"}:
+            raise ValueError("same-root visible state is outside the closed vocabulary")
+        super().__init__(message)
+        self.phase = phase
+        self.visible = visible
+
+
+def same_root_operation_id_valid(value: object) -> bool:
+    return (
+        type(value) is str and len(value) == 35 and value.startswith("sr-")
+        and all(char in "0123456789abcdef" for char in value[3:])
+    )
+
+
+def same_root_temp_name(operation_id: str) -> str:
+    if not same_root_operation_id_valid(operation_id):
+        raise SameRootRefused("same-root operation id is invalid")
+    return f".{_TASK_REGISTRY_NAME}.same-root-{operation_id}.tmp"
+
+
+def same_root_tuple(value: object, *, label: str) -> dict[str, Any]:
+    """One closed Linux root identity; never a boolean or a partial claim."""
+    if type(value) is not dict or set(value) != set(_SAME_ROOT_TUPLE_FIELDS):
+        raise SameRootRefused(f"{label} root identity fields are not closed")
+    path = value["path"]
+    if type(path) is not str or not path.startswith("/") or str(Path(path)) != path or ".." in Path(path).parts:
+        raise SameRootRefused(f"{label} root path is not an absolute canonical path")
+    for name in ("device", "inode", "uid", "mode"):
+        item = value[name]
+        if type(item) is not int or item < 0:
+            raise SameRootRefused(f"{label} root {name} is not a non-negative integer")
+    if not stat.S_ISDIR(value["mode"]):
+        raise SameRootRefused(f"{label} root mode is not a directory")
+    return {name: value[name] for name in _SAME_ROOT_TUPLE_FIELDS}
+
+
+def _same_root_digest(value: object, *, label: str) -> str:
+    if (
+        type(value) is not str or len(value) != 71 or not value.startswith("sha256:")
+        or any(char not in "0123456789abcdef" for char in value[7:])
+    ):
+        raise SameRootRefused(f"{label} is not a canonical sha256")
+    return value
+
+
+def _same_root_byte_count(value: object, *, label: str) -> int:
+    if type(value) is not int or not 0 < value <= _MAX_REGISTRY_BYTES:
+        raise SameRootRefused(f"{label} is outside the registry byte envelope")
+    return value
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _canonical_registry_bytes(payload: dict[str, Any]) -> bytes:
+    # The exact serialization the normal writer and the quiescent reader use.
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _same_root_payload(raw: bytes) -> dict[str, Any]:
+    if type(raw) is not bytes or not 0 < len(raw) <= _MAX_REGISTRY_BYTES:
+        raise SameRootRefused("registry bytes are outside the closed envelope")
+
+    def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise SameRootRefused("task registry contains duplicate fields")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> Any:
+        raise SameRootRefused(f"non-finite registry value: {value}")
+
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object, parse_constant=reject_constant)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SameRootRefused("registry is not strict UTF-8 JSON") from exc
+    if type(payload) is not dict or payload.get("schema") != REGISTRY_SCHEMA_V4:
+        raise SameRootRefused("same-root maintenance supports only the v4 registry")
+    if _canonical_registry_bytes(payload) != raw:
+        raise SameRootRefused("registry bytes are not canonical")
+    return payload
+
+
+def same_root_registry_body_sha256(raw: bytes) -> str:
+    """Digest of everything except ``output_root``: the bytes re-attestation must keep."""
+    payload = _same_root_payload(raw)
+    return _sha256_bytes(_canonical_registry_bytes({k: v for k, v in payload.items() if k != "output_root"}))
+
+
+def _same_root_decode(raw: bytes, identity: dict[str, Any], *, label: str) -> tuple[int, int]:
+    """Strict quiescent decode of a v4 registry under one explicit tuple."""
+    _same_root_payload(raw)
+    try:
+        records, watermark = _decode_quiescent_registry(
+            raw, Path(identity["path"]),
+            (identity["device"], identity["inode"], identity["uid"], identity["mode"]),
+        )
+    except TaskProtocolConflict as exc:
+        raise SameRootRefused(f"{label} registry is not strictly quiescent under its root: {exc}") from exc
+    if any(record.storage is not None for record in records.values()):
+        raise SameRootRefused(f"{label} registry still owns task storage")
+    return len(records), watermark
+
+
+def _same_root_pair(approved_root: object, current_root: object) -> tuple[dict[str, Any], dict[str, Any]]:
+    approved = same_root_tuple(approved_root, label="approved")
+    current = same_root_tuple(current_root, label="current")
+    for name in ("path", "uid", "mode"):
+        if approved[name] != current[name]:
+            raise SameRootRefused(f"current root {name} differs from the approved root; only device/inode may move")
+    return approved, current
+
+
+def same_root_reattested_registry(r0: bytes, *, approved_root: object, current_root: object) -> bytes:
+    """Pure transform: the approved original R0 re-attested to the current tuple.
+
+    Returns R0 itself when device and inode are unchanged. Otherwise only the
+    two integers move; the result must decode strictly under the current tuple
+    with a byte-identical body. Nothing is read from or written to disk.
+    """
+    approved, current = _same_root_pair(approved_root, current_root)
+    _same_root_decode(r0, approved, label="original")
+    if (approved["device"], approved["inode"]) == (current["device"], current["inode"]):
+        return r0
+    payload = _same_root_payload(r0)
+    payload["output_root"] = dict(payload["output_root"], device=current["device"], inode=current["inode"])
+    r1 = _canonical_registry_bytes(payload)
+    if len(r1) > _MAX_REGISTRY_BYTES:
+        raise SameRootRefused("re-attested registry exceeds the closed envelope")
+    _same_root_decode(r1, current, label="re-attested")
+    if same_root_registry_body_sha256(r1) != same_root_registry_body_sha256(r0):
+        raise SameRootRefused("re-attested registry body differs from the original")
+    return r1
+
+
+def _same_root_recognize_r1(
+    raw: bytes, approved: dict[str, Any], current: dict[str, Any], *,
+    r0_sha: str, r0_bytes: int, body_expected: str,
+) -> tuple[int, int]:
+    """Accept ``raw`` only as the re-attestation of exactly the approved original pair.
+
+    Putting the approved old tuple back must rebuild the approved R0 byte for
+    byte (digest and length), and that R0 must re-attest to ``raw`` again.
+    """
+    neither = "registry is neither the approved original nor its re-attestation"
+    try:
+        counts = _same_root_decode(raw, current, label="current")
+        payload = _same_root_payload(raw)
+        payload["output_root"] = dict(payload["output_root"], device=approved["device"], inode=approved["inode"])
+        original = _canonical_registry_bytes(payload)
+        round_trip = same_root_reattested_registry(original, approved_root=approved, current_root=current)
+    except SameRootRefused as exc:
+        raise SameRootRefused(f"{neither}: {exc}") from exc
+    if (
+        same_root_registry_body_sha256(raw) != body_expected
+        or _sha256_bytes(original) != r0_sha or len(original) != r0_bytes or round_trip != raw
+    ):
+        raise SameRootRefused(neither)
+    return counts
+
+
+def _same_root_file_facts(metadata: os.stat_result) -> dict[str, int]:
+    return {"device": metadata.st_dev, "inode": metadata.st_ino, "uid": metadata.st_uid,
+            "mode": metadata.st_mode, "nlink": metadata.st_nlink, "size": metadata.st_size}
+
+
+def _same_root_directory_facts(metadata: os.stat_result | None) -> dict[str, int] | None:
+    if metadata is None:
+        return None
+    return {"device": metadata.st_dev, "inode": metadata.st_ino, "uid": metadata.st_uid, "mode": metadata.st_mode}
+
+
+def _same_root_expected(
+    root: Path, approved: dict[str, Any], expected_r0_sha256: object, expected_r0_bytes: object,
+) -> tuple[str, int]:
+    if str(root) != approved["path"]:
+        raise SameRootRefused("observed root path differs from the approved root path")
+    return (
+        _same_root_digest(expected_r0_sha256, label="expected original registry sha256"),
+        _same_root_byte_count(expected_r0_bytes, label="expected original registry bytes"),
+    )
+
+
+@contextmanager
+def _same_root_refusal_boundary() -> Iterator[None]:
+    """Every precondition failure before a write is a refusal: nothing was written."""
+    try:
+        yield
+    except (SameRootRefused, SameRootOutcomeUnknown):
+        raise
+    except (TaskProtocolConflict, OSError) as exc:
+        raise SameRootRefused(f"same-root precondition failed: {exc}") from exc
+
+
+def observe_same_root_registry(
+    root: Path, *, approved_root: object, expected_r0_sha256: object, expected_r0_bytes: object,
+    expected_body_sha256: object = None,
+) -> dict[str, Any]:
+    """Read-only: classify the live registry against the approved original.
+
+    ``registry_state`` is ``r0`` when the live bytes are the approved original
+    and ``r1`` when they are already its re-attestation for the measured root
+    (which needs ``expected_body_sha256``). Anything else is refused.
+    """
+    approved = same_root_tuple(approved_root, label="approved")
+    r0_sha, r0_bytes = _same_root_expected(root, approved, expected_r0_sha256, expected_r0_bytes)
+    body_expected = None if expected_body_sha256 is None else _same_root_digest(
+        expected_body_sha256, label="expected registry body sha256",
+    )
+    with _same_root_refusal_boundary(), _PinnedOutputWalk(root) as walk:
+        walk.read_quiescent_inventory(allow_empty=False)
+        current = walk.live_identity()
+        _same_root_pair(approved, current)
+        raw = walk.raw
+        assert raw is not None and walk.registry_meta is not None
+        moved = (approved["device"], approved["inode"]) != (current["device"], current["inode"])
+        if _sha256_bytes(raw) == r0_sha and len(raw) == r0_bytes:
+            state = "r0"
+            record_count, watermark = _same_root_decode(raw, approved, label="original")
+            body = same_root_registry_body_sha256(raw)
+            if body_expected is not None and body != body_expected:
+                raise SameRootRefused("original registry body differs from the expected body")
+            r1 = same_root_reattested_registry(raw, approved_root=approved, current_root=current)
+        else:
+            if body_expected is None or not moved:
+                raise SameRootRefused("registry is neither the approved original nor its re-attestation")
+            record_count, watermark = _same_root_recognize_r1(
+                raw, approved, current, r0_sha=r0_sha, r0_bytes=r0_bytes, body_expected=body_expected,
+            )
+            state, body, r1 = "r1", body_expected, raw
+        walk.verify_unchanged()
+        return {
+            "schema": SAME_ROOT_OBSERVATION_SCHEMA, "root": str(root), "registry_schema": REGISTRY_SCHEMA_V4,
+            "approved_root": approved, "current_root": current, "registry_state": state,
+            "outcome": "reattest" if moved else "noop",
+            "r0_sha256": r0_sha, "r0_bytes": r0_bytes, "body_sha256": body,
+            "r1_sha256": _sha256_bytes(r1), "r1_bytes": len(r1),
+            "record_count": record_count, "submission_watermark_bucket": watermark,
+            "registry_file": _same_root_file_facts(walk.registry_meta),
+            "control_directory": _same_root_directory_facts(walk.control_meta),
+            "spool_directory": _same_root_directory_facts(walk.spool_meta),
+        }
+
+
+def _read_registry_at(control_fd: int) -> tuple[bytes, os.stat_result]:
+    descriptor = os.open(_TASK_REGISTRY_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=control_fd)
+    try:
+        raw, metadata = _read_registry_descriptor(descriptor)
+        if _metadata_identity(os.fstat(descriptor)) != _metadata_identity(metadata):
+            raise TaskProtocolConflict("task registry changed while reading")
+        return raw, metadata
     finally:
-        for descriptor in reversed(opened):
-            os.close(descriptor)
+        os.close(descriptor)
+
+
+def _same_root_visible(control_fd: int, r0: bytes, r1: bytes) -> str:
+    try:
+        raw, _ = _read_registry_at(control_fd)
+    except FileNotFoundError:
+        return "other"
+    except (OSError, TaskProtocolConflict):
+        return "unreadable"
+    return "r1" if raw == r1 else "r0" if raw == r0 else "other"
+
+
+def _remove_declared_temp(control_fd: int, temp_name: str) -> None:
+    """Remove only this operation's declared temporary, left by an earlier attempt."""
+    metadata = os.stat(temp_name, dir_fd=control_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1 or metadata.st_size > _MAX_REGISTRY_BYTES
+    ):
+        raise SameRootRefused("declared temporary registry is not this operation's owned file")
+    os.unlink(temp_name, dir_fd=control_fd)
+    os.fsync(control_fd)
+
+
+def _unlink_own_temp(control_fd: int, temp_name: str, identity: tuple[int, int] | None) -> None:
+    """Best effort: remove the temporary only while its name resolves to the inode this call created."""
+    if identity is None:
+        return
+    try:
+        named = os.stat(temp_name, dir_fd=control_fd, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) == identity:
+            os.unlink(temp_name, dir_fd=control_fd)
+            os.fsync(control_fd)
+    except OSError:
+        pass
+
+
+def _write_same_root_temp(control_fd: int, temp_name: str, payload: bytes) -> os.stat_result:
+    descriptor = os.open(
+        temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=control_fd,
+    )
+    identity: tuple[int, int] | None = None
+    closed = False
+    try:
+        metadata = os.fstat(descriptor)
+        identity = (metadata.st_dev, metadata.st_ino)
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_size != 0
+        ):
+            raise SameRootRefused("temporary registry identity is unsafe")
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            written = os.write(descriptor, view[offset:])
+            if written <= 0:
+                raise OSError("short temporary registry write")
+            offset += written
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if metadata.st_size != len(payload) or metadata.st_nlink != 1:
+            raise SameRootRefused("temporary registry changed while writing")
+        closed = True
+        os.close(descriptor)
+        return metadata
+    except BaseException:
+        if not closed:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _unlink_own_temp(control_fd, temp_name, identity)
+        raise
+
+
+def apply_same_root_registry(
+    root: Path, *, operation_id: object, approved_root: object, current_root: object,
+    expected_r0_sha256: object, expected_r0_bytes: object, expected_body_sha256: object,
+    expected_r1_sha256: object, expected_r1_bytes: object,
+) -> dict[str, Any]:
+    """The only same-root writer: publish the approved R1 over the approved R0, once.
+
+    The live root must be exactly the approved current tuple. The registry must
+    be R0 (publish) or R1 (idempotent completion: fsync and readback again);
+    anything else, including an unchanged tuple, is refused without writing. Before the replace the registry inode and bytes are
+    compared again (CAS) and the temporary must still be the file this call
+    created. After the replace, a failed fsync, readback or verification is
+    ``SameRootOutcomeUnknown`` with the visible bytes classified.
+    """
+    if not same_root_operation_id_valid(operation_id):
+        raise SameRootRefused("same-root operation id is invalid")
+    assert isinstance(operation_id, str)
+    temp_name = same_root_temp_name(operation_id)
+    approved, current = _same_root_pair(approved_root, current_root)
+    if (approved["device"], approved["inode"]) == (current["device"], current["inode"]):
+        raise SameRootRefused("an unchanged root needs no registry write")
+    r0_sha, r0_bytes = _same_root_expected(root, approved, expected_r0_sha256, expected_r0_bytes)
+    body_expected = _same_root_digest(expected_body_sha256, label="expected registry body sha256")
+    r1_sha = _same_root_digest(expected_r1_sha256, label="expected re-attested registry sha256")
+    r1_bytes = _same_root_byte_count(expected_r1_bytes, label="expected re-attested registry bytes")
+    with ExitStack() as stack:
+        with _same_root_refusal_boundary():
+            walk = stack.enter_context(_PinnedOutputWalk(root))
+            walk.read_quiescent_inventory(
+                allow_empty=False, control_allowed=frozenset({_TASK_REGISTRY_NAME, temp_name}),
+            )
+            if walk.live_identity() != current:
+                raise SameRootRefused("live root differs from the approved current root")
+            raw = walk.raw
+            assert raw is not None and walk.control_fd is not None and walk.registry_meta is not None
+            temp_present = temp_name in walk.control_entries
+            completed = _sha256_bytes(raw) == r1_sha and len(raw) == r1_bytes
+            if completed:
+                if temp_present:
+                    raise SameRootRefused("a declared temporary exists beside the re-attested registry")
+                _same_root_recognize_r1(
+                    raw, approved, current, r0_sha=r0_sha, r0_bytes=r0_bytes, body_expected=body_expected,
+                )
+                r1 = raw
+            else:
+                if _sha256_bytes(raw) != r0_sha or len(raw) != r0_bytes:
+                    raise SameRootRefused("registry is neither the approved original nor its re-attestation")
+                r1 = same_root_reattested_registry(raw, approved_root=approved, current_root=current)
+                if _sha256_bytes(r1) != r1_sha or len(r1) != r1_bytes:
+                    raise SameRootRefused("re-attested bytes differ from the approved plan")
+                if same_root_registry_body_sha256(raw) != body_expected:
+                    raise SameRootRefused("original registry body differs from the approved body")
+        if completed:
+            return _complete_same_root_apply(walk, operation_id, raw, current)
+        return _publish_same_root_apply(walk, operation_id, temp_name, raw, r1, current, temp_present)
+
+
+def _complete_same_root_apply(
+    walk: _PinnedOutputWalk, operation_id: str, raw: bytes, current: dict[str, Any],
+) -> dict[str, Any]:
+    """The live registry already holds R1: confirm durability again, never rewrite."""
+    control_fd = walk.control_fd
+    assert control_fd is not None
+    try:
+        os.fsync(control_fd)
+        after, metadata = _read_registry_at(control_fd)
+    except (OSError, TaskProtocolConflict) as exc:
+        raise SameRootOutcomeUnknown(
+            f"re-attested registry durability recheck failed: {exc}", phase="control_fsync",
+            visible=_same_root_visible(control_fd, b"", raw),
+        ) from exc
+    if after != raw:
+        raise SameRootOutcomeUnknown(
+            "re-attested registry changed during completion", phase="readback", visible="other",
+        )
+    with _same_root_refusal_boundary():
+        walk.verify_unchanged()
+    return _same_root_apply_result(
+        operation_id, "already_applied", after, metadata, None, current, stale_temp_removed=False,
+    )
+
+
+def _publish_same_root_apply(
+    walk: _PinnedOutputWalk, operation_id: str, temp_name: str, raw: bytes, r1: bytes,
+    current: dict[str, Any], temp_present: bool,
+) -> dict[str, Any]:
+    control_fd, previous = walk.control_fd, walk.registry_meta
+    assert control_fd is not None and previous is not None
+    temp_identity: tuple[int, int] | None = None
+    try:
+        if temp_present:
+            _remove_declared_temp(control_fd, temp_name)
+        temp = _write_same_root_temp(control_fd, temp_name, r1)
+        temp_identity = (temp.st_dev, temp.st_ino)
+        # Compare-and-swap immediately before the one replace: the same registry
+        # inode with the exact approved bytes, still our temporary, and every
+        # held directory still the one its path names (no detached tree).
+        visible, linked = _read_registry_at(control_fd)
+        if (linked.st_dev, linked.st_ino) != (previous.st_dev, previous.st_ino) or visible != raw:
+            raise SameRootRefused("registry changed before the replace")
+        named = os.stat(temp_name, dir_fd=control_fd, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != temp_identity:
+            raise SameRootRefused("temporary registry was replaced before the replace")
+        walk.verify_publish_paths(registry_edge=True)
+    except BaseException as exc:
+        _unlink_own_temp(control_fd, temp_name, temp_identity)
+        if isinstance(exc, SameRootRefused):
+            raise
+        raise SameRootRefused(f"same-root publish failed before the replace: {exc}") from exc
+    try:
+        os.replace(temp_name, _TASK_REGISTRY_NAME, src_dir_fd=control_fd, dst_dir_fd=control_fd)
+    except BaseException as exc:
+        raise SameRootOutcomeUnknown(
+            f"registry replace failed: {exc}", phase="replace", visible=_same_root_visible(control_fd, raw, r1),
+        ) from exc
+    try:
+        os.fsync(control_fd)
+    except BaseException as exc:
+        raise SameRootOutcomeUnknown(
+            f"control directory fsync failed after the replace: {exc}", phase="control_fsync",
+            visible=_same_root_visible(control_fd, raw, r1),
+        ) from exc
+    try:
+        after, metadata = _read_registry_at(control_fd)
+    except BaseException as exc:
+        raise SameRootOutcomeUnknown(
+            f"registry readback failed after the replace: {exc}", phase="readback", visible="unreadable",
+        ) from exc
+    if after != r1:
+        raise SameRootOutcomeUnknown(
+            "registry readback differs from the re-attested bytes", phase="readback",
+            visible="r0" if after == raw else "other",
+        )
+    if (metadata.st_dev, metadata.st_ino) != (temp.st_dev, temp.st_ino):
+        raise SameRootOutcomeUnknown("registry readback is not the published file", phase="readback", visible="r1")
+    try:
+        _same_root_decode(after, current, label="published")
+        walk.verify_publish_paths(registry_edge=False)
+    except (TaskProtocolConflict, OSError) as exc:
+        raise SameRootOutcomeUnknown(
+            f"published registry verification failed: {exc}", phase="verify", visible="r1",
+        ) from exc
+    return _same_root_apply_result(
+        operation_id, "applied", after, metadata, previous, current, stale_temp_removed=temp_present,
+    )
+
+
+def _same_root_apply_result(
+    operation_id: str, outcome: str, raw: bytes, metadata: os.stat_result,
+    previous: os.stat_result | None, current: dict[str, Any], *, stale_temp_removed: bool,
+) -> dict[str, Any]:
+    return {
+        "schema": SAME_ROOT_APPLY_SCHEMA, "operation_id": operation_id, "outcome": outcome,
+        "registry_sha256": _sha256_bytes(raw), "registry_bytes": len(raw),
+        "registry_file": _same_root_file_facts(metadata),
+        "previous_registry_file": None if previous is None else _same_root_file_facts(previous),
+        "current_root": current, "stale_temp_removed": stale_temp_removed,
+    }
 
 
 _REGISTRY_MUTATOR_NAMES = (
@@ -5273,6 +5896,17 @@ __all__ = [
     "evict_consumed_routes",
     "inspect_quiescent_output_root",
     "task_protocol_runtime_status",
+    "SAME_ROOT_APPLY_SCHEMA",
+    "SAME_ROOT_OBSERVATION_SCHEMA",
+    "SameRootOutcomeUnknown",
+    "SameRootRefused",
+    "apply_same_root_registry",
+    "observe_same_root_registry",
+    "same_root_operation_id_valid",
+    "same_root_reattested_registry",
+    "same_root_registry_body_sha256",
+    "same_root_temp_name",
+    "same_root_tuple",
 ]
 
 

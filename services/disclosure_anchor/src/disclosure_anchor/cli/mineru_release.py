@@ -4,7 +4,9 @@ Exit codes: 0 pass; 64 argument or input format; 65 identity or semantic
 inconsistency; 70 execution failure or an undeterminable outcome. Output is one
 JSON object on stdout. ``build`` and ``verify`` are offline. ``qualify``,
 ``bind`` and ``install`` touch the live runtime read-only or under the explicit
-private binding; none of them admits business work.
+private binding; none of them admits business work. ``same-root`` runs one
+phase of the zero-duty same-root registry maintenance through the same owner
+(``approve`` is offline); it never installs and never opens producers.
 """
 
 from __future__ import annotations
@@ -141,6 +143,37 @@ def cmd_install(args: argparse.Namespace) -> int:
     return EX_OK if summary["status"] == "pass" else EX_FAILURE
 
 
+def cmd_same_root(args: argparse.Namespace) -> int:
+    from disclosure_anchor.adapters.runtime.mineru_same_root_maintenance import (
+        run_same_root_phase,
+        write_same_root_approval,
+    )
+    from disclosure_anchor.adapters.runtime.mineru_release_private_binding import load_release_private_binding
+    from disclosure_anchor.application.contracts.mineru_same_root import new_same_root_operation_id
+
+    report = verify_release_package(args.package, check_active_dependencies=True)
+    if not report.passed:
+        return _fail(EX_IDENTITY, "package", "release package did not verify", **_verify_summary(report))
+    if args.action == "approve":
+        approval = write_same_root_approval(
+            report=report, package=args.package, prestop_output=args.prestop_output,
+            observe_output=args.observe_output, approved_by=args.approved_by,
+            decision_reference=args.decision_reference, output=args.output,
+        )
+        _emit({"status": "pass", **approval, "output": str(args.output)})
+        return EX_OK
+    binding = load_release_private_binding(args.private_binding)
+    resume = args.action == "prestop" and args.operation_id is not None
+    summary = run_same_root_phase(
+        report=report, package=args.package, binding=binding, output=args.output, phase=args.action,
+        operation_id=args.operation_id if args.operation_id is not None else new_same_root_operation_id(),
+        approval_path=getattr(args, "approval", None),
+        legacy_scope_inventory_path=getattr(args, "legacy_scope_inventory", None), resume=resume,
+    )
+    _emit({**summary, "output": str(args.output)})
+    return EX_OK if summary["status"] == "pass" else EX_FAILURE
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="disclosure-anchor mineru-release", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -187,6 +220,33 @@ def build_parser() -> argparse.ArgumentParser:
         default="api-compatibility",
     )
     install.set_defaults(handler=cmd_install)
+
+    same_root = commands.add_parser(
+        "same-root", help="one phase of the zero-duty same-root registry maintenance (live, except approve)",
+    )
+    actions = same_root.add_subparsers(dest="action", required=True)
+    for action in ("prestop", "observe", "apply", "restore", "close", "status"):
+        phase = actions.add_parser(action)
+        phase.add_argument("--package", type=_absolute, required=True)
+        phase.add_argument("--private-binding", type=_absolute, required=True)
+        phase.add_argument("--output", type=_absolute, required=True)
+        if action == "prestop":
+            phase.add_argument("--legacy-scope-inventory", type=_absolute, required=True,
+                               help="fresh zero-member execution_upgrade legacy-scope capture")
+            phase.add_argument("--operation-id", default=None, help="resume this interrupted prestop; omit to start one")
+        else:
+            phase.add_argument("--operation-id", required=True)
+        if action == "apply":
+            phase.add_argument("--approval", type=_absolute, required=True)
+        phase.set_defaults(handler=cmd_same_root)
+    approve = actions.add_parser("approve", help="offline: recompute the observed plan, then bind an operator approval")
+    approve.add_argument("--package", type=_absolute, required=True)
+    approve.add_argument("--prestop-output", type=_absolute, required=True)
+    approve.add_argument("--observe-output", type=_absolute, required=True)
+    approve.add_argument("--approved-by", required=True)
+    approve.add_argument("--decision-reference", required=True)
+    approve.add_argument("--output", type=_absolute, required=True)
+    approve.set_defaults(handler=cmd_same_root)
     return parser
 
 

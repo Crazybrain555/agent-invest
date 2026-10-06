@@ -121,6 +121,23 @@ class SettingsTests(unittest.TestCase):
             ):
                 load_settings()
 
+    def test_drain_existing_is_startup_only_default_off_and_staged_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            for mode in ("legacy-sync", "staged-v4"):
+                with patch.dict(os.environ, {**base, "WORKER_PARSE_EXECUTION_MODE": mode}, clear=True):
+                    self.assertFalse(load_settings().worker_drain_existing)
+            with patch.dict(os.environ, {**base, "WORKER_PARSE_EXECUTION_MODE": "staged-v4",
+                                         "WORKER_DRAIN_EXISTING": "true"}, clear=True):
+                self.assertTrue(load_settings().worker_drain_existing)
+            with (patch.dict(os.environ, {**base, "WORKER_DRAIN_EXISTING": "true"}, clear=True),
+                  self.assertRaisesRegex(ValidationError, "requires staged-v4")):
+                load_settings()
+            with (patch.dict(os.environ, {**base, "WORKER_PARSE_EXECUTION_MODE": "staged-v4",
+                                         "WORKER_DRAIN_EXISTING": "sometimes"}, clear=True),
+                  self.assertRaises(ValidationError)):
+                load_settings()
+
     def test_parallel_parse_requires_remote_http_backend_and_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = _env(Path(tmp))

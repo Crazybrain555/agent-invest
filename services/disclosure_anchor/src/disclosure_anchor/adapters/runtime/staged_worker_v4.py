@@ -186,6 +186,10 @@ def build_staged_worker_v4_runtime(
     validate_v4_admission_scope(admission_document_ids=admission_document_ids, campaign_scope=campaign_scope)
     if type(recovery_only) is not bool or (recovery_only and admission_document_ids is None):
         raise ValueError("recovery-only composition requires explicit bounded document scope")
+    if settings.worker_drain_existing is True and (
+        admission_document_ids is not None or campaign_scope is not None or recovery_only
+    ):
+        raise ValueError("drain-existing maintenance requires the unscoped resident worker")
     if (
         not callable(ownership_guard)
         or not callable(admission_guard)
@@ -414,7 +418,13 @@ def build_staged_worker_v4_runtime(
             claim_guard=claim_guard,
             publisher=publisher,
             poll_seconds=worker_profile.provider_poll_milliseconds / 1000,
-            new_work_admitter=_RecoveryOnlyAdmission() if recovery_only else new_work,
+            # Prepared heads retain their original H0/spec/key and all normal
+            # claim/credit/POST gates. Ordinary source observation, rejection
+            # and H0 creation are absent for the entire maintenance boot.
+            new_work_admitter=(
+                _RecoveryOnlyAdmission() if recovery_only
+                else persistence if settings.worker_drain_existing is True else new_work
+            ),
             publication_committed=publication_committed,
             lifecycle_facts=lifecycle_facts,
         )
@@ -424,7 +434,7 @@ def build_staged_worker_v4_runtime(
                 limits=limits,
                 progress=progress,
                 process_guard=ownership_guard,
-                admission_observer=None if recovery_only else new_work,
+                admission_observer=None if recovery_only or settings.worker_drain_existing is True else new_work,
                 stream_control=stream_control,
                 stage_observer=stage_observer,
                 stop_control=control,

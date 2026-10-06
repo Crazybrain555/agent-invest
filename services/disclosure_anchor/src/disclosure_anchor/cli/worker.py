@@ -890,7 +890,7 @@ def _run_loop(
             raise
         if should_stop():
             return 0
-        if maintenance_progress is not None:
+        if maintenance_progress is not None and settings.worker_drain_existing is not True:
             maintenance_progress[0] = time.monotonic()
             _wedge_watchdog(
                 plane="maintenance",
@@ -898,11 +898,12 @@ def _run_loop(
                 threshold_seconds=settings.worker_wedge_timeout_seconds,
                 stop=stop,
             )
-        maintenance_thread = threading.Thread(
-            target=maintenance_target,
-            name="worker-maintenance",
-        )
-        maintenance_thread.start()
+        if settings.worker_drain_existing is not True:
+            maintenance_thread = threading.Thread(
+                target=maintenance_target,
+                name="worker-maintenance",
+            )
+            maintenance_thread.start()
         if staged_mode:
             _run_staged_v4_resident(
                 settings,
@@ -933,7 +934,8 @@ def _run_loop(
                 outage_backoff_initial_seconds=PARSE_COOLDOWN_BASE_SECONDS,
                 outage_backoff_max_seconds=settings.worker_loop_max_interval_seconds,
             )
-        maintenance_thread.join()
+        if maintenance_thread is not None:
+            maintenance_thread.join()
         maintenance_thread = None
         if not fatal_errors.empty():
             raise fatal_errors.get()
@@ -1025,6 +1027,8 @@ def _run_staged_v4_resident(
             "stream_reason": snapshot.stream_reason,
             "stream_evidence_sha256": snapshot.stream_evidence_sha256,
         }
+        if settings.worker_drain_existing is True:
+            payload.update(maintenance_mode="drain_existing", ordinary_admission_enabled=False)
         if progress_output == "jsonl":
             import json
 
@@ -1038,7 +1042,9 @@ def _run_staged_v4_resident(
                 f"recovery={'done' if snapshot.recovery_complete else 'scan'} "
                 f"admission={'open' if snapshot.admission_open else 'closed'} "
                 f"active={active} queued={queued} completed={snapshot.completed} "
-                f"blocked={snapshot.blocked_reason or '-'}",
+                f"blocked={snapshot.blocked_reason or '-'}"
+                + (" maintenance=drain_existing ordinary_admission=disabled"
+                   if settings.worker_drain_existing is True else ""),
                 flush=True,
             )
 
@@ -1078,6 +1084,12 @@ def _run_staged_v4_resident(
                         scope=execution_scope,
                     )
                     print(audit, flush=True)
+                if settings.worker_drain_existing is True:
+                    print(
+                        "[staged-v4] maintenance=drain_existing ordinary_admission=disabled "
+                        "acquisition=disabled prepared_submission=enabled; resident waits for operator stop",
+                        flush=True,
+                    )
             except BaseException as exc:
                 _trip_worker_fault(control, exc, kind="startup_fatal", origin="startup_recovery",
                                    reason_code="staged_startup_verification_failed")
@@ -2223,6 +2235,9 @@ def _print_worker_status(settings: Settings, *, output_format: str) -> int:
     unchanged; the exit code is 3 while a stop is recorded.
     """
 
+    if settings.worker_drain_existing is True:
+        print("[worker-config] configured_maintenance_mode=drain_existing "
+              "(configuration only; verify resident boot log)", file=sys.stderr, flush=True)
     stopped = False
     try:
         require_worker_start_permitted(settings)

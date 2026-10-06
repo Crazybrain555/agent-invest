@@ -1063,6 +1063,10 @@
    "private_imports": [],
    "tests": 0
   },
+  "tests/unit/test_mineru_same_root_owner.py": {
+   "private_imports": [],
+   "tests": 5
+  },
   "tests/unit/test_mineru_service_io_execution.py": {
    "private_imports": [],
    "tests": 1
@@ -1410,6 +1414,10 @@
    "private_imports": [],
    "tests": 4
   },
+  "tests/unit/test_same_root_maintenance_independent.py": {
+   "private_imports": [],
+   "tests": 37
+  },
   "tests/unit/test_scheduler_retention_review.py": {
    "private_imports": [],
    "tests": 1
@@ -1467,7 +1475,7 @@
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/unit/test_source_semantic_build.py": {
    "private_imports": [],
@@ -1596,8 +1604,10 @@
    "tests": 5
   },
   "tests/unit/test_staged_worker_v4_runtime.py": {
-   "private_imports": [],
-   "tests": 2
+   "private_imports": [
+    "_require_execution_composition"
+   ],
+   "tests": 5
   },
   "tests/unit/test_storage_hold_cli.py": {
    "private_imports": [],
@@ -1695,9 +1705,13 @@
    "private_imports": [],
    "tests": 9
   },
+  "tests/unit/test_windows_same_root_owner_independent.py": {
+   "private_imports": [],
+   "tests": 24
+  },
   "tests/unit/test_worker_cli.py": {
    "private_imports": [],
-   "tests": 41
+   "tests": 44
   },
   "tests/unit/test_worker_progress.py": {
    "private_imports": [],

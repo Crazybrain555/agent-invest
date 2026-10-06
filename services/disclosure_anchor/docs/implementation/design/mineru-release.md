@@ -15,7 +15,8 @@
 - **不可变装配对象只有三个**（R20 跨阶段定义）：`m6.release.v1`（本包，WP1）、campaign intent（WP2）与
   既有 `M6RunSpec`。`mineru.deployment-profile.v1` 与 `mineru.local-worker-profile.v1` 是本包的**配置输入**，
   不是新的装配对象或账本；它们只提供确定值，包只引用其哈希，不复制维护第二套容量数值。
-- **一个入口**：`python -m disclosure_anchor.cli.mineru_release build|verify|qualify|bind|install`。
+- **一个入口**：`python -m disclosure_anchor.cli.mineru_release build|verify|qualify|bind|install`；同根注册表
+  重确认（§4a）是同一入口与同一 Windows owner 的 `same-root <phase>`，不是第二套部署工具。
 
 生产 worker 不依赖本入口；正式 M6 测量按 WP2 的 campaign 入口复用本包的 native 产物。
 
@@ -56,7 +57,8 @@ inputs/{capacity-config.json, deployment-profile.json, local-worker-profile.json
 compose/mineru-windows.compose.yaml
 api-context/{Dockerfile, patch_mineru_344.py, agent_task_protocol_v2.py, agent_capacity_*.py, capacity-config.json}
 windows/{install_mineru_fixed_api.ps1, collect_mineru_runtime.ps1, run_mineru_installation.ps1,
-         build_mineru_telemetry_assembly.ps1, load_mineru_telemetry_assembly.ps1, 三份 supervisor 源}
+         build_mineru_telemetry_assembly.ps1, load_mineru_telemetry_assembly.ps1, 三份 supervisor 源,
+         run_mineru_same_root_maintenance.ps1, mineru_same_root_identity.cs, mineru_same_root_registry_helper.py}
 native-m6/{12 份生产 .cs, build_mineru_m6_owner.ps1, run_mineru_m6_owner_host.ps1}
 ```
 
@@ -90,6 +92,56 @@ native-m6/{12 份生产 .cs, build_mineru_m6_owner.ps1, run_mineru_m6_owner_host
 `install_mineru_fixed_api.ps1` 只改资源管理：`-OperationBudgetSeconds` 一个单调预算、逐命令剩余期限、
 双管道持续排空与字节上限（`docker build` 用 head/tail 保留并计 dropped）、`-OperationRecordDirectory`
 下 write-new 的开始/阶段/首错/结果记录。部署判定、守卫、rollback witness 与 receipt 不变。
+
+## 4a. 同根注册表重确认（零职责维护）
+
+Docker Desktop 存储维护（例如官方 VHD 迁移）后，同一 Windows NTFS 输出根在 Linux 侧可能得到新的
+`device`/`inode`；普通 reader 对此保持严格拒绝。本操作只在全部旧责任已终态（业务 legacy-scope 零成员、
+原生 health 零职责、API 自身的严格 quiescence proof）时，把 v4 registry 的 `output_root.device/inode` 由批准的
+旧元组 I0 改写为实测新元组 I1：R0 以 I0、R1 以 I1 严格解码；路径、uid、mode、全部记录（含过期 tombstone、
+顺序、可选字段）与 watermark 字节不变。物理连续性由 Windows 证明：同主机、同卷、根/控制/spool 的 FileId128 与
+ACL 不变、所有祖先无重解析点；内容相同的副本不是连续性。
+
+- **入口**：`mineru_release same-root prestop|observe|approve|apply|restore|close|status`（`approve` 离线）。
+  每个阶段复用 install 的 Mac 锁、worker/GC 未加载证明、全新目录暂存、有界 SSH 与只据取回记录判定；写权限
+  始终关闭，从不安装、不放行生产者。binding `m6.installation-binding.v3`（闭合；`phase`、`operation_id`
+  `sr-<32 hex>`；`approval_sha256` 仅 apply，`legacy_scope_inventory_sha256` 仅 prestop）。
+- **所有权分割**：`run_mineru_installation.ps1` 仍只读并判定（闭合空闲 health、API 已安装模块的
+  `inspect_quiescent_output_root`、`docker inspect`）；全部变更在 Job 子进程 `run_mineru_same_root_maintenance.ps1`：
+  持久状态、三容器 restart 策略与启停、一次性 helper。v1/v2 binding 与 `install_mineru_fixed_api.ps1` 在
+  `pending.json` 存在时拒绝；没有放行开关。
+- **持久状态**：install receipt 同目录的 `same-root-maintenance\`（输出树与 Docker VHD 之外）：`pending.json` 与
+  `<operation_id>\` 内的 create-new 记录（API proof、冻结容器、R0 字节、身份、plan、helper 意图/结果、apply、
+  restore、close）。只做这一次字节维护的状态，不是业务账本；不删除以重试，只有 close 把 `pending.json` 移入操作目录。
+- **阶段**：prestop（无 pending 时须实时闭合空闲 + API proof；冻结三容器 ID/镜像/restart 策略，先全部
+  `restart=no` 再按 proxy→API→inference 停止，停止前后 R0 与 FileId 不变，同一 VM 内 helper 基线观察须为
+  noop/r0 且看到 API 的元组）→ 人工 Docker 存储维护 → observe（plan）→ approve（Mac 用包内
+  `api-context/agent_task_protocol_v2.py` 从取回字节重算 R1，审批绑定 plan 摘要）→ apply → restore（启动
+  inference、API；API 自身严格 reader 须证明 I1 与 R1）→ close（先写 close 意图，再启动 proxy、恢复冻结
+  restart 策略、归档 pending）。再次挂载时以本操作最新 registry（最新 apply）为原件重新 observe，不回写维护前的 R0。
+- **中断与续做**：成对记录只在已写的首件与本次结果逐字节一致（R0 副本）或是同一物理对象（apply 后 registry 的
+  FileId、字节、ACL 与根链）时补齐，否则保持失败；plan 号与 helper 序号永不复用，缺提交记录的半组（registry
+  副本/身份记录，或没有意图记录的 helper 目录）留作证据并取下一个号。已提交的 apply 在应答丢失后重跑只确认同一
+  对象（`already_recorded`），不写。close 在第一次变更（启动 proxy、恢复策略）之前写确定性的
+  `close-intent.json`（operation、restore 记录名与摘要、三容器 name/ID/冻结策略），续做时须逐字节重建；此后只有
+  close 能继续（prestop 续做、observe、apply、restore 均拒绝），非 `no` 的策略只有在该记录列出的容器上、等于其
+  记录值时才算本操作已恢复，其余都是外来漂移。prestop 在写 `pending.json` 之前中断只留下无 marker 的目录：
+  未冻结、未变更任何对象，新开 operation。
+- **版本绑定**：operation 属于开启它的已验证包。`pending.json` 记录 prestop 的 release manifest；之后每个阶段
+  （wrapper 早期门、子进程入口）都要求同一 manifest，否则在任何 Docker 调用前拒绝，只有 status 可用别的包查看。
+  Mac 核验 plan 时，prestop/observe 阶段结果、Windows `prestop.json` 与 plan 也必须都是核验所用的包。没有迁移
+  或换包开关。
+- **helper**：pinned API 镜像 + `/usr/bin/python3.12 -I -B`、`--network none --read-only --cap-drop ALL
+  --restart no`；输出根用 API 冻结的同一 bind 源/目标（observe 只读，apply 可写），加只读的 helper 目录。
+  prestop 基线观察须看到 API 自身的元组，apply 须测得 plan 的当前元组，否则拒绝；确定名
+  `mineru-same-root-<op>-<action>-<seq>` 与标签；create 前写意图；create/start 应答丢失只按同名对象读回；
+  `docker wait` 超时保持 unknown/pending；结果落盘后才 `docker rm`。写入：确定 temp 名、`O_EXCL|O_NOFOLLOW`、
+  0600、fsync、replace 前 CAS（同 inode、R0 字节、路径链仍指向被持有目录），replace 后控制目录 fsync、重开读回；
+  失败按 R0/R1/other 三态分类，unknown 永不当成功。
+- **数值身份**：PowerShell 只比较与回传解析后的元组；任何精度/类型偏差只能让 helper 拒绝（R0 须在批准元组下
+  解码、实时元组须等于批准的 I1），且 Mac 的 plan 解码要求每个字段逐字复述 helper 原始行。
+- **未在此证明**：Docker Desktop bind 上 Linux fsync/rename 是否映射为 NTFS 断电持久；Windows Job/daemon、
+  FileId/ACL 采集与 PowerShell/C# 实际执行。部署前须在真实后端以 stand-in 证明，不能由 Linux rename 推断。
 
 ## 5. 退出码与失败可见性
 

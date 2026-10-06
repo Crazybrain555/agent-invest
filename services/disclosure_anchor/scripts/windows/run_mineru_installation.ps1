@@ -13,6 +13,10 @@ Windows CLI processes: a build or recreate request the Docker daemon already acc
 by a timeout, so a forced or missing exit leaves the outcome "unknown" with write permission closed and
 never triggers an automatic rollback. Success requires the installer's own result record, the persisted
 install receipt, the compose target hash, the running API image and an idle health readback to agree.
+A binding v3 selects one phase of the same-root registry maintenance instead: the Job child is
+run_mineru_same_root_maintenance.ps1, which owns every maintenance mutation; this owner still only reads
+(closed idle health, the API's own quiescence proof, docker inspect) and judges. While that maintenance
+is pending (pending.json beside the install receipt), every v1/v2 installation is refused.
 Exit codes: 0 verified; 64 input; 65 identity; 70 failed or unknown.
 #>
 param(
@@ -21,7 +25,8 @@ param(
     [Parameter(Mandatory=$true)][string]$OperationDirectory,
     [Parameter(Mandatory=$true)][Alias('PrivateBinding')][string]$InstallationBinding,
     [string]$ComposeTarget='C:\ProgramData\compose.tailnet.yaml',
-    [string]$ReceiptTarget='C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json'
+    [string]$ReceiptTarget='C:\ProgramData\agent-invest\mineru-runtime-v6\install-receipt.json',
+    [string]$OutputRoot='C:\ProgramData\agent-invest\mineru-api-output'
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2
@@ -33,6 +38,7 @@ $firstError=$null; $status='failed'; $daemonSide='unknown'; $writePermission='cl
 $manifestSha=$null; $composeSha=$null; $capacitySha=$null; $accounting=$null; $installerResult=$null; $loaded=$null; $installerExit=$null; $recordsDir=$null
 $installationVerified=$false; $idleProofBefore=$null; $operationKind="api-compatibility"
 $existingReceiptSha=$null; $epochsBefore=$null; $epochsAfter=$null
+$sameRootPhase=$null; $sameRootOperation=$null; $sameRootResult=$null; $sameRootProofPath=$null; $sameRootProofSha=$null; $sameRootApprovalPath=$null
 function Fail([int]$Code,[string]$Message) { $script:ExitCode=$Code; throw $Message }
 function Get-Sha256File([string]$Path) { return 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
 function Get-Sha256Bytes([byte[]]$Bytes) { $a=[Security.Cryptography.SHA256]::Create(); try { return 'sha256:' + ([BitConverter]::ToString($a.ComputeHash($Bytes))).Replace('-','').ToLowerInvariant() } finally { $a.Dispose() } }
@@ -221,6 +227,32 @@ function Read-IdleCapacityHealth([string]$Docker,[string]$ExpectedCapacitySha256
     return $h
 }
 
+# The API's own strict reader of its output root, exactly as the collector runs it: the installed module, no
+# candidate source, no registry construction. One closed line; the maintenance child binds its values.
+function Read-ApiQuiescenceProof([string]$Docker,[string]$Label) {
+    $probe=Invoke-BoundedReadback $Docker @('exec','mineru-api','/usr/bin/python3.12','-I','-c',"import json; from pathlib import Path; from mineru.cli.agent_task_protocol_v2 import inspect_quiescent_output_root; print(json.dumps(inspect_quiescent_output_root(Path('/var/lib/mineru-api-output')), sort_keys=True))")
+    if ($probe.ExitCode -ne 0) { throw ($Label + ': API quiescence proof failed: ' + $probe.StandardError.Trim()) }
+    $line=$probe.StandardOutput.Trim()
+    if ($line.Length -eq 0 -or $line.Contains("`n")) { throw ($Label + ': API quiescence proof is not one line') }
+    $state=$line | ConvertFrom-Json
+    Assert-Closed $state @('file_count','quiescence','total_bytes') ($Label + ': quiescence state')
+    Assert-Closed $state.quiescence @('record_count','registry_sha256','root_identity','schema','submission_watermark_bucket') ($Label + ': quiescence proof')
+    Assert-Closed $state.quiescence.root_identity @('device','inode','mode','path','uid') ($Label + ': root identity')
+    if ([string]$state.quiescence.schema -cne 'mineru-output-quiescence.v1' -or [string]$state.quiescence.root_identity.path -cne '/var/lib/mineru-api-output' -or
+        [long]$state.file_count -ne 1 -or [long]$state.total_bytes -lt 1 -or [string]$state.quiescence.registry_sha256 -cnotmatch '^sha256:[0-9a-f]{64}$') {
+        throw ($Label + ': API quiescence proof is not one quiescent registry')
+    }
+    return [pscustomobject]@{ Line=$line; State=$state }
+}
+function Assert-SameRootProof($State,$Expected,[string]$Label) {
+    foreach ($name in @('path','device','inode','uid','mode')) {
+        if ([string]$State.quiescence.root_identity.$name -cne [string]$Expected.root_identity.$name) { throw ($Label + ': API root ' + $name + ' differs from the plan') }
+    }
+    if ([string]$State.quiescence.registry_sha256 -cne [string]$Expected.registry_sha256 -or [string]$State.total_bytes -cne [string]$Expected.registry_bytes -or
+        [string]$State.quiescence.record_count -cne [string]$Expected.record_count -or
+        [string]$State.quiescence.submission_watermark_bucket -cne [string]$Expected.submission_watermark_bucket) { throw ($Label + ': API registry differs from the plan') }
+}
+
 try {
     if ($PSVersionTable.PSVersion.Major -ne 5) { Fail 64 'Windows PowerShell 5.1 is required' }
     if (-not [Environment]::Is64BitProcess) { Fail 64 '64-bit PowerShell is required' }
@@ -243,6 +275,20 @@ try {
         Assert-Closed $binding @('contract_version','operation_kind','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256') 'installation binding'
         if ($binding.operation_kind -isnot [string] -or $binding.operation_kind -cne 'inference-recreate') { Fail 64 'installation operation kind is unsupported' }
         $operationKind='inference-recreate'
+    } elseif ($binding.contract_version -ceq 'm6.installation-binding.v3') {
+        Assert-Closed $binding @('contract_version','operation_kind','phase','operation_id','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256','approval_sha256','legacy_scope_inventory_sha256') 'installation binding'
+        if ($binding.operation_kind -isnot [string] -or $binding.operation_kind -cne 'same-root-reattestation') { Fail 64 'installation operation kind is unsupported' }
+        if ($binding.phase -isnot [string] -or $binding.phase -cnotin @('prestop','observe','apply','restore','close','status')) { Fail 64 'same-root phase is unsupported' }
+        if ($binding.operation_id -isnot [string] -or $binding.operation_id -cnotmatch '^sr-[0-9a-f]{32}$') { Fail 64 'same-root operation id is invalid' }
+        # Same-root maintenance only re-attests a known explicit-capacity deployment; it never installs one.
+        foreach ($name in @('expected_active_compose_sha256','expected_previous_capacity_sha256')) {
+            if ($null -eq $binding.$name) { Fail 64 ('same-root maintenance requires ' + $name) }
+        }
+        if (($binding.phase -ceq 'apply') -ne ($null -ne $binding.approval_sha256) -or
+            ($null -ne $binding.approval_sha256 -and [string]$binding.approval_sha256 -cnotmatch '^sha256:[0-9a-f]{64}$')) { Fail 64 'same-root approval identity is required for apply only' }
+        if (($binding.phase -ceq 'prestop') -ne ($null -ne $binding.legacy_scope_inventory_sha256) -or
+            ($null -ne $binding.legacy_scope_inventory_sha256 -and [string]$binding.legacy_scope_inventory_sha256 -cnotmatch '^sha256:[0-9a-f]{64}$')) { Fail 64 'same-root legacy-scope inventory identity is required for prestop only' }
+        $operationKind='same-root-reattestation'; $sameRootPhase=[string]$binding.phase; $sameRootOperation=[string]$binding.operation_id
     } else { Fail 64 'installation binding contract is unsupported' }
     if ([Environment]::MachineName -cne [string]$binding.expected_hostname) { Fail 65 'native host differs from the installation binding' }
     if ([string]$binding.api_device_profile -cnotin @('cpu','cuda0')) { Fail 64 'installation binding device profile is invalid' }
@@ -280,6 +326,12 @@ try {
         'compose/mineru-windows.compose.yaml','api-context/Dockerfile','api-context/patch_mineru_344.py','api-context/capacity-config.json')) {
         if (-not $verified.Contains($required)) { Fail 65 ('release package lacks ' + $required) }
     }
+    if ($operationKind -ceq 'same-root-reattestation') {
+        foreach ($required in @('windows/run_mineru_same_root_maintenance.ps1','windows/mineru_same_root_identity.cs',
+            'windows/mineru_same_root_registry_helper.py','api-context/agent_task_protocol_v2.py')) {
+            if (-not $verified.Contains($required)) { Fail 65 ('release package lacks ' + $required) }
+        }
+    }
     if ($verified['windows/install_mineru_fixed_api.ps1'] -cne [string]$manifest.installation.installer_sha256 -or
         $verified['windows/collect_mineru_runtime.ps1'] -cne [string]$manifest.installation.collector_sha256 -or
         $verified['compose/mineru-windows.compose.yaml'] -cne [string]$manifest.projection.compose_sha256 -or
@@ -303,12 +355,61 @@ try {
     # Fresh preconditions under the lock, immediately before any mutation: active compose identity,
     # previous explicit capacity identity and a closed idle proof from the running API.
     $docker=(Get-Command docker.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Source)
+    # A pending same-root maintenance owns the output root and the three business containers until its own
+    # verified close; there is no switch that lets an installation through.
+    $sameRootState=Join-Path (Split-Path -Parent $ReceiptTarget) 'same-root-maintenance'
+    $sameRootPending=Join-Path $sameRootState 'pending.json'
+    if ($operationKind -cne 'same-root-reattestation' -and (Test-Path -LiteralPath $sameRootPending)) {
+        Fail 65 ('a same-root registry maintenance is pending: ' + $sameRootPending)
+    }
     if ($null -ne $binding.expected_active_compose_sha256) {
         if (-not (Test-Path -LiteralPath $ComposeTarget -PathType Leaf)) { Fail 65 'expected active compose is absent' }
         $active=Get-Sha256File $ComposeTarget
         if ($active -cne [string]$binding.expected_active_compose_sha256) { Fail 65 ('active compose differs from the installation binding: ' + $active) }
     }
-    if ($null -ne $binding.expected_previous_capacity_sha256) {
+    if ($operationKind -ceq 'same-root-reattestation') {
+        # Unpinned read: the close child moves this marker, so no handle may stay open on it.
+        $pendingOperation=$null; $pendingRelease=$null
+        if (Test-Path -LiteralPath $sameRootPending -PathType Leaf) {
+            $pendingBytes=[IO.File]::ReadAllBytes($sameRootPending)
+            if ($pendingBytes.Length -lt 1 -or $pendingBytes.Length -gt 65536) { Fail 65 'same-root pending marker is outside its byte bound' }
+            $pendingValue=ConvertFrom-StrictJson $pendingBytes
+            $pendingOperation=[string]$pendingValue.operation_id; $pendingRelease=[string]$pendingValue.release_manifest_sha256
+        }
+        if ($null -ne $pendingOperation -and $pendingOperation -cne $sameRootOperation) { Fail 65 ('another same-root operation is pending: ' + $pendingOperation) }
+        # The pending operation belongs to the release that started it; only status may look at it from another.
+        if ($null -ne $pendingOperation -and $sameRootPhase -cne 'status' -and $pendingRelease -cne $manifestSha) {
+            Fail 65 ('same-root operation ' + $pendingOperation + ' was started by release ' + $pendingRelease + '; only that release continues it')
+        }
+        if ($null -eq $pendingOperation -and $sameRootPhase -cnotin @('prestop','close','status')) { Fail 65 'no same-root operation is pending' }
+        if (-not (Test-Path -LiteralPath $ReceiptTarget -PathType Leaf)) { Fail 65 'existing install receipt is absent' }
+        $sameRootReceipt=ConvertFrom-StrictJson (Read-BoundedFile $ReceiptTarget 4194304)
+        if ([string]$sameRootReceipt.schema -cne 'mineru-windows-install-receipt.v2' -or -not [bool]$sameRootReceipt.success -or
+            [string]$sameRootReceipt.compose_sha256 -cne [string]$binding.expected_active_compose_sha256 -or
+            [string]$sameRootReceipt.api_compatibility_image.image_id -cnotmatch '^sha256:[a-f0-9]{64}$') { Fail 65 'existing install receipt does not bind the active deployment' }
+        $sameRootApiImage=[string]$sameRootReceipt.api_compatibility_image.image_id
+        $previousCapacity=[string]$binding.expected_previous_capacity_sha256
+        # Only a live, closed idle API with its own strict quiescence proof may start a maintenance (prestop
+        # without a pending marker) or end one (close); the stopped phases in between need no live API.
+        $sameRootLiveGate=($sameRootPhase -ceq 'prestop' -and $null -eq $pendingOperation) -or ($sameRootPhase -ceq 'close' -and $null -ne $pendingOperation)
+        if ($sameRootLiveGate) {
+            $apiImageNow=Invoke-BoundedReadback $docker @('inspect','--format','{{.Image}}','mineru-api')
+            if ($apiImageNow.ExitCode -ne 0 -or $apiImageNow.StandardOutput.Trim() -cne $sameRootApiImage) { Fail 65 'running API image differs from the install receipt' }
+            $null=Read-IdleCapacityHealth $docker $previousCapacity ('same-root ' + $sameRootPhase + ' before proof')
+            $sameRootProof=Read-ApiQuiescenceProof $docker ('same-root ' + $sameRootPhase)
+            $null=Read-IdleCapacityHealth $docker $previousCapacity ('same-root ' + $sameRootPhase + ' after proof')
+            Write-NewRecord 'api-proof.json' ([ordered]@{contract_version='m6.same-root-api-proof.v1';operation_id=$sameRootOperation;phase=$sameRootPhase
+                capacity_config_sha256=$previousCapacity;api_image_id=$sameRootApiImage;idle_health='explicit_capacity_closed'
+                proof_line=$sameRootProof.Line;captured_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Compress -Depth 4)
+            $sameRootProofPath=Join-Path $OperationDirectory 'api-proof.json'; $sameRootProofSha=Get-Sha256File $sameRootProofPath
+            $idleProofBefore='explicit_capacity_closed'
+        }
+        if ($sameRootPhase -ceq 'apply') {
+            $sameRootApprovalPath=Join-Path (Split-Path -Parent $InstallationBinding) 'same-root-approval.json'
+            if (-not (Test-Path -LiteralPath $sameRootApprovalPath -PathType Leaf) -or
+                (Get-Sha256File $sameRootApprovalPath) -cne [string]$binding.approval_sha256) { Fail 65 'staged same-root approval differs from the installation binding' }
+        }
+    } elseif ($null -ne $binding.expected_previous_capacity_sha256) {
         $null=Read-IdleCapacityHealth $docker ([string]$binding.expected_previous_capacity_sha256) 'pre-mutation'
         $idleProofBefore='explicit_capacity_closed'
     } else {
@@ -387,9 +488,31 @@ try {
         [string]$binding.expected_previous_capacity_sha256 -ceq $capacitySha)) {
         $installerParameters['ApiDeviceProfile']=[string]$binding.api_device_profile
     }
+    $childScript=$installer; $childParameters=$installerParameters
+    if ($operationKind -ceq 'same-root-reattestation') {
+        $recordsDir=Join-Path $OperationDirectory 'same-root'
+        $consolePath=Join-Path $OperationDirectory 'same-root-console.txt'
+        $childScript=Join-Path $windows 'run_mineru_same_root_maintenance.ps1'
+        $childParameters=[ordered]@{
+            Phase=$sameRootPhase
+            OperationId=$sameRootOperation
+            StateRoot=$sameRootState
+            OutputRoot=[IO.Path]::GetFullPath($OutputRoot)
+            ReleaseRoot=$ReleaseRoot
+            RecordDirectory=$recordsDir
+            ReleaseManifestSha256=$manifestSha
+            ApiImageId=$sameRootApiImage
+            HelperSourceSha256=$verified['windows/mineru_same_root_registry_helper.py']
+            ProtocolSourceSha256=$verified['api-context/agent_task_protocol_v2.py']
+            IdentitySourceSha256=$verified['windows/mineru_same_root_identity.cs']
+            OperationBudgetSeconds=[string]$budgetSeconds
+        }
+        if ($null -ne $sameRootProofPath) { $childParameters['ProofPath']=$sameRootProofPath; $childParameters['ProofSha256']=$sameRootProofSha }
+        if ($null -ne $sameRootApprovalPath) { $childParameters['ApprovalPath']=$sameRootApprovalPath; $childParameters['ApprovalSha256']=[string]$binding.approval_sha256 }
+    }
     $installerArguments=@()
     $tokens=@()
-    foreach ($entry in $installerParameters.GetEnumerator()) {
+    foreach ($entry in $childParameters.GetEnumerator()) {
         if ($entry.Key -cnotmatch '^[A-Za-z][A-Za-z0-9]*$') { Fail 64 ('installer parameter name is invalid: ' + $entry.Key) }
         if ($null -eq $entry.Value) { $tokens+=('-' + $entry.Key); $installerArguments+=('-' + $entry.Key); continue }
         $value=[string]$entry.Value
@@ -397,14 +520,19 @@ try {
         $tokens+=('-' + $entry.Key + " '" + ($value -replace "'","''") + "'")
         $installerArguments+=('-' + $entry.Key); $installerArguments+=$value
     }
-    $childCommand="& '" + ($installer -replace "'","''") + "' " + ($tokens -join ' ') + " *>> '" + ($consolePath -replace "'","''") + "'; exit `$LASTEXITCODE"
+    $childCommand="& '" + ($childScript -replace "'","''") + "' " + ($tokens -join ' ') + " *>> '" + ($consolePath -replace "'","''") + "'; exit `$LASTEXITCODE"
     $powershell=Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
     $childArguments=[string[]]@('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',$childCommand)
-    Write-NewRecord 'operation-start.json' ([ordered]@{contract_version='m6.installation-operation-start.v1';hostname=[Environment]::MachineName;pid=$PID
+    $startRecord=[ordered]@{contract_version='m6.installation-operation-start.v1';hostname=[Environment]::MachineName;pid=$PID
         release_root=$ReleaseRoot;release_manifest_sha256=$manifestSha;capacity_config_sha256=$capacitySha;compose_sha256=$composeSha
         installation_binding_sha256=(Get-Sha256File $InstallationBinding);mac_exclusivity_receipt_sha256=$binding.mac_exclusivity_receipt_sha256
         supervisor_manifest_sha256=$prepared.manifest_sha256;job_lifetime_milliseconds=$lifetime;job_cleanup_milliseconds=$cleanup
-        installer_arguments=$installerArguments;started_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Compress -Depth 6)
+        installer_arguments=$installerArguments;started_utc=[DateTime]::UtcNow.ToString('o')}
+    if ($operationKind -ceq 'same-root-reattestation') {
+        $startRecord['contract_version']='m6.same-root-operation-start.v1'; $startRecord['operation_kind']=$operationKind
+        $startRecord['maintenance_phase']=$sameRootPhase; $startRecord['operation_id']=$sameRootOperation; $startRecord['api_proof_sha256']=$sameRootProofSha
+    }
+    Write-NewRecord 'operation-start.json' ($startRecord | ConvertTo-Json -Compress -Depth 6)
     $phase='job_running'
     $accountingJson=[MineruTelemetryJobSupervisor]::Run($powershell,$childArguments,[int]$lifetime,[int]$cleanup,$supervisorSourceSha)
     Write-NewRecord 'job-accounting.json' $accountingJson
@@ -418,49 +546,86 @@ try {
     }
     if ([int]$accounting.job_active_processes -ne 0) { $status='unknown'; Fail 70 'installer Job reports live members after exit' }
 
-    # ---- judge from records and real readback, never from the child's exit alone ----------------------
-    $resultPath=Join-Path $recordsDir 'installer-result.json'
-    if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
-        $status=$(if ($installerExit -eq 0) { 'unknown' } else { 'failed' })
-        Fail 70 ('installer left no result record (child exit ' + $installerExit + ')')
-    }
-    $installerResult=ConvertFrom-StrictJson (Read-BoundedFile $resultPath 4194304)
-    if ($operationKind -ceq 'inference-recreate' -and [string]$installerResult.status -ceq 'pass' -and [string]$installerResult.operation_kind -cne $operationKind) {
-        $status='unknown'; Fail 70 'installer result operation kind differs from the binding'
-    }
-    if ([string]$installerResult.status -cne 'pass') {
-        $status=$(if ([string]$installerResult.status -ceq 'unknown') { 'unknown' } else { 'failed' })
-        Fail 70 ('installer reported ' + [string]$installerResult.status + ': ' + [string]$installerResult.first_error)
-    }
-    if ($installerExit -ne 0) { $status='unknown'; Fail 70 ('installer result is pass but child exit is ' + $installerExit) }
-    if (-not (Test-Path -LiteralPath $ReceiptTarget -PathType Leaf)) { $status='unknown'; Fail 70 'install receipt target is absent after a pass result' }
-    if ($operationKind -ceq 'inference-recreate') {
-        if ((Get-Sha256File $ReceiptTarget) -cne $existingReceiptSha -or
-            [string]$installerResult.receipt_sha256 -cne $existingReceiptSha) {
-            $status='unknown'; Fail 70 'inference recreation changed the existing install receipt'
+    if ($operationKind -ceq 'same-root-reattestation') {
+        # ---- judge the maintenance phase from the child's own record and real readback --------------------
+        $resultPath=Join-Path $recordsDir 'same-root-result.json'
+        if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { $status='unknown'; Fail 70 ('same-root child left no result record (child exit ' + $installerExit + ')') }
+        $sameRootResult=ConvertFrom-StrictJson (Read-BoundedFile $resultPath 4194304)
+        if ([string]$sameRootResult.contract_version -cne 'm6.same-root-child-result.v1' -or [string]$sameRootResult.phase -cne $sameRootPhase -or
+            [string]$sameRootResult.operation_id -cne $sameRootOperation) { $status='unknown'; Fail 70 'same-root child result does not bind this operation phase' }
+        if ([string]$sameRootResult.status -cne 'pass') {
+            $status=$(if ([string]$sameRootResult.status -ceq 'failed') { 'failed' } else { 'unknown' })
+            Fail 70 ('same-root ' + $sameRootPhase + ' reported ' + [string]$sameRootResult.status + ': ' + [string]$sameRootResult.first_error)
         }
-        $epochsAfter=Read-MineruEpochs $docker
-        try { Assert-InferenceEpochs $epochsBefore $epochsAfter }
-        catch { $status='unknown'; Fail 70 $_.Exception.Message }
+        if ($installerExit -ne 0) { $status='unknown'; Fail 70 ('same-root child result is pass but child exit is ' + $installerExit) }
+        if ($sameRootPhase -ceq 'restore') {
+            # The API's own strict reader must now prove the planned tuple and the expected registry bytes.
+            try {
+                $null=Read-IdleCapacityHealth $docker $previousCapacity 'same-root restore before proof'
+                $restored=Read-ApiQuiescenceProof $docker 'same-root restore'
+                Assert-SameRootProof $restored.State $sameRootResult.facts.expected 'same-root restore'
+                $null=Read-IdleCapacityHealth $docker $previousCapacity 'same-root restore after proof'
+            } catch { $status='failed'; Fail 70 $_.Exception.Message }
+            Write-NewRecord 'api-proof-after.json' ([ordered]@{contract_version='m6.same-root-api-proof.v1';operation_id=$sameRootOperation;phase='restore'
+                capacity_config_sha256=$previousCapacity;api_image_id=$sameRootApiImage;idle_health='explicit_capacity_closed'
+                proof_line=$restored.Line;captured_utc=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Compress -Depth 4)
+        }
+        if ($sameRootPhase -ceq 'close' -and [string]$sameRootResult.outcome -ceq 'closed') {
+            try {
+                $epochsAfter=Read-MineruEpochs $docker
+                foreach ($item in @($sameRootResult.facts.containers)) {
+                    if ([string]$epochsAfter[[string]$item.name].container_id -cne [string]$item.id) { throw ('restored container differs from its frozen identity: ' + [string]$item.name) }
+                }
+                $null=Read-IdleCapacityHealth $docker $previousCapacity 'same-root close'
+            } catch { $status='unknown'; Fail 70 $_.Exception.Message }
+        }
+        # A maintenance phase never installs and never opens producers.
+        $daemonSide='verified'; $status='pass'; $ExitCode=0
+    } else {
+        # ---- judge from records and real readback, never from the child's exit alone ----------------------
+        $resultPath=Join-Path $recordsDir 'installer-result.json'
+        if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+            $status=$(if ($installerExit -eq 0) { 'unknown' } else { 'failed' })
+            Fail 70 ('installer left no result record (child exit ' + $installerExit + ')')
+        }
+        $installerResult=ConvertFrom-StrictJson (Read-BoundedFile $resultPath 4194304)
+        if ($operationKind -ceq 'inference-recreate' -and [string]$installerResult.status -ceq 'pass' -and [string]$installerResult.operation_kind -cne $operationKind) {
+            $status='unknown'; Fail 70 'installer result operation kind differs from the binding'
+        }
+        if ([string]$installerResult.status -cne 'pass') {
+            $status=$(if ([string]$installerResult.status -ceq 'unknown') { 'unknown' } else { 'failed' })
+            Fail 70 ('installer reported ' + [string]$installerResult.status + ': ' + [string]$installerResult.first_error)
+        }
+        if ($installerExit -ne 0) { $status='unknown'; Fail 70 ('installer result is pass but child exit is ' + $installerExit) }
+        if (-not (Test-Path -LiteralPath $ReceiptTarget -PathType Leaf)) { $status='unknown'; Fail 70 'install receipt target is absent after a pass result' }
+        if ($operationKind -ceq 'inference-recreate') {
+            if ((Get-Sha256File $ReceiptTarget) -cne $existingReceiptSha -or
+                [string]$installerResult.receipt_sha256 -cne $existingReceiptSha) {
+                $status='unknown'; Fail 70 'inference recreation changed the existing install receipt'
+            }
+            $epochsAfter=Read-MineruEpochs $docker
+            try { Assert-InferenceEpochs $epochsBefore $epochsAfter }
+            catch { $status='unknown'; Fail 70 $_.Exception.Message }
+        }
+        $receipt=ConvertFrom-StrictJson (Read-BoundedFile $ReceiptTarget 4194304)
+        if ([string]$receipt.schema -cne 'mineru-windows-install-receipt.v2' -or -not [bool]$receipt.success -or
+            [string]$receipt.compose_sha256 -cne $composeSha -or [string]$receipt.compose_sha256 -cne [string]$installerResult.compose_sha256) {
+            $status='unknown'; Fail 70 'persisted install receipt does not bind the release compose'
+        }
+        if ($operationKind -ceq 'inference-recreate' -and
+            (Get-Sha256File 'C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1') -cne $verified['windows/collect_mineru_runtime.ps1']) {
+            $status='unknown'; Fail 70 'inference recreation changed the active collector'
+        }
+        $activeCompose=Get-Sha256File $ComposeTarget
+        if ($activeCompose -cne $composeSha) { $status='unknown'; Fail 70 ('active compose after installation differs from the release: ' + $activeCompose) }
+        $inspect=Invoke-BoundedReadback $docker @('inspect','--format','{{.Image}}','mineru-api')
+        if ($inspect.ExitCode -ne 0) { $status='unknown'; Fail 70 'docker inspect of the API container failed after installation' }
+        $imageId=$inspect.StandardOutput.Trim()
+        if ($imageId -cne [string]$receipt.api_compatibility_image.image_id) { $status='unknown'; Fail 70 ('running API image differs from the receipt: ' + $imageId) }
+        try { $null=Read-IdleCapacityHealth $docker $capacitySha 'post-installation' } catch { $status='unknown'; Fail 70 $_.Exception.Message }
+        # Installation is verified; writer readiness stays closed until this image is qualified and bound.
+        $daemonSide='verified'; $status='pass'; $installationVerified=$true; $ExitCode=0
     }
-    $receipt=ConvertFrom-StrictJson (Read-BoundedFile $ReceiptTarget 4194304)
-    if ([string]$receipt.schema -cne 'mineru-windows-install-receipt.v2' -or -not [bool]$receipt.success -or
-        [string]$receipt.compose_sha256 -cne $composeSha -or [string]$receipt.compose_sha256 -cne [string]$installerResult.compose_sha256) {
-        $status='unknown'; Fail 70 'persisted install receipt does not bind the release compose'
-    }
-    if ($operationKind -ceq 'inference-recreate' -and
-        (Get-Sha256File 'C:\ProgramData\agent-invest\mineru-runtime-v6\collect_mineru_runtime.ps1') -cne $verified['windows/collect_mineru_runtime.ps1']) {
-        $status='unknown'; Fail 70 'inference recreation changed the active collector'
-    }
-    $activeCompose=Get-Sha256File $ComposeTarget
-    if ($activeCompose -cne $composeSha) { $status='unknown'; Fail 70 ('active compose after installation differs from the release: ' + $activeCompose) }
-    $inspect=Invoke-BoundedReadback $docker @('inspect','--format','{{.Image}}','mineru-api')
-    if ($inspect.ExitCode -ne 0) { $status='unknown'; Fail 70 'docker inspect of the API container failed after installation' }
-    $imageId=$inspect.StandardOutput.Trim()
-    if ($imageId -cne [string]$receipt.api_compatibility_image.image_id) { $status='unknown'; Fail 70 ('running API image differs from the receipt: ' + $imageId) }
-    try { $null=Read-IdleCapacityHealth $docker $capacitySha 'post-installation' } catch { $status='unknown'; Fail 70 $_.Exception.Message }
-    # Installation is verified; writer readiness stays closed until this image is qualified and bound.
-    $daemonSide='verified'; $status='pass'; $installationVerified=$true; $ExitCode=0
 } catch {
     if ($null -eq $firstError) { $firstError=$_.Exception.Message }
     if ($ExitCode -eq 0) { $ExitCode=70 }
@@ -478,6 +643,27 @@ try {
         $result['operation_kind']=$operationKind
         $result['existing_receipt_sha256']=$existingReceiptSha
         $result['service_epochs_before']=$epochsBefore
+        $result['service_epochs_after']=$epochsAfter
+    }
+    if ($operationKind -ceq 'same-root-reattestation') {
+        $next=@('same_root_status','read_only_recovery_judgement')
+        if ($status -ceq 'pass') {
+            if ($sameRootPhase -ceq 'prestop') { $next=@('docker_storage_maintenance','observe') }
+            elseif ($sameRootPhase -ceq 'observe') { $next=@($(if ([string]$sameRootResult.outcome -ceq 'reattest') { 'approve'; 'apply' } else { 'restore' })) }
+            elseif ($sameRootPhase -ceq 'apply') { $next=@('restore') }
+            elseif ($sameRootPhase -ceq 'restore') { $next=@('close') }
+            elseif ($sameRootPhase -ceq 'close') { $next=@('api_compatibility_install') }
+            else { $next=@() }
+        }
+        $result['contract_version']='m6.installation-operation.v3'
+        $result['operation_kind']=$operationKind
+        $result['maintenance_phase']=$sameRootPhase
+        $result['operation_id']=$sameRootOperation
+        $result['next_required']=$next
+        $result['same_root_status']=$(if ($null -ne $sameRootResult) { [string]$sameRootResult.status } else { $null })
+        $result['same_root_outcome']=$(if ($null -ne $sameRootResult) { $sameRootResult.outcome } else { $null })
+        $result['pending_present']=$(if ($null -ne $sameRootResult) { $sameRootResult.pending_present } else { $null })
+        $result['api_proof_sha256']=$sameRootProofSha
         $result['service_epochs_after']=$epochsAfter
     }
     $json=$result | ConvertTo-Json -Compress -Depth 8

@@ -91,7 +91,7 @@ class StagedCommissionTests(unittest.TestCase):
             mock.patch("disclosure_anchor.adapters.runtime.staged_worker_v4.load_staged_v4_settings") as loader,
             self.assertRaisesRegex(RuntimeError, "outside commissioning scope"),
         ):
-            build_staged_worker_v4_runtime(settings=SimpleNamespace(worker_parse_execution_mode="staged-v4"),
+            build_staged_worker_v4_runtime(settings=SimpleNamespace(worker_parse_execution_mode="staged-v4", worker_drain_existing=False),
                 engine=mock.Mock(), ownership_guard=lambda: None, admission_guard=lambda: None,
                 process_scope_classes=None, progress=lambda _: None, admission_document_ids=("chosen",))
         loader.assert_not_called()

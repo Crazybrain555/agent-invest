@@ -234,6 +234,20 @@ def read_idle_health(
     return health, raw, "legacy_gauges_only"
 
 
+def previous_capacity_for(report: VerifyReport, binding: ReleasePrivateBinding) -> AnyMineruCapacityConfig | None:
+    """The explicit capacity the running API must prove idle under, from exact bytes (None: legacy runtime)."""
+
+    expected = binding.windows.expected_previous_capacity_sha256
+    if expected is None:
+        return None
+    if expected == report.inputs.capacity.sha256:
+        return report.inputs.capacity
+    previous = binding.previous_capacity
+    if previous is None or previous.sha256 != expected:
+        raise ReleaseInputError("previous capacity bytes are required to prove idle under the previous explicit capacity")
+    return previous
+
+
 def installation_binding_document(
     binding: ReleasePrivateBinding, *, api_device_profile: str,
     exclusivity_sha256: str, operation_kind: str = API_COMPATIBILITY,
@@ -302,14 +316,7 @@ def install_release(
     try:
         assert_known_hosts_pins_address(binding)
         launchd = assert_launchd_jobs_unloaded(binding.launchd_labels)
-        previous_capacity = None
-        if binding.windows.expected_previous_capacity_sha256 is not None:
-            if binding.windows.expected_previous_capacity_sha256 == report.inputs.capacity.sha256:
-                previous_capacity = report.inputs.capacity
-            else:
-                previous_capacity = binding.previous_capacity
-                if previous_capacity is None or previous_capacity.sha256 != binding.windows.expected_previous_capacity_sha256:
-                    raise ReleaseInputError("previous capacity bytes are required to prove idle under the previous explicit capacity")
+        previous_capacity = previous_capacity_for(report, binding)
         deployment = report.inputs.deployment_profile
         health_before, health_raw, idle_proof = read_idle_health(
             binding.api_url, expected_capacity=previous_capacity,
@@ -444,6 +451,7 @@ __all__ = [
     "assert_launchd_jobs_unloaded",
     "install_release",
     "installation_binding_document",
+    "previous_capacity_for",
     "read_idle_health",
     "stage_batch",
 ]
