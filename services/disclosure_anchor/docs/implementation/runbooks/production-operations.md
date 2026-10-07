@@ -490,6 +490,16 @@ PYTHONPATH=src .venv/bin/python scripts/prepare_codex_semantic_model_catalog.py 
 envelope）和 Codex 一样写一条有界的 `semantic_provider_failure.v1`（`provider=claude_cli`）：typed HTTP
 状态只取自通过闭合校验的 envelope，不复制任何文本。403 仍是 `command_failed`，不切备用。
 
+Codex 调用失败时，日志行的 `private_diagnostic` 指向一份私有证据：
+`$DISCLOSURE_RUNTIME_ROOT/tmp/semantic_routes/failure_diagnostics/<UTC时间>-<pid>-<随机>.json`
+（目录 0700、文件 0600，`semantic_provider_failure_diagnostic.v1`）。里面是 CLI 自己的终止/重试消息和
+stderr 行（已去掉 URL 凭据与查询串、Authorization 与 key/token/secret/password/cookie 赋值、token 和
+cf-ray/request id/auth error 头值），模型输出、工具负载、未知事件只留位置和字节数；按 `group_hash` 或
+日志里的 `stdout_sha256` 对上停止记录。每次写入后最多保留 256 份、每份不超过 64 KiB：先写成新记录再删
+最旧的，写失败不会删旧证据；删除失败时日志带 `prune_error`，最多多出一份，之后的捕获报 `failed`，直到
+多出的那份能删掉。运维可随时删除单个文件或整个目录。`status=failed` 只表示证据没写成，判定与是否切备用
+不受影响。不要把这些文件拷进 Git 或外部复审包。
+
 staged V4 的语义 `failed_closed`（协议、安全、结果契约）在 commit 中出现时，worker 以公共停止
 （§1.1f）持久停下，不再被 launchd 重驱到同一个未缓存 group；不要靠反复重启或清理结果掩盖。
 保留原任务、收据和日志，修复并验证后显式放行。本机制不做单文档隔离、跨启动计数或半开探测；

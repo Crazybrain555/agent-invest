@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 import json
 import hashlib
 import inspect
@@ -20,6 +21,15 @@ from disclosure_anchor.adapters.semantics.codex_model_catalog import (
     CodexModelCatalog,
     _ClosedJsonError,
     _strict_json_loads,
+)
+from disclosure_anchor.adapters.semantics.failure_diagnostics import (
+    FAILURE_DIAGNOSTIC_DIRECTORY,
+    FAILURE_DIAGNOSTIC_SCHEMA,
+    MAX_TEXT_BYTES,
+    PrivateFailureDiagnostics,
+    bounded_text,
+    encoded_size,
+    redact_diagnostic_text,
 )
 from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_PROMPT_VERSION,
@@ -163,6 +173,18 @@ _CAPACITY_DIAGNOSTICS = tuple(
         ),
     )
 )
+# Codex 0.156.1 QuotaExceeded and every UsageLimitReachedError::fmt branch
+# (openai/codex rust-v0.156.1, codex-rs/protocol/src/error.rs). A reset time is
+# chrono "%-I:%M %p", prefixed by "%b %-d<st|nd|rd|th>, %Y " on another day. A
+# model limit name or promo is a trimmed response-header value, which
+# HeaderValue::to_str limits to visible ASCII, so each display is one line.
+_CODEX_RESET_TIME = (
+    r"(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?:[1-9]|[12][0-9]|3[01])"
+    r"(?:st|nd|rd|th), [0-9]{4} )?(?:[1-9]|1[0-2]):[0-5][0-9] (?:AM|PM)"
+)
+_CODEX_OR_RETRY = rf" or try again (?:at {_CODEX_RESET_TIME}|later)\."
+_CODEX_HEADER_TEXT = r"[!-~](?:[ -~]{0,510}[!-~])?"
+_CODEX_USAGE_LIMIT = r"You['’]ve hit your usage limit"
 _CODEX_CAPACITY_DIAGNOSTICS = (
     *_CAPACITY_DIAGNOSTICS,
     re.compile(
@@ -171,6 +193,45 @@ _CODEX_CAPACITY_DIAGNOSTICS = (
     ),
     re.compile(r"We’re currently experiencing high demand, which may cause temporary errors\."),
     re.compile(r"Selected model is at capacity\. Please try a different model\."),
+    *(
+        re.compile(pattern)
+        for pattern in (
+            r"Quota exceeded\. Check your plan and billing details\.",
+            (
+                rf"{_CODEX_USAGE_LIMIT} for {_CODEX_HEADER_TEXT}\. Switch to another model now,"
+                + _CODEX_OR_RETRY
+            ),
+            r"Your workspace is out of credits\. Add credits to continue\.",
+            (
+                r"Your workspace is out of credits\. Ask your workspace owner to refill in order"
+                r" to continue\."
+            ),
+            r"You hit your spend cap set in your workspace\. Increase your spend cap to continue\.",
+            (
+                r"You hit your spend cap set by the owner of your workspace\. Ask an owner to"
+                r" increase your spend cap to continue\."
+            ),
+            rf"{_CODEX_USAGE_LIMIT}\. {_CODEX_HEADER_TEXT},{_CODEX_OR_RETRY}",
+            (
+                rf"{_CODEX_USAGE_LIMIT}\. Upgrade to Pro \(https://chatgpt\.com/explore/pro\),"
+                r" visit https://chatgpt\.com/codex/settings/usage to purchase more credits"
+                + _CODEX_OR_RETRY
+            ),
+            (
+                rf"{_CODEX_USAGE_LIMIT}\. To get more access now, send a request to your admin"
+                + _CODEX_OR_RETRY
+            ),
+            (
+                rf"{_CODEX_USAGE_LIMIT}\. Upgrade to Plus to continue using Codex"
+                r" \(https://chatgpt\.com/explore/plus\)," + _CODEX_OR_RETRY
+            ),
+            (
+                rf"{_CODEX_USAGE_LIMIT}\. Visit https://chatgpt\.com/codex/settings/usage to"
+                r" purchase more credits" + _CODEX_OR_RETRY
+            ),
+            rf"{_CODEX_USAGE_LIMIT}\. Try again (?:at {_CODEX_RESET_TIME}|later)\.",
+        )
+    ),
 )
 _CODEX_TRANSPORT_DIAGNOSTICS = tuple(
     re.compile(pattern)
@@ -180,6 +241,18 @@ _CODEX_TRANSPORT_DIAGNOSTICS = tuple(
         r"request timed out",
         r"exceeded retry limit, last status: (?:500 Internal Server Error|502 Bad Gateway"
         r"|503 Service Unavailable|504 Gateway Timeout)(?:, request id: [^,\s]+)?",
+        # 0.156.1 HTTPS failures once the CLI's own retries end. Its
+        # ReqwestTransport::map_error drops the URL, leaving reqwest 0.12.28's
+        # fixed kind display: a connect failure (which the default-on
+        # unbounded_connection_retries feature normally retries until the
+        # process deadline), any other send failure, and a response-body read
+        # failure or read timeout as wrapped by eventsource-stream 0.2.3; plus
+        # the CLI's own SSE idle timeout.
+        r"Connection failed: error sending request",
+        r"stream disconnected before completion: error sending request",
+        r"stream disconnected before completion: Transport error: "
+        r"(?:network error: error decoding response body|timeout)",
+        r"stream disconnected before completion: idle timeout waiting for SSE",
     )
 )
 # Codex 0.156.1 UnexpectedResponseError owns the status prefix; its response
@@ -826,19 +899,19 @@ def _matched_availability_families(
     capacity_diagnostics: tuple[re.Pattern[str], ...] = _CAPACITY_DIAGNOSTICS,
     transport_diagnostics: tuple[re.Pattern[str], ...] = (),
 ) -> frozenset[str]:
-    matches = tuple(
+    # A line may match several closed forms of one family, such as a generic
+    # usage-limit form and its exact versioned display; a line matching two
+    # families is ambiguous and recognizes nothing.
+    families = frozenset(
         reason
         for reason, patterns in (
             ("not_authenticated", auth_diagnostics),
             ("capacity_unavailable", capacity_diagnostics),
             ("transport_unavailable", transport_diagnostics),
         )
-        for pattern in patterns
-        if pattern.fullmatch(line)
+        if any(pattern.fullmatch(line) for pattern in patterns)
     )
-    if len(matches) != 1:
-        return frozenset()
-    return frozenset(matches)
+    return families if len(families) == 1 else frozenset()
 
 
 def _known_availability_reason(
@@ -894,6 +967,9 @@ class CodexCliSemanticAdjudicator:
         self._model_catalog = model_catalog
         self._executable = executable
         self._runtime_tmp_root = runtime_tmp_root
+        self._failure_diagnostics = PrivateFailureDiagnostics(
+            runtime_tmp_root / FAILURE_DIAGNOSTIC_DIRECTORY
+        )
         self._reasoning_effort = reasoning_effort
         self._timeout_seconds = timeout_seconds
         self._slot = threading.BoundedSemaphore(max_concurrency)
@@ -1056,16 +1132,20 @@ class CodexCliSemanticAdjudicator:
                 if stage_guard is not None:
                     stage_guard.checkpoint()
                 if completed.returncode != 0:
-                    raise _command_error(completed)
-                _validate_event_stream(completed.stdout, completed.stderr)
+                    raise _command_error(completed, record_failure=self._record_failure)
                 try:
-                    raw_result = result_path.read_text(encoding="utf-8")
-                except OSError as exc:
-                    raise SemanticRouteAdjudicatorError(
-                        "Codex semantic adjudicator did not produce a result",
-                        reason_code="result_missing",
-                        retryable=True,
-                    ) from exc
+                    _validate_event_stream(completed.stdout, completed.stderr)
+                    try:
+                        raw_result = result_path.read_text(encoding="utf-8")
+                    except OSError as exc:
+                        raise SemanticRouteAdjudicatorError(
+                            "Codex semantic adjudicator did not produce a result",
+                            reason_code="result_missing",
+                            retryable=True,
+                        ) from exc
+                except SemanticRouteAdjudicatorError as exc:
+                    self._record_failure(completed, exc, ())
+                    raise
         except subprocess.TimeoutExpired as exc:
             raise SemanticRouteAdjudicatorError(
                 "Codex semantic adjudication timed out",
@@ -1092,6 +1172,23 @@ class CodexCliSemanticAdjudicator:
             response_sha256="sha256:" + hashlib.sha256(
                 raw_result.encode("utf-8")
             ).hexdigest(),
+        )
+
+    def _record_failure(
+        self,
+        completed: subprocess.CompletedProcess[str],
+        error: SemanticRouteAdjudicatorError,
+        messages: tuple[str, ...],
+    ) -> None:
+        # The private record is written first so the ordinary log line can
+        # name it; neither step can replace ``error``.
+        _log_command_failure(
+            completed,
+            error,
+            messages,
+            private_diagnostic=_retain_failure_diagnostic(
+                self._failure_diagnostics, completed, error, self._provider_identity
+            ),
         )
 
 
@@ -1396,6 +1493,8 @@ def _log_command_failure(
     completed: subprocess.CompletedProcess[str],
     error: SemanticRouteAdjudicatorError,
     messages: tuple[str, ...],
+    *,
+    private_diagnostic: Mapping[str, object] | None = None,
 ) -> None:
     statuses = sorted({
         int(match[1]) for message in messages
@@ -1408,6 +1507,7 @@ def _log_command_failure(
         error=error,
         terminal_http_statuses=statuses,
         terminal_message_count=len(messages),
+        private_diagnostic=private_diagnostic,
     )
 
 
@@ -1419,11 +1519,13 @@ def _log_provider_failure(
     error: SemanticRouteAdjudicatorError,
     terminal_http_statuses: list[int],
     terminal_message_count: int,
+    private_diagnostic: Mapping[str, object] | None = None,
 ) -> None:
     # The worker captures stderr durably. Keep enough transport evidence for
     # triage even when temporary call files are removed, without logging model
     # text, prompts, URLs, server bodies, request headers, credentials or the
-    # subprocess environment.
+    # subprocess environment. The terminal text itself goes only to the
+    # private record named here.
     group_hash = current_semantic_group()
     record: dict[str, object] = {
         "event": "semantic_provider_failure.v1",
@@ -1441,17 +1543,188 @@ def _log_provider_failure(
         encoded = value.encode("utf-8")
         record[channel + "_bytes"] = len(encoded)
         record[channel + "_sha256"] = hashlib.sha256(encoded).hexdigest()
+    if private_diagnostic is not None:
+        record["private_diagnostic"] = dict(private_diagnostic)
     logger.warning("semantic_provider_failure %s", json.dumps(record, sort_keys=True))
 
 
-def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRouteAdjudicatorError:
+_FAILURE_TEXT_BUDGET = 40 * 1024
+_FAILURE_STDOUT_ENTRIES = 64
+_FAILURE_STDERR_ENTRIES = 32
+_FAILURE_MODEL_ITEMS = frozenset({"agent_message", "reasoning"})
+_FailureText = tuple[int, int, dict[str, object], str]
+
+
+def _retain_failure_diagnostic(
+    store: PrivateFailureDiagnostics,
+    completed: subprocess.CompletedProcess[str],
+    error: SemanticRouteAdjudicatorError,
+    identity: SemanticProviderIdentity,
+) -> dict[str, object]:
+    try:
+        return store.retain(_failure_diagnostic_record(completed, error, identity))
+    except Exception as exc:  # noqa: BLE001 - evidence never replaces the provider failure
+        return {"status": "failed", "error": type(exc).__name__}
+
+
+def _failure_diagnostic_record(
+    completed: subprocess.CompletedProcess[str],
+    error: SemanticRouteAdjudicatorError,
+    identity: SemanticProviderIdentity,
+) -> dict[str, object]:
+    """Project one failed call onto the CLI's own diagnostics.
+
+    Error/notice messages from exactly shaped events and stderr lines are kept,
+    redacted and bounded. Model output, tool items and tool log lines, and
+    unrecognized events are withheld, leaving only their position and size;
+    the projection never changes how the call was classified.
+    """
+
+    texts: list[_FailureText] = []
+    stdout_entries = _stdout_failure_entries(completed.stdout, texts)
+    stderr_entries = _stderr_failure_entries(completed.stderr, texts)
+    # Terminal events come last on stdout; a root cause is usually stderr's first line.
+    kept_stdout = stdout_entries[-_FAILURE_STDOUT_ENTRIES:]
+    kept_stderr = stderr_entries[:_FAILURE_STDERR_ENTRIES]
+    kept = {id(entry) for entry in (*kept_stdout, *kept_stderr)}
+    _allocate_failure_text([item for item in texts if id(item[2]) in kept])
+    group_hash = current_semantic_group()
+    record: dict[str, object] = {
+        "schema": FAILURE_DIAGNOSTIC_SCHEMA,
+        "provider": "codex_cli",
+        "provider_id": identity.provider_id,
+        "adapter_version": identity.adapter_version,
+        "canonical_model": identity.canonical_model,
+        "observed_at_unix_ns": time.time_ns(),
+        "group_hash": (
+            group_hash if re.fullmatch(r"sha256:[0-9a-f]{64}", group_hash or "") else None
+        ),
+        "returncode": completed.returncode,
+        "reason_code": error.reason_code,
+        "retryable": error.retryable,
+        "adapter_error": bounded_text(str(error), 512)[0],
+        "stdout_events": kept_stdout,
+        "stdout_events_omitted": len(stdout_entries) - len(kept_stdout),
+        "stderr_lines": kept_stderr,
+        "stderr_lines_omitted": len(stderr_entries) - len(kept_stderr),
+    }
+    for channel, value in (("stdout", completed.stdout), ("stderr", completed.stderr)):
+        encoded = value.encode("utf-8")
+        record[channel + "_bytes"] = len(encoded)
+        record[channel + "_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return record
+
+
+def _stdout_failure_entries(stdout: str, texts: list[_FailureText]) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for line_number, raw_line in enumerate(stdout.split("\n"), start=1):
+        if not raw_line.strip():
+            continue
+        entry: dict[str, object] = {"line": line_number}
+        entries.append(entry)
+        try:
+            event = _strict_json_loads(raw_line)
+        except (json.JSONDecodeError, _ClosedJsonError):
+            event = None
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            entry.update(withheld="not_event", bytes=len(raw_line.encode("utf-8")))
+            continue
+        entry["type"] = _protocol_token(event["type"])
+        message = _provider_failure_message(event)
+        if message is not None:
+            # Retry notices yield the text budget to terminal messages.
+            priority = 2 if _is_transport_recovery_notice(event) else 0
+            texts.append((priority, -line_number, entry, message))
+            continue
+        if event["type"] in {"thread.started", "turn.started", "turn.completed"}:
+            continue
+        item = event.get("item")
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            entry["withheld"] = "model_output" if item_type in _FAILURE_MODEL_ITEMS else "item"
+            entry["item_type"] = _protocol_token(item_type)
+        else:
+            entry["withheld"] = "event"
+        entry["bytes"] = len(raw_line.encode("utf-8"))
+    return entries
+
+
+def _stderr_failure_entries(stderr: str, texts: list[_FailureText]) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for line_number, raw_line in enumerate(stderr.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        entry: dict[str, object] = {"line": line_number}
+        entries.append(entry)
+        if "::tools::" in line:
+            # Tool router and handler lines can quote model-authored arguments.
+            entry.update(withheld="tool_log", bytes=len(line.encode("utf-8")))
+        else:
+            texts.append((1, line_number, entry, line))
+    return entries
+
+
+def _provider_failure_message(event: dict[str, object]) -> str | None:
+    """The CLI's message text of an exactly shaped error event, else ``None``."""
+
+    event_type = event.get("type")
+    message: object
+    if event_type == "error" and set(event) == {"type", "message"}:
+        message = event.get("message")
+    elif event_type == "turn.failed" and set(event) == {"type", "error"}:
+        error = event.get("error")
+        message = (
+            error.get("message") if isinstance(error, dict) and set(error) == {"message"}
+            else error
+        )
+    elif event_type in {"item.started", "item.completed"} and set(event) == {"type", "item"}:
+        item = event.get("item")
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "error"
+            or set(item) - {"id", "type", "message"}
+            or ("id" in item and not isinstance(item["id"], str))
+        ):
+            return None
+        message = item.get("message")
+    else:
+        return None
+    return message if isinstance(message, str) else None
+
+
+def _allocate_failure_text(texts: list[_FailureText]) -> None:
+    # Terminal messages first (latest first), then stderr in order, then retry
+    # notices (latest first), until the record's text budget is spent.
+    remaining = _FAILURE_TEXT_BUDGET
+    for _priority, _order, entry, raw in sorted(texts, key=lambda item: (item[0], item[1])):
+        limit = min(MAX_TEXT_BYTES, remaining)
+        if limit < 64:
+            entry.update(text_withheld="budget", text_chars=len(raw))
+            continue
+        # Redact the whole text before cutting it, so a cut never splits a secret.
+        kept, truncated = bounded_text(redact_diagnostic_text(raw), limit)
+        entry["text"] = kept
+        if truncated:
+            entry.update(text_truncated=True, text_chars=len(raw))
+        remaining -= encoded_size(kept)
+
+
+def _command_error(
+    completed: subprocess.CompletedProcess[str],
+    *,
+    record_failure: Callable[
+        [subprocess.CompletedProcess[str], SemanticRouteAdjudicatorError, tuple[str, ...]],
+        None,
+    ] = _log_command_failure,
+) -> SemanticRouteAdjudicatorError:
     try:
         structured_messages = _nonzero_event_error_messages(
             completed.stdout,
             completed.stderr,
         )
     except SemanticRouteAdjudicatorError as exc:
-        _log_command_failure(completed, exc, ())
+        record_failure(completed, exc, ())
         return exc
     stderr_lines = tuple(
         line.strip()
@@ -1474,7 +1747,7 @@ def _command_error(completed: subprocess.CompletedProcess[str]) -> SemanticRoute
         reason_code=reason,
         retryable=retryable,
     )
-    _log_command_failure(completed, error, structured_messages)
+    record_failure(completed, error, structured_messages)
     return error
 
 

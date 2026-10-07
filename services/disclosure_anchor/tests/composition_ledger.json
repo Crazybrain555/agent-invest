@@ -1438,9 +1438,13 @@
    "private_imports": [],
    "tests": 9
   },
+  "tests/unit/test_semantic_cli_incident_independent.py": {
+   "private_imports": [],
+   "tests": 19
+  },
   "tests/unit/test_semantic_codex_cli.py": {
    "private_imports": [],
-   "tests": 16
+   "tests": 17
   },
   "tests/unit/test_semantic_codex_outage_failover.py": {
    "private_imports": [],
@@ -1453,6 +1457,10 @@
   "tests/unit/test_semantic_execution_guard.py": {
    "private_imports": [],
    "tests": 16
+  },
+  "tests/unit/test_semantic_failure_diagnostics.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_semantic_route_receipt_v3.py": {
    "private_imports": [],

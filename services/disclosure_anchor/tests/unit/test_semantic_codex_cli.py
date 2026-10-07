@@ -1424,7 +1424,7 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
             ("notice-only nonzero with websocket stderr", 1, "\n".join((THREAD_STARTED, TURN_STARTED, *_websocket_exhaustion())), websocket_stderr, "command_failed", True),
             ("usage limit after reconnects", 1, failed(*_websocket_exhaustion(), terminal=USAGE_LIMIT_MESSAGE), "", "capacity_unavailable", True),
             ("notices before turn stay evidence", 1, "\n".join((THREAD_STARTED, ws_notice, TURN_STARTED, _notice(USAGE_LIMIT_MESSAGE))), "", "command_failed", True),
-            ("variable terminal transport", 1, failed(ws_notice, terminal="stream disconnected before completion: error sending request"), "", "command_failed", True),
+            ("variable terminal transport", 1, failed(ws_notice, terminal="stream disconnected before completion: Connection reset by peer (os error 54)"), "", "command_failed", True),
             ("transport plus usage limit", 1, failed(_notice(USAGE_LIMIT_MESSAGE), terminal=stream_closed), "", "command_failed", True),
             ("transport plus unknown error", 1, failed(_notice("fatal protocol parser crashed"), terminal=stream_closed), "", "command_failed", True),
             ("websocket stderr without url", 1, EXHAUSTED_STREAM, websocket_stderr.replace(", url: ws://127.0.0.1:55957/v1/responses", ""), "command_failed", True),
@@ -1451,6 +1451,87 @@ class CodexCliSemanticAdjudicatorTests(unittest.TestCase):
             self.assertEqual(caught.exception.reason_code, reason_code)
             self.assertEqual(caught.exception.retryable, retryable)
             self.assertNotIn("sensitive surprise", str(caught.exception))
+
+    def test_pinned_cli_capacity_and_transport_displays_are_exact(self) -> None:
+        # Complete codex-cli 0.156.1 display forms (rust-v0.156.1:
+        # protocol/src/error.rs QuotaExceeded and every UsageLimitReachedError
+        # branch; HTTPS transport displays after url-stripping in
+        # http-client/src/transport.rs over reqwest 0.12.28 and
+        # eventsource-stream 0.2.3). The same text is classified alike from the
+        # JSONL terminal events and from stderr.
+        capacity = (
+            "Quota exceeded. Check your plan and billing details.",
+            "You’ve hit your usage limit. To get more access now, send a request to your admin or try again at 3:04 PM.",
+            "You’ve hit your usage limit. To get more access now, send a request to your admin or try again later.",
+            "You’ve hit your usage limit for GPT-5.6-Luna. Switch to another model now, or try again at Oct 8th, 2026 1:05 AM.",
+            "You’ve hit your usage limit for gpt-5.2-codex-sonic. Switch to another model now, or try again later.",
+            "Your workspace is out of credits. Add credits to continue.",
+            "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.",
+            "You hit your spend cap set in your workspace. Increase your spend cap to continue.",
+            "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.",
+            "You’ve hit your usage limit. Get 2x usage with Pro today, or try again at 11:59 PM.",
+            "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.",
+            "You’ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at Dec 1st, 2026 9:00 AM.",
+            "You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.",
+            "You’ve hit your usage limit. Try again later.",
+            "You’ve hit your usage limit. Try again at Nov 22nd, 2026 12:00 PM.",
+        )
+        transport = (
+            "stream disconnected before completion: error sending request",
+            "Connection failed: error sending request",
+            "stream disconnected before completion: Transport error: network error: error decoding response body",
+            "stream disconnected before completion: Transport error: timeout",
+            "stream disconnected before completion: idle timeout waiting for SSE",
+        )
+        closed = (
+            # entitlement, free-text and absent forms stay outside the families
+            "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.",
+            "rate limit exceeded: Rate limit reached for gpt-5.6-luna. Please try again in 1.2s.",
+            "Error while reading the server response: error decoding response body",
+            # near misses of the capacity displays
+            "Quota exceeded. Check your plan and billing details. Contact support.",
+            "quota exceeded. check your plan and billing details.",
+            "Your workspace is out of credits.",
+            "You’ve hit your usage limit. To get more access now, send a request to your admin.",
+            "You’ve hit your usage limit for GPT-5.6-Luna. Switch to another model now.",
+            "You’ve hit your usage limit for GPT-5.6-Luna. Switch to another model now, or try again at 13:04 PM.",
+            "You’ve hit your usage limit for GPT-5.6-Luna. Switch to another model now, or try again at Sept 8th, 2026 1:05 AM.",
+            "You’ve hit your usage limit for 月度模型. Switch to another model now, or try again later.",
+            "You’ve hit your usage limit. Get 2x usage today, or try again later. Then a tool ran.",
+            # the shared prefix also carries non-transport and variable details
+            "stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)",
+            "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+            "stream disconnected before completion: response.failed event received",
+            "stream disconnected before completion: Parse error: error Tag at: data",
+            "stream disconnected before completion: Transport error: network error: Connection reset by peer (os error 54)",
+            "stream disconnected before completion: idle timeout waiting for websocket",
+            "Connection failed: error sending request; forbidden tool call",
+        )
+        cases = (
+            *((message, "capacity_unavailable") for message in capacity),
+            *((message, "transport_unavailable") for message in transport),
+            *((message, "command_failed") for message in closed),
+        )
+        for message, reason_code in cases:
+            terminal = "\n".join((
+                THREAD_STARTED,
+                TURN_STARTED,
+                _notice(message),
+                _jsonl({"type": "turn.failed", "error": {"message": message}}),
+            ))
+            for channel, stdout, stderr in (("jsonl", terminal, ""), ("stderr", "", message + "\n")):
+                with (
+                    self.subTest(channel=channel, message=message[:80]),
+                    tempfile.TemporaryDirectory() as tmp,
+                    mock.patch(
+                        "disclosure_anchor.adapters.semantics.codex_cli._run_process",
+                        side_effect=_run_writing(stdout, returncode=1, stderr=stderr, result=None),
+                    ),
+                    self.assertRaises(SemanticRouteAdjudicatorError) as caught,
+                ):
+                    _adapter(tmp).adjudicate(_batch())
+                self.assertEqual(caught.exception.reason_code, reason_code)
+                self.assertTrue(caught.exception.retryable)
 
     def test_shutdown_terminates_registered_semantic_process_group(self) -> None:
         process = mock.MagicMock(pid=4242)

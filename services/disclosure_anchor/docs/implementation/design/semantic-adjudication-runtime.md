@@ -118,7 +118,19 @@ Unrecognized non-zero output is `command_failed` or a more specific fail-closed 
 stdout and bare diagnostic substrings are never availability evidence.
 The Codex capacity families are the 429/rate-limit/quota/credit-balance diagnostics and the account
 usage limit ("You've hit your usage limit", with or without its purchase-credits and retry-time
-clauses), which classify as `capacity_unavailable` and stay retryable. The exact
+clauses), which classify as `capacity_unavailable` and stay retryable. For the pinned 0.156.1 CLI this
+covers the complete display of `QuotaExceeded` ("Quota exceeded. Check your plan and billing
+details.") and of every `UsageLimitReachedError::fmt` branch in
+[rust-v0.156.1 `protocol/src/error.rs`](https://github.com/openai/codex/blob/rust-v0.156.1/codex-rs/protocol/src/error.rs)
+(commit `b412ff32c417f855c2b2d1581b77058eed87c84b`): the per-plan forms including the admin-request
+form, the model-specific limit, the promo form, the four workspace credit/spend-cap sentences, and both
+retry suffixes ("try again at <time>" or "later"). Variable parts are closed: the reset time follows
+the CLI's chrono format, and a limit name or promo is a trimmed response-header value, which the CLI
+only reads as visible ASCII. A line may match several closed forms of one family; a line matching
+two families recognizes nothing. Deferred, and therefore still `command_failed`: `UsageNotIncluded`
+(a plan entitlement fault that needs an operator, not a backup), `rate limit exceeded: <server
+text>` (a free-form server message), Codex-specific auth displays, and every form of another CLI
+version. The exact
 `codex_models_manager` "failed to refresh available models: timeout waiting for child process to exit"
 stderr line remains a closed, timestamp-anchored compatibility notice with no provider verdict. A static
 catalog does not refresh remote metadata. A disabled-code-mode startup warning now fails closed because
@@ -141,7 +153,16 @@ On a nonzero exit, those same intermediate notices do not replace the terminal v
 0.156.1 terminal 429 retry-limit (including its optional single-token request id), high-demand and overload
 messages classify as capacity unavailable, while
 the known prematurely closed response stream and request-timeout messages classify as transport
-unavailable. Every remaining diagnostic must agree. The timestamped `responses_websocket` failed-connect
+unavailable. So do the HTTPS failures that end the CLI's own retries: its `ReqwestTransport` drops the
+URL from reqwest 0.12.28's fixed error-kind display, which gives "Connection failed: error sending
+request" (normally retried until the process deadline by the default-on
+`unbounded_connection_retries` feature, which then ends as `timeout`), "stream disconnected before
+completion: error sending request", the response-body read failure or read timeout as wrapped by
+eventsource-stream 0.2.3 ("...: Transport error: network error: error decoding response body" or
+"...: Transport error: timeout"), and the SSE idle timeout ("...: idle timeout waiting for SSE").
+The same "stream disconnected before completion" prefix also carries non-transport and variable
+details (incomplete responses, `response.failed`, SSE parse errors, WebSocket/IO error text); those
+stay `command_failed`. Every remaining diagnostic must agree. The timestamped `responses_websocket` failed-connect
 debug line is a connection-attempt notice; the JSONL terminal error decides the result. Unknown terminal
 messages, conflicting diagnostics, and tool/protocol errors still stop the call without failover.
 The 0.156.1 `RetryLimitReachedError` display forms for HTTP 500, 502, 503 and 504 identify transport
@@ -157,11 +178,37 @@ still have to pass their existing checks;
 400/403, malformed status messages, unknown errors and explicit invalid output-schema errors do not
 gain failover permission. This is a classifier correction within `availability_only.v1`, not permission
 to fail over every `command_failed` or every error carrying `retryable=True`.
-Each nonzero Codex invocation logs a bounded `semantic_provider_failure.v1` record to the worker's
+Each failed Codex invocation (a nonzero exit, or an exit 0 rejected by the event-stream check or
+missing its result file) logs a bounded `semantic_provider_failure.v1` record to the worker's
 existing stderr capture: exit status, classification, observed terminal HTTP statuses, group hash,
 timestamp, and channel byte counts/hashes. No prompt, result, server body, URL or credential is copied.
 This keeps diagnostic facts after temporary call files are removed; it cannot recover details from
 historical failures that did not retain them.
+
+The CLI's terminal text goes only to a private record, named by the log line's additive
+`private_diagnostic` field (`status` `retained` with the file name, byte count and SHA-256, or
+`failed` with an exception class). Records live in `failure_diagnostics/` under the adapter's runtime
+tmp root (`$DISCLOSURE_RUNTIME_ROOT/tmp/semantic_routes/`), as `semantic_provider_failure_diagnostic.v1`
+JSON: identity, group hash, exit status, verdict, channel hashes matching the log line, the message of
+every exactly shaped `error`/`turn.failed`/error-item event and every stderr line. Model output, tool
+items, tool log lines (any `::tools::` target), unknown events and non-JSON lines are withheld and
+leave only position and size; thread IDs, usage and the prompt are never read. Kept text is redacted
+(URL userinfo and query strings, authorization headers, key/token/secret/password/cookie assignments,
+bearer and API-style tokens, and the CLI's response-header values `cf-ray`, `request id`,
+`auth error`, `auth error code`) and bounded: 4 KiB per message, a 40 KiB text
+budget spent on terminal messages first, then stderr, then retry notices; the last 64 stdout events and
+first 32 stderr lines; at most 64 KiB per file. The directory is 0700 and opened without following
+symlinks, each file is created exclusively at 0600, and at most 256 records remain after each write:
+under an exclusive lock (one bounded wait) the new record is written first and only then are the
+oldest pruned, so the bound holds across threads and processes and a failed capture never costs
+evidence within the bound. A prune error is reported as `prune_error` beside the retained status;
+that leaves at most one record over the bound, and later captures fail until it can be removed. A
+host without POSIX file locking still runs the adapter; its captures report `failed`.
+Capture never changes a verdict: any capture error is caught, leaves the original error and fallback
+decision intact, and is visible only as the failed status. Records are not fsynced, contain
+provider diagnostics rather than business content, stay out of Git and review packets, and may be
+deleted by an operator at any time. The Claude backup has no runtime tmp root and keeps its existing
+hash-only record.
 The Claude error envelope's closed key set follows Claude Code 2.1.274: besides the earlier metadata it
 carries `queued_turn_count`, `result_index` (non-negative ints) and `subagent_stats` (closed counter
 shape; the adjudicator runs with tools disabled, so any nonzero subagent counter is a forbidden

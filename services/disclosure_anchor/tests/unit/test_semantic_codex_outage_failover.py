@@ -17,7 +17,12 @@ from disclosure_anchor.application.services.semantic_adjudication import (
     OrderedSemanticAdjudicationExecutor,
 )
 from tests.unit._codex_model_catalog_fixture import neutral_catalog
-from tests.unit.test_semantic_adjudication import _Adapter, _Cache, _identity, _batch, _GROUP_HASH
+from tests.unit.test_semantic_adjudication import (
+    _Adapter, _Cache, _decisions, _identity, _batch, _GROUP_HASH, _RESPONSE_HASH,
+)
+
+
+QUOTA = "Quota exceeded. Check your plan and billing details."
 
 
 def _event(value: dict[str, object]) -> str:
@@ -48,7 +53,7 @@ def _completed() -> str:
 
 class CodexOutageFailoverTests(unittest.TestCase):
     def _run_chain(
-        self, *, stdout: str, stderr: str = "", returncode: int = 1,
+        self, *, stdout: str, stderr: str = "", returncode: int = 1, write_result: bool = False,
     ) -> tuple[object | None, SemanticRouteAdjudicatorError | None, int, int, _Cache, _Cache]:
         with tempfile.TemporaryDirectory() as tmp:
             primary = CodexCliSemanticAdjudicator(
@@ -66,7 +71,7 @@ class CodexOutageFailoverTests(unittest.TestCase):
             def run(*, args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
                 nonlocal calls
                 calls += 1
-                if returncode == 0:
+                if returncode == 0 or write_result:
                     Path(args[args.index("--output-last-message") + 1]).write_text(
                         '{"decisions":{"0":{"verdicts":{"forecast_summary":false}}}}',
                         encoding="utf-8",
@@ -85,8 +90,8 @@ class CodexOutageFailoverTests(unittest.TestCase):
                     outcome = None
             return outcome, caught, calls, sonnet.calls, primary_cache, backup_cache
 
-    def test_verified_temporary_server_errors_use_sonnet_once_with_lineage(self) -> None:
-        cases = (
+    def test_verified_availability_terminals_use_sonnet_once_with_lineage(self) -> None:
+        transport = (
             "exceeded retry limit, last status: 500 Internal Server Error, request id: req_1",
             "exceeded retry limit, last status: 502 Bad Gateway",
             "exceeded retry limit, last status: 503 Service Unavailable",
@@ -96,20 +101,38 @@ class CodexOutageFailoverTests(unittest.TestCase):
                 "<h1>temporary outage</h1>\r\n</html>, "
                 "url: https://example.invalid/v1/responses, request id: req_5"
             ),
+            "stream disconnected before completion: error sending request",
+            "stream disconnected before completion: Transport error: network error: error decoding response body",
+            "stream disconnected before completion: idle timeout waiting for SSE",
         )
-        for message in cases:
+        # codex-cli 0.156.1 capacity displays, as the incident's stream shape
+        # carries them: one error event and the failed turn, empty stderr.
+        capacity = (
+            "Quota exceeded. Check your plan and billing details.",
+            "You’ve hit your usage limit. To get more access now, send a request to your admin or try again later.",
+            "You’ve hit your usage limit for GPT-5.6-Luna. Switch to another model now, or try again at 4:49 AM.",
+            "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.",
+        )
+        cases = (
+            *((message, "transport_unavailable") for message in transport),
+            *((message, "capacity_unavailable") for message in capacity),
+        )
+        for message, reason_code in cases:
             with self.subTest(message=message[:65]):
+                # A result file left by the failed primary is never read.
                 outcome, error, codex_calls, sonnet_calls, primary_cache, backup_cache = (
-                    self._run_chain(stdout=_failed(message))
+                    self._run_chain(stdout=_failed(message), write_result=True)
                 )
                 self.assertIsNone(error)
                 self.assertIsNotNone(outcome)
                 self.assertEqual((codex_calls, sonnet_calls), (1, 1))
                 self.assertEqual(outcome.actual_result_attempt, 2)
                 self.assertEqual(outcome.actual_result_identity.provider_id, "sonnet-backup")
+                self.assertEqual(outcome.decisions, _decisions())
+                self.assertEqual(outcome.group_response_sha256, _RESPONSE_HASH)
                 self.assertEqual(
                     [(item.ordinal, item.outcome, item.reason_code) for item in outcome.attempts],
-                    [(1, "availability_failed", "transport_unavailable"), (2, "succeeded", None)],
+                    [(1, "availability_failed", reason_code), (2, "succeeded", None)],
                 )
                 self.assertEqual(len(primary_cache.entries), 0)
                 self.assertEqual(len(backup_cache.entries), 1)
@@ -150,6 +173,29 @@ class CodexOutageFailoverTests(unittest.TestCase):
                 _event({"type": "item.started", "item": {"type": "mcp_tool_call", "tool": "forbidden"}}),
                 _event({"type": "turn.failed", "error": {"message": "exceeded retry limit, last status: 503 Service Unavailable"}}),
             )), "", "forbidden_tool_call"),
+            ("quota with unknown stderr", _failed(QUOTA), "unrecognized diagnostic\n", "command_failed"),
+            ("quota with transport sibling", _failed(
+                QUOTA, _event({"type": "error", "message": "stream disconnected before completion: error sending request"}),
+            ), "", "command_failed"),
+            ("quota with schema error", _failed(QUOTA), "invalid_json_schema\n", "invalid_output_schema"),
+            ("quota with tool router line", _failed(QUOTA), (
+                "2026-10-07T04:49:06.000000Z ERROR codex_core::tools::router: error=unsupported call: exec_command\n"
+            ), "forbidden_tool_call"),
+            ("usage limit beside a tool item", "\n".join((
+                _event({"type": "thread.started", "thread_id": "synthetic-thread"}),
+                _event({"type": "turn.started"}),
+                _event({"type": "item.completed", "item": {"id": "item_1", "type": "command_execution", "command": "ls"}}),
+                _event({"type": "turn.failed", "error": {"message": "You’ve hit your usage limit. Try again later."}}),
+            )), "", "forbidden_tool_call"),
+            ("plan entitlement", _failed(
+                "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus."
+            ), "", "command_failed"),
+            ("free-text rate limit", _failed(
+                "rate limit exceeded: Rate limit reached for gpt-5.6-luna. Please try again in 1.2s."
+            ), "", "command_failed"),
+            ("non-transport stream detail", _failed(
+                "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens"
+            ), "", "command_failed"),
         )
         for label, stdout, stderr, reason in cases:
             with self.subTest(label):
