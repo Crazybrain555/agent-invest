@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pydantic import SecretStr
 import yaml
 
 from disclosure_anchor.api.schemas.public import (
@@ -20,6 +21,7 @@ from disclosure_anchor.api.schemas.public import (
 from disclosure_anchor.application.contracts.synchronized_telemetry import (
     operational_schema_documents,
 )
+from disclosure_anchor.agent_api import create_agent_api_app
 from disclosure_anchor.main import create_app
 from disclosure_anchor.settings import Settings
 
@@ -49,6 +51,15 @@ def export_contracts(output_root: Path = DEFAULT_CONTRACTS_ROOT) -> list[Path]:
         encoding="utf-8",
     )
     written.append(openapi_path)
+    agent_openapi_path = output_root / "agent_api.openapi.yaml"
+    agent_openapi = create_agent_api_app(
+        _contract_settings(), validate_runtime=False
+    ).openapi()
+    agent_openapi_path.write_text(
+        yaml.safe_dump(agent_openapi, sort_keys=True, allow_unicode=True),
+        encoding="utf-8",
+    )
+    written.append(agent_openapi_path)
 
     for name, model in PUBLIC_MODELS.items():
         path = public_models_root / f"{name}.v1.json"
@@ -84,6 +95,12 @@ def _contract_settings() -> Settings:
         mineru_processing_window_size=16,
         hf_home=shared_root / "model_cache" / "huggingface",
         modelscope_cache=shared_root / "model_cache" / "modelscope",
+        database_url=None,
+        # Placeholders: the export composes the agent app only for its schema.
+        disclosure_agent_api_read_token=SecretStr("contract-export-placeholder-read-token-0"),
+        disclosure_agent_api_request_token=SecretStr(
+            "contract-export-placeholder-request-token-0"
+        ),
     )
 
 

@@ -408,6 +408,39 @@ at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果
 
 ## 6. 契约变更记录（append-only）
 
+2026-10-07（0066 显式处理请求 + 私有 agent API，候选未部署）——public view、公共 Filing API（8711）与 change
+feed 不变；新增私有 agent API（8712，生成契约 `contracts/agent_api.openapi.yaml`）：
+
+```text
+只增 revision 0066_processing_request（down_revision 0065_requeue_key_lifetime）：disclosure_ops.processing_request
+（idempotency_key 唯一，intent_sha256 绑定规范化 intent）、processing_request_attempt（lease_expires_at/next_attempt_at，
+单一未结束尝试部分唯一索引，outcome ∈ matched|ambiguous|not_found|failed|abandoned|deferred；CHECK 逐子句
+NULL 安全：failed/deferred/abandoned 必带 error 对象、ambiguous 必带 choices 数组、未结束尝试不得排期；
+abandoned 当且仅当 finished_at >= lease_expires_at，即执行者结论只能在租约内落库；choices/error 为
+JSONB(none_as_null=True)，Python None 落 SQL NULL 而非 JSON null）、
+processing_request_target（每请求一行，admit_download/admit_parse）。processing_request.target 的 kind
+用 IS NOT DISTINCT FROM 比对。三表 REVOKE PUBLIC/reader/future_l2，
+GRANT app role（attempt 含 UPDATE）。queries.pending_parse / pending_parse_backlog_count / pending_downloads /
+pending_download_count 的池门+分类门与精确准入取 OR；重试资格、running/状态排除、campaign allowlist、
+下载失败上限与非重试闩不变。staged-v4 候选源、locked H0 与 source rejection 复查经同一谓词。
+解析由 resident maintenance 的 `_request_discovery_stage` 执行（WORKER_BATCH_REQUEST_DISCOVERY，默认 2），
+POST/GET/wait 不调用 provider。尝试的每个结论（成功与失败）都在 key 锁内复核“仍是最新未结束尝试且租约未到期”，
+并由 lease 守卫的 UPDATE 再核一次；失去授权则整笔回滚，过期租约只经 abandon 路径关闭。最后一次 provider
+调用之后复查 stop/deadline。本地同 CNINFO id 行须与请求的证券/交易所/窗口一致才绑定，否则
+failed（local_filing_mismatch / local_original_missing，不可重试）。CNINFO 网页通道每页须有 announcements
+（数组或 null）与布尔 hasMore；hasMore=true 的空页或不前进的重复页记 incomplete_response、畸形信封记
+invalid_response_shape（均 retryable，沿用既有 provider 基础设施分类），普通 sync 同样不再把截断结果当完整
+窗口。agent API 错误码（UNAUTHORIZED、FORBIDDEN、IDEMPOTENCY_CONFLICT、
+PROCESSING_REQUEST_LIMIT、TARGET_MISMATCH、ORIGINAL_*、TEXT_*、PAYLOAD_TOO_LARGE、LENGTH_REQUIRED、
+SERVICE_UNAVAILABLE）只在私有契约，不进入公共 ErrorEnvelope 枚举。
+```
+
+测试：tests/unit/test_processing_request_contract.py、test_processing_requests.py、test_processing_request_schema.py、
+test_agent_api.py、test_cninfo_web_source.py；scratch-only tests/integration/test_processing_request_queue.py
+（作者未运行，需 root scratch runner）。
+设计见 [agent API 与显式处理请求](../design/agent-api-processing-requests.md)。迁移、worker 重启与新进程均未执行。
+
+
 2026-09-06（0060/0061 私有 V4 execution spec 生命周期）——public view/API/change feed 不变：
 
 `remote_parse_v4_execution_spec` 保存每个 resourceful H0 至多 512 KiB exact canonical control bytes；

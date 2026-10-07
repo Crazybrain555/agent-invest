@@ -13,6 +13,9 @@ from typing import Self
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
+from disclosure_anchor.adapters.db.postgres.processing_requests import (
+    PostgresProcessingRequestRepository,
+)
 from disclosure_anchor.adapters.db.postgres.remote_parse_v4_repository import (
     RemoteParseV4Repository as PostgresRemoteParseV4Repository,
 )
@@ -37,6 +40,10 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
     TrackedCompanyRepository,
 )
 from disclosure_anchor.application.ports import repositories as ports_repos
+from disclosure_anchor.application.ports.processing_requests import (
+    ProcessingRequestRepository as ProcessingRequestRepositoryPort,
+    ProcessingRequestUnitOfWork,
+)
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Repository as RemoteParseV4RepositoryPort,
 )
@@ -74,6 +81,7 @@ class SqlAlchemyUnitOfWork:
     document_units: ports_repos.DocumentUnitRepository
     outbox: ports_repos.OutboxRepository
     publish_evidence: ports_repos.PublishEvidenceRepository
+    processing_requests: ProcessingRequestRepositoryPort
 
     def __init__(
         self,
@@ -184,6 +192,7 @@ class SqlAlchemyUnitOfWork:
         self.document_units = DocumentUnitRepository(session)
         self.outbox = OutboxRepository(session)
         self.publish_evidence = PublishEvidenceRepository(session)
+        self.processing_requests = PostgresProcessingRequestRepository(session)
 
     # -- transaction control ------------------------------------------------
     @property
@@ -204,5 +213,13 @@ class SqlAlchemyUnitOfWork:
 
 def unit_of_work_factory(engine: Engine) -> Callable[[], UnitOfWork]:
     """Build UnitOfWork instances from a process-level engine."""
+
+    return lambda: SqlAlchemyUnitOfWork(engine=engine)
+
+
+def processing_request_uow_factory(
+    engine: Engine,
+) -> Callable[[], ProcessingRequestUnitOfWork]:
+    """The same UnitOfWork, typed with its processing-request store."""
 
     return lambda: SqlAlchemyUnitOfWork(engine=engine)

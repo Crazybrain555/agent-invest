@@ -159,6 +159,67 @@ class CninfoWebSourceTests(unittest.TestCase):
         self.assertEqual(pages, [1, 2])
         self.assertEqual(len(refs), 31)
 
+    def _listing(self, pages: list[dict[str, object]]) -> tuple[list[AnnouncementRef], list[int]]:
+        served: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = request.read().decode()
+            served.append(int(dict(p.split("=") for p in body.split("&"))["pageNum"]))
+            return httpx.Response(200, json=pages[len(served) - 1])
+
+        refs = _source(handler).search_announcements(
+            SourceSecurity(security_code="000001", exchange="SZSE", security_name=None),
+            DisclosureWindow(date(2026, 4, 1), date(2026, 4, 30)),
+        )
+        return refs, served
+
+    def test_listing_ends_only_where_the_page_envelope_says_so(self) -> None:
+        full = [_record(1000 + i, f"公告{i}") for i in range(30)]
+        cases = {
+            "null announcements, no more": ([{"announcements": None, "hasMore": False}], 0, [1]),
+            "empty announcements, no more": ([{"announcements": [], "hasMore": False}], 0, [1]),
+            "full last page then empty end": (
+                [{"announcements": full, "hasMore": False},
+                 {"announcements": None, "hasMore": False}], 30, [1, 2]),
+            "full last page then a repeated page": (
+                [{"announcements": full, "hasMore": False},
+                 {"announcements": full, "hasMore": False}], 30, [1, 2]),
+        }
+        for name, (pages, count, served) in cases.items():
+            with self.subTest(case=name):
+                refs, pages_served = self._listing(pages)
+                self.assertEqual((len(refs), pages_served), (count, served))
+
+    def test_drifted_or_truncated_page_fails_instead_of_ending_the_listing(self) -> None:
+        # Like the API channel's count/shape checks: a page that cannot prove
+        # the end of the window is a retryable provider failure, never an end.
+        full = [_record(1000 + i, f"公告{i}") for i in range(30)]
+        cases = {
+            "announcements not an array": ([{"announcements": "shape drift", "hasMore": True}],
+                                           "invalid_response_shape"),
+            "announcements an object": ([{"announcements": {"x": 1}, "hasMore": False}],
+                                        "invalid_response_shape"),
+            "no announcements key": ([{"hasMore": False}], "invalid_response_shape"),
+            "no hasMore flag": ([{"announcements": full[:1]}], "invalid_response_shape"),
+            "hasMore not a boolean": ([{"announcements": full[:1], "hasMore": "false"}],
+                                      "invalid_response_shape"),
+            "empty page promising more": ([{"announcements": full, "hasMore": True},
+                                           {"announcements": [], "hasMore": True}],
+                                          "incomplete_response"),
+            "null page promising more": ([{"announcements": full[:1], "hasMore": True},
+                                          {"announcements": None, "hasMore": True}],
+                                         "incomplete_response"),
+            "repeated page promising more": ([{"announcements": full, "hasMore": True},
+                                              {"announcements": full, "hasMore": True}],
+                                             "incomplete_response"),
+        }
+        for name, (pages, code) in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(CninfoWebSourceError) as caught:
+                    self._listing(pages)
+                self.assertEqual(caught.exception.error_code, code)
+                self.assertTrue(caught.exception.retryable)
+
     def test_non_json_flap_is_retried(self) -> None:
         attempts = {"n": 0}
 

@@ -1049,6 +1049,34 @@ $REL status  --operation-id <op> --package <pkg> --private-binding <bind> --outp
 的 pending PDF（正式业务写入、结果保留，不是 scratch 实验）；全部责任收口、legacy-scope 再为零后，才按 §1.1h 走
 U01 v3（`implied/implied/2`、独立 GO、preflight）进入两个重活许可。不支持 Qnew 之后直接 exact heavy2。
 
+### 1.1j 私有 agent API 与显式处理请求（候选；以下步骤均未执行）
+
+设计：`../design/agent-api-processing-requests.md`。以下是联合上线顺序，须由当前生产控制者在取得部署授权后执行；
+只启动 AWS 网关或 mini API，不能让旧 worker 自动消费新请求。
+
+1. 冻结通过独立验证的 mini 候选与 AWS 网关，核对当时的 HANDOFF/RUNTIME、运行身份与全部未结职责，
+   按既有维护流程停止 worker。保留原件、已接受任务、处理结果、旧 release 与配置；不清库或重提 PDF。
+2. 迁移：在上述维护窗口按既有备份与迁移流程执行 `make migrate` 到 `0066_processing_request`
+   （只增三张 ops 表与授权）；随后跑 `make doctor`。API 和 worker 必须与迁移版本一致。
+3. worker：本改动包含 writer 指纹成员 `application/worker/queries.py`，不能用新代码配旧身份材料直接重启。
+   必须按 §1.1g 与 `../design/local-execution-upgrade.md`，依据当时的资格、恢复来源和全部未结职责选择适用
+   U01 版本，完成独立审阅、正式预检、受控安装及真实启动收据核验。不得改写旧资格/H0 或过滤职责来通过校验。
+   若现有资格不再适用，先明确所需验证范围；此 API 说明不授予额外 PDF/GPU 测试负载。
+   `WORKER_BATCH_REQUEST_DISCOVERY` 默认 2，设 0 只停止新的公告定位/发现尝试，
+   不停止 PDF 解析，也不撤销已绑定目标的下载/解析准入。
+4. agent API：在 `$(DISCLOSURE_ENV_DIR)/agent-api.env` 设置两个不同的 ≥32 字符令牌
+   （`DISCLOSURE_AGENT_API_READ_TOKEN`、`DISCLOSURE_AGENT_API_REQUEST_TOKEN`），必要时设置
+   `DISCLOSURE_AGENT_API_ALLOWED_HOSTS`；`make agent-api` 只绑定 loopback，单进程，无 access log。
+5. AWS 访问只经协调者管理的专用反向转发到 `127.0.0.1:8712`；不改既有 nginx/隧道；
+   AWS 使用两个 mini 令牌，另设不同的 MCP 访问令牌。验证两端握手、分权与实际读取后，
+   用已批准的精确请求核对持久受理和原 worker 消费，不能仅凭网关返回成功宣布完成。
+6. 回退：停 agent API 进程即可停止接收；已接受请求及尝试历史必须保留。
+   步骤 3 的发现开关不能取消已绑定职责；worker 代码回退仍须遵守 §1.1g 的身份与恢复约束。
+   不将 `0066` downgrade 作为常规回退，因为它会删除请求历史。
+
+运行事实：`pending` 公告发现需要 worker maintenance 在跑；drain_existing、public stop 时请求保持 pending/queued；
+状态中的 `*_queued` 是谓词选中事实，不是 worker 存活证明。
+
 ### 1.2 批量重解析与派生重置
 
 旧 NormalizedIR corpus reset/exact replay 工具已经删除：它维护第二套 manifest、备份、调度和状态分类，并会把旧 writer 重新引入生产入口。当前没有 production 数据；开发期需要重放时，使用明确的 document 列表走正常 Provider writer，先在仓外保留原 PDF 与 provider artifact，再由 operator 单独授权 DB/AgentSSD 变更。

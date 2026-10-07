@@ -24,9 +24,11 @@ PGPORT ?= 55432
 DISCLOSURE_ENV_DIR ?= $(HOME)/.config/agent-invest/disclosure_anchor
 WITH_ENV = set -a; for f in worker.env cninfo.env; do [ -r "$(DISCLOSURE_ENV_DIR)/$$f" ] && . "$(DISCLOSURE_ENV_DIR)/$$f"; done; set +a;
 WITH_WORKER_ENV = set -a; [ -r "$(DISCLOSURE_ENV_DIR)/worker.env" ] && . "$(DISCLOSURE_ENV_DIR)/worker.env"; set +a;
+# Private agent API: worker.env (DB/roots) plus agent-api.env (its two tokens).
+WITH_AGENT_API_ENV = set -a; for f in worker.env agent-api.env; do [ -r "$(DISCLOSURE_ENV_DIR)/$$f" ] && . "$(DISCLOSURE_ENV_DIR)/$$f"; done; set +a;
 
 .PHONY: doctor test test-unit test-contract test-data test-integration \
-	lint typecheck agent-check api archive pg-init pg-start pg-stop \
+	lint typecheck agent-check api agent-api archive pg-init pg-start pg-stop \
 	pg-status db-create migrate register parse build-units publish process rebuild-units parse-requeue source-recovery rebuild-search-projection load-rules config-check track track-status track-export untrack sync worker-once worker-loop doctor-full \
 	worker-status worker-control-status worker-release-circuit worker-record-circuit-stop \
 	worker-restart worker-backfill-publish-kpi mineru-smoke mineru-service-epoch-freeze mineru-validation-receipt mineru-phase-trace-capture mineru-tunnel-status install-mineru-tunnel mineru-remote-attest mineru-admission gc-orphans audit-unmapped-codes audit-weekly install-ops-launchd \
@@ -92,6 +94,10 @@ test-integration:
 
 api:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn disclosure_anchor.main:create_app --factory --host $(API_HOST) --port $(API_PORT)
+
+# Private agent API (loopback 8712 by default; host/port/tokens from settings).
+agent-api:
+	@$(WITH_AGENT_API_ENV) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m disclosure_anchor.cli.agent_api
 
 archive:
 	mkdir -p "$(ARCHIVE_DIR)"

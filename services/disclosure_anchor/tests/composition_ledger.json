@@ -36,6 +36,10 @@
    "private_imports": [],
    "tests": 6
   },
+  "tests/integration/test_disclosure_inventory_integration.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/integration/test_expired_prepared_closure_independent.py": {
    "private_imports": [],
    "tests": 2
@@ -80,6 +84,10 @@
    "private_imports": [],
    "tests": 35
   },
+  "tests/integration/test_original_download_link_integration.py": {
+   "private_imports": [],
+   "tests": 3
+  },
   "tests/integration/test_outbox_commit_order.py": {
    "private_imports": [],
    "tests": 1
@@ -91,6 +99,10 @@
   "tests/integration/test_prepare_and_publish_whole_document_v4.py": {
    "private_imports": [],
    "tests": 1
+  },
+  "tests/integration/test_processing_request_queue.py": {
+   "private_imports": [],
+   "tests": 10
   },
   "tests/integration/test_provider_terminal_retry_independent.py": {
    "private_imports": [],
@@ -192,6 +204,10 @@
   "tests/unit/test_acquisition_streaming_independent.py": {
    "private_imports": [],
    "tests": 15
+  },
+  "tests/unit/test_agent_api.py": {
+   "private_imports": [],
+   "tests": 10
   },
   "tests/unit/test_app_startup.py": {
    "private_imports": [],
@@ -297,7 +313,7 @@
   },
   "tests/unit/test_cninfo_web_source.py": {
    "private_imports": [],
-   "tests": 14
+   "tests": 16
   },
   "tests/unit/test_codex_model_catalog.py": {
    "private_imports": [],
@@ -334,6 +350,10 @@
   "tests/unit/test_diagnostic_projection_budget.py": {
    "private_imports": [],
    "tests": 4
+  },
+  "tests/unit/test_disclosure_inventory.py": {
+   "private_imports": [],
+   "tests": 10
   },
   "tests/unit/test_disclosure_source_port.py": {
    "private_imports": [],
@@ -1046,7 +1066,6 @@
   },
   "tests/unit/test_mineru_result_storage_release.py": {
    "private_imports": [
-    "_api_environment",
     "_require_storage_ceilings"
    ],
    "tests": 3
@@ -1155,6 +1174,14 @@
    "private_imports": [],
    "tests": 9
   },
+  "tests/unit/test_original_download_link.py": {
+   "private_imports": [],
+   "tests": 4
+  },
+  "tests/unit/test_original_download_link_api_independent.py": {
+   "private_imports": [],
+   "tests": 4
+  },
   "tests/unit/test_owned_disk_budget_independent.py": {
    "private_imports": [],
    "tests": 1
@@ -1192,6 +1219,18 @@
   "tests/unit/test_prepare_and_publish_whole_document_v4.py": {
    "private_imports": [],
    "tests": 6
+  },
+  "tests/unit/test_processing_request_contract.py": {
+   "private_imports": [],
+   "tests": 13
+  },
+  "tests/unit/test_processing_request_schema.py": {
+   "private_imports": [],
+   "tests": 8
+  },
+  "tests/unit/test_processing_requests.py": {
+   "private_imports": [],
+   "tests": 29
   },
   "tests/unit/test_progress_measurement_independent.py": {
    "private_imports": [],
@@ -1296,6 +1335,10 @@
   "tests/unit/test_qualified_runtime_upgrade.py": {
    "private_imports": [],
    "tests": 14
+  },
+  "tests/unit/test_quick_pdf_text.py": {
+   "private_imports": [],
+   "tests": 13
   },
   "tests/unit/test_r22_measurement_integration_independent.py": {
    "private_imports": [],

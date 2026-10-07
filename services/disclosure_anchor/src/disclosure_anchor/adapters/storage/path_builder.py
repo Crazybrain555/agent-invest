@@ -130,10 +130,15 @@ class FileStorePathBuilder:
         )
         return _assert_relative(relpath)
 
+    def data_root(self) -> Path:
+        """Root that every recorded data relpath (raw originals included) is under."""
+
+        return self._settings.disclosure_data_root / "data"
+
     def data_path(self, relpath: Path) -> Path:
         relpath = _assert_relative(relpath)
-        path = self._settings.disclosure_data_root / "data" / relpath
-        data_root = self._settings.disclosure_data_root / "data"
+        data_root = self.data_root()
+        path = data_root / relpath
         if not _is_relative_to(path, data_root):
             raise PathSafetyError(f"data path escapes root: {path}")
         return path

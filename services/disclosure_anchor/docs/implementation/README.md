@@ -16,6 +16,7 @@
 - `checks/fixture-and-test-policy.md`：真实样本、合成测试和 provider opt-in gate。
 - `runbooks/production-operations.md`：当前 worker、doctor、GC 与迁移操作。
 - `design/worker-dynamic-scheduling.md`：resident worker 机制。
+- `design/agent-api-processing-requests.md`：私有 agent API（8712）、显式处理请求的持久身份、worker 侧有界 discovery、精确准入与只读 quick text；候选未部署。
 - `design/v4-resource-lifetime.md`：H0/spec 原子存储、历史回填/退役、原地资源归属与启动/ACK 门。
 - `design/mineru-throughput-scheduler.md`：MinerU 端到端工作守恒调度、进程级资源所有权、
   vector credits、配置生命周期、Auto 与吞吐验收的当前实施契约；旧 fixed-arm/7GiB 约束不再适用。

@@ -36,6 +36,11 @@ CORPUS_WRITE_NS = 815006
 # This must be a different key from DOC_NS: nested UnitOfWork transactions
 # use DOC_NS and may run on another pooled connection.
 DOC_PRODUCER_NS = 815007
+# Explicit processing requests (0066): one xact lock per idempotency key, and
+# one xact lock serializing new-request creation for the rolling limit.
+# 815005 is the managed scratch-database lifecycle lock.
+PROCESSING_REQUEST_KEY_NS = 815008
+PROCESSING_REQUEST_ADMISSION_NS = 815009
 
 
 class WorkerBusyError(RuntimeError):

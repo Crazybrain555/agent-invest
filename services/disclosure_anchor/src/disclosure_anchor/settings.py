@@ -704,6 +704,71 @@ class Settings(BaseSettings):
             "DISCLOSURE_ADMIN_TOKEN", "disclosure_admin_token"
         ),
     )
+    # Private agent API (agent_api.py): a separate loopback process with its
+    # own read and request tokens; it refuses to start without both. The
+    # existing Filing API app is unchanged and never mounts these routes.
+    disclosure_agent_api_read_token: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_READ_TOKEN", "disclosure_agent_api_read_token"
+        ),
+    )
+    disclosure_agent_api_request_token: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_REQUEST_TOKEN", "disclosure_agent_api_request_token"
+        ),
+    )
+    disclosure_agent_api_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_HOST", "disclosure_agent_api_host"
+        ),
+    )
+    disclosure_agent_api_port: int = Field(
+        default=8712,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_PORT", "disclosure_agent_api_port"
+        ),
+    )
+    # Exact Host header values accepted (comma-separated host:port).
+    disclosure_agent_api_allowed_hosts: str = Field(
+        default="127.0.0.1:8712,localhost:8712",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_ALLOWED_HOSTS", "disclosure_agent_api_allowed_hosts"
+        ),
+    )
+    # New processing requests per rolling 24 hours; replays are never counted.
+    disclosure_agent_api_daily_request_limit: int = Field(
+        default=200,
+        ge=1,
+        le=10000,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_DAILY_REQUEST_LIMIT",
+            "disclosure_agent_api_daily_request_limit",
+        ),
+    )
+    # Concurrent quick-text extraction children; extra reads get 503 BUSY.
+    disclosure_agent_api_text_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_TEXT_CONCURRENCY",
+            "disclosure_agent_api_text_concurrency",
+        ),
+    )
+    disclosure_agent_api_text_timeout_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        le=120,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_TEXT_TIMEOUT_SECONDS",
+            "disclosure_agent_api_text_timeout_seconds",
+        ),
+    )
     # Backfill backpressure: when pending-download + downloaded/pending-parse
     # work reaches this watermark, never-synced companies are deferred.  The
     # env key keeps its original name for compatibility.
@@ -796,6 +861,16 @@ class Settings(BaseSettings):
         default=50,
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_PARSE", "worker_batch_parse"),
+    )
+    # Explicit processing requests whose provider discovery one acquisition
+    # pass may attempt (0 disables). Each attempt is lease- and deadline-bound.
+    worker_batch_request_discovery: int = Field(
+        default=2,
+        ge=0,
+        le=20,
+        validation_alias=AliasChoices(
+            "WORKER_BATCH_REQUEST_DISCOVERY", "worker_batch_request_discovery"
+        ),
     )
     # One process selects exactly one parse execution model at boot.  The
     # legacy path remains the safe default and must not compose any V4 secret,

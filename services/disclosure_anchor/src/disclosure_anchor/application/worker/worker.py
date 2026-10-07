@@ -57,6 +57,9 @@ from disclosure_anchor.application.ports.provider_parser import (
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticRouteReceiptStorePort,
 )
+from disclosure_anchor.application.ports.processing_requests import (
+    ProcessingRequestUnitOfWork,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjection,
@@ -84,7 +87,11 @@ from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
 from disclosure_anchor.application.services.semantic_router import SemanticRouter
+from disclosure_anchor.application.use_cases.processing_requests import (
+    ProcessingRequestResolver,
+)
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    INDEX_INTERFACE,
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
 )
@@ -300,6 +307,11 @@ class WorkerDeps:
     # read/map/store/DB finish) exceeds the extreme lease; launchd keeps that
     # nonzero exit down until an operator restarts the worker.
     on_parse_runaway: Callable[[str], None] = lambda _document_id: None
+    # Explicit processing requests (0066). None disables request discovery,
+    # e.g. for callers whose unit of work does not expose the request store.
+    processing_request_uow_factory: (
+        Callable[[], ProcessingRequestUnitOfWork] | None
+    ) = None
     # Resident production wiring re-validates the dedicated PostgreSQL
     # singleton session before every admission boundary and during long
     # waits. Losing that session must stop active MinerU groups before this
@@ -315,6 +327,8 @@ def _merge_acquisition_report(report: WorkerReport, acquisition: WorkerReport) -
 
     report.synced_companies += acquisition.synced_companies
     report.candidates_discovered += acquisition.candidates_discovered
+    report.request_discovery_claimed += acquisition.request_discovery_claimed
+    report.requests_resolved += acquisition.requests_resolved
     report.downloaded += acquisition.downloaded
     report.deferred_backfill += acquisition.deferred_backfill
     report.failed += acquisition.failed
@@ -397,7 +411,23 @@ def run_once(
             while True:
                 synced_before = acquisition.synced_companies
                 downloaded_before = acquisition.downloaded
+                resolved_before = acquisition.requests_resolved
                 try:
+                    if (
+                        limits.request_discovery > 0
+                        and not acquisition.sync_rate_limited
+                        and not acquisition.sync_quota_break
+                        and not acquisition.source_outage_break
+                        and not _has_local_infrastructure_failure(acquisition)
+                        and not should_stop()
+                    ):
+                        source = _request_discovery_stage(
+                            acquisition,
+                            deps,
+                            source,
+                            limit=limits.request_discovery,
+                            should_stop=should_stop,
+                        )
                     if (
                         limits.sync > 0
                         and not acquisition.sync_rate_limited
@@ -470,6 +500,7 @@ def run_once(
                 if (
                     acquisition.synced_companies == synced_before
                     and acquisition.downloaded == downloaded_before
+                    and acquisition.requests_resolved == resolved_before
                 ):
                     # No successful progress this pass: both queues are idle
                     # or every remaining item failed. Ending the round's
@@ -535,6 +566,73 @@ def run_once(
 
     report.duration_seconds = (deps.clock() - started_at).total_seconds()
     return report
+
+
+def _request_discovery_stage(
+    report: WorkerReport,
+    deps: WorkerDeps,
+    source: DisclosureSourcePort | None,
+    *,
+    limit: int,
+    should_stop: Callable[[], bool],
+) -> DisclosureSourcePort | None:
+    """Resolve due explicit processing requests inside the acquisition pump.
+
+    Same lifecycle as sync/download: a provider refusal sets the round's
+    existing cooldown flags, a stop ends the pass, and each request outcome
+    heartbeats once. The provider client is created only when work is due.
+    """
+
+    factory = deps.processing_request_uow_factory
+    if factory is None:
+        return source
+    with factory() as uow:
+        if not uow.processing_requests.due_discovery_requests(
+            now=deps.clock(), limit=1
+        ):
+            return source
+    source = source or deps.source_factory()
+    result = ProcessingRequestResolver(
+        uow_factory=factory,
+        source=source,
+        profile_loader=deps.profile_loader_factory(source),
+        # The interface the worker's own index sync records for either channel.
+        index_interface=INDEX_INTERFACE,
+        classify_failure=_classify_discovery_failure,
+        clock=deps.clock,
+        should_stop=should_stop,
+        heartbeat=deps.heartbeat,
+    ).run(limit=limit)
+    report.request_discovery_claimed += result.claimed
+    report.requests_resolved += result.concluded
+    if result.failed:
+        report.failed += result.failed
+        report.failures.append(
+            WorkerFailure(
+                stage="request_discovery",
+                item_ref="processing_request",
+                error_code="discovery_attempt_failed",
+                retryable=None,
+            )
+        )
+    if result.provider_refusal == "rate_limited":
+        report.sync_rate_limited = True
+    elif result.provider_refusal == "quota_exhausted":
+        report.sync_quota_break = True
+    elif result.provider_refusal == "outage":
+        report.source_outage_break = True
+    return source
+
+
+def _classify_discovery_failure(exc: BaseException) -> str:
+    if _is_rate_limit_error(exc):
+        return "rate_limited"
+    if _is_quota_error(exc):
+        return "quota_exhausted"
+    error_code, retryable = _source_error_details(exc)
+    if _is_provider_infrastructure_error(error_code, retryable):
+        return "outage"
+    return "item"
 
 
 def _sync_stage(

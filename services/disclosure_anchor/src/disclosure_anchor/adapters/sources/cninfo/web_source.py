@@ -74,6 +74,30 @@ class CninfoWebSourceError(SourceRequestError):
     """Raised when the public endpoint fails under retry policy."""
 
 
+def _page_facts(payload: dict[str, Any], *, page: int) -> tuple[list[Any], bool]:
+    """One query page's records and more-pages flag.
+
+    Every page carries an ``announcements`` key (null or [] when empty) and a
+    boolean ``hasMore``. Any other envelope says nothing about the window, so it
+    fails like the API channel's shape check instead of reading as an empty end.
+    """
+
+    announcements = payload.get("announcements")
+    has_more = payload.get("hasMore")
+    if (
+        "announcements" not in payload
+        or not (announcements is None or isinstance(announcements, list))
+        or not isinstance(has_more, bool)
+    ):
+        raise CninfoWebSourceError(
+            f"CNINFO web index page {page} lacks an announcements array "
+            "or a hasMore flag; response shape drifted",
+            error_code="invalid_response_shape",
+            retryable=True,
+        )
+    return announcements or [], has_more
+
+
 def _website_column(exchange: str) -> str:
     """Map only website channels whose behavior is verified.
 
@@ -146,9 +170,18 @@ class CninfoWebSource:
                 window=window,
                 page=page,
             )
-            announcements = payload.get("announcements")
-            if not isinstance(announcements, list) or not announcements:
+            announcements, has_more = _page_facts(payload, page=page)
+            if not announcements:
+                if has_more:
+                    # A truncated result, not the end of the window: an empty
+                    # page cannot both end the listing and promise more.
+                    raise CninfoWebSourceError(
+                        f"CNINFO web index page {page} is empty but reports more pages",
+                        error_code="incomplete_response",
+                        retryable=True,
+                    )
                 break
+            added = 0
             for record in announcements:
                 # Shape drift must fail loudly: a silently dropped record
                 # lands behind the advanced checkpoint and becomes a
@@ -167,8 +200,18 @@ class CninfoWebSource:
                     continue
                 seen.add(ref.provider_document_id)
                 refs.append(ref)
-            if not payload.get("hasMore") and len(announcements) < PAGE_SIZE:
+                added += 1
+            if not has_more and (len(announcements) < PAGE_SIZE or added == 0):
                 break
+            if added == 0:
+                # More pages are promised but this one only repeated records
+                # already seen, so the listing is not advancing.
+                raise CninfoWebSourceError(
+                    f"CNINFO web index page {page} repeats earlier records "
+                    "but reports more pages",
+                    error_code="incomplete_response",
+                    retryable=True,
+                )
             page += 1
         return refs
 

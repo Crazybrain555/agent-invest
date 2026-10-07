@@ -38,7 +38,10 @@ from disclosure_anchor.adapters.db.postgres.connection import (
     require_runtime_app_connection,
     require_runtime_app_engine,
 )
-from disclosure_anchor.adapters.db.postgres.unit_of_work import unit_of_work_factory
+from disclosure_anchor.adapters.db.postgres.unit_of_work import (
+    processing_request_uow_factory,
+    unit_of_work_factory,
+)
 from disclosure_anchor.adapters.parsers.mineru_medium.process import (
     MinerUProcess,
     terminate_active_mineru_processes,
@@ -1685,7 +1688,7 @@ class _AdaptiveLoopController:
 
 
 def _made_progress(report: WorkerReport) -> bool:
-    return bool(report.synced_companies or report.downloaded)
+    return bool(report.synced_companies or report.downloaded or report.requests_resolved)
 
 
 def _source_infrastructure_outage(report: WorkerReport) -> bool:
@@ -1818,6 +1821,7 @@ def _limits(settings: Settings) -> WorkerLimits:
         parse=settings.worker_batch_parse,
         build=settings.worker_batch_build,
         publish=settings.worker_batch_publish,
+        request_discovery=settings.worker_batch_request_discovery,
     )
 
 
@@ -1896,6 +1900,7 @@ def _deps(
     return WorkerDeps(
         engine=engine,
         uow_factory=unit_of_work_factory(engine),
+        processing_request_uow_factory=processing_request_uow_factory(engine),
         path_builder=paths,
         raw_store=RawDocumentStore.from_settings(paths, settings),
         artifact_store=artifacts,

@@ -21,6 +21,9 @@ class WorkerLimits:
     # conservative DTO default keeps direct constructions (tests) on the
     # legacy single-pass shape — production wires WORKER_ACQUISITION_SECONDS.
     acquisition_seconds: int = 0
+    # Explicit processing requests resolved by provider discovery per pass;
+    # 0 keeps direct constructions free of discovery work.
+    request_discovery: int = 0
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,8 @@ class WorkerReport:
     stale_reclaimed: int = 0
     synced_companies: int = 0
     candidates_discovered: int = 0
+    request_discovery_claimed: int = 0
+    requests_resolved: int = 0
     downloaded: int = 0
     parsed: int = 0
     built: int = 0
@@ -87,6 +92,8 @@ class WorkerReport:
             "stale_reclaimed": self.stale_reclaimed,
             "synced_companies": self.synced_companies,
             "candidates_discovered": self.candidates_discovered,
+            "request_discovery_claimed": self.request_discovery_claimed,
+            "requests_resolved": self.requests_resolved,
             "downloaded": self.downloaded,
             "sync_quota_break": self.sync_quota_break,
             "sync_rate_limited": self.sync_rate_limited,
