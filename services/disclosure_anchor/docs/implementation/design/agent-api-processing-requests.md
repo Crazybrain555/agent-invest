@@ -69,13 +69,16 @@
 
 ## 5. 队列准入（唯一谓词）
 
-- `pending_parse` / `pending_parse_backlog_count`：普通门（活跃公司 + 分类范围，含 carrier 与 title_noise）与
-  `processing_request_target` 精确准入取 OR；准入按 `document_id + raw_file_hash`，或在下载前按 provider 身份。
+- `pending_parse` / `pending_parse_backlog_count`：（活跃公司门 OR `processing_request_target` 精确准入）AND 分类门。
+  显式请求只释放公司门，解析范围沿用生产默认：`processing_policy.json` 的有效类与公司 `process_classes` 覆盖
+  （替换，空或 NULL 继承）、carrier 守卫、title_noise 硬排除，与普通文档完全相同。`enqueue_parse=true` 的含义是
+  “按生产范围解析”，v1 没有超范围覆盖字段。精确准入按 `document_id + raw_file_hash`，或在下载前按 provider 身份。
   重试资格（retryable 闩、契约失败门、item/charged 预算）、running-run 排除、published/parsed 状态排除、
-  frozen campaign 的 `document_ids` allowlist 全部在 OR 之外，保持不变。
+  frozen campaign 的 `document_ids` allowlist 都在组合之外，保持不变。
 - staged-v4 候选源（latest/page）、locked H0 ingress 复查、source rejection 复查都调用同一 `pending_parse`，
   因此不会出现 page 选中而 H0 拒绝。有限 pass 的 cursor/ceiling 语义不变，旧 ID 在下一 pass 可见（独立审查 B1–B3）。
-- `pending_downloads` / `pending_download_count`：普通池门 + 分类范围与精确下载准入取 OR；准入只覆盖尚未登记候选的首次获取；
+- `pending_downloads` / `pending_download_count`：（普通池门 AND 分类门）OR 精确下载准入。获取原件是独立能力，
+  超出解析范围的公告也可下载到 mini 并读 quick text 与官方链接；准入只覆盖尚未登记候选的首次获取，
   失败计数上限与非重试闩不变。新增 `provider_document_ids` 仅供状态读取精确提问。
 - 已 published 不重排；running/queued 直接加入既有职责；耗尽或契约失败报告 `parse_blocked`，从不重置。
 
@@ -83,6 +86,9 @@
 
 - `status.state` / `terminal` / `next_action` 由 `derive_status` 从事实纯函数推导；解析中恒为 `wait`。
   `*_queued` 表示 worker 自己的谓词此刻选中，不代表 worker 正在运行。`archived` 只表示原件已登记，不代表文本可提取。
+- 请求了解析但未被选中时，状态读取再问一次去掉分类门的同一谓词：若那样会选中，说明挡住它的是生产解析范围，
+  报 `parse_blocked` + `blocked_reasons=["outside_parse_scope"]` + `next_action=none`，不报重试失败；
+  原件与 `/text` 照常可用。否则如实报重试/闩/契约原因，或 `not_selected_by_queue`。
 - wait：1–20s，1s 轮询新快照，状态哈希变化或终态即返回；超时不取消任何事。
 
 ## 7. Quick text

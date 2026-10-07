@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from datetime import date
+import io
 import json
 import logging
+import os
 from pathlib import Path
 import tempfile
 import threading
 from typing import Any
 import unittest
+from unittest import mock
 
 from disclosure_anchor.application.contracts.quick_pdf_text import (
     QuickPdfTextChunk,
@@ -333,6 +337,57 @@ class AgentApiTests(unittest.TestCase):
         self.assertIn("route=/v1/documents/{document_id}/text", joined)
         self.assertNotIn("SECRETCURSORVALUE", joined)
         self.assertNotIn(READ, joined)
+
+
+
+@unittest.skipIf(TestClient is None, "fastapi is not installed")
+class AgentApiCliTests(unittest.TestCase):
+    ROOTS = {
+        name: "/nonexistent/agent-api-cli"
+        for name in ("DISCLOSURE_DATA_ROOT", "DISCLOSURE_SHARED_ROOT", "DISCLOSURE_RUNTIME_ROOT",
+                     "MINERU_MODEL_CACHE", "HF_HOME", "MODELSCOPE_CACHE")
+    }
+    TOKEN = "SYNTHETIC-READ-TOKEN-0c4d8e2a6f1b9d3c"
+
+    def _main(self, env: dict[str, str], argv: list[str] | None = None) -> tuple[int, str]:
+        from disclosure_anchor.cli import agent_api as cli
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch("uvicorn.run", side_effect=AssertionError("the server must not start")),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = cli.main([] if argv is None else argv)
+        return code, stderr.getvalue()
+
+    def test_invalid_settings_name_the_variable_never_its_value(self) -> None:
+        missing_root = {k: v for k, v in self.ROOTS.items() if k != "DISCLOSURE_RUNTIME_ROOT"}
+        cases = {
+            "token pasted into the port": (
+                {**self.ROOTS, "DISCLOSURE_AGENT_API_PORT": self.TOKEN},
+                "DISCLOSURE_AGENT_API_PORT [int_parsing]",
+            ),
+            "missing root beside a token": (
+                {**missing_root, "DISCLOSURE_AGENT_API_READ_TOKEN": self.TOKEN},
+                "DISCLOSURE_RUNTIME_ROOT [missing]",
+            ),
+        }
+        for name, (env, named) in cases.items():
+            with self.subTest(case=name):
+                code, err = self._main(env)
+                # The same status the uncaught validation error exits with.
+                self.assertEqual(code, 1)
+                self.assertIn("invalid agent API settings (values withheld): ", err)
+                self.assertIn(named, err)
+                self.assertNotIn(self.TOKEN, err)
+
+    def test_other_startup_refusals_keep_their_messages_and_status(self) -> None:
+        code, err = self._main({**self.ROOTS, "DISCLOSURE_AGENT_API_HOST": "0.0.0.0"})
+        self.assertEqual((code, err.strip()), (2, "DISCLOSURE_AGENT_API_HOST must be a loopback address"))
+        code, err = self._main(dict(self.ROOTS), argv=["--port", "1"])
+        self.assertEqual(code, 2)
+        self.assertIn("takes no arguments", err)
 
 
 if __name__ == "__main__":

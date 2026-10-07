@@ -1,10 +1,13 @@
 """Explicit processing requests on the managed scratch DB (0066).
 
 Exact-filing admission must reach the real queue predicates — the staged-v4
-candidate source and its locked H0-shaped recheck included — while pool,
-taxonomy and retry gates keep every other row where it was. Requests must be
-durable across "restarts" and resolved by the worker resolver without any
-client re-POST. Runs only under ``make test-integration``.
+candidate source and its locked H0-shaped recheck included. A request releases
+the company gate for parsing but never the production taxonomy (effective
+classes, company override, carrier guard, title noise) or the retry gates; a
+first download releases pool and taxonomy. Requests must be durable across
+"restarts" and resolved by the worker resolver without any client re-POST.
+Uniquely named synthetic rules keep the taxonomy cases independent of the
+loaded real rules. Runs only under ``make test-integration``.
 """
 
 from __future__ import annotations
@@ -27,7 +30,10 @@ from disclosure_anchor.adapters.db.postgres.staged_new_work_v4 import (
 from disclosure_anchor.adapters.db.postgres.unit_of_work import (
     processing_request_uow_factory,
 )
-from disclosure_anchor.application.contracts.processing_request import normalize_intent
+from disclosure_anchor.application.contracts.processing_request import (
+    derive_status,
+    normalize_intent,
+)
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
     DisclosureWindow,
@@ -63,9 +69,24 @@ class ProcessingRequestQueueTests(unittest.TestCase):
         self.doc_ids: list[str] = []
         self.sa_ids: list[str] = []
         self.request_ids: list[str] = []
+        token = self.suffix.upper()
+        self.rule_version = f"it-{self.suffix}"
+        self.scope_class = f"itcls{self.suffix}"
+        self.override_class = f"itoth{self.suffix}"
+        self.scope = (self.scope_class,)
+        self.in_title = f"ITIN{token}"
+        self.override_title = f"ITOTH{token}"
+        self.default_title = f"ITDEF{token}"
+        self.noise_title = f"ITNZ{token}"
+        self.scope_code = f"ITC{token}"
+        self.carrier_code = f"ITK{token}"
 
     def tearDown(self) -> None:
         with self.engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM disclosure_core.classification_rule WHERE version = :version"),
+                {"version": self.rule_version},
+            )
             request_ids = list(self.request_ids)
             request_ids += [
                 row[0]
@@ -167,7 +188,36 @@ class ProcessingRequestQueueTests(unittest.TestCase):
                  "security": self.security_id, "status": tracked_status},
             )
 
-    def _document(self, conn: Any, *, title: str = OFF_SCOPE_TITLE, status: str = "registered") -> str:
+    def _rules(self, conn: Any) -> None:
+        """Synthetic rules for this test's own class and tokens, beside the real ones."""
+
+        conn.execute(
+            text(
+                "INSERT INTO disclosure_core.classification_rule "
+                "(rule_set, prefix, value, priority, version) VALUES "
+                "('title', :in_title, :scope_class, 1, :version), "
+                "('title', :override_title, :override_class, 1, :version), "
+                "('title_noise', :noise_title, 'noise', 1, :version), "
+                "('class', :scope_code, :scope_class, 1, :version), "
+                "('class', :carrier_code, 'intermediary_report', 1, :version)"
+            ),
+            {"in_title": self.in_title, "override_title": self.override_title,
+             "noise_title": self.noise_title, "scope_code": self.scope_code,
+             "carrier_code": self.carrier_code, "scope_class": self.scope_class,
+             "override_class": self.override_class, "version": self.rule_version},
+        )
+
+    def _status(self, conn: Any, request_id: str) -> dict[str, Any]:
+        reader = PostgresProcessingStatusReader(
+            self.engine, max_download_retries=3, max_parse_retries=3,
+            max_build_retries=3, scope_classes=self.scope,
+        )
+        facts = reader._read(conn, request_id, observed_at=datetime.now(timezone.utc))
+        assert facts is not None
+        return derive_status(facts)
+
+    def _document(self, conn: Any, *, title: str = OFF_SCOPE_TITLE, status: str = "registered",
+                  raw_category: str = "") -> str:
         document_id = f"doc_pr{self.suffix}{len(self.doc_ids)}"
         pid = f"9{len(self.doc_ids)}{self.suffix[-6:]}"
         conn.execute(
@@ -176,10 +226,11 @@ class ProcessingRequestQueueTests(unittest.TestCase):
                 "(document_id, company_id, security_id, status, title, provider, provider_document_id, "
                 " provider_metadata, raw_file_relpath, raw_file_hash, announcement_date) "
                 "VALUES (:id, :company, :security, :status, :title, 'cninfo', :pid, "
-                " '{\"raw_category\": \"\"}'::jsonb, :relpath, :hash, DATE '2026-03-30')"
+                " CAST(:meta AS jsonb), :relpath, :hash, DATE '2026-03-30')"
             ),
             {"id": document_id, "company": self.company_id, "security": self.security_id,
              "status": status, "title": title, "pid": pid,
+             "meta": json.dumps({"raw_category": raw_category}),
              "relpath": f"raw_documents/cninfo/{self.code}/2026/{pid}/sha256_{'c' * 64}.pdf",
              "hash": HASH},
         )
@@ -218,52 +269,105 @@ class ProcessingRequestQueueTests(unittest.TestCase):
             {"target_id": "dprt_" + ids.new_ulid(), "request_id": request_id, **row},
         )
 
-    def _eligible(self, conn: Any, **kwargs: Any) -> list[str]:
+    def _eligible(self, conn: Any, *, scope: tuple[str, ...] | None = None, **kwargs: Any) -> list[str]:
         return [
             row["document_id"]
             for row in queries.pending_parse(
-                conn, max_retries=3, limit=500000, scope_classes=SCOPE,
+                conn, max_retries=3, limit=500000, scope_classes=scope or self.scope,
                 require_active_company_scope=True, **kwargs,
             )
         ]
 
+    def _failed_parse_runs(self, conn: Any, document_id: str, count: int) -> None:
+        for n in range(count):
+            conn.execute(
+                text(
+                    "INSERT INTO disclosure_core.processing_run (processing_run_id, document_id, "
+                    " artifact_owner_processing_run_id, run_kind, status, started_at, error, "
+                    " provider_document_relpath) VALUES (:id, :doc, :id, 'parse', 'failed', "
+                    " now() - (:n || ' minutes')::interval, CAST(:error AS jsonb), 'x')"
+                ),
+                {"id": f"run_pr{self.suffix}{n}", "doc": document_id, "n": str(n + 1),
+                 "error": json.dumps({"stage": "parse", "error_code": "T", "retryable": True,
+                                      "retry_budget_class": "item"})},
+            )
+
     # -- parse admission ---------------------------------------------------------
-    def test_exact_parse_admission_bypasses_pool_and_taxonomy_but_never_retry_gates(self) -> None:
+    def test_exact_parse_admission_releases_only_the_company_gate(self) -> None:
         with self.engine.connect() as conn:
             txn = conn.begin()
             try:
                 self._subject(conn, tracked_status="paused")
-                target = self._document(conn)
-                control = self._document(conn)
-                self.assertNotIn(target, self._eligible(conn))
-                request_id = self._request(conn)
-                self._target(conn, request_id, document_id=target, raw_file_hash=HASH)
-                eligible = self._eligible(conn)
-                self.assertIn(target, eligible)
-                self.assertNotIn(control, eligible)
+                self._rules(conn)
+                admitted = self._document(conn, title=self.in_title)
+                control = self._document(conn, title=self.in_title)
+                blocked = {
+                    "class outside the defaults": self._document(conn, title=self.default_title),
+                    "carrier outside the defaults": self._document(
+                        conn, title=self.default_title,
+                        raw_category=f"{self.scope_code}||{self.carrier_code}"),
+                    "title noise": self._document(conn, title=self.in_title + self.noise_title),
+                }
+                self.assertEqual(self._eligible(conn), [])  # paused company
+                requests = {}
+                for document in (admitted, *blocked.values()):
+                    requests[document] = self._request(conn)
+                    self._target(conn, requests[document], document_id=document, raw_file_hash=HASH)
+                self.assertEqual(self._eligible(conn), [admitted])
+                self.assertEqual(queries.pending_parse_backlog_count(conn, scope_classes=self.scope), 1)
                 # The locked H0/source-rejection recheck asks the same question.
-                self.assertEqual(self._eligible(conn, document_ids=(target,)), [target])
-                self.assertEqual(self._eligible(conn, document_ids=(control,)), [])
-                before = queries.pending_parse_backlog_count(conn, scope_classes=SCOPE)
-                self.assertGreaterEqual(before, 1)
+                self.assertEqual(self._eligible(conn, document_ids=(admitted,)), [admitted])
+                self.assertEqual(self._status(conn, requests[admitted])["state"], "parse_queued")
+                for name, document in blocked.items():
+                    with self.subTest(blocked=name):
+                        self.assertEqual(self._eligible(conn, document_ids=(document,)), [])
+                        status = self._status(conn, requests[document])
+                        self.assertEqual(
+                            (status["state"], status["next_action"], status["parse"]["blocked_reasons"]),
+                            ("parse_blocked", "none", ["outside_parse_scope"]),
+                        )
+                        # The archived original stays available to quick text.
+                        self.assertEqual((status["original"]["state"], status["original"]["text_path"]),
+                                         ("archived", f"/v1/documents/{document}/text"))
                 # A raw-hash mismatch binds nothing.
                 other = self._request(conn)
                 self._target(conn, other, document_id=control, raw_file_hash="sha256:" + "d" * 64)
                 self.assertNotIn(control, self._eligible(conn))
-                # Retry gates still close the admitted document.
-                for n in range(3):
+                # Retry gates still close the admitted document, and status names them, not the scope.
+                self._failed_parse_runs(conn, admitted, 3)
+                self.assertEqual(self._eligible(conn), [])
+                reasons = self._status(conn, requests[admitted])["parse"]["blocked_reasons"]
+                self.assertIn("item_retry_budget_exhausted", reasons)
+                self.assertNotIn("outside_parse_scope", reasons)
+            finally:
+                txn.rollback()
+
+    def test_requests_follow_company_overrides_and_untracked_defaults(self) -> None:
+        with self.engine.connect() as conn:
+            txn = conn.begin()
+            try:
+                self._subject(conn, tracked_status="paused")
+                self._rules(conn)
+                default_class = self._document(conn, title=self.in_title)
+                override_class = self._document(conn, title=self.override_title)
+                for document in (default_class, override_class):
+                    self._target(conn, self._request(conn), document_id=document, raw_file_hash=HASH)
+
+                def override(classes: list[str]) -> None:
                     conn.execute(
-                        text(
-                            "INSERT INTO disclosure_core.processing_run (processing_run_id, document_id, "
-                            " artifact_owner_processing_run_id, run_kind, status, started_at, error, "
-                            " provider_document_relpath) VALUES (:id, :doc, :id, 'parse', 'failed', "
-                            " now() - (:n || ' minutes')::interval, CAST(:error AS jsonb), 'x')"
-                        ),
-                        {"id": f"run_pr{self.suffix}{n}", "doc": target, "n": str(n + 1),
-                         "error": json.dumps({"stage": "parse", "error_code": "T", "retryable": True,
-                                              "retry_budget_class": "item"})},
+                        text("UPDATE disclosure_core.tracked_company "
+                             "SET process_classes = CAST(:classes AS jsonb) WHERE tracked_company_id = :id"),
+                        {"classes": json.dumps(classes), "id": self.tracked_id},
                     )
-                self.assertNotIn(target, self._eligible(conn))
+
+                self.assertEqual(self._eligible(conn), [default_class])
+                override([self.override_class])  # replaces the global classes, as for ordinary rows
+                self.assertEqual(self._eligible(conn), [override_class])
+                override([])  # empty inherits the global classes
+                self.assertEqual(self._eligible(conn), [default_class])
+                conn.execute(text("DELETE FROM disclosure_core.tracked_company WHERE tracked_company_id = :id"),
+                             {"id": self.tracked_id})
+                self.assertEqual(self._eligible(conn), [default_class])  # untracked company
             finally:
                 txn.rollback()
 
@@ -272,9 +376,11 @@ class ProcessingRequestQueueTests(unittest.TestCase):
             txn = conn.begin()
             try:
                 self._subject(conn, tracked_status=None)
-                running = self._document(conn)
-                published = self._document(conn, status="published")
-                for document_id in (running, published):
+                self._rules(conn)
+                ready = self._document(conn, title=self.in_title)
+                running = self._document(conn, title=self.in_title)
+                published = self._document(conn, title=self.in_title, status="published")
+                for document_id in (ready, running, published):
                     self._target(conn, self._request(conn), document_id=document_id, raw_file_hash=HASH)
                 conn.execute(
                     text(
@@ -284,27 +390,26 @@ class ProcessingRequestQueueTests(unittest.TestCase):
                     ),
                     {"id": f"run_pr{self.suffix}r", "doc": running},
                 )
-                eligible = self._eligible(conn)
-                self.assertNotIn(running, eligible)
-                self.assertNotIn(published, eligible)
+                # All three are in scope; only the guards keep two of them out.
+                self.assertEqual(self._eligible(conn), [ready])
             finally:
                 txn.rollback()
 
     def test_staged_candidate_source_and_locked_recheck_admit_only_the_exact_document(self) -> None:
         with self.engine.begin() as conn:
             self._subject(conn, tracked_status="paused")
-            target = self._document(conn)
-            control = self._document(conn)
-            self._target(conn, self._request(conn), document_id=target, raw_file_hash=HASH)
+            self._rules(conn)  # committed; tearDown removes this test's rule version
+            target = self._document(conn, title=self.in_title)
+            control = self._document(conn, title=self.in_title)
+            off_scope = self._document(conn, title=self.default_title)
+            for document in (target, off_scope):
+                self._target(conn, self._request(conn), document_id=document, raw_file_hash=HASH)
         source = PostgresV4OrdinaryParseCandidateSource(
-            engine=self.engine, max_retries=3, scope_classes=SCOPE,
+            engine=self.engine, max_retries=3, scope_classes=self.scope,
         )
         page = source.list_candidates(after_document_id=None, limit=500000)
-        listed = [candidate.document_id for candidate in page.candidates]
-        self.assertIn(target, listed)
-        self.assertNotIn(control, listed)
-        latest = source.latest_document_id()
-        self.assertIsNotNone(latest)
+        self.assertEqual([candidate.document_id for candidate in page.candidates], [target])
+        self.assertEqual(source.latest_document_id(), target)
         with self.engine.connect() as conn:
             txn = conn.begin()
             try:
@@ -313,7 +418,8 @@ class ProcessingRequestQueueTests(unittest.TestCase):
                 session = Session(bind=conn)
                 acquire_document_xact_lock(session, target)
                 self.assertEqual(self._eligible(session.connection(), document_ids=(target,)), [target])
-                self.assertEqual(self._eligible(session.connection(), document_ids=(control,)), [])
+                for refused in (control, off_scope):
+                    self.assertEqual(self._eligible(session.connection(), document_ids=(refused,)), [])
             finally:
                 txn.rollback()
 

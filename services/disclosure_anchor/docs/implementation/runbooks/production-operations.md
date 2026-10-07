@@ -1067,9 +1067,13 @@ U01 v3（`implied/implied/2`、独立 GO、preflight）进入两个重活许可�
 4. agent API：在 `$(DISCLOSURE_ENV_DIR)/agent-api.env` 设置两个不同的 ≥32 字符令牌
    （`DISCLOSURE_AGENT_API_READ_TOKEN`、`DISCLOSURE_AGENT_API_REQUEST_TOKEN`），必要时设置
    `DISCLOSURE_AGENT_API_ALLOWED_HOSTS`；`make agent-api` 只绑定 loopback，单进程，无 access log。
+   常驻运行可用 mcp_builder `servers/disclosure/deploy/mini/install_agent_api.zsh` 安装 LaunchAgent
+   （仅在登录会话内常驻；已加载即拒绝，校验通过前不写文件）。
 5. AWS 访问只经协调者管理的专用反向转发到 `127.0.0.1:8712`；不改既有 nginx/隧道；
    AWS 使用两个 mini 令牌，另设不同的 MCP 访问令牌。验证两端握手、分权与实际读取后，
    用已批准的精确请求核对持久受理和原 worker 消费，不能仅凭网关返回成功宣布完成。
+   显式请求只释放公司门：解析仍按生产分类（有效类、公司覆盖、carrier、title_noise），超范围的报
+   `outside_parse_scope`，原件、quick text 与官方链接仍可用。验收应各用一条在范围与超范围的已归档公告。
 6. 回退：停 agent API 进程即可停止接收；已接受请求及尝试历史必须保留。
    步骤 3 的发现开关不能取消已绑定职责；worker 代码回退仍须遵守 §1.1g 的身份与恢复约束。
    不将 `0066` downgrade 作为常规回退，因为它会删除请求历史。

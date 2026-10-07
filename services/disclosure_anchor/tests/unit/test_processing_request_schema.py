@@ -12,12 +12,16 @@ from sqlalchemy.dialects.postgresql import psycopg
 
 from disclosure_anchor.adapters.db.postgres import models
 from disclosure_anchor.adapters.db.postgres.migration_state import single_migration_head
+from disclosure_anchor.adapters.db.postgres.processing_requests import (
+    PostgresProcessingStatusReader,
+)
 from disclosure_anchor.adapters.db.postgres.schema import (
     APP_ROLE,
     FUTURE_L2_READER_ROLE,
     OPS_SCHEMA,
     READER_ROLE,
 )
+from disclosure_anchor.application.contracts.processing_request import TargetRecord
 from disclosure_anchor.application.worker import queries
 
 MIGRATION = importlib.import_module(
@@ -204,19 +208,28 @@ class CheckThreeValuedLogicTests(unittest.TestCase):
 
 
 class QueuePredicateCompositionTests(unittest.TestCase):
-    def test_parse_admission_is_an_alternative_to_the_scope_gates_only(self) -> None:
+    def test_exact_parse_admission_releases_only_the_company_gate(self) -> None:
+        exact = queries._PARSE_REQUEST_ADMISSION_SQL
+        # (company OR exact request) AND taxonomy; a frozen replay without the
+        # company gate keeps only the taxonomy gate.
+        self.assertEqual(queries._parse_admission_sql("AND C", "AND S"), f"AND ((true AND C) OR {exact}) AND S")
+        self.assertEqual(queries._parse_admission_sql("AND C", ""), f"AND ((true AND C) OR {exact}) ")
+        self.assertEqual(queries._parse_admission_sql("", "AND S"), "AND S")
+        self.assertEqual(queries._parse_admission_sql("", ""), "")
         recorder = _Recorder()
         queries.pending_parse(recorder, max_retries=3, limit=1,  # type: ignore[arg-type]
                               scope_classes=("annual_report",), require_active_company_scope=True,
                               document_ids=("doc_x",))
         sql = recorder.statements[0]
-        retry = sql.index("COALESCE(q.last_failed_retryable, true)")
-        alternative = sql.index("OR \n    EXISTS (")
-        self.assertLess(retry, alternative)
-        self.assertIn("processing_request_target AS pra", sql)
+        company = "AND (d.company_id IS NULL OR tc_scope.status = 'active')"
+        scope = queries._processing_scope_sql(
+            category_expr="d.provider_metadata->>'raw_category'", title_expr="d.title")
+        admission = queries._parse_admission_sql(company, scope)
+        self.assertIn(admission, sql)
         self.assertIn("pra.raw_file_hash = d.raw_file_hash", sql)
-        # The frozen document allowlist stays outside the alternative.
-        self.assertGreater(sql.index("q.document_id = ANY(:document_ids)"), alternative)
+        # Retry gates precede the admission; the frozen allowlist follows it.
+        self.assertLess(sql.index("COALESCE(q.last_failed_retryable, true)"), sql.index(admission))
+        self.assertGreater(sql.index("q.document_id = ANY(:document_ids)"), sql.index(admission))
 
     def test_frozen_replay_without_gates_reads_no_admission(self) -> None:
         recorder = _Recorder()
@@ -240,6 +253,56 @@ class QueuePredicateCompositionTests(unittest.TestCase):
         self.assertIn("pra.provider_document_id = q.provider_document_id", sql)
         self.assertLess(sql.index("q.failed_download_count < :max_retries"), sql.index("pra.admit_download"))
         self.assertEqual(recorder.params[0]["provider_document_ids"], ["1220000001"])
+
+
+class StatusReaderScopeTests(unittest.TestCase):
+    """outside_parse_scope is asked only when the real scope says no."""
+
+    ROW = {
+        "document_id": "doc_1", "status": "registered", "raw_file_hash": "sha256:" + "a" * 64,
+        "provider": "cninfo", "provider_document_id": "1220000001", "title": "t",
+        "announcement_date": None, "current_processing_run_id": None, "security_code": "600519",
+        "exchange": "SSE", "running_processing_run_id": None,
+    }
+    TARGET = TargetRecord(target_id="dprt_" + "1" * 26, resolution_method="document_id",
+                          admit_download=False, admit_parse=True, document_id="doc_1",
+                          raw_file_hash="sha256:" + "a" * 64)
+
+    def _facts(self, *, requested: bool, actual: bool, relaxed: bool,
+               scope: tuple[str, ...] | None = ("annual_report",)) -> tuple[Any, list[Any]]:
+        reader = PostgresProcessingStatusReader(
+            mock.MagicMock(), max_download_retries=3, max_parse_retries=3,
+            max_build_retries=3, scope_classes=scope)
+        conn = mock.MagicMock()
+        conn.execute.return_value.mappings.return_value.one_or_none.return_value = self.ROW
+        asked: list[Any] = []
+
+        def pending_parse(_conn: Any, *, scope_classes: Any, **_kwargs: Any) -> list[dict[str, str]]:
+            asked.append(scope_classes)
+            hit = actual if scope_classes is not None else relaxed
+            return [{"document_id": "doc_1"}] if hit else []
+
+        with (
+            mock.patch.object(queries, "pending_parse", side_effect=pending_parse),
+            mock.patch.object(queries, "parse_admission_diagnosis",
+                              return_value={"currently_eligible": actual, "remaining_blockers": {}}),
+        ):
+            document = reader._document_facts(conn, self.TARGET, requested=requested)
+        return document, asked
+
+    def test_taxonomy_is_named_only_when_it_is_the_gate_that_says_no(self) -> None:
+        cases = [
+            ("blocked only by taxonomy", True, False, True, True, [("annual_report",), None]),
+            ("blocked by a retry or company gate", True, False, False, False, [("annual_report",), None]),
+            ("selected", True, True, True, False, [("annual_report",)]),
+            ("download-only request", False, False, True, False, [("annual_report",)]),
+        ]
+        for name, requested, actual, relaxed, outside, asked in cases:
+            with self.subTest(case=name):
+                document, seen = self._facts(requested=requested, actual=actual, relaxed=relaxed)
+                self.assertEqual((document.outside_parse_scope, seen), (outside, asked))
+        unscoped, seen = self._facts(requested=True, actual=False, relaxed=True, scope=None)
+        self.assertEqual((unscoped.outside_parse_scope, seen), (False, [None]))
 
 
 if __name__ == "__main__":

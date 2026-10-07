@@ -137,6 +137,7 @@ ParseBlockedReason = Literal[
     "charged_retry_budget_exhausted",
     "not_selected_by_queue",
     "post_processing_not_selected",
+    "outside_parse_scope",
 ]
 
 

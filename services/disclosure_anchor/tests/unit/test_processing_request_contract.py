@@ -335,6 +335,31 @@ class DeriveStatusTests(unittest.TestCase):
              "item_retry_budget_exhausted"],
         )
 
+    def test_out_of_scope_parse_is_production_policy_not_a_retry_failure(self) -> None:
+        status = _status(target=_candidate_target(), document=_document(outside_parse_scope=True))
+        self.assertEqual((status["state"], status["terminal"], status["next_action"]),
+                         ("parse_blocked", True, "none"))
+        parse = status["parse"]
+        assert isinstance(parse, dict)
+        self.assertEqual(parse["blocked_reasons"], ["outside_parse_scope"])
+        # Retry facts are reported as they are; nothing is claimed exhausted.
+        self.assertEqual((parse["retry"]["item_failure_count"], parse["retry"]["latest_failed_run_id"]),
+                         (0, None))
+        original = status["original"]
+        assert isinstance(original, dict)
+        self.assertEqual((original["state"], original["text_path"]),
+                         ("archived", "/v1/documents/doc_01M4B45TP76AY533REBBYHCBGX/text"))
+        # Only an unselected, requested parse reads the flag.
+        for document, state in ((_document(outside_parse_scope=True, parse_selected=True), "parse_queued"),
+                                (_document(outside_parse_scope=True, status="published"), "published")):
+            with self.subTest(state=state):
+                self.assertEqual(_status(target=_candidate_target(), document=document)["state"], state)
+        download_only = _status(request=_request(enqueue_parse=False),
+                                target=_candidate_target(admit_parse=False),
+                                document=_document(outside_parse_scope=True))
+        self.assertEqual((download_only["state"], download_only["parse"]["state"]),  # type: ignore[index]
+                         ("archived", "not_requested"))
+
     def test_not_requested_parse_ends_at_archived(self) -> None:
         status = _status(request=_request(enqueue_parse=False),
                          target=_candidate_target(admit_parse=False), document=_document())

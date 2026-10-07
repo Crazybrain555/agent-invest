@@ -102,7 +102,7 @@
   },
   "tests/integration/test_processing_request_queue.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/integration/test_provider_terminal_retry_independent.py": {
    "private_imports": [],
@@ -207,7 +207,7 @@
   },
   "tests/unit/test_agent_api.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 12
   },
   "tests/unit/test_app_startup.py": {
    "private_imports": [],
@@ -1222,11 +1222,11 @@
   },
   "tests/unit/test_processing_request_contract.py": {
    "private_imports": [],
-   "tests": 13
+   "tests": 14
   },
   "tests/unit/test_processing_request_schema.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/unit/test_processing_requests.py": {
    "private_imports": [],

@@ -352,14 +352,17 @@ def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
     )
 
 
-# Explicit processing requests (0066) admit one exact filing past the pool and
-# taxonomy gates only, through the admit flags of processing_request_target; retry budgets, latches, the running-run guard and the
-# nonretryable-download exclusion still apply to it unchanged. Download
-# admission covers first acquisition of a not-yet-registered candidate. Parse
-# admission is bound to the registered document and its raw hash, or to the
-# provider identity until the requested candidate has been downloaded. The
-# staged-v4 scanner, its locked H0 recheck and source rejection all read this
-# same predicate, so admission cannot pass a page and then fail at commit.
+# Explicit processing requests (0066) admit one exact filing through the admit
+# flags of processing_request_target; retry budgets, latches, the running-run
+# guard and the nonretryable-download exclusion still apply to it unchanged.
+# Download admission releases the pool and taxonomy gates for the first
+# acquisition of a not-yet-registered candidate. Parse admission releases only
+# the company gate: the effective classes, carrier guard and title noise still
+# decide, exactly as for ordinary documents. It is bound to the registered
+# document and its raw hash, or to the provider identity until the requested
+# candidate has been downloaded. The staged-v4 scanner, its locked H0 recheck
+# and source rejection all read this same predicate, so admission cannot pass
+# a page and then fail at commit.
 _DOWNLOAD_REQUEST_ADMISSION_SQL = f"""
     (NOT q.already_registered
      AND EXISTS (
@@ -397,13 +400,13 @@ def _download_admission_sql(scope_classes: tuple[str, ...] | None) -> str:
 
 
 def _parse_admission_sql(company_scope_sql: str, scope_sql: str) -> str:
-    """Ordinary company+taxonomy gate, or one exact explicit request."""
+    """(Ordinary company gate OR one exact explicit request) AND the taxonomy gate."""
 
-    if not company_scope_sql and not scope_sql:
-        return ""
+    if not company_scope_sql:
+        return scope_sql
     return (
-        f"AND ((true {company_scope_sql} {scope_sql})"
-        f" OR {_PARSE_REQUEST_ADMISSION_SQL})"
+        f"AND ((true {company_scope_sql}) OR {_PARSE_REQUEST_ADMISSION_SQL})"
+        f" {scope_sql}"
     )
 
 
@@ -756,8 +759,9 @@ def pending_parse(
     back to the registration filing_type. None → parse everything ('all').
     Current active-company admission is independent of that taxonomy scope;
     only a raw-identity-guarded frozen replay may explicitly bypass it. An
-    explicit processing request admits its exact document past both gates
-    (never the retry gates), so every caller sees the same eligibility.
+    explicit processing request releases the company gate for its exact
+    document only; taxonomy and retry gates still apply, so every caller sees
+    the same eligibility.
 
     ``after_document_id`` (exclusive) and ``through_document_id`` (inclusive)
     bound one keyset window, and ``descending`` reverses its order; all apply

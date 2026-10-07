@@ -398,7 +398,7 @@ class PostgresProcessingStatusReader:
         )
         if target is None:
             return facts
-        document = self._document_facts(conn, target)
+        document = self._document_facts(conn, target, requested=request.enqueue_parse)
         if document is not None:
             return ProcessingFacts(
                 request=request,
@@ -421,7 +421,7 @@ class PostgresProcessingStatusReader:
         )
 
     def _document_facts(
-        self, conn: Connection, target: TargetRecord
+        self, conn: Connection, target: TargetRecord, *, requested: bool
     ) -> DocumentFacts | None:
         if target.document_id is not None:
             where, params = "d.document_id = :document_id", {"document_id": target.document_id}
@@ -474,6 +474,20 @@ class PostgresProcessingStatusReader:
             scope_classes=self._scope_classes,
             require_active_company_scope=True,
         )
+        outside_parse_scope = False
+        if requested and not selected and self._scope_classes is not None:
+            # Same predicate without the taxonomy gate: if that selects it, the
+            # production parse classes are what keep it out, not a retry gate.
+            outside_parse_scope = bool(
+                queries.pending_parse(
+                    conn,
+                    max_retries=self._max_parse_retries,
+                    limit=1,
+                    scope_classes=None,
+                    require_active_company_scope=True,
+                    document_ids=(document_id,),
+                )
+            )
         status = str(row["status"])
         post_parse_selected = (
             queries.post_parse_selected(
@@ -498,6 +512,7 @@ class PostgresProcessingStatusReader:
             running_processing_run_id=row["running_processing_run_id"],
             parse_selected=selected,
             retry=dict(diagnosis["remaining_blockers"]),
+            outside_parse_scope=outside_parse_scope,
             post_parse_selected=post_parse_selected,
         )
 

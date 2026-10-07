@@ -408,6 +408,22 @@ at-least-once 投递 + 消费端幂等（重复投递不产生重复消费效果
 
 ## 6. 契约变更记录（append-only）
 
+2026-10-08（显式请求的解析范围沿用生产默认，候选未部署）——public view、公共 Filing API 与 change feed 不变，
+0066 表结构不变：
+
+```text
+queries._parse_admission_sql 由「(公司门 AND 分类门) OR 精确目标」改为「(公司门 OR 精确目标) AND 分类门」：
+显式请求只释放活跃公司门，有效类/公司 process_classes 覆盖/carrier/title_noise 与普通文档相同；
+下载准入不变（池门+分类门 OR 首次获取的精确目标）。同一函数覆盖 pending_parse、积压计数、库存、
+状态读取、staged-v4 scanner、锁内 H0 复查与 source rejection。私有 agent API 的 ParseBlockedReason
+新增 outside_parse_scope：请求解析、真实范围未选中而去掉分类门会选中时报告，next_action=none，
+不报重试失败；contracts/agent_api.openapi.yaml 已重导出。cli.agent_api 对 pydantic 设置校验错误
+只输出变量名与错误类型（不含输入值），退出码仍为 1。
+```
+
+测试：tests/unit/test_processing_request_schema.py、test_processing_request_contract.py、test_agent_api.py；
+scratch-only tests/integration/test_processing_request_queue.py（作者未运行，需 root scratch runner）。
+
 2026-10-07（0066 显式处理请求 + 私有 agent API，候选未部署）——public view、公共 Filing API（8711）与 change
 feed 不变；新增私有 agent API（8712，生成契约 `contracts/agent_api.openapi.yaml`）：
 

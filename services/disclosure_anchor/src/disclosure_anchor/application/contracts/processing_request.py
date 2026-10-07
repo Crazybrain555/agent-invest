@@ -405,6 +405,9 @@ class DocumentFacts:
     retry: Mapping[str, object] = field(default_factory=dict)
     # For status 'parsed': whether the build or publish predicate selects it.
     post_parse_selected: bool = False
+    # Not selected with the resident taxonomy scope but selected without it:
+    # the production parse classes, not a retry gate, keep it out.
+    outside_parse_scope: bool = False
 
 
 @dataclass(frozen=True)
@@ -689,7 +692,11 @@ def _parse(facts: ProcessingFacts) -> dict[str, Any]:
         body["state"] = "not_requested"
     else:
         body["state"] = "parse_blocked"
-        body["blocked_reasons"] = _parse_blockers(document.retry)
+        body["blocked_reasons"] = (
+            ["outside_parse_scope"]
+            if document.outside_parse_scope
+            else _parse_blockers(document.retry)
+        )
     return body
 
 
@@ -757,6 +764,9 @@ def _summary(
         return "archived", True, "none"
     if parse_state in ("parse_running", "post_processing", "parse_queued"):
         return parse_state, False, "wait"
+    if parse["blocked_reasons"] == ["outside_parse_scope"]:
+        # Production policy, not a fault: the archived original stays readable.
+        return "parse_blocked", True, "none"
     return "parse_blocked", True, "operator_action_required"
 
 
