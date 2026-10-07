@@ -12,6 +12,9 @@
   `GET /v1/documents/{id}/text`（quick native text），以及其他作者提供并由本 app 组合的
   `GET /v1/disclosure-inventory`、`GET /v1/documents/{id}/download-link`。
 - AWS 侧只做 MCP/HTTP 转发：无队列、无缓存、无签名、无终态推导。
+- 库存读取在单条只读 SQL 的同一快照内计算总数、状态与分页，SQL 上限 120 秒；`limit` 只限制
+  返回页，不限制总数的计算范围。AWS 请求上限 180 秒，原生客户端建议留到 210 秒，完成即返回。
+  这些等待预算不改变 ≤20 秒的请求状态长轮询，也不等待生产队列清空；托管隧道仍受控制面预算约束。
 
 ## 2. 鉴权与传输
 

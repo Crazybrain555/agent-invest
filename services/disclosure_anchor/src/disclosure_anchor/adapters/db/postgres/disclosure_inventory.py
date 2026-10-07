@@ -27,16 +27,25 @@ def inventory_sql(scope_classes: tuple[str, ...] | None) -> str:
     status_counts = ", ".join(
         f"'{status}', count(*) FILTER (WHERE status = '{status}')" for status in INVENTORY_STATUSES
     )
+    # Row sets read by several steps (canonical documents, scoped, runs, facts) are
+    # written once; single-reader steps and the classified/matching projections
+    # stream. Each queue policy runs only over that queue's rows: CASE stops the
+    # parse scope gate becoming an early filter over every document, and the
+    # publish_queue fence keeps the unit-existence check a per-run probe instead
+    # of an aggregate over all document units.
     return f"""
     WITH canonical_documents AS MATERIALIZED (
       SELECT DISTINCT ON (
           COALESCE(d.provider, ''), CASE WHEN NULLIF(d.provider, '') IS NULL THEN d.document_id
-            ELSE COALESCE(NULLIF(d.provider_document_id, ''), d.document_id) END) d.*
+            ELSE COALESCE(NULLIF(d.provider_document_id, ''), d.document_id) END)
+             d.document_id, d.provider, d.provider_document_id, d.security_id, d.title,
+             d.announcement_date, d.status, d.raw_file_hash, d.raw_file_relpath,
+             d.current_processing_run_id
         FROM {C}.document d
        ORDER BY COALESCE(d.provider, ''), CASE WHEN NULLIF(d.provider, '') IS NULL THEN d.document_id
                   ELSE COALESCE(NULLIF(d.provider_document_id, ''), d.document_id) END,
                 d.created_at DESC, d.document_id DESC
-    ), candidates AS MATERIALIZED (
+    ), candidates AS (
       SELECT DISTINCT ON (c->>'provider_document_id')
              c->>'provider_document_id' AS provider_document_id, c AS candidate
         FROM {C}.source_access sa,
@@ -47,7 +56,7 @@ def inventory_sql(scope_classes: tuple[str, ...] | None) -> str:
        ORDER BY c->>'provider_document_id',
                 CASE WHEN COALESCE(c->>'raw_category', '') <> '' THEN 0 ELSE 1 END,
                 sa.accessed_at DESC, sa.source_access_id DESC
-    ), universe AS MATERIALIZED (
+    ), universe AS (
       SELECT 'document:' || d.document_id AS inventory_id, d.document_id,
              d.provider, d.provider_document_id, s.security_code, s.exchange,
              d.title, d.announcement_date::text AS announcement_date,
@@ -70,20 +79,22 @@ def inventory_sql(scope_classes: tuple[str, ...] | None) -> str:
       JOIN scoped target ON target.document_id = q.document_id
       JOIN {C}.document d ON d.document_id = q.document_id
       LEFT JOIN {C}.tracked_company tc_scope ON tc_scope.company_id = d.company_id
-      WHERE ({queries._PARSE_RETRY_ELIGIBLE_SQL}) {parse_admission}
+      WHERE CASE WHEN ({queries._PARSE_RETRY_ELIGIBLE_SQL}) THEN true {parse_admission} ELSE false END
     ), download_selected AS (
       SELECT q.provider_document_id FROM {O}.pending_download_v1 q
       JOIN scoped target ON target.provider = 'cninfo' AND target.provider_document_id = q.provider_document_id
       LEFT JOIN {C}.tracked_company tc_scope ON tc_scope.company_id = q.company_id
       WHERE q.failed_download_count < :max_download_retries {queries._download_admission_sql(scope_classes)}
+    ), publish_queue AS MATERIALIZED (
+      SELECT q.processing_run_id, q.document_id FROM {O}.pending_publish_v1 q
+      JOIN scoped target ON target.document_id = q.document_id
     ), post_selected AS (
       SELECT q.document_id FROM {O}.pending_build_v1 q
       JOIN scoped target ON target.document_id = q.document_id
       JOIN {C}.processing_run r ON r.processing_run_id = q.processing_run_id
       WHERE ({queries._BUILD_RETRY_ELIGIBLE_SQL}) AND NOT ({queries._TERMINAL_PUBLISH_QUARANTINE_SQL})
       UNION
-      SELECT q.document_id FROM {O}.pending_publish_v1 q
-      JOIN scoped target ON target.document_id = q.document_id
+      SELECT q.document_id FROM publish_queue q
       WHERE EXISTS (SELECT 1 FROM {C}.document_unit u WHERE u.processing_run_id = q.processing_run_id)
     ), relevant_runs AS MATERIALIZED (
       SELECT r.* FROM {C}.processing_run r JOIN scoped target ON target.document_id = r.document_id
@@ -167,7 +178,7 @@ def inventory_sql(scope_classes: tuple[str, ...] | None) -> str:
       LEFT JOIN last_run_failure rf ON rf.document_id = target.document_id
       LEFT JOIN download_failures df ON target.provider = 'cninfo' AND df.provider_document_id = target.provider_document_id
       LEFT JOIN last_download_failure ldf ON target.provider = 'cninfo' AND ldf.provider_document_id = target.provider_document_id
-    ), classified AS MATERIALIZED (
+    ), classified AS NOT MATERIALIZED (
       SELECT facts.*, CASE
         WHEN document_status = 'published' THEN 'published'
         WHEN running_processing_run_id IS NOT NULL THEN 'parsing'
@@ -177,7 +188,7 @@ def inventory_sql(scope_classes: tuple[str, ...] | None) -> str:
         WHEN download_selected THEN 'not_downloaded_queued'
         ELSE 'not_downloaded_not_queued' END AS status
       FROM facts
-    ), matching AS MATERIALIZED (
+    ), matching AS NOT MATERIALIZED (
       SELECT * FROM classified WHERE CAST(:status AS text) IS NULL
         OR status = :status OR (:status = 'failed' AND active_failure)
     ), page AS (
@@ -211,7 +222,8 @@ class PostgresDisclosureInventoryReader:
     def read(self, query: InventoryQuery) -> InventorySnapshot:
         with self._engine.connect() as conn:
             conn.execute(text("SET TRANSACTION READ ONLY"))
-            conn.execute(text("SET LOCAL statement_timeout = '8s'"))
+            # Bounds the whole global snapshot; limit only bounds the returned page.
+            conn.execute(text("SET LOCAL statement_timeout = '120s'"))
             try:
                 return self._read(conn, query)
             finally:

@@ -38,7 +38,7 @@
   },
   "tests/integration/test_disclosure_inventory_integration.py": {
    "private_imports": [],
-   "tests": 2
+   "tests": 7
   },
   "tests/integration/test_expired_prepared_closure_independent.py": {
    "private_imports": [],

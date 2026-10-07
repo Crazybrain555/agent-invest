@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 
 from disclosure_anchor.adapters.db.postgres.disclosure_inventory import (
-    PostgresDisclosureInventoryReader, inventory_sql,
+    PostgresDisclosureInventoryReader,
 )
 from disclosure_anchor.api.agent_auth import AgentApiAccess
 from disclosure_anchor.api.errors import install_error_handlers
@@ -21,7 +21,6 @@ from disclosure_anchor.application.contracts.disclosure_inventory import (
     INVENTORY_STATUSES, InventoryQueryInvalid, InventorySnapshot, continuation_cursor, normalize_query,
 )
 from disclosure_anchor.application.use_cases.read_disclosure_inventory import ReadDisclosureInventory
-from disclosure_anchor.application.worker import queries
 
 
 def _row(**overrides):
@@ -154,26 +153,29 @@ class DisclosureInventoryTests(unittest.TestCase):
         snapshot = reader.read(normalize_query(limit=1))
         self.assertEqual(len(snapshot.items), 1)
         self.assertTrue(snapshot.has_more)
-        self.assertEqual(conn.execute.call_count, 3)
         self.assertEqual(str(conn.execute.call_args_list[0].args[0]), "SET TRANSACTION READ ONLY")
-        self.assertIn("statement_timeout", str(conn.execute.call_args_list[1].args[0]))
-        sql, params = conn.execute.call_args_list[2].args
-        self.assertIn("LIMIT :page_limit", str(sql))
+        self.assertEqual(str(conn.execute.call_args_list[1].args[0]), "SET LOCAL statement_timeout = '120s'")
+        _, params = conn.execute.call_args_list[-1].args
         self.assertEqual((params["page_limit"], params["max_retries"], params["max_build_retries"]), (2, 4, 2))
         self.assertEqual(params["max_build_ceiling"], 10)
         conn.rollback.assert_called_once()
 
-    def test_scheduler_reuse_keeps_intent_scope_retry_and_running_guards(self) -> None:
-        sql = inventory_sql(("annual_report",))
-        self.assertIn(queries._PARSE_RETRY_ELIGIBLE_SQL, sql)
-        self.assertIn(queries._download_admission_sql(("annual_report",)), sql)
-        self.assertIn(queries._BUILD_RETRY_ELIGIBLE_SQL, sql)
-        self.assertIn("pra.raw_file_hash = d.raw_file_hash", sql)
-        self.assertIn("pra.admit_download", sql)
-        self.assertIn("pra.admit_parse", sql)
-        self.assertIn("pending_parse_v1", sql)
-        self.assertIn("tc_scope.status = 'active'", sql)
-        self.assertNotIn("OFFSET", sql)
+    def test_public_reader_rolls_back_failure_and_does_not_retry_a_canceled_snapshot(self) -> None:
+        # SQL-fragment assertions used to pin the implementation, although the
+        # scheduler's actual answers are the invariant. Scratch tests below
+        # cover that parity; this case covers cleanup of the live failure family.
+        engine = mock.MagicMock()
+        conn = engine.connect.return_value.__enter__.return_value
+        failure = OperationalError("private SQL", {}, RuntimeError("query canceled"))
+        conn.execute.side_effect = (mock.Mock(), mock.Mock(), failure)
+        reader = PostgresDisclosureInventoryReader(engine, max_download_retries=3,
+            max_parse_retries=4, max_build_retries=2, scope_classes=("annual_report",))
+        with self.assertRaises(OperationalError) as raised:
+            reader.read(normalize_query(limit=1))
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(conn.execute.call_count, 3)
+        conn.rollback.assert_called_once()
+        engine.connect.assert_called_once()
 
     def _client(self):
         app = FastAPI()
