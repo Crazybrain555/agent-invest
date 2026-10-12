@@ -11,6 +11,17 @@ qualified maximum and no probe below the recover floor. A below-recover band
 with provably no provider work is reported as ``idle_memory_deficit``; the
 target stays where it is.
 
+Every decision also reports whether it is part of an idle memory-deficit
+episode: admission closed for new POSTs, a fresh known sample whose provider is
+idle, and the GPU and/or host lane below its recover floor, in any band
+(``memory_pause``, ``gpu_memory_pressure`` or ``idle_memory_deficit``). The
+episode's time is the observation-time progress between consecutive such
+samples at most ``sample_max_age_seconds`` apart: re-reading a cached sample or
+a late evaluation adds nothing. Unknown, stale or unsafe evaluations neither
+credit nor end it; an evaluation that admits new POSTs or a fresh sample with
+provider work ends it. The policy only reports the episode; the coordinator
+owns its bound.
+
 ``new_post_allowed`` is the separate permission for a new remote POST. It is
 true only for a fresh, known, safe decision with a positive target outside the
 pause/reduce bands. A held positive target during an unknown grace interval
@@ -88,6 +99,11 @@ class StreamAdmissionDecision:
     sample_observed_monotonic: float | None
     unsafe: bool = False
     new_post_allowed: bool = False
+    # Lanes below their recover floors on a fresh, provider-idle sample while
+    # new POSTs are closed: "gpu", "host" or "gpu_host"; None otherwise.
+    idle_deficit: str | None = None
+    # Attested duration of the current idle-deficit episode, in seconds.
+    idle_deficit_seconds: float = 0.0
 
 
 class MineruStreamPolicy:
@@ -111,6 +127,10 @@ class MineruStreamPolicy:
         self._healthy_observed: float | None = None
         self._last_reduction = float("-inf")
         self._unsafe_reason: str | None = None
+        # Idle-deficit episode: credited seconds, and the observation time of
+        # the last deficit sample that a next one may extend.
+        self._deficit_seconds = 0.0
+        self._deficit_observed: float | None = None
 
     def evaluate(self, sample: StreamPressureSample | None, *, now: float) -> StreamAdmissionDecision:
         if isinstance(now, bool) or not isfinite(now) or now < 0 or now < self._last_now:
@@ -206,12 +226,50 @@ class MineruStreamPolicy:
         return self._decision(sample, "recovery" if self._target < c.qualified_max else "qualified_target")
 
     def _decision(self, sample: StreamPressureSample | None, reason: str, *, unsafe: bool = False) -> StreamAdmissionDecision:
+        new_post_allowed = not unsafe and self._target > 0 and reason in _NEW_POST_REASONS
+        deficit = self._idle_deficit(sample, unsafe=unsafe, new_post_allowed=new_post_allowed)
         return StreamAdmissionDecision(
             self._target, reason, None if sample is None else sample.sequence,
             None if sample is None else sample.evidence_sha256,
             None if sample is None else sample.observed_monotonic, unsafe,
-            new_post_allowed=(not unsafe and self._target > 0 and reason in _NEW_POST_REASONS),
+            new_post_allowed=new_post_allowed,
+            idle_deficit=deficit,
+            idle_deficit_seconds=self._deficit_seconds,
         )
+
+    def _idle_deficit(
+        self, sample: StreamPressureSample | None, *, unsafe: bool, new_post_allowed: bool,
+    ) -> str | None:
+        """Advance the idle-deficit episode for this evaluation; return its lanes."""
+        if new_post_allowed:
+            self._deficit_seconds, self._deficit_observed = 0.0, None
+            return None
+        c, now = self.config, self._last_now
+        if (unsafe or sample is None or sample.unknown_reason is not None
+                or sample.observed_monotonic is None
+                or now - sample.observed_monotonic > c.sample_max_age_seconds
+                or sample.gpu_free_bytes is None or sample.host_available_bytes is None
+                or sample.http_active is None or sample.http_pending is None
+                or sample.provider_nonterminal_tasks is None):
+            # Not a fresh known fact: the episode neither grows nor ends.
+            self._deficit_observed = None
+            return None
+        if sample.provider_nonterminal_tasks or sample.http_active or sample.http_pending:
+            # Accepted provider work can still release memory by itself.
+            self._deficit_seconds, self._deficit_observed = 0.0, None
+            return None
+        gpu = sample.gpu_free_bytes < c.gpu_recover_bytes
+        host = sample.host_available_bytes < c.host_recover_bytes
+        if not (gpu or host):
+            # Floors hold while the recovery window runs: no credit, no end.
+            self._deficit_observed = None
+            return None
+        observed, previous = sample.observed_monotonic, self._deficit_observed
+        if previous is not None and 0 < observed - previous <= c.sample_max_age_seconds:
+            self._deficit_seconds += observed - previous
+        if previous is None or observed > previous:
+            self._deficit_observed = observed
+        return "gpu_host" if gpu and host else "gpu" if gpu else "host"
 
 
 class StreamAdmissionControl:

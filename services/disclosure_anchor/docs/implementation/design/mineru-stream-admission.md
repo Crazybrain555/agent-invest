@@ -92,6 +92,30 @@ unsafe 且已证明未提交的 intent 被单独停放并继续续租；已接�
 继续排空。最终以可见的 open-circuit 状态结束，保留未提交责任供恢复，不能把它们
 记作业务成功或悄悄重建任务。进度输出分别报告 target、实际责任、原因和观测依据。
 
+### 空闲内存短缺的有限等待
+
+provider 空闲时内存仍低于恢复下限，没有任何在途工作能释放它，原等待没有上界。策略因此在每个决定上
+附带 `idle_deficit` 事实：新 POST 关闭、样本身份有效且新鲜已知（含 provider 未终结计数）、provider
+无 nonterminal/active/pending、且 GPU 和/或 host 低于各自恢复下限时，分别为 `gpu`、`host` 或
+`gpu_host`；`memory_pause`、`gpu_memory_pressure`、`idle_memory_deficit` 各带都计入，不以
+`reason` 判断。`idle_deficit_seconds` 按观测时间累计：相邻两份此类样本的观测时间差不超过
+`sample_max_age_seconds` 时计入该差值，重复读取同一缓存样本或评估滞后都不增加时长；
+unknown、陈旧、unsafe 的评估既不计时也不结束这一段；
+恢复下限已满足但目标尚未恢复的评估同样不计时；允许新 POST（目标为正）或出现 provider 工作才结束并
+清零。陈旧的低值即使触发 `memory_pause` 也不计时。
+
+协调器 `CoordinatorLimits.stream_idle_deficit_stop_seconds`（候选值 1800 秒）在当前新鲜短缺段达到上界时，
+置既有的粘性 `stream_failure`：不再新增，已接受任务与本地 tail/ACK 照常排空，之后以既有 durable
+`coordinator_circuit` 停止，`reason_code` 按到达上界那份样本的短缺通道为
+`stream_idle_gpu_memory_deficit`、`stream_idle_host_memory_deficit` 或 `stream_idle_gpu_host_memory_deficit`；
+unsafe 仍为 `stream_pressure_closed`。原恢复下限、未提交的 prepared 责任与已有 credit 不变，不自动重启、
+不重试、不新增账本。该上界与恢复窗口一样，只在协调器以不超过 `sample_max_age_seconds` 的间隔评估策略时推进：
+有排队的 durable 责任（如未提交的 prepared）时运行持续轮询，即 2026-10-12 现场的形态；没有任何排队责任时，
+resident 运行在目标 0 下直接 quiescent，恢复与此上界都只随 resident 轮次推进。GPU 短缺的运维恢复是既有同配置 `inference-recreate`（或新版本 full install），
+host 短缺需先处理宿主内存占用；两者都以既有 hash 绑定的释放解除停止。
+reclaim 模式的推理 owner 会在空闲时自行释放未占用的分配器缓存，它从不提供准入证据；准入仍只看新鲜的
+exporter 样本与原 v2 下限。
+
 ## 有限 campaign 与验收
 
 `V4CampaignAdmissionScope` 绑定 M6 scope 和 corpus manifest，SQL 在排序和 LIMIT

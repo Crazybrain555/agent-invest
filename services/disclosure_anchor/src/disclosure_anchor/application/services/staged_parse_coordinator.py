@@ -913,6 +913,11 @@ class CoordinatorLimits:
     retry_consecutive_threshold: int = 3
     retry_max_attempts: int = 8
     retry_stuck_seconds: float = 300.0
+    # An idle memory-deficit episode (stream decision facts: new POSTs closed,
+    # no provider work, a lane below its recover floor) that lasts this long
+    # becomes the stream stop instead of an unbounded wait. Candidate limit:
+    # far longer than the inference owner's own idle release takes.
+    stream_idle_deficit_stop_seconds: float = 1800.0
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -967,6 +972,7 @@ class CoordinatorLimits:
             (self.retry_initial_backoff_seconds, "initial retry backoff seconds"),
             (self.retry_max_backoff_seconds, "maximum retry backoff seconds"),
             (self.retry_stuck_seconds, "retry stuck seconds"),
+            (self.stream_idle_deficit_stop_seconds, "stream idle-deficit stop seconds"),
         ):
             if (
                 isinstance(timing_value, bool)
@@ -1248,6 +1254,27 @@ def _site_hold_reason(dimensions: tuple[str, ...]) -> str | None:
     if any(item in MATERIALIZATION_TRANSFER_INTEGRITY_HOLD_REASONS for item in dimensions):
         return "transfer_integrity_hold"
     return None
+
+
+# Stream stop reasons for an idle memory-deficit episode, by the lanes below
+# their recover floors on the fresh sample that reached the bound.
+_IDLE_DEFICIT_STOP_REASONS = {
+    "gpu": "stream_idle_gpu_memory_deficit",
+    "host": "stream_idle_host_memory_deficit",
+    "gpu_host": "stream_idle_gpu_host_memory_deficit",
+}
+
+
+def _idle_deficit_stop_reason(decision: StreamAdmissionDecision, limit: float) -> str | None:
+    """The stream stop reason once a fresh idle memory-deficit episode reaches its bound.
+
+    A decision source that reports no idle-deficit facts never reaches it.
+    """
+
+    lanes = getattr(decision, "idle_deficit", None)
+    if lanes is None or getattr(decision, "idle_deficit_seconds", 0.0) < limit:
+        return None
+    return _IDLE_DEFICIT_STOP_REASONS[lanes]
 
 
 def _stop_cause(
@@ -2743,6 +2770,14 @@ class StagedParseCoordinator:
                     if stream_decision.unsafe and stream_failure is None:
                         stream_failure = stream_decision.reason
                         errors.append("stream pressure closed new submissions: " + stream_failure)
+                    deficit_stop = _idle_deficit_stop_reason(
+                        stream_decision, self._limits.stream_idle_deficit_stop_seconds
+                    )
+                    if deficit_stop is not None and stream_failure is None:
+                        # Nothing running can release this memory: the bounded
+                        # wait ends in the stream stop below once tails drain.
+                        stream_failure = deficit_stop
+                        errors.append("stream memory deficit outlived its bound: " + deficit_stop)
                     if stream_failure is not None:
                         observation.cancel()
                 if stop_requested():
@@ -3249,9 +3284,12 @@ class StagedParseCoordinator:
                         # their reservations; no completion/ACK is invented.
                         circuit_open = True
                         admission_open = False
-                        blocked_reason = "stream_pressure_closed"
+                        blocked_reason = (
+                            stream_failure if stream_failure in _IDLE_DEFICIT_STOP_REASONS.values()
+                            else "stream_pressure_closed"
+                        )
                         trip_fault(_stop_cause(kind="coordinator_circuit",
-                                              reason_code="stream_pressure_closed",
+                                              reason_code=blocked_reason,
                                               origin="coordinator"))
                         return finish(CoordinatorTerminal.STUCK_OPEN_CIRCUIT)
                     if (

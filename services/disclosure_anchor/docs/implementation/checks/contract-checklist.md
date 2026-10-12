@@ -1356,6 +1356,32 @@ root 已用 managed scratch PostgreSQL 验证事务 P、读回、响应丢失重
 身份在普通守卫下恢复，按实际字节准入。独立复审与最终门由 root 执行，本条不宣称已通过部署资格。
 ```
 
+2026-10-12（推理 owner 空闲释放模式与空闲内存短缺有限等待；候选，未部署）——public view、Filing API、change feed 与
+migration 不变：
+
+```text
+部署输入：mineru.deployment-profile.v2 的 inference_diagnostic.contract_version 新增 mineru.owner-memory-reclaim.v1
+（同一 worker class）；context = Dockerfile + mineru_inference_memory/{__init__,core,reclaim,worker}.py；release 用
+m6.release.v3，inference_build 闭合字段 context/context_sha256/sources/mode（mode 必须等于该模式）。
+mineru.owner-memory.v1、m6.release.v2、其 argv、四个 vLLM 源前像与 server-config 字节不变。reclaim 模式 argv 在
+--worker-cls 后加 --middleware mineru_inference_memory.reclaim.OwnerMemoryReclaimMiddleware；实际源前像另加
+vllm/v1/engine/core.py 与 vllm/v1/executor/uniproc_executor.py（v0.21.0 ad7125a4 精确字节）；server-config diagnostic
+另记 mode 与 middleware。wrapper 只对 v3 传 -InferenceOwnerReclaim；安装器/collector 内容探针列出实际安装的 .py
+文件，仅当 reclaim.py 存在时哈希两个引擎源，Mac 按声明模式精确比较。
+推理日志：MINERU_GPU_OWNER_RECLAIM，schema mineru.gpu-owner-reclaim.v1，kind bound/reclaim（outcome released、
+no_benefit、failed）及 heartbeat_start/heartbeat_outcome_unknown/heartbeat_late_outcome/heartbeat_call_failed/
+heartbeat_unavailable/heartbeat_stop；每条 ≤ 8192 字节，不含地址、请求 ID、异常原文或文档内容。OwnerMemoryWorker 新增
+collective_rpc 目标 mineru_owner_memory_reclaim；不开 dev mode、不加 HTTP 路由或 worker extension。
+StreamAdmissionDecision 新增 idle_deficit（gpu|host|gpu_host|null）与 idle_deficit_seconds；CoordinatorLimits 新增
+stream_idle_deficit_stop_seconds（候选默认 1800，有限正数）。F5：coordinator_circuit 新增 reason_code
+stream_idle_gpu_memory_deficit / stream_idle_host_memory_deficit / stream_idle_gpu_host_memory_deficit（origin
+coordinator），经既有 stream_failure 在 tail/ACK 排空后记录；unsafe 仍为 stream_pressure_closed。
+设计 docs/implementation/checks/gpu-owner-memory.md（Reclaim mode）、design/mineru-stream-admission.md、
+design/mineru-release.md；运维 runbook “owner-memory reclaim 模式与空闲内存短缺停止”。决定性 owner/异步边界、
+心跳生命周期与短缺分段的独立测试由独立作者编写；PowerShell 原生解析、v3 包/镜像构建、实机释放效果、WDDM 可见性、
+回涨代价与继续服务资格由 root 执行，本条不宣称已通过。
+```
+
 
 ## Private MinerU owner-memory diagnostic installation
 
@@ -1372,3 +1398,6 @@ root 已用 managed scratch PostgreSQL 验证事务 P、读回、响应丢失重
   identity file, current process start ticks and unchanged container epoch. Stable server-config identity
   hashes source/configuration only; PID, epoch, instance, counters and observation times never change R.
 - Install completion verifies the full diagnostic source/image/loaded-worker proof and leaves writes closed.
+- The reclaim mode (`mineru.owner-memory-reclaim.v1`, `m6.release.v3`) adds `reclaim.py` to the exact
+  context, `--middleware` to the argv and the engine `core.py`/`uniproc_executor.py` preimages, under the same
+  installation, recreation and attestation rules; the observation mode's bytes are unchanged.

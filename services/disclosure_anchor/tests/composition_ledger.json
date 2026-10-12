@@ -954,6 +954,10 @@
    "private_imports": [],
    "tests": 15
   },
+  "tests/unit/test_mineru_idle_deficit_independent.py": {
+   "private_imports": [],
+   "tests": 9
+  },
   "tests/unit/test_mineru_materialize_grant_v5.py": {
    "private_imports": [],
    "tests": 4
@@ -981,6 +985,10 @@
   "tests/unit/test_mineru_owner_memory_independent.py": {
    "private_imports": [],
    "tests": 21
+  },
+  "tests/unit/test_mineru_owner_reclaim_independent.py": {
+   "private_imports": [],
+   "tests": 7
   },
   "tests/unit/test_mineru_package_a_builder.py": {
    "private_imports": [],
@@ -1021,6 +1029,10 @@
   "tests/unit/test_mineru_protocol_v2_wire.py": {
    "private_imports": [],
    "tests": 14
+  },
+  "tests/unit/test_mineru_reclaim_release_chain_independent.py": {
+   "private_imports": [],
+   "tests": 5
   },
   "tests/unit/test_mineru_recovery_gate.py": {
    "private_imports": [

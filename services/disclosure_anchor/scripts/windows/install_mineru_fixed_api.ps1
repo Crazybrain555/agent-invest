@@ -15,6 +15,7 @@ param(
     [switch]$InferenceRecreate,
     [string]$InferenceDiagnosticContext = "",
     [ValidatePattern('\A(|sha256:[a-f0-9]{64})\z')][string]$InferenceDiagnosticContextSha256 = "",
+    [switch]$InferenceOwnerReclaim,
     [ValidateSet("", "cpu", "cuda0")][string]$ExpectedApiDeviceProfile = "",
     [ValidateSet("", "cpu", "cuda0")][string]$ExpectedFullApiDeviceProfile = "",
     [ValidateSet("", "cpu", "cuda0")][string]$ApiDeviceProfile = "",
@@ -50,6 +51,11 @@ if ($InferenceDiagnostic -ne (-not [string]::IsNullOrEmpty($InferenceDiagnosticC
         ($InferenceDiagnostic -and $ApiOnlyOperation)) {
     throw "diagnostic source requires a context identity and full installation or exact same-config recreation"
 }
+if ($InferenceOwnerReclaim -and -not $InferenceDiagnostic) { throw "owner-memory reclaim requires the diagnostic source context" }
+# The reclaim mode adds reclaim.py to the package and pins the engine utility
+# dispatch and uni executor sources beside the observation preimages.
+$InferenceDiagnosticFiles = @('mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')
+if ($InferenceOwnerReclaim) { $InferenceDiagnosticFiles = @('mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/reclaim.py','mineru_inference_memory/worker.py') }
 $ExpectedInferenceReference = $ExpectedRepoDigest
 $ExpectedInferenceImageId = $ExpectedImageId
 $InferenceBuildProof = $null
@@ -1637,6 +1643,7 @@ function Get-ValidatedRuntime {
     $inferenceArgv = @("mineru-openai-server", "--host", "0.0.0.0", "--port", "30000",
         "--max-num-seqs", "128", "--mm-processor-cache-gb", "0")
     if ($InferenceDiagnostic) { $inferenceArgv += @("--worker-cls", "mineru_inference_memory.worker.OwnerMemoryWorker") }
+    if ($InferenceOwnerReclaim) { $inferenceArgv += @("--middleware", "mineru_inference_memory.reclaim.OwnerMemoryReclaimMiddleware") }
     Assert-ExactCommand -Container $inference -Expected $inferenceArgv
     $proxyCommand = @($proxy.Config.Entrypoint) + @($proxy.Config.Cmd)
     if (
@@ -1896,7 +1903,7 @@ function Build-ValidatedInferenceDiagnostic {
     param([switch]$ReuseInstalled)
     $context = [IO.Path]::GetFullPath($InferenceDiagnosticContext)
     $sourceMap = [ordered]@{}
-    foreach ($name in @('Dockerfile','mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+    foreach ($name in (@('Dockerfile') + $InferenceDiagnosticFiles)) {
         $path = Join-Path $context $name
         $file = Get-Item -LiteralPath $path
         if ($file.Length -lt 1 -or $file.Length -gt 8388608 -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "diagnostic build source is not a bounded regular file" }
@@ -1934,8 +1941,12 @@ def digest(relative):
     with path.open("rb") as stream: raw = stream.read(8388609)
     if not raw or len(raw) > 8388608: raise RuntimeError("source byte bound exceeded")
     return "sha256:" + hashlib.sha256(raw).hexdigest()
-diagnostic_paths = ("mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py")
+package = root / "mineru_inference_memory"
+if package.is_symlink() or not package.is_dir(): raise RuntimeError("diagnostic package is not a directory")
+diagnostic_paths = sorted("mineru_inference_memory/" + entry.name for entry in package.iterdir() if entry.name.endswith(".py"))
 paths = ("vllm/v1/worker/worker_base.py", "vllm/v1/worker/gpu_worker.py", "vllm/v1/worker/gpu_model_runner.py", "vllm/v1/worker/gpu/mm/encoder_runner.py")
+if "mineru_inference_memory/reclaim.py" in diagnostic_paths:
+    paths += ("vllm/v1/engine/core.py", "vllm/v1/executor/uniproc_executor.py")
 print(json.dumps({"module_sha256": digest("mineru_inference_memory/worker.py"), "actual_source_sha256": {path: digest(path) for path in paths}, "actual_diagnostic_source_sha256": {path: digest(path) for path in diagnostic_paths}, "vllm_version": importlib.metadata.version("vllm")}, sort_keys=True))
 '@
     $probeArguments = if ($ReuseInstalled) { @('exec','mineru-openai-server','/usr/bin/python3.12','-I','-c',$probe) } else { @('run','--rm','--network','none','--entrypoint','/usr/bin/python3.12',[string]$image[0].Id,'-I','-c',$probe) }
@@ -1948,9 +1959,15 @@ print(json.dumps({"module_sha256": digest("mineru_inference_memory/worker.py"), 
         'vllm/v1/worker/gpu_model_runner.py'='sha256:95b7ee3ff5eecdb0fa791f375b2aeedc6ac507f3ea4a9683700d3b202b2caf08'
         'vllm/v1/worker/gpu/mm/encoder_runner.py'='sha256:909181912d39bf4734d5202340a77813252136bc1f38c458f879b05743a522bf'
     }
+    if ($InferenceOwnerReclaim) {
+        $preimages['vllm/v1/engine/core.py']='sha256:53ff4df24745e3ac4ac09028ddeb310f6627b90f6374dbfa82548e97c9bc65bc'
+        $preimages['vllm/v1/executor/uniproc_executor.py']='sha256:93fac0cbecffb9800b1a90746fd179bfdc7c61bf22c6c1337ebe0d917157f247'
+    }
     if ([string]$actual.vllm_version -cne '0.21.0' -or [string]$actual.module_sha256 -cne $sourceMap['mineru_inference_memory/worker.py']) { throw "diagnostic built module/version drifted" }
+    if (@($actual.actual_source_sha256.PSObject.Properties).Count -ne $preimages.Count) { throw "diagnostic vLLM source preimage set drifted" }
     foreach ($name in $preimages.Keys) { if ([string]$actual.actual_source_sha256.$name -cne $preimages[$name]) { throw "diagnostic vLLM source preimage drifted: $name" } }
-    foreach ($name in @('mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+    if (@($actual.actual_diagnostic_source_sha256.PSObject.Properties).Count -ne $InferenceDiagnosticFiles.Count) { throw "diagnostic installed package file set drifted" }
+    foreach ($name in $InferenceDiagnosticFiles) {
         if ([string]$actual.actual_diagnostic_source_sha256.$name -cne $sourceMap[$name]) { throw "diagnostic installed package source drifted: $name" }
     }
     $labels = $image[0].Config.Labels

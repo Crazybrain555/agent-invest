@@ -322,10 +322,12 @@ try {
     if ($manifestSha -cne $ExpectedManifestSha256) { Fail 65 ('release manifest hash differs: ' + $manifestSha) }
     $manifest=ConvertFrom-StrictJson $manifestBytes
     $manifestFields=@('contract_version','built_at_utc','source','inputs','projection','api_build','native_m6','installation','files')
-    if ($manifest.contract_version -ceq 'm6.release.v2') { $manifestFields += 'inference_build' }
+    # v2 builds the owner-memory observation image; v3 builds the reclaim-mode image.
+    $manifestInference=$manifest.contract_version -cin @('m6.release.v2','m6.release.v3')
+    if ($manifestInference) { $manifestFields += 'inference_build' }
     elseif ($manifest.contract_version -cne 'm6.release.v1') { Fail 65 'release manifest contract is unsupported' }
     Assert-Closed $manifest $manifestFields 'release manifest'
-    if ($manifest.contract_version -ceq 'm6.release.v2' -and $operationKind -cnotin @('full-install','inference-recreate')) { Fail 65 'diagnostic source requires full installation' }
+    if ($manifestInference -and $operationKind -cnotin @('full-install','inference-recreate')) { Fail 65 'diagnostic source requires full installation' }
     if ([string]$manifest.projection.api_device_profile -cne [string]$binding.api_device_profile) { Fail 65 'release device profile differs from the installation binding' }
     $verified=[ordered]@{}
     foreach ($entry in $manifest.files) {
@@ -506,8 +508,16 @@ try {
         $installerParameters.Remove('ApiOnlyCompatibilityUpgrade')
         $installerParameters['ExpectedFullApiDeviceProfile']=[string]$binding.api_device_profile
     }
-    if ($manifest.contract_version -ceq 'm6.release.v2') {
-            foreach ($name in @('Dockerfile','mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+    if ($manifestInference) {
+            $contextNames=@('Dockerfile','mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')
+            if ($manifest.contract_version -ceq 'm6.release.v3') {
+                Assert-Closed $manifest.inference_build @('context','context_sha256','sources','mode') 'inference build'
+                if ([string]$manifest.inference_build.mode -cne 'mineru.owner-memory-reclaim.v1') { Fail 65 'inference build mode is unsupported' }
+                $contextNames=@('Dockerfile','mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/reclaim.py','mineru_inference_memory/worker.py')
+                $installerParameters['InferenceOwnerReclaim']=$null
+            }
+            Assert-Closed $manifest.inference_build.sources $contextNames 'inference build sources'
+            foreach ($name in $contextNames) {
                 $rel='inference-context/' + $name
                 if (-not $verified.Contains($rel) -or $verified[$rel] -cne [string]$manifest.inference_build.sources.$name) { Fail 65 ('diagnostic context source differs: ' + $name) }
             }

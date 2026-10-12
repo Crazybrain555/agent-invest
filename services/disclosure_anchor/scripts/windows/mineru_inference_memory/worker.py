@@ -5,6 +5,10 @@ vLLM imports this module in the engine process while resolving the worker
 class. The import adds nothing beyond the modules that the default
 ``vllm.v1.worker.gpu_worker`` import already loads: no CUDA call, no thread.
 The V1 runner module is checked only after upstream ``init_device`` loaded it.
+
+``mineru_owner_memory_reclaim`` is the ``collective_rpc`` target of the reclaim
+mode's API heartbeat. It binds the separately reviewed ``reclaim`` module on
+its first call, on the engine thread; this module itself releases nothing.
 """
 
 from __future__ import annotations
@@ -204,3 +208,21 @@ class OwnerMemoryWorker(Worker):
         result = super().sample_tokens(grammar_output)
         self._mineru_owner_memory.after_sample_tokens(result)
         return result
+
+    def mineru_owner_memory_reclaim(self) -> Any:
+        """One reclaim decision on the owner thread; see ``reclaim.OwnerMemoryReclaimer``."""
+        reclaimer = self.__dict__.get("_mineru_owner_reclaimer")
+        if reclaimer is None:
+            # Installed only by the reclaim-mode image, whose API loads the heartbeat.
+            from . import reclaim
+
+            root, parallel = _vllm_root(), self.parallel_config
+            reclaimer = reclaim.OwnerMemoryReclaimer(
+                monitor=self._mineru_owner_memory,
+                runner=self.model_runner,
+                cuda=reclaim.TorchReclaimCuda(),
+                logger=LOGGER,
+                binding=lambda: reclaim.engine_binding(root, parallel),
+            )
+            self._mineru_owner_reclaimer = reclaimer
+        return reclaimer.attempt()

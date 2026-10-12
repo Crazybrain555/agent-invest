@@ -24,7 +24,10 @@ from disclosure_anchor.application.contracts.mineru_capacity_config import (
     encode_mineru_capacity_config,
     encode_mineru_capacity_config_v2,
 )
-from disclosure_anchor.application.contracts.mineru_deployment_profile import MineruDeploymentProfile
+from disclosure_anchor.application.contracts.mineru_deployment_profile import (
+    OWNER_MEMORY_RECLAIM_MIDDLEWARE,
+    MineruDeploymentProfile,
+)
 from disclosure_anchor.application.contracts.mineru_local_worker_profile import MineruLocalWorkerProfile
 
 
@@ -144,8 +147,11 @@ def inference_command_argv(profile: MineruDeploymentProfile) -> tuple[str, ...]:
     millionths = profile.inference_declared_defaults.vllm_gpu_memory_utilization_millionths
     if millionths != MINERU_HELPER_GPU_MEMORY_UTILIZATION_MILLIONTHS:
         argv = (*argv, GPU_MEMORY_UTILIZATION_OPTION, gpu_memory_utilization_argument(millionths))
-    if profile.inference_diagnostic is not None:
-        argv = (*argv, "--worker-cls", profile.inference_diagnostic.worker_class)
+    diagnostic = profile.inference_diagnostic
+    if diagnostic is not None:
+        argv = (*argv, "--worker-cls", diagnostic.worker_class)
+        if diagnostic.reclaim:
+            argv = (*argv, "--middleware", OWNER_MEMORY_RECLAIM_MIDDLEWARE)
     return argv
 
 
