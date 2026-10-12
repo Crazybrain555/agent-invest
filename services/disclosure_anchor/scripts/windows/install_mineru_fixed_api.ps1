@@ -1902,7 +1902,7 @@ function Build-ValidatedInferenceDiagnostic {
     if ([string]$candidate.services."mineru-openai-server".image -cne $reference -or
             [string]$candidate.services."mineru-api-proxy".image -cne $ExpectedRepoDigest) { throw "diagnostic compose image projection drifted" }
     if (-not $ReuseInstalled) {
-    Invoke-Docker -Arguments @('build','--pull=false','--network','none','--tag',$reference,
+    Invoke-Docker -Arguments @('build','--pull=false','--provenance=false','--network','none','--tag',$reference,
         '--label',('io.agent-invest.mineru.owner-memory-module-sha256=' + $sourceMap['mineru_inference_memory/worker.py']),
         '--label',('io.agent-invest.mineru.owner-memory-dockerfile-sha256=' + $sourceMap['Dockerfile']),
         '--label',('io.agent-invest.mineru.owner-memory-base-repo-digest=' + $ExpectedRepoDigest),
