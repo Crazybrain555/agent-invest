@@ -327,6 +327,9 @@ def build_staged_worker_v4_runtime(
             settings=settings,
             paths=paths,
             artifacts=ArtifactStore(paths),
+            # COMMIT turns a semantic network outage into a scheduled wait of
+            # the same durable attempt instead of degraded routes.
+            network_wait=True,
         )
         new_publication_request = ProductionAtomicPublicationRequestBuilderV4(
             path_builder=paths,
@@ -427,6 +430,7 @@ def build_staged_worker_v4_runtime(
             ),
             publication_committed=publication_committed,
             lifecycle_facts=lifecycle_facts,
+            semantic_network_wait=semantic.network_wait,
         )
         return StagedWorkerV4Runtime(
             coordinator=StagedParseCoordinator(

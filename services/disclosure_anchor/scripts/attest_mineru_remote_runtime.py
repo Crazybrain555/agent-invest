@@ -13,6 +13,7 @@ import stat
 import subprocess
 from typing import Any
 
+from disclosure_anchor.application.contracts.mineru_deployment_profile import MineruDeploymentProfile, inference_diagnostic_config, verify_inference_diagnostic
 from disclosure_anchor.application.contracts.mineru_api_health import (
     validate_mineru_api_wire_health,
 )
@@ -454,6 +455,8 @@ def build_manifest(
     expected_api_cpu_threads: int | None = None,
     expected_capacity: AnyMineruCapacityConfig | None = None,
     expected_capacity_source_sha256: dict[str, str] | None = None,
+    expected_deployment_profile: MineruDeploymentProfile | None = None,
+    expected_inference_sources: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if expected_capacity is not None:
         encode_any_mineru_capacity_config(expected_capacity)
@@ -469,7 +472,20 @@ def build_manifest(
         2,
     }:
         raise ValueError("expected API CPU thread budget must be exactly 1 or 2")
+    diagnostic = None if expected_deployment_profile is None else expected_deployment_profile.inference_diagnostic
+    if (diagnostic is None) != (expected_inference_sources is None):
+        raise ValueError("diagnostic deployment and exact context sources must be supplied together")
+    diagnostic_configuration = None
+    expected_inference_command = list(EXPECTED_INFERENCE_COMMAND)
+    if diagnostic is not None:
+        if expected_capacity is None or expected_deployment_profile is None or expected_inference_sources is None:
+            raise ValueError("diagnostic inference requires explicit capacity")
+        diagnostic_proof = verify_inference_diagnostic(observation, expected_deployment_profile, expected_inference_sources)
+        diagnostic_configuration = inference_diagnostic_config(diagnostic_proof, expected_deployment_profile)
+        from disclosure_anchor.application.services.mineru_release_plan import inference_command_argv
+        expected_inference_command = list(inference_command_argv(expected_deployment_profile))
     if observation.get("schema") != (
+        "mineru-windows-runtime-observation.v7" if diagnostic is not None else
         "mineru-windows-runtime-observation.v5" if expected_capacity is None
         else "mineru-windows-runtime-observation.v6"
     ):
@@ -517,9 +533,9 @@ def build_manifest(
         api.get("image") != EXPECTED_API_COMPAT_IMAGE
         or SHA256_RE.fullmatch(str(api.get("image_id"))) is None
         or proxy.get("image") != EXPECTED_REPO_DIGEST
-        or inference.get("image") != EXPECTED_REPO_DIGEST
+        or inference.get("image") != (EXPECTED_REPO_DIGEST if diagnostic is None else diagnostic.image_reference)
         or proxy.get("image_id") != EXPECTED_IMAGE_ID
-        or inference.get("image_id") != EXPECTED_IMAGE_ID
+        or (inference.get("image_id") != EXPECTED_IMAGE_ID if diagnostic is None else SHA256_RE.fullmatch(str(inference.get("image_id"))) is None)
     ):
         raise ValueError("remote MinerU image digest drifted")
     compatibility = _verify_api_compatibility(
@@ -770,7 +786,7 @@ def build_manifest(
         expected_api_command[-1] = str(expected_capacity.final_http_limit_per_loop)
     if (
         api_command != expected_api_command
-        or inference_command != EXPECTED_INFERENCE_COMMAND
+        or inference_command != expected_inference_command
     ):
         raise ValueError("remote MinerU command drifted")
     capacity_projection = {
@@ -874,7 +890,7 @@ def build_manifest(
             ),
         },
         "inference_server": {
-            "container_image_digest": EXPECTED_REPO_DIGEST.removeprefix("mineru@"),
+            "container_image_digest": (EXPECTED_REPO_DIGEST.removeprefix("mineru@") if diagnostic is None else inference["image_id"]),
             "content_environment_sha256": canonical_payload_sha256(
                 inference_environment
             ),
@@ -887,6 +903,7 @@ def build_manifest(
                     "mounts": inference.get("mounts"),
                     "networks": inference.get("networks"),
                     "port": inference.get("port"),
+                    **({"diagnostic": diagnostic_configuration} if diagnostic_configuration is not None else {}),
                 }
             ),
             "mineru_version": "3.4.4",
@@ -1048,6 +1065,8 @@ def _read_remote_file(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="attest_mineru_remote_runtime")
+    parser.add_argument("--deployment-profile", type=Path, help="closed diagnostic deployment input")
+    parser.add_argument("--inference-context", type=Path, help="exact reviewed diagnostic build context")
     parser.add_argument("--mineru-bin", type=Path, required=True)
     parser.add_argument("--ssh-host", required=True)
     parser.add_argument("--ssh-user", required=True)
@@ -1154,6 +1173,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     expected_compose_bytes = args.expected_compose.read_bytes()
     expected_collector_bytes = args.collector_source.read_bytes()
+    deployment_profile = None
+    inference_sources = None
+    if (args.deployment_profile is None) != (args.inference_context is None):
+        parser.error("diagnostic deployment profile and inference context are required together")
+    if args.deployment_profile is not None:
+        from disclosure_anchor.application.contracts.mineru_deployment_profile import decode_mineru_deployment_profile
+        deployment_profile = decode_mineru_deployment_profile(args.deployment_profile.read_bytes())
+        inference_sources = {name: "sha256:" + hashlib.sha256((args.inference_context / name).read_bytes()).hexdigest()
+                             for name in ("Dockerfile", "mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py")}
     expected_compat_patcher_sha256 = (
         "sha256:" + hashlib.sha256(args.compat_patcher_source.read_bytes()).hexdigest()
     )
@@ -1219,6 +1247,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_api_cpu_threads=(args.expected_api_cpu_threads or 1) if expected_capacity is None else None,
         expected_capacity=expected_capacity,
         expected_capacity_source_sha256=capacity_sources,
+        expected_deployment_profile=deployment_profile, expected_inference_sources=inference_sources,
     )
     _new_private_json(args.observation_out, observation)
     _new_private_json(args.manifest_out, payload)

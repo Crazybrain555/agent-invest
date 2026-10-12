@@ -415,6 +415,95 @@ class AttestMinerURemoteRuntimeTests(unittest.TestCase):
             canonical_payload_sha256(payload["manifest"]),
         )
 
+    def test_diagnostic_attestation_binds_actual_image_and_source_proof_and_refuses_missing_loading(self):
+        from disclosure_anchor.application.contracts.mineru_deployment_profile import (
+            OWNER_MEMORY_PREIMAGES, decode_mineru_deployment_profile,
+        )
+        from tests._mineru_capacity_v11_fixture import observation, build, canonical_payload, capacity_payload
+        from tests.unit.test_mineru_release_compose_independent import DEPLOYMENT
+        source_map = {"Dockerfile": "sha256:" + "d" * 64,
+                      "mineru_inference_memory/__init__.py": "sha256:" + "a" * 64,
+                      "mineru_inference_memory/core.py": "sha256:" + "b" * 64,
+                      "mineru_inference_memory/worker.py": "sha256:" + "e" * 64}
+        profile_value = copy.deepcopy(DEPLOYMENT)
+        profile_value["inference_declared_defaults"].update(vllm_gpu_memory_utilization_millionths=500000, vllm_enable_prefix_caching=True)
+        profile_value.update(contract_version="mineru.deployment-profile.v2", inference_diagnostic={
+            "contract_version": "mineru.owner-memory.v1", "context_sha256": canonical_payload_sha256(source_map),
+            "worker_class": "mineru_inference_memory.worker.OwnerMemoryWorker",
+        })
+        profile = decode_mineru_deployment_profile(canonical_payload(profile_value))
+        value = observation()
+        value["schema"] = "mineru-windows-runtime-observation.v7"
+        value["inference"]["image"] = profile.inference_diagnostic.image_reference
+        value["inference"]["image_id"] = "sha256:" + "f" * 64
+        value["inference"]["command"] += ["--worker-cls", "mineru_inference_memory.worker.OwnerMemoryWorker"]
+        value["inference"].update(container_id="a" * 64, started_at="2026-10-12T01:00:00.123456789Z")
+        value["inference_diagnostic"] = {
+            "contract_version": "mineru.owner-memory-observation.v1",
+            "image_labels": {"io.agent-invest.mineru.owner-memory-module-sha256": source_map["mineru_inference_memory/worker.py"],
+                             "io.agent-invest.mineru.owner-memory-dockerfile-sha256": source_map["Dockerfile"],
+                             "io.agent-invest.mineru.owner-memory-base-repo-digest": EXPECTED_REPO_DIGEST,
+                             "io.agent-invest.mineru.owner-memory-context-sha256": profile.inference_diagnostic.context_sha256},
+            "module_sha256": source_map["mineru_inference_memory/worker.py"], "actual_source_sha256": dict(OWNER_MEMORY_PREIMAGES),
+            "loaded_workers": [{"module_sha256": source_map["mineru_inference_memory/worker.py"],
+                                "contract_version": "mineru.owner-memory-identity.v1",
+                                "worker_class": "mineru_inference_memory.worker.OwnerMemoryWorker", "pid": 42,
+                                "proc_start_ticks": 100, "observed_proc_start_ticks": 100,
+                                "namespace_init_start_ticks": 50, "device": "cuda:0", "instance_id": "first"}],
+            "actual_diagnostic_source_sha256": {name: digest for name, digest in source_map.items() if name != "Dockerfile"},
+            "container_epoch": {key: value["inference"][key] for key in ("container_id", "started_at")},
+        }
+        def attest(item):
+            return build(item, capacity_payload(), expected_deployment_profile=profile, expected_inference_sources=source_map)
+        first_bundle = attest(value)
+        manifest = first_bundle["manifest"]
+        # Smoke and freeze consume the unchanged v11 runtime contract, including
+        # the actual derived image and extended argv; no legacy raw-image pin.
+        from scripts.mineru_smoke import _runtime_manifest
+        from disclosure_anchor.application.contracts.mineru_capacity_config import decode_mineru_capacity_config
+        from disclosure_anchor.adapters.runtime.mineru_host_capacity_observer import project_host_service_epoch
+        from tests.unit.test_capacity_host_observer import _payload as host_payload
+        capacity = decode_mineru_capacity_config(canonical_payload(capacity_payload()))
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_path = Path(directory) / "runtime.json"
+            runtime_path.write_bytes(canonical_payload(first_bundle))
+            actual, _, _ = _runtime_manifest(
+                runtime_path, configured_identity=first_bundle["identity_sha256"],
+                local_client_identity=CLIENT, local_processing_window_size=capacity.processing_window_size,
+                local_writer_code_digest=CODE_DIGEST, expected_capacity=capacity)
+            self.assertEqual(actual, manifest)
+        host = host_payload()
+        host.update(collector_sha256=manifest["topology"]["windows_collector_sha256"],
+                    windows_node_identity_sha256=manifest["topology"]["windows_node_identity_sha256"])
+        sample = project_host_service_epoch(
+            host, expected_collector_sha256=host["collector_sha256"],
+            expected_windows_node_identity_sha256=host["windows_node_identity_sha256"])
+        self.assertEqual(sample.unsafe_container_count, 0)
+        restarted = copy.deepcopy(value)
+        restarted["inference_diagnostic"]["loaded_workers"][0].update(pid=123, proc_start_ticks=456, observed_proc_start_ticks=456, namespace_init_start_ticks=400, instance_id="second")
+        restarted["inference"].update(container_id="b" * 64, started_at="2026-10-12T02:00:00Z")
+        restarted["inference_diagnostic"]["container_epoch"] = {key: restarted["inference"][key] for key in ("container_id", "started_at")}
+        restarted["diagnostic_counters"] = {"samples": 999, "monotonic_ns": 987654321}
+        self.assertEqual(attest(restarted)["identity_sha256"], first_bundle["identity_sha256"])
+        self.assertEqual(manifest["inference_server"]["container_image_digest"], "sha256:" + "f" * 64)
+        self.assertEqual(manifest["orchestrator"]["base_container_image_digest"], EXPECTED_IMAGE_ID)
+        for change in (
+            lambda x: x["inference_diagnostic"].update(loaded_workers=[]),
+            lambda x: x["inference_diagnostic"]["loaded_workers"][0].update(observed_proc_start_ticks=101),
+            lambda x: x["inference_diagnostic"]["loaded_workers"][0].update(namespace_init_start_ticks=101),
+            lambda x: x["inference_diagnostic"]["loaded_workers"][0].update(device="cuda:1"),
+            lambda x: x["inference_diagnostic"]["container_epoch"].update(container_id="c" * 64),
+            lambda x: x["inference_diagnostic"]["actual_diagnostic_source_sha256"].update({"mineru_inference_memory/core.py": "sha256:" + "0" * 64}),
+            lambda x: x["inference_diagnostic"].update(module_sha256="sha256:" + "0" * 64),
+            lambda x: x["inference_diagnostic"]["actual_source_sha256"].update({"vllm/v1/worker/gpu_worker.py": "sha256:" + "0" * 64}),
+            lambda x: x["proxy"].update(image_id="sha256:" + "f" * 64),
+            lambda x: x["inference"]["command"].extend(["--gpu-memory-utilization", "0.900000"]),
+        ):
+            changed = copy.deepcopy(value)
+            change(changed)
+            with self.assertRaises(ValueError):
+                attest(changed)
+
     def test_build_manifest_binds_live_remote_observation(self) -> None:
         observation = _observation()
         observation["output_root"]["quiescence"]["record_count"] = 5

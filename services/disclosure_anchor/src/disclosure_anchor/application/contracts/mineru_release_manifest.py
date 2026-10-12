@@ -23,6 +23,7 @@ from disclosure_anchor.application.contracts.closed_document import (
 
 
 RELEASE_MANIFEST_CONTRACT = "m6.release.v1"
+DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT = "m6.release.v2"
 RELEASE_PROJECTION_CONTRACT = "m6.release-projection.v1"
 _MAX_BYTES = 256 * 1024
 _FIELDS = frozenset({
@@ -97,9 +98,28 @@ class MineruReleaseManifest:
     native_m6: dict[str, Any]
     installation: dict[str, Any]
     files: tuple[ReleaseFile, ...] = field(default_factory=tuple)
+    inference_build: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.contract_version != RELEASE_MANIFEST_CONTRACT:
+        if self.contract_version == RELEASE_MANIFEST_CONTRACT:
+            if self.inference_build is not None:
+                raise ValueError("raw release cannot contain an inference build")
+        elif self.contract_version == DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT:
+            build = self.inference_build
+            if not isinstance(build, dict):
+                raise ValueError("diagnostic release requires an inference build object")
+            require_fields(build, {"context", "context_sha256", "sources"}, label="inference build")
+            if build["context"] != "inference-context":
+                raise ValueError("inference build context is unsupported")
+            require_sha256(build["context_sha256"], label="inference context sha256")
+            if type(build["sources"]) is not dict:
+                raise ValueError("inference build sources must be an object")
+            require_fields(build["sources"], {"Dockerfile", "mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py"}, label="inference sources")
+            for name, digest in build["sources"].items():
+                require_sha256(digest, label=name)
+            if sha256_of(canonical_bytes(build["sources"])) != build["context_sha256"]:
+                raise ValueError("inference context digest differs from source map")
+        else:
             raise ValueError("release manifest contract is unsupported")
         if _UTC_RE.fullmatch(require_str(self.built_at_utc, label="built_at_utc", maximum=32)) is None:
             raise ValueError("release manifest built_at_utc must be an ISO-8601 UTC second timestamp")
@@ -195,6 +215,8 @@ class MineruReleaseManifest:
                 for item in self.files
             ],
         }
+        if self.inference_build is not None:
+            payload["inference_build"] = self.inference_build
         return canonical_bytes(payload)
 
     @property
@@ -217,7 +239,8 @@ def capacity_sources_sha256(sources: dict[str, str]) -> str:
 
 def decode_mineru_release_manifest(payload: bytes) -> MineruReleaseManifest:
     value = load_closed_object(payload, label="release manifest", maximum_bytes=_MAX_BYTES)
-    require_fields(value, _FIELDS, label="release manifest")
+    fields_expected = _FIELDS | {"inference_build"} if value.get("contract_version") == DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT else _FIELDS
+    require_fields(value, fields_expected, label="release manifest")
     files = value["files"]
     if type(files) is not list:
         raise ValueError("release manifest files must be a list")

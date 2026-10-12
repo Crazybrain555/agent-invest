@@ -182,6 +182,79 @@ def candidate_code_counts(conn: Connection) -> dict[str, int]:
     return {str(row.code): int(row.candidate_count) for row in rows}
 
 
+def successful_sync_ranges(
+    conn: Connection,
+    *,
+    company_id: str,
+    window_start: date,
+    window_end: date,
+) -> list[tuple[date, date]] | None:
+    """Merged closed coverage, or None if history admission is no longer valid.
+
+    The existing company index restricts receipt reads to one company. Date
+    clipping and server-side union bound returned ranges by the target window,
+    regardless of repeated hourly/overlap syncs. An eligible company with no
+    usable receipts returns [] (unknown coverage), never invented coverage.
+    """
+
+    rows = conn.execute(
+        text(
+            f"""
+            WITH eligible AS (
+                SELECT company_id
+                  FROM {CORE_SCHEMA}.tracked_company
+                 WHERE company_id = :company_id
+                   AND status = 'active' AND lookback IS NULL
+            ), successful AS (
+                SELECT (sa.query_params->>'sdate')::date AS query_start,
+                       (sa.query_params->>'edate')::date AS query_end
+                  FROM {CORE_SCHEMA}.source_access sa
+                  JOIN eligible e ON e.company_id = sa.company_id
+                 WHERE sa.provider = 'cninfo'
+                   AND sa.provider_interface IN (
+                       'cninfo:p_info3015', 'cninfo:hisAnnouncement')
+                   AND sa.status = 'ok'
+                   AND sa.result_hash ~ '^sha256:[0-9a-f]{{64}}$'
+                   AND sa.result_snapshot->>'result' IN ('ok', 'empty')
+                   AND jsonb_typeof(sa.result_snapshot->'candidates') = 'array'
+                   AND jsonb_typeof(sa.query_params->'sdate') = 'string'
+                   AND jsonb_typeof(sa.query_params->'edate') = 'string'
+                   AND sa.query_params->>'sdate' ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                   AND sa.query_params->>'edate' ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+            ), merged AS (
+                SELECT range_agg(daterange(
+                           greatest(query_start, CAST(:window_start AS date)),
+                           least(query_end, CAST(:window_end AS date)), '[]'
+                       )) AS coverage
+                  FROM successful
+                 WHERE query_start <= query_end
+                   AND query_start <= CAST(:window_end AS date)
+                   AND query_end >= CAST(:window_start AS date)
+            )
+            SELECT lower(r.covered_range) AS window_start,
+                   upper(r.covered_range) - 1 AS window_end
+              FROM eligible
+              CROSS JOIN merged
+              LEFT JOIN LATERAL unnest(merged.coverage) r(covered_range) ON true
+             ORDER BY window_start
+            """
+        ),
+        {
+            "company_id": company_id,
+            "window_start": window_start,
+            "window_end": window_end,
+        },
+    ).mappings()
+    values = list(rows)
+    if not values:
+        return None
+    return [
+        (row["window_start"], row["window_end"])
+        for row in values
+        if row["window_start"] is not None
+    ]
+
+
 def sync_due(
     conn: Connection, *, interval_seconds: int, limit: int
 ) -> list[dict[str, Any]]:

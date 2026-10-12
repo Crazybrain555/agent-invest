@@ -13,7 +13,10 @@ param(
     [switch]$ReuseCurrentPublishedImage,
     [switch]$ApiOnlyCompatibilityUpgrade,
     [switch]$InferenceRecreate,
+    [string]$InferenceDiagnosticContext = "",
+    [ValidatePattern('\A(|sha256:[a-f0-9]{64})\z')][string]$InferenceDiagnosticContextSha256 = "",
     [ValidateSet("", "cpu", "cuda0")][string]$ExpectedApiDeviceProfile = "",
+    [ValidateSet("", "cpu", "cuda0")][string]$ExpectedFullApiDeviceProfile = "",
     [ValidateSet("", "cpu", "cuda0")][string]$ApiDeviceProfile = "",
     [string]$CampaignApiCompatImageId = "",
     [ValidateSet(1)][int]$ExpectedApiTaskSlots = 1,
@@ -41,7 +44,17 @@ if (-not $InferenceRecreate -and $ExpectedApiDeviceProfile -ne "") {
     throw "expected API device profile is only valid for inference recreation"
 }
 $ApiOnlyOperation = $ReuseCurrentPublishedImage -or $ApiOnlyCompatibilityUpgrade
+if ($ExpectedFullApiDeviceProfile -ne "" -and ($ApiOnlyOperation -or $InferenceRecreate)) { throw "full API device expectation belongs to full installation only" }
+$InferenceDiagnostic = -not [string]::IsNullOrEmpty($InferenceDiagnosticContext)
+if ($InferenceDiagnostic -ne (-not [string]::IsNullOrEmpty($InferenceDiagnosticContextSha256)) -or
+        ($InferenceDiagnostic -and $ApiOnlyOperation)) {
+    throw "diagnostic source requires a context identity and full installation or exact same-config recreation"
+}
+$ExpectedInferenceReference = $ExpectedRepoDigest
+$ExpectedInferenceImageId = $ExpectedImageId
+$InferenceBuildProof = $null
 $ExplicitCapacity = -not [string]::IsNullOrEmpty($CapacityConfigSource)
+if ($InferenceDiagnostic -and (-not $ExplicitCapacity -or $ExpectedRepoDigest -cne "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458")) { throw "diagnostic source requires the exact observed raw base and explicit capacity" }
 if ($ExplicitCapacity -ne (-not [string]::IsNullOrEmpty($ExpectedCapacityConfigSha256))) {
     throw "capacity config source and expected SHA must be supplied together"
 }
@@ -1548,6 +1561,7 @@ function Get-ValidatedRuntime {
     $api = $api[0]
     if ($ApiDeviceProfile -ne "") { Assert-ApiDeviceRuntime -Container $api -Profile $ApiDeviceProfile }
     if ($InferenceRecreate) { Assert-ApiDeviceRuntime -Container $api -Profile $ExpectedApiDeviceProfile }
+    if ($ExpectedFullApiDeviceProfile -ne "") { Assert-ApiDeviceRuntime -Container $api -Profile $ExpectedFullApiDeviceProfile }
     $proxy = $proxy[0]
     $inference = $inference[0]
 
@@ -1557,13 +1571,16 @@ function Get-ValidatedRuntime {
     ) {
         throw "MinerU API compatibility image reference or ID drifted"
     }
-    foreach ($container in @($proxy, $inference)) {
+    foreach ($container in @($proxy)) {
         if (
             [string]$container.Config.Image -ne $ExpectedRepoDigest -or
             [string]$container.Image -ne $ExpectedImageId
         ) {
             throw "$($container.Name) base image reference or image ID drifted"
         }
+    }
+    if ([string]$inference.Config.Image -cne $ExpectedInferenceReference -or [string]$inference.Image -cne $ExpectedInferenceImageId) {
+        throw "inference image reference or image ID drifted"
     }
     foreach ($container in @($api, $proxy, $inference)) {
         if (
@@ -1610,10 +1627,10 @@ function Get-ValidatedRuntime {
         }
         Assert-CapacityFiles -ContainerId ([string]$api.Id)
     }
-    Assert-ExactCommand -Container $inference -Expected @(
-        "mineru-openai-server", "--host", "0.0.0.0", "--port", "30000",
-        "--max-num-seqs", "128", "--mm-processor-cache-gb", "0"
-    )
+    $inferenceArgv = @("mineru-openai-server", "--host", "0.0.0.0", "--port", "30000",
+        "--max-num-seqs", "128", "--mm-processor-cache-gb", "0")
+    if ($InferenceDiagnostic) { $inferenceArgv += @("--worker-cls", "mineru_inference_memory.worker.OwnerMemoryWorker") }
+    Assert-ExactCommand -Container $inference -Expected $inferenceArgv
     $proxyCommand = @($proxy.Config.Entrypoint) + @($proxy.Config.Cmd)
     if (
         $proxyCommand.Count -ne 4 -or
@@ -1866,6 +1883,118 @@ function Build-ValidatedApiCompatImage {
     }
     return (Get-ValidatedApiCompatImage -Reference $ApiCompatBuildTag `
         -RequiredImageId $ExpectedApiCompatImageId -BuildIdentity $identity)
+}
+
+function Build-ValidatedInferenceDiagnostic {
+    param([switch]$ReuseInstalled)
+    $context = [IO.Path]::GetFullPath($InferenceDiagnosticContext)
+    $sourceMap = [ordered]@{}
+    foreach ($name in @('Dockerfile','mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+        $path = Join-Path $context $name
+        $file = Get-Item -LiteralPath $path
+        if ($file.Length -lt 1 -or $file.Length -gt 8388608 -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "diagnostic build source is not a bounded regular file" }
+        $sourceMap[$name] = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+    }
+    $contextSha = Get-Sha256Text ($sourceMap | ConvertTo-Json -Compress)
+    if ($contextSha -cne $InferenceDiagnosticContextSha256) { throw "diagnostic build source map differs from the release identity" }
+    $reference = 'agent-invest/mineru-inference:owner-memory-' + $contextSha.Substring(7)
+    $candidate = Get-ResolvedCompose $ComposeSource
+    if ([string]$candidate.services."mineru-openai-server".image -cne $reference -or
+            [string]$candidate.services."mineru-api-proxy".image -cne $ExpectedRepoDigest) { throw "diagnostic compose image projection drifted" }
+    if (-not $ReuseInstalled) {
+    Invoke-Docker -Arguments @('build','--pull=false','--network','none','--tag',$reference,
+        '--label',('io.agent-invest.mineru.owner-memory-module-sha256=' + $sourceMap['mineru_inference_memory/worker.py']),
+        '--label',('io.agent-invest.mineru.owner-memory-dockerfile-sha256=' + $sourceMap['Dockerfile']),
+        '--label',('io.agent-invest.mineru.owner-memory-base-repo-digest=' + $ExpectedRepoDigest),
+        '--label',('io.agent-invest.mineru.owner-memory-context-sha256=' + $contextSha),
+        '--file',(Join-Path $context 'Dockerfile'),$context) -TimeoutMilliseconds 900000 | Out-Null
+    }
+    $image = @(Invoke-Docker -Arguments @('image','inspect',$reference) | ConvertFrom-Json)
+    if ($image.Count -ne 1 -or [string]$image[0].Id -cnotmatch '^sha256:[a-f0-9]{64}$') { throw "diagnostic image is not uniquely bound" }
+    if ($ReuseInstalled) {
+        $installed = (Get-Content -LiteralPath $ReceiptTarget -Raw | ConvertFrom-Json).inference_diagnostic_build
+        if ($null -eq $installed -or [string]$installed.context_sha256 -cne $contextSha -or
+                [string]$installed.image_reference -cne $reference -or [string]$installed.image_id -cne [string]$image[0].Id -or
+                (Get-CanonicalObjectJson $installed.sources) -cne (Get-CanonicalObjectJson $sourceMap)) { throw "installed diagnostic source/image proof differs from same-config recreation" }
+    }
+    $probe = @'
+import hashlib, importlib.metadata, json
+from pathlib import Path
+root = Path(importlib.metadata.distribution("vllm").locate_file(""))
+def digest(relative):
+    path = root / relative
+    if path.is_symlink(): raise RuntimeError("source symlink refused")
+    with path.open("rb") as stream: raw = stream.read(8388609)
+    if not raw or len(raw) > 8388608: raise RuntimeError("source byte bound exceeded")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+diagnostic_paths = ("mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py")
+paths = ("vllm/v1/worker/worker_base.py", "vllm/v1/worker/gpu_worker.py", "vllm/v1/worker/gpu_model_runner.py", "vllm/v1/worker/gpu/mm/encoder_runner.py")
+print(json.dumps({"module_sha256": digest("mineru_inference_memory/worker.py"), "actual_source_sha256": {path: digest(path) for path in paths}, "actual_diagnostic_source_sha256": {path: digest(path) for path in diagnostic_paths}, "vllm_version": importlib.metadata.version("vllm")}, sort_keys=True))
+'@
+    $probeArguments = if ($ReuseInstalled) { @('exec','mineru-openai-server','/usr/bin/python3.12','-I','-c',$probe) } else { @('run','--rm','--network','none','--entrypoint','/usr/bin/python3.12',[string]$image[0].Id,'-I','-c',$probe) }
+    $proof = @(Invoke-Docker -Arguments $probeArguments)
+    if ($proof.Count -ne 1) { throw "diagnostic image source probe is not singular" }
+    $actual = ([string]$proof[0]) | ConvertFrom-Json
+    $preimages = @{
+        'vllm/v1/worker/worker_base.py'='sha256:e6017acf80e442405f09f99413c0227515ae097d3e1dc79005b0b5c266932f12'
+        'vllm/v1/worker/gpu_worker.py'='sha256:53196cef1d32b5c5207c8986a5666352fd5ba0b79c418c074311147f266cadc4'
+        'vllm/v1/worker/gpu_model_runner.py'='sha256:95b7ee3ff5eecdb0fa791f375b2aeedc6ac507f3ea4a9683700d3b202b2caf08'
+        'vllm/v1/worker/gpu/mm/encoder_runner.py'='sha256:909181912d39bf4734d5202340a77813252136bc1f38c458f879b05743a522bf'
+    }
+    if ([string]$actual.vllm_version -cne '0.21.0' -or [string]$actual.module_sha256 -cne $sourceMap['mineru_inference_memory/worker.py']) { throw "diagnostic built module/version drifted" }
+    foreach ($name in $preimages.Keys) { if ([string]$actual.actual_source_sha256.$name -cne $preimages[$name]) { throw "diagnostic vLLM source preimage drifted: $name" } }
+    foreach ($name in @('mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+        if ([string]$actual.actual_diagnostic_source_sha256.$name -cne $sourceMap[$name]) { throw "diagnostic installed package source drifted: $name" }
+    }
+    $labels = $image[0].Config.Labels
+    if ([string]$labels.'io.agent-invest.mineru.owner-memory-module-sha256' -cne $sourceMap['mineru_inference_memory/worker.py'] -or
+            [string]$labels.'io.agent-invest.mineru.owner-memory-dockerfile-sha256' -cne $sourceMap['Dockerfile'] -or
+            [string]$labels.'io.agent-invest.mineru.owner-memory-base-repo-digest' -cne $ExpectedRepoDigest -or
+            [string]$labels.'io.agent-invest.mineru.owner-memory-context-sha256' -cne $contextSha) { throw "diagnostic built image labels drifted" }
+    $script:ExpectedInferenceReference = $reference
+    $script:ExpectedInferenceImageId = [string]$image[0].Id
+    $script:InferenceBuildProof = [ordered]@{ context_sha256=$contextSha; image_reference=$reference; image_id=[string]$image[0].Id; sources=$sourceMap; actual=$actual }
+    Write-OperationRecord 'inference-build-proof.json' $script:InferenceBuildProof
+}
+
+function Assert-DiagnosticCollectorIdentity {
+    param([string]$Phase, [AllowNull()][object]$Observation = $null)
+    if ($null -eq $Observation) {
+        $observed = @(& $CollectorTarget -ComposePath $ComposeTarget -OutputRoot $OutputRoot -ExpectedCapacityConfigSha256 $ExpectedCapacityConfigSha256)
+        if ($observed.Count -ne 1) { throw "diagnostic collector did not return a singular observation" }
+        $value = ([string]$observed[0]) | ConvertFrom-Json
+    } else { $value = $Observation }
+    if ([string]$value.schema -cne 'mineru-windows-runtime-observation.v7' -or
+            [string]$value.inference.image_id -cne $ExpectedInferenceImageId -or
+            [string]$value.inference_diagnostic.module_sha256 -cne [string]$InferenceBuildProof.sources.'mineru_inference_memory/worker.py' -or
+            (Get-CanonicalObjectJson $value.inference_diagnostic.actual_source_sha256) -cne (Get-CanonicalObjectJson $InferenceBuildProof.actual.actual_source_sha256) -or
+            (Get-CanonicalObjectJson $value.inference_diagnostic.actual_diagnostic_source_sha256) -cne (Get-CanonicalObjectJson $InferenceBuildProof.actual.actual_diagnostic_source_sha256) -or
+            @($value.inference_diagnostic.loaded_workers).Count -ne 1) { throw "diagnostic collector source/loading identity differs" }
+    $proof = $value.inference_diagnostic
+    $worker = @($proof.loaded_workers)[0]
+    $expectedLabels = [ordered]@{
+        'io.agent-invest.mineru.owner-memory-module-sha256'=$InferenceBuildProof.sources.'mineru_inference_memory/worker.py'
+        'io.agent-invest.mineru.owner-memory-dockerfile-sha256'=$InferenceBuildProof.sources.Dockerfile
+        'io.agent-invest.mineru.owner-memory-base-repo-digest'=$ExpectedRepoDigest
+        'io.agent-invest.mineru.owner-memory-context-sha256'=$InferenceDiagnosticContextSha256
+    }
+    if ([string]$proof.contract_version -cne 'mineru.owner-memory-observation.v1' -or
+            (Get-CanonicalObjectJson $proof.image_labels) -cne (Get-CanonicalObjectJson $expectedLabels) -or
+            [string]$proof.container_epoch.container_id -cne [string]$value.inference.container_id -or
+            [string]$proof.container_epoch.container_id -cnotmatch '^[a-f0-9]{64}$' -or
+            [string]$proof.container_epoch.started_at -cne [string]$value.inference.started_at -or
+            [string]::IsNullOrEmpty([string]$proof.container_epoch.started_at) -or
+            [string]$worker.contract_version -cne 'mineru.owner-memory-identity.v1' -or
+            [string]$worker.worker_class -cne 'mineru_inference_memory.worker.OwnerMemoryWorker' -or
+            [string]$worker.module_sha256 -cne [string]$proof.module_sha256 -or
+            [string]$worker.device -cne 'cuda:0' -or [long]$worker.pid -le 0 -or
+            [long]$worker.proc_start_ticks -le 0 -or [long]$worker.namespace_init_start_ticks -le 0 -or
+            [long]$worker.proc_start_ticks -ne [long]$worker.observed_proc_start_ticks -or
+            [long]$worker.namespace_init_start_ticks -gt [long]$worker.proc_start_ticks -or
+            [string]::IsNullOrEmpty([string]$worker.instance_id) -or ([string]$worker.instance_id).Length -gt 128) {
+        throw "diagnostic collector loaded owner/container proof differs"
+    }
+    Write-OperationRecord ('diagnostic-observation-' + $Phase + '.json') $value
 }
 
 function Assert-InferenceRecreateInputs {
@@ -2137,10 +2266,12 @@ try {
     Capture-OldRuntimeState
     if ($InferenceRecreate) {
         Assert-InferenceRecreateInputs
+        if ($InferenceDiagnostic) { Build-ValidatedInferenceDiagnostic -ReuseInstalled }
         $compatImage = Get-ValidatedPublishedApiCompatImage
         $PreDeploymentOutputState = Get-QuiescentOutputState -CandidateSource
         $registryWitnessBefore = Get-RollbackRegistryWitness -State $PreDeploymentOutputState
         $runtimeBefore = Get-ValidatedRuntime
+        if ($InferenceDiagnostic) { Assert-DiagnosticCollectorIdentity -Phase before }
         Assert-VllmIdle
         $beforeEpochs = Get-MineruServiceEpochs
         $receiptSha = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ReceiptTarget).Hash.ToLowerInvariant()
@@ -2158,6 +2289,7 @@ try {
         $DeploymentAttempted = $true
         Invoke-InferenceRecreate
         $runtime = Get-ValidatedRuntime
+        if ($InferenceDiagnostic) { Assert-DiagnosticCollectorIdentity -Phase after }
         Assert-VllmIdle
         $afterEpochs = Get-MineruServiceEpochs
         Assert-InferenceRecreateEpochs -Before $beforeEpochs -After $afterEpochs
@@ -2180,6 +2312,7 @@ try {
     }
     else {
         if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
+        if ($InferenceDiagnostic) { Build-ValidatedInferenceDiagnostic }
     foreach ($directory in @(
         (Split-Path -Parent $ComposeTarget), (Split-Path -Parent $CollectorTarget),
         (Split-Path -Parent $ReceiptTarget), $OutputRoot
@@ -2289,10 +2422,11 @@ try {
         throw "formal runtime collector did not return one observation"
     }
     $collectorObservation = ([string]$collectorOutput[0]) | ConvertFrom-Json
-    $expectedCollectorSchema = if ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } else { "mineru-windows-runtime-observation.v5" }
+    $expectedCollectorSchema = if ($InferenceDiagnostic) { "mineru-windows-runtime-observation.v7" } elseif ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } else { "mineru-windows-runtime-observation.v5" }
     if ($collectorObservation.schema -isnot [string] -or $collectorObservation.schema -cne $expectedCollectorSchema) {
         throw "formal runtime collector contract drifted"
     }
+    if ($InferenceDiagnostic) { Assert-DiagnosticCollectorIdentity -Phase installed -Observation $collectorObservation }
     Remove-CompatBuildTag
     $receipt = [ordered]@{
         schema = "mineru-windows-install-receipt.v2"
@@ -2309,6 +2443,13 @@ try {
         collector_backup = if ($CollectorExisted) { $CollectorBackup } else { $null }
         collector_observation_schema = [string]$collectorObservation.schema
         runtime = $runtime
+    }
+    if ($InferenceDiagnostic) {
+        $receipt["inference_diagnostic_build"] = $InferenceBuildProof
+        if ($ReceiptBackupCreated) {
+            $receipt["predecessor_receipt_backup"] = $ReceiptBackup
+            $receipt["predecessor_receipt_sha256"] = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ReceiptBackup).Hash.ToLowerInvariant()
+        }
     }
     $receiptJson = $receipt | ConvertTo-Json -Depth 100
     Write-Utf8NoBom -Path $ReceiptTarget -Value ($receiptJson + "`n")

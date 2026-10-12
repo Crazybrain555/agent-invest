@@ -32,6 +32,10 @@
    "private_imports": [],
    "tests": 1
   },
+  "tests/integration/test_db_file_open_interruption_independent.py": {
+   "private_imports": [],
+   "tests": 2
+  },
   "tests/integration/test_derived_ownership_lock.py": {
    "private_imports": [],
    "tests": 6
@@ -82,7 +86,7 @@
   },
   "tests/integration/test_ops_queue_views.py": {
    "private_imports": [],
-   "tests": 35
+   "tests": 36
   },
   "tests/integration/test_original_download_link_integration.py": {
    "private_imports": [],
@@ -239,7 +243,7 @@
   },
   "tests/unit/test_attest_mineru_remote_runtime.py": {
    "private_imports": [],
-   "tests": 8
+   "tests": 9
   },
   "tests/unit/test_audit_live_unit_replay.py": {
    "private_imports": [],
@@ -334,6 +338,10 @@
   "tests/unit/test_db_bootstrap.py": {
    "private_imports": [],
    "tests": 2
+  },
+  "tests/unit/test_db_file_open_interruption_independent.py": {
+   "private_imports": [],
+   "tests": 11
   },
   "tests/unit/test_dedicated_mac_observer.py": {
    "private_imports": [
@@ -966,6 +974,14 @@
    "private_imports": [],
    "tests": 16
   },
+  "tests/unit/test_mineru_owner_memory.py": {
+   "private_imports": [],
+   "tests": 20
+  },
+  "tests/unit/test_mineru_owner_memory_independent.py": {
+   "private_imports": [],
+   "tests": 21
+  },
   "tests/unit/test_mineru_package_a_builder.py": {
    "private_imports": [],
    "tests": 2
@@ -1018,19 +1034,19 @@
   },
   "tests/unit/test_mineru_release_compose_independent.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_mineru_release_inference_recreate.py": {
    "private_imports": [],
-   "tests": 3
+   "tests": 5
   },
   "tests/unit/test_mineru_release_install_independent.py": {
    "private_imports": [],
-   "tests": 5
+   "tests": 6
   },
   "tests/unit/test_mineru_release_package_independent.py": {
    "private_imports": [],
-   "tests": 10
+   "tests": 11
   },
   "tests/unit/test_mineru_release_projection_independent.py": {
    "private_imports": [],
@@ -1161,6 +1177,10 @@
   "tests/unit/test_native_storage_recovery_independent.py": {
    "private_imports": [],
    "tests": 1
+  },
+  "tests/unit/test_network_recovery_independent.py": {
+   "private_imports": [],
+   "tests": 16
   },
   "tests/unit/test_new_qualified_runtime_upgrade_independent.py": {
    "private_imports": [],
@@ -1505,6 +1525,10 @@
    "private_imports": [],
    "tests": 5
   },
+  "tests/unit/test_semantic_network_wait.py": {
+   "private_imports": [],
+   "tests": 18
+  },
   "tests/unit/test_semantic_route_receipt_v3.py": {
    "private_imports": [],
    "tests": 6
@@ -1526,7 +1550,7 @@
   },
   "tests/unit/test_settings.py": {
    "private_imports": [],
-   "tests": 11
+   "tests": 12
   },
   "tests/unit/test_source_semantic_build.py": {
    "private_imports": [],
@@ -1618,6 +1642,10 @@
    "private_imports": [],
    "tests": 11
   },
+  "tests/unit/test_staged_ingress_interruption_replay.py": {
+   "private_imports": [],
+   "tests": 18
+  },
   "tests/unit/test_staged_new_work_admission_v4.py": {
    "private_imports": [],
    "tests": 24
@@ -1678,7 +1706,7 @@
   },
   "tests/unit/test_sync_disclosure_index.py": {
    "private_imports": [],
-   "tests": 12
+   "tests": 14
   },
   "tests/unit/test_synchronized_telemetry_contract.py": {
    "private_imports": [],
@@ -1764,6 +1792,10 @@
    "private_imports": [],
    "tests": 44
   },
+  "tests/unit/test_worker_history_sync.py": {
+   "private_imports": [],
+   "tests": 12
+  },
   "tests/unit/test_worker_progress.py": {
    "private_imports": [],
    "tests": 10
@@ -1772,7 +1804,7 @@
    "private_imports": [
     "_sync_window_start"
    ],
-   "tests": 77
+   "tests": 78
   }
  },
  "schema": "test-composition-ledger.v1"

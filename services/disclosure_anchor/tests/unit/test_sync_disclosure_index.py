@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import unittest
@@ -232,6 +232,35 @@ class ComputeSyncWindowTests(unittest.TestCase):
             (date(2019, 1, 1), date(2019, 12, 31)),
         )
 
+    def test_first_contact_uses_five_year_default_or_explicit_window(self) -> None:
+        self.assertEqual(
+            self._window(),
+            (self.TODAY - timedelta(days=1827), self.TODAY),
+        )
+        self.assertEqual(
+            self._window(explicit_window_days=30),
+            (self.TODAY - timedelta(days=30), self.TODAY),
+        )
+
+    def test_tracked_first_sync_preserves_company_override(self) -> None:
+        uow = FakeUnitOfWork()
+        tracked = _seed_tracked(uow)
+        for lookback, expected in ((None, 1827), ({"days": 30}, 30), ({"days": 0}, 0)):
+            with self.subTest(lookback=lookback):
+                tracked.lookback = lookback
+                uow.tracked_companies.update(tracked)
+                self.assertEqual(
+                    compute_sync_window(
+                        uow_factory=lambda: uow,
+                        company="000001",
+                        exchange="SZSE",
+                        today=self.TODAY,
+                        overlap_days=7,
+                        explicit_window_days=None,
+                    ),
+                    (self.TODAY - timedelta(days=expected), self.TODAY),
+                )
+
     def test_range_and_window_days_are_mutually_exclusive(self) -> None:
         with self.assertRaises(ValueError):
             self._window(
@@ -263,6 +292,12 @@ class CheckpointMonotonicTests(unittest.TestCase):
         _seed_tracked(uow)
         use_case = _use_case(uow, _refs())
         first = use_case.execute(_command())  # window_end = 2026-07-02
+        original_access = uow.source_accesses.get(first.index_source_access_id)
+        original_identity = (
+            original_access.result_hash,
+            json.dumps(original_access.result_snapshot, sort_keys=True),
+            dict(original_access.query_params),
+        )
         backfill = use_case.execute(
             SyncDisclosureIndexCommand(
                 security_code="000001",
@@ -277,6 +312,30 @@ class CheckpointMonotonicTests(unittest.TestCase):
         self.assertEqual(checkpoint.cursor["window_end"], "2026-07-02")
         # Audit fields still record what the backfill actually covered.
         self.assertEqual(checkpoint.cursor["window_start"], "2019-01-01")
+        backfill_access = uow.source_accesses.get(backfill.index_source_access_id)
+        self.assertEqual(backfill_access.query_params["sdate"], "2019-01-01")
+        self.assertEqual(backfill_access.query_params["edate"], "2019-12-31")
+        self.assertEqual(
+            (
+                original_access.result_hash,
+                json.dumps(original_access.result_snapshot, sort_keys=True),
+                dict(original_access.query_params),
+            ),
+            original_identity,
+        )
+        # After an explicit range extension, the next ordinary sync remains
+        # incremental; it does not replay five years or the historical range.
+        self.assertEqual(
+            compute_sync_window(
+                uow_factory=lambda: uow,
+                company="000001",
+                exchange="SZSE",
+                explicit_window_days=None,
+                today=date(2026, 7, 14),
+                overlap_days=7,
+            ),
+            (date(2026, 6, 25), date(2026, 7, 14)),
+        )
 
 
 class FakeCninfoSource:

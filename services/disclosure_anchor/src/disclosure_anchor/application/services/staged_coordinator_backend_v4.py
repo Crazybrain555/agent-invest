@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from disclosure_anchor.application.ports.mineru_stream_pressure import StreamSubmissionDeferred
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import fields
 from math import isfinite
 from pathlib import Path
+import threading
 import time
 from typing import Protocol, TypeVar, cast
 
@@ -63,6 +65,11 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
     CleanupOutcome,
     PerAttemptResourceAllowance,
     ResourceCreditVector,
+)
+from disclosure_anchor.application.ports.semantic_routes import (
+    SemanticNetworkUnavailable,
+    SemanticNetworkWaitPort,
+    SemanticRouteAdjudicatorError,
 )
 from disclosure_anchor.application.ports.staged_lifecycle_facts import StagedLifecycleFactsPort
 from disclosure_anchor.application.services.staged_lifecycle_reporting import (
@@ -263,6 +270,93 @@ class V4NewWorkAdmissionPort(Protocol):
 _EvidenceT = TypeVar("_EvidenceT")
 
 
+class SemanticNetworkCommitWait:
+    """COMMIT's handling of a semantic network outage, without a new state.
+
+    A semantic network outage during the request build (no provider answered a
+    group, at least one was unreachable) becomes ``StageWaiting`` for the same
+    durable attempt: nothing was decided, so no receipt, cache entry, readiness
+    bundle or transaction P exists, the stage's heavy-work permit and producer
+    lock are released, and no retry budget is spent. The next COMMIT
+    rebuilds the same request and every answered group is a cache hit. The set
+    of waiting attempts is process local and only spares work: while the shared
+    cooldown still refuses provider calls, such an attempt waits again before
+    any reopen, read or permit-bound work; a restart forgets it and the first
+    COMMIT asks the cooldown again. Once provider calls are stopped for an
+    operator stop, a waiting attempt ends as the same retry-neutral
+    cancellation a stopped provider call raises, so a drain never waits for
+    the network to return.
+    """
+
+    def __init__(self, cooldown: SemanticNetworkWaitPort | None) -> None:
+        if cooldown is not None and not all(
+            callable(getattr(cooldown, name, None))
+            for name in ("pending_seconds", "shutdown_requested")
+        ):
+            raise ValueError("v4 backend semantic network wait is invalid")
+        self._cooldown = cooldown
+        self._waiting: set[str] = set()
+        self._lock = threading.Lock()
+
+    def raise_if_pending(self, attempt_id: str, stage_guard: StageLeaseGuard) -> None:
+        if self._cooldown is None:
+            return
+        with self._lock:
+            if attempt_id not in self._waiting:
+                return
+        stage_guard.checkpoint()
+        if self._cooldown.shutdown_requested():
+            raise _network_wait_cancelled()
+        pending = self._cooldown.pending_seconds()
+        if pending is None:
+            return
+        stage_guard.note(
+            "semantic_network_waiting",
+            retry_after_ms=max(1, round(pending * 1000)),
+            provider_attempts=0,
+        )
+        raise StageWaiting(
+            "COMMIT waits for the semantic providers' network to return",
+            retry_after_seconds=pending,
+        )
+
+    @contextmanager
+    def converting(self, attempt_id: str, stage_guard: StageLeaseGuard) -> Iterator[None]:
+        try:
+            yield
+        except SemanticNetworkUnavailable as exc:
+            with self._lock:
+                self._waiting.add(attempt_id)
+            if self._cooldown is not None and self._cooldown.shutdown_requested():
+                raise _network_wait_cancelled() from exc
+            stage_guard.note(
+                "semantic_network_waiting",
+                retry_after_ms=max(1, round(exc.retry_after_seconds * 1000)),
+                provider_attempts=len(exc.attempts),
+            )
+            raise StageWaiting(str(exc), retry_after_seconds=exc.retry_after_seconds) from exc
+        except BaseException:
+            self._forget(attempt_id)
+            raise
+        self._forget(attempt_id)
+
+    def waiting(self, attempt_id: str) -> bool:
+        with self._lock:
+            return attempt_id in self._waiting
+
+    def _forget(self, attempt_id: str) -> None:
+        with self._lock:
+            self._waiting.discard(attempt_id)
+
+
+def _network_wait_cancelled() -> SemanticRouteAdjudicatorError:
+    return SemanticRouteAdjudicatorError(
+        "semantic network wait ended because provider calls were stopped",
+        reason_code="cancelled",
+        retryable=True,
+    )
+
+
 class DurableStagedCoordinatorBackendV4:
     """Mechanically composable, default-off implementation of all seven lanes."""
 
@@ -281,11 +375,13 @@ class DurableStagedCoordinatorBackendV4:
         publication_committed: Callable[[bool], None] = lambda _replaced: None,
         wall_clock: Callable[[], float] = time.time,
         lifecycle_facts: StagedLifecycleFactsPort | None = None,
+        semantic_network_wait: SemanticNetworkWaitPort | None = None,
     ) -> None:
         if not 0 < poll_seconds <= 300:
             raise ValueError("v4 backend poll interval is invalid")
         if not callable(wall_clock):
             raise ValueError("v4 backend wall clock is invalid")
+        self._semantic_network = SemanticNetworkCommitWait(semantic_network_wait)
         self._persistence = persistence
         self._inputs = inputs
         self._remote = remote
@@ -645,6 +741,7 @@ class DurableStagedCoordinatorBackendV4:
         credit_allowance: ResourceCreditVector,
         stage_guard: StageLeaseGuard,
     ) -> CoordinatorWork:
+        self._semantic_network.raise_if_pending(work.attempt_id, stage_guard)
         if getattr(stage_guard, "heavy_work_permitted", None) is False:
             # Reopen, Unit build, readiness and promotion hold whole objects.
             raise StageHeavyWorkRequired(
@@ -658,13 +755,14 @@ class DurableStagedCoordinatorBackendV4:
         )
         materialized = self._reopen_materialized(authority, stage_guard)
         try:
-            winner = self._publisher.execute(
-                checkpoint=authority.checkpoint,
-                materialized=materialized,
-                claim=authority.claim_witness,
-                claim_guard=self._claim_guard,
-                stage_guard=stage_guard,
-            )
+            with self._semantic_network.converting(work.attempt_id, stage_guard):
+                winner = self._publisher.execute(
+                    checkpoint=authority.checkpoint,
+                    materialized=materialized,
+                    claim=authority.claim_witness,
+                    claim_guard=self._claim_guard,
+                    stage_guard=stage_guard,
+                )
         except SemanticRouteLockedCandidateOverflowError as exc:
             # The publication request builder refuses this document before
             # transaction P, so nothing was persisted and the attempt can close
@@ -1753,5 +1851,6 @@ class DurableStagedCoordinatorBackendV4:
 
 __all__ = [
     "DurableStagedCoordinatorBackendV4",
+    "SemanticNetworkCommitWait",
     "V4StageInputResolver",
 ]

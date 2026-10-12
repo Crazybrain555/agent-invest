@@ -137,7 +137,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     binding = load_release_private_binding(args.private_binding)
     summary = install_release(
         report=report, package=args.package, binding=binding, output=args.output,
-        operation_kind=args.operation_kind,
+        operation_kind=args.operation_kind, legacy_scope_inventory_path=args.legacy_scope_inventory,
     )
     _emit({**summary, "output": str(args.output)})
     return EX_OK if summary["status"] == "pass" else EX_FAILURE
@@ -216,9 +216,10 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--private-binding", type=_absolute, required=True)
     install.add_argument("--output", type=_absolute, required=True)
     install.add_argument(
-        "--operation-kind", choices=("api-compatibility", "inference-recreate"),
+        "--operation-kind", choices=("api-compatibility", "inference-recreate", "full-install"),
         default="api-compatibility",
     )
+    install.add_argument("--legacy-scope-inventory", type=_absolute, help="fresh exact zero-duty inventory; required only for full-install")
     install.set_defaults(handler=cmd_install)
 
     same_root = commands.add_parser(

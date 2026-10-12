@@ -1902,7 +1902,8 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
         self.assertNotIn("versioned v4 evidence paths", installer)
         self.assertIn('schema = "mineru-windows-runtime-observation.v5"', collector)
         self.assertIn(
-            '$expectedCollectorSchema = if ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } '
+            '$expectedCollectorSchema = if ($InferenceDiagnostic) { "mineru-windows-runtime-observation.v7" } '
+            'elseif ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } '
             'else { "mineru-windows-runtime-observation.v5" }',
             installer,
         )
@@ -1910,6 +1911,20 @@ class MinerUHeapTrimCompatibilityTests(unittest.TestCase):
             '$collectorObservation.schema -isnot [string] -or '
             '$collectorObservation.schema -cne $expectedCollectorSchema',
             installer,
+        )
+        self.assertIn(
+            'if ($ExplicitCapacity) {\n    $result.schema = "mineru-windows-runtime-observation.v6"',
+            collector,
+        )
+        self.assertIn(
+            'if ($null -ne $inferenceDiagnosticProof) {\n'
+            '    $result.schema = "mineru-windows-runtime-observation.v7"\n'
+            '    $result["inference_diagnostic"] = $inferenceDiagnosticProof',
+            collector,
+        )
+        self.assertLess(
+            collector.index('$result.schema = "mineru-windows-runtime-observation.v6"'),
+            collector.index('$result.schema = "mineru-windows-runtime-observation.v7"'),
         )
         self.assertNotIn("mineru-windows-runtime-observation.v3", installer)
         self.assertIn('schema = "mineru-phase-trace-capture.v2"', collector)

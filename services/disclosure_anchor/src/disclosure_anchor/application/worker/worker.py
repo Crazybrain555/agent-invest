@@ -96,6 +96,7 @@ from disclosure_anchor.application.use_cases.sync_disclosure_index import (
     SyncDisclosureIndexCommand,
 )
 from disclosure_anchor.application.worker import queries
+from disclosure_anchor.application.worker.history import oldest_missing_sync_slice
 from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-export, 08 §2)
     DOC_NS,
     WORKER_NS,
@@ -227,8 +228,8 @@ class WorkerConfig:
     # Legacy name: archived byte-size threshold for the HUGE lane only.
     # Large documents remain eligible and may borrow the full idle pool.
     cninfo_oversized_kb: int
-    # First-sync historical backfill (three years plus a 185-day safety lead).
-    initial_lookback_days: int = 1280
+    # First-sync historical backfill (five years, including two leap days).
+    initial_lookback_days: int = 1827
     # Backpressure cap for pending-download + downloaded/pending-parse work;
     # 0 disables first-sync deferral.  The env key retains its legacy name.
     backfill_max_pending_downloads: int = 2000
@@ -720,65 +721,116 @@ def _sync_stage(
             initial_lookback_days=deps.config.initial_lookback_days,
             lookback=row.get("lookback"),
         )
-        try:
-            result = use_case.execute(
-                SyncDisclosureIndexCommand(
-                    security_code=str(security_code),
-                    exchange=str(exchange),
-                    window_start=window_start,
-                    window_end=today,
+        for historical in (False, True):
+            window_end = today
+            if historical:
+                # History follows a successful forward sync only. Its timestamp
+                # cannot keep postponing incrementals because there is no
+                # standalone historical lane or separate cadence.
+                if never_synced or row.get("lookback") is not None:
+                    break
+                if should_stop():
+                    return source
+                if stage_deadline is not None and time.monotonic() >= stage_deadline:
+                    return source
+                history_start = today - timedelta(days=deps.config.initial_lookback_days)
+                history_end = min(today, date.fromisoformat(str(row["window_end"])))
+                if history_start > history_end:
+                    break
+                with deps.engine.connect() as conn:
+                    coverage = queries.successful_sync_ranges(
+                        conn,
+                        company_id=str(row["company_id"]),
+                        window_start=history_start,
+                        window_end=history_end,
+                    )
+                if coverage is None:
+                    # Membership/override may have changed since due selection.
+                    break
+                missing = oldest_missing_sync_slice(
+                    window_start=history_start,
+                    window_end=history_end,
+                    covered=coverage,
                 )
-            )
-        except Exception as exc:
-            error_code, retryable = _source_error_details(exc)
-            _record_sync_failure_access(
-                deps,
-                row,
-                error_code=error_code,
-                retryable=True if retryable is None else retryable,
-            )
-            report.failed += 1
-            report.failures.append(
-                WorkerFailure(
-                    stage="sync",
-                    item_ref=str(security_code),
+                if missing is None:
+                    break
+                if deps.config.backfill_max_pending_downloads > 0:
+                    if processing_backlog_now is None:
+                        with deps.engine.connect() as conn:
+                            processing_backlog_now = queries.pending_processing_backlog_count(
+                                conn,
+                                max_retries=deps.config.cninfo_max_retries,
+                                scope_classes=deps.config.process_scope_classes,
+                            )
+                    if processing_backlog_now >= deps.config.backfill_max_pending_downloads:
+                        report.deferred_backfill += 1
+                        break
+                # Recheck after database reads before another provider request.
+                if should_stop():
+                    return source
+                if stage_deadline is not None and time.monotonic() >= stage_deadline:
+                    return source
+                window_start, window_end = missing
+            try:
+                result = use_case.execute(
+                    SyncDisclosureIndexCommand(
+                        security_code=str(security_code),
+                        exchange=str(exchange),
+                        window_start=window_start,
+                        window_end=window_end,
+                    )
+                )
+            except Exception as exc:
+                error_code, retryable = _source_error_details(exc)
+                _record_sync_failure_access(
+                    deps,
+                    row,
                     error_code=error_code,
-                    retryable=retryable,
+                    retryable=True if retryable is None else retryable,
                 )
-            )
-            # Recorded before any early exit below, so the company that trips
-            # a rate-limit/quota/outage break is still a completed item.
+                report.failed += 1
+                report.failures.append(
+                    WorkerFailure(
+                        stage="sync",
+                        item_ref=str(security_code),
+                        error_code=error_code,
+                        retryable=retryable,
+                    )
+                )
+                # Recorded before any early exit below, so the company that trips
+                # a rate-limit/quota/outage break is still a completed item.
+                deps.heartbeat()
+                if _is_rate_limit_error(exc):
+                    # Short-window provider verdict: yield the stage now and let
+                    # the controller apply a brief cooldown while local download/
+                    # parse work continues.
+                    report.sync_rate_limited = True
+                    return source
+                if _is_quota_error(exc):
+                    # Round-level breaker (edgartools guidance: stop, do not keep
+                    # burning quota); remaining companies stay due for next round.
+                    report.sync_quota_break = True
+                    return source
+                if error_code == "DB_POOL_EXHAUSTED":
+                    # Local DB capacity is not CNINFO downtime. Stop acquisition
+                    # and let the controller use its local-failure backoff.
+                    return source
+                if _is_provider_infrastructure_error(error_code, retryable):
+                    # A retryable provider outage is batch-wide, not 13/50
+                    # independent item failures. Stop touching CNINFO now; the
+                    # resident controller cools source while local parse drains.
+                    report.source_outage_break = True
+                    return source
+                break
+            if not historical:
+                report.synced_companies += 1
+            report.candidates_discovered += result.candidate_count
             deps.heartbeat()
-            if _is_rate_limit_error(exc):
-                # Short-window provider verdict: yield the stage now and let
-                # the controller apply a brief cooldown while local download/
-                # parse work continues.
-                report.sync_rate_limited = True
-                return source
-            if _is_quota_error(exc):
-                # Round-level breaker (edgartools guidance: stop, do not keep
-                # burning quota); remaining companies stay due for next round.
-                report.sync_quota_break = True
-                return source
-            if error_code == "DB_POOL_EXHAUSTED":
-                # Local DB capacity is not CNINFO downtime. Stop acquisition
-                # and let the controller use its local-failure backoff.
-                return source
-            if _is_provider_infrastructure_error(error_code, retryable):
-                # A retryable provider outage is batch-wide, not 13/50
-                # independent item failures. Stop touching CNINFO now; the
-                # resident controller cools source while local parse drains.
-                report.source_outage_break = True
-                return source
-            continue
-        report.synced_companies += 1
-        report.candidates_discovered += result.candidate_count
-        deps.heartbeat()
-        if never_synced and processing_backlog_now is not None:
-            # Conservative in-round cache: candidate_count can include rows
-            # already known from overlap, so it may overestimate but cannot
-            # admit below the real watermark. The next round re-counts truth.
-            processing_backlog_now += result.candidate_count
+            if processing_backlog_now is not None:
+                # Conservative in-round cache: candidate_count can include rows
+                # already known from overlap, so it may overestimate but cannot
+                # admit below the real watermark. The next round re-counts truth.
+                processing_backlog_now += result.candidate_count
     return source
 
 
@@ -890,13 +942,13 @@ def _sync_window_start(
     *,
     today: date,
     overlap_days: int,
-    initial_lookback_days: int = 1280,
+    initial_lookback_days: int = 1827,
     lookback: object = None,
 ) -> date:
     if isinstance(window_end, str) and window_end:
         return date.fromisoformat(window_end) - timedelta(days=overlap_days)
-    # Never synced: default historical backfill (user decision 2026-07-06,
-    # 三年半留提前量), with an optional per-company override {"days": N}.
+    # Never synced: five-year historical backfill, with an optional
+    # per-company override {"days": N}. Existing cursors remain incremental.
     days = initial_lookback_days
     if isinstance(lookback, dict):
         override = lookback.get("days")

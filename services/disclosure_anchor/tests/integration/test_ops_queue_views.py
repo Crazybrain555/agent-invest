@@ -37,6 +37,76 @@ _CONTRACT_FAILURE = {
 
 
 class OpsQueueViewTests(unittest.TestCase):
+    def test_history_coverage_unions_success_and_empty_but_not_failed_receipts(self) -> None:
+        # The managed scratch runner owns this transaction and database. All
+        # fixtures roll back, including membership/override changes below.
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                company_id = f"co_history{self.suffix}"
+                conn.execute(text(
+                    "INSERT INTO disclosure_core.company (company_id, legal_name) "
+                    "VALUES (:id, :name)"
+                ), {"id": company_id, "name": f"历史覆盖测试{self.suffix}"})
+                conn.execute(text(
+                    "INSERT INTO disclosure_core.tracked_company "
+                    "(tracked_company_id, company_id, status) VALUES (:id, :co, 'active')"
+                ), {"id": f"tc_history{self.suffix}", "co": company_id})
+                for start, end, status, provider, interface, result_hash, empty in (
+                    ("2021-10-01", "2021-12-31", "ok", "cninfo", "cninfo:p_info3015", "sha256:" + "a"*64, False),
+                    ("2021-12-25", "2022-02-28", "ok", "cninfo", "cninfo:hisAnnouncement", "sha256:" + "b"*64, True),
+                    ("2022-04-01", "2022-08-01", "ok", "cninfo", "cninfo:p_info3015", "sha256:" + "c"*64, False),
+                    ("2022-03-01", "2022-03-31", "failed", "cninfo", "cninfo:p_info3015", None, False),
+                    ("2022-03-01", "2022-03-31", "ok", "other", "cninfo:p_info3015", "sha256:" + "d"*64, False),
+                    ("2022-03-01", "2022-03-31", "ok", "cninfo", "cninfo:worker_sync_failure", "sha256:" + "e"*64, False),
+                    ("2022-03-01", "2022-03-31", "ok", "cninfo", "cninfo:p_info3015", None, False),
+                    ("unknown", "2022-03-31", "ok", "cninfo", "cninfo:p_info3015", "sha256:" + "f"*64, False),
+                ):
+                    conn.execute(text(
+                        "INSERT INTO disclosure_core.source_access "
+                        "(source_access_id, company_id, provider, provider_interface, "
+                        "query_params, accessed_at, status, result_hash, result_snapshot) "
+                        "VALUES (:id, :co, :provider, :interface, CAST(:params AS jsonb), "
+                        "now(), :status, :hash, CAST(:snapshot AS jsonb))"
+                    ), {
+                        "id": ids.new_source_access_id(), "co": company_id,
+                        "provider": provider, "interface": interface, "status": status,
+                        "hash": result_hash,
+                        "params": json.dumps({"sdate": start, "edate": end}),
+                        "snapshot": json.dumps({"result": "empty" if empty else "ok", "candidates": []}),
+                    })
+                arguments = {
+                    "company_id": company_id,
+                    "window_start": date(2021, 10, 7),
+                    "window_end": date(2022, 7, 5),
+                }
+                self.assertEqual(queries.successful_sync_ranges(conn, **arguments), [
+                    (date(2021, 10, 7), date(2022, 2, 28)),
+                    (date(2022, 4, 1), date(2022, 7, 5)),
+                ])
+                # Paused companies and explicit overrides are ineligible, not
+                # mistaken for an eligible company with missing coverage.
+                conn.execute(text(
+                    "UPDATE disclosure_core.tracked_company SET status='paused' "
+                    "WHERE company_id=:co"
+                ), {"co": company_id})
+                self.assertIsNone(queries.successful_sync_ranges(conn, **arguments))
+                conn.execute(text(
+                    "UPDATE disclosure_core.tracked_company "
+                    "SET status='active', lookback=CAST(:lookback AS jsonb) "
+                    "WHERE company_id=:co"
+                ), {"co": company_id, "lookback": json.dumps({"days": 30})})
+                self.assertIsNone(queries.successful_sync_ranges(conn, **arguments))
+                conn.execute(text(
+                    "UPDATE disclosure_core.tracked_company SET lookback=NULL WHERE company_id=:co"
+                ), {"co": company_id})
+                conn.execute(text(
+                    "DELETE FROM disclosure_core.source_access WHERE company_id=:co"
+                ), {"co": company_id})
+                self.assertEqual(queries.successful_sync_ranges(conn, **arguments), [])
+            finally:
+                transaction.rollback()
+
     def setUp(self) -> None:
         self.engine = engine_or_skip()
         self.suffix = ids.new_ulid().lower()

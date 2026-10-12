@@ -154,3 +154,43 @@ ACL 不变、所有祖先无重解析点；内容相同的副本不是连续性�
 - Windows：`build_mineru_m6_owner.ps1` 的生产编译与 `run_mineru_installation.ps1` 的受控子进程/竞争/
   daemon-unknown 反例由独立作者驱动；本仓不把测试源装入生产包。
 - 实机 `install`/`qualify`/`bind` 只在获准的运行时窗口执行，并保留全部原始 stdout/stderr/退出码。
+
+
+## 4b. Owner-memory 诊断：零职责后的既有 full install
+
+`install --operation-kind full-install --legacy-scope-inventory <fresh-exact-inventory>` 暴露低层安装器已有的完整安装分支。
+它复用同一 Mac exclusion、Windows installation lock、不可变 staging、有限 Job、现有完整安装/rollback 和真实回读。
+Mac 在持锁且 worker/GC 未加载后复用 `require_zero_duty_inventory` 验证既有 `worker-legacy-scope-inventory.v1`：
+全部成员为零且捕获未过期；Windows 核对同一字节 SHA 和新鲜度。scope capture 必须由原身份完成，包含所有
+prepared/submitted/publication/ACK 职责，且现有 `require_no_staged_heads` 拒绝非 current staged heads。
+原生 API/vLLM idle 是附加条件，不能代替业务 scope 零职责。full dispatch 不传 API-only/recreate switch，也不传
+API-only `ApiDeviceProfile` transition 参数；独立 full device expectation 只验证生成 Compose 的实际结果。
+
+原始 `mineru.deployment-profile.v1`、`m6.release.v1` 的字段与 canonical 编码保持不变。
+诊断选择使用 `mineru.deployment-profile.v2` 的封闭 `inference_diagnostic`：仅
+`mineru.owner-memory.v1`、一个审核过的 worker class 和 exact context SHA。SHA 来自 canonical
+`Dockerfile` 及 `mineru_inference_memory/{__init__,core,worker}.py` 四个源文件的相对路径→SHA 映射，
+唯一派生本地镜像 tag；tag 自身不是镜像 ID 证明。
+`m6.release.v2` 在既有 inventory/provenance 中加入 `inference-context/` 四个源文件及 `inference_build` 源映射，
+照常要求冻结 tracked source 与执行中 generator 完全相等。dirty checkout 不能借用旧 HEAD 表述新源码。
+
+同一诊断包的 `inference-recreate` 继续使用既有 same-config 分支：active compose/collector、已安装
+receipt 的 context/source/image ID、实际 image/source/loaded-worker 全部相等才可进入，禁止重建/retag/source change；
+仍保留 API/proxy epoch 与 root/registry witness。首次或不同诊断源则必须 full install。
+
+诊断 Compose 只替换 inference image 并追加封闭 `--worker-cls`，proxy 继续使用原 raw digest；模型、依赖、
+容量、并发、显存比例与 floor 不变。既有 full branch 在 full up 前构建并内容探测派生镜像，记录真实 image ID、
+模块及实际 vLLM 源前像，再使用既有备份/registry witness/full deployment/unknown 处理。
+旧 compose、collector、receipt 保留精确 backup；不得删 consumed tombstone 或原件来制造 quiescence。
+API/proxy epoch 可变化，其实际结果进入新 qualification；不新增 U01 或 inference 业务兼容关系。
+
+collector v7 只读容器临时目录的有界原子 owner identity 文件，核验实际 PID/start ticks、device、
+模块/class、namespace init ticks 与未改变的容器 epoch；不依赖 startup 日志仍在 tail 中。它同时观察 image labels、
+完整诊断 package 和 vLLM 源码字节；内容探针只用
+stdlib 读文件，禁止导入 worker/torch/CUDA。attester 的 `--deployment-profile` 与 `--inference-context` 必须成对，
+并与 exact source map、实际 image、argv 和加载证据一致。runtime bundle 仍用既有 image/command/server-config 字段；
+server-config 只绑定稳定模块、镜像、源码、worker class 与配置，不包含 PID、process start ticks、epoch、
+计数或时间快照。加载/liveness 证据独立验证，不能让同配置重启隐式改变 R。
+
+安装通过仍保持 write permission closed。新实际 attestation、完整 smoke/held-outs epoch bracket、G5、bind 和
+完整业务 scope/source preflight 通过后，root 才能按既有操作流程恢复 producer；旧 Q 或旧 receipt 不可改写为新证据。

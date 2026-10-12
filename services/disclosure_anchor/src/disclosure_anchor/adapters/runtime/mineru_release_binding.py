@@ -321,8 +321,31 @@ def verify_observation(path: Path, *, manifest: dict[str, Any], report: VerifyRe
 
     raw = _read_private(path, label="runtime observation")
     observation = strict_json_loads(raw)
-    if type(observation) is not dict or observation.get("schema") != "mineru-windows-runtime-observation.v6":
+    diagnostic = report.inputs.deployment_profile.inference_diagnostic
+    expected_schema = "mineru-windows-runtime-observation.v6" if diagnostic is None else "mineru-windows-runtime-observation.v7"
+    if type(observation) is not dict or observation.get("schema") != expected_schema:
         raise ReleaseIdentityError("runtime observation is not a collector v6 observation")
+    if diagnostic is not None:
+        from disclosure_anchor.application.contracts.mineru_deployment_profile import inference_diagnostic_config, verify_inference_diagnostic
+        if report.manifest.inference_build is None:
+            raise ReleaseIdentityError("diagnostic release is missing its inference build identity")
+        try:
+            proof = verify_inference_diagnostic(observation, report.inputs.deployment_profile, report.manifest.inference_build["sources"])
+        except ValueError as exc:
+            raise ReleaseIdentityError(str(exc)) from exc
+        inference = observation.get("inference")
+        if (type(inference) is not dict or inference.get("image") != diagnostic.image_reference
+                or inference.get("image_id") != manifest["inference_server"]["container_image_digest"]
+                or inference.get("entrypoint", []) + inference.get("command", []) != list(inference_command_argv(report.inputs.deployment_profile))):
+            raise ReleaseIdentityError("diagnostic inference image or argv differs from the release/runtime")
+        config = {
+            "compose_sha256": observation.get("compose_sha256"), "compose_config_sha256": observation.get("compose_config_sha256"),
+            "command": inference.get("entrypoint", []) + inference.get("command", []),
+            **{name: inference.get(name) for name in ("restart_policy", "mounts", "networks", "port")},
+            "diagnostic": inference_diagnostic_config(proof, report.inputs.deployment_profile),
+        }
+        if canonical_payload_sha256(config) != manifest["inference_server"]["server_config_sha256"]:
+            raise ReleaseIdentityError("runtime diagnostic source proof differs from the collector")
     topology = manifest["topology"]
     if observation.get("compose_sha256") != topology.get("windows_compose_sha256"):
         raise ReleaseIdentityError("runtime observation compose differs from the runtime bundle")

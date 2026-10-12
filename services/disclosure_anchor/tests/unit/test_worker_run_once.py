@@ -42,6 +42,9 @@ def _config() -> WorkerConfig:
 
 
 class _FakeResult:
+    def mappings(self) -> tuple[dict[str, object], ...]:
+        return ()
+
     def scalar_one(self) -> bool:
         return True
 
@@ -142,18 +145,42 @@ class SyncWindowStartTests(unittest.TestCase):
             _sync_window_start("2026-07-01", today=date(2026, 7, 6), overlap_days=7),
             date(2026, 6, 24),
         )
+        # A default-depth change or per-company override must not repeat the
+        # historical window on every incremental worker round.
+        self.assertEqual(
+            _sync_window_start(
+                "2026-07-01",
+                today=date(2026, 7, 6),
+                overlap_days=7,
+                initial_lookback_days=1827,
+                lookback={"days": 30},
+            ),
+            date(2026, 6, 24),
+        )
 
     def test_missing_cursor_defaults_to_initial_backfill(self) -> None:
-        # A never-synced company gets a three-year window plus safety lead,
-        # not merely the incremental overlap.
+        # A never-synced company gets five years including two leap days.
         self.assertEqual(
             _sync_window_start(
                 None,
                 today=date(2026, 7, 6),
                 overlap_days=7,
             ),
-            date(2026, 7, 6) - timedelta(days=1280),
+            date(2026, 7, 6) - timedelta(days=1827),
         )
+        self.assertEqual(_config().initial_lookback_days, 1827)
+
+    def test_five_year_window_never_undershoots_across_leap_days(self) -> None:
+        for today, five_year_floor in (
+            (date(2025, 3, 1), date(2020, 3, 1)),
+            (date(2024, 3, 1), date(2019, 3, 1)),
+            (date(2028, 2, 29), date(2023, 2, 28)),
+            (date(2101, 3, 1), date(2096, 3, 1)),
+        ):
+            with self.subTest(today=today):
+                start = _sync_window_start(None, today=today, overlap_days=7)
+                self.assertLessEqual(start, five_year_floor)
+                self.assertEqual((today - start).days, 1827)
 
     def test_missing_cursor_honors_per_company_lookback_override(self) -> None:
         self.assertEqual(

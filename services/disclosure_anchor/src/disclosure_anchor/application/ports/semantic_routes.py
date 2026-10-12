@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Protocol
 
@@ -32,6 +33,52 @@ class SemanticRouteAdjudicatorError(RuntimeError):
         self.reason_code = reason_code
         self.retryable = retryable
         self.attempts = attempts
+
+
+class SemanticNetworkUnavailable(SemanticRouteAdjudicatorError):
+    """No provider answered a group and the network is why; nothing was decided.
+
+    Raised only by an executor composed with a network cooldown, for a scheduled
+    caller that runs the same group again after ``retry_after_seconds``. No
+    outcome, receipt or cache entry exists for the group. ``attempts`` are the
+    group's provider attempts in this episode, empty when the shared cooldown
+    refused the group before any provider was called. Escaping a scheduled
+    caller, it is an adjudication error like any other and fails closed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float,
+        attempts: tuple[SemanticProviderAttempt, ...] = (),
+    ) -> None:
+        if (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, (int, float))
+            or not isfinite(retry_after_seconds)
+            or retry_after_seconds <= 0
+        ):
+            raise ValueError("semantic network wait delay must be positive")
+        super().__init__(
+            message,
+            reason_code="transport_unavailable",
+            retryable=True,
+            attempts=attempts,
+        )
+        self.retry_after_seconds = float(retry_after_seconds)
+
+
+class SemanticNetworkWaitPort(Protocol):
+    """Read-only view of the shared network cooldown for a scheduled caller."""
+
+    def pending_seconds(self) -> float | None:
+        """Seconds to keep waiting, or ``None`` when a provider call may be admitted now."""
+        ...
+
+    def shutdown_requested(self) -> bool:
+        """Whether provider calls were stopped for this process, so a wait ends now."""
+        ...
 
 
 class SemanticRouteReceiptStoreError(RuntimeError):
@@ -193,6 +240,8 @@ __all__ = [
     "SemanticAdjudicatorIdentity",
     "SemanticAdjudicatorAdapterPort",
     "SemanticDecisionValidator",
+    "SemanticNetworkUnavailable",
+    "SemanticNetworkWaitPort",
     "SemanticProviderResult",
     "SemanticRouteAdjudicatorPort",
     "SemanticRouteAdjudicatorError",

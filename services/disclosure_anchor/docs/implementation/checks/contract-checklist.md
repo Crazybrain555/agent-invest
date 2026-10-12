@@ -1355,3 +1355,20 @@ root 已用 managed scratch PostgreSQL 验证事务 P、读回、响应丢失重
 测量；纯离线 RSS 测量不等于整机最坏情况资格。不宣称 84 项职责全部装得下或 8 MiB DB CHECK 对其足够：它们以原
 身份在普通守卫下恢复，按实际字节准入。独立复审与最终门由 root 执行，本条不宣称已通过部署资格。
 ```
+
+
+## Private MinerU owner-memory diagnostic installation
+
+- Raw `mineru.deployment-profile.v1` / `m6.release.v1` canonical bytes remain unchanged. The closed v2
+  diagnostic binds one worker class, the exact four-file context, content-derived image reference, actual
+  image ID, original raw proxy/base, unchanged model/engine/capacity inputs, and actual source preimages.
+- `mineru-release install --operation-kind full-install --legacy-scope-inventory <fresh-exact-inventory>`
+  reuses the existing full installer under producer exclusion and all-duty-zero inventory. No source
+  compatibility relation is added. Full installation may produce new API/proxy epochs; exact backups,
+  registry/root identity and consumed tombstones remain protected, and fresh qualification is required.
+- Already installed identical diagnostic source/image/compose/collector may use existing same-config
+  inference recreation. A changed source requires full installation; recreation cannot rebuild or retag it.
+- Collector v7 and attestation require current loaded-worker proof from a bounded container-local owner
+  identity file, current process start ticks and unchanged container epoch. Stable server-config identity
+  hashes source/configuration only; PID, epoch, instance, counters and observation times never change R.
+- Install completion verifies the full diagnostic source/image/loaded-worker proof and leaves writes closed.

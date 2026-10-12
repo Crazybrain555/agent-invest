@@ -4,10 +4,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from disclosure_anchor.adapters.runtime.mineru_release_install import (
     API_COMPATIBILITY,
     INFERENCE_RECREATE,
+    FULL_INSTALL,
     installation_binding_document,
     install_release,
 )
@@ -66,6 +68,45 @@ class InferenceRecreateSelectionTests(unittest.TestCase):
                     output=unknown, operation_kind="unknown",
                 )
             self.assertFalse(unknown.exists())
+
+    def test_full_install_requires_exact_zero_duty_binding_without_weakening_old_modes(self):
+        full = installation_binding_document(_binding(), api_device_profile="cuda0", exclusivity_sha256=_HASH,
+                                             operation_kind=FULL_INSTALL, legacy_scope_inventory_sha256=_OTHER)
+        self.assertEqual(full["contract_version"], "m6.installation-binding.v4")
+        self.assertEqual(full["operation_kind"], "full-install")
+        self.assertEqual(full["legacy_scope_inventory_sha256"], _OTHER)
+        for operation, inventory in ((FULL_INSTALL, None), (API_COMPATIBILITY, _OTHER), (INFERENCE_RECREATE, _OTHER)):
+            with self.subTest(operation=operation), self.assertRaises(ReleaseInputError):
+                installation_binding_document(_binding(), api_device_profile="cuda0", exclusivity_sha256=_HASH,
+                                             operation_kind=operation, legacy_scope_inventory_sha256=inventory)
+        with TemporaryDirectory() as temp:
+            out = Path(temp) / "out"
+            with self.assertRaises(ReleaseInputError):
+                install_release(report=SimpleNamespace(passed=True), package=Path(temp), binding=_binding(),
+                                output=out, operation_kind=FULL_INSTALL)
+            self.assertFalse(out.exists())
+
+    def test_same_config_diagnostic_recreation_reaches_existing_owner_but_source_change_is_refused(self):
+        report = SimpleNamespace(
+            passed=True, manifest=SimpleNamespace(sha256=_HASH, projection={"compose_sha256": _HASH}),
+            inputs=SimpleNamespace(capacity=SimpleNamespace(sha256=_HASH),
+                                   deployment_profile=SimpleNamespace(inference_diagnostic=object())),
+        )
+        binding = _binding()
+        binding.mac_exclusive_lock_path = Path("/unused-lock")
+        with TemporaryDirectory() as temp:
+            with patch("disclosure_anchor.adapters.runtime.mineru_release_install.acquire_exclusivity",
+                       side_effect=RuntimeError("owner reached")) as owner:
+                with self.assertRaisesRegex(RuntimeError, "owner reached"):
+                    install_release(report=report, package=Path(temp), binding=binding,
+                                    output=Path(temp) / "same", operation_kind=INFERENCE_RECREATE)
+                owner.assert_called_once()
+            for changed in (_binding(compose=_OTHER), _binding(capacity=_OTHER)):
+                output = Path(temp) / ("compose" if changed.windows.expected_active_compose_sha256 == _OTHER else "capacity")
+                with self.assertRaises(ReleaseIdentityError):
+                    install_release(report=report, package=Path(temp), binding=changed,
+                                    output=output, operation_kind=INFERENCE_RECREATE)
+                self.assertFalse(output.exists())
 
     def test_cli_requires_explicit_operation_selection(self):
         common = ["install", "--package", "/tmp/package", "--private-binding", "/tmp/binding", "--output", "/tmp/out"]

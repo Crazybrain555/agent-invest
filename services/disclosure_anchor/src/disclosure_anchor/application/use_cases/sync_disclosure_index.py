@@ -91,7 +91,7 @@ def compute_sync_window(
     explicit_window_days: int | None,
     today: date,
     overlap_days: int,
-    initial_lookback_days: int = 1095,
+    initial_lookback_days: int = 1827,
     explicit_window_start: date | None = None,
     explicit_window_end: date | None = None,
 ) -> tuple[date, date]:
@@ -123,8 +123,8 @@ def compute_sync_window(
     with uow_factory() as uow:
         security = uow.securities.get_by_code_exchange(company, exchange)
         if security is None:
-            # First contact: default historical backfill (user decision
-            # 2026-07-06, 三年是底线); explicit window stays the override.
+            # First contact: five-year historical backfill, including two
+            # leap days; explicit windows retain precedence.
             return today - timedelta(days=initial_lookback_days), today
         checkpoint = uow.source_checkpoints.get_by_scope(
             "cninfo", f"{security.company_id}:p_info3015"

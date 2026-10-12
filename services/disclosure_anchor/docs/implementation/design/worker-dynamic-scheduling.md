@@ -878,6 +878,16 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   与 created/failed outbox 事件原子处置；不制造页数、spec 或 H0。重启后普通队列依据已有
   last-failure retryability 排除它，后续正常 PDF 继续前进。文件缺失、身份漂移和未知 IO/native
   错误不伪装成内容拒绝；响应丢失只核对同一 episode，写入重试仍需当前所有权许可。
+- H0 ingress 与源拒绝事务（`DurableStagedIngressV4`）共用两次写入：原写入加一次重放，由提交应答丢失
+  和下述数据库中断共享。PostgreSQL 打开关系文件遇 EINTR 时以 ERROR/SQLSTATE XX000 报
+  `could not open file "<relpath>": Interrupted system call`。ingress 每次写入都在 `replayable_transaction`
+  内进入新单元；只有这样声明、尚未开始任何提交、且该单元自己的 rollback、session 锁释放与连接回收都
+  成功时，适配层才把这一精确形状转成 `DatabaseInterruptionRolledBack`（cause 为原错误）。ingress 只在
+  mutation 返回前、且证明出自本次写入单元时，用同一不可变命令（attempt/run/fence/key/event/proposal
+  不变）在新单元重放，重放前重新经过 write guard，日志只记 label 与写入序号。其它 XX000、读写/fsync、
+  缺文件、IO、FATAL/PANIC、取消/超时、连接失效、清理失败或已开始提交都不得此能力：提交后的错误仍只读
+  对账，部分 packet/漂移照旧停止，预算用尽时带原错误链落到既有公共停止。不新增准入延后、计数、原因或
+  自动重启；其它阶段与读者不声明可重放，同样错误照旧失败可见。
 - 最终状态列表只是有界近期诊断样本，累计 completed 单独计数；PG 仍是完整任务历史和
   唯一 durable backlog。领取后的校验/IO 异常必须携带已领取的全部 ownership，不得漏记。
 - scratch 与 canonical `data` 目录必须存在明确、互不包含且同文件系统的 pinned namespace。

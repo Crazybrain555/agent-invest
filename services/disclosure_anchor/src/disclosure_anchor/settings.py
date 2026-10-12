@@ -672,11 +672,10 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("CNINFO_OVERLAP_DAYS", "cninfo_overlap_days"),
     )
-    # First-sync historical backfill.  The scale-rollout decision supersedes
-    # the old three-year floor: use 3.5 years plus a small leap-day/calendar
-    # buffer so a days-based provider API cannot silently undershoot 42 months.
+    # First-sync historical backfill: five calendar years can include two
+    # leap days, so 1827 days never undershoots the requested five years.
     disclosure_initial_lookback_days: int = Field(
-        default=1280,
+        default=1827,
         ge=0,
         validation_alias=AliasChoices(
             "DISCLOSURE_INITIAL_LOOKBACK_DAYS", "disclosure_initial_lookback_days"

@@ -1,7 +1,11 @@
 """Independent pre-install refusals; all external reads are controlled fixtures."""
 
+import hashlib
 import json
+from pathlib import Path
 import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -65,3 +69,57 @@ class MineruReleaseInstallIndependentTests(unittest.TestCase):
         self.assertEqual(raw, json.dumps(health).encode())
         self.assertEqual(proof, "explicit_capacity_closed")
         self.assertEqual(actual, health)
+
+
+class MineruDiagnosticCollectorProbeIndependentTests(unittest.TestCase):
+    def test_bounded_owner_proof_survives_log_rotation_and_refuses_stale_or_dead_process(self):
+        # Execute the actual embedded stdlib probe with only its three IO roots
+        # redirected to temporary fixtures. No Docker, CUDA, torch or vLLM import.
+        collector = Path(__file__).resolve().parents[2] / "scripts/windows/collect_mineru_runtime.ps1"
+        script = collector.read_text()
+        probe = script.split("$diagnosticProbe = @'\n", 1)[1].split("\n'@", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            installed = root / "installed"
+            package = installed / "mineru_inference_memory"
+            package.mkdir(parents=True)
+            for name in ("__init__.py", "core.py", "worker.py"):
+                (package / name).write_bytes(("fixture " + name).encode())
+            for name in ("worker_base.py", "gpu_worker.py", "gpu_model_runner.py", "gpu/mm/encoder_runner.py"):
+                source = installed / "vllm/v1/worker" / name
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(("fixture " + name).encode())
+            proc = root / "proc"
+            for pid, ticks in ((1, 50), (42, 100)):
+                (proc / str(pid)).mkdir(parents=True)
+                (proc / str(pid) / "stat").write_text(f"{pid} (worker process) S " + "0 " * 18 + str(ticks))
+            identity = root / "owner.json"
+            owner = {"contract_version": "mineru.owner-memory-identity.v1",
+                     "worker_class": "mineru_inference_memory.worker.OwnerMemoryWorker",
+                     "module_sha256": "sha256:" + hashlib.sha256((package / "worker.py").read_bytes()).hexdigest(),
+                     "pid": 42, "proc_start_ticks": 100, "device": "cuda:0", "instance_id": "fixture"}
+            identity.write_text(json.dumps(owner))
+            identity.chmod(0o600)
+            controlled = probe.replace('root = Path(importlib.metadata.distribution("vllm").locate_file(""))',
+                                       f"root = Path({str(installed)!r})")
+            controlled = controlled.replace('"/tmp/mineru-owner-memory/owner.json"', repr(str(identity)))
+            controlled = controlled.replace('Path("/proc")', f"Path({str(proc)!r})")
+            def run():
+                return subprocess.run([sys.executable, "-I", "-c", controlled], text=True,
+                                      capture_output=True, timeout=10)
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            proof = json.loads(result.stdout)
+            self.assertEqual(proof["loaded_workers"][0]["observed_proc_start_ticks"], 100)
+            self.assertEqual(proof["loaded_workers"][0]["namespace_init_start_ticks"], 50)
+            self.assertEqual(len(proof["actual_diagnostic_source_sha256"]), 3)
+            # No log file exists at all; proof is independent of startup/tail age.
+            for state, ticks in (("S", 101), ("Z", 100), ("X", 100)):
+                with self.subTest(state=state, ticks=ticks):
+                    (proc / "42/stat").write_text("42 (worker process) " + state + " " + "0 " * 18 + str(ticks))
+                    self.assertNotEqual(run().returncode, 0)
+            (proc / "42/stat").write_text("42 (worker process) S " + "0 " * 18 + "100")
+            identity.write_text(json.dumps(owner)[:-1] + ',"pid":42}')
+            self.assertNotEqual(run().returncode, 0)
+            identity.write_text(" " * 16385)
+            self.assertNotEqual(run().returncode, 0)

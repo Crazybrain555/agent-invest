@@ -253,6 +253,14 @@ _CODEX_TRANSPORT_DIAGNOSTICS = tuple(
         r"stream disconnected before completion: Transport error: "
         r"(?:network error: error decoding response body|timeout)",
         r"stream disconnected before completion: idle timeout waiting for SSE",
+        # WorkspaceRoutingError::DiscoveryTimeout (0.156.1 app-server
+        # account_processor/workspace_routing.rs): the 15-second bound around
+        # the per-request ChatGPT workspace discovery GET expired. The CLI
+        # retries it as an IO error over WebSockets and then HTTPS before this
+        # terminal display. Its siblings (discovery failed, unauthorized,
+        # account or configuration changed, backend validation) are not
+        # timeouts and stay unrecognized.
+        r"workspace routing discovery timed out",
     )
 )
 # Codex 0.156.1 UnexpectedResponseError owns the status prefix; its response
@@ -438,6 +446,12 @@ def terminate_active_semantic_processes(
                 "and is still running"
             )
     return len(processes)
+
+
+def semantic_shutdown_requested() -> bool:
+    """Whether the worker has stopped semantic provider calls for this process."""
+
+    return _SEMANTIC_SHUTDOWN_REQUESTED.is_set()
 
 
 def _safe_subprocess_environment() -> dict[str, str]:
@@ -1753,5 +1767,6 @@ def _command_error(
 
 __all__ = [
     "CodexCliSemanticAdjudicator",
+    "semantic_shutdown_requested",
     "terminate_active_semantic_processes",
 ]

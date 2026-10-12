@@ -275,6 +275,19 @@ try {
         Assert-Closed $binding @('contract_version','operation_kind','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256') 'installation binding'
         if ($binding.operation_kind -isnot [string] -or $binding.operation_kind -cne 'inference-recreate') { Fail 64 'installation operation kind is unsupported' }
         $operationKind='inference-recreate'
+    } elseif ($binding.contract_version -ceq 'm6.installation-binding.v4') {
+        Assert-Closed $binding @('contract_version','operation_kind','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256','legacy_scope_inventory_sha256') 'installation binding'
+        if ($binding.operation_kind -cne 'full-install' -or [string]$binding.legacy_scope_inventory_sha256 -cnotmatch '^sha256:[0-9a-f]{64}$') { Fail 64 'full installation lacks the zero-duty inventory binding' }
+        if ($null -eq $binding.expected_active_compose_sha256 -or $null -eq $binding.expected_previous_capacity_sha256) { Fail 64 'full installation requires the active compose and previous explicit capacity identities' }
+        $inventoryPath=Join-Path (Split-Path -Parent $InstallationBinding) 'legacy-scope-inventory.json'
+        $inventoryBytes=Read-BoundedFile $inventoryPath 16777216
+        if ((Get-Sha256Bytes $inventoryBytes) -cne [string]$binding.legacy_scope_inventory_sha256) { Fail 65 'full installation zero-duty inventory bytes differ' }
+        $inventory=ConvertFrom-StrictJson $inventoryBytes
+        if ($inventory.contract_version -cne 'worker-legacy-scope-inventory.v1' -or @($inventory.members).Count -ne 0) { Fail 65 'full installation still has business duties' }
+        $captured=[DateTimeOffset]::Parse([string]$inventory.captured_at_utc)
+        $age=([DateTimeOffset]::UtcNow-$captured).TotalSeconds
+        if ($age -lt -60 -or $age -gt 300) { Fail 65 'full installation zero-duty inventory is stale' }
+        $operationKind='full-install'
     } elseif ($binding.contract_version -ceq 'm6.installation-binding.v3') {
         Assert-Closed $binding @('contract_version','operation_kind','phase','operation_id','expected_hostname','api_device_profile','expected_active_compose_sha256','expected_previous_capacity_sha256','job_lifetime_milliseconds','job_cleanup_milliseconds','mac_exclusivity_receipt_sha256','approval_sha256','legacy_scope_inventory_sha256') 'installation binding'
         if ($binding.operation_kind -isnot [string] -or $binding.operation_kind -cne 'same-root-reattestation') { Fail 64 'installation operation kind is unsupported' }
@@ -308,8 +321,11 @@ try {
     $manifestSha=Get-Sha256Bytes $manifestBytes
     if ($manifestSha -cne $ExpectedManifestSha256) { Fail 65 ('release manifest hash differs: ' + $manifestSha) }
     $manifest=ConvertFrom-StrictJson $manifestBytes
-    Assert-Closed $manifest @('contract_version','built_at_utc','source','inputs','projection','api_build','native_m6','installation','files') 'release manifest'
-    if ($manifest.contract_version -cne 'm6.release.v1') { Fail 65 'release manifest contract is unsupported' }
+    $manifestFields=@('contract_version','built_at_utc','source','inputs','projection','api_build','native_m6','installation','files')
+    if ($manifest.contract_version -ceq 'm6.release.v2') { $manifestFields += 'inference_build' }
+    elseif ($manifest.contract_version -cne 'm6.release.v1') { Fail 65 'release manifest contract is unsupported' }
+    Assert-Closed $manifest $manifestFields 'release manifest'
+    if ($manifest.contract_version -ceq 'm6.release.v2' -and $operationKind -cnotin @('full-install','inference-recreate')) { Fail 65 'diagnostic source requires full installation' }
     if ([string]$manifest.projection.api_device_profile -cne [string]$binding.api_device_profile) { Fail 65 'release device profile differs from the installation binding' }
     $verified=[ordered]@{}
     foreach ($entry in $manifest.files) {
@@ -447,6 +463,11 @@ try {
         $epochsBefore=Read-MineruEpochs $docker
     }
 
+    if ($operationKind -ceq 'full-install') {
+        $epochsBefore=Read-MineruEpochs $docker
+        if (Test-Path -LiteralPath $ReceiptTarget -PathType Leaf) { $existingReceiptSha=Get-Sha256File $ReceiptTarget }
+    }
+
     # ---- Job supervisor from packaged production sources (fresh csc child; no Add-Type) ---------------
     $windows=Join-Path $ReleaseRoot 'windows'
     $prepared=(& (Join-Path $windows 'build_mineru_telemetry_assembly.ps1') -OutputDirectory $OperationDirectory) | ConvertFrom-Json
@@ -481,10 +502,22 @@ try {
         $installerParameters['ExpectedApiDeviceProfile']=[string]$binding.api_device_profile
         $installerParameters['CampaignApiCompatImageId']=[string]$existingReceipt.api_compatibility_image.image_id
     }
+    if ($operationKind -ceq 'full-install') {
+        $installerParameters.Remove('ApiOnlyCompatibilityUpgrade')
+        $installerParameters['ExpectedFullApiDeviceProfile']=[string]$binding.api_device_profile
+    }
+    if ($manifest.contract_version -ceq 'm6.release.v2') {
+            foreach ($name in @('Dockerfile','mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+                $rel='inference-context/' + $name
+                if (-not $verified.Contains($rel) -or $verified[$rel] -cne [string]$manifest.inference_build.sources.$name) { Fail 65 ('diagnostic context source differs: ' + $name) }
+            }
+            $installerParameters['InferenceDiagnosticContext']=(Join-Path $ReleaseRoot 'inference-context')
+            $installerParameters['InferenceDiagnosticContextSha256']=[string]$manifest.inference_build.context_sha256
+        }
     # A release profile declares the desired device, not always a device transition.
     # A changed explicit capacity uses the existing capacity-only comparison, which
     # retains device and all non-capacity fields. Mixed device/capacity edits still fail.
-    if ($operationKind -cne 'inference-recreate' -and ($null -eq $binding.expected_previous_capacity_sha256 -or
+    if ($operationKind -ceq 'api-compatibility' -and ($null -eq $binding.expected_previous_capacity_sha256 -or
         [string]$binding.expected_previous_capacity_sha256 -ceq $capacitySha)) {
         $installerParameters['ApiDeviceProfile']=[string]$binding.api_device_profile
     }
@@ -528,6 +561,10 @@ try {
         installation_binding_sha256=(Get-Sha256File $InstallationBinding);mac_exclusivity_receipt_sha256=$binding.mac_exclusivity_receipt_sha256
         supervisor_manifest_sha256=$prepared.manifest_sha256;job_lifetime_milliseconds=$lifetime;job_cleanup_milliseconds=$cleanup
         installer_arguments=$installerArguments;started_utc=[DateTime]::UtcNow.ToString('o')}
+    if ($operationKind -ceq 'full-install') {
+        $startRecord['operation_kind']=$operationKind
+        $startRecord['legacy_scope_inventory_sha256']=[string]$binding.legacy_scope_inventory_sha256
+    }
     if ($operationKind -ceq 'same-root-reattestation') {
         $startRecord['contract_version']='m6.same-root-operation-start.v1'; $startRecord['operation_kind']=$operationKind
         $startRecord['maintenance_phase']=$sameRootPhase; $startRecord['operation_id']=$sameRootOperation; $startRecord['api_proof_sha256']=$sameRootProofSha
@@ -623,6 +660,7 @@ try {
         $imageId=$inspect.StandardOutput.Trim()
         if ($imageId -cne [string]$receipt.api_compatibility_image.image_id) { $status='unknown'; Fail 70 ('running API image differs from the receipt: ' + $imageId) }
         try { $null=Read-IdleCapacityHealth $docker $capacitySha 'post-installation' } catch { $status='unknown'; Fail 70 $_.Exception.Message }
+        if ($operationKind -ceq 'full-install') { $epochsAfter=Read-MineruEpochs $docker }
         # Installation is verified; writer readiness stays closed until this image is qualified and bound.
         $daemonSide='verified'; $status='pass'; $installationVerified=$true; $ExitCode=0
     }
@@ -641,6 +679,14 @@ try {
     }
     if ($operationKind -ceq 'inference-recreate') {
         $result['operation_kind']=$operationKind
+        $result['existing_receipt_sha256']=$existingReceiptSha
+        $result['service_epochs_before']=$epochsBefore
+        $result['service_epochs_after']=$epochsAfter
+    }
+    if ($operationKind -ceq 'full-install') {
+        $result['contract_version']='m6.installation-operation.v4'
+        $result['operation_kind']=$operationKind
+        $result['legacy_scope_inventory_sha256']=[string]$binding.legacy_scope_inventory_sha256
         $result['existing_receipt_sha256']=$existingReceiptSha
         $result['service_epochs_before']=$epochsBefore
         $result['service_epochs_after']=$epochsAfter

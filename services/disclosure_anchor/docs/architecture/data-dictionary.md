@@ -56,7 +56,7 @@ security_id PK；company_id FK；`security_code+exchange` 定位并唯一。写�
 | 列 | 含义 |
 |---|---|
 | status | active / paused（暂停=改字段不删行；真源是 config/watchlist.csv，`make track` 对账） |
-| lookback | jsonb `{"days": N}`；覆盖默认初始回补 1095 天（级联：空=继承 env） |
+| lookback | jsonb `{"days": N}`；覆盖默认初始回补 1827 天（五年，含两天闰日缓冲）（级联：空=继承 env） |
 | process_classes | jsonb 数组（class 键，0018 由 filing_categories 改名改义）；**按公司覆盖全局处理策略**（替换式，非空数组整体替换；NULL/空数组 `[]` 均继承 config/processing_policy.json）；登记永远全量 |
 | sync_frequency | 闭集 hourly/daily/weekly；NULL=全局 DISCLOSURE_SYNC_INTERVAL_SECONDS |
 

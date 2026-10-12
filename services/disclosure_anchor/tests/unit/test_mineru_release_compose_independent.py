@@ -68,6 +68,36 @@ class MineruReleaseComposeIndependentTests(unittest.TestCase):
         self.deployment = self.contract.decode_mineru_deployment_profile(_wire(DEPLOYMENT))
         self.capacity = _capacity()
 
+    def test_closed_owner_memory_profile_changes_only_inference_image_and_worker_selection(self):
+        value = deepcopy(DEPLOYMENT)
+        value["inference_declared_defaults"].update(vllm_gpu_memory_utilization_millionths=500000, vllm_enable_prefix_caching=True)
+        raw = self.contract.decode_mineru_deployment_profile(_wire(value))
+        self.assertEqual(raw.exact_bytes, _wire(value))
+        value.update(contract_version="mineru.deployment-profile.v2", inference_diagnostic={
+            "contract_version": "mineru.owner-memory.v1", "context_sha256": "sha256:" + "d" * 64,
+            "worker_class": "mineru_inference_memory.worker.OwnerMemoryWorker",
+        })
+        diagnostic = self.contract.decode_mineru_deployment_profile(_wire(value))
+        actual = self.plan.compose_document(diagnostic, self.capacity)
+        expected = self.plan.compose_document(raw, self.capacity)
+        inference = actual["services"]["mineru-openai-server"]
+        self.assertEqual(inference["image"], "agent-invest/mineru-inference:owner-memory-" + "d" * 64)
+        self.assertEqual(inference["command"], LEGACY_INFERENCE_ARGV[1:] + ["--worker-cls", "mineru_inference_memory.worker.OwnerMemoryWorker"])
+        inference["image"] = expected["services"]["mineru-openai-server"]["image"]
+        inference["command"] = expected["services"]["mineru-openai-server"]["command"]
+        self.assertEqual(actual, expected)
+        for mutate in (
+            lambda x: x["inference_diagnostic"].update(worker_class="arbitrary.Worker"),
+            lambda x: x.update(inference_max_num_seqs=64),
+            lambda x: x["inference_declared_defaults"].update(vllm_gpu_memory_utilization_millionths=900000),
+            lambda x: x.update(contract_version="mineru.deployment-profile.v1"),
+            lambda x: x.update(inference_diagnostic=None),
+        ):
+            bad = deepcopy(value)
+            mutate(bad)
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.contract.decode_mineru_deployment_profile(_wire(bad))
+
     def document(self, capacity=None):
         return self.plan.compose_document(self.deployment, capacity or self.capacity)
 

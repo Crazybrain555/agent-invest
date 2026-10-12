@@ -39,6 +39,30 @@ def _mineru_topology() -> dict[str, str]:
 
 
 class SettingsTests(unittest.TestCase):
+    def test_initial_history_default_and_explicit_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            for overrides, expected in (
+                ({}, 1827),
+                ({"DISCLOSURE_INITIAL_LOOKBACK_DAYS": "30"}, 30),
+                ({"DISCLOSURE_INITIAL_LOOKBACK_DAYS": "0"}, 0),
+            ):
+                with self.subTest(overrides=overrides), patch.dict(
+                    os.environ, {**base, **overrides}, clear=True
+                ):
+                    self.assertEqual(
+                        load_settings().disclosure_initial_lookback_days, expected
+                    )
+            with (
+                patch.dict(
+                    os.environ,
+                    {**base, "DISCLOSURE_INITIAL_LOOKBACK_DAYS": "-1"},
+                    clear=True,
+                ),
+                self.assertRaises(ValidationError),
+            ):
+                load_settings()
+
     def test_cninfo_download_deadline_default_and_watchdog_margin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = _env(Path(tmp))

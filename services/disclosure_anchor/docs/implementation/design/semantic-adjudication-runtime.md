@@ -89,7 +89,9 @@ Cancellation propagates immediately and does not consume a build retry. Unknown 
 invalid/missing structured output, schema or model identity drift, forbidden capability attempts,
 invalid decisions, cache identity conflicts, and every other protocol/security failure fail closed;
 they never try a backup. If every configured provider ends in the availability allowlist, the base
-Unit set is preserved with no invented route and the run ends as `degraded_unavailable`.
+Unit set is preserved with no invented route and the run ends as `degraded_unavailable`, except in the
+staged V4 COMMIT: there a group that no provider answered, with at least one provider failing as
+`transport_unavailable`, decides nothing and waits for the network ("Network outage wait" below).
 
 The executor classifies the closed reason before any stage-guard checkpoint: a failed-closed reason is
 raised at once as a typed error with a `failed_closed` attempt, so a concurrent revocation cannot turn it
@@ -105,8 +107,8 @@ a `cache_hit_invalid` note, and the entry left untouched: no quarantine or recom
 error from the hook itself propagates unchanged. In the staged V4 commit a
 failed-closed error is therefore a public fault: the worker latches it as the first cause and stops
 persistently until an explicit release, instead of re-driving the same uncached group
-(`worker-operational-stop.md`). A cancellation stays retry-neutral and is not a fault. The legacy
-`BuildUnits` path keeps its per-run build retry budget.
+(`worker-operational-stop.md`). A cancellation stays retry-neutral and is not a fault, and neither is a
+network wait. The legacy `BuildUnits` path keeps its per-run build retry budget.
 Adapters assign an availability reason only from typed subprocess failures, a closed structured
 error field, or a provider-owned error event / stderr line matching a versioned complete diagnostic.
 Every nonblank textual diagnostic atom from every inspected output channel must be recognized and
@@ -162,7 +164,16 @@ eventsource-stream 0.2.3 ("...: Transport error: network error: error decoding r
 "...: Transport error: timeout"), and the SSE idle timeout ("...: idle timeout waiting for SSE").
 The same "stream disconnected before completion" prefix also carries non-transport and variable
 details (incomplete responses, `response.failed`, SSE parse errors, WebSocket/IO error text); those
-stay `command_failed`. Every remaining diagnostic must agree. The timestamped `responses_websocket` failed-connect
+stay `command_failed`. Every remaining diagnostic must agree.
+"workspace routing discovery timed out" is transport unavailability too: it is the display of
+`WorkspaceRoutingError::DiscoveryTimeout` in 0.156.1 `app-server/.../account_processor/workspace_routing.rs`
+(commit `b412ff32c417f855c2b2d1581b77058eed87c84b`), the 15-second bound around the per-request ChatGPT
+workspace discovery GET. The CLI returns it as an IO error that its stream retry repeats over WebSockets
+and then HTTPS ("Reconnecting... n/5 (...)" notices and the fallback item) before the terminal `error` and
+`turn.failed` carry the bare display. This is the 2026-10-08 home-network incident's exact terminal. Its
+sibling displays are not timeouts and stay `command_failed`: "workspace routing discovery failed" (any
+non-401 HTTP status, a transport error, or an invalid accounts response), "... unauthorized (401)", account
+or configuration changes, a missing or duplicate workspace, and backend/origin validation. The timestamped `responses_websocket` failed-connect
 debug line is a connection-attempt notice; the JSONL terminal error decides the result. Unknown terminal
 messages, conflicting diagnostics, and tool/protocol errors still stop the call without failover.
 The 0.156.1 `RetryLimitReachedError` display forms for HTTP 500, 502, 503 and 504 identify transport
@@ -219,6 +230,73 @@ refreshed", "Login expired · Please run /login", "Authentication error · This 
 network issue, please try again", "Invalid API key · Fix external API key" — and belong to the Claude
 `not_authenticated` family (retryable); the middle dot is part of the complete diagnostic. Any other
 unknown key still fails closed as `invalid_runtime_protocol`; re-verify the set on a CLI upgrade.
+A request that never got an HTTP response ends, after the CLI's own retries, as the Claude
+`transport_unavailable` family (retryable), with `api_error_status` null. These are the exact `result`
+sentences of Claude Code 2.1.280's API-error mapper for the embedded Anthropic SDK 0.112.1
+`APIConnectionError`/`APIConnectionTimeoutError` (read from the pinned binary): "Request timed out";
+"API Error: Request timed out. Check your internet connection and proxy settings"; "API Error: Unable to
+connect to API. Check your internet connection"; "API Error: Connection dropped (CODE)" for ECONNRESET,
+EPIPE, ECONNABORTED, ConnectionClosed, ERR_SOCKET_CLOSED, UND_ERR_SOCKET; "API Error: Connection refused —
+a firewall or proxy may be blocking it (CODE)" for ECONNREFUSED, ConnectionRefused; "API Error: Can't
+reach the API server — check your internet or DNS (CODE)" for ENOTFOUND, EAI_AGAIN, FailedToOpenSocket;
+"API Error: No internet route — check your connection or VPN (CODE)" for ENETUNREACH, ENETDOWN,
+EHOSTUNREACH, EHOSTDOWN; "API Error: Connection lost while your computer was asleep"; and "API Error:
+Connection to the API was lost (CODE). This is usually temporary — try again." for those codes plus
+ETIMEDOUT and StreamSuspended. Certificate/TLS forms (possible interception), the proxy-tunnel refusal
+(proxy credentials), the generic "Unable to connect to API (CODE)" with an unlisted code and the
+first-byte "No response from API (waited ...)" form stay `command_failed`. A typed HTTP status keeps
+precedence, and every inspected line must still agree on one family. Before this family existed, a
+Codex outage that correctly fell back to Sonnet would have stopped again on Sonnet's offline sentence.
+
+## Network outage wait (staged V4 COMMIT only)
+
+A transient network outage suspends the affected work and continues the same work once the network is
+back; it is neither a degraded publication nor a public stop. Only the staged V4 worker composes this
+(`build_semantic_runtime(network_wait=True)`); every other caller (pipeline CLI, admin API, legacy
+`BuildUnits`, replay script) keeps `degraded_unavailable` for such a group.
+
+- Outage rule: every configured provider was tried and ended `availability_failed`, and at least one of
+  them as `transport_unavailable`. The other providers' reasons may be any availability reason: the
+  unreachable provider is expected to answer once the network returns, so the group waits instead of
+  publishing degraded routes for good. Without transport evidence (only capacity, login, executable,
+  local IO or deadline reasons) the deliberate `degraded_unavailable` policy is unchanged; unknown,
+  security, schema, identity and validation failures still fail closed as before.
+- The executor then raises the typed `SemanticNetworkUnavailable` (a `SemanticRouteAdjudicatorError` with
+  `transport_unavailable`, retryable) instead of returning an outcome: no receipt, no cache entry, and the
+  failed providers' replies are never read or cached. The V4 COMMIT turns it into `StageWaiting`
+  (`SemanticNetworkCommitWait`): the stage returns, which releases its heavy-work permit, commit thread and
+  document producer lock; no retry budget is spent; the coordinator keeps renewing the durable claim and
+  re-dispatches the same `local_materialized` attempt. Transaction P never ran and no readiness bundle
+  exists, so the next COMMIT rebuilds the same request (same attempt, run, fence and provider evidence);
+  every group answered before the outage is a cache hit, and nothing can be published twice.
+- One shared cooldown per staged executor (`SharedSemanticNetworkCooldown`, a circuit breaker): an outage
+  opens it; while open, an uncached group waits without calling any provider (cache hits still proceed),
+  and a group admitted before it opened stops before its next provider. After the cooldown one probe group
+  runs the whole chain while others keep waiting (probe wait 30 s). A provider answer closes it; a failed
+  probe reopens it with the next delay. Delays start at 60 s and double to a 600 s cap (Celery's default
+  `retry_backoff_max`), with no attempt limit (Temporal's default), so a long outage keeps waiting and
+  recovers by itself without an operator. A probe that degraded, failed closed or was cancelled is
+  released without a verdict: degradation never counts as network recovery. The state is process-local; a
+  restart starts closed and its first COMMIT simply asks the network again. No jitter: one process and one
+  probe leave no herd to spread.
+- An attempt whose COMMIT waited is remembered in process; while the cooldown still refuses calls its next
+  COMMIT waits again before reopening, reading or building anything, so a long outage costs one cheap
+  dispatch per waiting document per wait cycle (the coordinator caps a single wait at the lease bound,
+  30 s in production) rather than repeated whole-document rebuilds. Documents whose groups are all cached,
+  or that need no model, keep committing during an outage; credit limits still bound how many documents
+  can wait in `local_materialized`.
+- An operator stop (TERM/INT already stops semantic provider calls through
+  `terminate_active_semantic_processes`) ends a waiting COMMIT as the same retry-neutral `cancelled`
+  error a stopped provider call raises, at its next dispatch, so a drain never waits for the network. The
+  attempt keeps its durable state and a restart recovers it with a new claim generation.
+- Visibility: each transition logs one bounded `semantic_network_wait.v1` record to the worker's stderr
+  (`opened`, `probe_failed`, `closed`, with consecutive outages, outage seconds, the next wait, the group
+  hash and the deciding `(provider_id, reason_code)` pairs; never provider text). Each wait is a
+  `semantic_network_waiting` stage note, and every failed call keeps its `semantic_provider_failure.v1`
+  record and private diagnostic.
+- Unchanged: provider identities and adapter versions, prompt/schema hashes, router version, cache keys,
+  receipt contracts and `availability_only.v1`. A wait records nothing durable; the receipt of the group's
+  eventual answer shows that episode's real attempts.
 
 ## Cache and receipt
 

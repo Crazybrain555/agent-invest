@@ -50,6 +50,49 @@ _CLAUDE_CAPACITY_DIAGNOSTICS = (
     ),
     re.compile(r"overloaded_error[.!]?", re.IGNORECASE),
 )
+# Claude Code 2.1.280 `result` sentences for a request that never got an HTTP
+# response, as its API-error mapper writes them after the CLI's own retries
+# (embedded Anthropic SDK 0.112.1 APIConnectionError "Connection error.",
+# APIConnectionTimeoutError, or a socket error code on the cause chain). Each
+# sentence keeps the CLI's closed code list. Certificate/TLS forms, the proxy
+# tunnel refusal, an unlisted code and the first-byte "No response" form are
+# deliberately absent: they stay unrecognized and fail closed.
+_CLAUDE_DROPPED_CODES = "ECONNRESET|EPIPE|ECONNABORTED|ConnectionClosed|ERR_SOCKET_CLOSED|UND_ERR_SOCKET"
+_CLAUDE_REFUSED_CODES = "ECONNREFUSED|ConnectionRefused"
+_CLAUDE_UNREACHABLE_CODES = "ENOTFOUND|EAI_AGAIN|FailedToOpenSocket"
+_CLAUDE_NO_ROUTE_CODES = "ENETUNREACH|ENETDOWN|EHOSTUNREACH|EHOSTDOWN"
+# The CLI's lost-connection sentence takes every socket code above plus these
+# two; its proxy-tunnel code is left out with the proxy sentence.
+_CLAUDE_LOST_CODES = "|".join((
+    _CLAUDE_DROPPED_CODES, "ETIMEDOUT|StreamSuspended", _CLAUDE_REFUSED_CODES,
+    _CLAUDE_UNREACHABLE_CODES, _CLAUDE_NO_ROUTE_CODES,
+))
+_CLAUDE_TRANSPORT_DIAGNOSTICS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"Request timed out",
+        r"API Error: Request timed out\. Check your internet connection and proxy settings",
+        r"API Error: Unable to connect to API\. Check your internet connection",
+        rf"API Error: Connection dropped \((?:{_CLAUDE_DROPPED_CODES})\)",
+        (
+            r"API Error: Connection refused — a firewall or proxy may be blocking it"
+            rf" \((?:{_CLAUDE_REFUSED_CODES})\)"
+        ),
+        (
+            r"API Error: Can't reach the API server — check your internet or DNS"
+            rf" \((?:{_CLAUDE_UNREACHABLE_CODES})\)"
+        ),
+        (
+            r"API Error: No internet route — check your connection or VPN"
+            rf" \((?:{_CLAUDE_NO_ROUTE_CODES})\)"
+        ),
+        r"API Error: Connection lost while your computer was asleep",
+        (
+            rf"API Error: Connection to the API was lost \((?:{_CLAUDE_LOST_CODES})\)\."
+            r" This is usually temporary — try again\."
+        ),
+    )
+)
 _ERROR_ENVELOPE_CORE_FIELDS = frozenset(
     {"is_error", "permission_denials", "api_error_status", "result"}
 )
@@ -419,7 +462,7 @@ def _command_error(
     error = SemanticRouteAdjudicatorError(
         f"Claude semantic adjudicator failed with exit {completed.returncode}",
         reason_code=reason,
-        retryable=reason in {"not_authenticated", "capacity_unavailable"},
+        retryable=reason in {"not_authenticated", "capacity_unavailable", "transport_unavailable"},
     )
     _log_command_failure(completed, error, envelope)
     return error
@@ -776,6 +819,7 @@ def _known_availability_reason(diagnostics: tuple[str, ...]) -> str | None:
         diagnostics,
         auth_diagnostics=_CLAUDE_AUTH_DIAGNOSTICS,
         capacity_diagnostics=_CLAUDE_CAPACITY_DIAGNOSTICS,
+        transport_diagnostics=_CLAUDE_TRANSPORT_DIAGNOSTICS,
     )
 
 

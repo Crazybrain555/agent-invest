@@ -136,15 +136,17 @@ def inference_command_argv(profile: MineruDeploymentProfile) -> tuple[str, ...]:
     """
 
     profile.__post_init__()
-    argv = (
+    argv: tuple[str, ...] = (
         INFERENCE_ENTRYPOINT, *INFERENCE_FIXED_ARGV,
         "--max-num-seqs", str(profile.inference_max_num_seqs),
         "--mm-processor-cache-gb", str(profile.inference_mm_processor_cache_gb),
     )
     millionths = profile.inference_declared_defaults.vllm_gpu_memory_utilization_millionths
-    if millionths == MINERU_HELPER_GPU_MEMORY_UTILIZATION_MILLIONTHS:
-        return argv
-    return (*argv, GPU_MEMORY_UTILIZATION_OPTION, gpu_memory_utilization_argument(millionths))
+    if millionths != MINERU_HELPER_GPU_MEMORY_UTILIZATION_MILLIONTHS:
+        argv = (*argv, GPU_MEMORY_UTILIZATION_OPTION, gpu_memory_utilization_argument(millionths))
+    if profile.inference_diagnostic is not None:
+        argv = (*argv, "--worker-cls", profile.inference_diagnostic.worker_class)
+    return argv
 
 
 def compose_document(profile: MineruDeploymentProfile, capacity: AnyMineruCapacityConfig) -> dict[str, Any]:
@@ -205,7 +207,7 @@ def compose_document(profile: MineruDeploymentProfile, capacity: AnyMineruCapaci
     })
     inference_argv = inference_command_argv(profile)
     inference: dict[str, Any] = {
-        "image": profile.base_image_repo_digest,
+        "image": (profile.inference_diagnostic.image_reference if profile.inference_diagnostic is not None else profile.base_image_repo_digest),
         "pull_policy": "never",
         "container_name": "mineru-openai-server",
         "restart": "always",

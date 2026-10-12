@@ -59,6 +59,7 @@ class _OwnerCase(unittest.TestCase):
                 capacity=self.capacity,
                 deployment_profile=SimpleNamespace(
                     api_task_retention_seconds=600, api_task_cleanup_interval_seconds=30,
+                    inference_diagnostic=None,
                 ),
             ),
         )
@@ -97,6 +98,9 @@ class OrdinaryInstallationGatePreservationTests(_OwnerCase):
         self.assertFalse(result["installation_verified"])
         self.assertEqual(result["write_permission"], "closed")
         self.assertEqual(calls, 0)
+        self.assertEqual(health["queued_tasks"], 0)
+        self.assertEqual(health["processing_tasks"], 0)
+        self.assertIn("MinerU admission responsibility counters disagree", result["first_error"])
 
 
 _OPERATION = "sr-" + "7" * 32

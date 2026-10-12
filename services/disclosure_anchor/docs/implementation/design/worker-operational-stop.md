@@ -13,8 +13,14 @@ procedures are in `../runbooks/production-operations.md` §1.1f.
 - After the cause is fixed and the stop explicitly released, the existing recovery barrier resumes the
   same attempt, run, materialized output and successful group cache. Only still-uncached groups can call
   a model again. There is no whole-document at-most-once claim and no new parse key.
-- Not added: per-document quarantine, cross-boot retry counters, half-open probes, a second business
-  ledger, new item-local mappings, a stop service/park loop, or a WAL/IO framework. Existing typed
+- A recognized network outage is not a fault: a COMMIT whose semantic group no provider answered, with at
+  least one provider failing as `transport_unavailable`, waits as `StageWaiting` and continues the same
+  attempt when the network returns (semantic-adjudication-runtime.md, "Network outage wait"). That
+  shared cooldown's single probe belongs to the semantic runtime of a running worker; it never releases or
+  bypasses a public stop. Unknown, security, schema, identity and validation failures still latch
+  `semantic_failed_closed`.
+- Not added: per-document quarantine, cross-boot retry counters, half-open probes of a stopped worker, a
+  second business ledger, new item-local mappings, a stop service/park loop, or a WAL/IO framework. Existing typed
   item-local failures (for example the locked-candidate overflow), the six availability reasons and
   `RetryStage`/`StageWaiting` budgets keep their bounded behavior. Only a provider-witnessed
   `StageProviderWaiting` ends its own attempt's retry episode (worker-dynamic-scheduling.md), so a
@@ -96,7 +102,9 @@ composes it from settings when the caller passes none.
   with `public_stop`, and drains. The durable claim, fence, credit and publication state is never rolled
   back, and `_fail_attempt`/cleanup/ACK are not invoked for a stopped attempt.
 - A typed `cancelled` error or a drain-revoked stage opens the circuit only to end the drain promptly; it
-  is retry-neutral and latches nothing. `KeyboardInterrupt`/`SystemExit` are operator interrupts.
+  is retry-neutral and latches nothing. `KeyboardInterrupt`/`SystemExit` are operator interrupts. A COMMIT
+  waiting for the semantic network ends as that `cancelled` error at its next dispatch once TERM/INT has
+  stopped semantic provider calls, so a drain does not wait for the network to return.
 - Capacity holds (`StageCapacityBlocked`) are classified once, in the coordinator's handler, from their
   closed reason vocabularies. A hold no retained attempt can clear by itself is a site stop latched as
   `coordinator_circuit`: a native storage hold (`native_storage_hold`: hard envelope, codec bound, seal or

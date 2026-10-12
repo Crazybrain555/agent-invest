@@ -505,6 +505,19 @@ staged V4 的语义 `failed_closed`（协议、安全、结果契约）在 commi
 保留原任务、收据和日志，修复并验证后显式放行。本机制不做单文档隔离、跨启动计数或半开探测；
 已证实的 item-local 类型失败与 availability 降级保持原有有界语义。
 
+断网等待（只在 staged V4 commit）：某个语义 group 没有任何 provider 给出答案、且至少一个 provider 的失败
+是已识别的 `transport_unavailable`（例如 Codex 的 `workspace routing discovery timed out`，或 Claude 的
+`API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)` 一类断网句子），这个文档就
+暂停等网，不发布降级结果，也不触发公共停止。同一个 attempt 保持 `local_materialized` 和它的 claim，
+heavy-work 许可和 commit 线程都会让出；网络恢复后自动继续同一份任务，已答过的 group 走缓存，不会重复
+发布。全进程共用一个冷却：首次 60 秒，失败的探测把等待翻倍，最长 600 秒，不设次数上限；冷却期间不调用
+任何 CLI，冷却结束只放一个 group 去探测，其他文档继续等。worker stderr 里每次状态变化有一行
+`semantic_network_wait.v1`（`opened`/`probe_failed`/`closed`，含连续断网次数、已断网秒数、下次等待和
+`(provider_id, reason_code)`，不含 provider 原文）；看到 `closed` 即已恢复。不需要也不要手动重启、放行或
+清缓存。只有登录/额度/可执行文件/本地 IO/超时这类非网络原因时仍按原策略降级；未知、安全、schema、身份
+与校验错误照旧 fail closed。TERM/INT 停 worker 时，等网的 commit 在下一次派发时以可重试的取消结束
+（单次等待最长 30 秒），drain 不会一直等网；重启后同一 attempt 会被恢复接着做。
+
 `invalid_decision` 表示答案通过了协议解码、但没通过路由校验（决策没有恰好覆盖所请求的 Unit 时记为
 `invalid_contract`）；校验在写缓存之前、以及每次命中缓存时都会运行，所以被拒的新答案从不入缓存。
 按停止记录中该 attempt 的 `cache_key` 查
@@ -689,6 +702,14 @@ container ID、StartedAt 与 image ID 均未改变。以上供应链约束不等
   复位该 attempt 的次数与 300 s 窗口；日志 `[staged-v4] … retry budget exhausted (attempts=…, elapsed=…,
   last=…, causes=…[, http_status=…])` 给出耗尽的边界与最后失败类别（不含异常原文）。
   纯操作员 TERM/INT、无故障且在途工作收尾时以 0 退出；取消（`cancelled`）不计为故障。
+- **数据库打开文件被中断**：PostgreSQL 打开关系文件遇 EINTR（`could not open file "base/…": Interrupted
+  system call`，SQLSTATE XX000）只在 H0 ingress/源拒绝事务内、提交开始前、且回滚与锁/连接回收都已证实时
+  自动重放一次，worker 日志出现 `staged ingress <attempt|run>: write 1/2 rolled back after a database
+  interruption before commit; replaying the same command`。重放与提交应答丢失共用两次写入；再次中断时以
+  `DatabaseInterruptionRolledBack`（cause 为原 psycopg 错误，附 `no replay left` 注记）走既有公共停止
+  （`coordinator_fault/controller_unexpected_failure`；同一轮已有 durable claim 时为
+  `coordinator_circuit/admission_interrupted`）。其它阶段与读者遇到同样错误照旧停止或报错，不算受保护；
+  按下文查因放行，不靠重启或注入故障试错。
 - **查看**：`make worker-control-status`（`FORMAT=json` 给 Agent；只读 control 文件与 launchd，不连
   DB/MinerU/模型）、`make worker-status`（stderr 报 STOPPED，退出 3）、`make doctor-full`
   （`worker operational control` 为 FAIL，DB 宕机也能报）。
@@ -1163,7 +1184,7 @@ maintenance watchdog：采集平面按“已完成的条目”心跳（成功、
 |---|---|---|
 | parse 重试耗尽 / 不可重试 | doctor `parse dead letters` WARN；`pending_parse_v1.last_failed_retryable=false` | 查 `processing_run.error` 根因；修复后 `make process DOC=<id>` 手动重跑 |
 | Unit build 重试耗尽 / fail-closed | doctor `build dead letters` FAIL、health degraded、`disclosure_ops.unit_build_terminal_v1`；worker 只在集合变化时告警；0048 起已被后续成功 Unit 代际修复的旧失败自动退出这些运维读面 | 查 `unit_build_error` 与 `semantic_adjudication_summary`；修复 provider/config/规则后 `make rebuild-units DOC=<id>` 生成新 run，再发布；不得改旧 run 或紧循环 |
-| provider 全部暂时不可用 | active run 的 `semantic_adjudication_status='degraded_unavailable'`、health/doctor WARN | Unit 集仍保留但无编造语义；恢复任一 provider 后显式 `rebuild-units`，确认新 run 为 complete_primary/backup |
+| provider 全部暂时不可用 | active run 的 `semantic_adjudication_status='degraded_unavailable'`、health/doctor WARN | Unit 集仍保留但无编造语义；恢复任一 provider 后显式 `rebuild-units`，确认新 run 为 complete_primary/backup。staged V4 中至少一个 provider 是 `transport_unavailable` 的断网不会进这里：它等网后自动继续（§1.1b） |
 | 空发布（0 unit） | doctor `empty publish dead letters`（实存案例：美的 3 篇「日常关联交易预计」，疑似表格型盲区） | 人工看原 PDF：确属无正文可切 → `make publish RUN=<id> ALLOW_EMPTY=1 REASON=...`；是切分盲区 → 修规则后 `make rebuild-units DOC=<id>` |
 | HUGE lane 长任务 | worker report 的 `parse_huge_dispatched` 与 processing_run 时长；不再有大小排除死信 | 以归档 actual byte_count/页数核对成本；正常长任务继续运行；极端 whole-future runaway 由 watchdog 以 70 退出，launchd 不再自动重启，排查后 `make worker-restart` |
 
@@ -1363,3 +1384,25 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
   窗口，不能把 Alembic 事务内的索引创建冒充无阻塞 online migration。
 - admin API 需要 `DISCLOSURE_ADMIN_TOKEN`（Bearer）且仅回环可用；token 在 worker.env，
   轮换用 `openssl rand -hex 32` 换值后 `make worker-restart` + 重启 API。
+
+
+### 零职责 owner-memory 诊断完整安装
+
+仅在原 release/current pins 下自然完成全部 prepared/submitted/publish/ACK 职责，并由 root 停止 worker、
+保持 worker/GC unloaded 和持续 producer exclusion 后，使用既有 scope capture 得到新鲜零成员 inventory。
+非 current staged heads 必须由既有 capture guard 拒绝；API/vLLM idle 不代替业务零职责。
+审核并冻结 source/package/profile 后，正式入口为：
+
+```sh
+python -m disclosure_anchor.cli.mineru_release install \
+  --operation-kind full-install --package <verified-package> \
+  --private-binding <owner-only-binding> --legacy-scope-inventory <fresh-owner-only-inventory> \
+  --output <new-operation-directory>
+```
+
+这是既有 full-project installer 分支，不是新的 inference migration。它允许 drained API/proxy 获得新 epoch；
+保留原始数据、注册、输出根、registry/consumed tombstone、旧 receipt 和精确 backups。
+诊断包由 v2 deployment profile/v2 release manifest 绑定派生镜像源；raw v1 包继续保持原行为。
+未知 daemon 结果保持 writes closed，按既有只读 reconciliation 处理，不自动重复 build/recreate/rollback。
+安装通过后继续执行新实际 attestation、完整 qualification/epoch bracket、G5、bind 和 deployment preflight，
+再由 root 恢复普通 producer。source/image/worker 加载证据不足或任何旧职责未关闭均拒绝部署。
