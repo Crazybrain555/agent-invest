@@ -378,7 +378,14 @@ function Write-OperationRecord {
     if ([string]::IsNullOrEmpty($OperationRecordDirectory)) { return }
     $script:OperationRecordCount++
     $payload = [ordered]@{ sequence = $script:OperationRecordCount; utc = (Get-Date).ToUniversalTime().ToString("o") }
-    foreach ($property in $Value.GetEnumerator()) { $payload[$property.Key] = $property.Value }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($property in $Value.GetEnumerator()) { $payload[$property.Key] = $property.Value }
+    } elseif ($Value -is [System.Management.Automation.PSCustomObject]) {
+        # ConvertFrom-Json returns PSCustomObject on Windows PowerShell 5.1.
+        foreach ($property in $Value.PSObject.Properties) { $payload[$property.Name] = $property.Value }
+    } else {
+        throw "operation record value must be a dictionary or JSON object"
+    }
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($payload | ConvertTo-Json -Depth 8 -Compress))
     $stream = [IO.File]::Open((Join-Path $OperationRecordDirectory $Name), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
