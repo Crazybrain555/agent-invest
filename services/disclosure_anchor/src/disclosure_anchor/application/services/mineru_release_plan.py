@@ -15,11 +15,14 @@ from typing import Any
 
 import yaml
 
+from disclosure_anchor.application.contracts.closed_document import require_int
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig,
+    AnyMineruCapacityConfig,
+    MineruCapacityConfigV2,
     capacity_environment,
     capacity_http_arguments,
     encode_mineru_capacity_config,
+    encode_mineru_capacity_config_v2,
 )
 from disclosure_anchor.application.contracts.mineru_deployment_profile import MineruDeploymentProfile
 from disclosure_anchor.application.contracts.mineru_local_worker_profile import MineruLocalWorkerProfile
@@ -29,6 +32,15 @@ CURRENT_RUNTIME_PROCESSING_WINDOW_SIZE = 16
 API_FIXED_ARGV = ("--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client")
 API_CONTAINER_OUTPUT_ROOT = "/var/lib/mineru-api-output"
 API_STOP_GRACE_SECONDS = 10
+INFERENCE_ENTRYPOINT = "mineru-openai-server"
+INFERENCE_FIXED_ARGV = ("--host", "0.0.0.0", "--port", "30000")
+GPU_MEMORY_UTILIZATION_OPTION = "--gpu-memory-utilization"
+# MinerU 3.4.4's server entry appends its helper fraction only when the argv
+# names none (exact option or ``option=value``); the helper yields 0.5 on a GPU
+# above 8 GiB. A release declaring exactly that value keeps the flagless argv
+# that existing packages and runtime receipts bind byte for byte; any other
+# declared value must be passed explicitly or the engine silently keeps 0.5.
+MINERU_HELPER_GPU_MEMORY_UTILIZATION_MILLIONTHS = 500_000
 PROXY_PROGRAM = (
     "import asyncio\n"
     "\n"
@@ -83,7 +95,7 @@ class ReleasePlan:
     local_profile_admits_full_pending: bool
 
 
-def require_current_runtime_capabilities(capacity: MineruCapacityConfig) -> None:
+def require_current_runtime_capabilities(capacity: AnyMineruCapacityConfig) -> None:
     """Reject capacity requests the current patched runtime cannot honour.
 
     The codec admits a wider envelope than the deployed patch set supports:
@@ -91,7 +103,10 @@ def require_current_runtime_capabilities(capacity: MineruCapacityConfig) -> None
     the only qualified topology.
     """
 
-    encode_mineru_capacity_config(capacity)
+    if isinstance(capacity, MineruCapacityConfigV2):
+        encode_mineru_capacity_config_v2(capacity)
+    else:
+        encode_mineru_capacity_config(capacity)
     if capacity.processing_window_size != CURRENT_RUNTIME_PROCESSING_WINDOW_SIZE:
         raise ValueError(
             f"current runtime supports processing_window_size {CURRENT_RUNTIME_PROCESSING_WINDOW_SIZE} only"
@@ -100,11 +115,41 @@ def require_current_runtime_capabilities(capacity: MineruCapacityConfig) -> None
         raise ValueError("current runtime supports one API process and one event loop only")
 
 
-def api_command_argv(capacity: MineruCapacityConfig) -> tuple[str, ...]:
+def api_command_argv(capacity: AnyMineruCapacityConfig) -> tuple[str, ...]:
     return API_FIXED_ARGV + capacity_http_arguments(capacity)
 
 
-def compose_document(profile: MineruDeploymentProfile, capacity: MineruCapacityConfig) -> dict[str, Any]:
+def gpu_memory_utilization_argument(millionths: int) -> str:
+    """Render an integer millionths fraction as its exact six-decimal CLI value."""
+
+    require_int(millionths, label="vllm_gpu_memory_utilization_millionths", maximum=1_000_000)
+    whole, fraction = divmod(millionths, 1_000_000)
+    return f"{whole}.{fraction:06d}"
+
+
+def inference_command_argv(profile: MineruDeploymentProfile) -> tuple[str, ...]:
+    """Complete inference-server argv, entrypoint first, projected from the profile.
+
+    Compose generation, Compose verification and release binding all compare
+    against this one value. A declared GPU memory fraction other than the
+    MinerU helper default is appended once as its exact six-decimal value.
+    """
+
+    profile.__post_init__()
+    argv: tuple[str, ...] = (
+        INFERENCE_ENTRYPOINT, *INFERENCE_FIXED_ARGV,
+        "--max-num-seqs", str(profile.inference_max_num_seqs),
+        "--mm-processor-cache-gb", str(profile.inference_mm_processor_cache_gb),
+    )
+    millionths = profile.inference_declared_defaults.vllm_gpu_memory_utilization_millionths
+    if millionths != MINERU_HELPER_GPU_MEMORY_UTILIZATION_MILLIONTHS:
+        argv = (*argv, GPU_MEMORY_UTILIZATION_OPTION, gpu_memory_utilization_argument(millionths))
+    if profile.inference_diagnostic is not None:
+        argv = (*argv, "--worker-cls", profile.inference_diagnostic.worker_class)
+    return argv
+
+
+def compose_document(profile: MineruDeploymentProfile, capacity: AnyMineruCapacityConfig) -> dict[str, Any]:
     """Structured Compose with every capacity consumer projected once."""
 
     profile.__post_init__()
@@ -160,18 +205,15 @@ def compose_document(profile: MineruDeploymentProfile, capacity: MineruCapacityC
         },
         "networks": ["inference"],
     })
+    inference_argv = inference_command_argv(profile)
     inference: dict[str, Any] = {
-        "image": profile.base_image_repo_digest,
+        "image": (profile.inference_diagnostic.image_reference if profile.inference_diagnostic is not None else profile.base_image_repo_digest),
         "pull_policy": "never",
         "container_name": "mineru-openai-server",
         "restart": "always",
         "environment": {"MINERU_MODEL_SOURCE": "local"},
-        "entrypoint": ["mineru-openai-server"],
-        "command": [
-            "--host", "0.0.0.0", "--port", "30000",
-            "--max-num-seqs", str(profile.inference_max_num_seqs),
-            "--mm-processor-cache-gb", str(profile.inference_mm_processor_cache_gb),
-        ],
+        "entrypoint": list(inference_argv[:1]),
+        "command": list(inference_argv[1:]),
         "ports": [{
             "name": "vllm-observability", "target": 30000, "host_ip": "127.0.0.1",
             "published": str(profile.vllm_observability_published_port), "protocol": "tcp",
@@ -344,14 +386,15 @@ def parse_compose_yaml(payload: bytes) -> dict[str, Any]:
 
 
 def verify_compose_projection(
-    document: dict[str, Any], capacity: MineruCapacityConfig, profile: MineruDeploymentProfile,
+    document: dict[str, Any], capacity: AnyMineruCapacityConfig, profile: MineruDeploymentProfile,
 ) -> list[str]:
     """Return every mismatch between a parsed Compose and the exact projection."""
 
     mismatches: list[str] = []
     expected = compose_document(profile, capacity)
     if document != expected:
-        api = document.get("services", {}).get("mineru-api") if type(document.get("services")) is dict else None
+        services = document.get("services")
+        api = services.get("mineru-api") if type(services) is dict else None
         environment = api.get("environment") if type(api) is dict else None
         if type(environment) is not dict:
             mismatches.append("services.mineru-api.environment: missing")
@@ -368,13 +411,21 @@ def verify_compose_projection(
         command = api.get("command") if type(api) is dict else None
         if command != list(api_command_argv(capacity)):
             mismatches.append(f"services.mineru-api.command: {command!r} != {list(api_command_argv(capacity))!r}")
+        inference = services.get("mineru-openai-server") if type(services) is dict else None
+        argv = inference_command_argv(profile)
+        for field, projected in (("entrypoint", list(argv[:1])), ("command", list(argv[1:]))):
+            actual = inference.get(field) if type(inference) is dict else None
+            if actual != projected:
+                mismatches.append(f"services.mineru-openai-server.{field}: {actual!r} != {projected!r}")
         if not mismatches:
-            mismatches.append("compose document differs from the exact projection outside capacity fields")
+            mismatches.append(
+                "compose document differs from the exact projection outside capacity fields and the inference argv"
+            )
     return mismatches
 
 
 def resolve_release(
-    capacity: MineruCapacityConfig,
+    capacity: AnyMineruCapacityConfig,
     deployment_profile: MineruDeploymentProfile,
     local_profile: MineruLocalWorkerProfile,
 ) -> ReleasePlan:
@@ -390,7 +441,9 @@ def resolve_release(
     # The Mac process-profile contract requires every admitted pending task to
     # hold a full reservation within the retained-result budget; the API
     # registry itself only backpressures. Report the difference; never hide it.
-    admits_full_pending = (
+    # A v2 capacity has no per-task B: its codec already proved that every
+    # admitted upload plus the producers' growth permits fit the source pool.
+    admits_full_pending = isinstance(capacity, MineruCapacityConfigV2) or (
         capacity.result_reservation_bytes * capacity.total_nonterminal_limit <= capacity.max_unacked_result_bytes
     )
     return ReleasePlan(
@@ -409,6 +462,8 @@ __all__ = [
     "ReleasePlan",
     "api_command_argv",
     "compose_document",
+    "gpu_memory_utilization_argument",
+    "inference_command_argv",
     "parse_compose_yaml",
     "render_compose_yaml",
     "require_current_runtime_capabilities",

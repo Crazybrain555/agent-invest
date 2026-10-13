@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 from typing import TypeVar
 
 from disclosure_anchor.application.ports.remote_parse_v4_ingress import (
@@ -10,10 +11,16 @@ from disclosure_anchor.application.ports.remote_parse_v4_ingress import (
 )
 from disclosure_anchor.application.ports.remote_parse_v4_repository import RemoteParseV4Authority
 from disclosure_anchor.application.ports.remote_parse_v4_source_rejection import V4SourceRejectionCommit
-from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.ports.unit_of_work import (
+    DatabaseInterruptionRolledBack, UnitOfWork, replayable_transaction,
+)
 
 
+LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
+# The original write plus one replay, shared by commit-response loss and a
+# database interruption proven rolled back before commit.
+_WRITE_ATTEMPTS = 2
 
 
 class StagedIngressResponseLost(RuntimeError):
@@ -55,11 +62,15 @@ class DurableStagedIngressV4:
         if not callable(write_guard):
             raise ValueError("staged ingress requires an explicit write guard")
         last_unknown: Exception | None = None
-        for write_number in range(2):
+        for write_number in range(_WRITE_ATTEMPTS):
             write_guard()
             mutation_returned = False
+            unit = self._uow_factory()
             try:
-                with self._uow_factory() as uow:
+                # Every write repeats the same immutable command, whose
+                # attempt/run/fence/key/event identities were fixed before
+                # the first one, in a fresh unit of work.
+                with replayable_transaction(), unit as uow:
                     result = mutate(uow)
                     mutation_returned = True
                     write_guard()
@@ -67,7 +78,28 @@ class DurableStagedIngressV4:
                 return result
             except Exception as exc:
                 if not mutation_returned:
-                    raise
+                    # Only this write's own unit can prove that nothing of it
+                    # survived; anything else before the mutation returned
+                    # stays the visible failure it was.
+                    if not (
+                        isinstance(exc, DatabaseInterruptionRolledBack)
+                        and exc.unit_of_work is unit
+                    ):
+                        raise
+                    if write_number + 1 == _WRITE_ATTEMPTS:
+                        exc.add_note(
+                            f"staged ingress {label}: write {write_number + 1}/"
+                            f"{_WRITE_ATTEMPTS} rolled back after a database "
+                            "interruption; no replay left"
+                        )
+                        raise
+                    LOGGER.warning(
+                        "staged ingress %s: write %d/%d rolled back after a "
+                        "database interruption before commit; replaying the "
+                        "same command",
+                        label, write_number + 1, _WRITE_ATTEMPTS,
+                    )
+                    continue
                 last_unknown = exc
                 try:
                     with self._uow_factory() as uow:
@@ -75,7 +107,7 @@ class DurableStagedIngressV4:
                         # and remains valid after readiness/ownership loss.
                         reconciled = reconcile(uow)
                 except V4InitialIngressNotCommitted:
-                    if write_number == 0:
+                    if write_number + 1 < _WRITE_ATTEMPTS:
                         continue
                     break
                 except Exception as reconcile_exc:

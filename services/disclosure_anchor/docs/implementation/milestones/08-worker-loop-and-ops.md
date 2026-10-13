@@ -150,10 +150,15 @@ maintenance/report 周期禁止重复执行，正常长任务绝不按年龄回�
    终止并清理当前 MinerU 进程组后退出。parse/startup 与 maintenance 使用两个独立
    heartbeat/watchdog；任一平面的活动都不能掩盖另一平面失活。
 3. 重试策略只读结构化错误：`error.retryable`（04R-R4 已收紧分类）+ PostgreSQL 次数上限；
-   worker 不自行解释错误文本。resident 对可重试失败先让一个固定候选窗口的其他任务通过，
+   worker 不自行解释错误文本。legacy-sync resident 对可重试失败先让一个固定候选窗口的其他任务通过，
    到期后经同一 PostgreSQL 资格/次数谓词按 exact ID 重新准入；普通候选扫描使用固定页
    大小 keyset，游标只推进到实际检查行，禁止随进程内已见集合扩大 SQL `LIMIT`。因此即使
-   新 ULID 持续到达也不热重试、不饿死，内存和查询成本都有界。
+   新 ULID 持续到达，可重试失败也不热重试、不因队尾增长被饿死，内存和查询成本都有界。
+   staged-v4 普通准入没有 exact-ID 旁路，而是每轮冻结一个上界 ID 的有限轮次：更高 ID 持续到达
+   不能让一轮永不结束，游标之下变为合格的行（含可重试失败回流）最迟下一轮被重新检查。已知大小、profile
+   装得下的候选只因临时信用不足放不下时，游标停在它之前等待在途工作释放信用，之后的 ID 不先于它准入；
+   进展以在途工作继续完成为条件，不承诺固定等待时间，等待期间利用率可能下降。永久装不下与观察前大小未知
+   的 PDF 仍越过，后者的容量饥饿不在此保证内（见 `../design/worker-dynamic-scheduling.md` §10）。
 4. 报告路径与写入语义定死：`<DISCLOSURE_RUNTIME_ROOT>/reports/worker/YYYY-MM-DD.md`、
    `<DISCLOSURE_RUNTIME_ROOT>/reports/parse_quality/YYYY-MM-DD.md`（date = 本地时区的轮次
    开始日期；**同日多快照追加写入**，每个所有权已转移的 WorkerReport 一个
@@ -231,6 +236,10 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
 - **pending_download_v1**：候选来源含 web 兜底通道（provider_interface IN
   ('cninfo:p_info3015','cninfo:hisAnnouncement')），并额外暴露 company_id 与完整 candidate
   jsonb 列（下载复用 07 候选协议所需）；仍为 facts-only。
+  0064：终态排除改读 `ops.download_failure_resolution_v1`——只有「不可重试且未被成功保留原件登记
+  解决」的失败阻断；`failed_download_count` 仍计全部失败，阈值仍在 queries.py。worker 与 CLI sync 把行上的
+  `source_access_id`（承载该候选的索引访问）传给 `DownloadDocumentCommand.index_source_access_id`；
+  dead-letter 计数、legacy 待下载路径与 doctor 读同一视图（`design/historical-security-retained-registration.md`）。
 - **queries.sync_due** 在 helper 层 join core.security 取 scode/exchange；worker 对
   从未同步过的公司只做 overlap 回看（历史回填仍是显式 `make sync WINDOW=N` 人工步骤）。
 - **文档级锁**取阻塞形态 `pg_advisory_xact_lock`，经 locks.maybe_lock_document 注入
@@ -260,6 +269,16 @@ tests/unit 只测 run_once 的调度/报告聚合（fake 队列结果）与 stab
   继续不引入 Celery、Redis、Airflow 等外部调度平台。
 
 完整取证、备选设计与回退条件见 `../design/worker-dynamic-scheduling.md`。
+
+## 6.7 公共故障持久停止（F5，2026-09-24 实施后修订）
+
+- 常驻 `worker loop` 拿不到单例锁时仍打印 `[skip] another worker holds the singleton lock`，但退出码改为
+  **75**：launchd 现为 `KeepAlive={SuccessfulExit=true}`，0 会被立即重启成忙等。`worker once` 保持 0。
+- 公共故障（staged V4 语义 failed_closed、未能对账的所有权/截止丢失、协调器 circuit、维护/启动恢复
+  致命错误）以 78 退出并持久记录；start gate 在任何 DB/MinerU 之前拒绝（生产根上受监督 label 已知
+  disabled 或读回未知时同样拒绝）。doctor 新增 `worker operational control`（记录/无效/不可信/读回未知
+  → FAIL；仅原生禁用 → WARN），不需要 DB。
+- 当前合同见 `../design/worker-operational-stop.md`；运维步骤见 production runbook §1.1f。
 
 ## 7. 明确不做
 

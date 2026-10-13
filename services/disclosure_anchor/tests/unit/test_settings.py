@@ -39,6 +39,56 @@ def _mineru_topology() -> dict[str, str]:
 
 
 class SettingsTests(unittest.TestCase):
+    def test_initial_history_default_and_explicit_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            for overrides, expected in (
+                ({}, 1827),
+                ({"DISCLOSURE_INITIAL_LOOKBACK_DAYS": "30"}, 30),
+                ({"DISCLOSURE_INITIAL_LOOKBACK_DAYS": "0"}, 0),
+            ):
+                with self.subTest(overrides=overrides), patch.dict(
+                    os.environ, {**base, **overrides}, clear=True
+                ):
+                    self.assertEqual(
+                        load_settings().disclosure_initial_lookback_days, expected
+                    )
+            with (
+                patch.dict(
+                    os.environ,
+                    {**base, "DISCLOSURE_INITIAL_LOOKBACK_DAYS": "-1"},
+                    clear=True,
+                ),
+                self.assertRaises(ValidationError),
+            ):
+                load_settings()
+
+    def test_cninfo_download_deadline_default_and_watchdog_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            for overrides, expected in (
+                ({}, 1800),
+                ({"CNINFO_DOWNLOAD_DEADLINE_SECONDS": "2639"}, 2639),
+                ({"WORKER_WEDGE_TIMEOUT_SECONDS": "1861"}, 1800),
+            ):
+                with self.subTest(overrides=overrides), patch.dict(
+                    os.environ, {**base, **overrides}, clear=True
+                ):
+                    self.assertEqual(
+                        load_settings().cninfo_download_deadline_seconds, expected
+                    )
+            for overrides in (
+                {"CNINFO_DOWNLOAD_DEADLINE_SECONDS": "0"},
+                {"CNINFO_DOWNLOAD_DEADLINE_SECONDS": "2640"},
+                {"WORKER_WEDGE_TIMEOUT_SECONDS": "1860"},
+            ):
+                with (
+                    self.subTest(invalid=overrides),
+                    patch.dict(os.environ, {**base, **overrides}, clear=True),
+                    self.assertRaises(ValidationError),
+                ):
+                    load_settings()
+
     def test_staged_bootstrap_is_lazy_and_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = _env(Path(tmp))
@@ -93,6 +143,23 @@ class SettingsTests(unittest.TestCase):
                 ),
                 self.assertRaises(ValidationError),
             ):
+                load_settings()
+
+    def test_drain_existing_is_startup_only_default_off_and_staged_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _env(Path(tmp))
+            for mode in ("legacy-sync", "staged-v4"):
+                with patch.dict(os.environ, {**base, "WORKER_PARSE_EXECUTION_MODE": mode}, clear=True):
+                    self.assertFalse(load_settings().worker_drain_existing)
+            with patch.dict(os.environ, {**base, "WORKER_PARSE_EXECUTION_MODE": "staged-v4",
+                                         "WORKER_DRAIN_EXISTING": "true"}, clear=True):
+                self.assertTrue(load_settings().worker_drain_existing)
+            with (patch.dict(os.environ, {**base, "WORKER_DRAIN_EXISTING": "true"}, clear=True),
+                  self.assertRaisesRegex(ValidationError, "requires staged-v4")):
+                load_settings()
+            with (patch.dict(os.environ, {**base, "WORKER_PARSE_EXECUTION_MODE": "staged-v4",
+                                         "WORKER_DRAIN_EXISTING": "sometimes"}, clear=True),
+                  self.assertRaises(ValidationError)):
                 load_settings()
 
     def test_parallel_parse_requires_remote_http_backend_and_server(self) -> None:
@@ -216,14 +283,29 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.cninfo_oversized_kb, 10240)
             self.assertEqual(settings.disclosure_semantic_model, "gpt-5.6-luna")
             self.assertEqual(settings.disclosure_semantic_reasoning_effort, "low")
-            self.assertEqual(
-                tuple(item.id for item in settings.semantic_provider_configs),
-                ("luna-primary", "sonnet-backup"),
-            )
-            self.assertEqual(
-                settings.semantic_provider_configs[1].canonical_model,
-                "claude-sonnet-5",
-            )
+            # Loading settings never needs the Codex catalog; only composing the
+            # provider chain does, and then it is a configuration failure.
+            with self.assertRaisesRegex(ValueError, "model_catalog_sha256"):
+                settings.semantic_provider_configs
+        catalog_sha256 = "sha256:" + "a" * 64
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {
+                    **_env(Path(tmp)),
+                    "DISCLOSURE_SEMANTIC_CODEX_MODEL_CATALOG_SHA256": catalog_sha256,
+                },
+                clear=True,
+            ),
+        ):
+            configs = load_settings().semantic_provider_configs
+        self.assertEqual(
+            tuple(item.id for item in configs), ("luna-primary", "sonnet-backup")
+        )
+        self.assertEqual(configs[0].model_catalog_sha256, catalog_sha256)
+        self.assertIsNone(configs[1].model_catalog_sha256)
+        self.assertEqual(configs[1].canonical_model, "claude-sonnet-5")
 
     def test_mineru_topology_rejects_ambiguous_or_exposed_urls(self) -> None:
         invalid_overrides = (
@@ -395,6 +477,7 @@ class SettingsTests(unittest.TestCase):
                         "profile": "low",
                         "timeout_seconds": 600,
                         "max_concurrency": 1,
+                        "model_catalog_sha256": "sha256:" + "b" * 64,
                     },
                 ]
             )
@@ -409,6 +492,10 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(
                 settings.semantic_provider_configs[0].executable,
                 Path("/opt/claude"),
+            )
+            self.assertEqual(
+                settings.semantic_provider_configs[1].model_catalog_sha256,
+                "sha256:" + "b" * 64,
             )
 
     def test_semantic_provider_chain_rejects_aliases_duplicates_and_mismatch(
@@ -432,6 +519,7 @@ class SettingsTests(unittest.TestCase):
                     "provider": "openai",
                     "executable": "codex",
                     "canonical_model": "gpt-5.6-luna",
+                    "model_catalog_sha256": "sha256:" + "c" * 64,
                 },
                 {
                     "id": "same-id",
@@ -448,6 +536,46 @@ class SettingsTests(unittest.TestCase):
                     "provider": "anthropic",
                     "executable": "codex",
                     "canonical_model": "gpt-5.6-luna",
+                    "model_catalog_sha256": "sha256:" + "c" * 64,
+                },
+            ],
+            # A Codex provider without its pinned catalog, with a malformed hash,
+            # or a Claude provider claiming one, is rejected at configuration time.
+            [
+                {
+                    "id": "luna-primary",
+                    "kind": "codex_cli",
+                    "provider": "openai",
+                    "executable": "codex",
+                    "canonical_model": "gpt-6-luna",
+                },
+            ],
+            *(
+                [
+                    {
+                        "id": "luna-primary",
+                        "kind": "codex_cli",
+                        "provider": "openai",
+                        "executable": "codex",
+                        "canonical_model": "gpt-6-luna",
+                        "model_catalog_sha256": malformed,
+                    },
+                ]
+                for malformed in (
+                    "sha256:" + "C" * 64,
+                    "c" * 64,
+                    "sha256:" + "c" * 63,
+                    "sha256:../../" + "c" * 58,
+                )
+            ),
+            [
+                {
+                    "id": "sonnet-primary",
+                    "kind": "claude_cli",
+                    "provider": "anthropic",
+                    "executable": "claude",
+                    "canonical_model": "claude-sonnet-5",
+                    "model_catalog_sha256": "sha256:" + "c" * 64,
                 },
             ],
         )

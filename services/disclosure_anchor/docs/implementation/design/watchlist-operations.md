@@ -160,3 +160,54 @@ CSV 降级为导入/种子 + git 快照格式。**
 = `make untrack`（删订阅行，公司/文档留档；下载队列谓词同轮从"paused 才拦"翻转为
 "active 行才放行"，否则删行会重新打开积压下载）。corpus/raw/source_access 不属于股票池
 运维删除语义；测试数据由隔离 scratch runner 持有和清理。
+
+## 8. 默认五年与已有订阅的历史扩展
+
+默认首次索引回补为 `DISCLOSURE_INITIAL_LOOKBACK_DAYS=1827`。五个日历年最多包含两天
+闰日，使用 `365 × 5 + 2` 天不会少于五年；个股非负 `lookback.days` 显式覆盖继续优先。
+例如 2026-10-08 首次同步从 2021-10-07 开始。源只有较短历史时保存源实际返回的索引或
+空结果，不构造上市前公告。
+
+已有 checkpoint 的订阅继续按 `window_end - CNINFO_OVERLAP_DAYS` 增量同步。普通 worker
+在一次前向同步成功后，对继承默认值的已有 active 公司最多再查询一个最早缺失的历史段，
+每段最多 90 天；首次同步和显式个股覆盖不追加该查询。历史查询仍受同一 stop、时间预算、
+provider 限流/配额/故障熔断及 §5.3 水位控制，水位满时只延后历史，前向同步继续。
+候选数包含两次查询，`synced_companies` 每公司只计一次；每个实际请求完成各 heartbeat 一次。
+历史不是独立 lane，只能跟随成功前向查询，因此历史查询更新 checkpoint 时间不会持续
+推迟前向同步。正常 hourly/daily/weekly 调度保持不变，已有历史逐步补齐，不声明当次启动
+便已获得完整五年。
+
+恢复进度复用成功索引 source_access，包含真实 empty 响应。按公司索引限制读取，日期段
+裁剪到目标窗口，数据库用 `range_agg(daterange(..., '[]'))` 合并后返回有限区间，不逐公司
+载入整张 source_access 表；仅 canonical hash、ok/empty 快照和实际日期范围可证明覆盖。
+`cursor.window_start` 只表示最近一次请求，不能证明整个历史已覆盖。重启重新读成功范围，
+失败和未知范围不当成已查询，不引入第二份进度 ledger。
+
+必要的显式运维加速仍使用现有 `SyncDisclosureIndex` 绝对日期范围，按下面步骤执行：
+
+1. 在授权的 runtime scope 下读取 active `tracked_company`，保留所有显式 lookback 覆盖。
+   汇总各公司的成功索引 `source_access`（`status=ok`，`cninfo:p_info3015` 或
+   `cninfo:hisAnnouncement`）的 `query_params.sdate/edate`，合并实际查询区间。
+   最早公告日期和最新 checkpoint 都不能替代查询覆盖证据。
+2. 对继承默认值且已有 checkpoint 的公司，计算 `[today - 1827, today]` 的未查询历史
+   区间；证据缺失时标为未知，再以明确有界的日期段同步。不要删除 checkpoint、修改
+   公司覆盖或重置下载/解析/发布结果。失败请求不计为覆盖。
+3. 用已有索引用例提交缺失日期段，每段成功后保存其 source_access ID 和实际请求范围。
+   中断后重新读取成功区间，只继续未完成部分。按公司/日期段有界执行，并在公司之间检查
+   §5.3 的待下载加待解析水位；水位已满时留待正常 worker 排水后继续。
+4. 历史查询不会回退 `window_end`；新增历史候选沿用现有来源身份去重和 worker 队列。
+   旧 raw、source_access、document、processing_run、发布结果与 lineage 都保留。
+
+现有 CLI 也支持精确范围（使用已配置的私有环境）：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.pipeline sync \
+  --company <tracked-security-code> --from <missing-start-YYYY-MM-DD> \
+  --to <missing-end-YYYY-MM-DD> --channel api
+```
+
+CLI 在写入历史索引后，还会下载该公司最近 overlap 内已有的合格待下载候选；历史范围
+外的近期下载不是索引回补完成证明。需要纯索引扩展时，在受控运维入口直接组合已有
+`SyncDisclosureIndex.execute(SyncDisclosureIndexCommand(...))`，或使用已启用且已授权的
+admin sync 接口，不为这次扩展单独启用 admin API。两条路径均需实际 provider/DB 授权；
+默认值代码变更及离线测试不能声称生产已完成历史补数。

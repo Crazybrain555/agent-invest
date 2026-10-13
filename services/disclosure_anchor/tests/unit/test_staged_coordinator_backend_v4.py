@@ -35,7 +35,15 @@ from disclosure_anchor.application.ports.remote_provider_v4 import (
     RemoteProviderWaitingV4,
     RemoteSubmissionAmbiguousV4,
 )
+from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
+    PublicationEnvelopeExceededError,
+)
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+)
 from disclosure_anchor.application.ports.staged_provider_parser import (
+    MaterializationCapacityWaitV4,
+    MaterializationHeavyWorkRequiredV4,
     MaterializedProviderDocumentV4,
 )
 from disclosure_anchor.application.services.staged_coordinator_backend_v4 import (
@@ -45,9 +53,13 @@ from disclosure_anchor.application.services.staged_coordinator_backend_v4 import
 )
 from disclosure_anchor.application.services.staged_parse_coordinator import (
     AdmissionOutcome,
+    CapacityHoldDetail,
     CoordinatorWork,
     RetryStage,
+    StageCapacityBlocked,
+    StageHeavyWorkRequired,
     StageLeaseGuard,
+    StageWaiting,
 )
 from tests.unit.test_remote_parse_evidence_v4 import (
     _exact_materialization_reservation_and_allowance,
@@ -251,6 +263,40 @@ def _backend(
         wall_clock=wall_clock,
     )
     return backend, persistence, inputs, materialization
+
+
+def _backend_with_publisher_error(error: Exception):  # type: ignore[no-untyped-def]
+    """A materialized attempt whose transaction-P publisher raises ``error``."""
+
+    authority = _authority("local_materialized")
+    (
+        _,
+        _,
+        values,
+        _,
+        manifest,
+        envelope,
+        _,
+        _,
+        _,
+    ) = _typed_happy_bundle()
+    materialization = mock.Mock()
+    materialization.reopen_materialized_v4.return_value = (
+        MaterializedProviderDocumentV4(
+            receipt=values[6],
+            intent=values[5],
+            provider_envelope=envelope,
+            manifest=manifest,
+        )
+    )
+    publication_committed = mock.Mock()
+    backend, persistence, _, _ = _backend(
+        authority,
+        materialization=materialization,
+        publication_committed=publication_committed,
+    )
+    backend._publisher.execute.side_effect = error
+    return authority, backend, persistence, publication_committed
 
 
 class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
@@ -604,35 +650,7 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
         publication_committed.assert_called_once_with(True)
 
     def _commit_with_publisher_error(self, error: Exception):  # type: ignore[no-untyped-def]
-        authority = _authority("local_materialized")
-        (
-            _,
-            _,
-            values,
-            _,
-            manifest,
-            envelope,
-            _,
-            _,
-            _,
-        ) = _typed_happy_bundle()
-        materialization = mock.Mock()
-        materialization.reopen_materialized_v4.return_value = (
-            MaterializedProviderDocumentV4(
-                receipt=values[6],
-                intent=values[5],
-                provider_envelope=envelope,
-                manifest=manifest,
-            )
-        )
-        publication_committed = mock.Mock()
-        backend, persistence, _, _ = _backend(
-            authority,
-            materialization=materialization,
-            publication_committed=publication_committed,
-        )
-        backend._publisher.execute.side_effect = error
-        return authority, backend, persistence, publication_committed
+        return _backend_with_publisher_error(error)
 
     def test_commit_semantic_locked_overflow_becomes_local_failure(self) -> None:
         overflow = SemanticRouteLockedCandidateOverflowError(
@@ -679,6 +697,54 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
         # Transaction P was never entered: no winner, no commit notification.
         publication_committed.assert_not_called()
         backend._publisher.execute.assert_called_once()
+
+    def test_commit_outside_the_publication_envelope_holds_with_nothing_written(self) -> None:
+        # A capacity fact found while encoding or measuring the private records:
+        # the attempt keeps its materialized output and holds; it is never
+        # failed or cleaned, and only the content-free fact travels with it,
+        # its bound unchanged, as the hold's typed detail.
+        policy = PUBLICATION_ENVELOPE_POLICY_V1
+        for record_kind, bound in (("request", "exact"), ("unit", "lower_bound"), ("winner", "upper_bound")):
+            with self.subTest(bound=bound):
+                capacity = policy.exceeded(record_kind, policy.limit(record_kind) + 1, bound=bound)
+                assert capacity is not None
+                (authority, backend, persistence, publication_committed) = (
+                    self._commit_with_publisher_error(PublicationEnvelopeExceededError(capacity))
+                )
+                with self.assertRaises(StageCapacityBlocked) as held:
+                    backend.commit(_work(authority), credit_allowance=ResourceCreditVector(), stage_guard=_guard())
+                self.assertIs(type(held.exception), StageCapacityBlocked)
+                self.assertEqual(held.exception.dimensions, ("publication_envelope",))
+                self.assertEqual(
+                    held.exception.detail,
+                    CapacityHoldDetail(
+                        record_kind=record_kind,
+                        byte_count=policy.limit(record_kind) + 1,
+                        limit=policy.limit(record_kind),
+                        bound=bound,
+                        policy_sha256=policy.identity,
+                    ),
+                )
+                self.assertEqual(persistence.appends, [])
+                publication_committed.assert_not_called()
+
+    def test_commit_waits_for_readiness_free_space_and_needs_the_heavy_permit(self) -> None:
+        (authority, backend, persistence, publication_committed) = self._commit_with_publisher_error(
+            MaterializationCapacityWaitV4("mac_free_floor")
+        )
+        with self.assertRaises(StageWaiting) as waiting:
+            backend.commit(_work(authority), credit_allowance=ResourceCreditVector(), stage_guard=_guard())
+        self.assertNotIsInstance(waiting.exception, StageCapacityBlocked)
+        self.assertEqual(persistence.appends, [])
+        backend._publisher.execute.reset_mock()
+        unpermitted = StageLeaseGuard(
+            deadline_monotonic=100.0, _revoked=Event(), _monotonic=lambda: 1.0, heavy_work_permitted=False,
+        )
+        with self.assertRaises(StageHeavyWorkRequired):
+            backend.commit(_work(authority), credit_allowance=ResourceCreditVector(), stage_guard=unpermitted)
+        backend._materialization.reopen_materialized_v4.assert_called_once()  # Only the first call reopened.
+        backend._publisher.execute.assert_not_called()
+        publication_committed.assert_not_called()
 
     def test_commit_generic_semantic_contract_error_still_raises(self) -> None:
         (
@@ -736,6 +802,14 @@ class DurableStagedCoordinatorBackendV4Tests(unittest.TestCase):
                 credit_allowance=output_grant,
                 stage_guard=_guard(),
             )
+        self.assertEqual(local_persistence.appends, [])
+        # A decode reached without the shared permit is a healthy wait.
+        local_materialization.materialize_v4.side_effect = MaterializationHeavyWorkRequiredV4()
+        with (
+            mock.patch.object(local_backend, "_capability", return_value=mock.sentinel.capability),
+            self.assertRaises(StageHeavyWorkRequired),
+        ):
+            local_backend.run_local(_work(materializing), credit_allowance=output_grant, stage_guard=_guard())
         self.assertEqual(local_persistence.appends, [])
 
         ack_pending = _authority("ack_pending")

@@ -19,13 +19,18 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from disclosure_anchor.adapters.runtime.mineru_capacity_file import read_mineru_capacity_file
 from disclosure_anchor.adapters.runtime.mineru_stream_pressure import PressureBinding
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig, AnyMineruCapacityConfig, MineruCapacityConfigV2
 from disclosure_anchor.application.contracts.mineru_process_pressure import ProcessPressureOwner
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
-from disclosure_anchor.application.services.mineru_stream_policy import StreamPolicyConfig
+from disclosure_anchor.application.services.mineru_stream_policy import (
+    STREAM_POLICY_ALGORITHM_V1,
+    STREAM_POLICY_ALGORITHM_V2,
+    StreamPolicyConfig,
+)
 
 
 STREAM_ACTIVATION_CONTRACT = "mineru.stream-activation.v1"
+STREAM_ACTIVATION_CONTRACT_V2 = "mineru.stream-activation.v2"
 _HASH_PATTERN = r"sha256:[a-f0-9]{64}"
 _Hash = Annotated[str, Field(min_length=71, max_length=71, pattern="^" + _HASH_PATTERN + "$")]
 _Bytes = Annotated[int, Field(gt=0, le=2**63 - 1)]
@@ -53,6 +58,13 @@ class _Policy(_Closed):
     reduction_interval_seconds: _Seconds
 
 
+class _PolicyV2(_Policy):
+    # v2 names the executable algorithm explicitly; the v1 schema predates it
+    # and always meant the superseded qualified-start algorithm. The name is
+    # activation identity only; the policy settings stay the same fields.
+    algorithm: Literal["mineru.stream-policy.v2"]
+
+
 class _Activation(_Closed):
     schema_version: Literal["mineru.stream-activation.v1"] = Field(alias="schema")
     runtime_identity_sha256: _Hash
@@ -66,6 +78,19 @@ class _Activation(_Closed):
     policy: _Policy
 
 
+class _ActivationV2(_Closed):
+    schema_version: Literal["mineru.stream-activation.v2"] = Field(alias="schema")
+    runtime_identity_sha256: _Hash
+    capacity_config_sha256: _Hash
+    owner: ProcessPressureOwner
+    cgroup_identity_sha256: _Hash
+    cgroup_max_bytes: _Bytes | None
+    gpu_uuid: _GPUUUID
+    api_max_age_seconds: _Seconds
+    gpu_max_age_seconds: _Seconds
+    policy: _PolicyV2
+
+
 @dataclass(frozen=True, slots=True)
 class LoadedMineruStreamActivation:
     """Validated configuration, with the hash of the exact securely read file."""
@@ -74,6 +99,10 @@ class LoadedMineruStreamActivation:
     policy: StreamPolicyConfig
     source_path: Path
     source_sha256: str
+    # The algorithm the activation names. The loader always sets it from the
+    # file schema: v1 files predate the field and name the superseded
+    # qualified-start algorithm; they stay decodable, never executable.
+    algorithm: str = STREAM_POLICY_ALGORITHM_V2
 
 
 def load_mineru_stream_activation(
@@ -81,7 +110,7 @@ def load_mineru_stream_activation(
     *,
     expected_sha256: str | None,
     expected_owner_uid: int,
-    expected_capacity: MineruCapacityConfig | None,
+    expected_capacity: AnyMineruCapacityConfig | None,
     expected_runtime_identity_sha256: str | None,
 ) -> LoadedMineruStreamActivation | None:
     """Load an explicit absolute-path/hash pair; an absent pair stays disabled.
@@ -99,12 +128,19 @@ def load_mineru_stream_activation(
     only checks that the declared maximum fits the selected startup capacity's
     nonterminal depth P (the remote-wait domain), not the parse slots N.
     File security, parsing and identity errors propagate, never disable silently.
+
+    ``mineru.stream-activation.v2`` adds ``policy.algorithm`` =
+    ``mineru.stream-policy.v2``. A v1 file still decodes (old releases stay
+    auditable) into a config naming ``mineru.stream-policy.v1``; the policy
+    refuses to execute that superseded algorithm.
     """
     if path is None and expected_sha256 is None:
         return None
     if path is None or expected_sha256 is None:
         raise ValueError("stream activation requires paired absolute path and SHA-256")
-    if type(expected_capacity) is not MineruCapacityConfig:
+    if expected_capacity is None or type(expected_capacity) not in (
+        MineruCapacityConfig, MineruCapacityConfigV2,
+    ):
         raise ValueError("stream activation requires explicit capacity authority")
     expected_capacity.__post_init__()
     if (
@@ -118,7 +154,11 @@ def load_mineru_stream_activation(
         expected_owner_uid=expected_owner_uid,
     )
     try:
-        document = _Activation.model_validate(strict_json_loads(payload))
+        decoded = strict_json_loads(payload)
+        v2 = isinstance(decoded, dict) and decoded.get("schema") == STREAM_ACTIVATION_CONTRACT_V2
+        document: _Activation | _ActivationV2 = (
+            _ActivationV2.model_validate(decoded) if v2 else _Activation.model_validate(decoded)
+        )
     except (ValueError, RecursionError) as error:
         raise ValueError("stream activation is not closed strict UTF-8 JSON") from error
     if document.capacity_config_sha256 != expected_capacity.sha256:
@@ -127,7 +167,11 @@ def load_mineru_stream_activation(
         raise ValueError("stream activation runtime differs from selected identity")
     # Future policy additions must explicitly enter this versioned schema, not
     # inherit an implementation default through dataclass construction.
-    if set(_Policy.model_fields) != {field.name for field in fields(StreamPolicyConfig)}:
+    policy_fields = {field.name for field in fields(StreamPolicyConfig)}
+    if (
+        set(_Policy.model_fields) != policy_fields
+        or set(_PolicyV2.model_fields) != policy_fields | {"algorithm"}
+    ):
         raise ValueError("stream activation schema does not cover the complete policy")
     binding = PressureBinding(
         runtime_identity_sha256=document.runtime_identity_sha256,
@@ -139,7 +183,11 @@ def load_mineru_stream_activation(
         api_max_age_seconds=document.api_max_age_seconds,
         gpu_max_age_seconds=document.gpu_max_age_seconds,
     )
-    policy = StreamPolicyConfig(**document.policy.model_dump())
+    settings = document.policy.model_dump()
+    algorithm = settings.pop("algorithm", STREAM_POLICY_ALGORITHM_V1)
+    if isinstance(document, _ActivationV2) != (algorithm == STREAM_POLICY_ALGORITHM_V2):
+        raise ValueError("stream activation schema and policy algorithm disagree")
+    policy = StreamPolicyConfig(**settings)
     if (policy.runtime_identity_sha256, policy.owner_identity_sha256) != (
         binding.runtime_identity_sha256, binding.owner_sha256,
     ):
@@ -156,11 +204,29 @@ def load_mineru_stream_activation(
     return LoadedMineruStreamActivation(
         binding=binding, policy=policy, source_path=path,
         source_sha256="sha256:" + hashlib.sha256(payload).hexdigest(),
+        algorithm=algorithm,
     )
+
+
+def require_executable_stream_activation(loaded: LoadedMineruStreamActivation) -> None:
+    """Refuse to run a policy under an activation that qualified another algorithm.
+
+    A v1 activation was qualified with the superseded qualified-start rule.
+    Running the v2 algorithm under its identity would let a changed algorithm
+    pose as the old qualification, so execution needs an explicit v2 file.
+    """
+
+    if type(loaded) is not LoadedMineruStreamActivation or loaded.algorithm != STREAM_POLICY_ALGORITHM_V2:
+        raise ValueError(
+            "stream activation names a superseded policy algorithm; "
+            "execution requires a mineru.stream-activation.v2 file naming mineru.stream-policy.v2"
+        )
 
 
 __all__ = [
     "STREAM_ACTIVATION_CONTRACT",
+    "STREAM_ACTIVATION_CONTRACT_V2",
     "LoadedMineruStreamActivation",
     "load_mineru_stream_activation",
+    "require_executable_stream_activation",
 ]

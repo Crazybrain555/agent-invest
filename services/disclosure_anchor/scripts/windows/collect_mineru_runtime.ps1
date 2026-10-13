@@ -799,10 +799,7 @@ $apiAllowedEnvironment = @(
 )
 $vllmAllowedEnvironment = @("MINERU_MODEL_SOURCE")
 if ($ExplicitCapacity) {
-    $apiAllowedEnvironment += @(
-        "MINERU_API_FINALIZER_SLOTS", "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
-        "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES"
-    )
+    $apiAllowedEnvironment += "MINERU_API_FINALIZER_SLOTS"
     $anchorExpected = @{
         MINERU_CAPACITY_CONFIG_PATH = "/usr/local/etc/mineru/capacity.json"
         MINERU_CAPACITY_CONFIG_SHA256 = $ExpectedCapacityConfigSha256
@@ -823,15 +820,6 @@ if ($null -ne $configObject.services."mineru-api".environment.PSObject.Propertie
     if (-not $ExplicitCapacity) { throw 'API device selection requires explicit capacity' }
     $apiAllowedEnvironment += 'MINERU_DEVICE_MODE'
 }
-$apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
-    -ImageValues $apiImageEnvironment `
-    -ResolvedValues $configObject.services."mineru-api".environment -AllowedNames $apiAllowedEnvironment
-$vllmEnvironment = Select-ExactEnvironment -ActualValues @($vllm.Config.Env) `
-    -ImageValues $baseImageEnvironment `
-    -ResolvedValues $configObject.services."mineru-openai-server".environment -AllowedNames $vllmAllowedEnvironment
-$emptyEnvironment = [pscustomobject]@{}
-$proxyEnvironment = Select-ExactEnvironment -ActualValues @($proxy.Config.Env) `
-    -ImageValues $baseImageEnvironment -ResolvedValues $emptyEnvironment -AllowedNames @()
 
 $compatProbeCode = @'
 import hashlib
@@ -898,26 +886,40 @@ else:
     serving_health = json.loads(health_bytes, object_pairs_hook=unique_object,
                                parse_constant=reject_constant)
 runtime = serving_health["task_protocol_runtime"]
-runtime_fields = {"schema", "enabled", "task_registry_max_records",
-                  "task_result_reservation_bytes", "max_unacked_result_bytes",
-                  "registry_schema", "admission_scope"}
-if capacity is not None:
-    runtime_fields.add("capacity_config_sha256")
+# A result-storage capacity (v2) has no per-task budgets: runtime v4 and
+# registry v4 name the bound storage policy instead.
+storage_policy = None if capacity is None else getattr(capacity, "result_storage", None)
+if storage_policy is not None:
+    runtime_fields = {"schema", "enabled", "task_registry_max_records", "registry_schema",
+                      "admission_scope", "capacity_config_sha256", "result_storage_policy_sha256"}
+    budget_fields = ("task_registry_max_records",)
+    runtime_schema, registry_schema = "mineru-task-runtime.v4", "mineru-task-registry.v4"
     if (runtime.get("capacity_config_sha256") != capacity.sha256
             or serving_health.get("capacity_observation", {}).get("capacity_config_sha256") != capacity.sha256
-            or runtime.get("task_result_reservation_bytes") != capacity.result_reservation_bytes
-            or runtime.get("max_unacked_result_bytes") != capacity.max_unacked_result_bytes):
+            or runtime.get("result_storage_policy_sha256") != storage_policy.sha256):
         raise RuntimeError("serving capacity config identity drifted")
+else:
+    runtime_fields = {"schema", "enabled", "task_registry_max_records",
+                      "task_result_reservation_bytes", "max_unacked_result_bytes",
+                      "registry_schema", "admission_scope"}
+    budget_fields = ("task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes")
+    runtime_schema = "mineru-task-runtime.v2" if capacity is None else "mineru-task-runtime.v3"
+    registry_schema = "mineru-task-registry.v3"
+    if capacity is not None:
+        runtime_fields.add("capacity_config_sha256")
+        if (runtime.get("capacity_config_sha256") != capacity.sha256
+                or serving_health.get("capacity_observation", {}).get("capacity_config_sha256") != capacity.sha256
+                or runtime.get("task_result_reservation_bytes") != capacity.result_reservation_bytes
+                or runtime.get("max_unacked_result_bytes") != capacity.max_unacked_result_bytes):
+            raise RuntimeError("serving capacity config identity drifted")
 if (
     serving_health.get("task_protocol_schema") != "mineru-task-protocol.v2"
     or set(runtime) != runtime_fields
-    or runtime["schema"] != ("mineru-task-runtime.v2" if capacity is None else "mineru-task-runtime.v3")
+    or runtime["schema"] != runtime_schema
     or runtime["enabled"] is not True
-    or runtime["registry_schema"] != "mineru-task-registry.v3"
+    or runtime["registry_schema"] != registry_schema
     or runtime["admission_scope"] != "post_form_owned_upload"
-    or any(type(runtime[name]) is not int or runtime[name] < 1 for name in (
-        "task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes"
-    ))
+    or any(type(runtime[name]) is not int or runtime[name] < 1 for name in budget_fields)
     or type(serving_health.get("max_pending_tasks_effective")) is not int
 ):
     raise RuntimeError("serving API task runtime evidence is invalid")
@@ -926,6 +928,7 @@ agent_task_protocol_v2.validate_mineru_task_admission(
     queued_tasks=serving_health["queued_tasks"],
     processing_tasks=serving_health["processing_tasks"],
     nonterminal_limit=serving_health["max_pending_tasks_effective"],
+    registry_schema=registry_schema,
 )
 marker = json.loads(
     Path("/opt/agent-invest/mineru-serial-v1/compatibility.json")
@@ -946,8 +949,8 @@ probe = {
     "pipeline_inference_locks_enabled": PIPELINE_INFERENCE_LOCKS_ENABLED,
     "task_protocol_v2_enabled": runtime["enabled"],
     "task_registry_max_records": runtime["task_registry_max_records"],
-    "task_result_reservation_bytes": runtime["task_result_reservation_bytes"],
-    "max_unacked_result_bytes": runtime["max_unacked_result_bytes"],
+    "task_result_reservation_bytes": runtime.get("task_result_reservation_bytes"),
+    "max_unacked_result_bytes": runtime.get("max_unacked_result_bytes"),
     "mineru_version": importlib.metadata.version("mineru"),
     "mineru_vl_utils_version": importlib.metadata.version("mineru-vl-utils"),
 }
@@ -986,6 +989,29 @@ if ([string]$compatProbe.mineru_version -ne "3.4.4") {
 if ([string]$compatProbe.mineru_vl_utils_version -ne "1.0.5") {
     throw "live mineru-vl-utils version drifted"
 }
+# The embedded probe bound the capacity file and serving runtime to the caller
+# anchor. Only a validated v3 runtime projects the legacy per-task budgets;
+# storage-managed v4 retires them from the exact compose environment.
+if ($ExplicitCapacity) {
+    $servingRuntimeSchema = [string]$compatProbe.serving_health.task_protocol_runtime.schema
+    if ($servingRuntimeSchema -ceq "mineru-task-runtime.v3") {
+        $apiAllowedEnvironment += @(
+            "MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES",
+            "MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES"
+        )
+    } elseif ($servingRuntimeSchema -cne "mineru-task-runtime.v4") {
+        throw "serving task runtime version is unsupported for compose environment"
+    }
+}
+$apiEnvironment = Select-ExactEnvironment -ActualValues @($api.Config.Env) `
+    -ImageValues $apiImageEnvironment `
+    -ResolvedValues $configObject.services."mineru-api".environment -AllowedNames $apiAllowedEnvironment
+$vllmEnvironment = Select-ExactEnvironment -ActualValues @($vllm.Config.Env) `
+    -ImageValues $baseImageEnvironment `
+    -ResolvedValues $configObject.services."mineru-openai-server".environment -AllowedNames $vllmAllowedEnvironment
+$emptyEnvironment = [pscustomobject]@{}
+$proxyEnvironment = Select-ExactEnvironment -ActualValues @($proxy.Config.Env) `
+    -ImageValues $baseImageEnvironment -ResolvedValues $emptyEnvironment -AllowedNames @()
 $compatLabelNames = @(
     "io.agent-invest.mineru.base-image-digest",
     "io.agent-invest.mineru.capacity-policy",
@@ -1036,6 +1062,86 @@ if ($vllmVersionOutput.Count -ne 1) {
 }
 $vllmVersion = ([string]$vllmVersionOutput[0]).Trim()
 if ($vllmVersion -ne "0.21.0") { throw "live vLLM package version drifted" }
+
+# A diagnostic is recognized only by its closed content-derived image projection.
+# This probe reads bytes and metadata; it never imports worker, torch or CUDA.
+$inferenceDiagnosticProof = $null
+if ([string]$vllm.Config.Image -cmatch '^agent-invest/mineru-inference:owner-memory-[a-f0-9]{64}$') {
+    if (-not $ExplicitCapacity -or [string]$baseImageInspect[0].Id -cne [string]$vllm.Image) { throw "diagnostic image/capacity identity drifted" }
+    $diagnosticProbe = @'
+import hashlib, importlib.metadata, json, os, stat
+from pathlib import Path
+root = Path(importlib.metadata.distribution("vllm").locate_file(""))
+def digest(relative):
+    path = root / relative
+    if path.is_symlink(): raise RuntimeError("source symlink refused")
+    with path.open("rb") as stream: raw = stream.read(8388609)
+    if not raw or len(raw) > 8388608: raise RuntimeError("source byte bound exceeded")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result: raise RuntimeError("duplicate owner identity field")
+        result[key] = value
+    return result
+fd = os.open("/tmp/mineru-owner-memory/owner.json", os.O_RDONLY | os.O_NOFOLLOW)
+with os.fdopen(fd, "rb") as stream:
+    info = os.fstat(stream.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise RuntimeError("owner identity file ownership/mode drifted")
+    raw = stream.read(16385)
+if not raw or len(raw) > 16384: raise RuntimeError("owner identity byte bound exceeded")
+owner = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+fields = {"contract_version", "worker_class", "module_sha256", "pid", "proc_start_ticks", "device", "instance_id"}
+if type(owner) is not dict or set(owner) != fields: raise RuntimeError("owner identity fields drifted")
+if (owner["contract_version"] != "mineru.owner-memory-identity.v1"
+        or owner["worker_class"] != "mineru_inference_memory.worker.OwnerMemoryWorker"
+        or owner["device"] != "cuda:0"
+        or type(owner["pid"]) is not int or owner["pid"] <= 0
+        or type(owner["proc_start_ticks"]) is not int or owner["proc_start_ticks"] <= 0
+        or type(owner["instance_id"]) is not str or not 1 <= len(owner["instance_id"]) <= 128):
+    raise RuntimeError("owner identity values drifted")
+def start_ticks(pid):
+    raw = Path("/proc") / str(pid) / "stat"
+    with raw.open("rb") as stream: value = stream.read(8193)
+    if len(value) > 8192: raise RuntimeError("process stat byte bound exceeded")
+    fields = value.decode("utf-8").rsplit(")", 1)[1].split()
+    if fields[0] in {"Z", "X"}: raise RuntimeError("owner process is not live")
+    return int(fields[19])
+observed_ticks = start_ticks(owner["pid"])
+init_ticks = start_ticks(1)
+if observed_ticks != owner["proc_start_ticks"] or observed_ticks < init_ticks:
+    raise RuntimeError("owner identity does not name the current live process")
+module_sha = digest("mineru_inference_memory/worker.py")
+if owner["module_sha256"] != module_sha: raise RuntimeError("loaded owner module differs from actual source")
+owner["observed_proc_start_ticks"] = observed_ticks
+owner["namespace_init_start_ticks"] = init_ticks
+diagnostic_paths = ("mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py")
+paths = ("vllm/v1/worker/worker_base.py", "vllm/v1/worker/gpu_worker.py", "vllm/v1/worker/gpu_model_runner.py", "vllm/v1/worker/gpu/mm/encoder_runner.py")
+print(json.dumps({"module_sha256": module_sha, "actual_source_sha256": {path: digest(path) for path in paths}, "actual_diagnostic_source_sha256": {path: digest(path) for path in diagnostic_paths}, "loaded_workers": [owner]}, sort_keys=True))
+'@
+    $sourceOutput = @(Invoke-Docker -Arguments @('exec',[string]$vllm.Id,'/usr/bin/python3.12','-I','-c',$diagnosticProbe))
+    if ($sourceOutput.Count -ne 1) { throw "diagnostic source observation is not singular" }
+    $sourceProof = ([string]$sourceOutput[0]) | ConvertFrom-Json
+    $imageLabels = [ordered]@{}
+    foreach ($name in @('io.agent-invest.mineru.owner-memory-module-sha256','io.agent-invest.mineru.owner-memory-dockerfile-sha256','io.agent-invest.mineru.owner-memory-base-repo-digest','io.agent-invest.mineru.owner-memory-context-sha256')) {
+        $value = [string]$baseImageInspect[0].Config.Labels.$name
+        if ([string]::IsNullOrEmpty($value)) { throw "diagnostic image label missing: $name" }
+        $imageLabels[$name] = $value
+    }
+    $epochNow = @(Invoke-Docker -Arguments @('inspect',[string]$vllm.Id) | ConvertFrom-Json)
+    if ($epochNow.Count -ne 1 -or [string]$epochNow[0].Id -cne [string]$vllm.Id -or
+            [string]$epochNow[0].State.StartedAt -cne [string]$vllm.State.StartedAt -or -not [bool]$epochNow[0].State.Running) {
+        throw "diagnostic container epoch changed during source/owner observation"
+    }
+    $inferenceDiagnosticProof = [ordered]@{
+        contract_version='mineru.owner-memory-observation.v1'; image_labels=$imageLabels
+        module_sha256=[string]$sourceProof.module_sha256; actual_source_sha256=$sourceProof.actual_source_sha256
+        actual_diagnostic_source_sha256=$sourceProof.actual_diagnostic_source_sha256
+        loaded_workers=@($sourceProof.loaded_workers)
+        container_epoch=[ordered]@{container_id=[string]$vllm.Id;started_at=[string]$vllm.State.StartedAt}
+    }
+}
 
 $egressResult = Invoke-DockerProcess -Arguments @(
     "exec", "mineru-api", "/usr/bin/python3.12", "-I", "-c",
@@ -1139,8 +1245,9 @@ $result = [ordered]@{
         pipeline_inference_locks_enabled = [bool]$compatProbe.pipeline_inference_locks_enabled
         task_protocol_v2_enabled = [bool]$compatProbe.task_protocol_v2_enabled
         task_registry_max_records = [int]$compatProbe.task_registry_max_records
-        task_result_reservation_bytes = [long]$compatProbe.task_result_reservation_bytes
-        max_unacked_result_bytes = [long]$compatProbe.max_unacked_result_bytes
+        # null under a result-storage capacity, whose budgets live in its policy
+        task_result_reservation_bytes = if ($null -eq $compatProbe.task_result_reservation_bytes) { $null } else { [long]$compatProbe.task_result_reservation_bytes }
+        max_unacked_result_bytes = if ($null -eq $compatProbe.max_unacked_result_bytes) { $null } else { [long]$compatProbe.max_unacked_result_bytes }
         image_labels = $compatLabels
     }
     proxy = [ordered]@{
@@ -1177,5 +1284,11 @@ if ($ExplicitCapacity) {
     $result.api_compatibility.Remove("capacity_runtime")
     $result.api_compatibility["capacity_sources_actual_sha256"] = $compatProbe.capacity_sources_actual_sha256
     $result.api_compatibility["capacity_config_file"] = $compatProbe.capacity_config_file
+}
+if ($null -ne $inferenceDiagnosticProof) {
+    $result.schema = "mineru-windows-runtime-observation.v7"
+    $result["inference_diagnostic"] = $inferenceDiagnosticProof
+    $result.inference["container_id"] = [string]$vllm.Id
+    $result.inference["started_at"] = [string]$vllm.State.StartedAt
 }
 $result | ConvertTo-Json -Depth 100 -Compress

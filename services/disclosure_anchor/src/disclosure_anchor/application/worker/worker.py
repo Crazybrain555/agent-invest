@@ -57,6 +57,9 @@ from disclosure_anchor.application.ports.provider_parser import (
 from disclosure_anchor.application.ports.semantic_routes import (
     SemanticRouteReceiptStorePort,
 )
+from disclosure_anchor.application.ports.processing_requests import (
+    ProcessingRequestUnitOfWork,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.use_cases.build_search_projection import (
     BuildSearchProjection,
@@ -84,11 +87,16 @@ from disclosure_anchor.application.services.provider_document_admission import (
     ProviderDocumentAdmission,
 )
 from disclosure_anchor.application.services.semantic_router import SemanticRouter
+from disclosure_anchor.application.use_cases.processing_requests import (
+    ProcessingRequestResolver,
+)
 from disclosure_anchor.application.use_cases.sync_disclosure_index import (
+    INDEX_INTERFACE,
     SyncDisclosureIndex,
     SyncDisclosureIndexCommand,
 )
 from disclosure_anchor.application.worker import queries
+from disclosure_anchor.application.worker.history import oldest_missing_sync_slice
 from disclosure_anchor.application.worker.locks import (  # noqa: F401  (re-export, 08 §2)
     DOC_NS,
     WORKER_NS,
@@ -151,6 +159,10 @@ PARSER_CONTROL_ERROR_CODES = frozenset(
 PROVIDER_INFRASTRUCTURE_ERROR_CODES = frozenset(
     {
         "transport_error",
+        # A logical PDF download that outlived its source-adapter deadline:
+        # the provider is currently too slow, so cool the source down like a
+        # transport failure instead of starting the next slow transfer.
+        "transfer_deadline_exceeded",
         "non_json_response",
         "invalid_response_shape",
         "incomplete_response",
@@ -216,8 +228,8 @@ class WorkerConfig:
     # Legacy name: archived byte-size threshold for the HUGE lane only.
     # Large documents remain eligible and may borrow the full idle pool.
     cninfo_oversized_kb: int
-    # First-sync historical backfill (three years plus a 185-day safety lead).
-    initial_lookback_days: int = 1280
+    # First-sync historical backfill (five years, including two leap days).
+    initial_lookback_days: int = 1827
     # Backpressure cap for pending-download + downloaded/pending-parse work;
     # 0 disables first-sync deferral.  The env key retains its legacy name.
     backfill_max_pending_downloads: int = 2000
@@ -292,9 +304,15 @@ class WorkerDeps:
     heartbeat: Callable[[], None] = lambda: None
     # Python threads cannot be killed safely. Production injects a
     # process-supervisor handoff that terminates registered MinerU groups and
-    # exits for launchd replacement when the entire parse future (including
-    # artifact read/map/store/DB finish) exceeds the extreme lease.
+    # exits 70 when the entire parse future (including artifact
+    # read/map/store/DB finish) exceeds the extreme lease; launchd keeps that
+    # nonzero exit down until an operator restarts the worker.
     on_parse_runaway: Callable[[str], None] = lambda _document_id: None
+    # Explicit processing requests (0066). None disables request discovery,
+    # e.g. for callers whose unit of work does not expose the request store.
+    processing_request_uow_factory: (
+        Callable[[], ProcessingRequestUnitOfWork] | None
+    ) = None
     # Resident production wiring re-validates the dedicated PostgreSQL
     # singleton session before every admission boundary and during long
     # waits. Losing that session must stop active MinerU groups before this
@@ -310,6 +328,8 @@ def _merge_acquisition_report(report: WorkerReport, acquisition: WorkerReport) -
 
     report.synced_companies += acquisition.synced_companies
     report.candidates_discovered += acquisition.candidates_discovered
+    report.request_discovery_claimed += acquisition.request_discovery_claimed
+    report.requests_resolved += acquisition.requests_resolved
     report.downloaded += acquisition.downloaded
     report.deferred_backfill += acquisition.deferred_backfill
     report.failed += acquisition.failed
@@ -392,7 +412,23 @@ def run_once(
             while True:
                 synced_before = acquisition.synced_companies
                 downloaded_before = acquisition.downloaded
+                resolved_before = acquisition.requests_resolved
                 try:
+                    if (
+                        limits.request_discovery > 0
+                        and not acquisition.sync_rate_limited
+                        and not acquisition.sync_quota_break
+                        and not acquisition.source_outage_break
+                        and not _has_local_infrastructure_failure(acquisition)
+                        and not should_stop()
+                    ):
+                        source = _request_discovery_stage(
+                            acquisition,
+                            deps,
+                            source,
+                            limit=limits.request_discovery,
+                            should_stop=should_stop,
+                        )
                     if (
                         limits.sync > 0
                         and not acquisition.sync_rate_limited
@@ -465,6 +501,7 @@ def run_once(
                 if (
                     acquisition.synced_companies == synced_before
                     and acquisition.downloaded == downloaded_before
+                    and acquisition.requests_resolved == resolved_before
                 ):
                     # No successful progress this pass: both queues are idle
                     # or every remaining item failed. Ending the round's
@@ -532,6 +569,73 @@ def run_once(
     return report
 
 
+def _request_discovery_stage(
+    report: WorkerReport,
+    deps: WorkerDeps,
+    source: DisclosureSourcePort | None,
+    *,
+    limit: int,
+    should_stop: Callable[[], bool],
+) -> DisclosureSourcePort | None:
+    """Resolve due explicit processing requests inside the acquisition pump.
+
+    Same lifecycle as sync/download: a provider refusal sets the round's
+    existing cooldown flags, a stop ends the pass, and each request outcome
+    heartbeats once. The provider client is created only when work is due.
+    """
+
+    factory = deps.processing_request_uow_factory
+    if factory is None:
+        return source
+    with factory() as uow:
+        if not uow.processing_requests.due_discovery_requests(
+            now=deps.clock(), limit=1
+        ):
+            return source
+    source = source or deps.source_factory()
+    result = ProcessingRequestResolver(
+        uow_factory=factory,
+        source=source,
+        profile_loader=deps.profile_loader_factory(source),
+        # The interface the worker's own index sync records for either channel.
+        index_interface=INDEX_INTERFACE,
+        classify_failure=_classify_discovery_failure,
+        clock=deps.clock,
+        should_stop=should_stop,
+        heartbeat=deps.heartbeat,
+    ).run(limit=limit)
+    report.request_discovery_claimed += result.claimed
+    report.requests_resolved += result.concluded
+    if result.failed:
+        report.failed += result.failed
+        report.failures.append(
+            WorkerFailure(
+                stage="request_discovery",
+                item_ref="processing_request",
+                error_code="discovery_attempt_failed",
+                retryable=None,
+            )
+        )
+    if result.provider_refusal == "rate_limited":
+        report.sync_rate_limited = True
+    elif result.provider_refusal == "quota_exhausted":
+        report.sync_quota_break = True
+    elif result.provider_refusal == "outage":
+        report.source_outage_break = True
+    return source
+
+
+def _classify_discovery_failure(exc: BaseException) -> str:
+    if _is_rate_limit_error(exc):
+        return "rate_limited"
+    if _is_quota_error(exc):
+        return "quota_exhausted"
+    error_code, retryable = _source_error_details(exc)
+    if _is_provider_infrastructure_error(error_code, retryable):
+        return "outage"
+    return "item"
+
+
 def _sync_stage(
     report: WorkerReport,
     deps: WorkerDeps,
@@ -572,6 +676,9 @@ def _sync_stage(
             attempted.add(str(row.get("company_id")))
         security_code = row.get("security_code")
         exchange = row.get("exchange")
+        # Maintenance liveness is a completed company, not a successful one:
+        # each handled outcome below (sync, recorded failure, deferral)
+        # heartbeats exactly once, while a request that never returns cannot.
         if not security_code or not exchange:
             _record_sync_failure_access(
                 deps,
@@ -586,6 +693,7 @@ def _sync_stage(
                     error_code="tracked_company_without_security",
                 )
             )
+            deps.heartbeat()
             continue
         never_synced = row.get("last_synced_at") is None and not row.get("window_end")
         if never_synced and deps.config.backfill_max_pending_downloads > 0:
@@ -604,6 +712,7 @@ def _sync_stage(
                     )
             if processing_backlog_now >= deps.config.backfill_max_pending_downloads:
                 report.deferred_backfill += 1
+                deps.heartbeat()
                 continue
         window_start = _sync_window_start(
             row.get("window_end"),
@@ -612,62 +721,116 @@ def _sync_stage(
             initial_lookback_days=deps.config.initial_lookback_days,
             lookback=row.get("lookback"),
         )
-        try:
-            result = use_case.execute(
-                SyncDisclosureIndexCommand(
-                    security_code=str(security_code),
-                    exchange=str(exchange),
-                    window_start=window_start,
-                    window_end=today,
+        for historical in (False, True):
+            window_end = today
+            if historical:
+                # History follows a successful forward sync only. Its timestamp
+                # cannot keep postponing incrementals because there is no
+                # standalone historical lane or separate cadence.
+                if never_synced or row.get("lookback") is not None:
+                    break
+                if should_stop():
+                    return source
+                if stage_deadline is not None and time.monotonic() >= stage_deadline:
+                    return source
+                history_start = today - timedelta(days=deps.config.initial_lookback_days)
+                history_end = min(today, date.fromisoformat(str(row["window_end"])))
+                if history_start > history_end:
+                    break
+                with deps.engine.connect() as conn:
+                    coverage = queries.successful_sync_ranges(
+                        conn,
+                        company_id=str(row["company_id"]),
+                        window_start=history_start,
+                        window_end=history_end,
+                    )
+                if coverage is None:
+                    # Membership/override may have changed since due selection.
+                    break
+                missing = oldest_missing_sync_slice(
+                    window_start=history_start,
+                    window_end=history_end,
+                    covered=coverage,
                 )
-            )
-        except Exception as exc:
-            error_code, retryable = _source_error_details(exc)
-            _record_sync_failure_access(
-                deps,
-                row,
-                error_code=error_code,
-                retryable=True if retryable is None else retryable,
-            )
-            report.failed += 1
-            report.failures.append(
-                WorkerFailure(
-                    stage="sync",
-                    item_ref=str(security_code),
+                if missing is None:
+                    break
+                if deps.config.backfill_max_pending_downloads > 0:
+                    if processing_backlog_now is None:
+                        with deps.engine.connect() as conn:
+                            processing_backlog_now = queries.pending_processing_backlog_count(
+                                conn,
+                                max_retries=deps.config.cninfo_max_retries,
+                                scope_classes=deps.config.process_scope_classes,
+                            )
+                    if processing_backlog_now >= deps.config.backfill_max_pending_downloads:
+                        report.deferred_backfill += 1
+                        break
+                # Recheck after database reads before another provider request.
+                if should_stop():
+                    return source
+                if stage_deadline is not None and time.monotonic() >= stage_deadline:
+                    return source
+                window_start, window_end = missing
+            try:
+                result = use_case.execute(
+                    SyncDisclosureIndexCommand(
+                        security_code=str(security_code),
+                        exchange=str(exchange),
+                        window_start=window_start,
+                        window_end=window_end,
+                    )
+                )
+            except Exception as exc:
+                error_code, retryable = _source_error_details(exc)
+                _record_sync_failure_access(
+                    deps,
+                    row,
                     error_code=error_code,
-                    retryable=retryable,
+                    retryable=True if retryable is None else retryable,
                 )
-            )
-            if _is_rate_limit_error(exc):
-                # Short-window provider verdict: yield the stage now and let
-                # the controller apply a brief cooldown while local download/
-                # parse work continues.
-                report.sync_rate_limited = True
-                return source
-            if _is_quota_error(exc):
-                # Round-level breaker (edgartools guidance: stop, do not keep
-                # burning quota); remaining companies stay due for next round.
-                report.sync_quota_break = True
-                return source
-            if error_code == "DB_POOL_EXHAUSTED":
-                # Local DB capacity is not CNINFO downtime. Stop acquisition
-                # and let the controller use its local-failure backoff.
-                return source
-            if _is_provider_infrastructure_error(error_code, retryable):
-                # A retryable provider outage is batch-wide, not 13/50
-                # independent item failures. Stop touching CNINFO now; the
-                # resident controller cools source while local parse drains.
-                report.source_outage_break = True
-                return source
-            continue
-        report.synced_companies += 1
-        report.candidates_discovered += result.candidate_count
-        deps.heartbeat()
-        if never_synced and processing_backlog_now is not None:
-            # Conservative in-round cache: candidate_count can include rows
-            # already known from overlap, so it may overestimate but cannot
-            # admit below the real watermark. The next round re-counts truth.
-            processing_backlog_now += result.candidate_count
+                report.failed += 1
+                report.failures.append(
+                    WorkerFailure(
+                        stage="sync",
+                        item_ref=str(security_code),
+                        error_code=error_code,
+                        retryable=retryable,
+                    )
+                )
+                # Recorded before any early exit below, so the company that trips
+                # a rate-limit/quota/outage break is still a completed item.
+                deps.heartbeat()
+                if _is_rate_limit_error(exc):
+                    # Short-window provider verdict: yield the stage now and let
+                    # the controller apply a brief cooldown while local download/
+                    # parse work continues.
+                    report.sync_rate_limited = True
+                    return source
+                if _is_quota_error(exc):
+                    # Round-level breaker (edgartools guidance: stop, do not keep
+                    # burning quota); remaining companies stay due for next round.
+                    report.sync_quota_break = True
+                    return source
+                if error_code == "DB_POOL_EXHAUSTED":
+                    # Local DB capacity is not CNINFO downtime. Stop acquisition
+                    # and let the controller use its local-failure backoff.
+                    return source
+                if _is_provider_infrastructure_error(error_code, retryable):
+                    # A retryable provider outage is batch-wide, not 13/50
+                    # independent item failures. Stop touching CNINFO now; the
+                    # resident controller cools source while local parse drains.
+                    report.source_outage_break = True
+                    return source
+                break
+            if not historical:
+                report.synced_companies += 1
+            report.candidates_discovered += result.candidate_count
+            deps.heartbeat()
+            if processing_backlog_now is not None:
+                # Conservative in-round cache: candidate_count can include rows
+                # already known from overlap, so it may overestimate but cannot
+                # admit below the real watermark. The next round re-counts truth.
+                processing_backlog_now += result.candidate_count
     return source
 
 
@@ -779,13 +942,13 @@ def _sync_window_start(
     *,
     today: date,
     overlap_days: int,
-    initial_lookback_days: int = 1280,
+    initial_lookback_days: int = 1827,
     lookback: object = None,
 ) -> date:
     if isinstance(window_end, str) and window_end:
         return date.fromisoformat(window_end) - timedelta(days=overlap_days)
-    # Never synced: default historical backfill (user decision 2026-07-06,
-    # 三年半留提前量), with an optional per-company override {"days": N}.
+    # Never synced: five-year historical backfill, with an optional
+    # per-company override {"days": N}. Existing cursors remain incremental.
     days = initial_lookback_days
     if isinstance(lookback, dict):
         override = lookback.get("days")
@@ -823,6 +986,10 @@ def _download_stage(
             return source
         item_ref = str(row["provider_document_id"])
         candidate = row.get("candidate")
+        # As in sync, every candidate that reaches an outcome heartbeats once:
+        # a registered document, a typed failure DownloadDocument already
+        # recorded, or a handled exception. A download that never returns
+        # does not; its bound is the source adapter's download deadline.
         if not isinstance(candidate, dict):
             report.failed += 1
             report.failures.append(
@@ -830,9 +997,23 @@ def _download_stage(
                     stage="download", item_ref=item_ref, error_code="candidate_shape"
                 )
             )
+            deps.heartbeat()
             continue
+        index_source_access_id = row.get("source_access_id")
         try:
-            result = downloader.execute(DownloadDocumentCommand(candidate=candidate))
+            result = downloader.execute(
+                DownloadDocumentCommand(
+                    candidate=candidate,
+                    # The index access that carried this candidate; a
+                    # historical-code registration cannot be proven without it.
+                    index_source_access_id=(
+                        index_source_access_id
+                        if isinstance(index_source_access_id, str)
+                        and index_source_access_id
+                        else None
+                    ),
+                )
+            )
         except Exception as exc:
             error_code, retryable = _source_error_details(exc)
             report.failed += 1
@@ -845,15 +1026,16 @@ def _download_stage(
                     message=str(exc)[:500],
                 )
             )
+            deps.heartbeat()
             if error_code == "DB_POOL_EXHAUSTED":
                 return source
             if _is_provider_infrastructure_error(error_code, retryable):
                 report.source_outage_break = True
                 return source
             continue
+        deps.heartbeat()
         if result.document_id is not None:
             report.downloaded += 1
-            deps.heartbeat()
         else:
             report.failed += 1
             report.failures.append(

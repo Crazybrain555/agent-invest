@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import csv
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta
@@ -34,6 +34,10 @@ from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentChecker,
     MinerUDeploymentGateError,
 )
+from disclosure_anchor.adapters.runtime.worker_stop_control import (
+    EXIT_PUBLIC_STOP,
+    require_worker_start_permitted,
+)
 from disclosure_anchor.adapters.semantics.runtime import build_semantic_runtime
 from disclosure_anchor.adapters.sources.cninfo import CninfoClient, CninfoSource
 from disclosure_anchor.adapters.sources.cninfo.mapper import load_class_map
@@ -54,6 +58,7 @@ from disclosure_anchor.adapters.watchlist_config import (
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.ports.worker_stop_control import WorkerOperationalStopError
 from disclosure_anchor.application.services.subject_resolver import (
     PENDING_LEGAL_NAME_PREFIX,
 )
@@ -400,16 +405,20 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write(csv_text)
                 return 0
         elif args.command == "rebuild-units":
+            # Compose the semantic stages first: a worker public stop refuses
+            # before the rebuild run is created.
+            rebuild_builder = deps.build_units()
+            rebuild_publisher = deps.publish()
             rebuild_result = deps.rebuild_units().execute(
                 RebuildUnitsCommand(document_id=args.document_id)
             )
-            build_result = deps.build_units().execute(
+            build_result = rebuild_builder.execute(
                 BuildUnitsCommand(processing_run_id=rebuild_result.processing_run_id)
             )
             if not _stage_succeeded("build-units", build_result):
                 _print_failed_stage("build-units", build_result)
                 return 1
-            publish_result = deps.publish().execute(
+            publish_result = rebuild_publisher.execute(
                 PublishRunCommand(
                     processing_run_id=rebuild_result.processing_run_id,
                     allow_empty=args.allow_empty,
@@ -432,6 +441,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "process":
             assert mineru_checker is not None
+            # Compose the semantic stages first: a worker public stop refuses
+            # before any parse side effect.
+            process_builder = deps.build_units()
+            process_publisher = deps.publish()
             mineru_checker.assert_admission()
             with exclusive_worker_admission(deps.engine):
                 parse_result = deps.parse().execute(
@@ -443,13 +456,13 @@ def main(argv: list[str] | None = None) -> int:
             if not _stage_succeeded("parse", parse_result):
                 _print_failed_stage("parse", parse_result)
                 return 1
-            build_result = deps.build_units().execute(
+            build_result = process_builder.execute(
                 BuildUnitsCommand(processing_run_id=parse_result.processing_run_id)
             )
             if not _stage_succeeded("build-units", build_result):
                 _print_failed_stage("build-units", build_result)
                 return 1
-            publish_result = deps.publish().execute(
+            publish_result = process_publisher.execute(
                 PublishRunCommand(
                     processing_run_id=parse_result.processing_run_id,
                     allow_empty=args.allow_empty,
@@ -476,6 +489,10 @@ def main(argv: list[str] | None = None) -> int:
     except CompanyNotTrackedError as exc:
         print(f"[FAIL] sync: {exc}", file=sys.stderr)
         return 2
+    except WorkerOperationalStopError as exc:
+        # No generic override: release the stop first (production runbook).
+        print(f"[FAIL] pipeline: {exc}", file=sys.stderr)
+        return EXIT_PUBLIC_STOP
     except (
         ConfigurationError,
         MinerUDeploymentGateError,
@@ -509,7 +526,7 @@ class _Deps:
 
     def register(self) -> RegisterLocalPdf:
         return RegisterLocalPdf(
-            raw_store=RawDocumentStore(self.paths),
+            raw_store=RawDocumentStore.from_settings(self.paths, self.settings),
             uow_factory=self.uow_factory,
         )
 
@@ -553,6 +570,9 @@ class _Deps:
         )
 
     def build_units(self) -> BuildUnits:
+        # Semantic business composition honors the worker start gate (stop
+        # record, trusted root, supervised label state).
+        require_worker_start_permitted(self.settings)
         semantic = build_semantic_runtime(
             settings=self.settings,
             paths=self.paths,
@@ -571,6 +591,7 @@ class _Deps:
         )
 
     def publish(self) -> PublishRun:
+        require_worker_start_permitted(self.settings)
         semantic = build_semantic_runtime(
             settings=self.settings,
             paths=self.paths,
@@ -722,6 +743,9 @@ class _Deps:
             source: CninfoSource | CninfoWebSource = CninfoWebSource(
                 max_qps=self.settings.cninfo_max_qps,
                 max_retries=self.settings.cninfo_max_retries,
+                download_deadline_seconds=(
+                    self.settings.cninfo_download_deadline_seconds
+                ),
             )
             index_interface = WEB_INDEX_INTERFACE
         else:
@@ -744,7 +768,7 @@ class _Deps:
             )
             downloader = DownloadDocument(
                 source=source,
-                raw_store=RawDocumentStore(self.paths),
+                raw_store=RawDocumentStore.from_settings(self.paths, self.settings),
                 path_builder=self.paths,
                 uow_factory=self.uow_factory,
             )
@@ -770,7 +794,12 @@ class _Deps:
                     - timedelta(days=self.settings.cninfo_overlap_days),
                 )
             downloads = [
-                downloader.execute(DownloadDocumentCommand(candidate=row["candidate"]))
+                downloader.execute(
+                    DownloadDocumentCommand(
+                        candidate=row["candidate"],
+                        index_source_access_id=_index_source_access_id(row),
+                    )
+                )
                 for row in pending_rows
                 if isinstance(row.get("candidate"), dict)
             ]
@@ -790,6 +819,13 @@ class _Deps:
 
 def _database_url(settings: Settings) -> str:
     return app_database_url(settings)
+
+
+def _index_source_access_id(row: Mapping[str, Any]) -> str | None:
+    """The index access that carried a pending candidate, when the row has one."""
+
+    value = row.get("source_access_id")
+    return value if isinstance(value, str) and value else None
 
 
 def datetime_today_shanghai() -> date:

@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack, redirect_stderr
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import UTC, datetime
 import hashlib
 import io
@@ -33,10 +34,20 @@ from tests._mineru_capacity_consumers_fixture import (
     overlap_health,
     runtime_wrapper,
 )
+from tests.unit.test_mineru_materialize_grant_v5 import synthetic_storage_policy
 
 
 class BoundaryReached(Exception):
     """An expected test-only control boundary; never an actual runtime failure."""
+
+
+class IdleAcceptingHealth:
+    """Only the pre-diagnostic facts the smoke reads; health parsing is tested above."""
+
+    active_tasks = 0
+
+    def require_accepting(self):
+        return None
 
 
 def write_json(path, value):
@@ -333,6 +344,62 @@ class CapacityCliConsumerTests(unittest.TestCase):
         self.assertEqual(len(health_calls), 2)
         self.assertFalse((self.root / "smoke.json").exists())
         self.assertFalse((self.root / "canary.json").exists())
+
+    def test_smoke_reads_a_storage_runtime_only_under_its_own_capacity_policy(self):
+        policy = synthetic_storage_policy()
+        legacy = config_payload()
+        storage = {
+            key: value for key, value in legacy.items()
+            if key not in {"result_reservation_bytes", "max_unacked_result_bytes"}
+        }
+        storage.update(contract_version="mineru.capacity-config.v2", result_storage=asdict(policy))
+        for label, payload, expected in (("legacy", legacy, None), ("storage", storage, policy)):
+            with self.subTest(label), ExitStack() as stack:
+                capacity = self.root / f"capacity-{label}.json"
+                write_json(capacity, payload)
+                wrapper = runtime_wrapper()
+                orchestrator = wrapper["manifest"]["orchestrator"]
+                orchestrator.update(capacity_config=payload, capacity_config_sha256=digest(payload))
+                if expected is not None:
+                    orchestrator.update(task_result_reservation_bytes=None, max_unacked_result_bytes=None)
+                wrapper["identity_sha256"] = digest(wrapper["manifest"])
+                manifest = self.root / f"runtime-{label}.json"
+                write_json(manifest, wrapper)
+                args = list(self.smoke_args)
+                for old, new in (
+                    (str(self.manifest), str(manifest)),
+                    (self.wrapper["identity_sha256"], wrapper["identity_sha256"]),
+                    (str(self.root / "smoke.json"), str(self.root / f"smoke-{label}.json")),
+                    (str(self.root / "canary.json"), str(self.root / f"canary-{label}.json")),
+                ):
+                    args[args.index(old)] = new
+                args += ["--capacity-config", str(capacity), "--capacity-config-sha256", digest(payload)]
+                handed = {}
+
+                def diagnostic(**kwargs):
+                    handed.update(kwargs)
+                    raise BoundaryReached
+
+                snapshot = stack.enter_context(tempfile.TemporaryDirectory(dir=self.root))
+                cleanup_handle = tempfile.TemporaryDirectory(dir=snapshot)
+                stack.callback(cleanup_handle.cleanup)
+                for name, value in (
+                    ("process_snapshot", {}),
+                    ("mineru_api_temp_dirs", set()),
+                    ("client_bundle_identity", self.client),
+                    ("writer_code_digest", WRITER_SHA),
+                    ("run_mineru_multimodal_canary", object()),
+                    ("fetch_mineru_orchestrator_health", IdleAcceptingHealth()),
+                    ("_snapshot_pdf", (cleanup_handle, self.input_path, self.input_sha,
+                                       self.input_path.stat().st_size, 2)),
+                ):
+                    stack.enter_context(patch.object(smoke, name, return_value=value))
+                stack.enter_context(patch.object(smoke, "run_diagnostic_pdf", side_effect=diagnostic))
+                stack.enter_context(patch.dict(os.environ, {"MINERU_PROCESSING_WINDOW_SIZE": "16"}))
+                with self.assertRaises(BoundaryReached):
+                    smoke.main(args)
+                self.assertEqual(handed["result_storage_policy"], expected)
+                self.assertFalse((self.root / f"smoke-{label}.json").exists())
 
     def test_smoke_missing_pair_fails_before_snapshot_and_legacy_helper_keeps_family_boundary(
         self,

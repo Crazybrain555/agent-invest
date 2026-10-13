@@ -17,8 +17,8 @@ SEMANTIC_ROUTE_RECEIPTS_FILENAME = "semantic_route_receipts.v2.jsonl"
 SEMANTIC_ROUTE_RECEIPTS_V3_FILENAME = "semantic_route_receipts.v3.jsonl"
 SEMANTIC_FAILOVER_POLICY_VERSION = "availability_only.v1"
 SEMANTIC_OUTPUT_SCHEMA_VERSION = "semantic_route_output.v1"
-SEMANTIC_ROUTER_VERSION = "semantic_router.v104"
-SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v33"
+SEMANTIC_ROUTER_VERSION = "semantic_router.v105"
+SEMANTIC_PROMPT_VERSION = "semantic_route_adjudication.v34"
 SEMANTIC_FALLBACK_KEY = "document_content"
 MAX_SEMANTIC_ROUTES = 8
 MAX_SEMANTIC_CANDIDATES = 8
@@ -89,6 +89,14 @@ class SemanticRouteContractError(ValueError):
 class SemanticRouteLockedCandidateOverflowError(SemanticRouteContractError):
     """One Unit has more locked semantic routes than the closed route envelope;
     a deterministic, attempt-local refusal."""
+
+
+class SemanticDecisionCoverageError(SemanticRouteContractError):
+    """A group's decisions do not name exactly the requested Units, once each.
+
+    This breaks the provider result contract (``invalid_contract``); every other
+    routing-validation rejection is an unroutable decision (``invalid_decision``).
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -1334,6 +1342,7 @@ __all__ = [
     "SemanticAdjudicationReceipt",
     "SemanticAdjudicationTerminalV1",
     "SemanticAdjudicatorMetadata",
+    "SemanticDecisionCoverageError",
     "SemanticDocumentContext",
     "SemanticRouteCandidate",
     "SemanticRouteContractError",

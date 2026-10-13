@@ -77,6 +77,13 @@ Thumbs.db
 # ============================================================
 # 数据目录（重要！防止大量数据文件进入 Git）
 data/
+# Byte-exact upstream writer fixtures are source, not runtime datasets.
+!tests/fixtures/mineru_344_preimages/mineru/data/
+tests/fixtures/mineru_344_preimages/mineru/data/*
+!tests/fixtures/mineru_344_preimages/mineru/data/data_reader_writer/
+tests/fixtures/mineru_344_preimages/mineru/data/data_reader_writer/*
+!tests/fixtures/mineru_344_preimages/mineru/data/data_reader_writer/base.py
+!tests/fixtures/mineru_344_preimages/mineru/data/data_reader_writer/filebase.py
 .data/
 signal_data/
 forbid_data/

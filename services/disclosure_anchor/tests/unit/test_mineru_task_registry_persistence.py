@@ -597,11 +597,13 @@ class DurableViewTests(_RegistryCase):
         drive(lab, registry, "pending_unbound", key=OTHER_KEY, task_id=OTHER_TASK)
         committed = registry.durable_view()
         durable = json.loads(lab.disk_bytes())
-        # Older v3 bytes omit the optional cause that defaults to None in memory.
+        # Older v3 bytes omit the optional cause and storage record that
+        # default to None in memory.
         durable_records = []
         for record in durable["records"]:
             expected = dict(record)
             expected.setdefault("failure_cause", None)
+            expected.setdefault("storage", None)
             durable_records.append(expected)
         self.assertEqual(
             [asdict(record) for record in committed.records], durable_records

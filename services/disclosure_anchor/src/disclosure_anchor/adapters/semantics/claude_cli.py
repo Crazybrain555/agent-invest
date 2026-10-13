@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import logging
 import math
 from pathlib import Path
 import re
 import subprocess
 import threading
+from typing import Any
 
 from disclosure_anchor.adapters.semantics import codex_cli
 from disclosure_anchor.application.contracts.semantic_routes import (
@@ -47,6 +49,49 @@ _CLAUDE_CAPACITY_DIAGNOSTICS = (
         re.IGNORECASE,
     ),
     re.compile(r"overloaded_error[.!]?", re.IGNORECASE),
+)
+# Claude Code 2.1.280 `result` sentences for a request that never got an HTTP
+# response, as its API-error mapper writes them after the CLI's own retries
+# (embedded Anthropic SDK 0.112.1 APIConnectionError "Connection error.",
+# APIConnectionTimeoutError, or a socket error code on the cause chain). Each
+# sentence keeps the CLI's closed code list. Certificate/TLS forms, the proxy
+# tunnel refusal, an unlisted code and the first-byte "No response" form are
+# deliberately absent: they stay unrecognized and fail closed.
+_CLAUDE_DROPPED_CODES = "ECONNRESET|EPIPE|ECONNABORTED|ConnectionClosed|ERR_SOCKET_CLOSED|UND_ERR_SOCKET"
+_CLAUDE_REFUSED_CODES = "ECONNREFUSED|ConnectionRefused"
+_CLAUDE_UNREACHABLE_CODES = "ENOTFOUND|EAI_AGAIN|FailedToOpenSocket"
+_CLAUDE_NO_ROUTE_CODES = "ENETUNREACH|ENETDOWN|EHOSTUNREACH|EHOSTDOWN"
+# The CLI's lost-connection sentence takes every socket code above plus these
+# two; its proxy-tunnel code is left out with the proxy sentence.
+_CLAUDE_LOST_CODES = "|".join((
+    _CLAUDE_DROPPED_CODES, "ETIMEDOUT|StreamSuspended", _CLAUDE_REFUSED_CODES,
+    _CLAUDE_UNREACHABLE_CODES, _CLAUDE_NO_ROUTE_CODES,
+))
+_CLAUDE_TRANSPORT_DIAGNOSTICS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"Request timed out",
+        r"API Error: Request timed out\. Check your internet connection and proxy settings",
+        r"API Error: Unable to connect to API\. Check your internet connection",
+        rf"API Error: Connection dropped \((?:{_CLAUDE_DROPPED_CODES})\)",
+        (
+            r"API Error: Connection refused — a firewall or proxy may be blocking it"
+            rf" \((?:{_CLAUDE_REFUSED_CODES})\)"
+        ),
+        (
+            r"API Error: Can't reach the API server — check your internet or DNS"
+            rf" \((?:{_CLAUDE_UNREACHABLE_CODES})\)"
+        ),
+        (
+            r"API Error: No internet route — check your connection or VPN"
+            rf" \((?:{_CLAUDE_NO_ROUTE_CODES})\)"
+        ),
+        r"API Error: Connection lost while your computer was asleep",
+        (
+            rf"API Error: Connection to the API was lost \((?:{_CLAUDE_LOST_CODES})\)\."
+            r" This is usually temporary — try again\."
+        ),
+    )
 )
 _ERROR_ENVELOPE_CORE_FIELDS = frozenset(
     {"is_error", "permission_denials", "api_error_status", "result"}
@@ -121,6 +166,7 @@ _MODEL_USAGE_FIELDS = frozenset(
 _ERROR_ENVELOPE_CANONICAL_MODELS = frozenset(
     {"claude-haiku-4-5", "claude-sonnet-5"}
 )
+_LOGGER = logging.getLogger(__name__)
 
 
 class ClaudeCliSemanticAdjudicator:
@@ -264,7 +310,15 @@ class ClaudeCliSemanticAdjudicator:
             ) from exc
         if completed.returncode != 0:
             raise _command_error(completed)
-        structured = _structured_output(completed.stdout)
+        try:
+            structured = _structured_output(completed.stdout)
+        except SemanticRouteAdjudicatorError as exc:
+            if exc.reason_code == "runtime_event_error":
+                # An exit-0 error envelope fails closed like a nonzero exit. It
+                # never passed the closed error-envelope validation, so the
+                # record trusts none of its fields.
+                _log_command_failure(completed, exc)
+            raise
         canonical = json.dumps(
             structured,
             ensure_ascii=False,
@@ -391,25 +445,51 @@ def _output_schema_contract_hash() -> str:
 def _command_error(
     completed: subprocess.CompletedProcess[str],
 ) -> SemanticRouteAdjudicatorError:
+    envelope: dict[str, Any] | None = None
     if completed.stdout.strip():
         try:
-            reason = _structured_command_reason(completed.stdout, completed.stderr)
+            envelope = _error_envelope(completed.stdout)
         except SemanticRouteAdjudicatorError as exc:
+            _log_command_failure(completed, exc)
             return exc
+        reason = _structured_command_reason(envelope, completed.stderr)
     else:
         diagnostics = (completed.stderr,) if completed.stderr.strip() else ()
         if any("not a valid json schema" in item.casefold() for item in diagnostics):
             reason = "invalid_output_schema"
         else:
             reason = _known_availability_reason(diagnostics) or "command_failed"
-    return SemanticRouteAdjudicatorError(
+    error = SemanticRouteAdjudicatorError(
         f"Claude semantic adjudicator failed with exit {completed.returncode}",
         reason_code=reason,
-        retryable=reason in {"not_authenticated", "capacity_unavailable"},
+        retryable=reason in {"not_authenticated", "capacity_unavailable", "transport_unavailable"},
+    )
+    _log_command_failure(completed, error, envelope)
+    return error
+
+
+def _log_command_failure(
+    completed: subprocess.CompletedProcess[str],
+    error: SemanticRouteAdjudicatorError,
+    envelope: dict[str, Any] | None = None,
+) -> None:
+    # Only an envelope that passed the closed validation contributes its typed
+    # status and whether it carried a terminal message; no text is copied.
+    status = None if envelope is None else envelope.get("api_error_status")
+    result = None if envelope is None else envelope.get("result")
+    codex_cli._log_provider_failure(
+        _LOGGER,
+        provider="claude_cli",
+        completed=completed,
+        error=error,
+        terminal_http_statuses=(
+            [status] if type(status) is int and 100 <= status <= 599 else []
+        ),
+        terminal_message_count=1 if isinstance(result, str) and result.strip() else 0,
     )
 
 
-def _structured_command_reason(stdout: str, stderr: str = "") -> str:
+def _error_envelope(stdout: str) -> dict[str, Any]:
     try:
         payload = codex_cli._strict_json_loads(stdout)
     except (json.JSONDecodeError, codex_cli._ClosedJsonError) as exc:
@@ -453,6 +533,12 @@ def _structured_command_reason(stdout: str, stderr: str = "") -> str:
             reason_code="invalid_runtime_protocol",
             retryable=False,
         )
+    return payload
+
+
+def _structured_command_reason(envelope: dict[str, Any], stderr: str = "") -> str:
+    status = envelope.get("api_error_status")
+    result = envelope.get("result")
     diagnostics = tuple(
         item
         for item in (result, stderr)
@@ -733,6 +819,7 @@ def _known_availability_reason(diagnostics: tuple[str, ...]) -> str | None:
         diagnostics,
         auth_diagnostics=_CLAUDE_AUTH_DIAGNOSTICS,
         capacity_diagnostics=_CLAUDE_CAPACITY_DIAGNOSTICS,
+        transport_diagnostics=_CLAUDE_TRANSPORT_DIAGNOSTICS,
     )
 
 

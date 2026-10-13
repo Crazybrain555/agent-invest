@@ -1934,6 +1934,571 @@ def _patch_api_gc_lifecycle(source: str) -> str:
     return source[:start] + replacement + source[end:]
 
 
+_RESULT_STORAGE_MANAGER_METHODS = '''
+    @staticmethod
+    def _bind_result_storage_process(policy) -> None:
+        """Latch permit-only parser output and bind the policy to its volume."""
+        output_root = get_output_root()
+        usage = os.statvfs(output_root)
+        if usage.f_blocks * usage.f_frsize != policy.native_volume_total_bytes:
+            raise RuntimeError("result storage policy does not describe the output volume")
+        # The framework spools each multipart body before the endpoint runs;
+        # the spool lives on the charged volume and is charged before the body
+        # is read (the request middleware), never on an unaccounted temp mount.
+        spool = os.path.join(output_root, ".agent-ingress-spool")
+        os.makedirs(spool, mode=0o700, exist_ok=True)
+        if os.path.islink(spool) or os.stat(spool).st_dev != os.stat(output_root).st_dev:
+            raise RuntimeError("ingress spool is not a directory on the output volume")
+        import starlette.formparsers as multipart_forms
+
+        current = multipart_forms.SpooledTemporaryFile
+        if current is not tempfile.SpooledTemporaryFile and getattr(current, "agent_spool_dir", None) != spool:
+            raise RuntimeError("framework multipart spool is not the pinned stdlib spool")
+
+        class OutputVolumeSpool(tempfile.SpooledTemporaryFile):
+            agent_spool_dir = spool
+
+            def __init__(self, *args, **kwargs):
+                kwargs.setdefault("dir", spool)
+                super().__init__(*args, **kwargs)
+
+        multipart_forms.SpooledTemporaryFile = OutputVolumeSpool
+        require_storage_managed_output()
+
+    @staticmethod
+    def _result_storage_selections(task: AsyncParseTask) -> tuple:
+        """The retained-result v1 member selection, relative to the task root."""
+        root = Path(task.output_dir)
+        selections = []
+        for pdf_name in task.file_names:
+            parse_dir = Path(get_parse_dir(task.output_dir, pdf_name, task.backend, task.parse_method))
+            named = []
+            if task.return_md:
+                named.append(f"{pdf_name}.md")
+            if task.return_middle_json:
+                named.append(f"{pdf_name}_middle.json")
+            if task.return_model_output:
+                named.append(f"{pdf_name}_model.json")
+            if task.return_content_list:
+                named.extend([f"{pdf_name}_content_list.json", f"{pdf_name}_content_list_v2.json"])
+            selections.append(ResultSelection(
+                pdf_name=pdf_name,
+                parse_dir_parts=parse_dir.relative_to(root).parts,
+                arc_prefix=build_zip_arcname(pdf_name, str(parse_dir), "").replace(os.sep, "/").rstrip("/"),
+                named_files=tuple(named),
+                image_suffixes=(frozenset(RESULT_IMAGE_SUFFIXES) if task.return_images else None),
+                origin_prefix=(f"{pdf_name}_origin." if task.return_original_file else None),
+            ))
+        return tuple(selections)
+
+    async def _run_storage_task(self, task: AsyncParseTask) -> bool:
+        """Run one storage-managed task; False when it is held for an operator."""
+        policy = self.result_storage_policy
+        key = task.agent_idempotency_key
+        io = self.service_io
+        root = Path(task.output_dir)
+        identity = await self.task_protocol_v2.observe(lambda: self.task_protocol_v2.task_root_identity(key))
+        selections = self._result_storage_selections(task)
+        from mineru.cli.agent_capacity_config import retained_zip_upper_bound
+
+        async def parse(permit):
+            with bind_source_growth_permit(permit):
+                await self._run_parse_stage(task)
+
+        async def seal():
+            return await io.call(
+                build_result_inventory, task_id=task.task_id, task_root=root, root_identity=identity,
+                selections=selections, policy=policy, zip_upper_bound=retained_zip_upper_bound,
+                lane="bulk", required=True,
+            )
+
+        async def write_seal(inventory):
+            return await io.call(write_inventory_file, root, identity, inventory, lane="bulk", required=True)
+
+        def reopen(expected):
+            try:
+                inventory = load_inventory_file(
+                    root, identity, expected_sha256=expected, task_id=task.task_id, policy=policy,
+                )
+            except FileNotFoundError as exc:
+                raise TaskProtocolConflict("sealed inventory is missing") from exc
+            verify_result_inventory(task_root=root, root_identity=identity, inventory=inventory, selections=selections)
+            return inventory
+
+        async def reopen_seal(expected):
+            return await io.call(reopen, expected, lane="bulk", required=True)
+
+        async def finalize(inventory, grant):
+            path, digest, size = await io.call(
+                write_retained_zip, task_root=root, root_identity=identity, inventory=inventory,
+                selections=selections, grant_bytes=grant, lane="bulk", required=True,
+            )
+            owner = hashlib.sha256(f"{task.task_id}\\0{digest}\\0{size}".encode()).hexdigest()
+            task.result_artifact_path = str(path)
+            task.result_artifact_sha256 = digest
+            task.result_artifact_bytes = size
+            task.result_artifact_owner = owner
+            return path, digest, size, owner
+
+        async def probe_free():
+            return await io.call(live_free_bytes, root, lane="metadata", required=True)
+
+        try:
+            await self.task_protocol_executor.run_storage(
+                registry=self.task_protocol_v2, key=key, permit_root=root, parse=parse, seal=seal,
+                reopen_seal=reopen_seal, write_seal=write_seal, finalize=finalize,
+                probe_free=probe_free, registry_io=io,
+            )
+        except TaskStorageBlocked as blocked:
+            # Held with its bytes and seal for an operator decision; never failed.
+            task.status = TASK_PROCESSING
+            self._signal_task_event(task.task_id)
+            logger.warning(f"Task storage held for operator decision: {task.task_id} {blocked.reason}")
+            return False
+        return True
+
+    async def _reserve_ingress_storage(self, key: str, files) -> None:
+        """Move the request's pre-body upload charge to the key its body named.
+
+        Outside a request scope nothing was charged before the body, so one
+        maximal upload is charged here, still before any upload byte is written.
+        """
+        if len(files) != 1:
+            raise HTTPException(status_code=400, detail={"code": "storage_managed_single_upload"})
+        resources = _request_resource_context.get()
+        ingress_token = None if resources is None else resources.ingress_token
+        if ingress_token is not None:
+            await self.service_io.call(
+                self.task_protocol_v2.transfer_request_ingress, ingress_token, key,
+                lane="metadata", required=True,
+            )
+            return
+        await self.service_io.call(
+            self.task_protocol_v2.reserve_ingress_storage, key,
+            live_free_bytes=await self.service_io.call(
+                live_free_bytes, get_output_root(), lane="metadata", required=True,
+            ),
+            outstanding_promise_bytes=self.task_protocol_executor.outstanding_promise_bytes(),
+            lane="metadata", required=True,
+        )
+
+    async def authorize_storage_hold_operator(self, authorization) -> None:
+        """Admit only the enrolled operator credential; runs before any body byte or registry read.
+
+        The route is disabled until an operator enrolls a credential verifier in
+        this container. The small file read stays off the serving loop.
+        """
+        try:
+            await self.service_io.call(require_storage_hold_operator, authorization, lane="metadata")
+        except StorageHoldOperatorRefused as exc:
+            raise HTTPException(
+                status_code=exc.status, detail={"code": exc.code},
+                headers={"WWW-Authenticate": "Bearer"} if exc.status == 401 else None,
+            ) from None
+        except TaskRegistryObservationBusy as exc:
+            raise HTTPException(status_code=503, detail={"code": "registry_observation_busy"}) from exc
+
+    async def storage_hold_decision(self, task_id: str, body) -> dict:
+        """Operator only: preview, or apply, one exact terminal decision for a held task.
+
+        Reached only through the authenticated route; task execution and the Mac
+        worker never call this. ``execute`` fails the task durably under the
+        registry's own lock; its bytes and seal stay until the ordinary
+        failed-task ACK. Nothing here resumes or deletes.
+        """
+        if self.result_storage_policy is None:
+            raise HTTPException(status_code=404, detail="storage holds require capacity config v2")
+        mode = body.get("mode") if type(body) is dict else None
+        expected = {"mode"} if mode == "preview" else {
+            "mode", "expected_preview_sha256", "decided_by", "reason", "fixed_by",
+        }
+        if mode not in {"preview", "execute"} or set(body) != expected:
+            raise HTTPException(status_code=400, detail={"code": "storage_hold_request_invalid"})
+        registry = self.task_protocol_v2
+        runtime = self.capacity_config.sha256
+        try:
+            record = await registry.observe(lambda: registry.get_by_task_id(task_id))
+            if record is None:
+                raise HTTPException(status_code=404, detail="Task not found")
+            if mode == "preview":
+                return await self.service_io.call(
+                    registry.storage_hold_preview, record.idempotency_key,
+                    runtime_identity_sha256=runtime, lane="metadata", required=True,
+                )
+            if task_id in self._scheduled_task_ids:
+                raise TaskProtocolConflict("held task still has an in-flight producer")
+            receipt = await self.service_io.call(
+                registry.decide_storage_hold, record.idempotency_key,
+                runtime_identity_sha256=runtime,
+                expected_preview_sha256=body["expected_preview_sha256"],
+                decided_by=body["decided_by"], reason=body["reason"], fixed_by=body["fixed_by"],
+                lane="metadata", required=True,
+            )
+        except TaskRegistryPersistenceError as exc:
+            # The decision's durability is unknown: replay the same decision after recovery.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except TaskRegistryObservationBusy as exc:
+            raise HTTPException(status_code=503, detail={"code": "registry_observation_busy"}) from exc
+        except TaskProtocolConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Status readers sync from the durable record; wake waiters now.
+        self.get(task_id)
+        self._signal_task_event(task_id)
+        return receipt
+
+'''
+
+
+def _patch_result_storage(source: str) -> str:
+    """Capacity config v2 only: physical result storage on the generated API.
+
+    Every branch keys on ``result_storage_policy``, which is None for a v1 or
+    absent capacity config, so those processes keep their exact behavior. New
+    names are referenced only inside storage branches; reduced fixtures that
+    lack the full module are left unchanged.
+    """
+    if "async def create_async_parse_task(" not in source or "def health_check(" not in source:
+        return source
+    source = _replace_exact(
+        source,
+        "    evict_consumed_routes, task_protocol_runtime_status,\n)\n",
+        "    evict_consumed_routes, task_protocol_runtime_status,\n)\n"
+        "from mineru.cli.agent_task_protocol_v2 import (\n"
+        "    STORAGE_BLOCKED_REASONS, ResultSelection, StorageHoldOperatorRefused, TaskStorageBlocked,\n"
+        "    TaskStorageWait, bind_source_growth_permit, build_result_inventory, live_free_bytes,\n"
+        "    load_inventory_file, require_storage_hold_operator, require_storage_managed_output,\n"
+        "    storage_status_payload, verify_result_inventory, write_inventory_file, write_retained_zip,\n"
+        ")\n",
+        count=1, label="result storage imports",
+    )
+    legacy_construction = (
+        '        result_limit = int(os.getenv("MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES", "2147483648"))\n'
+        '        result_budget = int(os.getenv("MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES", "268435456"))\n'
+        '        if not 0 < result_budget <= result_limit:\n'
+        '            raise ValueError("result reservation must be positive and within its limit")\n'
+        '        self.task_protocol_v2 = DurableTaskRegistry(\n'
+        '            protocol_root / "registry.json",\n'
+        '            max_unacked_result_bytes=result_limit,\n'
+        '            output_root=get_output_root(),\n'
+        '            tombstone_retention_seconds=int(os.getenv("MINERU_TASK_PROTOCOL_V2_TOMBSTONE_RETENTION_SECONDS", "86400")),\n'
+        '            enforce_key_lifecycle=True,\n'
+        '        )\n'
+        '        self.task_protocol_executor = SplitTaskExecutor(\n'
+        '            parse_slots=get_max_concurrent_requests(),\n'
+        '            finalizer_slots=(1 if self.capacity_config is None\n'
+        '                             else self.capacity_config.finalizer_active_limit),\n'
+        '            result_reservation_bytes=result_budget,\n'
+        '        )\n'
+    )
+    indented = "".join(
+        ("    " + line if line.strip() else line) for line in legacy_construction.splitlines(keepends=True)
+    )
+    source = _replace_exact(
+        source,
+        legacy_construction,
+        "        # Capacity config v2 carries the physical result storage policy; only\n"
+        "        # then do growth permits, completion grants and registry v4 apply.\n"
+        '        self.result_storage_policy = getattr(self.capacity_config, "result_storage", None)\n'
+        "        if self.result_storage_policy is None:\n"
+        + indented +
+        "        else:\n"
+        "            self._bind_result_storage_process(self.result_storage_policy)\n"
+        "            self.task_protocol_v2 = DurableTaskRegistry(\n"
+        '                protocol_root / "registry.json",\n'
+        "                output_root=get_output_root(),\n"
+        '                tombstone_retention_seconds=int(os.getenv("MINERU_TASK_PROTOCOL_V2_TOMBSTONE_RETENTION_SECONDS", "86400")),\n'
+        "                enforce_key_lifecycle=True,\n"
+        "                storage_policy=self.result_storage_policy,\n"
+        "            )\n"
+        "            self.task_protocol_executor = SplitTaskExecutor(\n"
+        "                parse_slots=get_max_concurrent_requests(),\n"
+        "                finalizer_slots=self.capacity_config.finalizer_active_limit,\n"
+        "                storage_policy=self.result_storage_policy,\n"
+        "            )\n",
+        count=1, label="result storage registry and executor",
+    )
+    source = _replace_exact(
+        source,
+        "            await self.task_protocol_executor.run(\n"
+        "                registry=self.task_protocol_v2, key=task.agent_idempotency_key,\n"
+        "                parse=parse_stage, finalize=finalizer_stage, registry_io=self.service_io,\n"
+        "            )\n"
+        "            task.status = TASK_COMPLETED\n",
+        "            if self.result_storage_policy is None:\n"
+        "                await self.task_protocol_executor.run(\n"
+        "                    registry=self.task_protocol_v2, key=task.agent_idempotency_key,\n"
+        "                    parse=parse_stage, finalize=finalizer_stage, registry_io=self.service_io,\n"
+        "                )\n"
+        "            elif not await self._run_storage_task(task):\n"
+        "                return\n"
+        "            task.status = TASK_COMPLETED\n",
+        count=1, label="result storage task execution",
+    )
+    source = _replace_exact(
+        source,
+        "    async def _run_parse_stage(self, task: AsyncParseTask) -> None:\n",
+        _RESULT_STORAGE_MANAGER_METHODS.lstrip("\n")
+        + "    async def _run_parse_stage(self, task: AsyncParseTask) -> None:\n",
+        count=1, label="result storage manager methods",
+    )
+    source = _replace_exact(
+        source,
+        '        if record.state in {"processing", "finalizing"} and task_id not in self._scheduled_task_ids:\n',
+        '        if (record.state in {"processing", "finalizing"} and task_id not in self._scheduled_task_ids\n'
+        '                and not (record.storage is not None\n'
+        '                         and record.storage["wait_reason"] in STORAGE_BLOCKED_REASONS)):\n',
+        count=1, label="result storage held route stays visible",
+    )
+    source = _replace_exact(
+        source,
+        '        payload["idempotency_key"] = record.idempotency_key\n'
+        "        if record.failure_cause is not None:\n",
+        '        payload["idempotency_key"] = record.idempotency_key\n'
+        "        if record.storage is not None:\n"
+        '            payload["storage"] = storage_status_payload(record)\n'
+        "        if record.failure_cause is not None:\n",
+        count=1, label="result storage status envelope",
+    )
+    source = _replace_exact(
+        source,
+        "async def save_upload_files(upload_dir: str, files: list[UploadFile], service_io=None) -> list[StoredUpload]:\n",
+        "async def save_upload_files(upload_dir: str, files: list[UploadFile], service_io=None,\n"
+        "                            byte_limit=None) -> list[StoredUpload]:\n",
+        count=1, label="result storage upload limit parameter",
+    )
+    source = _replace_exact(
+        source,
+        "            while True:\n"
+        "                chunk = await _settle_service_operation(upload.read(1 << 20))\n"
+        "                if not chunk:\n"
+        "                    break\n"
+        "                if service_io is None:\n"
+        "                    handle.write(chunk)\n",
+        "            written = 0\n"
+        "            while True:\n"
+        "                chunk = await _settle_service_operation(upload.read(1 << 20))\n"
+        "                if not chunk:\n"
+        "                    break\n"
+        "                written += len(chunk)\n"
+        "                if byte_limit is not None and written > byte_limit:\n"
+        "                    # The ingress charge covers one maximal source; never write past it.\n"
+        '                    raise HTTPException(status_code=413, detail={"code": "source_upload_too_large"})\n'
+        "                if service_io is None:\n"
+        "                    handle.write(chunk)\n",
+        count=1, label="result storage upload limit before write",
+    )
+    source = _replace_exact(
+        source,
+        "        uploads = await save_upload_files(uploads_dir, request_options.files, task_manager.service_io)\n",
+        "        storage_policy = getattr(task_manager, \"result_storage_policy\", None)\n"
+        "        if storage_policy is not None:\n"
+        "            await task_manager._reserve_ingress_storage(record.idempotency_key, request_options.files)\n"
+        "        uploads = await save_upload_files(\n"
+        "            uploads_dir, request_options.files, task_manager.service_io,\n"
+        "            byte_limit=None if storage_policy is None else storage_policy.source_pdf_bytes_limit,\n"
+        "        )\n",
+        count=1, label="result storage ingress reservation",
+    )
+    source = _replace_exact(
+        source,
+        "        if isinstance(exc, TaskProtocolConflict):\n"
+        "            raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+        "        raise\n"
+        "    finally:\n"
+        "        task_manager.finish_submission(task_id)\n",
+        "        if getattr(task_manager, \"result_storage_policy\", None) is not None and isinstance(exc, TaskStorageWait):\n"
+        "            # Not accepted: the client may retry once space is released.\n"
+        '            raise HTTPException(status_code=429, detail={"code": "storage_capacity_wait", "reason": exc.reason}) from exc\n'
+        "        if isinstance(exc, TaskProtocolConflict):\n"
+        "            raise HTTPException(status_code=409, detail=str(exc)) from exc\n"
+        "        raise\n"
+        "    finally:\n"
+        "        task_manager.finish_submission(task_id)\n",
+        count=1, label="result storage ingress wait response",
+    )
+    source = _replace_exact(
+        source,
+        "        path = await _pin_response_result(manager, task.agent_idempotency_key)\n"
+        "        return FileResponse(path=str(path), media_type='application/zip', filename=f'{task.task_id}.zip',\n"
+        "            headers={'X-MinerU-Result-SHA256':task.result_artifact_sha256, 'X-MinerU-Result-Owner':task.result_artifact_owner})\n",
+        "        path = await _pin_response_result(manager, task.agent_idempotency_key)\n"
+        "        headers = {'X-MinerU-Result-SHA256':task.result_artifact_sha256, 'X-MinerU-Result-Owner':task.result_artifact_owner}\n"
+        "        if getattr(manager, 'result_storage_policy', None) is not None:\n"
+        "            # Strong validator from the sealed content: a resumed Range read\n"
+        "            # continues only while If-Range still names these exact bytes.\n"
+        "            headers['ETag'] = '\"' + task.result_artifact_sha256 + '\"'\n"
+        "        return FileResponse(path=str(path), media_type='application/zip', filename=f'{task.task_id}.zip',\n"
+        "            headers=headers)\n",
+        count=1, label="result storage strong result validator",
+    )
+    source = _replace_exact(
+        source,
+        "class _ServiceRequestMiddleware:\n"
+        '    """Keep the entire ASGI response and its resource release in one owned scope."""\n'
+        "\n"
+        "    def __init__(self, app):\n"
+        "        self.app = app\n"
+        "\n",
+        "class _ServiceRequestMiddleware:\n"
+        '    """Keep the entire ASGI response and its resource release in one owned scope."""\n'
+        "\n"
+        "    # Form fields and multipart framing around a storage-managed task's one upload.\n"
+        "    _STORAGE_INGRESS_FORM_BYTES = 64 * 1024\n"
+        "\n"
+        "    def __init__(self, app):\n"
+        "        self.app = app\n"
+        "\n"
+        "    @classmethod\n"
+        "    def _storage_ingress_bound(cls, scope, policy):\n"
+        '        """The declared body of a storage-managed upload, or its refusal before any body byte."""\n'
+        "        declared = [value for name, value in scope.get('headers', ()) if name.lower() == b'content-length']\n"
+        "        if len(declared) != 1 or not declared[0].isdigit() or len(declared[0]) > 18:\n"
+        "            return None, JSONResponse(status_code=411, content={'detail': {'code': 'content_length_required'}})\n"
+        "        body_bytes = int(declared[0])\n"
+        "        if body_bytes > policy.source_pdf_bytes_limit + cls._STORAGE_INGRESS_FORM_BYTES:\n"
+        "            return None, JSONResponse(status_code=413, content={'detail': {'code': 'source_upload_too_large'}})\n"
+        "        return body_bytes, None\n"
+        "\n"
+        "    async def _serve_storage_ingress(self, manager, resources, body_bytes, scope, receive, send):\n"
+        '        """Charge the body spool and upload copy first, then read at most the declared body."""\n'
+        "        registry = manager.task_protocol_v2\n"
+        "        ingress_token = uuid.uuid4().hex\n"
+        "        resources.defer(registry.release_request_ingress, ingress_token)\n"
+        "        try:\n"
+        "            await manager.service_io.call(\n"
+        "                registry.reserve_request_ingress, ingress_token, body_bytes=body_bytes,\n"
+        "                live_free_bytes=await manager.service_io.call(\n"
+        "                    live_free_bytes, get_output_root(), lane='metadata', required=True,\n"
+        "                ),\n"
+        "                outstanding_promise_bytes=manager.task_protocol_executor.outstanding_promise_bytes(),\n"
+        "                lane='metadata', required=True,\n"
+        "            )\n"
+        "        except TaskStorageWait as exc:\n"
+        "            # Not accepted and no body byte read: the client waits and resubmits.\n"
+        "            response = JSONResponse(status_code=429, content={'detail': {\n"
+        "                'code': 'storage_capacity_wait', 'reason': exc.reason,\n"
+        "            }})\n"
+        "            return await response(scope, receive, send)\n"
+        "        resources.ingress_token = ingress_token\n"
+        "        received = 0\n"
+        "\n"
+        "        async def declared_body():\n"
+        "            nonlocal received\n"
+        "            message = await receive()\n"
+        "            if message.get('type') == 'http.request':\n"
+        "                received += len(message.get('body', b''))\n"
+        "                if received > body_bytes:\n"
+        "                    raise HTTPException(status_code=413, detail={'code': 'source_upload_too_large'})\n"
+        "            return message\n"
+        "\n"
+        "        return await self.app(scope, declared_body, send)\n"
+        "\n",
+        count=1, label="result storage pre-body ingress gate",
+    )
+    source = _replace_exact(
+        source,
+        "            response = JSONResponse(status_code=503, content={'detail': 'Task manager is not initialized'})\n"
+        "            return await response(scope, receive, send)\n"
+        "        try:\n"
+        "            resources = manager.service_io.open_request('mutation' if mutation else 'reader')\n",
+        "            response = JSONResponse(status_code=503, content={'detail': 'Task manager is not initialized'})\n"
+        "            return await response(scope, receive, send)\n"
+        "        ingress_bytes = None\n"
+        "        storage_policy = getattr(manager, 'result_storage_policy', None)\n"
+        "        if storage_policy is not None and method == 'POST' and path == '/tasks':\n"
+        "            ingress_bytes, refusal = self._storage_ingress_bound(scope, storage_policy)\n"
+        "            if refusal is not None:\n"
+        "                return await refusal(scope, receive, send)\n"
+        "        try:\n"
+        "            resources = manager.service_io.open_request('mutation' if mutation else 'reader')\n",
+        count=1, label="result storage pre-body ingress bound",
+    )
+    source = _replace_exact(
+        source,
+        "        try:\n"
+        "            await _settle_service_operation(self.app(adjusted, receive, send))\n"
+        "        except BaseException as exc:\n"
+        "            primary = exc\n",
+        "        try:\n"
+        "            if ingress_bytes is None:\n"
+        "                await _settle_service_operation(self.app(adjusted, receive, send))\n"
+        "            else:\n"
+        "                await _settle_service_operation(self._serve_storage_ingress(\n"
+        "                    manager, resources, ingress_bytes, adjusted, receive, send,\n"
+        "                ))\n"
+        "        except BaseException as exc:\n"
+        "            primary = exc\n",
+        count=1, label="result storage pre-body ingress charge",
+    )
+    source = _replace_exact(
+        source,
+        '@app.get(path="/health")\n',
+        '@app.post(path="/agent/storage-holds/{task_id}", include_in_schema=False)\n'
+        "async def agent_storage_hold_decision(task_id: str, request: Request):\n"
+        "    import json\n\n"
+        "    manager = get_task_manager()\n"
+        "    # The operator credential first: an unknown caller never has a body byte\n"
+        "    # read or the registry consulted. Hiding the route from OpenAPI is not a gate.\n"
+        '    await manager.authorize_storage_hold_operator(request.headers.get("authorization"))\n'
+        '    declared = request.headers.get("content-length")\n'
+        "    if declared is not None and not declared.isdigit():\n"
+        '        raise HTTPException(status_code=400, detail={"code": "storage_hold_request_invalid"})\n'
+        "    if declared is not None and int(declared) > 16384:\n"
+        '        raise HTTPException(status_code=413, detail={"code": "storage_hold_request_too_large"})\n'
+        "    raw = bytearray()\n"
+        "    async for chunk in request.stream():\n"
+        "        # Refuse a chunk that would cross the bound before copying it.\n"
+        "        if len(raw) + len(chunk) > 16384:\n"
+        '            raise HTTPException(status_code=413, detail={"code": "storage_hold_request_too_large"})\n'
+        "        raw += chunk\n"
+        "    try:\n"
+        "        body = json.loads(raw)\n"
+        "    except ValueError as exc:\n"
+        '        raise HTTPException(status_code=400, detail={"code": "storage_hold_request_invalid"}) from exc\n'
+        "    return await manager.storage_hold_decision(task_id, body)\n\n\n"
+        '@app.get(path="/health")\n',
+        count=1, label="result storage operator hold decision route",
+    )
+    return source
+
+
+def _patch_granted_data_writer(source: str) -> str:
+    """Charge every parser output write to its producer's growth permit first.
+
+    All per-document parser output reaches ``FileBasedDataWriter.write`` with
+    its whole payload; the permit charges it and writes it through descriptors
+    below the task root, never through an upstream path ``open``. Outside a
+    storage-managed process the writer is the unmodified upstream class.
+    """
+    source = _replace_exact(
+        source,
+        "from mineru.data.data_reader_writer import FileBasedDataWriter\n",
+        "from mineru.data.data_reader_writer import FileBasedDataWriter as _UngrantedFileBasedDataWriter\n"
+        "from mineru.cli.agent_task_protocol_v2 import (\n"
+        "    current_source_growth_permit, storage_managed_output_required,\n"
+        ")\n",
+        count=1, label="granted parser output writer import",
+    )
+    return _replace_exact(
+        source,
+        '\n\npdf_suffixes = ["pdf"]\n',
+        "\n\nclass FileBasedDataWriter(_UngrantedFileBasedDataWriter):\n"
+        "    def write(self, path: str, data: bytes) -> None:\n"
+        "        permit = current_source_growth_permit()\n"
+        "        if permit is None:\n"
+        "            if storage_managed_output_required():\n"
+        '                raise RuntimeError("parser output write has no growth permit")\n'
+        "            return super().write(path, data)\n"
+        "        target = path\n"
+        "        if not os.path.isabs(target) and len(self._parent_dir) > 0:\n"
+        "            target = os.path.join(self._parent_dir, path)\n"
+        "        permit.write_file(target, data)\n"
+        '\n\npdf_suffixes = ["pdf"]\n',
+        count=1, label="granted parser output writer",
+    )
+
 def patch_source(relative_path: str, source: str) -> str:
     """Return the deterministic patched source for one exact MinerU module."""
 
@@ -3036,7 +3601,7 @@ def _process_async_request_limiter(capacity: int) -> _ProcessAsyncRequestLimiter
         source = _patch_registry_persistence_behavior(source)
         source = _patch_admission_responsibility(source)
         source = _patch_explicit_capacity(_patch_result_capacity_before_parse(source))
-        return _patch_api_gc_lifecycle(_patch_health_durable_view_observation(_patch_service_scope_completion(_patch_service_io_pressure(_patch_service_io_shutdown(_patch_service_io_ingress(_patch_service_io_ack_health(_patch_service_io_manager(source))))))))
+        return _patch_result_storage(_patch_api_gc_lifecycle(_patch_health_durable_view_observation(_patch_service_scope_completion(_patch_service_io_pressure(_patch_service_io_shutdown(_patch_service_io_ingress(_patch_service_io_ack_health(_patch_service_io_manager(source)))))))))
 
     if relative_path == "mineru/utils/model_utils.py":
         source = _replace_exact(
@@ -4205,14 +4770,14 @@ def _hybrid_model_device_event(model, role, capacity):
             occurrence=3,
             label="CLI asynchronous hybrid output generation off the serving loop",
         )
-        return _replace_exact_occurrence(
+        return _patch_granted_data_writer(_replace_exact_occurrence(
             source,
             output_call,
             owned_output_call,
             count=3,
             occurrence=0,
             label="CLI asynchronous VLM output generation off the serving loop",
-        )
+        ))
 
     if relative_path == "mineru/backend/hybrid/hybrid_analyze.py":
         source = _replace_exact(

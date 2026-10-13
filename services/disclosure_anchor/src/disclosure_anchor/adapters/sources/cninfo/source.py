@@ -21,7 +21,9 @@ from disclosure_anchor.adapters.sources.cninfo.mapper import (
 )
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
+    CompletedPdfTransfer,
     DisclosureWindow,
+    PdfDownloadSink,
     SourceSecurity,
 )
 from disclosure_anchor.adapters.sources.cninfo.web_source import CninfoWebSource
@@ -198,13 +200,16 @@ class CninfoSource:
                 names[code] = name
         return names
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
-        payload, _ = self._client.download_bytes(
+    def download_pdf_to(
+        self, ref: AnnouncementRef, sink: PdfDownloadSink
+    ) -> CompletedPdfTransfer:
+        transfer, _ = self._client.download_to(
             provider_interface="cninfo:download_pdf",
             url=ref.download_url,
+            sink=sink,
             params={},
         )
-        return payload
+        return transfer
 
 
 def _window_chunks(
@@ -271,14 +276,16 @@ class CninfoWebIndexSource:
             return self._bse_api().search_announcements(security, window)
         return self._web.search_announcements(security, window)
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+    def download_pdf_to(
+        self, ref: AnnouncementRef, sink: PdfDownloadSink
+    ) -> CompletedPdfTransfer:
         try:
             exchange = infer_mainland_exchange(ref.security_code)
         except ValueError:
             exchange = None
         if exchange == "BSE":
-            return self._bse_api().download_pdf(ref)
-        return self._web.download_pdf(ref)
+            return self._bse_api().download_pdf_to(ref, sink)
+        return self._web.download_pdf_to(ref, sink)
 
     def _bse_api(self) -> CninfoSource:
         if self._api is None:

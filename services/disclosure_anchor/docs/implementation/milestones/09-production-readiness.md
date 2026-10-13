@@ -22,7 +22,7 @@ findings 全部带 file:line 证据；critic 纠正的 2 条假阳性已剔除�
 ## 已完成（2026-07-07 第一批）
 
 - [x] **[blocker]** No batch company-list intake → pipeline track + config/watchlist.csv（离线幂等，PENDING_LEGAL_NAME 占位+首同步升级）
-- [x] **[blocker]** No default initial backfill window → DISCLOSURE_INITIAL_LOOKBACK_DAYS=1280（规模启动改为 3.5 年并留日历缓冲）+ tracked.lookback 覆盖，CLI/worker 双路径
+- [x] **[blocker]** No default initial backfill window → DISCLOSURE_INITIAL_LOOKBACK_DAYS=1827（默认五年，包含最多两天闰日；已有 checkpoint 在成功增量同步后按最多 90 天历史段逐步补数）+ tracked.lookback 覆盖，CLI/worker 双路径
 - [x] **[blocker]** 大文档永久占 parse batch 槽 → 2026-07-25 复核后废止大小硬排除；
   pending_parse 返回归档 actual byte_count，worker 送入可借用 HUGE lane
 - [x] **[blocker]** No mechanism delivers required environment to automated runs; the shipped launch → ~/.config/agent-invest/disclosure_anchor/{worker,cninfo}.env + scripts/run_worker_once.sh + launchd 模板/安装脚本

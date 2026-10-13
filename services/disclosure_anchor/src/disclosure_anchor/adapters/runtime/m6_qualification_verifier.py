@@ -86,7 +86,7 @@ from disclosure_anchor.application.ports.atomic_document_publisher_v4 import Ato
 from disclosure_anchor.application.ports.file_store import FileStorePathPort
 from disclosure_anchor.application.ports.provider_document_source import ProviderDocumentSourcePort
 from disclosure_anchor.application.ports.semantic_routes import (
-    SemanticAdjudicationBatch, SemanticAdjudicationOutcome, SemanticExecutionGuard,
+    SemanticAdjudicationBatch, SemanticAdjudicationOutcome, SemanticDecisionValidator, SemanticExecutionGuard,
 )
 from disclosure_anchor.application.services.atomic_publication_request_builder_v4 import (
     ProductionAtomicPublicationRequestBuilderV4,
@@ -260,6 +260,7 @@ class _RefusingExecutor:
     def adjudicate(
         self, batch: SemanticAdjudicationBatch, *, group_hash: str,
         stage_guard: SemanticExecutionGuard | None = None,
+        validate: SemanticDecisionValidator | None = None,
     ) -> SemanticAdjudicationOutcome:
         raise RuntimeError("read-only qualification cannot call a semantic model")
 
@@ -549,6 +550,7 @@ class M6ReadonlyQualificationVerifier:
             "artifact_count": len(document.artifacts),
             "reconciliation_count": len(admitted.source_text_reconciliations),
             "finding_count": len(admitted.source_quality_findings),
+            "text_substitution_count": len(admitted.text_substitutions),
         }
         report["source_admission"] = detail
         identity_failures: list[dict[str, Any]] = []
@@ -736,6 +738,7 @@ class M6ReadonlyQualificationVerifier:
         try:
             semantics = ProviderSourceSemantics(
                 admitted.provider_document, admitted.source_text_reconciliations, admitted.source_quality_findings,
+                admitted.text_substitutions,
             )
             occurrences = assess_source_build_quality(semantics, base_build)
         except _CONTRACT_ERRORS as exc:

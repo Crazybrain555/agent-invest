@@ -18,6 +18,7 @@ from tests._mineru_package_a_fixture import gate_fixture
 from tests._staged_campaign_sql import CampaignSqlDatabase, campaign
 from tests.unit import test_mineru_package_a_builder as builder_fixture
 from tests.unit.test_mineru_stream_policy import Pressure
+from tests.unit._codex_model_catalog_fixture import prepare_catalog_sha256
 
 
 def stream_control(runtime=m6.digest("runtime"), maximum=2):
@@ -33,7 +34,7 @@ class StagedCampaignBuilderTests(unittest.TestCase):
         self.scope = campaign()
 
     def arguments(self):
-        return dict(settings=SimpleNamespace(worker_parse_execution_mode="staged-v4"),
+        return dict(settings=SimpleNamespace(worker_parse_execution_mode="staged-v4", worker_drain_existing=False),
                     engine=self.db.engine, ownership_guard=mock.Mock(), admission_guard=mock.Mock(),
                     process_scope_classes=None, progress=mock.Mock(), campaign_scope=self.scope,
                     expected_capacity=configuration(), stream_control=stream_control())
@@ -55,6 +56,12 @@ class StagedCampaignBuilderTests(unittest.TestCase):
         with (mock.patch.object(builder, "load_staged_v4_settings") as loader,
               self.assertRaises(ValueError)):
             builder.build_staged_worker_v4_runtime(**args, admission_document_ids=self.scope.document_ids[:8])
+        loader.assert_not_called()
+        args["ownership_guard"].assert_not_called()
+        args["settings"].worker_drain_existing = True
+        with (mock.patch.object(builder, "load_staged_v4_settings") as loader,
+              self.assertRaisesRegex(ValueError, "unscoped resident")):
+            builder.build_staged_worker_v4_campaign_runtime(**args)
         loader.assert_not_called()
         args["ownership_guard"].assert_not_called()
 
@@ -91,7 +98,9 @@ class StagedCampaignBuilderTests(unittest.TestCase):
             settings, profile, capacity, _ = gate_fixture(root)
             environment = builder_fixture.ExplicitStagedBuilderTests().profile_environment(root, profile)
             settings = Settings(**dict(settings.model_dump(),
-                disclosure_v4_secret_keyring_file=Path(environment["DISCLOSURE_V4_SECRET_KEYRING_FILE"])))
+                disclosure_v4_secret_keyring_file=Path(environment["DISCLOSURE_V4_SECRET_KEYRING_FILE"]),
+                disclosure_semantic_codex_model_catalog_sha256=prepare_catalog_sha256(
+                    settings.disclosure_runtime_root)))
             FileStorePathBuilder(settings).data_path(Path()).mkdir(parents=True)
             control = stream_control(profile.runtime_bundle_identity_sha256, capacity.parse_active_limit)
             calls = []

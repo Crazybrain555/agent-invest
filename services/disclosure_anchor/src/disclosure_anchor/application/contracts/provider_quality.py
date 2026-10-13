@@ -10,7 +10,9 @@ from disclosure_anchor.application.contracts.provider_source_semantics import So
 from disclosure_anchor.application.contracts.provider_table_projection import (
     ProviderTablePartRef, UnboundProviderTablePart, UnboundTablePartReason,
 )
-from disclosure_anchor.application.contracts.provider_unit import ProviderUnitSourceQualityFinding
+from disclosure_anchor.application.contracts.provider_unit import (
+    ProviderUnitSourceQualityFinding, ProviderUnitTextSubstitution,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +79,22 @@ class TableImageUnmatchedOccurrence:
         return "table_image_unmatched"
 
 
+@dataclass(frozen=True, slots=True)
+class TextSubstitutionOccurrence:
+    """One U+0000 marker exposed in this Unit's title, heading path or payload."""
+
+    unit_index: int
+    substitution: ProviderUnitTextSubstitution
+
+    @property
+    def reason_id(self) -> str:
+        return "text_substitution:" + self.substitution.policy
+
+
 ProviderQualityOccurrence = (
     SourceFindingOccurrence | UnboundTableOccurrence
     | EncodedTextOccurrence | TruncatedTitleOccurrence | TableImageUnmatchedOccurrence
+    | TextSubstitutionOccurrence
 )
 
 
@@ -96,6 +111,7 @@ def quality_occurrence_to_payload(item: ProviderQualityOccurrence) -> dict[str, 
         EncodedTextOccurrence: "encoded_text",
         TruncatedTitleOccurrence: "truncated_title",
         TableImageUnmatchedOccurrence: "table_image_unmatched",
+        TextSubstitutionOccurrence: "text_substitution",
     }.get(type(item))
     if kind is None:
         raise ValueError("quality occurrence type is unsupported")
@@ -195,6 +211,23 @@ def quality_occurrence_from_payload(value: object) -> ProviderQualityOccurrence:
             _optional_index(obj["unit_index"]), _index(obj["page_index"]), _index(obj["model_block_index"]),
             image_kind, _text(obj["token"]), expected, actual, _sha(obj["image_sha256"]),
         )
+    elif kind == "text_substitution":
+        _fields(obj, common | {"substitution"})
+        substitution = _fields(
+            obj["substitution"], set(ProviderUnitTextSubstitution.__dataclass_fields__)
+        )
+        item = TextSubstitutionOccurrence(
+            _index(obj["unit_index"]),
+            ProviderUnitTextSubstitution(
+                source_index=_index(substitution["source_index"]),
+                payload_ordinal=_index(substitution["payload_ordinal"]),
+                raw_block_sha256=_sha(substitution["raw_block_sha256"]),
+                provider_text_sha256=_sha(substitution["provider_text_sha256"]),
+                substituted_text_sha256=_sha(substitution["substituted_text_sha256"]),
+                occurrence_count=_index(substitution["occurrence_count"]),
+                policy=_text(substitution["policy"]),
+            ),
+        )
     else:
         raise ValueError("quality occurrence kind is unsupported")
     if _text(obj["reason_id"]) != item.reason_id:
@@ -231,6 +264,12 @@ def _order(item: ProviderQualityOccurrence) -> tuple[object, ...]:
         identity = (item.source_index, item.raw_block_sha256)
     elif isinstance(item, TableImageUnmatchedOccurrence):
         identity = (item.page_index, item.model_block_index, item.token, item.image_sha256)
+    elif isinstance(item, TextSubstitutionOccurrence):
+        identity = (
+            item.substitution.source_index, item.substitution.payload_ordinal,
+            item.substitution.raw_block_sha256, item.substitution.provider_text_sha256,
+            item.substitution.substituted_text_sha256,
+        )
     else:
         identity = (item.heading_id, tuple(
             (f.source_index, f.payload_ordinal, f.page_index, f.text, f.raw_block_sha256)

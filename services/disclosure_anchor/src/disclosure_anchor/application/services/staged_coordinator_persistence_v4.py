@@ -26,7 +26,12 @@ from disclosure_anchor.application.contracts.staged_resource_credit import (
     STAGED_RESOURCE_STATE_TRANSITIONS,
 )
 from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
+    MaterializationIntentV4,
     RemoteParseCheckpointV4,
+)
+from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
+    TerminalReceiptV4,
+    effective_resource_reservation_v4,
 )
 from disclosure_anchor.application.ports.staged_lifecycle_facts import StagedLifecycleFactsPort
 from disclosure_anchor.application.services.staged_lifecycle_reporting import (
@@ -113,6 +118,18 @@ class DurableV4ClaimGuard:
 
 def _is_final(authority: RemoteParseV4Authority) -> bool:
     return authority.state not in STAGED_RESOURCE_STATE_TRANSITIONS
+
+
+def _effective_reservation(authority: RemoteParseV4Authority) -> ResourceCreditVector:
+    """The durable reservation after committed grants (estimate, Z, stage grant)."""
+    assert authority.reservation is not None
+    terminal = intent = None
+    for item in authority.evidence:
+        if item.kind == "terminal_receipt" and type(item.value) is TerminalReceiptV4:
+            terminal = item.value
+        elif item.kind == "materialization_intent" and type(item.value) is MaterializationIntentV4:
+            intent = item.value
+    return effective_resource_reservation_v4(authority.reservation, terminal=terminal, intent=intent)
 
 
 def _same_head(
@@ -787,7 +804,7 @@ class DurableStagedCoordinatorPersistenceV4:
                 claim_generation=authority.claim_generation,
                 claim_owner_identity=authority.claim_owner_identity,
                 lease_expires_monotonic=deadline,
-                credit_reservation=authority.reservation.reserved_credit,
+                credit_reservation=_effective_reservation(authority),
                 credits=authority.checkpoint.held_resource_credit,
             )
         except ValueError as exc:
@@ -909,13 +926,16 @@ class DurableStagedCoordinatorPersistenceV4:
         *,
         ignore_lease: bool = False,
     ) -> None:
+        # An admitted, uncommitted grant widens what the coordinator may use,
+        # never the durable identity: compare the durable reservation exactly.
         if (
-            observed.attempt_id != expected.attempt_id
+            observed.durable_credit_reservation is not None
+            or observed.attempt_id != expected.attempt_id
             or observed.state != expected.state
             or observed.lifecycle_version != expected.lifecycle_version
             or observed.claim_generation != expected.claim_generation
             or observed.claim_owner_identity != expected.claim_owner_identity
-            or observed.credit_reservation != expected.credit_reservation
+            or observed.credit_reservation != expected.durable_reservation
             or observed.credits != expected.credits
             or (
                 not ignore_lease
@@ -945,7 +965,7 @@ class DurableStagedCoordinatorPersistenceV4:
             if (
                 observed.state != previous.state
                 or observed.claim_owner_identity != previous.claim_owner_identity
-                or observed.credit_reservation != previous.credit_reservation
+                or observed.credit_reservation != previous.durable_reservation
                 or observed.credits != previous.credits
             ):
                 raise StagedClaimLost(
@@ -957,9 +977,13 @@ class DurableStagedCoordinatorPersistenceV4:
             frozenset(),
         ):
             raise StagedClaimLost("durable V4 reload crossed more than one transition")
+        # One successor may commit exactly the grant the coordinator admitted
+        # for it (its reservation becomes the admitted value), or keep the
+        # durable reservation; nothing else.
         if observed.state in STAGED_RESOURCE_STATE_TRANSITIONS and (
             observed.claim_owner_identity != previous.claim_owner_identity
-            or observed.credit_reservation != previous.credit_reservation
+            or observed.credit_reservation
+            not in {previous.durable_reservation, previous.credit_reservation}
         ):
             raise StagedClaimLost("durable V4 successor lost claim continuity")
 

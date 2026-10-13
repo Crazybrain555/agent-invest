@@ -30,7 +30,7 @@ from disclosure_anchor.adapters.runtime.mineru_release_package import (
     write_new_json,
 )
 from disclosure_anchor.adapters.runtime.mineru_release_private_binding import ReleasePrivateBinding
-from disclosure_anchor.application.contracts.mineru_capacity_config import MineruCapacityConfig
+from disclosure_anchor.application.contracts.mineru_capacity_config import AnyMineruCapacityConfig
 from disclosure_anchor.application.contracts.mineru_capacity_health import parse_mineru_capacity_wire_health
 from disclosure_anchor.adapters.runtime.resident_owner_control import (
     BoundedOwnerCommand,
@@ -38,12 +38,17 @@ from disclosure_anchor.adapters.runtime.resident_owner_control import (
     owner_ssh_command,
     pinned_windows_script,
 )
-from disclosure_anchor.application.contracts.closed_document import canonical_bytes, sha256_of
+from disclosure_anchor.application.contracts.closed_document import canonical_bytes, require_sha256, sha256_of
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
 INSTALLATION_BINDING_CONTRACT = "m6.installation-binding.v1"
+INSTALLATION_BINDING_CONTRACT_V2 = "m6.installation-binding.v2"
 INSTALL_RESULT_CONTRACT = "m6.release-install-result.v1"
+INSTALL_RESULT_CONTRACT_V2 = "m6.release-install-result.v2"
+API_COMPATIBILITY = "api-compatibility"
+INFERENCE_RECREATE = "inference-recreate"
+FULL_INSTALL = "full-install"
 _STAGE_TIMEOUT_SECONDS = 600
 _FETCH_TIMEOUT_SECONDS = 300
 _LAUNCHCTL_TIMEOUT_SECONDS = 30
@@ -178,7 +183,7 @@ def assert_launchd_jobs_unloaded(labels: tuple[str, ...]) -> dict[str, str]:
 
 
 def assert_idle_capacity_health(
-    payload: bytes, *, expected_capacity: MineruCapacityConfig, task_retention_seconds: int, cleanup_interval_seconds: int,
+    payload: bytes, *, expected_capacity: AnyMineruCapacityConfig, task_retention_seconds: int, cleanup_interval_seconds: int,
 ) -> dict[str, Any]:
     """Closed idle proof: the full explicit-capacity wire health with zero durable responsibility.
 
@@ -207,7 +212,7 @@ def assert_idle_capacity_health(
 
 
 def read_idle_health(
-    api_url: str, *, expected_capacity: MineruCapacityConfig | None, task_retention_seconds: int, cleanup_interval_seconds: int,
+    api_url: str, *, expected_capacity: AnyMineruCapacityConfig | None, task_retention_seconds: int, cleanup_interval_seconds: int,
 ) -> tuple[dict[str, Any], bytes, str]:
     """Return the health sample and which idle proof applied.
 
@@ -230,10 +235,36 @@ def read_idle_health(
     return health, raw, "legacy_gauges_only"
 
 
-def installation_binding_document(binding: ReleasePrivateBinding, *, api_device_profile: str, exclusivity_sha256: str) -> dict[str, Any]:
+def previous_capacity_for(report: VerifyReport, binding: ReleasePrivateBinding) -> AnyMineruCapacityConfig | None:
+    """The explicit capacity the running API must prove idle under, from exact bytes (None: legacy runtime)."""
+
+    expected = binding.windows.expected_previous_capacity_sha256
+    if expected is None:
+        return None
+    if expected == report.inputs.capacity.sha256:
+        return report.inputs.capacity
+    previous = binding.previous_capacity
+    if previous is None or previous.sha256 != expected:
+        raise ReleaseInputError("previous capacity bytes are required to prove idle under the previous explicit capacity")
+    return previous
+
+
+def installation_binding_document(
+    binding: ReleasePrivateBinding, *, api_device_profile: str,
+    exclusivity_sha256: str, operation_kind: str = API_COMPATIBILITY, legacy_scope_inventory_sha256: str | None = None,
+) -> dict[str, Any]:
+    if operation_kind not in (API_COMPATIBILITY, INFERENCE_RECREATE, FULL_INSTALL):
+        raise ReleaseInputError("installation operation kind is unsupported")
+    if (operation_kind == FULL_INSTALL) != (legacy_scope_inventory_sha256 is not None):
+        raise ReleaseInputError("full installation requires the zero-duty inventory identity only")
+    if legacy_scope_inventory_sha256 is not None:
+        require_sha256(legacy_scope_inventory_sha256, label="zero-duty inventory sha256")
     windows = binding.windows
-    return {
-        "contract_version": INSTALLATION_BINDING_CONTRACT,
+    document = {
+        "contract_version": (
+            "m6.installation-binding.v4" if operation_kind == FULL_INSTALL else INSTALLATION_BINDING_CONTRACT_V2 if operation_kind == INFERENCE_RECREATE
+            else INSTALLATION_BINDING_CONTRACT
+        ),
         "expected_hostname": windows.hostname,
         "api_device_profile": api_device_profile,
         "expected_active_compose_sha256": windows.expected_active_compose_sha256,
@@ -242,9 +273,14 @@ def installation_binding_document(binding: ReleasePrivateBinding, *, api_device_
         "job_cleanup_milliseconds": windows.job_cleanup_milliseconds,
         "mac_exclusivity_receipt_sha256": exclusivity_sha256,
     }
+    if operation_kind != API_COMPATIBILITY:
+        document["operation_kind"] = operation_kind
+    if operation_kind == FULL_INSTALL:
+        document["legacy_scope_inventory_sha256"] = legacy_scope_inventory_sha256
+    return document
 
 
-def stage_batch(report: VerifyReport, package: Path, remote_root: PureWindowsPath, binding_local: Path, binding_remote_dir: PureWindowsPath) -> str:
+def stage_batch(report: VerifyReport, package: Path, remote_root: PureWindowsPath, binding_local: Path, binding_remote_dir: PureWindowsPath, inventory_local: Path | None = None) -> str:
     directories = sorted({str(PureWindowsPath(entry.path).parent) for entry in report.manifest.files if "/" in entry.path})
     lines = [f"mkdir {_quoted(_sftp_path(remote_root))}"]
     for directory in directories:
@@ -254,15 +290,37 @@ def stage_batch(report: VerifyReport, package: Path, remote_root: PureWindowsPat
     lines.append(f"put {_quoted(str(package / MANIFEST_NAME))} {_quoted(_sftp_path(remote_root / MANIFEST_NAME))}")
     lines.append(f"mkdir {_quoted(_sftp_path(binding_remote_dir))}")
     lines.append(f"put {_quoted(str(binding_local))} {_quoted(_sftp_path(binding_remote_dir / 'installation-binding.json'))}")
+    if inventory_local is not None:
+        lines.append(f"put {_quoted(str(inventory_local))} {_quoted(_sftp_path(binding_remote_dir / 'legacy-scope-inventory.json'))}")
     return "\n".join(lines) + "\n"
 
 
-def install_release(*, report: VerifyReport, package: Path, binding: ReleasePrivateBinding, output: Path) -> dict[str, Any]:
+def install_release(
+    *, report: VerifyReport, package: Path, binding: ReleasePrivateBinding,
+    output: Path, operation_kind: str = API_COMPATIBILITY, legacy_scope_inventory_path: Path | None = None,
+) -> dict[str, Any]:
+    if operation_kind not in (API_COMPATIBILITY, INFERENCE_RECREATE, FULL_INSTALL):
+        raise ReleaseInputError("installation operation kind is unsupported")
     if not output.is_absolute() or output.exists() or output.is_symlink() or not output.parent.is_dir():
         raise ReleaseInputError("install output must be a new absolute directory under an existing parent")
     if not report.passed:
         raise ReleaseIdentityError("release package did not verify; refusing to install")
+    if (operation_kind == FULL_INSTALL) != (legacy_scope_inventory_path is not None):
+        raise ReleaseInputError("full installation requires an exact fresh zero-duty legacy-scope inventory")
     manifest = report.manifest
+    if operation_kind == FULL_INSTALL and (
+        binding.windows.expected_active_compose_sha256 is None or binding.windows.expected_previous_capacity_sha256 is None
+    ):
+        raise ReleaseInputError("full installation requires exact active compose and previous explicit capacity identities")
+    if operation_kind == INFERENCE_RECREATE and (
+        binding.windows.expected_active_compose_sha256 != manifest.projection["compose_sha256"]
+        or binding.windows.expected_previous_capacity_sha256 != report.inputs.capacity.sha256
+    ):
+        raise ReleaseIdentityError(
+            "inference recreation requires the already active release compose and capacity"
+        )
+    if report.inputs.deployment_profile.inference_diagnostic is not None and operation_kind not in (FULL_INSTALL, INFERENCE_RECREATE):
+        raise ReleaseInputError("diagnostic source changes require full installation; only exact same-config inference recreation is supported")
     output.mkdir(mode=0o700)
     started = datetime.now(UTC).isoformat(timespec="seconds")
     lock = acquire_exclusivity(binding.mac_exclusive_lock_path, holder={
@@ -275,14 +333,18 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
     try:
         assert_known_hosts_pins_address(binding)
         launchd = assert_launchd_jobs_unloaded(binding.launchd_labels)
-        previous_capacity = None
-        if binding.windows.expected_previous_capacity_sha256 is not None:
-            if binding.windows.expected_previous_capacity_sha256 == report.inputs.capacity.sha256:
-                previous_capacity = report.inputs.capacity
-            else:
-                previous_capacity = binding.previous_capacity
-                if previous_capacity is None or previous_capacity.sha256 != binding.windows.expected_previous_capacity_sha256:
-                    raise ReleaseInputError("previous capacity bytes are required to prove idle under the previous explicit capacity")
+        inventory_local = None
+        inventory_sha = None
+        if operation_kind == FULL_INSTALL:
+            from disclosure_anchor.adapters.runtime.mineru_same_root_maintenance import require_zero_duty_inventory
+            from disclosure_anchor.adapters.runtime.mineru_release_binding import _read_private
+            assert legacy_scope_inventory_path is not None
+            raw = _read_private(legacy_scope_inventory_path, label="zero-duty legacy scope inventory")
+            require_zero_duty_inventory(raw, now=datetime.now(UTC))
+            inventory_local = output / "legacy-scope-inventory.json"
+            write_new_exact(inventory_local, raw)
+            inventory_sha = sha256_of(raw)
+        previous_capacity = previous_capacity_for(report, binding)
         deployment = report.inputs.deployment_profile
         health_before, health_raw, idle_proof = read_idle_health(
             binding.api_url, expected_capacity=previous_capacity,
@@ -295,6 +357,7 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
             "lock_path": str(binding.mac_exclusive_lock_path), "pid": os.getpid(), "started_utc": started,
             "launchd": launchd, "api_health_before_sha256": sha256_of(health_raw), "idle_proof": idle_proof,
             "release_manifest_sha256": manifest.sha256,
+            **({"legacy_scope_inventory_sha256": inventory_sha} if inventory_sha is not None else {}),
         }
         exclusivity_raw = write_new_json(output / "mac-exclusivity.json", exclusivity)
         short = manifest.sha256[7:19]
@@ -305,12 +368,13 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
         remote = {"release_root": str(remote_root), "binding_dir": str(remote_binding_dir), "operation_dir": str(remote_operation)}
         install_binding = installation_binding_document(
             binding, api_device_profile=report.inputs.deployment_profile.api_device_profile,
-            exclusivity_sha256=sha256_of(exclusivity_raw),
+            exclusivity_sha256=sha256_of(exclusivity_raw), operation_kind=operation_kind,
+            legacy_scope_inventory_sha256=inventory_sha,
         )
         binding_local = output / "installation-binding.json"
         write_new_exact(binding_local, canonical_bytes(install_binding) + b"\n")
         batch = output / "stage.batch"
-        write_new_exact(batch, stage_batch(report, package, remote_root, binding_local, remote_binding_dir).encode("utf-8"))
+        write_new_exact(batch, stage_batch(report, package, remote_root, binding_local, remote_binding_dir, inventory_local).encode("utf-8"))
         staged = _run_owned(_sftp_argv(binding, batch), timeout_seconds=_STAGE_TIMEOUT_SECONDS, output=output, label="stage")
         if staged.exit_code != 0:
             raise ReleaseIdentityError(f"staging failed with sftp exit {staged.exit_code}; the remote directory may be partial and must not be reused")
@@ -353,7 +417,20 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
         else:
             daemon_side = str(operation.get("daemon_side_outcome", "unknown"))
             remote_status = operation.get("status")
-            if remote_status == "pass" and wrapper_exit == 0 and daemon_side == "verified":
+            if operation_kind == FULL_INSTALL and (
+                operation.get("contract_version") != "m6.installation-operation.v4"
+                or operation.get("operation_kind") != FULL_INSTALL
+                or operation.get("legacy_scope_inventory_sha256") != inventory_sha
+            ):
+                status = "unknown"
+                failure = failure or "Windows full-install result did not bind the zero-duty operation"
+            elif operation_kind == INFERENCE_RECREATE and (
+                operation.get("contract_version") != "m6.installation-operation.v2"
+                or operation.get("operation_kind") != INFERENCE_RECREATE
+            ):
+                status = "unknown"
+                failure = failure or "Windows inference-recreate result did not bind the requested operation"
+            elif remote_status == "pass" and wrapper_exit == 0 and daemon_side == "verified":
                 health_after, health_after_raw, _ = read_idle_health(
                     binding.api_url, expected_capacity=report.inputs.capacity,
                     task_retention_seconds=deployment.api_task_retention_seconds,
@@ -374,7 +451,10 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
     finally:
         lock.release()
     summary = {
-        "contract_version": INSTALL_RESULT_CONTRACT,
+        "contract_version": (
+            "m6.release-install-result.v3" if operation_kind == FULL_INSTALL else INSTALL_RESULT_CONTRACT_V2 if operation_kind == INFERENCE_RECREATE
+            else INSTALL_RESULT_CONTRACT
+        ),
         "status": status,
         "first_error": failure,
         "daemon_side_outcome": daemon_side,
@@ -390,18 +470,25 @@ def install_release(*, report: VerifyReport, package: Path, binding: ReleasePriv
         "started_utc": started,
         "finished_utc": datetime.now(UTC).isoformat(timespec="seconds"),
     }
+    if operation_kind != API_COMPATIBILITY:
+        summary["operation_kind"] = operation_kind
     write_new_json(output / "install-result.json", summary)
     return summary
 
 
 __all__ = [
     "INSTALLATION_BINDING_CONTRACT",
+    "INSTALLATION_BINDING_CONTRACT_V2",
     "INSTALL_RESULT_CONTRACT",
+    "INSTALL_RESULT_CONTRACT_V2",
+    "API_COMPATIBILITY",
+    "INFERENCE_RECREATE",
     "InstallationOutcomeUnknown",
     "acquire_exclusivity",
     "assert_launchd_jobs_unloaded",
     "install_release",
     "installation_binding_document",
+    "previous_capacity_for",
     "read_idle_health",
     "stage_batch",
 ]

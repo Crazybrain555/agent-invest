@@ -1,6 +1,7 @@
 """Real protocol/ZIP/reader composition with an offline synthetic provider."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 import hashlib
 import io
@@ -8,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -19,9 +21,12 @@ from disclosure_anchor.adapters.parsers.mineru_medium.artifacts import PinnedArt
 from disclosure_anchor.adapters.runtime.mineru_diagnostic import (
     run_diagnostic_pdf, validate_diagnostic_disposal,
 )
+from disclosure_anchor.application.contracts.mineru_api_health import MINERU_API_RESULT_RESERVATION_BYTES
+from disclosure_anchor.application.contracts.mineru_capacity_config import MineruResultStoragePolicy
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.domain.errors import ParserOutputContractError
 from tests._mineru_diagnostic_fixture import diagnostic_disposal_fixture
+from tests.unit.test_mineru_materialize_grant_v5 import synthetic_storage_policy
 from tests.unit.test_mineru_medium_artifacts import _write_bundle
 
 
@@ -57,12 +62,19 @@ class _Provider:
         )
         self.fields: dict[str, str] = {}
         self.acked = False
+        # A storage-managed runtime names its policy in every reply; it may also
+        # declare a retained-result size other than the bytes it serves.
+        self.storage_policy_sha256: str | None = None
+        self.declared_bytes: int | None = None
+        self.lease_seconds: list[str | None] = []
 
     def response(self, status: int, value: object) -> httpx.Response:
         return httpx.Response(status, stream=httpx.ByteStream(json.dumps(value).encode()))
 
     def payload(self, status: str) -> dict[str, object]:
-        return {
+        completed = status == "completed"
+        size = len(self.archive) if self.declared_bytes is None else self.declared_bytes
+        value: dict[str, object] = {
             "task_id": "task-1", "status": status, "protocol_state": status,
             "status_url": "http://mineru.invalid/tasks/task-1",
             "result_url": "http://mineru.invalid/tasks/task-1/result",
@@ -70,11 +82,26 @@ class _Provider:
             "idempotency_key": self.fields["agent_idempotency_key"],
             "attempt_identity": self.fields["agent_attempt_identity"],
             "fence_identity": ("wrong-fence" if self.failure == "identity" else self.fields["agent_fence_identity"]),
-            "result_artifact_schema": "mineru-retained-result.v1" if status == "completed" else None,
-            "result_artifact_sha256": self.archive_sha if status == "completed" else None,
-            "result_artifact_bytes": len(self.archive) if status == "completed" else None,
-            "result_artifact_owner": self.owner if status == "completed" else None,
+            "result_artifact_schema": "mineru-retained-result.v1" if completed else None,
+            "result_artifact_sha256": self.archive_sha if completed else None,
+            "result_artifact_bytes": size if completed else None,
+            "result_artifact_owner": canonical_result_owner_v2(
+                task_id="task-1", artifact_sha256=self.archive_sha, artifact_byte_count=size,
+            ) if completed else None,
         }
+        if self.storage_policy_sha256 is not None:
+            with zipfile.ZipFile(io.BytesIO(self.archive)) as archive:
+                members = archive.infolist()
+            value["storage"] = {
+                "schema": "mineru.task-storage-status.v1", "policy_sha256": self.storage_policy_sha256,
+                "phase": "zip_sealed" if completed else "admitted",
+                "wait_reason": None, "wait_since_unix": None, "blocked": False,
+                "selected_bytes": sum(item.file_size for item in members) if completed else 0,
+                "member_count": len(members) if completed else 0,
+                "inventory_sha256": "sha256:" + "c" * 64 if completed else None,
+                "zip_bytes": size if completed else 0,
+            }
+        return value
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -98,6 +125,7 @@ class _Provider:
         if path == "/tasks/task-1":
             return self.response(200, self.payload("failed" if self.failure == "remote_failure" else "completed"))
         if path.endswith("/lease"):
+            self.lease_seconds.append(request.url.params.get("seconds"))
             return self.response(200, {"schema": "mineru-task-protocol.v2", "task_id": "task-1",
                                        "lease_until_unix": 1 if self.failure == "expired_lease" else 1_000_000})
         if path.endswith("/result"):
@@ -122,14 +150,18 @@ class _Provider:
             return self.response(404, {"detail": "wrong" if self.failure == "absence" else "Task not found"})
         raise AssertionError(path)
 
-    def run(self, *, pages: int = 2, reconcile: bool = False) -> tuple[dict[str, object], dict[str, object]]:
+    def run(
+        self, *, pages: int = 2, reconcile: bool = False,
+        result_storage_policy: MineruResultStoragePolicy | None = None,
+        timeout_seconds: int = 60, monotonic: Callable[[], float] = time.monotonic,
+    ) -> tuple[dict[str, object], dict[str, object]]:
         return run_diagnostic_pdf(
             input_pdf=self.source, source_pdf_sha256=self.source_sha, source_page_count=pages,
             api_url="http://mineru.invalid", server_url="http://vlm.invalid/v1",
-            options=ParserOptions(runtime_bundle_identity_sha256=RUNTIME, timeout_seconds=60),
+            options=ParserOptions(runtime_bundle_identity_sha256=RUNTIME, timeout_seconds=timeout_seconds),
             journal_root=self.journal, transport=httpx.MockTransport(self.handle),
-            unix_time=lambda: 1000.0, pause=lambda _: None,
-            reconcile_submitted=reconcile,
+            monotonic=monotonic, unix_time=lambda: 1000.0, pause=lambda _: None,
+            reconcile_submitted=reconcile, result_storage_policy=result_storage_policy,
         )
 
 
@@ -209,8 +241,68 @@ class MinerUDiagnosticTests(unittest.TestCase):
                 source_page_count=2, provider_bundle_sha256=str(evidence["provider_bundle_sha256"]),
             )
             self.assertEqual(provider.calls.count(("POST", "/tasks")), 1)
+            # The legacy runtime keeps its native default lease duration.
+            self.assertEqual(provider.lease_seconds, [None])
             for record in provider.journal.iterdir():
                 self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+
+    def test_storage_bound_diagnostic_disposes_under_its_policy_with_a_bounded_lease(self) -> None:
+        policy = synthetic_storage_policy()
+        for timeout in (60, 7200):
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as tmp:
+                provider = _Provider(Path(tmp))
+                provider.storage_policy_sha256 = policy.sha256
+                evidence, disposal = provider.run(
+                    result_storage_policy=policy, timeout_seconds=timeout, monotonic=lambda: 0.0,
+                )
+                self.assertEqual(evidence["page_count"], 2)
+                self.assertEqual(disposal["terminal_artifact_bytes"], len(provider.archive))
+                self.assertTrue(provider.acked)
+                self.assertEqual(provider.calls.count(("POST", "/tasks")), 1)
+                self.assertEqual(provider.calls.count(("POST", "/tasks/task-1/ack")), 1)
+                self.assertFalse((provider.journal / "resources").exists())
+                self.assertTrue((provider.journal / "06-disposed.json").is_file())
+                terminal = json.loads((provider.journal / "03-terminal.json").read_bytes())
+                self.assertEqual(terminal["storage"]["policy_sha256"], policy.sha256)
+                # The whole remaining deadline, never beyond the native 3600 s route bound.
+                self.assertEqual(provider.lease_seconds, [str(min(timeout, 3600))])
+
+    def test_storage_binding_disagreement_refuses_before_any_lease_or_ack(self) -> None:
+        policy = synthetic_storage_policy()
+        for label, served, bound in (
+            ("other_policy", "sha256:" + "0" * 64, policy),
+            ("unbound_client", policy.sha256, None),
+            ("legacy_runtime", None, policy),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                provider = _Provider(Path(tmp))
+                provider.storage_policy_sha256 = served
+                with self.assertRaises(ValueError):
+                    provider.run(result_storage_policy=bound)
+                self.assertFalse(provider.acked)
+                self.assertEqual(provider.calls, [("POST", "/tasks")])
+                self.assertFalse((provider.journal / "02-accepted.json").exists())
+                self.assertTrue((provider.journal / "resources" / "source.pdf").is_file())
+
+    def test_storage_bound_result_limit_is_the_policy_hard_limit(self) -> None:
+        policy = synthetic_storage_policy()
+        limit = policy.native_result_hard_limit_bytes
+        self.assertLess(limit + 1, MINERU_API_RESULT_RESERVATION_BYTES)
+        for label, declared, bound, admitted in (
+            ("at_policy_limit", limit, policy, True),
+            ("above_policy_limit", limit + 1, policy, False),
+            ("legacy_reservation", limit + 1, None, True),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                provider = _Provider(Path(tmp))
+                provider.storage_policy_sha256 = None if bound is None else policy.sha256
+                provider.declared_bytes = declared
+                # The served ZIP never matches the declared size, so no case can dispose.
+                with self.assertRaises(ValueError):
+                    provider.run(result_storage_policy=bound)
+                self.assertEqual(("POST", "/tasks/task-1/lease") in provider.calls, admitted)
+                self.assertFalse(provider.acked)
+                self.assertTrue((provider.journal / "resources").is_dir())
 
     def test_pre_disposal_failures_preserve_resources_and_never_ack(self) -> None:
         for failure in ("identity", "remote_failure", "expired_lease", "zip_hash", "unsafe_zip"):

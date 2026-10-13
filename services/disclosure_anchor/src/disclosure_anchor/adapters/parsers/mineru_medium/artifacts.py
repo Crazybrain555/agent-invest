@@ -152,6 +152,18 @@ class PinnedArtifactReadResult:
     artifact_root_relpath: PurePosixPath
 
 
+@dataclass(frozen=True, slots=True)
+class PinnedArtifactLocation:
+    """Where one MinerU output lives in a tree, from file metadata only.
+
+    ``decode_input_bytes`` is the size of the JSON files the one real read
+    decodes: the input a decode working-set budget must bound.
+    """
+
+    artifact_root_relpath: PurePosixPath
+    decode_input_bytes: int
+
+
 class PinnedArtifactTree:
     """Immutable-by-verification view over an already published output tree.
 
@@ -1550,6 +1562,31 @@ class MinerUMediumArtifactReader:
     ) -> PinnedArtifactReadResult:
         return self._read_pinned(
             tree, source_pdf_sha256=source_pdf_sha256, parser_files=tree.files
+        )
+
+    def locate_pinned(
+        self, tree: PinnedArtifactTree, *, source_pdf_sha256: str
+    ) -> PinnedArtifactLocation:
+        """Find the output root and its decode input without decoding anything.
+
+        The same single-content-list, source-stem and required-role checks the
+        full read starts with; the full read later proves every content.
+        """
+        if not _SHA256_RE.fullmatch(source_pdf_sha256):
+            raise ParserOutputContractError("source PDF sha256 must be canonical")
+        content_file = _locate_content_list_pinned(tree)
+        artifact_root = content_file.relative_path.parent
+        stem = content_file.relative_path.name.removesuffix("_content_list.json")
+        if stem != source_pdf_sha256.replace("sha256:", "sha256_", 1):
+            raise ParserOutputContractError(
+                "MinerU content-list stem does not match the source PDF sha256"
+            )
+        decode_input = content_file.size_bytes
+        for suffix in _REQUIRED_SUFFIXES.values():
+            decode_input += tree.require_file(artifact_root / f"{stem}{suffix}").size_bytes
+        tree.verify_unchanged()
+        return PinnedArtifactLocation(
+            artifact_root_relpath=artifact_root, decode_input_bytes=decode_input,
         )
 
     def read_published(

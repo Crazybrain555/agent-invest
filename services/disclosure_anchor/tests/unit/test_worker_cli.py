@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,15 +18,50 @@ from disclosure_anchor.application.dto.worker_report import (
 )
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.services.staged_parse_coordinator import (
+    CapacityHoldDetail,
+    CapacityHoldEvent,
     CoordinatorTerminal,
+    StagedParseCoordinator,
 )
 from disclosure_anchor.adapters.runtime.mineru_deployment_gate import (
     MinerUDeploymentGateError,
     MinerUDeploymentUnavailableError,
 )
+from disclosure_anchor.application.contracts.atomic_document_publication_v4 import (
+    PublicationEnvelopeExceededError,
+)
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+)
 from disclosure_anchor.cli import worker as worker_cli
 from disclosure_anchor.domain.errors import ConfigurationError
+from disclosure_anchor.application.ports.worker_stop_control import PublicStopCause
+from disclosure_anchor.application.services.worker_stop_latch import InProcessWorkerStopLatch
 from disclosure_anchor.settings import Settings
+from tests.unit._codex_model_catalog_fixture import prepare_catalog_sha256
+from tests.unit.test_staged_completion_credit import _run as _run_to_end
+from tests.unit.test_staged_coordinator_backend_v4 import _backend_with_publisher_error
+from tests.unit.test_staged_parse_coordinator import _Backend, _limits
+from tests.unit.test_staged_parse_coordinator import _work as _coordinator_work
+
+
+def _unstopped_settings(test: unittest.TestCase) -> mock.MagicMock:
+    """Settings over a trusted temp runtime root with no stop recorded.
+
+    The worker start gate reads the real control directory before any DB or
+    MinerU work; this root is 0700, owned by the test user and never the
+    supervised root, so the gate is RUNNABLE and never runs launchctl.
+    """
+
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    runtime_root = Path(directory.name) / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    runtime_root.chmod(0o700)
+    return mock.MagicMock(
+        disclosure_runtime_root=runtime_root,
+        disclosure_worker_supervised_runtime_root=Path(directory.name) / "supervised-elsewhere",
+    )
 
 
 def _report(**values: int | bool) -> WorkerReport:
@@ -525,6 +563,9 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 disclosure_data_root=root / "service",
                 disclosure_shared_root=root / "shared",
                 disclosure_runtime_root=root / "service" / "runtime",
+                disclosure_semantic_codex_model_catalog_sha256=prepare_catalog_sha256(
+                    root / "service" / "runtime"
+                ),
                 mineru_model_cache=root / "shared" / "mineru",
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
@@ -554,6 +595,9 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 disclosure_data_root=root / "service",
                 disclosure_shared_root=root / "shared",
                 disclosure_runtime_root=root / "service" / "runtime",
+                disclosure_semantic_codex_model_catalog_sha256=prepare_catalog_sha256(
+                    root / "service" / "runtime"
+                ),
                 mineru_model_cache=root / "shared" / "mineru",
                 hf_home=root / "shared" / "hf",
                 modelscope_cache=root / "shared" / "modelscope",
@@ -763,7 +807,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         engine.dispose.assert_called_once_with()
 
     def test_once_rejects_runtime_role_before_advisory_lock(self) -> None:
-        settings = mock.MagicMock()
+        settings = _unstopped_settings(self)
         checker = mock.MagicMock(spec=worker_cli.MinerUDeploymentChecker)
         lock_conn = mock.MagicMock()
         lock_engine = mock.MagicMock()
@@ -810,9 +854,13 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         checker.assert_not_called()
         create_engine.assert_not_called()
 
-    def test_staged_loop_drains_legacy_tails_without_legacy_parse_reclaim(
-        self,
-    ) -> None:
+    def test_staged_loop_drains_legacy_tails_without_legacy_parse_reclaim(self) -> None:
+        self._assert_staged_loop(drain_existing=False)
+
+    def test_drain_existing_disables_maintenance_but_keeps_startup_and_resident(self) -> None:
+        self._assert_staged_loop(drain_existing=True)
+
+    def _assert_staged_loop(self, *, drain_existing: bool) -> None:
         stop = mock.MagicMock()
         stop.is_set.return_value = False
         engine = mock.MagicMock()
@@ -820,6 +868,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         deps.config.process_scope_classes = ("annual_report",)
         settings = mock.MagicMock(
             worker_parse_execution_mode="staged-v4",
+            worker_drain_existing=drain_existing,
             worker_loop_interval_seconds=900,
             worker_loop_max_interval_seconds=1800,
             worker_wedge_timeout_seconds=0,
@@ -835,7 +884,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
             mock.patch.object(worker_cli, "_deps", return_value=deps),
             mock.patch.object(worker_cli, "_limits", return_value=limits),
             mock.patch.object(worker_cli, "_emit_progress_snapshot"),
-            mock.patch.object(worker_cli, "_run_maintenance_loop"),
+            mock.patch.object(worker_cli, "_run_maintenance_loop") as maintenance,
             mock.patch.object(worker_cli, "_run_startup_recovery") as recovery,
             mock.patch.object(worker_cli, "run_resident_parse") as legacy_parse,
             mock.patch.object(worker_cli, "_run_staged_v4_resident") as staged_parse,
@@ -846,6 +895,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 progress_output="off",
             )
 
+        self.assertEqual(maintenance.call_count, 0 if drain_existing else 1)
         self.assertEqual(result, 0)
         recovery.assert_called_once()
         self.assertFalse(recovery.call_args.kwargs["reclaim_running"])
@@ -910,8 +960,58 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         work_available.wait.assert_called_once_with(timeout=900)
         runtime.close.assert_called_once_with()
 
+    def test_drain_status_marks_configuration_without_claiming_live_mode(self) -> None:
+        settings = mock.MagicMock(worker_drain_existing=True)
+        engine = mock.MagicMock()
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with (mock.patch.object(worker_cli, "require_worker_start_permitted"),
+              mock.patch.object(worker_cli, "create_db_engine", return_value=engine),
+              mock.patch.object(worker_cli, "require_runtime_app_engine"),
+              mock.patch.object(worker_cli, "collect_worker_progress"),
+              mock.patch.object(worker_cli, "_process_scope_classes", return_value=None),
+              mock.patch.object(worker_cli, "render_worker_progress_json", return_value='{"existing": true}'),
+              redirect_stderr(stderr), redirect_stdout(stdout)):
+            self.assertEqual(worker_cli._print_worker_status(settings, output_format="json"), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {"existing": True})
+        self.assertIn("configured_maintenance_mode=drain_existing", stderr.getvalue())
+        self.assertIn("configuration only", stderr.getvalue())
+        engine.dispose.assert_called_once_with()
+
+    def test_drain_resident_waits_after_quiescence_and_keeps_public_fault_visible(self) -> None:
+        for fault in (False, True):
+            with self.subTest(fault=fault):
+                runtime = mock.MagicMock()
+                result = mock.MagicMock(terminal=CoordinatorTerminal.QUIESCENT, errors=())
+                runtime.coordinator.run.side_effect = ([RuntimeError("durable head unreadable")] if fault else [result, result])
+                settings = mock.MagicMock(worker_drain_existing=True, worker_loop_interval_seconds=900,
+                                         disclosure_mineru_stream_pressure_config=None,
+                                         disclosure_mineru_stream_pressure_config_sha256=None)
+                event = mock.MagicMock()
+                control = InProcessWorkerStopLatch()
+                stdout = io.StringIO()
+                with (mock.patch("disclosure_anchor.adapters.runtime.staged_worker_v4.build_staged_worker_v4_runtime",
+                                 return_value=runtime), redirect_stdout(stdout)):
+                    args = dict(engine=mock.MagicMock(), deps=mock.MagicMock(),
+                                should_stop=mock.Mock(side_effect=[False, False, False, True]),
+                                ownership_guard=lambda: None, admission_guard=lambda: None,
+                                work_available=event, prune_tracker=worker_cli._ProjectionPruneTracker(),
+                                progress_output="off", stop_control=control)
+                    if fault:
+                        with self.assertRaisesRegex(RuntimeError, "durable head unreadable"):
+                            worker_cli._run_staged_v4_resident(settings, **args)
+                        self.assertIsNotNone(control.first_cause())
+                        event.wait.assert_not_called()
+                    else:
+                        worker_cli._run_staged_v4_resident(settings, **args)
+                        self.assertEqual(runtime.coordinator.run.call_count, 2)
+                        event.wait.assert_called_once_with(timeout=900)
+                        self.assertIsNone(control.first_cause())
+                self.assertIn("maintenance=drain_existing ordinary_admission=disabled acquisition=disabled", stdout.getvalue())
+                runtime.verify_startup.assert_called_once_with()
+                runtime.close.assert_called_once_with()
+
     def test_once_static_mineru_gate_fails_before_database_connection(self) -> None:
-        settings = mock.MagicMock()
+        settings = _unstopped_settings(self)
         gate_error = MinerUDeploymentGateError("GPU identity unavailable")
 
         with (
@@ -958,10 +1058,14 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
                 ):
                     worker_cli.run_resident_worker(settings)
 
+                # The resident loop is the one executor that threads a verified
+                # local-upgrade context to every boundary, so it alone asks the
+                # same gate to accept one (it still refuses without proof).
                 checker.assert_called_once_with(
                     settings,
                     parse_enabled=True,
                     process_profile=(profile if mode == "staged-v4" else None),
+                    accept_execution_upgrade=True,
                 )
                 if mode == "staged-v4":
                     profile_loader.assert_called_once_with(settings)
@@ -1122,6 +1226,7 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
         terminate_semantic.assert_called_once_with()
 
     def test_wedge_exit_terminates_parser_groups_before_hard_exit(self) -> None:
+        self.addCleanup(worker_cli._WEDGED_EXIT.clear)
         events: list[object] = []
         with (
             mock.patch.object(
@@ -1146,3 +1251,226 @@ class ResidentLoopBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchdogStopCauseAcceptanceTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        marker = getattr(worker_cli, "_WEDGED_EXIT", None)
+        if marker is not None:
+            marker.clear()
+
+    def _simulate_watchdog_exit(self, events: list[object]) -> None:
+        with (
+            mock.patch.object(worker_cli, "terminate_active_mineru_processes",
+                              side_effect=lambda: events.append("mineru")),
+            mock.patch.object(worker_cli, "terminate_active_semantic_processes",
+                              side_effect=lambda: events.append("semantic")),
+            mock.patch("os._exit", side_effect=lambda code: events.append(("exit", code))),
+        ):
+            worker_cli._exit_wedged_worker()
+        self.assertEqual(events, ["mineru", "semantic", ("exit", 70)])
+
+    def test_watchdog_induced_cancellation_never_creates_public_stop(self) -> None:
+        persisted: list[PublicStopCause] = []
+        control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+        events: list[object] = []
+        self._simulate_watchdog_exit(events)
+        result = mock.Mock(termination_kind="circuit", errors=("semantic:cancelled:watchdog",))
+        with (
+            redirect_stderr(io.StringIO()),
+            redirect_stdout(io.StringIO()),
+            self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+        ):
+            worker_cli._end_staged_resident(result, control, lambda: False)
+        self.assertIsNone(raised.exception.cause)
+        worker_cli._trip_worker_fault(
+            control, RuntimeError("child exited during watchdog cleanup"),
+            kind="maintenance_fatal", origin="maintenance", reason_code="maintenance_loop_failed",
+        )
+        self.assertIsNone(control.first_cause())
+        self.assertEqual(persisted, [])
+
+    def test_a_publication_hold_alone_stops_once_and_logs_only_its_typed_diagnostics(self) -> None:
+        # The real coordinator dispatches COMMIT into the real V4 backend, whose
+        # publisher refuses a record: the attempt holds with nothing written,
+        # nothing else can progress, and the site stops once. The exit logs
+        # the typed records, never the coordinator's error entries.
+        policy = PUBLICATION_ENVELOPE_POLICY_V1
+        prefix = "[staged-v4] diagnostic "
+        for record_kind, bound, byte_count in (
+            ("request", "exact", policy.request_bytes + 1),
+            # The plan's conservative winner bound: its refusal is named as an
+            # upper bound, not as the size of a winner P would write.
+            ("winner", "upper_bound", policy.winner_bytes + 4096),
+        ):
+            with self.subTest(bound=bound):
+                capacity = policy.exceeded(record_kind, byte_count, bound=bound)
+                assert capacity is not None
+                authority, v4, persistence, publication_committed = _backend_with_publisher_error(
+                    PublicationEnvelopeExceededError(capacity)
+                )
+
+                class _Queue(_Backend):
+                    def commit(self, work, *, credit_allowance, stage_guard):  # type: ignore[no-untyped-def]
+                        self.calls.append(f"commit:{work.attempt_id}")
+                        return v4.commit(work, credit_allowance=credit_allowance, stage_guard=stage_guard)
+
+                queue = _Queue(recoverable=(
+                    _coordinator_work(authority.attempt_id, "local_materialized", authority.lifecycle_version),
+                ))
+                persisted: list[PublicStopCause] = []
+                latch = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+                result = _run_to_end(StagedParseCoordinator(backend=queue, limits=_limits(), stop_control=latch))
+                cause = latch.first_cause()
+                assert cause is not None, result
+                self.assertEqual((cause.reason_code, cause.attempt_id, cause.lane),
+                                 ("capacity_holds_exhausted", authority.attempt_id, "commit"))
+                self.assertEqual(persisted, [cause])
+                self.assertEqual(persistence.appends, [])
+                publication_committed.assert_not_called()
+
+                stderr = io.StringIO()
+                with (
+                    redirect_stderr(stderr),
+                    redirect_stdout(io.StringIO()),
+                    self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+                ):
+                    worker_cli._end_staged_resident(result, latch, lambda: False)
+                self.assertIs(raised.exception.cause, cause)
+                lines = stderr.getvalue().splitlines()
+                self.assertTrue(all(line.startswith(prefix) and line.isascii() for line in lines), lines)
+                hold, stop = (json.loads(line[len(prefix):]) for line in lines)
+                self.assertEqual(
+                    {key: hold[key] for key in ("event", "attempt_id", "lane", "state", "dimensions", "site_stop")},
+                    {"event": "capacity_hold", "attempt_id": authority.attempt_id, "lane": "commit",
+                     "state": "local_materialized", "dimensions": ["publication_envelope"], "site_stop": False},
+                )
+                self.assertEqual(hold["detail"], {
+                    "bound": bound, "byte_count": byte_count, "limit": policy.limit(record_kind),
+                    "policy_sha256": policy.identity, "record_kind": record_kind,
+                })
+                self.assertEqual(hold["exception_fingerprint"], cause.exception_fingerprint)
+                self.assertEqual(
+                    (stop["event"], stop["reason_code"], stop["hold_count"], stop["holds"]),
+                    ("no_progress", "capacity_holds_exhausted", 1, [hold]),
+                )
+                self.assertIn(f"{authority.attempt_id}:commit:stage_capacity_hold:publication_envelope",
+                              result.errors)
+                for error in result.errors:
+                    self.assertNotIn(error, stderr.getvalue())
+                exit_stderr = io.StringIO()
+                with redirect_stderr(exit_stderr):
+                    self.assertEqual(worker_cli._public_stop_exit(latch), 78)
+                self.assertIn("capacity_holds_exhausted", exit_stderr.getvalue())
+
+    def test_an_unlatched_circuit_latches_before_logging_and_logs_only_exact_typed_records(self) -> None:
+        # Any circuit without a latched cause is still a public stop; nothing
+        # it logs, and no failure to log, can keep that stop from latching.
+        secret = "sk-live-HOLDSECRET /Volumes/AgentSSD/secret/request.json 业绩预告正文"
+        policy = PUBLICATION_ENVELOPE_POLICY_V1
+        event = CapacityHoldEvent(
+            attempt_id="rpa_big", lane="commit", state="local_materialized", lifecycle_version=6,
+            dimensions=("publication_envelope",), site_stop=False,
+            detail=CapacityHoldDetail(record_kind="unit", byte_count=policy.unit_bytes + 7,
+                                      limit=policy.unit_bytes, bound="lower_bound",
+                                      policy_sha256=policy.identity),
+        )
+        forged = mock.Mock(to_payload=lambda: {"event": "capacity_hold", "detail": secret})
+        entry = "[staged-v4] diagnostic " + json.dumps(event.to_payload(), sort_keys=True)
+
+        class _BrokenStream(io.StringIO):
+            def write(self, _text: str) -> int:
+                raise OSError("stderr is gone")
+
+        cases = {
+            "unrelated circuit": (
+                mock.Mock(termination_kind="circuit", errors=("ordinary failure",)), io.StringIO(), None, [],
+            ),
+            "typed record beside forged ones": (
+                mock.MagicMock(termination_kind="circuit", errors=(f"rpa_big:commit:RuntimeError:{secret}",),
+                               diagnostics=(forged, event, secret)),
+                io.StringIO(), None, [entry, "[staged-v4] diagnostic omitted=2"],
+            ),
+            "record that cannot encode": (
+                mock.MagicMock(termination_kind="circuit", errors=(), diagnostics=(event,)),
+                io.StringIO(), RuntimeError(secret), ["[staged-v4] diagnostic omitted=1"],
+            ),
+            "broken log stream": (
+                mock.MagicMock(termination_kind="circuit", errors=(), diagnostics=(event,)),
+                _BrokenStream(), None, None,
+            ),
+            "malformed result": (
+                mock.Mock(termination_kind="circuit", errors=5, diagnostics=[event]),
+                io.StringIO(), None, [],
+            ),
+        }
+        for label, (result, stream, encode_error, expected) in cases.items():
+            with self.subTest(label):
+                persisted: list[PublicStopCause] = []
+                control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+                with (
+                    mock.patch.object(CapacityHoldEvent, "to_payload", side_effect=encode_error)
+                    if encode_error is not None else nullcontext(),
+                    redirect_stderr(stream),
+                    self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+                ):
+                    worker_cli._end_staged_resident(result, control, lambda: False)
+                cause = control.first_cause()
+                assert cause is not None
+                self.assertEqual(cause.reason_code, "unclassified_circuit")
+                self.assertIs(raised.exception.cause, cause)
+                self.assertEqual(persisted, [cause])
+                if expected is not None:
+                    self.assertEqual(stream.getvalue().splitlines(), expected)
+                    self.assertNotIn("HOLDSECRET", stream.getvalue())
+
+    def test_genuine_preexisting_first_cause_survives_watchdog_cleanup(self) -> None:
+        persisted: list[PublicStopCause] = []
+        control = InProcessWorkerStopLatch(on_first_trip=persisted.append)
+        genuine = PublicStopCause(
+            kind="stage_fault", reason_code="semantic_failed_closed", origin="stage_call"
+        )
+        control.trip(genuine)
+        self._simulate_watchdog_exit([])
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(worker_cli.WorkerPublicStopError) as raised,
+        ):
+            worker_cli._end_staged_resident(
+                mock.Mock(termination_kind="circuit", errors=("later cancellation",)),
+                control, lambda: False,
+            )
+        self.assertIs(raised.exception.cause, genuine)
+        self.assertIs(control.first_cause(), genuine)
+        self.assertEqual(persisted, [genuine])
+
+    def test_watchdog_marks_exit_before_terminating_children(self) -> None:
+        seen: list[bool] = []
+        def observe() -> None:
+            marker = getattr(worker_cli, "_WEDGED_EXIT", None)
+            seen.append(marker is not None and marker.is_set())
+        with (
+            mock.patch.object(worker_cli, "terminate_active_mineru_processes", side_effect=observe),
+            mock.patch.object(worker_cli, "terminate_active_semantic_processes", side_effect=observe),
+            mock.patch("os._exit"),
+        ):
+            worker_cli._exit_wedged_worker()
+        self.assertEqual(seen, [True, True])
+
+    def test_cleanup_failure_still_attempts_exit_70(self) -> None:
+        for failing_cleanup in ("mineru", "semantic"):
+            with self.subTest(failing_cleanup=failing_cleanup):
+                mineru_error = RuntimeError("mineru cleanup failed") if failing_cleanup == "mineru" else None
+                semantic_error = RuntimeError("semantic cleanup failed") if failing_cleanup == "semantic" else None
+                with (
+                    mock.patch.object(worker_cli, "terminate_active_mineru_processes",
+                                      side_effect=mineru_error),
+                    mock.patch.object(worker_cli, "terminate_active_semantic_processes",
+                                      side_effect=semantic_error),
+                    mock.patch("os._exit") as exit_process,
+                ):
+                    try:
+                        worker_cli._exit_wedged_worker()
+                    except RuntimeError:
+                        pass
+                exit_process.assert_called_once_with(70)

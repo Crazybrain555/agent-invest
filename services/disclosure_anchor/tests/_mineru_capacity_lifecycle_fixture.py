@@ -40,9 +40,10 @@ UPLOAD_BYTES = b"synthetic-unparsed-admission-ownership-fixture\n"
 class BoundaryHTTPException(Exception):
     """Only the HTTP exception transport surface; no admission behavior."""
 
-    def __init__(self, *, status_code, detail):
+    def __init__(self, *, status_code, detail, headers=None):
         self.status_code = status_code
         self.detail = detail
+        self.headers = headers
         super().__init__(detail)
 
 

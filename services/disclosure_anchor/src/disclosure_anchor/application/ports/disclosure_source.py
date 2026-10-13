@@ -72,6 +72,42 @@ class SourceCompanyProfile:
     uscc: str | None
 
 
+class PdfDownloadSink(Protocol):
+    """Destination for the body of one logical PDF download.
+
+    The source adapter owns transfer completion; the sink owns the bytes,
+    their hash and local capacity. ``begin_attempt`` precedes every attempt's
+    first body byte and discards whatever an earlier attempt wrote, so a retry
+    never appends to a partial body. ``declared_byte_count`` is the framed
+    body length when the response declared one; it is an early hint, never a
+    substitute for counting the bytes actually written.
+    """
+
+    def begin_attempt(self, *, declared_byte_count: int | None) -> None:
+        ...
+
+    def write(self, chunk: bytes) -> None:
+        ...
+
+
+@dataclass(frozen=True)
+class CompletedPdfTransfer:
+    """The final attempt's body reached EOF within the logical download budget.
+
+    ``byte_count`` is what that attempt wrote into the sink after its
+    ``begin_attempt``; ``declared_byte_count`` is the length it announced.
+    """
+
+    byte_count: int
+    declared_byte_count: int | None
+
+    def __post_init__(self) -> None:
+        if self.byte_count < 0:
+            raise ValueError("completed transfer byte_count must be non-negative")
+        if self.declared_byte_count is not None and self.declared_byte_count < 0:
+            raise ValueError("declared_byte_count must be non-negative")
+
+
 class DisclosureSourcePort(Protocol):
     """Provider adapter boundary for index search and PDF download."""
 
@@ -82,5 +118,12 @@ class DisclosureSourcePort(Protocol):
     ) -> list[AnnouncementRef]:
         ...
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+    def download_pdf_to(
+        self, ref: AnnouncementRef, sink: PdfDownloadSink
+    ) -> CompletedPdfTransfer:
+        """Stream the PDF body into ``sink``; return only after a complete body.
+
+        Provider and deadline failures raise ``SourceRequestError``; errors
+        raised by the sink propagate unchanged.
+        """
         ...

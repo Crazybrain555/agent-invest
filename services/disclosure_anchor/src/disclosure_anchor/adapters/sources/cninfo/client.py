@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 import logging
 import random
@@ -11,6 +11,10 @@ from typing import Any
 
 import httpx
 
+from disclosure_anchor.application.ports.disclosure_source import (
+    CompletedPdfTransfer,
+    PdfDownloadSink,
+)
 from disclosure_anchor.domain.errors import ConfigurationError, SourceRequestError
 from disclosure_anchor.settings import Settings
 
@@ -38,6 +42,17 @@ TOKEN_REFRESH_RESULT_CODES = frozenset({404, 405})
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_FACTOR = 2.0
 BACKOFF_CAP_SECONDS = 30.0
+# HTTPX applies this to each connect/read/write/pool wait separately; a read
+# timeout is the wait for the next chunk, never a whole-response bound.
+IO_TIMEOUT_SECONDS = 30.0
+DEFAULT_DOWNLOAD_DEADLINE_SECONDS = 1800.0
+DOWNLOAD_DEADLINE_ERROR_CODE = "transfer_deadline_exceeded"
+# PDFs are fetched as identity: the stored bytes and their hash are exactly
+# the framed wire bytes, and no content decoder runs. HTTPX decodes a whole
+# network read before any chunking, so a decoder's output has no bound of its
+# own; an encoded answer is refused instead (same rule as the V4 ZIP GET).
+PDF_DOWNLOAD_HEADERS = {"Accept-Encoding": "identity"}
+UNSUPPORTED_CONTENT_ENCODING_ERROR_CODE = "unsupported_content_encoding"
 
 
 @dataclass(frozen=True)
@@ -110,6 +125,147 @@ class TokenBucket:
         self._next_available_at = max(now, self._next_available_at) + self._interval_seconds
 
 
+class UnsupportedContentEncoding(Exception):
+    """A PDF response applied a content coding despite the identity request."""
+
+    def __init__(self, content_encoding: str) -> None:
+        self.content_encoding = content_encoding
+        super().__init__(f"content coding {content_encoding!r} instead of identity")
+
+
+class DownloadDeadline:
+    """One monotonic budget for a logical PDF download.
+
+    The token wait, every attempt, the retry backoff and the streamed body all
+    spend the same budget; it is never reset per attempt. Synchronous socket
+    IO cannot be cancelled, so the bound comes from the blocking waits
+    themselves: each request's connect/read/write/pool timeout is clamped to
+    ``min(IO_TIMEOUT_SECONDS, remaining)``, the budget is checked after every
+    received body chunk and before every retry sleep, and no request starts
+    once it is spent. A call can therefore overrun by at most one clamped wait
+    (<= 30s) plus one token-bucket interval. Not covered: the response header
+    block and chunked-encoding framing, which httpcore reads through repeated
+    ``recv`` calls that each obey the clamped timeout without yielding to this
+    check, and name resolution inside connect, which only the system resolver
+    bounds.
+    """
+
+    def __init__(self, seconds: float, *, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._expires_at = clock() + seconds
+
+    def io_timeout(self) -> httpx.Timeout | None:
+        """Per-request timeout clamped to the budget; ``None`` once it is spent."""
+
+        remaining = self._expires_at - self._clock()
+        if remaining <= 0:
+            return None
+        return httpx.Timeout(min(IO_TIMEOUT_SECONDS, remaining))
+
+    def allows_sleep(self, seconds: float) -> bool:
+        return self._clock() + seconds < self._expires_at
+
+    def stream_body(
+        self, response: httpx.Response, sink: PdfDownloadSink
+    ) -> CompletedPdfTransfer | None:
+        """Stream one identity body into ``sink`` as it arrives.
+
+        ``None`` means the budget ran out before EOF; what this attempt wrote
+        stays uncommitted in the sink. ``UnsupportedContentEncoding`` is raised
+        before any body byte. A byte count that contradicts the declared
+        framing raises ``httpx.RemoteProtocolError``, as the transport itself
+        does for a short Content-Length body (RFC 9112 section 6.3).
+        """
+
+        if self._clock() >= self._expires_at:
+            return None
+        declared = _identity_body_length(response)
+        sink.begin_attempt(declared_byte_count=declared)
+        written = 0
+        for chunk in _identity_chunks(response):
+            if self._clock() >= self._expires_at:
+                return None
+            written += len(chunk)
+            if declared is not None and written > declared:
+                raise httpx.RemoteProtocolError(
+                    "PDF body exceeds its declared Content-Length",
+                    request=response.request,
+                )
+            sink.write(chunk)
+        # Waiting for EOF can consume the remaining budget without yielding
+        # another chunk; completion must satisfy the same deadline.
+        if self._clock() >= self._expires_at:
+            return None
+        if declared is not None and written != declared:
+            raise httpx.RemoteProtocolError(
+                "PDF body ended before its declared Content-Length",
+                request=response.request,
+            )
+        return CompletedPdfTransfer(byte_count=written, declared_byte_count=declared)
+
+
+class MemoryPdfSink:
+    """In-memory sink behind the byte-returning compatibility calls.
+
+    It buffers a whole body, so the acquisition path never uses it; those
+    calls keep the exact transfer semantics of the streaming path.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def begin_attempt(self, *, declared_byte_count: int | None) -> None:
+        del declared_byte_count
+        self._buffer.clear()
+
+    def write(self, chunk: bytes) -> None:
+        self._buffer.extend(chunk)
+
+    def payload(self) -> bytes:
+        return bytes(self._buffer)
+
+
+def _identity_chunks(response: httpx.Response) -> Iterator[bytes]:
+    """Body chunks exactly as framed; no content decoder ever runs."""
+
+    if response.is_stream_consumed:
+        # HTTPX reads a Response built from bytes when it is constructed (mock
+        # transports do this); with identity coding its content is the body.
+        if response.content:
+            yield response.content
+        return
+    # iter_raw, not iter_bytes: every network chunk is one transport read
+    # (64 KiB in httpcore's HTTP/1.1), so memory never holds more of the body.
+    yield from response.iter_raw()
+
+
+def _identity_body_length(response: httpx.Response) -> int | None:
+    """Declared body length of an identity response; refuse content codings."""
+
+    codings = [
+        value.strip().lower()
+        for value in response.headers.get_list("content-encoding", split_commas=True)
+    ]
+    applied = [coding for coding in codings if coding and coding != "identity"]
+    if applied:
+        raise UnsupportedContentEncoding(", ".join(applied))
+    if "transfer-encoding" in response.headers:
+        # Transfer-Encoding overrides Content-Length (RFC 9112 section 6.3).
+        return None
+    lengths = {
+        value.strip()
+        for value in response.headers.get_list("content-length", split_commas=True)
+    }
+    if not lengths:
+        return None
+    length = lengths.pop() if len(lengths) == 1 else ""
+    if not (length.isascii() and length.isdigit()):
+        raise httpx.RemoteProtocolError(
+            "PDF response has an invalid Content-Length", request=response.request
+        )
+    return int(length)
+
+
 class AdaptiveTokenBucket:
     """AIMD client-side rate limiter (AWS SDK adaptive-retry-mode style).
 
@@ -179,13 +335,17 @@ class CninfoClient:
         access_token: str | None,
         max_qps: float = 1.0,
         max_retries: int = 3,
+        download_deadline_seconds: float = DEFAULT_DOWNLOAD_DEADLINE_SECONDS,
         transport: httpx.BaseTransport | None = None,
         bucket: TokenBucket | None = None,
         sleep: Callable[[float], None] | None = None,
         jitter: Callable[[float], float] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if max_retries < 0:
             raise ValueError("CNINFO max_retries must be non-negative")
+        if not download_deadline_seconds > 0:
+            raise ValueError("CNINFO download deadline must be greater than zero")
         if not access_token and not (access_key and access_secret):
             raise ConfigurationError(
                 "CNINFO credentials require CNINFO_ACCESS_TOKEN or key/secret"
@@ -194,12 +354,16 @@ class CninfoClient:
         self._access_secret = access_secret
         self._access_token = access_token
         self._max_retries = max_retries
+        self._download_deadline_seconds = download_deadline_seconds
+        self._clock = clock or time.monotonic
         self._bucket = bucket or AdaptiveTokenBucket(
-            max_qps=max_qps, sleep=sleep
+            max_qps=max_qps, clock=clock, sleep=sleep
         )
         self._sleep = sleep or time.sleep
         self._jitter = jitter or (lambda upper: random.uniform(0.0, upper))
-        self._client = httpx.Client(transport=transport, timeout=30.0, trust_env=False)
+        self._client = httpx.Client(
+            transport=transport, timeout=IO_TIMEOUT_SECONDS, trust_env=False
+        )
 
     @classmethod
     def from_settings(
@@ -216,6 +380,7 @@ class CninfoClient:
             access_token=_secret_value(settings.cninfo_access_token),
             max_qps=settings.cninfo_max_qps,
             max_retries=settings.cninfo_max_retries,
+            download_deadline_seconds=settings.cninfo_download_deadline_seconds,
             transport=transport,
             sleep=sleep,
             jitter=jitter,
@@ -236,6 +401,83 @@ class CninfoClient:
             params=request_params,
         )
 
+    def download_to(
+        self,
+        *,
+        provider_interface: str,
+        url: str,
+        sink: PdfDownloadSink,
+        params: Mapping[str, object] | None = None,
+    ) -> tuple[CompletedPdfTransfer, RequestAudit]:
+        """Stream one logical download into ``sink`` under a single deadline."""
+
+        request_params = dict(params or {})
+        deadline = DownloadDeadline(self._download_deadline_seconds, clock=self._clock)
+        attempt = 0
+        while True:
+            started = time.perf_counter()
+            self._bucket.take()
+            timeout = deadline.io_timeout()
+            if timeout is None:
+                raise self._download_deadline_error(provider_interface)
+            refused: UnsupportedContentEncoding | None = None
+            transfer: CompletedPdfTransfer | None = None
+            try:
+                with self._client.stream(
+                    "GET",
+                    url,
+                    params=_http_params(request_params),
+                    headers=PDF_DOWNLOAD_HEADERS,
+                    timeout=timeout,
+                ) as response:
+                    status = response.status_code
+                    if status < 400:
+                        try:
+                            transfer = deadline.stream_body(response, sink)
+                        except UnsupportedContentEncoding as exc:
+                            refused = exc
+            except httpx.TransportError as exc:
+                if attempt >= self._max_retries:
+                    raise CninfoClientError(
+                        f"CNINFO transport failed for {provider_interface}",
+                        error_code="transport_error",
+                        retryable=True,
+                    ) from exc
+                self._sleep_before_download_retry(attempt, deadline, provider_interface)
+                attempt += 1
+                continue
+            audit = RequestAudit(
+                provider_interface=provider_interface,
+                query_params=redact_params(request_params),
+                http_status=status,
+                resultcode=None,
+                row_count=None,
+                elapsed_ms=_elapsed_ms(started),
+            )
+            self._log_audit(audit)
+            if refused is not None:
+                raise CninfoClientError(
+                    f"CNINFO download for {provider_interface} answered with "
+                    f"{refused}",
+                    error_code=UNSUPPORTED_CONTENT_ENCODING_ERROR_CODE,
+                    retryable=True,
+                    audit=audit,
+                ) from refused
+            if status < 400:
+                if transfer is None:
+                    raise self._download_deadline_error(provider_interface, audit=audit)
+                return transfer, audit
+            retryable = status == 429 or status >= 500
+            if not retryable or attempt >= self._max_retries:
+                raise CninfoClientError(
+                    "CNINFO download request failed",
+                    error_code=f"http_{status}",
+                    retryable=retryable,
+                    audit=audit,
+                )
+            self._sleep_before_download_retry(attempt, deadline, provider_interface)
+            attempt += 1
+
     def download_bytes(
         self,
         *,
@@ -243,13 +485,13 @@ class CninfoClient:
         url: str,
         params: Mapping[str, object] | None = None,
     ) -> tuple[bytes, RequestAudit]:
-        request_params = dict(params or {})
-        response = self._request_bytes_with_retries(
-            provider_interface=provider_interface,
-            url=url,
-            params=request_params,
+        """Compatibility call returning the whole body; see ``MemoryPdfSink``."""
+
+        sink = MemoryPdfSink()
+        _, audit = self.download_to(
+            provider_interface=provider_interface, url=url, sink=sink, params=params
         )
-        return response
+        return sink.payload(), audit
 
     def close(self) -> None:
         self._client.close()
@@ -418,50 +660,26 @@ class CninfoClient:
         self._log_audit(audit)
         return CninfoResponse(payload=payload, audit=audit)
 
-    def _request_bytes_with_retries(
-        self,
-        *,
-        provider_interface: str,
-        url: str,
-        params: Mapping[str, object],
-    ) -> tuple[bytes, RequestAudit]:
-        attempt = 0
-        while True:
-            started = time.perf_counter()
-            self._bucket.take()
-            try:
-                response = self._client.get(url, params=_http_params(params))
-            except httpx.TransportError as exc:
-                if attempt >= self._max_retries:
-                    raise CninfoClientError(
-                        f"CNINFO transport failed for {provider_interface}",
-                        error_code="transport_error",
-                        retryable=True,
-                    ) from exc
-                self._sleep(self._next_delay(attempt))
-                attempt += 1
-                continue
-            audit = RequestAudit(
-                provider_interface=provider_interface,
-                query_params=redact_params(params),
-                http_status=response.status_code,
-                resultcode=None,
-                row_count=None,
-                elapsed_ms=_elapsed_ms(started),
-            )
-            self._log_audit(audit)
-            if response.status_code < 400:
-                return response.content, audit
-            retryable = response.status_code == 429 or response.status_code >= 500
-            if not retryable or attempt >= self._max_retries:
-                raise CninfoClientError(
-                    "CNINFO download request failed",
-                    error_code=f"http_{response.status_code}",
-                    retryable=retryable,
-                    audit=audit,
-                )
-            self._sleep(self._next_delay(attempt))
-            attempt += 1
+    def _sleep_before_download_retry(
+        self, attempt: int, deadline: DownloadDeadline, provider_interface: str
+    ) -> None:
+        # A backoff that would outlive the download budget cannot lead to a
+        # completed download, so the budget verdict is final now.
+        delay = self._next_delay(attempt)
+        if not deadline.allows_sleep(delay):
+            raise self._download_deadline_error(provider_interface)
+        self._sleep(delay)
+
+    def _download_deadline_error(
+        self, provider_interface: str, *, audit: RequestAudit | None = None
+    ) -> CninfoClientError:
+        return CninfoClientError(
+            f"CNINFO download for {provider_interface} exceeded its "
+            f"{self._download_deadline_seconds:g}s deadline",
+            error_code=DOWNLOAD_DEADLINE_ERROR_CODE,
+            retryable=True,
+            audit=audit,
+        )
 
     def _next_delay(self, attempt: int) -> float:
         upper = min(

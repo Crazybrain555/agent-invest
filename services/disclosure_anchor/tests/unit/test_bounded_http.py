@@ -11,6 +11,9 @@ from disclosure_anchor.adapters.runtime.bounded_http import (
     BoundedHTTPTransportError,
     ThreadOwnedPersistentHTTPClient,
 )
+from disclosure_anchor.adapters.runtime.gpu_telemetry_freshness import (
+    exporter_response_date_seconds,
+)
 
 
 class _CountingHTTPServer(ThreadingHTTPServer):
@@ -106,6 +109,14 @@ class _KeepAliveHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             self.close_connection = True
             return
+        if self.path == "/two-dates":
+            payload = b"ok"
+            self.send_response(200)
+            self.send_header("Date", self.date_time_string())
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path == "/status503":
             payload = b"down"
             self.send_response(503)
@@ -155,6 +166,43 @@ class ThreadOwnedPersistentHTTPClientTests(unittest.TestCase):
                     transport_attempts=2,
                 )
                 self.assertEqual((status, payload), (200, b"ok"))
+        finally:
+            client.close()
+        self.assertEqual(self.server.accepted_connections, 1)
+
+    def test_get_response_exposes_every_selected_header_value_on_one_connection(self) -> None:
+        client = ThreadOwnedPersistentHTTPClient(
+            self.base_url,
+            maximum_response_bytes=64,
+        )
+        try:
+            self.assertEqual(client.get_bytes("/ok", timeout_seconds=2), (200, b"ok"))
+            dated = client.get_response(
+                "/ok", response_headers=("Date", "X-Absent"), timeout_seconds=2,
+            )
+            self.assertEqual((dated.status, dated.body), (200, b"ok"))
+            self.assertEqual(set(dated.headers), {"Date", "X-Absent"})
+            self.assertEqual(dated.headers["X-Absent"], ())
+            self.assertEqual(len(dated.headers["Date"]), 1)
+            # A standard server Date is a strict IMF-fixdate on its own clock.
+            self.assertGreater(exporter_response_date_seconds(dated.headers["Date"]), 0)
+            repeated = client.get_response(
+                "/two-dates", response_headers=("date",), timeout_seconds=2,
+            )
+            self.assertEqual(len(repeated.headers["date"]), 2)
+            # The elapsed time covers the whole body transfer, not just headers.
+            dripped = client.get_response(
+                "/slow-drip", response_headers=("Date",), timeout_seconds=3,
+            )
+            self.assertEqual(dripped.body, b"abcdefgh")
+            self.assertGreaterEqual(dripped.elapsed_seconds, 0.5)
+            self.assertLess(dripped.elapsed_seconds, 3)
+            self.assertGreaterEqual(dated.elapsed_seconds, 0)
+            for selection in ((), ("Date", "date"), ("Da te",), ["Date"], ("Date\r\nX",)):
+                with self.subTest(selection=selection), self.assertRaises(ValueError):
+                    client.get_response(
+                        "/ok", response_headers=selection, timeout_seconds=2,
+                    )
         finally:
             client.close()
         self.assertEqual(self.server.accepted_connections, 1)

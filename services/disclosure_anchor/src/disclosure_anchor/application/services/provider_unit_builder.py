@@ -36,6 +36,7 @@ from disclosure_anchor.application.contracts._provider_content import (
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 from disclosure_anchor.application.contracts.provider_source_semantics import (
     ProviderSourceSemantics,
+    ProviderTextSubstitution,
     SourceTextReconciliation,
     SourceQualityFinding,
 )
@@ -48,6 +49,8 @@ from disclosure_anchor.application.contracts.provider_table_projection import (
     UnboundProviderTablePart,
 )
 from disclosure_anchor.application.contracts.provider_unit import (
+    PROVIDER_UNIT_LOCATOR_VERSION,
+    TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION,
     ProviderSearchDestination,
     ProviderUnitBuildResult,
     ProviderUnitApplicability,
@@ -63,6 +66,7 @@ from disclosure_anchor.application.contracts.provider_unit import (
     ProviderUnitSearchContractError,
     ProviderUnitSourceTextReconciliation,
     ProviderUnitSourceQualityFinding,
+    ProviderUnitTextSubstitution,
     provider_unit_locator_from_payload,
 )
 from disclosure_anchor.application.contracts.retrieval_primary import (
@@ -80,7 +84,10 @@ from disclosure_anchor.application.services.retrieval_primary import (
     build_retrieval_primary_projection,
     replay_retrieval_target,
 )
-from disclosure_anchor.application.services.provider_quality import assess_provider_unit_quality
+from disclosure_anchor.application.services.provider_quality import (
+    assess_provider_unit_quality,
+    exposed_payloads,
+)
 from disclosure_anchor.domain.services.unit_hashing import compute_unit_hashes
 
 
@@ -90,6 +97,7 @@ class _Part:
     provider_type: str
     payload: dict[str, object]
     targets: tuple[RetrievalTarget, ...]
+    copied_payloads: frozenset[tuple[int, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +117,7 @@ class _ProviderBuildInput:
     provider_document_sha256: str
     source_text_reconciliations: tuple[SourceTextReconciliation, ...]
     source_quality_findings: tuple[SourceQualityFinding, ...]
+    text_substitutions: tuple[ProviderTextSubstitution, ...]
 
 
 def _admitted_build_input(admitted: AdmittedProviderDocument) -> _ProviderBuildInput:
@@ -119,6 +128,7 @@ def _admitted_build_input(admitted: AdmittedProviderDocument) -> _ProviderBuildI
         admitted.provider_document_sha256,
         admitted.source_text_reconciliations,
         admitted.source_quality_findings,
+        admitted.text_substitutions,
     )
 
 
@@ -203,6 +213,7 @@ def _source_build_input(
         semantic_record_sha256,
         semantics.source_text_reconciliations,
         semantics.source_quality_findings,
+        semantics.text_substitutions,
     )
 
 
@@ -556,6 +567,28 @@ class _BuildContext:
             )
         )
 
+        dependency_sources = {
+            *unit_sources,
+            *(heading_ref.source_index for heading_ref in heading_chain),
+            *(
+                fragment.source_index
+                for heading_ref in heading_chain
+                for fragment in heading_ref.continuation_fragments
+            ),
+        }
+        text_substitutions = tuple(
+            ProviderUnitTextSubstitution(
+                source_index=item.source_index,
+                payload_ordinal=item.payload_ordinal,
+                raw_block_sha256=item.raw_block_sha256,
+                provider_text_sha256=item.provider_text_sha256,
+                substituted_text_sha256=item.substituted_text_sha256,
+                occurrence_count=item.occurrence_count,
+                policy=item.policy,
+            )
+            for item in self.build_input.text_substitutions
+            if item.source_index in dependency_sources
+        )
         locator = ProviderUnitLocator(
             provider_document_sha256=self.build_input.provider_document_sha256,
             unit_index=unit.unit_index,
@@ -574,16 +607,7 @@ class _BuildContext:
                     source_kind=item.source_kind,
                 )
                 for item in self.build_input.source_text_reconciliations
-                if item.source_index
-                in {
-                    *unit_sources,
-                    *(heading_ref.source_index for heading_ref in heading_chain),
-                    *(
-                        fragment.source_index
-                        for heading_ref in heading_chain
-                        for fragment in heading_ref.continuation_fragments
-                    ),
-                }
+                if item.source_index in dependency_sources
             ),
             source_quality_findings=tuple(
                 ProviderUnitSourceQualityFinding(
@@ -599,7 +623,28 @@ class _BuildContext:
                 if item.source_index in unit_sources
             ),
             search_targets=tuple(search_bindings),
+            text_substitutions=text_substitutions,
+            contract_version=(
+                TEXT_SUBSTITUTION_PROVIDER_UNIT_LOCATOR_VERSION
+                if text_substitutions
+                else PROVIDER_UNIT_LOCATOR_VERSION
+            ),
         )
+        copied_payloads = {
+            identity
+            for heading_ref in heading_chain
+            for identity in (
+                (heading_ref.source_index, heading_ref.payload_ordinal),
+                *(
+                    (fragment.source_index, fragment.payload_ordinal)
+                    for fragment in heading_ref.continuation_fragments
+                ),
+            )
+        }
+        for part in parts:
+            copied_payloads.update(part.copied_payloads)
+        if copied_payloads != exposed_payloads(blocks=self.blocks, locator=locator):
+            raise ValueError("provider Unit exposure differs from its copied payloads")
         heading_path = () if heading is None else heading.headpath
         quality_status = assess_provider_unit_quality(
             document=self.document, unit_sources=frozenset(unit_sources),
@@ -698,6 +743,13 @@ class _BuildContext:
         content_artifact_roles = tuple(
             dict.fromkeys((*block.referenced_artifact_roles, *segment_artifact_roles))
         )
+        payload, copied_ordinals = _part_payload(
+            block,
+            kind=kind,
+            artifacts=self.artifacts,
+            content_artifact_roles=content_artifact_roles,
+            excluded_payload_ordinals=excluded_payload_ordinals,
+        )
         return _Part(
             ref=ProviderUnitPartRef(
                 part_index=part_index,
@@ -707,17 +759,15 @@ class _BuildContext:
                 logical_table_index=logical_table_index,
             ),
             provider_type=block.provider_type,
-            payload=_part_payload(
-                block,
-                kind=kind,
-                artifacts=self.artifacts,
-                content_artifact_roles=content_artifact_roles,
-                excluded_payload_ordinals=excluded_payload_ordinals,
-            ),
+            payload=payload,
             targets=tuple(
                 target
                 for target in self._targets_for_source(block.source_index)
                 if target.payload_ordinal not in excluded_payload_ordinals
+            ),
+            copied_payloads=frozenset(
+                (block.source_index, payload_ordinal)
+                for payload_ordinal in copied_ordinals
             ),
         )
 
@@ -1021,24 +1071,30 @@ def _part_payload(
     artifacts: dict[str, ProviderArtifact],
     content_artifact_roles: tuple[str, ...],
     excluded_payload_ordinals: frozenset[int] = frozenset(),
-) -> dict[str, object]:
+) -> tuple[dict[str, object], frozenset[int]]:
+    """Return the part payload and the provider payload ordinals it copied."""
+
     payload: dict[str, object] = {}
+    copied: set[int] = set()
     scalar_fields, sequence_fields = provider_payload_field_contract(
         block.provider_type
     )
-    by_field: dict[str, list[ProviderPayload]] = {}
+    by_field: dict[str, list[tuple[int, ProviderPayload]]] = {}
     for payload_ordinal, item in enumerate(block.payloads):
         if payload_ordinal in excluded_payload_ordinals:
             continue
-        by_field.setdefault(item.field, []).append(item)
+        by_field.setdefault(item.field, []).append((payload_ordinal, item))
     for field in scalar_fields:
         values = by_field.get(field, [])
         if values:
-            payload[field] = values[0].text
+            payload_ordinal, item = values[0]
+            payload[field] = item.text
+            copied.add(payload_ordinal)
     for field in sequence_fields:
         values = by_field.get(field, [])
         if values:
-            payload[field] = [item.text for item in values]
+            payload[field] = [item.text for _, item in values]
+            copied.update(payload_ordinal for payload_ordinal, _ in values)
     if content_artifact_roles and (
         kind == "visual"
         or not any(
@@ -1056,7 +1112,7 @@ def _part_payload(
             }
             for role in content_artifact_roles
         ]
-    return payload
+    return payload, frozenset(copied)
 
 
 def _part_kind(block: ProviderBlock) -> ProviderUnitPartKind:
@@ -1213,6 +1269,7 @@ def _validate_build(
     logical_tables: list[int] = []
     covered_reconciliations: set[tuple[int, int]] = set()
     covered_quality_findings: set[tuple[int, int]] = set()
+    covered_substitutions: set[tuple[int, int]] = set()
     for unit, retrieval_unit, draft in zip(
         context.outline.units,
         context.retrieval.units,
@@ -1301,6 +1358,20 @@ def _validate_build(
                 "provider Unit source quality findings differ from dependencies"
             )
         covered_quality_findings.update(actual_quality_findings)
+        actual_substitutions = tuple(
+            (item.source_index, item.payload_ordinal)
+            for item in draft.locator.text_substitutions
+        )
+        expected_substitutions = tuple(
+            (item.source_index, item.payload_ordinal)
+            for item in context.build_input.text_substitutions
+            if item.source_index in dependency_sources
+        )
+        if actual_substitutions != expected_substitutions:
+            raise ValueError(
+                "provider Unit text substitutions differ from its source dependencies"
+            )
+        covered_substitutions.update(actual_substitutions)
     owned_segments.extend(
         part.part.physical_segment_index
         for part in result.unassigned_table_parts
@@ -1332,6 +1403,11 @@ def _validate_build(
         for item in context.build_input.source_quality_findings
     }:
         raise ValueError("provider Unit build must bind every source quality finding")
+    if covered_substitutions != {
+        (item.source_index, item.payload_ordinal)
+        for item in context.build_input.text_substitutions
+    }:
+        raise ValueError("provider Unit build must bind every text substitution")
 
 
 __all__ = [

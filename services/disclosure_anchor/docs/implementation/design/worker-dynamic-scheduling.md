@@ -434,6 +434,17 @@ composition 之外的直接构造与测试夹具。`commit_stage_seconds` 的配
 判活改为"进展判活"（有字节/记录在流动就续期，只有停滞超过阈值才算卡死）或按结果大小配比预算，
 从而不再需要按最坏个例调这一常数。
 
+`RetryStage` 的每 attempt 预算（`retry_max_attempts = 8` 次、`retry_stuck_seconds = 300` s、0.25→30 s
+退避，均为 `CoordinatorLimits` 默认值）只约束一段连续失败的 episode。只有 backend 在权威 status 轮询
+确认本 attempt 的 provider 任务仍为 pending/processing、且已先通过 86400 s runaway 检查后抛出的
+`StageProviderWaiting`，才同时清零该 attempt 的计数与首失败时间；本地 stream-pressure 暂停（普通
+`StageWaiting`）、`StageAdmissionDeferred` 和其他文档的健康回答都不清零。全局 `consecutive_retries`/
+`retry_degraded` 软熔断不变，仍只由 durable transition 复位。于是活着但偶发失败的 provider 只受 PDF
+总期限约束；连续失败仍按原节奏开路（快速失败约 70 s 第 9 次，挂起请求在 300 s 窗口），并作为
+`retry_stage_stuck` public stop 持久停机。耗尽行
+`<attempt>:<lane>:retry budget exhausted (attempts=n/8, elapsed=s/300s, last=…, causes=…[, http_status=nnn])`
+只含已识别的 backend 固定字面量、异常类型名和 HTTP 状态码；未知文本只以 fingerprint 表示，从不原文输出。
+
 当前实现采用完整 recovery barrier 加周期等待续租，因为 admission 的 documents credit 会约束日常
 等待集合。只有真实 backlog 与数据库 RTT 证明一次 barrier 的候选规模超过该续租能力，才引入
 bounded recovery feeder/batch renewal；不能为假设扩容增加第二队列或削弱 recovery-before-admission。
@@ -502,10 +513,19 @@ MinerU 3.4 的异步状态只有 pending/processing/completed/failed、时间戳
 - ZIP read-inactivity timeout 为 120 秒；
 - dispatcher 每 30 秒为仍由本 worker 持有、且未越过极远 lease 的 parse 续 heartbeat；
 - 同一极远 lease 覆盖整个 parse future：MinerU 子进程、产物定位/读取、IR 映射、归档写入
-  和 DB finish；Python 线程无法安全强杀，越界后先终止已登记 MinerU process group，再由
-  launchd 替换整个 worker，不能继续用一个已污染的进程；
+  和 DB finish；Python 线程无法安全强杀，越界后先终止已登记 MinerU process group，再以
+  exit 70 结束整个 worker，不能继续用一个已污染的进程；launchd 只重启退出码 0，因此
+  worker 保持停止，由运维者排查后 `make worker-restart`；
 - startup/resident parse 与 maintenance 各自维护独立 heartbeat/watchdog；一个平面的正常
-  进展不能替另一个死锁平面续租，任一 active owner 超过 wedge threshold 都触发整进程替换；
+  进展不能替另一个死锁平面续租，任一 active owner 超过 wedge threshold 都以 exit 70 结束
+  整个进程（同样不自动重启）；
+- maintenance 的活跃证据是“已完成的条目”而不是“成功的条目”：每个 sync 公司与下载候选
+  在得到结果后各心跳一次——成功、已落库的类型化失败、被处理的异常、backfill 延后、
+  触发 rate-limit/quota/outage 早退的那一条都算；没有计时器心跳，一个永不返回的请求仍然
+  沉默。单个下载由 `CNINFO_DOWNLOAD_DEADLINE_SECONDS`（默认 1800）封顶整段逻辑下载
+  （token 等待、每次尝试、重试退避与流式响应体），超时即可重试的
+  `transfer_deadline_exceeded`；因此一个条目的最长沉默约为该预算加一次钳制后的 30 秒读
+  等待，配置校验要求它至少比 wedge threshold 低 60 秒；
 - 只有 runaway guard 到期、明确 task failure、子进程退出或操作员取消才结束任务；
 - task deadline、generic task failure、输出契约错误都是 item-local，不改变全局容量；
 - 只有明确 HTTP 429 或 `RESOURCE_EXHAUSTED` 记为 backend overload，停止新 refill 并进入
@@ -757,10 +777,11 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
 的页数/主机小时；CPU/GPU 利用率用于解释空档，不能替代完整性或吞吐验证。
 
 - Windows `MineruProcessProfile` 只描述远端进程及资源上限。本机
-  `staged-worker-composition.v2` 另行绑定它的 SHA，以及 preflight/finalize 并发上限、
-  provider 状态轮询、admission 探测间隔与 commit 总预算；七条 lane、物化信用和 DB primary/nested
-  checkout 均从这两个 exact profile 投影。运行时可在上限内按实时信用派工，不固定占满槽数。
-  历史 v1 的规范字节和 SHA 保持不变，解码仍接受其封闭字段集；v2 才包含 commit 预算。
+  `staged-worker-composition.v2`/`v3` 另行绑定它的 SHA，以及 preflight/finalize 并发上限、
+  provider 状态轮询、admission 探测间隔与 commit 总预算（v3 另加重活许可数）；七条 lane、物化信用、
+  重活许可和 DB primary/nested checkout 均从这两个 exact profile 投影。运行时可在上限内按实时信用派工，
+  不固定占满槽数。历史 v1 的规范字节和 SHA 保持不变，解码仍接受其封闭字段集；v2 才包含 commit 预算，
+  v3 才包含重活许可数，v1/v2 一律投影为 1 个许可。
 - `v4-prepared-execution-spec.v2` 将两份 exact profile 与 request/source/runtime 关联，
   由 H0 的 spec SHA/byte count 绑定。未发布的旧 spec v1 不做默默兼容。恢复时所有阶段，
   包括 publish、cleanup、ACK，在副作用前验证当前本机 profile；不同则明确失败。
@@ -789,6 +810,24 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   子进程通信至多每 `0.1s` 检查一次。失去权限不进入下一组、备用 provider 或缓存写入，
   保留原始阶段失权异常；已启动子进程按自有进程组停止并排空管道、实际 reap 后才退出。
   不支持 live guard 的历史 adjudicator 分支不能用于受保护的模型执行，旧无 guard 调用不变。
+- `DISCLOSURE_V4_HEAVY_WORK_PERMITS`（可选，`1..2`）选择 `staged-worker-composition.v3`，把同时运行的
+  整对象重活（LOCAL 解码，COMMIT 的重开/Unit 构建/语义路由/就绪/事务 P）许可数写进本机 profile 身份。
+  - 未设置时仍是 v2 的原字节与 SHA，固定 1 个许可，行为与身份都不变。
+  - 设为 `2` 时，两个 COMMIT 可以同时运行，模型组仍受各 provider 自身并发上限约束；一个解码也可与一个
+    COMMIT 同时运行。解码仍受 decoded_bytes 账本约束。DB 池本就按 `commit_workers` 个 COMMIT 各一个
+    primary 加一个 nested checkout 配置，无需另加。
+  - 同一文档仍由 producer advisory lock 与事务 P 的文档锁串行。
+  - 证据与上限见 [结果存储](mineru-result-storage.md) “Heavy work”。
+  - 改变取值就是改变 profile 身份（含从 v3 回到 v2），只能经 `worker-local-execution-upgrade.v3` 关系迁移
+    （[本地执行升级](local-execution-upgrade.md)“U01 v3”）：
+    - 关系逐个角色写明 heavy-work 许可形态；
+    - 名单内责任以原 H0/spec/key 在新许可数下继续；
+    - 新 H0 等全部成员终结；
+    - 不需要另设排空。
+  - U01 v1/v2 拒绝 v3 组合：它们只允许 process-profile 引用移动，而 Q0 证据不记录 worker profile。
+  - 没有 U01 时，exact 路径要求 Q0 资格覆盖当前 writer/runtime，生产已不满足，所以“关掉 U01 再排空切换”
+    不可行。
+  - release binding 的 overlay 不生成此变量，需写在基础 worker env 中，合并时保留。
 - 单例数据库连接只由协调线程探测；执行线程提交后的 claim 重读使用独立 UoW 与阶段 guard。
   staged 单例探测失败立即抛出，协调器先撤销全部在途阶段许可、等待实际退出，再由 resident
   外层清理进程；不得先等待进程终止而让其他阶段在已知失锁期间继续启动副作用。
@@ -796,6 +835,37 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   不缓存整库候选或逐行 blocked vector。两源共享一轮完成状态，游标只越过实际检查的行；
   完整扫描后按间隔探测新数据，信用释放可提前唤醒，未完成分页不得提前判空。
   临时信用不足与当前 profile 永远装不下的 PDF 分开报告；超大源不应终止整轮扫描。
+- 普通源每一轮都有终点：读第一页前，用与页查询完全相同的 `pending_parse` 谓词、重试上限、scope 与
+  allowlist 取当前最大合格 `document_id`（`DESC LIMIT 1`），冻结为本轮闭区间上界；合格集为空时本轮
+  不发页查询即完成。每页在 `LIMIT` 前同时施加 `> 游标` 与 `<= 上界`，返回越界行即 fail closed；
+  上界之上的新到达留给下一轮。只有本轮读完上界内最后一页（`has_more=false`，或合格集为空）才同时
+  清空游标与上界；容量等待、observation 等待/放弃、readiness 或 legacy obligations 暂停都保留本轮
+  上界与游标。上界只是进程内扫描状态，不持久化、不另建队列，重启即从新一轮开始。
+- 普通候选只因临时信用不足放不下时原地等待，不被越过：观察前已知归档字节数、且没有任何维度超过
+  profile 容量的候选，游标停在它之前，本次调用返回扫描未完成（`held_for_credit`）并照常上报 `credit_backpressure:<维度>`；
+  此后每个调度 tick 仍按原游标与上界重列一页并重新检查，ID 在它之后的候选不会先于它准入；它若在外部
+  变得不合格，重列时页首即换成下一个候选。observation 之后 `build()` 临时放不下时，观察已证明大小
+  （归档大小原本未知也一样），保留观察结果与游标（同样 `held_for_credit`），下一次调用直接重跑 `build()`、
+  不再观察；装下后仍由 ingress 事务按同一谓词复核资格。永久装不下（任一维度超过 profile 容量，含观察后才
+  知道的页数派生维度）与观察前大小未知的候选仍越过并分开报告，游标照常前进（不算 `held_for_credit`）；
+  prepared head 放不下仍越过。等待只由游标与保留的观察结果
+  表达：不设计时器、超时、信用缓存或队列，不改容量、profile 与 parser；prepared 优先、legacy
+  obligations 与准入 guard 不变，已接受工作的各车道照常推进、释放信用。
+- 保证与限度：持续到达的更高 ID 不再能让一轮永不结束；可重试失败回流、requeue 放行、公司恢复 active 等
+  在游标之下变为合格的行，最迟在下一轮被重新检查。等待中的候选只在已接受的在途工作继续完成、释放信用
+  时取得进展，等待时长由在途工作决定，不承诺固定等待时间；等待期间 ID 在它之后的普通文档不准入，
+  在途工作排空时并发与 GPU 利用率可能下降。真正卡住的在途工作由既有有限重试、runaway 期限与公共停止
+  处理，准入层不另设卡死判定。等待会延长本轮，轮次中途出现的未领取 prepared head 要到本轮结束才被扫描。
+  未知大小的 PDF 观察时按整个字节预算计费，只有字节预算全部空闲才能观察，放不下仍被越过；这类容量
+  饥饿不在本范围内。
+- LOCAL 完成额度：LOCAL_PREPARE 只有连同它促成的 LOCAL 完成所需输出额度（output_items/bytes/pages）
+  一起放得下时才取 decode 额度；materializing head 在自己的 LOCAL 提交实际输出前一直保有这份承诺，重启时
+  由 durable 有效预留减去已持有额度重建，不另设账本。新增长须与全部承诺并存，兑现承诺的 LOCAL 只与已持有
+  和在途额度比较；恢复出的承诺欠额先由 COMMIT/CLEANUP/ACK 释放。站点只在无在途、无任何自唤醒路径而仍有
+  排队或 hold 时停止一次，并点名阻塞者。仍能带来可运行工作的准入（未读扫描位置、会重新探测的 readiness
+  延后、安全的 stream 暂停）算唤醒；原地等信用的扫描（`held_for_credit`）与未结 legacy obligations
+  （`deferred_on_obligations`）不算。操作员排空时只剩 hold 以 `operator_drain` 结束，不新写公共停止。
+  细则见 [V4 资源生命周期](v4-resource-lifetime.md)。
 - 新任务 readiness 的类型化暂不可用只暂停普通源准入；已领取 prepared-H0、远端轮询、
   publication、cleanup、ACK 不以新任务健康检查为执行许可。单例/身份丢失仍立即 fail closed。
   准入暂停按独立探测间隔恢复，遥测在暂停期间保持 closed，成功探测后清除旧原因。
@@ -808,6 +878,16 @@ KV cache 97.7%，叠加其他 GPU 负载后 CUDA OOM，vLLM EngineCore 死亡；
   与 created/failed outbox 事件原子处置；不制造页数、spec 或 H0。重启后普通队列依据已有
   last-failure retryability 排除它，后续正常 PDF 继续前进。文件缺失、身份漂移和未知 IO/native
   错误不伪装成内容拒绝；响应丢失只核对同一 episode，写入重试仍需当前所有权许可。
+- H0 ingress 与源拒绝事务（`DurableStagedIngressV4`）共用两次写入：原写入加一次重放，由提交应答丢失
+  和下述数据库中断共享。PostgreSQL 打开关系文件遇 EINTR 时以 ERROR/SQLSTATE XX000 报
+  `could not open file "<relpath>": Interrupted system call`。ingress 每次写入都在 `replayable_transaction`
+  内进入新单元；只有这样声明、尚未开始任何提交、且该单元自己的 rollback、session 锁释放与连接回收都
+  成功时，适配层才把这一精确形状转成 `DatabaseInterruptionRolledBack`（cause 为原错误）。ingress 只在
+  mutation 返回前、且证明出自本次写入单元时，用同一不可变命令（attempt/run/fence/key/event/proposal
+  不变）在新单元重放，重放前重新经过 write guard，日志只记 label 与写入序号。其它 XX000、读写/fsync、
+  缺文件、IO、FATAL/PANIC、取消/超时、连接失效、清理失败或已开始提交都不得此能力：提交后的错误仍只读
+  对账，部分 packet/漂移照旧停止，预算用尽时带原错误链落到既有公共停止。不新增准入延后、计数、原因或
+  自动重启；其它阶段与读者不声明可重放，同样错误照旧失败可见。
 - 最终状态列表只是有界近期诊断样本，累计 completed 单独计数；PG 仍是完整任务历史和
   唯一 durable backlog。领取后的校验/IO 异常必须携带已领取的全部 ownership，不得漏记。
 - scratch 与 canonical `data` 目录必须存在明确、互不包含且同文件系统的 pinned namespace。

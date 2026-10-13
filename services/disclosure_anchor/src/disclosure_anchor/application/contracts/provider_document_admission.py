@@ -14,6 +14,7 @@ from disclosure_anchor.application.contracts.provider_document_envelope import (
 )
 
 from disclosure_anchor.application.contracts.provider_source_semantics import (
+    ProviderTextSubstitution,
     SourcePdfObservation,
     SourcePdfTextObservation,
     SourceQualityFinding,
@@ -35,6 +36,7 @@ class AdmittedProviderDocument:
     envelope: ProviderDocumentEnvelope
     source_text_reconciliations: tuple[SourceTextReconciliation, ...] = ()
     source_quality_findings: tuple[SourceQualityFinding, ...] = ()
+    text_substitutions: tuple[ProviderTextSubstitution, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -48,6 +50,7 @@ class AdmittedProviderDocument:
             self.envelope.provider_document,
             self.source_text_reconciliations,
             self.source_quality_findings,
+            self.text_substitutions,
         )
 
     @property
@@ -56,10 +59,12 @@ class AdmittedProviderDocument:
 
     @property
     def effective_provider_document(self) -> ProviderDocument:
-        """Return the admitted semantic view with source-bound numeric repairs."""
+        """Return the admitted view with source repairs and U+0000 markers."""
 
         return effective_provider_document(
-            self.provider_document, self.source_text_reconciliations
+            self.provider_document,
+            self.source_text_reconciliations,
+            self.text_substitutions,
         )
 
 
@@ -81,6 +86,7 @@ class ProviderDocumentAdmissionError(ValueError):
 __all__ = [
     "AdmittedProviderDocument",
     "ProviderDocumentAdmissionError",
+    "ProviderTextSubstitution",
     "SourcePdfObservation",
     "SourcePdfTextObservation",
     "SourceQualityFinding",

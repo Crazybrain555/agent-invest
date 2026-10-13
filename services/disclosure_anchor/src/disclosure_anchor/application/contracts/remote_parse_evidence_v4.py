@@ -26,11 +26,14 @@ from disclosure_anchor.application.contracts.remote_parse_lifecycle_v4 import (
     ResourceReservationV4,
     advance_remote_parse_checkpoint_v4,
     build_initial_remote_parse_checkpoint_v4,
+    credit_union_v4,
     decode_local_cleanup_plan_v4,
     decode_local_cleanup_receipt_v4,
     decode_local_materialization_receipt_v4,
     decode_materialization_intent_v4,
     decode_provider_ack_receipt_v4,
+    materialization_grant_limits_v4,
+    terminal_result_growth_v4,
     validate_local_cleanup_plan_v4,
     validate_materialized_provider_evidence_v4,
     validate_resource_reservation_checkpoint_binding_v4,
@@ -49,6 +52,9 @@ SUBMISSION_INTENT_V4_CONTRACT = "remote-parse-submission-intent.v4"
 SUBMISSION_ABSENCE_PROOF_V4_CONTRACT = "submission-absence-proof.v4"
 ACCEPTED_SUBMISSION_V4_CONTRACT = "accepted-submission-receipt.v4"
 TERMINAL_RECEIPT_V4_CONTRACT = "remote-terminal-receipt.v4"
+# A storage-managed runtime's completion also carries its native storage
+# envelope (selected S/M and inventory identity) for the Mac stage grant.
+TERMINAL_RECEIPT_V5_CONTRACT = "remote-terminal-receipt.v5"
 FAILURE_RECEIPT_V4_CONTRACT = "remote-parse-failure-receipt.v4"
 SUPERSESSION_RECEIPT_V4_CONTRACT = "remote-parse-supersession-receipt.v4"
 
@@ -396,7 +402,25 @@ class AcceptedSubmissionReceiptV4:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalResultStorageV1:
+    """The native storage envelope of one sealed, storage-managed result."""
+
+    policy_sha256: str
+    selected_bytes: int
+    member_count: int
+    inventory_sha256: str
+
+    def __post_init__(self) -> None:
+        _sha(self.policy_sha256, "result storage policy")
+        _sha(self.inventory_sha256, "result inventory")
+        _nonnegative(self.selected_bytes, "result selected byte count")
+        _positive(self.member_count, "result member count")
+
+
+@dataclass(frozen=True, slots=True)
 class TerminalReceiptV4:
+    """Terminal receipt; v5 adds the native storage envelope, v4 bytes unchanged."""
+
     attempt_id: str
     fence_identity: str
     accepted_submission_receipt_sha256: str
@@ -406,9 +430,15 @@ class TerminalReceiptV4:
     artifact_byte_count: int
     provider_protocol_version: str
     contract_version: str = TERMINAL_RECEIPT_V4_CONTRACT
+    result_storage: TerminalResultStorageV1 | None = None
 
     def __post_init__(self) -> None:
-        _contract(self.contract_version, TERMINAL_RECEIPT_V4_CONTRACT)
+        if self.contract_version not in {TERMINAL_RECEIPT_V4_CONTRACT, TERMINAL_RECEIPT_V5_CONTRACT}:
+            raise ValueError("remote-parse v4 evidence contract is unsupported")
+        if (self.contract_version == TERMINAL_RECEIPT_V5_CONTRACT) != (self.result_storage is not None):
+            raise ValueError("terminal receipt storage envelope contradicts its version")
+        if self.result_storage is not None and type(self.result_storage) is not TerminalResultStorageV1:
+            raise ValueError("terminal receipt storage envelope is not exact")
         _identities(
             self.attempt_id,
             self.fence_identity,
@@ -422,7 +452,10 @@ class TerminalReceiptV4:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical(asdict(self))
+        payload = asdict(self)
+        if self.result_storage is None:
+            del payload["result_storage"]
+        return _canonical(payload)
 
     @property
     def sha256(self) -> str:
@@ -720,9 +753,7 @@ def decode_remote_parse_evidence_v4(
         "accepted_submission": lambda value: _decode_dataclass(
             value, AcceptedSubmissionReceiptV4
         ),
-        "terminal_receipt": lambda value: _decode_dataclass(
-            value, TerminalReceiptV4
-        ),
+        "terminal_receipt": _decode_terminal_receipt,
         "materialization_intent": decode_materialization_intent_v4,
         "local_materialization_receipt": decode_local_materialization_receipt_v4,
         "failure_receipt": _decode_failure,
@@ -1239,6 +1270,8 @@ def _validate_remote_parse_evidence_bundle_v4(
             or intent.reservation_sha256 != source_reservation.sha256
     ):
         raise ValueError("materialization-intent evidence chain drifted")
+    if intent is not None and terminal is not None:
+        _validate_stage_grant_basis(intent, terminal=terminal, reservation=source_reservation)
     if local_receipt is not None:
         if (
             intent is None
@@ -1785,6 +1818,83 @@ def _decode_dataclass(exact_bytes: bytes, item_type: type[Any]) -> Any:
     return value
 
 
+def _validate_stage_grant_basis(
+    intent: MaterializationIntentV4,
+    *,
+    terminal: TerminalReceiptV4,
+    reservation: ResourceReservationV4,
+) -> None:
+    """A stage grant is exactly the deterministic grant of its verified result.
+
+    Its Z/S/M, inventory and policy are the terminal's native storage envelope,
+    and its limits are recomputed, never trusted: a forged or inflated grant
+    fails replay even when every hash around it was reclosed.
+    """
+    grant = intent.resource_grant
+    storage = terminal.result_storage
+    if (grant is None) != (storage is None):
+        raise ValueError("stage grant presence differs from the terminal storage envelope")
+    if grant is None or storage is None:
+        return
+    if (
+        grant.terminal_receipt_sha256, grant.artifact_byte_count, grant.storage_policy_sha256,
+        grant.inventory_sha256, grant.selected_bytes, grant.member_count,
+    ) != (
+        terminal.sha256, terminal.artifact_byte_count, storage.policy_sha256,
+        storage.inventory_sha256, storage.selected_bytes, storage.member_count,
+    ):
+        raise ValueError("stage grant basis differs from its terminal storage envelope")
+    if grant.limits != materialization_grant_limits_v4(
+        reservation.reserved_credit,
+        artifact_byte_count=grant.artifact_byte_count,
+        selected_bytes=grant.selected_bytes,
+        decode_working_set_bytes=grant.decode_working_set_bytes,
+    ):
+        raise ValueError("stage grant limits are not its deterministic grant")
+
+
+def effective_resource_reservation_v4(
+    reservation: ResourceReservationV4,
+    *,
+    terminal: TerminalReceiptV4 | None,
+    intent: MaterializationIntentV4 | None,
+) -> ResourceCreditVector:
+    """One attempt's coordinator reservation after its committed grants.
+
+    The immutable reservation is the scheduling estimate. A verified
+    storage-managed terminal result grows it to Z, and a v5 materialization
+    intent to its stage grant. Nothing else ever changes it.
+    """
+
+    value = reservation.reserved_credit
+    if terminal is not None and terminal.result_storage is not None:
+        value = terminal_result_growth_v4(value, artifact_byte_count=terminal.artifact_byte_count)
+    if intent is not None and intent.resource_grant is not None:
+        if intent.resource_grant.reservation_sha256 != reservation.sha256:
+            raise ValueError("stage grant is bound to another reservation")
+        value = credit_union_v4(value, intent.resource_grant.limits)
+    return value
+
+
+def _decode_terminal_receipt(exact_bytes: bytes) -> TerminalReceiptV4:
+    payload = _decode_object(exact_bytes)
+    names = {item.name for item in fields(TerminalReceiptV4)}
+    if payload.get("contract_version") == TERMINAL_RECEIPT_V5_CONTRACT:
+        if set(payload) != names:
+            raise ValueError("TerminalReceiptV4 fields are not closed")
+        nested = payload["result_storage"]
+        if not isinstance(nested, dict):
+            raise ValueError("terminal receipt storage envelope must be an object")
+        _closed(cast(dict[str, Any], nested), TerminalResultStorageV1)
+        payload = {**payload, "result_storage": TerminalResultStorageV1(**nested)}
+    elif set(payload) != names - {"result_storage"}:
+        raise ValueError("TerminalReceiptV4 fields are not closed")
+    value = TerminalReceiptV4(**payload)
+    if value.canonical_bytes != exact_bytes:
+        raise ValueError("remote-parse v4 evidence JSON is not canonical")
+    return value
+
+
 def _decode_failure(exact_bytes: bytes) -> FailureReceiptV4:
     payload = _decode_object(exact_bytes)
     _closed(payload, FailureReceiptV4)
@@ -1904,6 +2014,7 @@ __all__ = [
     "SUBMISSION_INTENT_V4_CONTRACT",
     "SUPERSESSION_RECEIPT_V4_CONTRACT",
     "TERMINAL_RECEIPT_V4_CONTRACT",
+    "TERMINAL_RECEIPT_V5_CONTRACT",
     "AcceptedSubmissionReceiptV4",
     "EncodedRemoteParseEvidenceV4",
     "EvidenceKindV4",
@@ -1915,8 +2026,10 @@ __all__ = [
     "SubmissionIntentV4",
     "SupersessionReceiptV4",
     "TerminalReceiptV4",
+    "TerminalResultStorageV1",
     "build_preparation_intent_v4",
     "decode_remote_parse_evidence_v4",
+    "effective_resource_reservation_v4",
     "encode_remote_parse_evidence_v4",
     "validate_durable_remote_parse_evidence_bundle_v4",
     "validate_remote_parse_evidence_bundle_v4",

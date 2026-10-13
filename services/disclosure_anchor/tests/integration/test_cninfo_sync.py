@@ -249,7 +249,7 @@ class FakeCninfoSource:
     ) -> list[AnnouncementRef]:
         return self.refs
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+    def download_pdf_to(self, ref: AnnouncementRef, sink: object) -> object:
         raise AssertionError("sync integration should not download PDFs")
 
 

@@ -2276,8 +2276,14 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                 "stage_guard": _StepGuard(),
                 "replay_context": replay,
             }
-            first = backend.cleanup_v4(**common)
-            second = backend.cleanup_v4(**common)
+            # The transfer is bound by the receipt's exact output inventory;
+            # cleanup never decodes the envelope whole (it holds no permit).
+            with mock.patch.object(
+                MinerUHttpStagedV4, "_load_exact_output",
+                side_effect=AssertionError("cleanup decoded the output whole"),
+            ):
+                first = backend.cleanup_v4(**common)
+                second = backend.cleanup_v4(**common)
             self.assertEqual(first, second)
             self.assertFalse((root / fixture.intent.spool_relpath).exists())
             self.assertFalse((root / fixture.intent.output_relpath).exists())
@@ -2520,7 +2526,13 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     raced.append(path)
                     raise FileExistsError("another document created this container")
 
-            with mock.patch("os.mkdir", side_effect=concurrent_mkdir):
+            with (
+                mock.patch("os.mkdir", side_effect=concurrent_mkdir),
+                mock.patch.object(
+                    MinerUHttpStagedV4, "_load_exact_output",
+                    side_effect=AssertionError("promotion decoded the output again"),
+                ),
+            ):
                 backend.promote_or_replay(**arguments)
             self.assertEqual(len(raced), 1)
             with mock.patch.object(backend._root_lock_coordinator, "process_lock") as gate:
@@ -2558,6 +2570,40 @@ class MinerUHttpStagedV4Tests(unittest.TestCase):
                     expected_file_count=materialized.receipt.output_file_count,
                     expected_byte_count=materialized.receipt.output_byte_count,
                 )
+
+    def test_promotion_and_cleanup_refuse_same_size_drift_by_inventory_alone(self) -> None:
+        archive = _official_zip()
+        fixture = _materialize_fixture(archive)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "scratch"
+            root.mkdir(mode=0o700)
+            backend = MinerUHttpStagedV4(
+                scratch_root=root, published_root=_published_test_root(root),
+                transport=_Transport(archive), clock=lambda: 1.0,
+            )
+            materialized = backend.materialize_v4(**fixture.arguments(), claim_guard=_Guard())
+            cleanup = _successful_cleanup_arguments(fixture=fixture, materialized=materialized)
+            checkpoint = cleanup["replay_context"].resourceful_checkpoint_history[-2]
+            output = root / fixture.intent.output_relpath
+            envelope = output / fixture.intent.provider_envelope_relpath
+            original = envelope.read_bytes()
+            # Same size, one byte flipped: only its SHA-256 differs.
+            envelope.write_bytes(original[:-2] + bytes([original[-2] ^ 1]) + original[-1:])
+            with mock.patch.object(
+                MinerUHttpStagedV4, "_load_exact_output",
+                side_effect=AssertionError("drift must be refused without a whole decode"),
+            ):
+                with self.assertRaisesRegex(ParserOutputContractError, "inventory drifted"):
+                    backend.promote_or_replay(
+                        checkpoint=checkpoint, materialized=materialized,
+                        published_relpath=fixture.intent.provider_envelope_context.parser_artifact_root_relpath,
+                        claim=_claim(checkpoint), claim_guard=_Guard(), stage_guard=_StepGuard(),
+                    )
+                with self.assertRaisesRegex(ParserOutputContractError, "inventory drifted"):
+                    backend.cleanup_v4(**cleanup)
+            self.assertTrue(output.is_dir())
+            self.assertFalse((_published_test_root(root)
+                              / fixture.intent.provider_envelope_context.parser_artifact_root_relpath).exists())
 
     def test_publication_namespace_is_explicit_disjoint_and_owner_controlled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

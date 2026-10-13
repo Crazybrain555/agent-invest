@@ -14,8 +14,11 @@ from threading import Barrier, Event
 import unittest
 from unittest.mock import patch
 
+import psycopg
 import sqlalchemy as sa
 from sqlalchemy.exc import DBAPIError
+
+from disclosure_anchor.adapters.db.postgres import models
 
 from disclosure_anchor.adapters.db.postgres.atomic_document_publisher_v4 import (
     PostgresAtomicWholeDocumentPublisherV4,
@@ -1224,6 +1227,113 @@ class AtomicDocumentPublisherV4IntegrationTests(unittest.TestCase):
                 ).one()
             )
         self.assertEqual(counts, (1, 2, 1, 1))
+
+
+class PublicationTextPostgresBoundaryTests(unittest.TestCase):
+    """The actual driver and server for the Unit row's TEXT/JSONB column types.
+
+    A TEMPORARY table reuses the exact ``DocumentUnit`` column types (``Text``, ``JSONB``,
+    ``JSONB(none_as_null=True)``), so SQLAlchemy's real bind processors and psycopg's real dumpers
+    run against the scratch server. Every insert runs in a savepoint and the outer transaction is
+    rolled back, so nothing persists.
+    """
+
+    _REPRESENTABLE = (
+        "第一节\t重要事项", "第一节\n重要事项", "第一节\r\n重要事项", "第\x01节 重要事项",
+        "第\x7f节 重要事项", "第\U0000FFFD节 重要事项", "第\U0000FFFE节 重要事项",
+        "第\U0000FFFF节 重要事项", "第\U00020000节 重要事项", "第\U0001F600节 重要事项",
+        "第\\u0000节 重要事项", '{"k":"\\u0000","n":null}',
+    )
+
+    def setUp(self) -> None:
+        self.engine = engine_or_skip()
+        self.addCleanup(self.engine.dispose)
+        unit = models.DocumentUnit.__table__.c
+        self.table = sa.Table(
+            "publication_text_probe", sa.MetaData(),
+            sa.Column("probe_id", sa.Integer, primary_key=True),
+            sa.Column("title", unit.title.type),
+            sa.Column("heading_path", unit.heading_path.type, nullable=False),
+            sa.Column("payload", unit.payload.type, nullable=False),
+            sa.Column("semantic_keys", unit.semantic_keys.type),
+            prefixes=["TEMPORARY"],
+        )
+
+    def _insert_error(self, conn: sa.Connection, row: dict[str, object]) -> BaseException:
+        savepoint = conn.begin_nested()
+        try:
+            conn.execute(self.table.insert(), row)
+        except Exception as exc:  # noqa: BLE001 - the observed rejection is the subject
+            savepoint.rollback()
+            return exc
+        savepoint.rollback()
+        raise AssertionError(f"PostgreSQL accepted an unstorable row: {sorted(row)}")
+
+    def test_nul_is_refused_by_the_text_client_and_by_the_jsonb_server_then_nothing_persists(self) -> None:
+        with self.engine.connect() as conn:
+            # SQLAlchemy 2 autobegins on the first execute, so the explicit outer transaction comes first.
+            outer = conn.begin()
+            version, server_encoding, client_encoding = conn.execute(sa.text(
+                "SELECT current_setting('server_version'), current_setting('server_encoding'), "
+                "current_setting('client_encoding')"
+            )).one()
+            print(f"[pg-text-boundary] server={version} server_encoding={server_encoding} "
+                  f"client_encoding={client_encoding} psycopg={psycopg.__version__} sqlalchemy={sa.__version__}")
+            self.assertEqual((server_encoding, client_encoding), ("UTF8", "UTF8"))
+            self.table.create(conn)
+            nul = "第\x00节 重要事项"
+            text_error = self._insert_error(conn, {"probe_id": 1, "title": nul, "heading_path": [], "payload": {}})
+            # TEXT: psycopg's text dumper refuses before any SQL reaches the server.
+            self.assertIsInstance(text_error, sa.exc.DataError)
+            self.assertIsInstance(text_error.orig, psycopg.DataError)
+            self.assertIsNone(getattr(text_error.orig, "sqlstate", None))
+            for label, row in (
+                ("heading_path", {"probe_id": 2, "title": None, "heading_path": [nul], "payload": {}}),
+                ("payload", {"probe_id": 3, "title": None, "heading_path": [], "payload": {"text": nul}}),
+                ("payload_key", {"probe_id": 4, "title": None, "heading_path": [], "payload": {"k\x00": "v"}}),
+            ):
+                with self.subTest(jsonb=label):
+                    error = self._insert_error(conn, row)
+                    # JSONB: the client sends an escape; the server's jsonb input refuses U+0000.
+                    self.assertIsInstance(error, sa.exc.DataError)
+                    self.assertEqual(getattr(error.orig, "sqlstate", None), "22P05", error)
+            for label, row in (
+                ("text", {"probe_id": 5, "title": "第\ud800节", "heading_path": [], "payload": {}}),
+                ("jsonb", {"probe_id": 6, "title": None, "heading_path": ["第\udc00节"], "payload": {}}),
+            ):
+                with self.subTest(lone_surrogate=label):
+                    error = self._insert_error(conn, row)
+                    self.assertIsInstance(error, (sa.exc.StatementError, UnicodeError), error)
+            self.assertEqual(conn.execute(sa.select(sa.func.count()).select_from(self.table)).scalar_one(), 0)
+            outer.rollback()
+            self.assertIsNone(conn.execute(sa.text("SELECT to_regclass('pg_temp.publication_text_probe')")).scalar())
+
+    def test_representable_controls_are_stored_exactly_and_rolled_back(self) -> None:
+        with self.engine.connect() as conn:
+            outer = conn.begin()
+            self.table.create(conn)
+            for index, value in enumerate(self._REPRESENTABLE, start=1):
+                with self.subTest(value=ascii(value)):
+                    savepoint = conn.begin_nested()
+                    conn.execute(self.table.insert(), {
+                        "probe_id": index, "title": value, "heading_path": ["第一节", value],
+                        "payload": {"text": value, value: None, "note": None}, "semantic_keys": None,
+                    })
+                    stored = conn.execute(sa.select(
+                        self.table.c.title, self.table.c.heading_path, self.table.c.payload,
+                        sa.func.jsonb_typeof(self.table.c.payload["note"]),
+                        self.table.c.semantic_keys.is_(None),
+                    ).where(self.table.c.probe_id == index)).one()
+                    self.assertEqual(stored[0], value)
+                    self.assertEqual(stored[1], ["第一节", value])
+                    self.assertEqual(stored[2], {"text": value, value: None, "note": None})
+                    self.assertEqual(stored[3], "null")  # JSON null inside jsonb, not SQL NULL
+                    self.assertTrue(stored[4])  # Python None binds SQL NULL (none_as_null)
+                    savepoint.commit()
+            self.assertEqual(conn.execute(sa.select(sa.func.count()).select_from(self.table)).scalar_one(),
+                             len(self._REPRESENTABLE))
+            outer.rollback()
+            self.assertIsNone(conn.execute(sa.text("SELECT to_regclass('pg_temp.publication_text_probe')")).scalar())
 
 
 if __name__ == "__main__":

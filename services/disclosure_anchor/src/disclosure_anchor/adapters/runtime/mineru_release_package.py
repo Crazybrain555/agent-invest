@@ -20,8 +20,8 @@ from typing import Any
 from disclosure_anchor.adapters.runtime.exact_file_write import write_new_exact
 from disclosure_anchor.application.contracts.closed_document import canonical_bytes, sha256_of
 from disclosure_anchor.application.contracts.mineru_capacity_config import (
-    MineruCapacityConfig,
-    decode_mineru_capacity_config,
+    AnyMineruCapacityConfig,
+    decode_any_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.mineru_deployment_profile import (
     MineruDeploymentProfile,
@@ -35,6 +35,7 @@ from disclosure_anchor.application.contracts.mineru_release_manifest import (
     CAPACITY_SOURCE_NAMES,
     NATIVE_M6_PRODUCTION_SOURCES,
     RELEASE_MANIFEST_CONTRACT,
+    DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT,
     RELEASE_PROJECTION_CONTRACT,
     TELEMETRY_SUPERVISOR_SOURCES,
     MineruReleaseManifest,
@@ -72,6 +73,11 @@ RELEASE_SOURCE_FILES: dict[str, str] = {
     "windows/run_mineru_installation.ps1": "scripts/windows/run_mineru_installation.ps1",
     "windows/build_mineru_telemetry_assembly.ps1": "scripts/windows/build_mineru_telemetry_assembly.ps1",
     "windows/load_mineru_telemetry_assembly.ps1": "scripts/windows/load_mineru_telemetry_assembly.ps1",
+    # Same-root registry maintenance: Job child, NTFS identity probe and the one-shot
+    # helper that runs beside api-context/agent_task_protocol_v2.py.
+    "windows/run_mineru_same_root_maintenance.ps1": "scripts/windows/run_mineru_same_root_maintenance.ps1",
+    "windows/mineru_same_root_identity.cs": "scripts/windows/mineru_same_root_identity.cs",
+    "windows/mineru_same_root_registry_helper.py": "scripts/windows/mineru_same_root_registry_helper.py",
     "native-m6/build_mineru_m6_owner.ps1": "scripts/windows/build_mineru_m6_owner.ps1",
     "native-m6/run_mineru_m6_owner_host.ps1": "scripts/windows/run_mineru_m6_owner_host.ps1",
 }
@@ -79,6 +85,17 @@ for _name in TELEMETRY_SUPERVISOR_SOURCES:
     RELEASE_SOURCE_FILES[f"windows/{_name}"] = f"scripts/windows/{_name}"
 for _name in NATIVE_M6_PRODUCTION_SOURCES:
     RELEASE_SOURCE_FILES[f"native-m6/{_name}"] = f"scripts/windows/{_name}"
+INFERENCE_SOURCE_FILES = {
+    "inference-context/Dockerfile": "scripts/windows/Dockerfile.mineru_owner_memory",
+    **{f"inference-context/mineru_inference_memory/{name}": f"scripts/windows/mineru_inference_memory/{name}"
+       for name in ("__init__.py", "core.py", "worker.py")},
+}
+
+
+def release_source_files(diagnostic: bool) -> dict[str, str]:
+    return {**RELEASE_SOURCE_FILES, **(INFERENCE_SOURCE_FILES if diagnostic else {})}
+
+
 IMPLICIT_EXTERNAL_READ_PATTERNS = (
     "/private/tmp/", "launch_one", "m6-r18-fable-primary", "m6-stream-native-telemetry-independent",
     "installation-supervisor.dll", "build_exploration_package", "build_final_package", "run_g4.py",
@@ -99,7 +116,7 @@ class ReleaseIdentityError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ReleaseInputs:
     capacity_bytes: bytes
-    capacity: MineruCapacityConfig
+    capacity: AnyMineruCapacityConfig
     deployment_profile: MineruDeploymentProfile
     local_profile: MineruLocalWorkerProfile
 
@@ -114,7 +131,7 @@ def load_release_inputs(capacity_path: Path, deployment_path: Path, local_path: 
     try:
         return ReleaseInputs(
             capacity_bytes=capacity_bytes,
-            capacity=decode_mineru_capacity_config(capacity_bytes),
+            capacity=decode_any_mineru_capacity_config(capacity_bytes),
             deployment_profile=decode_mineru_deployment_profile(deployment_bytes),
             local_profile=decode_mineru_local_worker_profile(local_bytes),
         )
@@ -238,10 +255,11 @@ def build_release_package(
             continue
         blobs[path] = parts[2]
 
+    source_files = release_source_files(inputs.deployment_profile.inference_diagnostic is not None)
     files: dict[str, tuple[bytes, dict[str, str]]] = {}
     drift: list[str] = []
     candidates: list[tuple[str, str, Path, bytes]] = []
-    for package_path, tracked_relative in sorted(RELEASE_SOURCE_FILES.items()):
+    for package_path, tracked_relative in sorted(source_files.items()):
         tracked_path = f"{TRACKED_SCOPE_PREFIX}/{tracked_relative}"
         expected_blob = blobs.get(tracked_path)
         if expected_blob is None:
@@ -274,7 +292,7 @@ def build_release_package(
         raise ReleaseIdentityError("in-scope source drift: " + "; ".join(drift + generator_drift))
 
     status = _git(source_root, "status", "--porcelain=v1", "--untracked-files=all", "--", TRACKED_SCOPE_PREFIX)
-    release_dirs = {str(Path(TRACKED_SCOPE_PREFIX, rel).parent) for rel in RELEASE_SOURCE_FILES.values()}
+    release_dirs = {str(Path(TRACKED_SCOPE_PREFIX, rel).parent) for rel in source_files.values()}
     out_of_scope: list[str] = []
     untracked_release: list[str] = []
     for line in status.decode("utf-8").splitlines():
@@ -314,7 +332,7 @@ def build_release_package(
     native_sources = {name: digest(f"native-m6/{name}") for name in NATIVE_M6_PRODUCTION_SOURCES}
     built_at = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest = MineruReleaseManifest(
-        contract_version=RELEASE_MANIFEST_CONTRACT,
+        contract_version=(DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT if inputs.deployment_profile.inference_diagnostic is not None else RELEASE_MANIFEST_CONTRACT),
         built_at_utc=built_at,
         source={"head": source_head, "tracked_scope_prefix": TRACKED_SCOPE_PREFIX,
                 "source_manifest_sha256": source_manifest_sha256},
@@ -356,11 +374,20 @@ def build_release_package(
             "telemetry_assembly_builder_sha256": digest("windows/build_mineru_telemetry_assembly.ps1"),
             "telemetry_assembly_loader_sha256": digest("windows/load_mineru_telemetry_assembly.ps1"),
         },
+        inference_build=(None if inputs.deployment_profile.inference_diagnostic is None else {
+            "context": "inference-context",
+            "context_sha256": sha256_of(canonical_bytes({path.removeprefix("inference-context/"): digest(path) for path in INFERENCE_SOURCE_FILES})),
+            "sources": {path.removeprefix("inference-context/"): digest(path) for path in INFERENCE_SOURCE_FILES},
+        }),
         files=tuple(
             ReleaseFile(path=path, sha256=sha256_of(raw), bytes=len(raw), provenance=provenance)
             for path, (raw, provenance) in sorted(files.items())
         ),
     )
+    if manifest.inference_build is not None:
+        diagnostic = inputs.deployment_profile.inference_diagnostic
+        if diagnostic is None or manifest.inference_build["context_sha256"] != diagnostic.context_sha256:
+            raise ReleaseIdentityError("diagnostic deployment profile context differs from the frozen source bytes")
     manifest_bytes = manifest.exact_bytes
     out.mkdir(mode=0o700)
     for path, (raw, _) in sorted(files.items()):
@@ -418,16 +445,17 @@ def verify_release_package(package: Path, *, check_active_dependencies: bool = F
         present[entry.path] = raw
         if len(raw) != entry.bytes or sha256_of(raw) != entry.sha256:
             problems.append(f"{entry.path}: bytes differ from the manifest")
+    source_files = release_source_files(manifest.inference_build is not None)
     listed = {entry.path for entry in manifest.files}
     for path in sorted(str(p.relative_to(package)).replace(os.sep, "/") for p in package.rglob("*") if p.is_file()):
         if path != MANIFEST_NAME and path not in listed:
             problems.append(f"{path}: file not listed in the manifest")
-    for path in (*RELEASE_SOURCE_FILES, COMPOSE_PACKAGE_PATH, CAPACITY_INPUT_PATH, API_CONTEXT_CAPACITY_PATH,
+    for path in (*source_files, COMPOSE_PACKAGE_PATH, CAPACITY_INPUT_PATH, API_CONTEXT_CAPACITY_PATH,
                  DEPLOYMENT_INPUT_PATH, LOCAL_INPUT_PATH):
         if path not in listed:
             problems.append(f"{path}: required package file is not listed")
     expected_provenance = {
-        **{path: ("tracked", f"{TRACKED_SCOPE_PREFIX}/{rel}") for path, rel in RELEASE_SOURCE_FILES.items()},
+        **{path: ("tracked", f"{TRACKED_SCOPE_PREFIX}/{rel}") for path, rel in source_files.items()},
         COMPOSE_PACKAGE_PATH: ("generated", "compose"),
         CAPACITY_INPUT_PATH: ("input", "capacity"), API_CONTEXT_CAPACITY_PATH: ("input", "capacity"),
         DEPLOYMENT_INPUT_PATH: ("input", "deployment_profile"), LOCAL_INPUT_PATH: ("input", "local_worker_profile"),
@@ -455,7 +483,7 @@ def verify_release_package(package: Path, *, check_active_dependencies: bool = F
     try:
         inputs = ReleaseInputs(
             capacity_bytes=present[CAPACITY_INPUT_PATH],
-            capacity=decode_mineru_capacity_config(present[CAPACITY_INPUT_PATH]),
+            capacity=decode_any_mineru_capacity_config(present[CAPACITY_INPUT_PATH]),
             deployment_profile=decode_mineru_deployment_profile(present[DEPLOYMENT_INPUT_PATH]),
             local_profile=decode_mineru_local_worker_profile(present[LOCAL_INPUT_PATH]),
         )
@@ -502,6 +530,14 @@ def verify_release_package(package: Path, *, check_active_dependencies: bool = F
     def digest(path: str) -> str:
         return sha256_of(present[path])
 
+    diagnostic = inputs.deployment_profile.inference_diagnostic
+    if (diagnostic is None) != (manifest.inference_build is None):
+        problems.append("inference build selection differs from the deployment profile")
+    elif diagnostic is not None:
+        assert manifest.inference_build is not None
+        sources = {path.removeprefix("inference-context/"): digest(path) for path in INFERENCE_SOURCE_FILES}
+        if sources != manifest.inference_build["sources"] or sha256_of(canonical_bytes(sources)) != diagnostic.context_sha256:
+            problems.append("inference build sources differ from the deployment profile or packaged bytes")
     build = manifest.api_build
     capacity_source_map = {
         f"mineru/cli/agent_capacity_{name}.py": digest(f"api-context/agent_capacity_{name}.py")
@@ -570,6 +606,7 @@ def release_inventory(report: VerifyReport) -> dict[str, Any]:
     """Cleanup-map inventory: layer, provenance, active consumer and retention per file."""
 
     layers = {
+        "inference-context": ("inference-image", "full installation diagnostic build", "exact diagnostic image/source identity"),
         "api-context": ("api-image", "install_mineru_fixed_api.ps1 docker build context", "exact API image identity"),
         "compose": ("deployment", "install_mineru_fixed_api.ps1 -ComposeSource", "active compose identity"),
         "windows": ("installation", "run_mineru_installation.ps1 / installer / collector", "installation owner and attestation"),

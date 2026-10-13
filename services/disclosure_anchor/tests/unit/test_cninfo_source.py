@@ -7,7 +7,7 @@ import unittest
 
 import httpx
 
-from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient
+from disclosure_anchor.adapters.sources.cninfo.client import CninfoClient, MemoryPdfSink
 from disclosure_anchor.adapters.sources.cninfo.source import (
     CninfoSource,
     CninfoWebIndexSource,
@@ -15,13 +15,27 @@ from disclosure_anchor.adapters.sources.cninfo.source import (
 )
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
+    CompletedPdfTransfer,
     DisclosureWindow,
+    PdfDownloadSink,
     SourceSecurity,
 )
 from disclosure_anchor.domain.errors import SourceRequestError
 
 
 ACCESS_TOKEN = "unit-access-token"
+
+
+def _deliver(sink: PdfDownloadSink, payload: bytes) -> CompletedPdfTransfer:
+    sink.begin_attempt(declared_byte_count=len(payload))
+    sink.write(payload)
+    return CompletedPdfTransfer(byte_count=len(payload), declared_byte_count=len(payload))
+
+
+def _download(source: CninfoWebIndexSource, ref: AnnouncementRef) -> bytes:
+    sink = MemoryPdfSink()
+    source.download_pdf_to(ref, sink)
+    return sink.payload()
 
 
 def _ref(security_code: str) -> AnnouncementRef:
@@ -327,9 +341,9 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
                 calls.append("web.search")
                 return []
 
-            def download_pdf(self, ref):
+            def download_pdf_to(self, ref, sink):
                 calls.append("web.download")
-                return b"pdf"
+                return _deliver(sink, b"pdf")
 
             def close(self):
                 calls.append("web.close")
@@ -354,7 +368,7 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
             SourceSecurity("600941", "SSE"),
             DisclosureWindow(date(2026, 8, 1), date(2026, 8, 23)),
         )
-        self.assertEqual(hybrid.download_pdf(_ref("600941")), b"pdf")
+        self.assertEqual(_download(hybrid, _ref("600941")), b"pdf")
         self.assertEqual(hybrid.profile_for_security("600941"), "profile")
         hybrid.close()
         self.assertEqual(
@@ -370,9 +384,9 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
                 calls.append("web.search")
                 return []
 
-            def download_pdf(self, ref):
+            def download_pdf_to(self, ref, sink):
                 calls.append("web.download")
-                return b"web"
+                return _deliver(sink, b"web")
 
             def close(self):
                 calls.append("web.close")
@@ -382,9 +396,9 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
                 calls.append(f"api.search:{security.security_code}")
                 return []
 
-            def download_pdf(self, ref):
+            def download_pdf_to(self, ref, sink):
                 calls.append(f"api.download:{ref.security_code}")
-                return b"api"
+                return _deliver(sink, b"api")
 
             def profile_for_security(self, security_code):
                 calls.append("api.profile")
@@ -397,7 +411,7 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
         window = DisclosureWindow(date(2026, 8, 1), date(2026, 8, 23))
         for code in ("920001", "430001", "830001"):
             hybrid.search_announcements(SourceSecurity(code, "BSE"), window)
-            self.assertEqual(hybrid.download_pdf(_ref(code)), b"api")
+            self.assertEqual(_download(hybrid, _ref(code)), b"api")
 
         self.assertEqual(
             calls,
@@ -419,9 +433,9 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
                 calls.append("web.search")
                 return []
 
-            def download_pdf(self, ref):
+            def download_pdf_to(self, ref, sink):
                 calls.append("web.download")
-                return b"web"
+                return _deliver(sink, b"web")
 
             def close(self):
                 pass
@@ -433,7 +447,7 @@ class CninfoWebIndexSourceTests(unittest.TestCase):
                 DisclosureWindow(date(2026, 8, 1), date(2026, 8, 23)),
             )
         with self.assertRaises(SourceRequestError) as download_error:
-            hybrid.download_pdf(_ref("920001"))
+            hybrid.download_pdf_to(_ref("920001"), MemoryPdfSink())
 
         for error in (search_error.exception, download_error.exception):
             self.assertEqual(error.error_code, "bse_api_required")

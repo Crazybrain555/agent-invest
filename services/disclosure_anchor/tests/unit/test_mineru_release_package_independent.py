@@ -142,6 +142,35 @@ class MineruReleasePackageIndependentTests(unittest.TestCase):
             self.assertEqual(item["sha256"], "sha256:" + hashlib.sha256(raw).hexdigest())
             self.assertEqual(item["bytes"], len(raw))
 
+    def test_diagnostic_package_is_self_contained_and_binds_every_package_source(self):
+        sources = {"Dockerfile": "scripts/windows/Dockerfile.mineru_owner_memory",
+                   **{f"mineru_inference_memory/{name}": f"scripts/windows/mineru_inference_memory/{name}"
+                      for name in ("__init__.py", "core.py", "worker.py")}}
+        source_map = {name: "sha256:" + hashlib.sha256((self.source / path).read_bytes()).hexdigest()
+                      for name, path in sources.items()}
+        context_sha = "sha256:" + hashlib.sha256(_wire(source_map)).hexdigest()
+        deployment = deepcopy(DEPLOYMENT)
+        deployment["inference_declared_defaults"].update(
+            vllm_gpu_memory_utilization_millionths=500000, vllm_enable_prefix_caching=True)
+        deployment.update(contract_version="mineru.deployment-profile.v2", inference_diagnostic={
+            "contract_version": "mineru.owner-memory.v1", "context_sha256": context_sha,
+            "worker_class": "mineru_inference_memory.worker.OwnerMemoryWorker"})
+        self.deployment.write_bytes(_wire(deployment))
+        self.build()
+        self.cli("verify", "--package", self.package)
+        manifest = json.loads((self.package / "release-manifest.json").read_bytes())
+        self.assertEqual(manifest["contract_version"], "m6.release.v2")
+        self.assertEqual(manifest["inference_build"], {
+            "context": "inference-context", "context_sha256": context_sha, "sources": source_map})
+        for name, path in sources.items():
+            self.assertEqual((self.package / "inference-context" / name).read_bytes(),
+                             (self.source / path).read_bytes())
+        # An attacker cannot replace only a helper while retaining the reviewed
+        # package/context identity, even though worker.py itself is unchanged.
+        helper = self.package / "inference-context/mineru_inference_memory/core.py"
+        helper.write_bytes(helper.read_bytes() + b"\n# source drift\n")
+        self.cli("verify", "--package", self.package, expected=65)
+
     def test_in_scope_source_drift_is_rejected_before_package_creation(self):
         source = self.source / "src/disclosure_anchor/application/contracts/mineru_capacity_config.py"
         original = source.read_bytes()

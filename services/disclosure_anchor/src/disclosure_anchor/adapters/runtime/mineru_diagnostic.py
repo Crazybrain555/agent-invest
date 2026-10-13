@@ -52,6 +52,10 @@ from disclosure_anchor.adapters.runtime.mineru_diagnostic_wire import Diagnostic
 from disclosure_anchor.application.contracts.mineru_api_health import (
     MINERU_API_RESULT_RESERVATION_BYTES,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruResultStoragePolicy,
+    encode_mineru_result_storage_policy,
+)
 from disclosure_anchor.application.ports.parser import ParserOptions
 from disclosure_anchor.application.contracts.parser_target import ParserTargetIdentity
 
@@ -59,13 +63,32 @@ from disclosure_anchor.application.contracts.parser_target import ParserTargetId
 DIAGNOSTIC_DISPOSAL_SCHEMA = "mineru-diagnostic-disposal.v1"
 DIAGNOSTIC_AUTHORITY = "validated-diagnostic-no-publication.v1"
 _MAX_INPUT_BYTES = 512 * 1024 * 1024
+# The native result lease route accepts 1..3600 seconds.
+_NATIVE_MAX_LEASE_SECONDS = 3600
+
+
+def _retained_result_limit(policy: MineruResultStoragePolicy | None) -> int:
+    """The retained-result bound: a storage policy's hard limit, else the legacy reservation."""
+    if policy is None:
+        return MINERU_API_RESULT_RESERVATION_BYTES
+    if type(policy) is not MineruResultStoragePolicy:
+        raise ValueError("diagnostic result storage policy must be the exact contract type")
+    encode_mineru_result_storage_policy(policy)  # re-encoding revalidates every invariant
+    return policy.native_result_hard_limit_bytes
 
 
 def validate_diagnostic_disposal(
     value: object, *, source_pdf_sha256: str, runtime_identity: str,
     source_page_count: int, provider_bundle_sha256: str,
+    result_storage_policy: MineruResultStoragePolicy | None = None,
 ) -> None:
-    """Validate a closed diagnostic proof; grants no production ACK authority."""
+    """Validate a closed diagnostic proof; grants no production ACK authority.
+
+    ``result_storage_policy`` is the configured policy of the storage runtime
+    the diagnostic ran against, never a value read from the proof itself;
+    without one the legacy reservation bounds the retained result.
+    """
+    artifact_byte_limit = _retained_result_limit(result_storage_policy)
     fields = {
         "schema", "authority", "source_pdf_sha256", "runtime_bundle_identity_sha256",
         "attempt_identity", "fence_identity", "submission_epoch_unix", "idempotency_key",
@@ -97,7 +120,7 @@ def validate_diagnostic_disposal(
         artifact_byte_count=value["terminal_artifact_bytes"],
     )
     if (value["idempotency_key"] != key or value["terminal_artifact_owner"] != owner
-            or not 0 < value["terminal_artifact_bytes"] <= MINERU_API_RESULT_RESERVATION_BYTES
+            or not 0 < value["terminal_artifact_bytes"] <= artifact_byte_limit
             or value["ack_response"] != {"schema": "mineru-task-protocol.v2",
                                          "task_id": value["task_id"], "status": "consumed"}):
         raise ValueError("diagnostic disposal task/result/ACK identity drifted")
@@ -123,8 +146,17 @@ def run_diagnostic_pdf(
     unix_time: Callable[[], float] = time.time,
     pause: Callable[[float], None] = time.sleep,
     reconcile_submitted: bool = False,
+    result_storage_policy: MineruResultStoragePolicy | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate one whole PDF, dispose only its diagnostics, retain audit proof.
+
+    ``result_storage_policy`` names the exact policy of a storage-managed
+    (capacity-config v2) runtime. Every task reply is then decoded like the
+    production client: its closed storage envelope is required and must name
+    that policy; the retained result may reach the policy's hard limit; and
+    the result lease spans the rest of this diagnostic's deadline, at most the
+    native 3600 seconds. Without a policy the legacy runtime contract applies
+    unchanged, so a storage envelope is refused.
 
     Existing journals are never overwritten or resumed by guessing. Explicit
     reconciliation supports exactly two durable states with an intact snapshot:
@@ -144,6 +176,8 @@ def run_diagnostic_pdf(
         raise ValueError("diagnostic deadline is required")
     if not journal_root.is_absolute() or journal_root.is_symlink():
         raise ValueError("diagnostic journal must be a new absolute private directory")
+    artifact_byte_limit = _retained_result_limit(result_storage_policy)
+    storage_policy_sha256 = None if result_storage_policy is None else result_storage_policy.sha256
     if not reconcile_submitted:
         journal_root.mkdir(mode=0o700)
     root_identity = _identity(journal_root)
@@ -161,6 +195,14 @@ def run_diagnostic_pdf(
         if remaining <= 0:
             raise TimeoutError("diagnostic deadline expired; preserve exact attempt")
         return min(30.0, remaining)
+
+    def lease_seconds() -> int:
+        # Whole seconds, never beyond this diagnostic's own deadline.
+        checkpoint()
+        remaining = deadline - monotonic()
+        if remaining < 1:
+            raise TimeoutError("diagnostic deadline leaves no whole second to lease the result")
+        return min(_NATIVE_MAX_LEASE_SECONDS, int(remaining))
 
     prior: dict[str, Any] | None = None
     recorded_acceptance: bytes | None = None
@@ -242,7 +284,8 @@ def run_diagnostic_pdf(
             return parse_task_payload_v2(
                 exact, api_origin=api_url, idempotency_key=prepared.client_submit_key,
                 attempt_identity=attempt, fence_identity=fence, expected_task_id=task_id,
-                artifact_byte_limit=MINERU_API_RESULT_RESERVATION_BYTES,
+                artifact_byte_limit=artifact_byte_limit,
+                storage_policy_sha256=storage_policy_sha256,
             )
 
         # No blind automatic retry: the durable intent is sufficient to perform
@@ -304,9 +347,10 @@ def run_diagnostic_pdf(
         _record(journal_root, "03-terminal.json", json.loads(exact))
         if current.status != "completed":
             raise ValueError("diagnostic provider failed; exact terminal evidence retained")
-        status, lease_exact = request("POST", result_lease_url_v2(
-            api_origin=api_url, task_id=current.task_id,
-        ))
+        lease_url = result_lease_url_v2(api_origin=api_url, task_id=current.task_id)
+        if storage_policy_sha256 is not None:
+            lease_url = str(httpx.URL(lease_url, params={"seconds": str(lease_seconds())}))
+        status, lease_exact = request("POST", lease_url)
         if status != 200:
             raise ValueError(f"diagnostic result lease returned HTTP {status}")
         lease = parse_result_lease_v2(lease_exact, task_id=current.task_id,
@@ -329,7 +373,7 @@ def run_diagnostic_pdf(
                 if unix_time() >= lease.lease_until_unix:
                     raise ValueError("diagnostic result lease expired during download")
                 count += len(chunk)
-                if count > MINERU_API_RESULT_RESERVATION_BYTES:
+                if count > artifact_byte_limit:
                     raise ValueError("diagnostic ZIP exceeds retained byte envelope")
                 digest.update(chunk)
                 sink.write(chunk)
@@ -408,6 +452,7 @@ def run_diagnostic_pdf(
             disposal, source_pdf_sha256=source_pdf_sha256,
             runtime_identity=options.runtime_bundle_identity_sha256 or "",
             source_page_count=source_page_count, provider_bundle_sha256=document.bundle_sha256,
+            result_storage_policy=result_storage_policy,
         )
         _record(journal_root, "06-disposed.json", disposal)
         return provider, disposal

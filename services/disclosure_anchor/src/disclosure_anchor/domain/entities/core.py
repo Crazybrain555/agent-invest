@@ -75,6 +75,9 @@ class SourceAccess:
     result_snapshot: Optional[dict[str, Any]] = None
     company_id: Optional[str] = None
     security_id: Optional[str] = None
+    # Set only on a successful retained-archive registration: the one failed
+    # download attempt this access resolves. Every other access leaves it None.
+    recovery_of_source_access_id: Optional[str] = None
     created_at: Optional[datetime] = None
 
 

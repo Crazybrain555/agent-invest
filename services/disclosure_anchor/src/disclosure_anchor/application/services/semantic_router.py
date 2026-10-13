@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 import hashlib
 import json
 import re
@@ -29,6 +30,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SemanticAdjudicationDecision,
     SemanticAdjudicationReceipt,
     SemanticAdjudicatorMetadata,
+    SemanticDecisionCoverageError,
     SemanticDocumentContext,
     SemanticRouteCandidate,
     SemanticRouteContractError,
@@ -406,6 +408,7 @@ class SemanticRouter:
                         units=requested,
                     ),
                     group_hash=group_hash,
+                    validate=partial(self._validate_group_decisions, requested),
                     **guard_arguments,
                 )
                 if stage_guard is not None:
@@ -424,26 +427,21 @@ class SemanticRouter:
                             )
                         )
                     continue
-                decision_by_index = {
-                    decision.unit_index: self._canonicalize_decision(
-                        next(
-                            item
-                            for item in requested
-                            if item.unit_index == decision.unit_index
-                        ),
-                        decision,
+                # The executor already validated these decisions before caching
+                # or reusing them; this repeats the same deterministic check on
+                # the returned outcome and yields the canonical routes.
+                try:
+                    decision_by_index = self._canonical_group_decisions(
+                        requested,
+                        outcome.decisions,
                     )
-                    for decision in outcome.decisions
-                }
-                if set(decision_by_index) != {
-                    item.unit_index for item in requested
-                } or len(decision_by_index) != len(outcome.decisions):
+                except SemanticDecisionCoverageError as exc:
                     raise SemanticRouteAdjudicatorError(
                         "semantic executor did not cover the exact requested Units",
                         reason_code="invalid_contract",
                         retryable=False,
                         attempts=outcome.attempts,
-                    )
+                    ) from exc
                 for unit_input in requested:
                     decision = decision_by_index[unit_input.unit_index]
                     try:
@@ -602,6 +600,45 @@ class SemanticRouter:
             )
             for unit_index, decision in decision_by_index.items()
         }
+
+    def _canonical_group_decisions(
+        self,
+        requested: tuple[SemanticRouteUnitInput, ...],
+        decisions: tuple[SemanticAdjudicationDecision, ...],
+    ) -> dict[int, SemanticAdjudicationDecision]:
+        requested_by_index = {unit.unit_index: unit for unit in requested}
+        canonical: dict[int, SemanticAdjudicationDecision] = {}
+        for decision in decisions:
+            unit_input = requested_by_index.get(decision.unit_index)
+            if unit_input is None or decision.unit_index in canonical:
+                raise SemanticDecisionCoverageError(
+                    "semantic decisions do not cover the exact requested Units"
+                )
+            canonical[decision.unit_index] = self._canonicalize_decision(
+                unit_input,
+                decision,
+            )
+        if len(canonical) != len(requested_by_index):
+            raise SemanticDecisionCoverageError(
+                "semantic decisions do not cover the exact requested Units"
+            )
+        return canonical
+
+    def _validate_group_decisions(
+        self,
+        requested: tuple[SemanticRouteUnitInput, ...],
+        decisions: tuple[SemanticAdjudicationDecision, ...],
+    ) -> None:
+        """Reject provider decisions for one group that cannot become receipts.
+
+        This is the executor's validation hook: it runs before a result is
+        cached and again on every cache hit, so neither a fresh nor a stored
+        answer is accepted unless the router would accept it.
+        """
+
+        canonical = self._canonical_group_decisions(requested, decisions)
+        for unit_input in requested:
+            self._validate_decision(unit_input, canonical[unit_input.unit_index])
 
     def replay(
         self,
@@ -1766,12 +1803,16 @@ class SemanticRouter:
                 raise SemanticRouteContractError(
                     "exclusive semantic container lacks an exact source heading"
                 )
-        if len(decision.routes) > 1 and any(
+        exclusive = tuple(
             self._definitions[route.key].exclusive_container
             for route in decision.routes
-        ):
+        )
+        if any(exclusive) and not all(exclusive):
+            # Every exclusive candidate is witnessed by the Unit's own exact
+            # title, so several containers mean the title names several
+            # carriers.  A line item beside a container is never a route.
             raise SemanticRouteContractError(
-                "multiple exclusive semantic containers cannot coexist"
+                "exclusive semantic container cannot coexist with a line-item route"
             )
         if (
             any(
@@ -1819,17 +1860,29 @@ class SemanticRouter:
             # Validation owns the controlled non-candidate error.  Do not let
             # canonical ordering turn model input into a raw KeyError first.
             return canonical
-        exclusive_keys = tuple(
-            key
-            for key in selected_by_key
-            if self._definitions[key].exclusive_container
+        candidate_order = {
+            candidate.key: index
+            for index, candidate in enumerate(unit_input.candidates)
+        }
+        exclusive_keys = sorted(
+            (
+                key
+                for key in selected_by_key
+                if self._definitions[key].exclusive_container
+            ),
+            key=candidate_order.__getitem__,
         )
-        if len(exclusive_keys) == 1:
+        if exclusive_keys:
             # A whole-statement/table container owns the Unit.  Row labels in
             # its payload remain lexically searchable but cannot become an
-            # arbitrary capped subset of semantic secondaries.
-            key = exclusive_keys[0]
-            return replace(canonical, routes=(selected_by_key[key],))
+            # arbitrary capped subset of semantic secondaries.  One exact
+            # title may name several carriers (合并及公司报表); each stays a
+            # route in candidate order, and validation still requires every
+            # one of them to carry its exact source heading.
+            return replace(
+                canonical,
+                routes=tuple(selected_by_key[key] for key in exclusive_keys),
+            )
         for candidate in unit_input.candidates:
             if candidate.locked and candidate.key not in selected_by_key:
                 # Exact Unit-local source evidence is a deterministic fact.
@@ -1850,10 +1903,6 @@ class SemanticRouter:
                 key=overview_anchor.key,
                 support_ids=overview_anchor.source_ids,
             )
-        candidate_order = {
-            candidate.key: index
-            for index, candidate in enumerate(unit_input.candidates)
-        }
         ordered_keys: list[str] = []
         # An exact source title is the strongest scalar-route evidence.  If
         # there is no exact title, a provider-marked overview Unit keeps its

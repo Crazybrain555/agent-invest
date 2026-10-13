@@ -15,6 +15,21 @@ from disclosure_anchor.application.contracts.provider_document import (
 
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
+NUL_SUBSTITUTION_POLICY = "provider_text_nul_substitution.v1"
+_NUL = "\x00"
+_REPLACEMENT_CHARACTER = "\ufffd"
+
+
+def substitute_nul_characters(text: str) -> str:
+    """Replace each U+0000 with one U+FFFD and keep every other character.
+
+    PostgreSQL TEXT/JSONB cannot store U+0000, and the character that the
+    provider lost is unknown, so the replacement marks the position without
+    guessing it. The literal six-character escape ``\\u0000`` is ordinary text.
+    """
+
+    return text.replace(_NUL, _REPLACEMENT_CHARACTER)
+
 
 @dataclass(frozen=True, slots=True)
 class SourcePdfObservation:
@@ -133,24 +148,78 @@ class SourceQualityFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderTextSubstitution:
+    """One provider payload whose U+0000 characters were marked, not repaired.
+
+    Unlike ``SourceTextReconciliation`` this is not proven by the native PDF:
+    it records that the stored text differs from the provider text only by
+    ``occurrence_count`` U+0000 -> U+FFFD replacements.
+    """
+
+    source_index: int
+    payload_ordinal: int
+    raw_block_sha256: str
+    provider_text_sha256: str
+    substituted_text_sha256: str
+    substituted_text: str
+    occurrence_count: int
+    policy: str = NUL_SUBSTITUTION_POLICY
+
+    def __post_init__(self) -> None:
+        for value in (self.source_index, self.payload_ordinal, self.occurrence_count):
+            if type(value) is not int:
+                raise ValueError("provider text substitution counts must be integers")
+        if min(self.source_index, self.payload_ordinal) < 0:
+            raise ValueError("provider text substitution indices cannot be negative")
+        if self.policy != NUL_SUBSTITUTION_POLICY:
+            raise ValueError("provider text substitution policy is unsupported")
+        if not all(
+            type(value) is str and _SHA256_RE.fullmatch(value)
+            for value in (
+                self.raw_block_sha256,
+                self.provider_text_sha256,
+                self.substituted_text_sha256,
+            )
+        ):
+            raise ValueError("provider text substitution hashes must be canonical")
+        if (
+            type(self.substituted_text) is not str
+            or not self.substituted_text
+            or _NUL in self.substituted_text
+            or _sha_text(self.substituted_text) != self.substituted_text_sha256
+        ):
+            raise ValueError("provider text substitution text hash drifted")
+        if (
+            self.occurrence_count < 1
+            or self.substituted_text.count(_REPLACEMENT_CHARACTER)
+            < self.occurrence_count
+        ):
+            raise ValueError("provider text substitution count is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderSourceSemantics:
     """Original provider projection and its validated source-derived semantics."""
 
     provider_document: ProviderDocument
     source_text_reconciliations: tuple[SourceTextReconciliation, ...] = ()
     source_quality_findings: tuple[SourceQualityFinding, ...] = ()
+    text_substitutions: tuple[ProviderTextSubstitution, ...] = ()
 
     def __post_init__(self) -> None:
         validate_source_semantics(
             self.provider_document,
             self.source_text_reconciliations,
             self.source_quality_findings,
+            self.text_substitutions,
         )
 
     @property
     def effective_provider_document(self) -> ProviderDocument:
         return effective_provider_document(
-            self.provider_document, self.source_text_reconciliations
+            self.provider_document,
+            self.source_text_reconciliations,
+            self.text_substitutions,
         )
 
 
@@ -158,8 +227,14 @@ def validate_source_semantics(
     document: ProviderDocument,
     reconciliations: tuple[SourceTextReconciliation, ...],
     findings: tuple[SourceQualityFinding, ...],
+    substitutions: tuple[ProviderTextSubstitution, ...] = (),
 ) -> None:
-    """Validate the exact existing ordered repair/finding preimage contract."""
+    """Validate the exact ordered repair/finding/substitution preimage contract.
+
+    Every provider payload holding U+0000 has exactly one substitution unless a
+    native repair replaced that payload; a repaired text that still holds U+0000
+    stays visible to the publication representability gate.
+    """
 
     identities = [
         (item.source_index, item.payload_ordinal)
@@ -202,21 +277,60 @@ def validate_source_semantics(
             != finding.provider_text_sha256
         ):
             raise ValueError("source quality finding differs from its provider")
-
+    substitution_identities = [
+        (item.source_index, item.payload_ordinal)
+        for item in substitutions
+    ]
+    if substitution_identities != sorted(substitution_identities) or len(
+        substitution_identities
+    ) != len(set(substitution_identities)):
+        raise ValueError("provider text substitutions must be unique and source ordered")
+    if set(substitution_identities) & set(identities):
+        raise ValueError("provider text substitution cannot overlap a source repair")
+    for substitution in substitutions:
+        if substitution.source_index >= len(blocks):
+            raise ValueError("provider text substitution block is out of range")
+        block = blocks[substitution.source_index]
+        if (
+            block.raw_item_sha256 != substitution.raw_block_sha256
+            or substitution.payload_ordinal >= len(block.payloads)
+        ):
+            raise ValueError("provider text substitution differs from its provider")
+        text = block.payloads[substitution.payload_ordinal].text
+        if (
+            _sha_text(text) != substitution.provider_text_sha256
+            or text.count(_NUL) != substitution.occurrence_count
+            or substitute_nul_characters(text) != substitution.substituted_text
+        ):
+            raise ValueError("provider text substitution differs from its provider")
+    required = {
+        (block.source_index, payload_ordinal)
+        for block in blocks
+        for payload_ordinal, payload in enumerate(block.payloads)
+        if _NUL in payload.text
+    } - set(identities)
+    if required != set(substitution_identities):
+        raise ValueError("provider text substitutions must cover every unrepaired U+0000")
 
 
 def effective_provider_document(
     document: ProviderDocument,
     reconciliations: tuple[SourceTextReconciliation, ...],
+    substitutions: tuple[ProviderTextSubstitution, ...] = (),
 ) -> ProviderDocument:
-    """Apply validated source repairs without changing original artifacts."""
+    """Apply validated repairs, then U+0000 markers, keeping original artifacts."""
 
-    if not reconciliations:
+    if not reconciliations and not substitutions:
         return document
     by_identity = {
-        (item.source_index, item.payload_ordinal): item
+        (item.source_index, item.payload_ordinal): item.source_text
         for item in reconciliations
     }
+    for substitution in substitutions:
+        identity = (substitution.source_index, substitution.payload_ordinal)
+        if identity in by_identity:
+            raise ValueError("provider text substitution cannot overlap a source repair")
+        by_identity[identity] = substitution.substituted_text
     pages: list[ProviderPage] = []
     for page in document.pages:
         blocks: list[ProviderBlock] = []
@@ -224,7 +338,7 @@ def effective_provider_document(
             payloads = tuple(
                 replace(
                     payload,
-                    text=by_identity[(block.source_index, payload_ordinal)].source_text,
+                    text=by_identity[(block.source_index, payload_ordinal)],
                 )
                 if (block.source_index, payload_ordinal) in by_identity
                 else payload

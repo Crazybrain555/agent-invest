@@ -12,6 +12,11 @@ param(
     [string]$ExpectedImageId = "sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458",
     [switch]$ReuseCurrentPublishedImage,
     [switch]$ApiOnlyCompatibilityUpgrade,
+    [switch]$InferenceRecreate,
+    [string]$InferenceDiagnosticContext = "",
+    [ValidatePattern('\A(|sha256:[a-f0-9]{64})\z')][string]$InferenceDiagnosticContextSha256 = "",
+    [ValidateSet("", "cpu", "cuda0")][string]$ExpectedApiDeviceProfile = "",
+    [ValidateSet("", "cpu", "cuda0")][string]$ExpectedFullApiDeviceProfile = "",
     [ValidateSet("", "cpu", "cuda0")][string]$ApiDeviceProfile = "",
     [string]$CampaignApiCompatImageId = "",
     [ValidateSet(1)][int]$ExpectedApiTaskSlots = 1,
@@ -23,11 +28,33 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ($ReuseCurrentPublishedImage -and $ApiOnlyCompatibilityUpgrade) {
-    throw "API compatibility upgrade and published-image reuse are mutually exclusive"
+# A pending same-root registry maintenance owns the output root and the three business containers until
+# its own verified close (run_mineru_same_root_maintenance.ps1); no installation may start meanwhile.
+$SameRootPendingMarker = Join-Path (Split-Path -Parent $ReceiptTarget) "same-root-maintenance\pending.json"
+if (Test-Path -LiteralPath $SameRootPendingMarker) {
+    throw "a same-root registry maintenance is pending: $SameRootPendingMarker"
+}
+if (@(@($ReuseCurrentPublishedImage, $ApiOnlyCompatibilityUpgrade, $InferenceRecreate) | Where-Object { $_ }).Count -gt 1) {
+    throw "installation operation switches are mutually exclusive"
+}
+if ($InferenceRecreate -and ($ExpectedApiDeviceProfile -eq "" -or $ApiDeviceProfile -ne "")) {
+    throw "inference recreation requires an expected API device profile and forbids a transition"
+}
+if (-not $InferenceRecreate -and $ExpectedApiDeviceProfile -ne "") {
+    throw "expected API device profile is only valid for inference recreation"
 }
 $ApiOnlyOperation = $ReuseCurrentPublishedImage -or $ApiOnlyCompatibilityUpgrade
+if ($ExpectedFullApiDeviceProfile -ne "" -and ($ApiOnlyOperation -or $InferenceRecreate)) { throw "full API device expectation belongs to full installation only" }
+$InferenceDiagnostic = -not [string]::IsNullOrEmpty($InferenceDiagnosticContext)
+if ($InferenceDiagnostic -ne (-not [string]::IsNullOrEmpty($InferenceDiagnosticContextSha256)) -or
+        ($InferenceDiagnostic -and $ApiOnlyOperation)) {
+    throw "diagnostic source requires a context identity and full installation or exact same-config recreation"
+}
+$ExpectedInferenceReference = $ExpectedRepoDigest
+$ExpectedInferenceImageId = $ExpectedImageId
+$InferenceBuildProof = $null
 $ExplicitCapacity = -not [string]::IsNullOrEmpty($CapacityConfigSource)
+if ($InferenceDiagnostic -and (-not $ExplicitCapacity -or $ExpectedRepoDigest -cne "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458")) { throw "diagnostic source requires the exact observed raw base and explicit capacity" }
 if ($ExplicitCapacity -ne (-not [string]::IsNullOrEmpty($ExpectedCapacityConfigSha256))) {
     throw "capacity config source and expected SHA must be supplied together"
 }
@@ -40,6 +67,7 @@ if ($ApiDeviceProfile -ne "" -and (-not $ApiOnlyCompatibilityUpgrade -or -not $E
 }
 $PreviousApiDeviceProfile = $null
 $CapacityInputs = $null
+$OldApiHealth = $null
 $ProgressPreference = "SilentlyContinue"
 if ($ExpectedApiTaskSlots -ne 1 -or $ExpectedApiMaxPendingTasks -ne 1) {
     throw "serial MinerU requires task slots and pending depth to both equal 1"
@@ -350,7 +378,14 @@ function Write-OperationRecord {
     if ([string]::IsNullOrEmpty($OperationRecordDirectory)) { return }
     $script:OperationRecordCount++
     $payload = [ordered]@{ sequence = $script:OperationRecordCount; utc = (Get-Date).ToUniversalTime().ToString("o") }
-    foreach ($property in $Value.GetEnumerator()) { $payload[$property.Key] = $property.Value }
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($property in $Value.GetEnumerator()) { $payload[$property.Key] = $property.Value }
+    } elseif ($Value -is [System.Management.Automation.PSCustomObject]) {
+        # ConvertFrom-Json returns PSCustomObject on Windows PowerShell 5.1.
+        foreach ($property in $Value.PSObject.Properties) { $payload[$property.Name] = $property.Value }
+    } else {
+        throw "operation record value must be a dictionary or JSON object"
+    }
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($payload | ConvertTo-Json -Depth 8 -Compress))
     $stream = [IO.File]::Open((Join-Path $OperationRecordDirectory $Name), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
@@ -414,17 +449,17 @@ $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
 $ComposeBackup = "$ComposeTarget.pre-fixed-api-$Timestamp.bak"
 $CollectorBackup = "$CollectorTarget.pre-fixed-api-$Timestamp.bak"
 $ReceiptBackup = "$ReceiptTarget.pre-fixed-api-$Timestamp.bak"
-if ($ReuseCurrentPublishedImage) {
+if ($ReuseCurrentPublishedImage -or $InferenceRecreate) {
     if ($CampaignApiCompatImageId -notmatch '^sha256:[a-f0-9]{64}$') {
-        throw "reuse mode requires one canonical campaign API compatibility image ID"
+        throw "existing-image mode requires one canonical campaign API compatibility image ID"
     }
     if (-not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
-        throw "reuse mode requires one complete existing deployment"
+        throw "existing-image mode requires one complete existing deployment"
     }
     $ExpectedApiCompatImageId = $CampaignApiCompatImageId
 }
 elseif (-not [string]::IsNullOrEmpty($CampaignApiCompatImageId)) {
-    throw "campaign API compatibility image ID is valid only in reuse mode"
+    throw "campaign API compatibility image ID is valid only in existing-image mode"
 }
 
 function Get-OptionalImageId {
@@ -487,6 +522,46 @@ function Get-StableServiceEpochs {
     return $result
 }
 
+function Get-MineruServiceEpochs {
+    $inspect = (Invoke-Docker -Arguments @("inspect", "mineru-api", "mineru-api-proxy", "mineru-openai-server")) | ConvertFrom-Json
+    if (@($inspect).Count -ne 3) { throw "inference recreation requires three inspectable services" }
+    $result = [ordered]@{}
+    foreach ($name in @("mineru-api", "mineru-api-proxy", "mineru-openai-server")) {
+        $matches = @($inspect | Where-Object { $_.Name -ceq "/$name" })
+        if ($matches.Count -ne 1) { throw "inference recreation service $name is not unique" }
+        $container = $matches[0]
+        if (-not [bool]$container.State.Running -or [string]$container.State.Health.Status -cne "healthy" -or
+            [int]$container.RestartCount -ne 0 -or [bool]$container.State.OOMKilled -or
+            [string]$container.Id -cnotmatch '^[a-f0-9]{64}$' -or
+            [string]$container.Image -cnotmatch '^sha256:[a-f0-9]{64}$' -or
+            [string]::IsNullOrWhiteSpace([string]$container.State.StartedAt)) {
+            throw "inference recreation service $name has an invalid epoch"
+        }
+        $result[$name] = [ordered]@{
+            container_id = [string]$container.Id; started_at = [string]$container.State.StartedAt
+            image_id = [string]$container.Image
+        }
+    }
+    return $result
+}
+
+function Assert-InferenceRecreateEpochs {
+    param([Parameter(Mandatory=$true)][object]$Before, [Parameter(Mandatory=$true)][object]$After)
+    foreach ($name in @("mineru-api", "mineru-api-proxy")) {
+        foreach ($field in @("container_id", "started_at", "image_id")) {
+            if ([string]$Before[$name][$field] -cne [string]$After[$name][$field]) {
+                throw "inference recreation changed $name $field"
+            }
+        }
+    }
+    $name = "mineru-openai-server"
+    if ([string]$Before[$name].image_id -cne [string]$After[$name].image_id -or
+        [string]$Before[$name].container_id -ceq [string]$After[$name].container_id -or
+        [string]$Before[$name].started_at -ceq [string]$After[$name].started_at) {
+        throw "inference recreation did not produce exactly the expected new inference epoch"
+    }
+}
+
 function Assert-StableServiceEpochs {
     param([Parameter(Mandatory = $true)][object]$Expected)
     $actual = Get-StableServiceEpochs
@@ -545,20 +620,31 @@ function Get-ExplicitCapacityInputs {
     $text = $utf8.GetString($raw)
     if ((Get-Sha256Text $text) -cne $ExpectedCapacityConfigSha256) { throw "capacity config SHA differs" }
     $config = $text | ConvertFrom-Json
+    # v2 replaces the per-task result budgets with one nested result storage
+    # policy; the container decoder validates that policy exactly.
+    $storage = $config.contract_version -is [string] -and $config.contract_version -ceq "mineru.capacity-config.v2"
     $limits = @{
         parse_active_limit=128; total_nonterminal_limit=128; finalizer_active_limit=128;
         final_http_limit_per_loop=128; api_process_limit=1; api_event_loop_limit=1;
         processing_window_size=1024; omp_num_threads=256; mkl_num_threads=256;
-        openblas_num_threads=256; pdf_render_processes_requested=256;
-        result_reservation_bytes=[long]::MaxValue; max_unacked_result_bytes=[long]::MaxValue
+        openblas_num_threads=256; pdf_render_processes_requested=256
+    }
+    if (-not $storage) {
+        $limits["result_reservation_bytes"] = [long]::MaxValue
+        $limits["max_unacked_result_bytes"] = [long]::MaxValue
     }
     $names = @($limits.Keys) + @("contract_version", "hybrid_batch_ratio_requested", "pipeline_inference_locks")
+    if ($storage) { $names += "result_storage" }
     if ((@($config.PSObject.Properties.Name | Sort-Object) -join ",") -cne
             (@($names | Sort-Object) -join ",") -or
-        $config.contract_version -isnot [string] -or $config.contract_version -cne "mineru.capacity-config.v1" -or
+        $config.contract_version -isnot [string] -or
+        $config.contract_version -cnotin @("mineru.capacity-config.v1", "mineru.capacity-config.v2") -or
         $config.pipeline_inference_locks -isnot [bool] -or -not $config.pipeline_inference_locks -or
         ($config.hybrid_batch_ratio_requested -isnot [int] -and $config.hybrid_batch_ratio_requested -isnot [long]) -or
         $config.hybrid_batch_ratio_requested -notin @(1,2,4,8)) { throw "capacity config fields or policy differ" }
+    if ($storage -and $config.result_storage -isnot [System.Management.Automation.PSCustomObject]) {
+        throw "capacity config result storage policy is not an object"
+    }
     foreach ($name in $limits.Keys) {
         $value = $config.$name
         if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt 1 -or $value -gt $limits[$name]) {
@@ -567,15 +653,23 @@ function Get-ExplicitCapacityInputs {
     }
     if ($config.parse_active_limit -gt $config.total_nonterminal_limit -or
         $config.finalizer_active_limit -gt $config.total_nonterminal_limit -or
-        $config.result_reservation_bytes -gt $config.max_unacked_result_bytes -or
+        (-not $storage -and $config.result_reservation_bytes -gt $config.max_unacked_result_bytes) -or
         (Get-CanonicalObjectJson $config) -cne $text) { throw "capacity config is not canonical or internally consistent" }
     $mapping = @{
         MINERU_API_MAX_CONCURRENT_REQUESTS="parse_active_limit"; MINERU_API_MAX_PENDING_TASKS="total_nonterminal_limit";
         MINERU_API_FINALIZER_SLOTS="finalizer_active_limit"; MINERU_PROCESSING_WINDOW_SIZE="processing_window_size";
         OMP_NUM_THREADS="omp_num_threads"; MKL_NUM_THREADS="mkl_num_threads"; OPENBLAS_NUM_THREADS="openblas_num_threads";
-        MINERU_PDF_RENDER_THREADS="pdf_render_processes_requested"; MINERU_HYBRID_BATCH_RATIO="hybrid_batch_ratio_requested";
+        MINERU_PDF_RENDER_THREADS="pdf_render_processes_requested"; MINERU_HYBRID_BATCH_RATIO="hybrid_batch_ratio_requested"
+    }
+    # The v1 per-task result budgets. v1 projects them; v2 retires them: a v2
+    # bootstrap refuses them because its budgets live only in the policy.
+    $resultBudgets = @{
         MINERU_TASK_PROTOCOL_V2_RESULT_RESERVATION_BYTES="result_reservation_bytes";
         MINERU_TASK_PROTOCOL_V2_MAX_UNACKED_BYTES="max_unacked_result_bytes"
+    }
+    $retired = [ordered]@{}
+    foreach ($name in ($resultBudgets.Keys | Sort-Object)) {
+        if ($storage) { $retired[$name] = $resultBudgets[$name] } else { $mapping[$name] = $resultBudgets[$name] }
     }
     $environment = [ordered]@{}
     foreach ($name in ($mapping.Keys | Sort-Object)) { $environment[$name] = [string]$config.($mapping[$name]) }
@@ -589,7 +683,7 @@ function Get-ExplicitCapacityInputs {
     return [ordered]@{
         config=$config; config_sha256=$ExpectedCapacityConfigSha256; config_bytes=$raw;
         source_sha256=$sources; sources_sha256=(Get-Sha256Text (Get-CanonicalObjectJson $sources));
-        environment=$environment; build_target="explicit-capacity"; context=$context
+        environment=$environment; retired_environment=$retired; build_target="explicit-capacity"; context=$context
     }
 }
 
@@ -645,6 +739,15 @@ function Assert-CapacityCompose {
     }
     foreach ($name in @("MINERU_CAPACITY_CONFIG_PATH", "MINERU_CAPACITY_CONFIG_SHA256")) {
         if ($null -ne $api.environment.PSObject.Properties[$name]) { throw "compose overrides baked capacity anchor" }
+    }
+    # A field retired by this capacity version is never carried forward (a v2
+    # bootstrap refuses the v1 result budgets); no comparison masks it here.
+    if ($null -ne $CapacityInputs.retired_environment) {
+        foreach ($name in @($CapacityInputs.retired_environment.Keys)) {
+            if ($null -ne $api.environment.PSObject.Properties[$name]) {
+                throw "compose carries a capacity field retired by its capacity version: $name"
+            }
+        }
     }
     $expected = @("--host", "0.0.0.0", "--port", "8000", "--allow-public-http-client", "--max-concurrency",
         [string]$CapacityInputs.config.final_http_limit_per_loop)
@@ -768,6 +871,50 @@ function Assert-ApiOnlyUpgradeInputs {
         }
         # Only the selected API capacity fields may differ. Inference/proxy,
         # networks, mounts, image name and every other setting remain exact.
+        # Each side masks only its own capacity projection. A candidate version
+        # that retires projected fields (v1 -> v2 retires the per-task result
+        # budgets) leaves them on the deployed side, where they are masked only
+        # as the complete canonical v1 pair that the running API actually serves.
+        # The candidate side never masks them: Assert-CapacityCompose refused them.
+        $retired = $CapacityInputs.retired_environment
+        $deployed = $previous.services."mineru-api".environment
+        $carried = @()
+        if ($null -ne $retired) {
+            $carried = @($retired.Keys | Where-Object { $null -ne $deployed.PSObject.Properties[$_] })
+        }
+        if ($carried.Count -ne 0) {
+            if ($carried.Count -ne @($retired.Keys).Count) {
+                throw "deployed compose carries an incomplete retired capacity projection"
+            }
+            $budgets = @{}
+            foreach ($name in $carried) {
+                $value = $deployed.$name
+                $parsed = [long]0
+                if ($value -isnot [string] -or $value -cnotmatch '\A[1-9][0-9]{0,18}\z' -or
+                    -not [long]::TryParse($value, [ref]$parsed)) {
+                    throw "deployed retired capacity field is not a canonical positive integer: $name"
+                }
+                $budgets[$retired[$name]] = $parsed
+            }
+            if ($budgets["result_reservation_bytes"] -gt $budgets["max_unacked_result_bytes"]) {
+                throw "deployed retired capacity budgets are not a valid v1 projection"
+            }
+            # The captured, idle-validated running API is the exact old binding:
+            # a v3 runtime (capacity v1) resolving exactly these budgets.
+            $evidence = $script:OldApiHealth
+            if ($null -eq $evidence -or $null -eq $evidence.task_protocol_runtime -or
+                $evidence.task_protocol_runtime.schema -isnot [string] -or
+                $evidence.task_protocol_runtime.schema -cne "mineru-task-runtime.v3") {
+                throw "retired capacity fields require the running v1 capacity API as evidence"
+            }
+            $served = $evidence.capacity_observation.resolved_limits
+            foreach ($field in @($budgets.Keys)) {
+                $value = $served.$field
+                if (($value -isnot [int] -and $value -isnot [long]) -or [long]$value -ne $budgets[$field]) {
+                    throw "deployed retired capacity field differs from the running API: $field"
+                }
+            }
+        }
         foreach ($item in @($next, $previous)) {
             Remove-ApiStopBudgetProjection -Compose $item
             foreach ($name in $CapacityInputs.environment.Keys) {
@@ -780,6 +927,7 @@ function Assert-ApiOnlyUpgradeInputs {
             }
             $item.services."mineru-api".command = @($command[0..5]) + @("capacity-value")
         }
+        foreach ($name in $carried) { $deployed.PSObject.Properties.Remove($name) }
         if ((Get-CanonicalObjectJson $next) -cne (Get-CanonicalObjectJson $previous)) {
             throw "API-only capacity upgrade changed configuration outside API capacity fields"
         }
@@ -788,6 +936,14 @@ function Assert-ApiOnlyUpgradeInputs {
             (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash) {
         throw "API-only compatibility upgrade requires unchanged compose bytes"
     }
+}
+
+function Invoke-InferenceRecreate {
+    Invoke-Docker -Arguments @(
+        "compose", "--project-name", $ProjectName, "--file", $ComposeTarget,
+        "up", "--detach", "--no-build", "--no-deps", "--force-recreate",
+        "mineru-openai-server"
+    ) -TimeoutMilliseconds 900000 | Out-Null
 }
 
 function Invoke-ApiOnlyRecreate {
@@ -886,32 +1042,59 @@ function Assert-CapacityIdleHealth {
         $Health.processing_tasks -ne 0 -or $Health.task_retention_seconds -ne 600 -or
         $Health.task_cleanup_interval_seconds -ne 30) { throw "$Label capacity API is not healthy and idle" }
     $runtime = $Health.task_protocol_runtime
-    Assert-ClosedProperties $runtime @("schema", "enabled", "task_registry_max_records", "task_result_reservation_bytes",
-        "max_unacked_result_bytes", "registry_schema", "admission_scope", "capacity_config_sha256") "$Label runtime"
+    # A result-storage capacity (v2) serves runtime/registry v4: its per-task
+    # budgets are replaced by the bound storage policy and its idle ledger.
+    $storage = $runtime.schema -is [string] -and $runtime.schema -ceq "mineru-task-runtime.v4"
+    if ($null -ne $ExpectedCapacity -and
+        (($ExpectedCapacity.contract_version -ceq "mineru.capacity-config.v2") -ne $storage)) {
+        throw "$Label runtime storage mode differs from the external config"
+    }
+    if ($storage) {
+        Assert-ClosedProperties $runtime @("schema", "enabled", "task_registry_max_records", "registry_schema",
+            "admission_scope", "capacity_config_sha256", "result_storage_policy_sha256") "$Label runtime"
+        $runtimeSchema = "mineru-task-runtime.v4"; $registrySchema = "mineru-task-registry.v4"
+        $budgetNames = @("task_registry_max_records")
+        if ($runtime.result_storage_policy_sha256 -isnot [string] -or
+            $runtime.result_storage_policy_sha256 -cnotmatch '\Asha256:[a-f0-9]{64}\z' -or
+            ($null -ne $ExpectedCapacity -and
+             (Get-Sha256Text (Get-CanonicalObjectJson $ExpectedCapacity.result_storage)) -cne $runtime.result_storage_policy_sha256)) {
+            throw "$Label runtime result storage policy differs"
+        }
+    } else {
+        Assert-ClosedProperties $runtime @("schema", "enabled", "task_registry_max_records", "task_result_reservation_bytes",
+            "max_unacked_result_bytes", "registry_schema", "admission_scope", "capacity_config_sha256") "$Label runtime"
+        $runtimeSchema = "mineru-task-runtime.v3"; $registrySchema = "mineru-task-registry.v3"
+        $budgetNames = @("task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes")
+    }
     if ($runtime.schema -isnot [string] -or $runtime.registry_schema -isnot [string] -or
         $runtime.admission_scope -isnot [string] -or $runtime.capacity_config_sha256 -isnot [string] -or
-        $runtime.schema -cne "mineru-task-runtime.v3" -or $runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
-        $runtime.registry_schema -cne "mineru-task-registry.v3" -or $runtime.admission_scope -cne "post_form_owned_upload" -or
+        $runtime.schema -cne $runtimeSchema -or $runtime.enabled -isnot [bool] -or -not $runtime.enabled -or
+        $runtime.registry_schema -cne $registrySchema -or $runtime.admission_scope -cne "post_form_owned_upload" -or
         $runtime.capacity_config_sha256 -cnotmatch '\Asha256:[a-f0-9]{64}\z') { throw "$Label runtime identity differs" }
-    foreach ($name in @("task_registry_max_records", "task_result_reservation_bytes", "max_unacked_result_bytes")) {
+    foreach ($name in $budgetNames) {
         if (($runtime.$name -isnot [int] -and $runtime.$name -isnot [long]) -or $runtime.$name -lt 1) {
             throw "$Label runtime limit is invalid: $name"
         }
     }
-    if ($runtime.task_registry_max_records -ne 128 -or $runtime.task_result_reservation_bytes -gt $runtime.max_unacked_result_bytes) {
+    if ($runtime.task_registry_max_records -ne 128 -or
+        (-not $storage -and $runtime.task_result_reservation_bytes -gt $runtime.max_unacked_result_bytes)) {
         throw "$Label runtime capacity is inconsistent"
     }
     $observation = $Health.capacity_observation
-    Assert-ClosedProperties $observation @("schema", "capacity_config_sha256", "owner", "resolved_limits",
-        "http_limiter_state", "stage_counters", "http_counters", "owner_control", "framework_limits", "observed_at") "$Label observation"
+    $observationFields = @("schema", "capacity_config_sha256", "owner", "resolved_limits",
+        "http_limiter_state", "stage_counters", "http_counters", "owner_control", "framework_limits", "observed_at")
+    if ($storage) { $observationFields += "result_storage" }
+    Assert-ClosedProperties $observation $observationFields "$Label observation"
+    $observationSchema = if ($storage) { "mineru.capacity-observation.v2" } else { "mineru.capacity-observation.v1" }
     if ($observation.schema -isnot [string] -or $observation.capacity_config_sha256 -isnot [string] -or
         $observation.http_limiter_state -isnot [string] -or
-        $observation.schema -cne "mineru.capacity-observation.v1" -or
+        $observation.schema -cne $observationSchema -or
         $observation.capacity_config_sha256 -cne $runtime.capacity_config_sha256) { throw "$Label config identity differs" }
     $limits = $observation.resolved_limits
-    Assert-ClosedProperties $limits @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit",
-        "result_reservation_bytes", "max_unacked_result_bytes", "final_http_limit_per_loop") "$Label resolved limits"
-    foreach ($name in @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit", "result_reservation_bytes", "max_unacked_result_bytes")) {
+    $limitNames = @("parse_active_limit", "total_nonterminal_limit", "finalizer_active_limit")
+    if (-not $storage) { $limitNames += @("result_reservation_bytes", "max_unacked_result_bytes") }
+    Assert-ClosedProperties $limits ($limitNames + @("final_http_limit_per_loop")) "$Label resolved limits"
+    foreach ($name in $limitNames) {
         if (($limits.$name -isnot [int] -and $limits.$name -isnot [long]) -or $limits.$name -lt 1) {
             throw "$Label resolved limit is invalid: $name"
         }
@@ -924,8 +1107,36 @@ function Assert-CapacityIdleHealth {
         $limits.total_nonterminal_limit -ne $Health.max_pending_tasks_effective -or
         $limits.total_nonterminal_limit -gt 128 -or $limits.parse_active_limit -gt $limits.total_nonterminal_limit -or
         $limits.finalizer_active_limit -gt $limits.total_nonterminal_limit -or
-        $limits.result_reservation_bytes -ne $runtime.task_result_reservation_bytes -or
-        $limits.max_unacked_result_bytes -ne $runtime.max_unacked_result_bytes) { throw "$Label resolved owners disagree" }
+        (-not $storage -and ($limits.result_reservation_bytes -ne $runtime.task_result_reservation_bytes -or
+         $limits.max_unacked_result_bytes -ne $runtime.max_unacked_result_bytes))) { throw "$Label resolved owners disagree" }
+    if ($storage) {
+        $ledger = $observation.result_storage
+        Assert-ClosedProperties $ledger @("policy_sha256", "source_bytes", "ingress_bytes", "result_bytes",
+            "growing_producers", "outstanding_promise_bytes", "completion_queue_depth", "waiting_tasks",
+            "blocked_tasks") "$Label result storage"
+        if ($ledger.policy_sha256 -isnot [string] -or $ledger.policy_sha256 -cne $runtime.result_storage_policy_sha256) {
+            throw "$Label result storage ledger names another policy"
+        }
+        foreach ($name in @("source_bytes", "result_bytes")) {
+            if (($ledger.$name -isnot [int] -and $ledger.$name -isnot [long]) -or $ledger.$name -lt 0) {
+                throw "$Label result storage ledger is invalid: $name"
+            }
+        }
+        # Idle: no ingress, producer, promise, completion wait or hold.
+        foreach ($name in @("ingress_bytes", "growing_producers", "outstanding_promise_bytes",
+            "completion_queue_depth", "blocked_tasks")) {
+            if (($ledger.$name -isnot [int] -and $ledger.$name -isnot [long]) -or $ledger.$name -ne 0) {
+                throw "$Label result storage is not idle: $name"
+            }
+        }
+        Assert-ClosedProperties $ledger.waiting_tasks @("completion_capacity", "free_floor", "source_growth_capacity") "$Label storage waits"
+        foreach ($name in @("completion_capacity", "free_floor", "source_growth_capacity")) {
+            $waiting = $ledger.waiting_tasks.$name
+            if (($waiting -isnot [int] -and $waiting -isnot [long]) -or $waiting -ne 0) {
+                throw "$Label result storage is waiting: $name"
+            }
+        }
+    }
     if ($null -ne $ExpectedCapacity -and
         ((Get-Sha256Text (Get-CanonicalObjectJson $ExpectedCapacity)) -cne $runtime.capacity_config_sha256 -or
         $Health.processing_window_size -ne $ExpectedCapacity.processing_window_size)) { throw "$Label expected config differs" }
@@ -944,6 +1155,7 @@ function Assert-CapacityIdleHealth {
     }
     if ($null -ne $observation.owner_control.trigger) { throw "$Label owner trigger is active" }
     $stages = @("result_capacity_waiting", "parse_waiting", "parse_active", "finalizer_waiting", "finalizer_active")
+    if ($storage) { $stages += @("source_growth_waiting", "completion_waiting") }
     $http = @("active_requests", "pending_requests")
     Assert-ClosedProperties $observation.stage_counters $stages "$Label stages"
     Assert-ClosedProperties $observation.http_counters $http "$Label HTTP"
@@ -960,7 +1172,7 @@ function Assert-CapacityIdleHealth {
         "scheduled_tasks", "queue_depth", "active_processors")
     Assert-ClosedProperties $admission (@("schema", "registry_schema", "nonterminal_limit", "recovery_overcommitted", "admission_open", "blocked_reason") + $counters) "$Label admission"
     if ($admission.schema -isnot [string] -or $admission.registry_schema -isnot [string] -or
-        $admission.schema -cne "mineru-task-admission.v1" -or $admission.registry_schema -cne "mineru-task-registry.v3" -or
+        $admission.schema -cne "mineru-task-admission.v1" -or $admission.registry_schema -cne $registrySchema -or
         ($admission.nonterminal_limit -isnot [int] -and $admission.nonterminal_limit -isnot [long]) -or
         $admission.nonterminal_limit -ne $limits.total_nonterminal_limit -or $admission.recovery_overcommitted -isnot [bool] -or
         $admission.recovery_overcommitted -or $admission.admission_open -isnot [bool] -or -not $admission.admission_open -or
@@ -1015,9 +1227,9 @@ function Assert-CapacityFiles {
 import hashlib,json,sys
 from pathlib import Path
 from mineru.cli.agent_capacity_file import read_mineru_capacity_file
-from mineru.cli.agent_capacity_config import decode_mineru_capacity_config
+from mineru.cli.agent_capacity_config import decode_any_mineru_capacity_config
 raw=read_mineru_capacity_file(Path('/usr/local/etc/mineru/capacity.json'),expected_sha256=sys.argv[1],expected_owner_uid=0)
-config=decode_mineru_capacity_config(raw)
+config=decode_any_mineru_capacity_config(raw)
 sources={}
 for name in ('bootstrap','config','file','observation'):
     relative='mineru/cli/agent_capacity_'+name+'.py'
@@ -1059,7 +1271,10 @@ function Assert-IdleHealth {
     }
     $runtime = $Health.task_protocol_runtime
     $isV3 = $null -ne $runtime -and $runtime.schema -eq "mineru-task-runtime.v3"
-    if ($isV3) {
+    # A result-storage capacity (v2) serves runtime v4; the explicit capacity
+    # check owns both closed shapes and matches each to the expected config.
+    $isV4 = $null -ne $runtime -and $runtime.schema -is [string] -and $runtime.schema -ceq "mineru-task-runtime.v4"
+    if ($isV3 -or $isV4) {
         Assert-CapacityIdleHealth -Health $Health -ExpectedCapacity $ExpectedCapacity -Label $Label
         return
     }
@@ -1238,6 +1453,7 @@ function Capture-OldRuntimeState {
         }
         $oldHealth = Invoke-RestMethod -Uri "http://127.0.0.1:30003/health" -TimeoutSec 15
         Assert-IdleHealth -Health $oldHealth -Label "old MinerU API"
+        $script:OldApiHealth = $oldHealth
         $oldApi = (Invoke-Docker -Arguments @("inspect", "mineru-api")) | ConvertFrom-Json
         if (
             $script:OldProjectContainers -notcontains "mineru-api-proxy" -or
@@ -1260,7 +1476,7 @@ function Capture-OldRuntimeState {
             Assert-VllmIdle
         }
     }
-    if ($ApiOnlyOperation) {
+    if ($ApiOnlyOperation -or $InferenceRecreate) {
         $required = @("mineru-api", "mineru-api-proxy", "mineru-openai-server")
         if (
             (@($script:OldProjectContainers | Sort-Object) -join ",") -ne
@@ -1351,6 +1567,8 @@ function Get-ValidatedRuntime {
     }
     $api = $api[0]
     if ($ApiDeviceProfile -ne "") { Assert-ApiDeviceRuntime -Container $api -Profile $ApiDeviceProfile }
+    if ($InferenceRecreate) { Assert-ApiDeviceRuntime -Container $api -Profile $ExpectedApiDeviceProfile }
+    if ($ExpectedFullApiDeviceProfile -ne "") { Assert-ApiDeviceRuntime -Container $api -Profile $ExpectedFullApiDeviceProfile }
     $proxy = $proxy[0]
     $inference = $inference[0]
 
@@ -1360,13 +1578,16 @@ function Get-ValidatedRuntime {
     ) {
         throw "MinerU API compatibility image reference or ID drifted"
     }
-    foreach ($container in @($proxy, $inference)) {
+    foreach ($container in @($proxy)) {
         if (
             [string]$container.Config.Image -ne $ExpectedRepoDigest -or
             [string]$container.Image -ne $ExpectedImageId
         ) {
             throw "$($container.Name) base image reference or image ID drifted"
         }
+    }
+    if ([string]$inference.Config.Image -cne $ExpectedInferenceReference -or [string]$inference.Image -cne $ExpectedInferenceImageId) {
+        throw "inference image reference or image ID drifted"
     }
     foreach ($container in @($api, $proxy, $inference)) {
         if (
@@ -1413,10 +1634,10 @@ function Get-ValidatedRuntime {
         }
         Assert-CapacityFiles -ContainerId ([string]$api.Id)
     }
-    Assert-ExactCommand -Container $inference -Expected @(
-        "mineru-openai-server", "--host", "0.0.0.0", "--port", "30000",
-        "--max-num-seqs", "128", "--mm-processor-cache-gb", "0"
-    )
+    $inferenceArgv = @("mineru-openai-server", "--host", "0.0.0.0", "--port", "30000",
+        "--max-num-seqs", "128", "--mm-processor-cache-gb", "0")
+    if ($InferenceDiagnostic) { $inferenceArgv += @("--worker-cls", "mineru_inference_memory.worker.OwnerMemoryWorker") }
+    Assert-ExactCommand -Container $inference -Expected $inferenceArgv
     $proxyCommand = @($proxy.Config.Entrypoint) + @($proxy.Config.Cmd)
     if (
         $proxyCommand.Count -ne 4 -or
@@ -1671,6 +1892,162 @@ function Build-ValidatedApiCompatImage {
         -RequiredImageId $ExpectedApiCompatImageId -BuildIdentity $identity)
 }
 
+function Build-ValidatedInferenceDiagnostic {
+    param([switch]$ReuseInstalled)
+    $context = [IO.Path]::GetFullPath($InferenceDiagnosticContext)
+    $sourceMap = [ordered]@{}
+    foreach ($name in @('Dockerfile','mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+        $path = Join-Path $context $name
+        $file = Get-Item -LiteralPath $path
+        if ($file.Length -lt 1 -or $file.Length -gt 8388608 -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "diagnostic build source is not a bounded regular file" }
+        $sourceMap[$name] = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+    }
+    $contextSha = Get-Sha256Text ($sourceMap | ConvertTo-Json -Compress)
+    if ($contextSha -cne $InferenceDiagnosticContextSha256) { throw "diagnostic build source map differs from the release identity" }
+    $reference = 'agent-invest/mineru-inference:owner-memory-' + $contextSha.Substring(7)
+    $candidate = Get-ResolvedCompose $ComposeSource
+    if ([string]$candidate.services."mineru-openai-server".image -cne $reference -or
+            [string]$candidate.services."mineru-api-proxy".image -cne $ExpectedRepoDigest) { throw "diagnostic compose image projection drifted" }
+    if (-not $ReuseInstalled) {
+    Invoke-Docker -Arguments @('build','--pull=false','--provenance=false','--network','none','--tag',$reference,
+        '--label',('io.agent-invest.mineru.owner-memory-module-sha256=' + $sourceMap['mineru_inference_memory/worker.py']),
+        '--label',('io.agent-invest.mineru.owner-memory-dockerfile-sha256=' + $sourceMap['Dockerfile']),
+        '--label',('io.agent-invest.mineru.owner-memory-base-repo-digest=' + $ExpectedRepoDigest),
+        '--label',('io.agent-invest.mineru.owner-memory-context-sha256=' + $contextSha),
+        '--file',(Join-Path $context 'Dockerfile'),$context) -TimeoutMilliseconds 900000 | Out-Null
+    }
+    $image = @(Invoke-Docker -Arguments @('image','inspect',$reference) | ConvertFrom-Json)
+    if ($image.Count -ne 1 -or [string]$image[0].Id -cnotmatch '^sha256:[a-f0-9]{64}$') { throw "diagnostic image is not uniquely bound" }
+    if ($ReuseInstalled) {
+        $installed = (Get-Content -LiteralPath $ReceiptTarget -Raw | ConvertFrom-Json).inference_diagnostic_build
+        if ($null -eq $installed -or [string]$installed.context_sha256 -cne $contextSha -or
+                [string]$installed.image_reference -cne $reference -or [string]$installed.image_id -cne [string]$image[0].Id -or
+                (Get-CanonicalObjectJson $installed.sources) -cne (Get-CanonicalObjectJson $sourceMap)) { throw "installed diagnostic source/image proof differs from same-config recreation" }
+    }
+    $probe = @'
+import hashlib, importlib.metadata, json
+from pathlib import Path
+root = Path(importlib.metadata.distribution("vllm").locate_file(""))
+def digest(relative):
+    path = root / relative
+    if path.is_symlink(): raise RuntimeError("source symlink refused")
+    with path.open("rb") as stream: raw = stream.read(8388609)
+    if not raw or len(raw) > 8388608: raise RuntimeError("source byte bound exceeded")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+diagnostic_paths = ("mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py")
+paths = ("vllm/v1/worker/worker_base.py", "vllm/v1/worker/gpu_worker.py", "vllm/v1/worker/gpu_model_runner.py", "vllm/v1/worker/gpu/mm/encoder_runner.py")
+print(json.dumps({"module_sha256": digest("mineru_inference_memory/worker.py"), "actual_source_sha256": {path: digest(path) for path in paths}, "actual_diagnostic_source_sha256": {path: digest(path) for path in diagnostic_paths}, "vllm_version": importlib.metadata.version("vllm")}, sort_keys=True))
+'@
+    $probeArguments = if ($ReuseInstalled) { @('exec','mineru-openai-server','/usr/bin/python3.12','-I','-c',$probe) } else { @('run','--rm','--network','none','--entrypoint','/usr/bin/python3.12',[string]$image[0].Id,'-I','-c',$probe) }
+    $proof = @(Invoke-Docker -Arguments $probeArguments)
+    if ($proof.Count -ne 1) { throw "diagnostic image source probe is not singular" }
+    $actual = ([string]$proof[0]) | ConvertFrom-Json
+    $preimages = @{
+        'vllm/v1/worker/worker_base.py'='sha256:e6017acf80e442405f09f99413c0227515ae097d3e1dc79005b0b5c266932f12'
+        'vllm/v1/worker/gpu_worker.py'='sha256:53196cef1d32b5c5207c8986a5666352fd5ba0b79c418c074311147f266cadc4'
+        'vllm/v1/worker/gpu_model_runner.py'='sha256:95b7ee3ff5eecdb0fa791f375b2aeedc6ac507f3ea4a9683700d3b202b2caf08'
+        'vllm/v1/worker/gpu/mm/encoder_runner.py'='sha256:909181912d39bf4734d5202340a77813252136bc1f38c458f879b05743a522bf'
+    }
+    if ([string]$actual.vllm_version -cne '0.21.0' -or [string]$actual.module_sha256 -cne $sourceMap['mineru_inference_memory/worker.py']) { throw "diagnostic built module/version drifted" }
+    foreach ($name in $preimages.Keys) { if ([string]$actual.actual_source_sha256.$name -cne $preimages[$name]) { throw "diagnostic vLLM source preimage drifted: $name" } }
+    foreach ($name in @('mineru_inference_memory/__init__.py','mineru_inference_memory/core.py','mineru_inference_memory/worker.py')) {
+        if ([string]$actual.actual_diagnostic_source_sha256.$name -cne $sourceMap[$name]) { throw "diagnostic installed package source drifted: $name" }
+    }
+    $labels = $image[0].Config.Labels
+    if ([string]$labels.'io.agent-invest.mineru.owner-memory-module-sha256' -cne $sourceMap['mineru_inference_memory/worker.py'] -or
+            [string]$labels.'io.agent-invest.mineru.owner-memory-dockerfile-sha256' -cne $sourceMap['Dockerfile'] -or
+            [string]$labels.'io.agent-invest.mineru.owner-memory-base-repo-digest' -cne $ExpectedRepoDigest -or
+            [string]$labels.'io.agent-invest.mineru.owner-memory-context-sha256' -cne $contextSha) { throw "diagnostic built image labels drifted" }
+    $script:ExpectedInferenceReference = $reference
+    $script:ExpectedInferenceImageId = [string]$image[0].Id
+    $script:InferenceBuildProof = [ordered]@{ context_sha256=$contextSha; image_reference=$reference; image_id=[string]$image[0].Id; sources=$sourceMap; actual=$actual }
+    Write-OperationRecord 'inference-build-proof.json' $script:InferenceBuildProof
+}
+
+function Assert-DiagnosticCollectorIdentity {
+    param([string]$Phase, [AllowNull()][object]$Observation = $null)
+    if ($null -eq $Observation) {
+        $observed = @(& $CollectorTarget -ComposePath $ComposeTarget -OutputRoot $OutputRoot -ExpectedCapacityConfigSha256 $ExpectedCapacityConfigSha256)
+        if ($observed.Count -ne 1) { throw "diagnostic collector did not return a singular observation" }
+        $value = ([string]$observed[0]) | ConvertFrom-Json
+    } else { $value = $Observation }
+    if ([string]$value.schema -cne 'mineru-windows-runtime-observation.v7' -or
+            [string]$value.inference.image_id -cne $ExpectedInferenceImageId -or
+            [string]$value.inference_diagnostic.module_sha256 -cne [string]$InferenceBuildProof.sources.'mineru_inference_memory/worker.py' -or
+            (Get-CanonicalObjectJson $value.inference_diagnostic.actual_source_sha256) -cne (Get-CanonicalObjectJson $InferenceBuildProof.actual.actual_source_sha256) -or
+            (Get-CanonicalObjectJson $value.inference_diagnostic.actual_diagnostic_source_sha256) -cne (Get-CanonicalObjectJson $InferenceBuildProof.actual.actual_diagnostic_source_sha256) -or
+            @($value.inference_diagnostic.loaded_workers).Count -ne 1) { throw "diagnostic collector source/loading identity differs" }
+    $proof = $value.inference_diagnostic
+    $worker = @($proof.loaded_workers)[0]
+    $expectedLabels = [ordered]@{
+        'io.agent-invest.mineru.owner-memory-module-sha256'=$InferenceBuildProof.sources.'mineru_inference_memory/worker.py'
+        'io.agent-invest.mineru.owner-memory-dockerfile-sha256'=$InferenceBuildProof.sources.Dockerfile
+        'io.agent-invest.mineru.owner-memory-base-repo-digest'=$ExpectedRepoDigest
+        'io.agent-invest.mineru.owner-memory-context-sha256'=$InferenceDiagnosticContextSha256
+    }
+    if ([string]$proof.contract_version -cne 'mineru.owner-memory-observation.v1' -or
+            (Get-CanonicalObjectJson $proof.image_labels) -cne (Get-CanonicalObjectJson $expectedLabels) -or
+            [string]$proof.container_epoch.container_id -cne [string]$value.inference.container_id -or
+            [string]$proof.container_epoch.container_id -cnotmatch '^[a-f0-9]{64}$' -or
+            [string]$proof.container_epoch.started_at -cne [string]$value.inference.started_at -or
+            [string]::IsNullOrEmpty([string]$proof.container_epoch.started_at) -or
+            [string]$worker.contract_version -cne 'mineru.owner-memory-identity.v1' -or
+            [string]$worker.worker_class -cne 'mineru_inference_memory.worker.OwnerMemoryWorker' -or
+            [string]$worker.module_sha256 -cne [string]$proof.module_sha256 -or
+            [string]$worker.device -cne 'cuda:0' -or [long]$worker.pid -le 0 -or
+            [long]$worker.proc_start_ticks -le 0 -or [long]$worker.namespace_init_start_ticks -le 0 -or
+            [long]$worker.proc_start_ticks -ne [long]$worker.observed_proc_start_ticks -or
+            [long]$worker.namespace_init_start_ticks -gt [long]$worker.proc_start_ticks -or
+            [string]::IsNullOrEmpty([string]$worker.instance_id) -or ([string]$worker.instance_id).Length -gt 128) {
+        throw "diagnostic collector loaded owner/container proof differs"
+    }
+    Write-OperationRecord ('diagnostic-observation-' + $Phase + '.json') $value
+}
+
+function Assert-InferenceRecreateInputs {
+    if (-not $ExplicitCapacity -or -not $ComposeExisted -or -not $CollectorExisted -or -not $ReceiptExisted) {
+        throw "inference recreation requires the existing explicit-capacity deployment"
+    }
+    foreach ($pair in @(@{source=$ComposeSource;target=$ComposeTarget}, @{source=$CollectorSource;target=$CollectorTarget})) {
+        $source = [IO.Path]::GetFullPath([string]$pair.source); $target = [IO.Path]::GetFullPath([string]$pair.target)
+        if ($source -ceq $target -or (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash -cne
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash) {
+            throw "inference recreation requires distinct, byte-identical staged and active files"
+        }
+    }
+    $candidate = Get-ResolvedCompose -Path $ComposeSource
+    $active = Get-ResolvedCompose -Path $ComposeTarget
+    Assert-CapacityCompose -Compose $candidate
+    Assert-CapacityCompose -Compose $active
+    if ([string]$candidate.services."mineru-openai-server".pull_policy -cne "never" -or
+        [string]$active.services."mineru-openai-server".pull_policy -cne "never") {
+        throw "inference recreation requires the pinned no-pull Compose policy"
+    }
+    if ((Get-CanonicalObjectJson $candidate) -cne (Get-CanonicalObjectJson $active)) {
+        throw "inference recreation resolved compose differs from active compose"
+    }
+    if ((Get-ApiDeviceProfile -Api $active.services."mineru-api") -cne $ExpectedApiDeviceProfile) {
+        throw "inference recreation API device profile differs from the active compose"
+    }
+    $receiptFile = Get-Item -LiteralPath $ReceiptTarget
+    if ($receiptFile.Length -lt 1 -or $receiptFile.Length -gt 4194304 -or
+        (($receiptFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "existing receipt is not a bounded regular file"
+    }
+    $receiptText = (New-Object Text.UTF8Encoding($false,$true)).GetString([IO.File]::ReadAllBytes($ReceiptTarget))
+    $receipt = $receiptText | ConvertFrom-Json
+    if ($receipt.schema -cne "mineru-windows-install-receipt.v2" -or -not [bool]$receipt.success -or
+        [string]$receipt.compose_sha256 -cne ("sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash.ToLowerInvariant()) -or
+        [string]$receipt.collector_sha256 -cne ("sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $CollectorTarget).Hash.ToLowerInvariant()) -or
+        [string]$receipt.api_compatibility_image.image_id -cne $CampaignApiCompatImageId) {
+        throw "inference recreation existing receipt identity differs"
+    }
+    $api = @(Invoke-Docker -Arguments @("inspect", "mineru-api") | ConvertFrom-Json)
+    if ($api.Count -ne 1 -or [string]$api[0].Image -cne $CampaignApiCompatImageId) {
+        throw "inference recreation running API image differs from existing receipt"
+    }
+}
+
 function Get-ValidatedPublishedApiCompatImage {
     $identity = Get-ApiCompatBuildIdentity
     $publishedImageId = Get-OptionalImageId -Reference $ApiCompatImage
@@ -1893,8 +2270,56 @@ try {
         throw "local Docker image does not match the expected repo digest and image ID"
     }
 
-    if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
     Capture-OldRuntimeState
+    if ($InferenceRecreate) {
+        Assert-InferenceRecreateInputs
+        if ($InferenceDiagnostic) { Build-ValidatedInferenceDiagnostic -ReuseInstalled }
+        $compatImage = Get-ValidatedPublishedApiCompatImage
+        $PreDeploymentOutputState = Get-QuiescentOutputState -CandidateSource
+        $registryWitnessBefore = Get-RollbackRegistryWitness -State $PreDeploymentOutputState
+        $runtimeBefore = Get-ValidatedRuntime
+        if ($InferenceDiagnostic) { Assert-DiagnosticCollectorIdentity -Phase before }
+        Assert-VllmIdle
+        $beforeEpochs = Get-MineruServiceEpochs
+        $receiptSha = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ReceiptTarget).Hash.ToLowerInvariant()
+        $composeBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash
+        $collectorBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $CollectorTarget).Hash
+        Write-OperationRecord "installer-phase-preflight-complete.json" ([ordered]@{
+            phase = "preflight_complete"; operation_kind = "inference-recreate"
+            receipt_sha256 = $receiptSha; service_epochs_before = $beforeEpochs
+            registry_witness_before = $registryWitnessBefore; runtime_before = $runtimeBefore
+        })
+        Write-OperationRecord "installer-phase-mutation-started.json" ([ordered]@{
+            phase = "mutation_started"; operation_kind = "inference-recreate"
+        })
+        $MutationStarted = $true
+        $DeploymentAttempted = $true
+        Invoke-InferenceRecreate
+        $runtime = Get-ValidatedRuntime
+        if ($InferenceDiagnostic) { Assert-DiagnosticCollectorIdentity -Phase after }
+        Assert-VllmIdle
+        $afterEpochs = Get-MineruServiceEpochs
+        Assert-InferenceRecreateEpochs -Before $beforeEpochs -After $afterEpochs
+        Assert-RollbackRegistryUnchanged
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $ComposeTarget).Hash -cne $composeBefore -or
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $CollectorTarget).Hash -cne $collectorBefore -or
+            ("sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ReceiptTarget).Hash.ToLowerInvariant()) -cne $receiptSha) {
+            throw "inference recreation changed the existing deployment files"
+        }
+        Write-OperationRecord "installer-result.json" ([ordered]@{
+            phase = "complete"; status = "pass"; first_error = $null
+            operation_kind = "inference-recreate"; receipt_sha256 = $receiptSha
+            compose_sha256 = "sha256:$($composeBefore.ToLowerInvariant())"
+            collector_sha256 = "sha256:$($collectorBefore.ToLowerInvariant())"
+            api_image_id = $compatImage.image_id
+            service_epochs_before = $beforeEpochs; service_epochs_after = $afterEpochs
+            registry_witness_before = $registryWitnessBefore
+            runtime_before = $runtimeBefore; runtime_after = $runtime
+        })
+    }
+    else {
+        if ($ApiOnlyCompatibilityUpgrade) { Assert-ApiOnlyUpgradeInputs }
+        if ($InferenceDiagnostic) { Build-ValidatedInferenceDiagnostic }
     foreach ($directory in @(
         (Split-Path -Parent $ComposeTarget), (Split-Path -Parent $CollectorTarget),
         (Split-Path -Parent $ReceiptTarget), $OutputRoot
@@ -2004,10 +2429,11 @@ try {
         throw "formal runtime collector did not return one observation"
     }
     $collectorObservation = ([string]$collectorOutput[0]) | ConvertFrom-Json
-    $expectedCollectorSchema = if ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } else { "mineru-windows-runtime-observation.v5" }
+    $expectedCollectorSchema = if ($InferenceDiagnostic) { "mineru-windows-runtime-observation.v7" } elseif ($ExplicitCapacity) { "mineru-windows-runtime-observation.v6" } else { "mineru-windows-runtime-observation.v5" }
     if ($collectorObservation.schema -isnot [string] -or $collectorObservation.schema -cne $expectedCollectorSchema) {
         throw "formal runtime collector contract drifted"
     }
+    if ($InferenceDiagnostic) { Assert-DiagnosticCollectorIdentity -Phase installed -Observation $collectorObservation }
     Remove-CompatBuildTag
     $receipt = [ordered]@{
         schema = "mineru-windows-install-receipt.v2"
@@ -2025,6 +2451,13 @@ try {
         collector_observation_schema = [string]$collectorObservation.schema
         runtime = $runtime
     }
+    if ($InferenceDiagnostic) {
+        $receipt["inference_diagnostic_build"] = $InferenceBuildProof
+        if ($ReceiptBackupCreated) {
+            $receipt["predecessor_receipt_backup"] = $ReceiptBackup
+            $receipt["predecessor_receipt_sha256"] = "sha256:" + (Get-FileHash -Algorithm SHA256 -LiteralPath $ReceiptBackup).Hash.ToLowerInvariant()
+        }
+    }
     $receiptJson = $receipt | ConvertTo-Json -Depth 100
     Write-Utf8NoBom -Path $ReceiptTarget -Value ($receiptJson + "`n")
     Write-OperationRecord "installer-result.json" ([ordered]@{
@@ -2033,6 +2466,7 @@ try {
         api_image_id = $compatImage.image_id; receipt_sha256 = (Get-Sha256Text $receiptJson)
     })
     $receiptJson
+    }
 }
 catch {
     $originalError = $_.Exception.Message
@@ -2041,8 +2475,15 @@ catch {
     $outcomeUnknown = $originalError -like "native_outcome_unknown:*"
     Write-OperationRecord "installer-first-error.json" ([ordered]@{
         phase = "failed"; first_error = $originalError; mutation_started = [bool]$MutationStarted
-        deployment_attempted = [bool]$DeploymentAttempted; daemon_side_outcome = $(if ($outcomeUnknown) { "unknown" } else { "cli_observed" })
+        deployment_attempted = [bool]$DeploymentAttempted; daemon_side_outcome = $(if ($outcomeUnknown -or ($InferenceRecreate -and $MutationStarted)) { "unknown" } else { "cli_observed" })
     })
+    if ($InferenceRecreate -and $MutationStarted) {
+        Write-OperationRecord "installer-result.json" ([ordered]@{
+            phase = "reconciliation_required"; status = "unknown"; first_error = $originalError
+            operation_kind = "inference-recreate"; rollback = "not_attempted"
+        })
+        throw "inference recreation requires read-only reconciliation; no retry or rollback attempted: $originalError"
+    }
     if ($MutationStarted -and $outcomeUnknown) {
         Write-OperationRecord "installer-result.json" ([ordered]@{
             phase = "unknown"; status = "unknown"; first_error = $originalError; rollback = "not_attempted"

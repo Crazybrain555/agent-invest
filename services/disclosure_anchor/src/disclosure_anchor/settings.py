@@ -15,6 +15,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 SENTINEL_NAME = "MOUNT_SENTINEL_DO_NOT_CREATE_ON_INTERNAL"
+# The production runtime root. The production worker launchd label is bound to
+# this root alone, and it is the default supervised runtime root.
+PRODUCTION_WORKER_RUNTIME_ROOT = Path("/Volumes/AgentSSD/agent_system/services/disclosure_anchor/runtime")
 
 if TYPE_CHECKING:
     from disclosure_anchor.application.contracts.staged_worker_profile_v4 import StagedWorkerProfileV4
@@ -61,12 +64,17 @@ class SemanticProviderConfig(BaseModel):
     profile: Literal["low", "medium", "high"] = "low"
     timeout_seconds: int = Field(default=600, ge=1)
     max_concurrency: int = Field(default=1, ge=1, le=8)
+    model_catalog_sha256: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _validate_adapter_identity(self) -> "SemanticProviderConfig":
         if self.kind == "codex_cli" and self.provider != "openai":
             raise ValueError("codex_cli semantic provider must be openai")
+        if self.kind == "codex_cli" and self.model_catalog_sha256 is None:
+            raise ValueError("codex_cli semantic provider requires model_catalog_sha256")
         if self.kind == "claude_cli":
+            if self.model_catalog_sha256 is not None:
+                raise ValueError("claude_cli does not use a Codex model catalog")
             if self.provider != "anthropic":
                 raise ValueError("claude_cli semantic provider must be anthropic")
             if self.canonical_model != "claude-sonnet-5":
@@ -129,6 +137,15 @@ class StagedV4Settings(BaseSettings):
             "DISCLOSURE_V4_COMMIT_STAGE_SECONDS", "commit_stage_seconds",
         ),
     )
+    # Unset keeps the v2 composition bytes: one heavy-work permit and the same
+    # identity. A value composes v3, a new identity that old heads cannot
+    # continue under, so they drain first.
+    heavy_work_permits: int | None = Field(
+        default=None, ge=1, le=2,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_V4_HEAVY_WORK_PERMITS", "heavy_work_permits",
+        ),
+    )
 
     def worker_profile(
         self, *, process_profile_sha256: str,
@@ -138,8 +155,12 @@ class StagedV4Settings(BaseSettings):
             StagedWorkerProfileV4,
         )
         return StagedWorkerProfileV4(
-            contract_version="staged-worker-composition.v2",
+            contract_version=(
+                "staged-worker-composition.v2" if self.heavy_work_permits is None
+                else "staged-worker-composition.v3"
+            ),
             commit_stage_seconds=self.commit_stage_seconds,
+            heavy_work_permits=self.heavy_work_permits,
             process_profile_sha256=process_profile_sha256,
             mac_preflight_workers=mac_preflight_workers,
             mac_finalize_workers=mac_finalize_workers,
@@ -435,6 +456,56 @@ class Settings(BaseSettings):
             "disclosure_mineru_validation_receipt",
         ),
     )
+    # One reviewed local execution upgrade (U01): the immutable parent
+    # qualification above stays history, the configured runtime/profile/
+    # activation name the current execution, and the pinned proposal plus its
+    # GO review relate them for the listed legacy obligations only. All four
+    # values are set together or not at all; absent, every strict exact path
+    # is unchanged. See docs/implementation/design/local-execution-upgrade.md.
+    disclosure_worker_execution_upgrade_file: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_WORKER_EXECUTION_UPGRADE_FILE",
+            "disclosure_worker_execution_upgrade_file",
+        ),
+    )
+    disclosure_worker_execution_upgrade_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_WORKER_EXECUTION_UPGRADE_SHA256",
+            "disclosure_worker_execution_upgrade_sha256",
+        ),
+    )
+    disclosure_worker_execution_upgrade_review_file: Optional[Path] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_WORKER_EXECUTION_UPGRADE_REVIEW_FILE",
+            "disclosure_worker_execution_upgrade_review_file",
+        ),
+    )
+    disclosure_worker_execution_upgrade_review_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_WORKER_EXECUTION_UPGRADE_REVIEW_SHA256",
+            "disclosure_worker_execution_upgrade_review_sha256",
+        ),
+    )
+
+    @property
+    def execution_upgrade_configured(self) -> bool:
+        """Whether any U01 setting is present; a partial set is still refused."""
+
+        return any(
+            value is not None
+            for value in (
+                self.disclosure_worker_execution_upgrade_file,
+                self.disclosure_worker_execution_upgrade_sha256,
+                self.disclosure_worker_execution_upgrade_review_file,
+                self.disclosure_worker_execution_upgrade_review_sha256,
+            )
+        )
     # Private V4 provider-secret keyring file. Default None keeps V4
     # default-off; V4 secret composition fails closed when the path is absent.
     disclosure_v4_secret_keyring_file: Optional[Path] = Field(
@@ -487,6 +558,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "DISCLOSURE_SEMANTIC_MODEL",
             "disclosure_semantic_model",
+        ),
+    )
+    disclosure_semantic_codex_model_catalog_sha256: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_SEMANTIC_CODEX_MODEL_CATALOG_SHA256",
+            "disclosure_semantic_codex_model_catalog_sha256",
         ),
     )
     disclosure_semantic_reasoning_effort: Literal["low", "medium", "high"] = Field(
@@ -551,6 +630,33 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("CNINFO_MAX_RETRIES", "cninfo_max_retries"),
     )
+    # Budget of one logical CNINFO PDF download on both the website and API
+    # channels: token wait, every attempt, retry backoff and the streamed
+    # body. The per-operation 30s HTTP timeout never bounds a slowly dripping
+    # body; past this budget the download fails as retryable
+    # transfer_deadline_exceeded, counted in the existing download retry
+    # budget. It must stay below the maintenance watchdog (validated below).
+    cninfo_download_deadline_seconds: int = Field(
+        default=1800,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CNINFO_DOWNLOAD_DEADLINE_SECONDS", "cninfo_download_deadline_seconds"
+        ),
+    )
+    # Physical free-space floor for raw acquisition writes: the download
+    # staging file, the archive copy of a completed download and quarantine
+    # copies, all on the volume of the runtime tmp root and raw archive
+    # (production PGDATA shares it). Unset keeps 10% of that volume free, the
+    # doctor's disk-headroom watermark. It bounds disk growth, never document
+    # size: a large PDF downloads whenever it fits above the floor.
+    disclosure_acquisition_free_floor_bytes: Optional[int] = Field(
+        default=None,
+        ge=0,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_ACQUISITION_FREE_FLOOR_BYTES",
+            "disclosure_acquisition_free_floor_bytes",
+        ),
+    )
     # Worker index-sync channel. "api" is the credentialed WebAPI; "web" uses
     # the public website index (no per-API allowance) while company profiles
     # stay on the API channel — the escape hatch when the listing API's
@@ -566,11 +672,10 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("CNINFO_OVERLAP_DAYS", "cninfo_overlap_days"),
     )
-    # First-sync historical backfill.  The scale-rollout decision supersedes
-    # the old three-year floor: use 3.5 years plus a small leap-day/calendar
-    # buffer so a days-based provider API cannot silently undershoot 42 months.
+    # First-sync historical backfill: five calendar years can include two
+    # leap days, so 1827 days never undershoots the requested five years.
     disclosure_initial_lookback_days: int = Field(
-        default=1280,
+        default=1827,
         ge=0,
         validation_alias=AliasChoices(
             "DISCLOSURE_INITIAL_LOOKBACK_DAYS", "disclosure_initial_lookback_days"
@@ -596,6 +701,71 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices(
             "DISCLOSURE_ADMIN_TOKEN", "disclosure_admin_token"
+        ),
+    )
+    # Private agent API (agent_api.py): a separate loopback process with its
+    # own read and request tokens; it refuses to start without both. The
+    # existing Filing API app is unchanged and never mounts these routes.
+    disclosure_agent_api_read_token: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_READ_TOKEN", "disclosure_agent_api_read_token"
+        ),
+    )
+    disclosure_agent_api_request_token: Optional[SecretStr] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_REQUEST_TOKEN", "disclosure_agent_api_request_token"
+        ),
+    )
+    disclosure_agent_api_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_HOST", "disclosure_agent_api_host"
+        ),
+    )
+    disclosure_agent_api_port: int = Field(
+        default=8712,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_PORT", "disclosure_agent_api_port"
+        ),
+    )
+    # Exact Host header values accepted (comma-separated host:port).
+    disclosure_agent_api_allowed_hosts: str = Field(
+        default="127.0.0.1:8712,localhost:8712",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_ALLOWED_HOSTS", "disclosure_agent_api_allowed_hosts"
+        ),
+    )
+    # New processing requests per rolling 24 hours; replays are never counted.
+    disclosure_agent_api_daily_request_limit: int = Field(
+        default=200,
+        ge=1,
+        le=10000,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_DAILY_REQUEST_LIMIT",
+            "disclosure_agent_api_daily_request_limit",
+        ),
+    )
+    # Concurrent quick-text extraction children; extra reads get 503 BUSY.
+    disclosure_agent_api_text_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_TEXT_CONCURRENCY",
+            "disclosure_agent_api_text_concurrency",
+        ),
+    )
+    disclosure_agent_api_text_timeout_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        le=120,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_AGENT_API_TEXT_TIMEOUT_SECONDS",
+            "disclosure_agent_api_text_timeout_seconds",
         ),
     )
     # Backfill backpressure: when pending-download + downloaded/pending-parse
@@ -691,6 +861,16 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("WORKER_BATCH_PARSE", "worker_batch_parse"),
     )
+    # Explicit processing requests whose provider discovery one acquisition
+    # pass may attempt (0 disables). Each attempt is lease- and deadline-bound.
+    worker_batch_request_discovery: int = Field(
+        default=2,
+        ge=0,
+        le=20,
+        validation_alias=AliasChoices(
+            "WORKER_BATCH_REQUEST_DISCOVERY", "worker_batch_request_discovery"
+        ),
+    )
     # One process selects exactly one parse execution model at boot.  The
     # legacy path remains the safe default and must not compose any V4 secret,
     # catalog, scratch, or remote capability.  Staged V4 is an explicit
@@ -701,6 +881,11 @@ class Settings(BaseSettings):
             "WORKER_PARSE_EXECUTION_MODE",
             "worker_parse_execution_mode",
         ),
+    )
+    # Startup-only operational maintenance; it does not change P/WP/Q or H0.
+    worker_drain_existing: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("WORKER_DRAIN_EXISTING", "worker_drain_existing"),
     )
     # Parallel parse chains per round (1 = serial). Meant for the
     # *-http-client backends where the GPU server absorbs concurrency;
@@ -863,16 +1048,45 @@ class Settings(BaseSettings):
             "worker_loop_max_interval_seconds",
         ),
     )
-    # Wedge watchdog: exit loudly (launchd relaunches) when the coordinator
-    # stops reporting ownership progress for this long. Healthy parse futures
-    # heartbeat every 30 seconds, independently of their wall-clock duration;
-    # the separate extreme parse lease handles live-but-never-return futures.
-    # 0 disables.
+    # Wedge watchdog: exit 70 when either plane (parse/startup or maintenance)
+    # stops reporting progress for this long; launchd restarts only a clean
+    # exit 0, so the worker then stays down until an operator restarts it.
+    # Healthy parse futures heartbeat every 30 seconds, independently of their
+    # wall-clock duration; the separate extreme parse lease handles
+    # live-but-never-return futures. Maintenance heartbeats once per completed
+    # sync/download item, whatever its outcome. 0 disables.
     worker_wedge_timeout_seconds: int = Field(
         default=2700,
         ge=0,
         validation_alias=AliasChoices(
             "WORKER_WEDGE_TIMEOUT_SECONDS", "worker_wedge_timeout_seconds"
+        ),
+    )
+    # The launchd label of the supervised resident worker (the production label
+    # when unset; the worker plist sets it explicitly). It is bound to the
+    # supervised runtime root below: over that root the start gate, status,
+    # doctor and release read it back, and a public stop disables it natively,
+    # whether launchd or an operator started the process. The production label
+    # serves only the production runtime root, so a temporary root can never
+    # read or disable the production job; it must name its own label.
+    disclosure_worker_launchd_label: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        validation_alias=AliasChoices(
+            "DISCLOSURE_WORKER_LAUNCHD_LABEL", "disclosure_worker_launchd_label"
+        ),
+    )
+    # The one runtime root the supervised worker label owns. Only over this
+    # root does that label's native disabled state refuse business starts
+    # (manual ones included) on macOS, does a public stop disable it, and must
+    # the root sit on the volume carrying the agent_system mount sentinel.
+    # Temp, test, scratch and offline roots never match, so they never run
+    # launchctl.
+    disclosure_worker_supervised_runtime_root: Path = Field(
+        default=PRODUCTION_WORKER_RUNTIME_ROOT,
+        validation_alias=AliasChoices(
+            "DISCLOSURE_WORKER_SUPERVISED_RUNTIME_ROOT",
+            "disclosure_worker_supervised_runtime_root",
         ),
     )
 
@@ -974,7 +1188,21 @@ class Settings(BaseSettings):
                 "DISCLOSURE_PARSE_RUNAWAY_TIMEOUT_SECONDS must be greater "
                 "than or equal to DISCLOSURE_PARSE_TIMEOUT_MAX_SECONDS"
             )
+        # One download item may stay silent for its budget plus one clamped
+        # 30s read wait, a token wait and recording its outcome; that must end
+        # before the maintenance watchdog calls a live plane wedged.
+        if (
+            self.worker_wedge_timeout_seconds > 0
+            and self.cninfo_download_deadline_seconds + 60
+            >= self.worker_wedge_timeout_seconds
+        ):
+            raise ValueError(
+                "CNINFO_DOWNLOAD_DEADLINE_SECONDS must be at least 60 seconds "
+                "below WORKER_WEDGE_TIMEOUT_SECONDS"
+            )
         capacity_path = self.disclosure_mineru_capacity_config
+        if self.worker_drain_existing and self.worker_parse_execution_mode != "staged-v4":
+            raise ValueError("WORKER_DRAIN_EXISTING requires staged-v4 worker mode")
         capacity_hash = self.disclosure_mineru_capacity_config_sha256
         if (capacity_path is None) != (capacity_hash is None):
             raise ValueError("MinerU explicit capacity path and SHA256 must be paired")
@@ -1095,6 +1323,7 @@ class Settings(BaseSettings):
                 profile=self.disclosure_semantic_reasoning_effort,
                 timeout_seconds=self.disclosure_semantic_timeout_seconds,
                 max_concurrency=1,
+                model_catalog_sha256=self.disclosure_semantic_codex_model_catalog_sha256,
             ),
             SemanticProviderConfig(
                 id="sonnet-backup",

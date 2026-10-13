@@ -19,8 +19,13 @@ builder 已删除。当前调度、容量搜索和 Auto 生命周期只服从
 | pinned nvidia-smi exporter | 1 s | 99% | 5 s | 单卡 kernel-busy、显存、功耗、温度；GPU UUID 只保存 SHA-256 |
 | pinned Windows collector | 5 s | 100% | 15 s | epoch、restart/OOM/cgroup、API RSS/HWM 与 Docker VM memory |
 
-Windows exporter freshness 使用远端整数 Unix 秒。只容许最多 1 秒跨机未来偏差；超过 1 秒的未来时间、
-超过 30 秒的旧 sample 或 collection failure 都必须 unavailable，不得补零或沿用最近值。
+Windows exporter freshness 只比较同一 exporter 主机的两个时钟值：响应 HTTP `Date` 与
+`last_collect_success_timestamp_seconds`，两者都是整数秒；`Date` 在响应体传完之前就已写入，所以完整
+收到时的 sample age 保守上界是 `Date + 1 - last_success` 再加本机从发出请求到收完响应体的 monotonic
+耗时。Mac 与 Windows 不要求对时，任何一方的 wall clock 都不与对方比较，也不以
+Mac 当前时间替代缺失证据；`Date` 缺失、重复或不是 IMF-fixdate 视为协议错误。上界超过 30 秒、`Date`
+早于同一响应自身的 collection（exporter 主机时钟在其间回拨）或 collection failure 都必须 unavailable，
+不得补零或沿用最近值。
 
 采样以 monotonic clock 调度；延迟后从当前时点继续，不补发 catch-up burst。每个 source 使用自己的实际
 completion offset。available gauge 只持有到下一 observation、interval end 或 source max gap 中最早者；

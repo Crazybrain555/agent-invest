@@ -40,7 +40,12 @@ from disclosure_anchor.adapters.runtime.mineru_release_package import (
     VerifyReport,
     write_new_json,
 )
-from disclosure_anchor.adapters.runtime.mineru_stream_activation import load_mineru_stream_activation
+from disclosure_anchor.application.services.mineru_release_plan import inference_command_argv
+from disclosure_anchor.application.services.mineru_stream_policy import STREAM_POLICY_ALGORITHM_V2
+from disclosure_anchor.adapters.runtime.mineru_stream_activation import (
+    load_mineru_stream_activation,
+    require_executable_stream_activation,
+)
 from disclosure_anchor.application.contracts.closed_document import (
     canonical_bytes,
     load_closed_object,
@@ -53,8 +58,13 @@ from disclosure_anchor.application.contracts.mineru_process_pressure import (
     MineruProcessPressure,
     ProcessPressureOwner,
 )
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruCapacityConfigV2,
+    mac_document_disk_upper_bound,
+)
 from disclosure_anchor.application.contracts.mineru_process_profile import (
     EXPLICIT_PROCESS_PROFILE_CONTRACT,
+    RESULT_STORAGE_PROCESS_PROFILE_CONTRACT,
     MineruProcessProfile,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
@@ -311,8 +321,31 @@ def verify_observation(path: Path, *, manifest: dict[str, Any], report: VerifyRe
 
     raw = _read_private(path, label="runtime observation")
     observation = strict_json_loads(raw)
-    if type(observation) is not dict or observation.get("schema") != "mineru-windows-runtime-observation.v6":
+    diagnostic = report.inputs.deployment_profile.inference_diagnostic
+    expected_schema = "mineru-windows-runtime-observation.v6" if diagnostic is None else "mineru-windows-runtime-observation.v7"
+    if type(observation) is not dict or observation.get("schema") != expected_schema:
         raise ReleaseIdentityError("runtime observation is not a collector v6 observation")
+    if diagnostic is not None:
+        from disclosure_anchor.application.contracts.mineru_deployment_profile import inference_diagnostic_config, verify_inference_diagnostic
+        if report.manifest.inference_build is None:
+            raise ReleaseIdentityError("diagnostic release is missing its inference build identity")
+        try:
+            proof = verify_inference_diagnostic(observation, report.inputs.deployment_profile, report.manifest.inference_build["sources"])
+        except ValueError as exc:
+            raise ReleaseIdentityError(str(exc)) from exc
+        inference = observation.get("inference")
+        if (type(inference) is not dict or inference.get("image") != diagnostic.image_reference
+                or inference.get("image_id") != manifest["inference_server"]["container_image_digest"]
+                or inference.get("entrypoint", []) + inference.get("command", []) != list(inference_command_argv(report.inputs.deployment_profile))):
+            raise ReleaseIdentityError("diagnostic inference image or argv differs from the release/runtime")
+        config = {
+            "compose_sha256": observation.get("compose_sha256"), "compose_config_sha256": observation.get("compose_config_sha256"),
+            "command": inference.get("entrypoint", []) + inference.get("command", []),
+            **{name: inference.get(name) for name in ("restart_policy", "mounts", "networks", "port")},
+            "diagnostic": inference_diagnostic_config(proof, report.inputs.deployment_profile),
+        }
+        if canonical_payload_sha256(config) != manifest["inference_server"]["server_config_sha256"]:
+            raise ReleaseIdentityError("runtime diagnostic source proof differs from the collector")
     topology = manifest["topology"]
     if observation.get("compose_sha256") != topology.get("windows_compose_sha256"):
         raise ReleaseIdentityError("runtime observation compose differs from the runtime bundle")
@@ -404,18 +437,44 @@ def assert_structurally_bindable(report: VerifyReport) -> None:
         raise ReleaseIdentityError("local stream ceiling exceeds the capacity nonterminal depth P")
     if deployment.api_memory_limit_bytes is None:
         raise ReleaseIdentityError("binding requires an explicit API memory limit in the deployment profile")
-    if capacity.result_reservation_bytes * capacity.total_nonterminal_limit > capacity.max_unacked_result_bytes:
+    if isinstance(capacity, MineruCapacityConfigV2):
+        _require_storage_ceilings(capacity, local.process_ceilings)
+    elif capacity.result_reservation_bytes * capacity.total_nonterminal_limit > capacity.max_unacked_result_bytes:
         raise ReleaseIdentityError(
             "capacity is not bindable on the Mac: the process-profile contract requires B*P <= L "
             "(API build legality is only B <= L); this release cannot be called fully runnable"
         )
 
 
-def _command_option(command: list[Any], option: str) -> str:
-    for index, item in enumerate(command[:-1]):
-        if item == option and type(command[index + 1]) is str:
-            return command[index + 1]
-    raise ReleaseIdentityError(f"inference command lacks {option}")
+def _require_storage_ceilings(capacity: MineruCapacityConfigV2, ceilings: Any) -> None:
+    """The root-chosen Mac ceilings must hold one maximal result-storage document.
+
+    No value is derived here: a release whose ceilings cannot cash the storage
+    policy's own maximal grant is refused instead of silently clamped.
+    """
+    policy = capacity.result_storage
+    per_document_disk = mac_document_disk_upper_bound(
+        policy, policy.native_result_hard_limit_bytes, policy.native_source_single_limit_bytes,
+    )
+    failures = []
+    if ceilings.source_pdf_bytes_limit != policy.source_pdf_bytes_limit:
+        failures.append("source_pdf_bytes_limit")
+    if ceilings.temporary_disk_bytes_limit < per_document_disk:
+        failures.append("temporary_disk_bytes_limit")
+    if ceilings.decoded_payload_bytes_limit < policy.mac_decode_working_set_budget_bytes:
+        failures.append("decoded_payload_bytes_limit")
+    if ceilings.terminal_output_bytes_limit < (
+        policy.native_source_single_limit_bytes + policy.mac_decode_working_set_budget_bytes
+    ):
+        failures.append("terminal_output_bytes_limit")
+    # Disk ceilings live on the Mac work volume: none may exceed its quota D.
+    for name in ("temporary_disk_bytes_limit", "terminal_output_bytes_limit"):
+        if getattr(ceilings, name) > policy.mac_work_disk_limit_bytes:
+            failures.append(name + " above the Mac work quota")
+    if failures:
+        raise ReleaseIdentityError(
+            "Mac process ceilings cannot hold one maximal result-storage grant: " + ", ".join(failures)
+        )
 
 
 def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identity: str, live: LiveIdentity) -> MineruProcessProfile:
@@ -437,13 +496,14 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
     registry_records = orchestrator.get("task_registry_max_records")
     if type(registry_records) is not int or registry_records <= capacity.total_nonterminal_limit:
         raise ReleaseIdentityError("runtime bundle task registry does not exceed the nonterminal depth")
+    # Exact equality with the release projection: a declared GPU fraction that
+    # never reached the argv cannot be bound. The effective engine value itself
+    # is not observed here.
     command = inference.get("command")
-    if type(command) is not list:
-        raise ReleaseIdentityError("runtime bundle inference command is missing")
-    max_num_seqs = int(_command_option(command, "--max-num-seqs"))
-    cache_gb = int(_command_option(command, "--mm-processor-cache-gb"))
-    if max_num_seqs != deployment.inference_max_num_seqs or cache_gb != deployment.inference_mm_processor_cache_gb:
-        raise ReleaseIdentityError("runtime bundle inference command differs from the deployment profile")
+    if command != list(inference_command_argv(deployment)):
+        raise ReleaseIdentityError(
+            "runtime bundle inference command is not the release projection of the deployment profile"
+        )
     memory_limit = deployment.api_memory_limit_bytes
     if memory_limit is None:
         raise ReleaseIdentityError("binding requires an explicit API memory limit in the deployment profile")
@@ -452,8 +512,11 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
     declared = deployment.inference_declared_defaults
     ceilings = local.process_ceilings
     effective_ratio = 1 if ceilings.hybrid_ocr_override else capacity.hybrid_batch_ratio_requested
+    storage_managed = isinstance(capacity, MineruCapacityConfigV2)
     return MineruProcessProfile(
-        contract_version=EXPLICIT_PROCESS_PROFILE_CONTRACT,
+        contract_version=(
+            RESULT_STORAGE_PROCESS_PROFILE_CONTRACT if storage_managed else EXPLICIT_PROCESS_PROFILE_CONTRACT
+        ),
         runtime_bundle_identity_sha256=identity,
         orchestrator_image_identity_sha256=str(orchestrator["container_image_digest"]),
         inference_image_identity_sha256=str(inference["container_image_digest"]),
@@ -477,19 +540,23 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
         effective_hybrid_batch_ratio=effective_ratio,
         hybrid_ocr_override=ceilings.hybrid_ocr_override,
         inference_concurrency=capacity.final_http_limit_per_loop,
-        vllm_max_num_seqs=max_num_seqs,
+        vllm_max_num_seqs=deployment.inference_max_num_seqs,
         vllm_max_model_len=int(inference["max_model_len"]),
         vllm_max_num_batched_tokens=None,
         vllm_gpu_memory_utilization_millionths=declared.vllm_gpu_memory_utilization_millionths,
         vllm_tensor_parallel_size=declared.vllm_tensor_parallel_size,
         vllm_pipeline_parallel_size=declared.vllm_pipeline_parallel_size,
-        vllm_mm_processor_cache_bytes=cache_gb * (1 << 30),
+        vllm_mm_processor_cache_bytes=deployment.inference_mm_processor_cache_gb * (1 << 30),
         vllm_enforce_eager=declared.vllm_enforce_eager,
         vllm_enable_prefix_caching=declared.vllm_enable_prefix_caching,
         pipeline_inference_locks=capacity.pipeline_inference_locks,
         finalizer_slots=capacity.finalizer_active_limit,
-        result_reservation_bytes=capacity.result_reservation_bytes,
-        max_unacked_result_bytes=capacity.max_unacked_result_bytes,
+        result_reservation_bytes=(
+            None if isinstance(capacity, MineruCapacityConfigV2) else capacity.result_reservation_bytes
+        ),
+        max_unacked_result_bytes=(
+            None if isinstance(capacity, MineruCapacityConfigV2) else capacity.max_unacked_result_bytes
+        ),
         source_pdf_bytes_limit=ceilings.source_pdf_bytes_limit,
         resident_pages_limit=ceilings.resident_pages_limit,
         rasterized_page_bytes_limit=ceilings.rasterized_page_bytes_limit,
@@ -506,6 +573,9 @@ def build_process_profile(report: VerifyReport, manifest: dict[str, Any], identi
         host_runtime_memory_limit_bytes=live.vm_total_bytes,
         task_retention_seconds=deployment.api_task_retention_seconds,
         task_cleanup_interval_seconds=deployment.api_task_cleanup_interval_seconds,
+        result_storage_policy_sha256=(
+            capacity.result_storage.sha256 if isinstance(capacity, MineruCapacityConfigV2) else None
+        ),
     )
 
 
@@ -521,9 +591,12 @@ def build_activation(report: VerifyReport, identity: str, live: LiveIdentity, gp
             "gpu_pause_bytes", "gpu_reduce_bytes", "gpu_recover_bytes", "host_pause_bytes", "host_recover_bytes",
             "sample_max_age_seconds", "missing_pause_seconds", "recovery_seconds", "reduction_interval_seconds",
         )},
+        # A new release binds the executable algorithm explicitly; a v1 file
+        # would claim the superseded qualified-start rule.
+        "algorithm": STREAM_POLICY_ALGORITHM_V2,
     }
     return {
-        "schema": "mineru.stream-activation.v1",
+        "schema": "mineru.stream-activation.v2",
         "runtime_identity_sha256": identity,
         "capacity_config_sha256": capacity.sha256,
         "owner": live.owner,
@@ -635,6 +708,10 @@ def bind_release(
     )
     if loaded_profile.sha256 != profile.sha256 or loaded_activation is None:
         raise ReleaseIdentityError("bound artifacts did not reload through the product loaders")
+    try:
+        require_executable_stream_activation(loaded_activation)
+    except ValueError as exc:
+        raise ReleaseIdentityError(str(exc)) from exc
     local = report.inputs.local_profile
     overlay = {
         "WORKER_PARSE_EXECUTION_MODE": "staged-v4",

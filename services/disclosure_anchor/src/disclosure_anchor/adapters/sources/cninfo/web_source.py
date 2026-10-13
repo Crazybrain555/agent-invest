@@ -34,7 +34,15 @@ from disclosure_anchor.adapters.sources.cninfo.client import (
     BACKOFF_BASE_SECONDS,
     BACKOFF_CAP_SECONDS,
     BACKOFF_FACTOR,
+    DEFAULT_DOWNLOAD_DEADLINE_SECONDS,
+    DOWNLOAD_DEADLINE_ERROR_CODE,
+    IO_TIMEOUT_SECONDS,
+    PDF_DOWNLOAD_HEADERS,
+    UNSUPPORTED_CONTENT_ENCODING_ERROR_CODE,
+    DownloadDeadline,
+    MemoryPdfSink,
     TokenBucket,
+    UnsupportedContentEncoding,
 )
 from disclosure_anchor.adapters.sources.cninfo.mapper import (
     CninfoCompanyProfile,
@@ -45,7 +53,9 @@ from disclosure_anchor.adapters.sources.cninfo.mapper import (
 )
 from disclosure_anchor.application.ports.disclosure_source import (
     AnnouncementRef,
+    CompletedPdfTransfer,
     DisclosureWindow,
+    PdfDownloadSink,
     SourceSecurity,
 )
 from disclosure_anchor.domain.errors import SourceRequestError
@@ -62,6 +72,30 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 class CninfoWebSourceError(SourceRequestError):
     """Raised when the public endpoint fails under retry policy."""
+
+
+def _page_facts(payload: dict[str, Any], *, page: int) -> tuple[list[Any], bool]:
+    """One query page's records and more-pages flag.
+
+    Every page carries an ``announcements`` key (null or [] when empty) and a
+    boolean ``hasMore``. Any other envelope says nothing about the window, so it
+    fails like the API channel's shape check instead of reading as an empty end.
+    """
+
+    announcements = payload.get("announcements")
+    has_more = payload.get("hasMore")
+    if (
+        "announcements" not in payload
+        or not (announcements is None or isinstance(announcements, list))
+        or not isinstance(has_more, bool)
+    ):
+        raise CninfoWebSourceError(
+            f"CNINFO web index page {page} lacks an announcements array "
+            "or a hasMore flag; response shape drifted",
+            error_code="invalid_response_shape",
+            retryable=True,
+        )
+    return announcements or [], has_more
 
 
 def _website_column(exchange: str) -> str:
@@ -92,17 +126,23 @@ class CninfoWebSource:
         *,
         max_qps: float = 1.0,
         max_retries: int = 3,
+        download_deadline_seconds: float = DEFAULT_DOWNLOAD_DEADLINE_SECONDS,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] | None = None,
         jitter: Callable[[float], float] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        if not download_deadline_seconds > 0:
+            raise ValueError("CNINFO download deadline must be greater than zero")
         self._max_retries = max_retries
-        self._bucket = TokenBucket(max_qps=max_qps, sleep=sleep)
+        self._download_deadline_seconds = download_deadline_seconds
+        self._clock = clock or time.monotonic
+        self._bucket = TokenBucket(max_qps=max_qps, clock=clock, sleep=sleep)
         self._sleep = sleep or time.sleep
         self._jitter = jitter or (lambda upper: random.uniform(0.0, upper))
         self._client = httpx.Client(
             transport=transport,
-            timeout=30.0,
+            timeout=IO_TIMEOUT_SECONDS,
             trust_env=False,
             headers={
                 "User-Agent": "Mozilla/5.0",
@@ -130,9 +170,18 @@ class CninfoWebSource:
                 window=window,
                 page=page,
             )
-            announcements = payload.get("announcements")
-            if not isinstance(announcements, list) or not announcements:
+            announcements, has_more = _page_facts(payload, page=page)
+            if not announcements:
+                if has_more:
+                    # A truncated result, not the end of the window: an empty
+                    # page cannot both end the listing and promise more.
+                    raise CninfoWebSourceError(
+                        f"CNINFO web index page {page} is empty but reports more pages",
+                        error_code="incomplete_response",
+                        retryable=True,
+                    )
                 break
+            added = 0
             for record in announcements:
                 # Shape drift must fail loudly: a silently dropped record
                 # lands behind the advanced checkpoint and becomes a
@@ -151,8 +200,18 @@ class CninfoWebSource:
                     continue
                 seen.add(ref.provider_document_id)
                 refs.append(ref)
-            if not payload.get("hasMore") and len(announcements) < PAGE_SIZE:
+                added += 1
+            if not has_more and (len(announcements) < PAGE_SIZE or added == 0):
                 break
+            if added == 0:
+                # More pages are promised but this one only repeated records
+                # already seen, so the listing is not advancing.
+                raise CninfoWebSourceError(
+                    f"CNINFO web index page {page} repeats earlier records "
+                    "but reports more pages",
+                    error_code="incomplete_response",
+                    retryable=True,
+                )
             page += 1
         return refs
 
@@ -162,16 +221,38 @@ class CninfoWebSource:
         del security_code
         return None
 
-    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+    def download_pdf_to(
+        self, ref: AnnouncementRef, sink: PdfDownloadSink
+    ) -> CompletedPdfTransfer:
+        # One budget for the whole logical download (see DownloadDeadline).
+        deadline = DownloadDeadline(self._download_deadline_seconds, clock=self._clock)
         attempt = 0
         while True:
             self._bucket.take()
+            timeout = deadline.io_timeout()
+            if timeout is None:
+                raise self._download_deadline_error()
             # Transport failures (connect/read timeouts — routine on the
             # public site) must surface as SourceRequestError like the API
             # channel does (client.py), or they escape the download retry
             # budget entirely (round23 review S1).
+            transfer: CompletedPdfTransfer | None = None
             try:
-                response = self._client.get(ref.download_url)
+                with self._client.stream(
+                    "GET",
+                    ref.download_url,
+                    headers=PDF_DOWNLOAD_HEADERS,
+                    timeout=timeout,
+                ) as response:
+                    status = response.status_code
+                    if status < 400:
+                        transfer = deadline.stream_body(response, sink)
+            except UnsupportedContentEncoding as exc:
+                raise CninfoWebSourceError(
+                    f"CNINFO web download answered with {exc}",
+                    error_code=UNSUPPORTED_CONTENT_ENCODING_ERROR_CODE,
+                    retryable=True,
+                ) from exc
             except httpx.TransportError as exc:
                 if attempt >= self._max_retries:
                     raise CninfoWebSourceError(
@@ -179,20 +260,47 @@ class CninfoWebSource:
                         error_code="transport_error",
                         retryable=True,
                     ) from exc
-                self._sleep(self._next_delay(attempt))
+                self._sleep_before_download_retry(attempt, deadline)
                 attempt += 1
                 continue
-            if response.status_code < 400:
-                return response.content
-            retryable = response.status_code == 429 or response.status_code >= 500
+            if status < 400:
+                if transfer is None:
+                    raise self._download_deadline_error()
+                return transfer
+            retryable = status == 429 or status >= 500
             if not retryable or attempt >= self._max_retries:
                 raise CninfoWebSourceError(
                     "CNINFO web download failed",
-                    error_code=f"http_{response.status_code}",
+                    error_code=f"http_{status}",
                     retryable=retryable,
                 )
-            self._sleep(self._next_delay(attempt))
+            self._sleep_before_download_retry(attempt, deadline)
             attempt += 1
+
+    def download_pdf(self, ref: AnnouncementRef) -> bytes:
+        """Compatibility call returning the whole body; see ``MemoryPdfSink``."""
+
+        sink = MemoryPdfSink()
+        self.download_pdf_to(ref, sink)
+        return sink.payload()
+
+    def _sleep_before_download_retry(
+        self, attempt: int, deadline: DownloadDeadline
+    ) -> None:
+        # A backoff that would outlive the download budget cannot lead to a
+        # completed download, so the budget verdict is final now.
+        delay = self._next_delay(attempt)
+        if not deadline.allows_sleep(delay):
+            raise self._download_deadline_error()
+        self._sleep(delay)
+
+    def _download_deadline_error(self) -> CninfoWebSourceError:
+        return CninfoWebSourceError(
+            "CNINFO web download exceeded its "
+            f"{self._download_deadline_seconds:g}s deadline",
+            error_code=DOWNLOAD_DEADLINE_ERROR_CODE,
+            retryable=True,
+        )
 
     def _query_page(
         self,

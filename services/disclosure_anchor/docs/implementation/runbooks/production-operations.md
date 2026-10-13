@@ -6,7 +6,8 @@
 ## 1. 开机 / 重启顺序
 
 正常情况全自动：`com.agentinvest.postgres`（launchd 一次性 pg_ctl start，等 AgentSSD 挂载）
-→ `com.agentinvest.disclosure-worker`（KeepAlive 常驻）。人工核对：
+→ `com.agentinvest.disclosure-worker`（RunAtLoad 常驻；`KeepAlive={SuccessfulExit=true}`，只在
+退出码 0 时重启）。人工核对：
 
 ```bash
 launchctl list | grep agentinvest     # 五个 label：postgres；doctor/gc；tunnel/worker
@@ -14,11 +15,20 @@ make pg-status && make doctor-full    # exit 0 才算活
 make worker-status
 ```
 
-手工恢复（自动链路失效时）：`make pg-start` → `make worker-restart` → `make doctor-full`。
+worker 任何非 0 退出（78 公共停止、75 单例被占、70 watchdog、77 TCC、崩溃）都不会被 launchd 自动
+重启，`launchctl print` 的 `last exit code` 和 worker 日志说明原因；公共停止见 §1.1f。
+手工恢复（自动链路失效时）：`make pg-start` → `make worker-restart`（先要求
+`make worker-control-status` 为 RUNNABLE）→ `make doctor-full`。
 launchd job 丢失时重装：`make install-ops-launchd`（postgres+doctor+gc）、
 `make install-mineru-tunnel`（MinerU tunnel）、
 `./scripts/install_launchd.sh`（worker）。其中 postgres 是一次性启动，doctor/gc 是日历任务，
 tunnel/worker 是常驻链路。
+
+`staged-v4` 常驻配置必须设置 `DISCLOSURE_V4_SECRET_KEYRING_FILE`，指向已有的私有
+provider 密钥环。安装器在修改 plist 或 launchd 状态前，用实际 loader 检查文件格式、
+所有者和权限；缺失或不可读即停止。配置从实验环境提升到常驻 `worker.env` 时必须保留
+这项依赖。不要为了通过预检重新生成密钥，旧密钥仍可能用于解密持久任务的恢复凭据。
+仅通过基础 Settings 或空业务库的 doctor 检查，不代表密钥环已被验证。
 
 ### 1.1 首次从旧 worker 切换到当前 plist
 
@@ -102,8 +112,10 @@ launchctl print "$GC_DOMAIN/$GC_LABEL" >/dev/null 2>&1; echo "loaded? exit=$?"  
 worker 走 `./scripts/install_launchd.sh`，GC（连同 postgres/doctor）走
 `make install-ops-launchd`。两个安装器都拒绝替换任何 loaded label；operator 先确认 idle 并显式
 bootout。安装器随后预渲染/校验全部 plist、按需清除 persistent disable、bootstrap，并在任一步失败时
-bootout 新 job、恢复旧 plist 和原 disabled 状态。恢复后用上面两条命令反查（期望状态为
-`=> enabled`、`print` 退出 0）。
+bootout 新 job、恢复旧 plist 和原 disabled 状态。worker 安装器例外：存在公共停止记录或 control
+状态不可信时以 78 拒绝；label 处于 disabled 时不会隐式 enable，确认只是普通维护禁用（不是记录写入
+失败的原生公共停止，见 §1.1f）后才用 `./scripts/install_launchd.sh --confirm-operator-disabled`。
+恢复后用上面两条命令反查（期望状态为 `=> enabled`、`print` 退出 0）。
 
 ### 1.1a MinerU runtime bundle attestation（任何 fresh parse 的前置）
 
@@ -231,6 +243,18 @@ compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurren
 `up --detach --no-build --no-deps --force-recreate mineru-api`。回滚通过上述 witness 检查后才恢复
 旧 tag 与文件，再重建 API、验证旧 API image、健康状态以及推理服务/代理的原 ID、image、started_at。
 机器断线或监督进程超时仍须核对 daemon 状态；不能把客户端退出当作完成回滚。
+
+如需对**同一配置**做一次推理服务重建以区分 warm residency，使用正式 release owner 的
+`python -m disclosure_anchor.cli.mineru_release install --operation-kind inference-recreate --package <verified-package> --private-binding <unchanged-binding> --output <new-operation-dir>`。
+此操作要求发布包的 compose、容量、collector 和已安装 target 字节相同，现有 receipt 与 API image/context
+仍匹配，三服务健康且 API/vLLM 空闲，并继续持有 Mac 排他锁及 Windows 安装锁/有限 Job。
+安装器只向 Docker 发一次
+`compose --project-name mineru-tailnet --file <active-compose> up --detach --no-build --no-deps --force-recreate mineru-openai-server`；
+它不复制 compose/collector、不重写旧 receipt、不重建 API，也不重建 proxy。
+操作记录保存旧 receipt 哈希、三服务前后 epoch 和输出根/registry witness；成功须证明 API/proxy epoch
+不变、推理 epoch 改变、全部 runtime 与空闲检查通过。任何可能已发出重建请求后的失败都保留原始错误和
+现场，标为需只读核对；**不得自动再执行一次相同重建，也不得把重复重建称为恢复旧 epoch**。
+新推理 epoch 使先前资格失效，必须重新完成相应 qualification/bind；此命令不会开启 producer 或消费验证额度。
 完整项目安装模式保留给明确授权的初装或拓扑变更，不能借 dry-run 代替此 API 单独升级边界。
 以上 compose 字节不变要求描述默认兼容层升级。已显式选择容量配置时，容量参数变化以及
 `-ApiDeviceProfile cpu|cuda0` 的设备变化分别遵循
@@ -246,24 +270,30 @@ compose 源字节（包括现场内存/交换上限），拒绝与 `-ReuseCurren
 验证配置保护、旧 tag/文件恢复顺序以及健康/镜像不符的失败路径；不调用真实 Docker。
 它是部署前回归，不能替代安装后的实际镜像、服务 identity、容量与输出根验证。
 
-protocol-v2 启动后的输出根并非物理零文件：唯一控制树
+protocol-v2 启动后的输出根并非物理零文件：控制树
 `.agent-task-protocol-v2/registry.json` 保存提交水位与已消费 tombstone，不能删除来通过安装门。
-runtime observation v5 保留真实 `file_count/total_bytes`，另附 `mineru-output-quiescence.v1`：
-在 Linux bind-mount 命名空间固定根/目录/文件身份、读取有界稳定 canonical registry-v2/v3 字节，
-只接受空登记或已完全清理的 consumed 记录；未知目录（包括空目录）、链接、临时文件和任何
-仍持有资源的记录均拒绝。首次旧 API 安装前才允许真正空根；新 API commissioning 必须有登记。
+使用 `mineru.capacity-config.v2` 的 storage-managed API 启动还会创建 `.agent-ingress-spool`；
+检查器只允许它是同卷、属主一致、无链接且为空的目录，
+并在检查前后固定和复核目录身份。空 spool 不计入文件数，不允许残留上传文件。
+对应的 Windows runtime observation v6 保留真实 `file_count/total_bytes`，另附 `mineru-output-quiescence.v1`：
+在 Linux bind-mount 命名空间固定根/目录/文件身份、读取有界稳定 canonical registry-v2/v3/v4 字节，
+只接受空登记或已完全清理的 consumed 记录；除上述规范空 spool 外的未知目录（即使为空）、链接、临时文件和任何
+仍持有资源的记录均拒绝。仅显式 `allow_empty` 的未 commissioning 检查允许空根或仅含合法空 spool；
+严格 commissioning 检查仍必须有登记。
 安装器与 collector 调用同一已绑定源码的只读检查，前后核对 API idle；这不代替停用 producer
 和实际 writer drain，也不把瞬时快照当成防止新提交的锁。排除写入的窗口必须从 preflight 持续到
 部署或回滚结论，覆盖所有调用方已经发出的 submit/ACK/lease/GC 请求，包括尚在 Form 解析、未计入
-ingress 的请求。v3 writer 可以读取旧 v2，但旧 reader 不能读取 v3；即使只有 consumed 记录，也不能
-用旧 registry 备份覆盖新的 tombstone 或水位。旧 v4 observation 不能用于新 attestation。
+ingress 的请求。新 writer 兼容读取旧登记不代表旧 reader 能读取新版本；即使只有 consumed 记录，也不能
+用旧 registry 备份覆盖新的 tombstone 或水位。旧 v4/v5 Windows runtime observation 不能代替本次
+storage-managed v6 attestation；无显式容量的旧部署仍保留自己的 v5 分支。
 
 collector 的独立 Python 进程只检查安装字节/package/marker，不能读取服务进程的
 `get_task_manager()`。真实对象容量由正在服务的 `/health` 返回闭合
-`task_protocol_runtime`（新部署为 `mineru-task-runtime.v2`）以及
-`mineru-task-admission.v1`；包含实际 registry/executor 容量及 durable/ingress/排队/执行责任，
-effective pending 也取自同一 HTTP 证据。新 collector 与部署资格检查要求 v2 admission；明确的
-旧 v1 分支仅用于观察旧服务。collector 有界读取并复核 API container/start epoch。
+`task_protocol_runtime`（storage-managed 新部署为 `mineru-task-runtime.v4`，登记为
+`mineru-task-registry.v4`）以及 `mineru-task-admission.v1`，容量观测为 `mineru.capacity-observation.v2`；
+包含实际 registry/executor 容量及 durable/ingress/排队/执行责任，effective pending 也取自同一 HTTP 证据。
+collector 与部署资格检查按绑定的容量配置验证相应版本；旧版本分支仅用于其匹配的旧服务。
+collector 有界读取并复核 API container/start epoch。
 所有 wire health 消费者先严格验证 protocol-v2 标记与 runtime 子证明，再显式投影为原有
 13 字段 receipt/observer 形状；旧规范化 receipt 可继续读取，但不能冒充 live wire health。
 
@@ -361,6 +391,25 @@ staged-v4 的默认关闭 source candidate 另有 [V4 资源生命周期与离�
 0060→全历史 spec 回填→0061 验证；实际旧 writer 退出是前置，不可用 PG lease 代替。
 启动历史隔离残留门或 ACK 前残留检查失败时保留证据/信用，不手工伪造清理回执或删除未知树。
 
+临时排空旧职责可以在受控维护启动前设置 `WORKER_DRAIN_EXISTING=true`（默认 `false`，只允许
+`staged-v4` 常驻、无 document/campaign scope）。该开关是启动时的运维控制，不改变 P/WP/Q、
+原 H0/spec/idempotency key 或 resource budget；代码更新本身仍须经过精确 W/E、当前部署门及
+适用 U01 审阅/预检，不能复用不匹配的旧授权。它直接使用 prepared persistence admission，保留
+prepared POST、已提交/接受任务的取回、解析、发布、原 ACK、lease/fence 和 verified U01；不扫描
+普通候选，不做普通 source observation、source rejection 或新 H0。独立 maintenance 线程关闭，
+因此 sync/register/download/acquisition 及 steady-state derived/search projection 暂停；原启动
+recovery/build/publish/prune barrier 保留。排空期间的 derived/search projection 可能滞后，下一次
+正常启动会恢复 startup projection；该模式只用于临时维护，不能替代正常常驻生产。
+
+启动日志和 staged progress 标记 `maintenance=drain_existing ordinary_admission=disabled`；
+`worker status` 的 stderr 只报告 `configured_maintenance_mode`，不是已运行进程的实时模式证明，
+需核对对应 resident boot 日志。worker 在 QUIESCENT 后继续有界轮询，不自动退出触发 launchd
+重启；operator TERM 和 F5 公共停止语义不变。QUIESCENT/无活跃 lane **不等于排空完成**：
+profile-ineligible、credit-blocked、未完成 prepared 或其它原职责必须继续如实报告。进入后续
+原生配置更新前，应由既有只读完整 scope/preflight 核实零剩余职责，再用既有受控维护停止路径
+停下此 resident；不要重置数据、丢弃失败、替换 key、清账或伪造空 scope。正常恢复启动前把
+`WORKER_DRAIN_EXISTING` 改回 `false`，保留原始数据与证据。scratch runner 默认隔离该开关。
+
 上线前有界验证使用 `python -m disclosure_anchor.cli.staged_commission --document-id <id>`
 有界连续供给（超过 8 份、小时级）使用 `python -m disclosure_anchor.cli.staged_campaign --manifest <corpus.json> --manifest-sha256 <sha> --scope <scope.json> --scope-sha256 <sha> --max-seconds <n> --receipt-out <runtime-root/...> [--stop-file <path>]`；准入上限就是冻结 scope 的普通成员本身（不另设配额），截止时间或停止文件只关闭新准入不取消已接受任务；它复用相同的锁、部署门与 stream activation，收据只投影协调器的持久结果，不是正式 M6 计分。
 正式 M6 关闭（owner 绑定）时按顺序使用：`python -m disclosure_anchor.cli.m6_run_control bind|open --run-dir <dir>`（controller；`<dir>` 含 owner 的 `anchor.json`、`roles.json`（四角色各自的 epoch 与 token 文件路径）、`transport.json`，bind 写入 `run-spec.json`）→ `staged_campaign ... --observation-out <dir> --m6-run-dir <dir>`（runner：生命周期事实经本地 spool 由独立线程作为 `e2e_runner` 事件送达 owner，runner 的 lease 上限不单独配置：READY 之后由私有绑定的 `windows.maximum_lease_ticks` 按 READY anchor 的实际 QPC 频率换算写入 `transport.json`（一次、bind/open 之前；绑定的 propagation_reserve_ticks 须等于 intent 的 stop_propagation_reserve_ns），native 与 client 只有这一个来源；runner 先等 sender 拿到首个 lease（上限 2×控制交换截止且不超过 --max-seconds）再装入会锁存的停止判定，拿不到即 `campaign_startup_error`/退出码 3、不写收据（含义：未准入任何文档、runner 未发 admission_closed ACK、owner 侧 run 仍开着，由 controller 既有关闭路径收尾，不是崩溃；spool 记录含 `lease refresh:` 原因）；若首个 lease 在协调器首次判定前已到期，run 会以 admitted 0 / `external_stop` 收尾而非 startup error，读 spool 与 owner-status 区分；刷新在途时旧 lease 仍可见并按同一连续时钟到期，回复到达后原样替换；owner lease 真正失效只关闭新准入（对本次 run 锁存），排空后按序存入 resource_audit / unresolved_claims / admission_reconciliation 收据、ACK `admission_closed`、存入 ownership_closure；收据 `m6_assembly` 块记录全部 sha 与失败步骤）同时（runner 启动后立即）运行 `python -m disclosure_anchor.cli.m6_verifier_supervisor --m6-run-dir <dir> --runner-spool <observation-out>/m6-assembly/spool.jsonl --runner-receipt <receipt> --output-dir <new> --verifier-identity <id> --plan <plan> --deadline-seconds <n>`（进行中校验：tail runner spool，只在 owner 对该 attempt 的 `attempt_admitted` 与 `publication_committed` 都有持久 `delivered` 回执后才派发；每个 attempt 先 public 后 quality，quality 直接绑定本进程产出的公开受理精确字节；两角色各一条长期 sender/序列；runner 收据出现且 `m6_assembly.status` 为 complete、attempt 集合对账一致后，quality 完成、public 写 `drain-receipt.json` 并发唯一 `verifier_drained`；任何失败/超时/不一致 → 双方显式 abort、不 drain）→ `m6_run_control close --run-dir <dir> --campaign-receipt <receipt> --reason ...`。独立 CLI `m6_public_verify` / `m6_qualify_readonly --public-receipts <supervisor 输出的 public-inputs.json> --plan` 只作证据重跑（sender 完成、不 drain）；顺序不可颠倒：quality 依赖 public 的受理文件，drain 依赖两者全部完成。任一装配步骤失败时对应收据/摘要标记 failed，运行记为证据不完整，不得声明正式关闭。边界规则：`bind` 只在 `run-spec.json` 不存在时写入（整体写入，否则失败），已存在且字节与本次输入重算一致时重放 owner 的幂等 bind 并核对回复状态的 `spec_sha256`/`run_id`，字节不同则拒绝且不发远端命令；runner 在加载 profile、持锁、连库、准入之前先要求 spec 的 manifest/scope/campaign/mode 与本次输入一致，再核对 process profile、runtime bundle 与 worker profile 身份；发出 drain 的一方先写入不可变的 `drain-receipt.json`，`verifier_drained` 只引用该文件的摘要，`run-summary.json` 随后单独写入；连库失败、循环未跑到底、spool 尾部损坏/残缺或收据无法整体写入时以显式 abort 关闭发送线程且不产生任何 drain 声明。
@@ -415,6 +464,67 @@ MinerU 的 GZip middleware 会让编码后的响应长度不同，不能拿它�
 错误与取消不会。配置格式、收据和终态矩阵见
 `../design/semantic-adjudication-runtime.md`。不要用 model alias 代替 canonical identity。
 
+Codex provider 还必须固定无工具模型配置。先用已固定版本的 CLI 离线准备（不调用模型）：
+
+```sh
+PYTHONPATH=src .venv/bin/python scripts/prepare_codex_semantic_model_catalog.py \
+  --codex "$DISCLOSURE_SEMANTIC_CODEX_BIN" --model "$DISCLOSURE_SEMANTIC_MODEL" \
+  --expect-version 0.156.1 --runtime-root "$DISCLOSURE_RUNTIME_ROOT"
+```
+
+这里的版本是已验证示例，升级时填写实际固定版本并重新验收。输出的 `model_catalog_sha256`
+填入 `DISCLOSURE_SEMANTIC_PROVIDERS_JSON` 对应 Codex 条目；使用默认 provider 链则设置
+`DISCLOSURE_SEMANTIC_CODEX_MODEL_CATALOG_SHA256`。文件及来源记录保存在 runtime 的
+`semantic/codex_model_catalogs/`；只改变工具字段，保留模型原始提示、推理参数和业务规则。
+配置核验、空工具列表和真实结构化输出验证通过后，才按常规流程重启。不要改共享的
+`~/.codex/models_cache.json`，不要通过开启代码宿主或忽略工具错误来恢复服务。
+备用 Claude 也应在 provider 条目中固定已验收的版本化可执行文件路径；不要让全局 CLI
+自动升级悄悄改变生产的工具或结果协议。升级后先验证安全模式、结构化输出和错误 envelope。
+
+两个语义 CLI 子进程只拿到登录/运行变量和 provider 进程自己的 HTTP(S) 代理：worker 环境里已设置的
+`HTTPS_PROXY`、`HTTP_PROXY`、`NO_PROXY` 及其小写拼写按原值传入（空值也传，不合并、不补齐，大小写优先级
+由 CLI 自己决定）。`ALL_PROXY`/SOCKS、API key、数据库和业务密钥都不传；Codex 工具子进程的
+`include_only` 仍只含登录/运行变量，代理凭据到不了工具。网络需要代理时，把现有代理值放进 worker 的私有
+环境，并在放行前用 provider probe 分别验证 Luna 和 Sonnet；核对的是 worker 进程实际生效的环境
+（launchd `setenv` 的值也会进入），不只是 worker.env/plist。Claude 非零退出（以及 exit 0 却报错的
+envelope）和 Codex 一样写一条有界的 `semantic_provider_failure.v1`（`provider=claude_cli`）：typed HTTP
+状态只取自通过闭合校验的 envelope，不复制任何文本。403 仍是 `command_failed`，不切备用。
+
+Codex 调用失败时，日志行的 `private_diagnostic` 指向一份私有证据：
+`$DISCLOSURE_RUNTIME_ROOT/tmp/semantic_routes/failure_diagnostics/<UTC时间>-<pid>-<随机>.json`
+（目录 0700、文件 0600，`semantic_provider_failure_diagnostic.v1`）。里面是 CLI 自己的终止/重试消息和
+stderr 行（已去掉 URL 凭据与查询串、Authorization 与 key/token/secret/password/cookie 赋值、token 和
+cf-ray/request id/auth error 头值），模型输出、工具负载、未知事件只留位置和字节数；按 `group_hash` 或
+日志里的 `stdout_sha256` 对上停止记录。每次写入后最多保留 256 份、每份不超过 64 KiB：先写成新记录再删
+最旧的，写失败不会删旧证据；删除失败时日志带 `prune_error`，最多多出一份，之后的捕获报 `failed`，直到
+多出的那份能删掉。运维可随时删除单个文件或整个目录。`status=failed` 只表示证据没写成，判定与是否切备用
+不受影响。不要把这些文件拷进 Git 或外部复审包。
+
+staged V4 的语义 `failed_closed`（协议、安全、结果契约）在 commit 中出现时，worker 以公共停止
+（§1.1f）持久停下，不再被 launchd 重驱到同一个未缓存 group；不要靠反复重启或清理结果掩盖。
+保留原任务、收据和日志，修复并验证后显式放行。本机制不做单文档隔离、跨启动计数或半开探测；
+已证实的 item-local 类型失败与 availability 降级保持原有有界语义。
+
+断网等待（只在 staged V4 commit）：某个语义 group 没有任何 provider 给出答案、且至少一个 provider 的失败
+是已识别的 `transport_unavailable`（例如 Codex 的 `workspace routing discovery timed out`，或 Claude 的
+`API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)` 一类断网句子），这个文档就
+暂停等网，不发布降级结果，也不触发公共停止。同一个 attempt 保持 `local_materialized` 和它的 claim，
+heavy-work 许可和 commit 线程都会让出；网络恢复后自动继续同一份任务，已答过的 group 走缓存，不会重复
+发布。全进程共用一个冷却：首次 60 秒，失败的探测把等待翻倍，最长 600 秒，不设次数上限；冷却期间不调用
+任何 CLI，冷却结束只放一个 group 去探测，其他文档继续等。worker stderr 里每次状态变化有一行
+`semantic_network_wait.v1`（`opened`/`probe_failed`/`closed`，含连续断网次数、已断网秒数、下次等待和
+`(provider_id, reason_code)`，不含 provider 原文）；看到 `closed` 即已恢复。不需要也不要手动重启、放行或
+清缓存。只有登录/额度/可执行文件/本地 IO/超时这类非网络原因时仍按原策略降级；未知、安全、schema、身份
+与校验错误照旧 fail closed。TERM/INT 停 worker 时，等网的 commit 在下一次派发时以可重试的取消结束
+（单次等待最长 30 秒），drain 不会一直等网；重启后同一 attempt 会被恢复接着做。
+
+`invalid_decision` 表示答案通过了协议解码、但没通过路由校验（决策没有恰好覆盖所请求的 Unit 时记为
+`invalid_contract`）；校验在写缓存之前、以及每次命中缓存时都会运行，所以被拒的新答案从不入缓存。
+按停止记录中该 attempt 的 `cache_key` 查
+`$DISCLOSURE_RUNTIME_ROOT/cache/semantic_routes/v2/<taxonomy_version>/<provider_id>/<前两位>/<hex>.json`：
+文件存在，说明被拒的是已存条目（篡改或语义改了却没升版本），原样保留作证据，只有明确授权才可改名
+隔离；文件不存在，说明被拒的是这次调用的新答案。两种情况都先修复原因、离线验证，再按 §1.1f 放行。
+
 ### 1.1c Worker progress and GPU telemetry
 
 前台启动用 `make worker-loop`：取得 singleton、通过部署门后会立刻输出公司同步与文档发布两条
@@ -435,8 +545,11 @@ loopback-only 的 nvidia-smi exporter，再经专用 SSH LocalForward 暴露给 
 不得停止健康数据面。
 事件含进程实例 ID 与单调 sequence/event ID，消费方可区分 worker 重启和事件缺口；探针失败区分
 endpoint 不可达与 metric contract 不满足。
-Windows exporter freshness 使用远端整数 Unix 秒，允许最多 1 秒跨机未来偏差；更大的时钟漂移、
-超过 30 秒的旧 sample 或 collection failure 仍显示 unavailable，不得用最近值填补。
+Windows exporter freshness 只用 exporter 自身响应 `Date` 减 last-success 时间戳（同主机、整数秒，
+保守加 1 秒）再加本机请求到收完响应体的 monotonic 耗时，从不与 Mac wall clock 比较，所以两机不需要
+对时，也不要为此调钟；`Date` 缺失/重复/格式错误、上界超过 30 秒的旧 sample、`Date` 早于其 collection
+或 collection failure 仍显示 unavailable，不得用最近值填补。worker progress 与
+`scripts/mineru_tunnel_status.sh` 的 `sample_age_seconds` 就是该保守上界（刚采集的样本约为 1 秒加传输耗时）。
 
 当前 vLLM 0.21 MinerU2.5-Pro 服务还必须把
 `--mm-processor-cache-gb 0` 纳入远端容器命令和上述 manifest。2026-08-13 的 221 页半年度
@@ -574,6 +687,421 @@ labels/marker、安装 receipt 与 runtime attestation。复用已发布镜像�
 `-ReuseCurrentPublishedImage -CampaignApiCompatImageId sha256:<exact-id>` 路径，并必须证明 proxy/vLLM
 container ID、StartedAt 与 image ID 均未改变。以上供应链约束不等于吞吐 profile 已获授权。
 
+### 1.1f Worker 公共停止（F5）与显式放行
+
+合同见 `../design/worker-operational-stop.md`。
+
+- **触发**：staged V4 语义 `failed_closed`（如 `forbidden_tool_call`）、未能对账的 claim/lease 丢失、
+  stage/claim 截止、协调器 circuit（重试预算耗尽、持久转移契约违例、credit 不可得、stream pressure
+  关闭、admission 中断；容量 hold 中单个 attempt 自己解不开的：`native_storage_hold`、
+  `transfer_integrity_hold`、`stage_grant_unsatisfiable`、`capacity_holds_exhausted`，见 §1.1h）、
+  控制器/维护/启动恢复致命错误。第一个原因不可覆盖。worker 依次 latch 停止
+  所有平面、对受监督根绑定的 label `launchctl disable` 并回读（launchd 或手工启动都一样；其它根不调用
+  launchctl）、写入 `$DISCLOSURE_RUNTIME_ROOT/control/worker-circuit-stop.json`，排空后以 **78** 退出，
+  launchd 不再重启。重试预算只在同一 attempt 连续失败时耗尽：provider 权威 status 回答任务仍在处理会
+  复位该 attempt 的次数与 300 s 窗口；日志 `[staged-v4] … retry budget exhausted (attempts=…, elapsed=…,
+  last=…, causes=…[, http_status=…])` 给出耗尽的边界与最后失败类别（不含异常原文）。
+  纯操作员 TERM/INT、无故障且在途工作收尾时以 0 退出；取消（`cancelled`）不计为故障。
+- **数据库打开文件被中断**：PostgreSQL 打开关系文件遇 EINTR（`could not open file "base/…": Interrupted
+  system call`，SQLSTATE XX000）只在 H0 ingress/源拒绝事务内、提交开始前、且回滚与锁/连接回收都已证实时
+  自动重放一次，worker 日志出现 `staged ingress <attempt|run>: write 1/2 rolled back after a database
+  interruption before commit; replaying the same command`。重放与提交应答丢失共用两次写入；再次中断时以
+  `DatabaseInterruptionRolledBack`（cause 为原 psycopg 错误，附 `no replay left` 注记）走既有公共停止
+  （`coordinator_fault/controller_unexpected_failure`；同一轮已有 durable claim 时为
+  `coordinator_circuit/admission_interrupted`）。其它阶段与读者遇到同样错误照旧停止或报错，不算受保护；
+  按下文查因放行，不靠重启或注入故障试错。
+- **查看**：`make worker-control-status`（`FORMAT=json` 给 Agent；只读 control 文件与 launchd，不连
+  DB/MinerU/模型）、`make worker-status`（stderr 报 STOPPED，退出 3）、`make doctor-full`
+  （`worker operational control` 为 FAIL，DB 宕机也能报）。
+- **门控范围**：启动门先看本进程 latch、再看活动记录；只有 macOS 上 `DISCLOSURE_RUNTIME_ROOT` 等于
+  `DISCLOSURE_WORKER_SUPERVISED_RUNTIME_ROOT`（默认即生产 runtime 根）时，才再读回 worker label
+  （未设 `DISCLOSURE_WORKER_LAUNCHD_LABEL` 时为生产 label）的 disabled 状态，手工从生产 shell 启动也同样
+  受限。已知 disabled → `OPERATOR_DISABLED`，读回失败/未知 → `CONTROL_UNAVAILABLE`，都拒绝；只有已知
+  enabled 才可能 RUNNABLE。其它根（临时/测试/scratch/离线）与非 macOS 不调用 launchctl，status 的
+  `supervision` 显示 `unsupervised_runtime_root`/`not_macos`；生产 label 配非生产根（或生产根配其它
+  label）显示 `label_root_mismatch`，同样不调用 launchctl 并拒绝启动。部署后先确认生产 status 为
+  `supervision=supervised`。生产根还必须是非 symlink、归 worker 用户、不可被组/他人写，且与挂载
+  sentinel 同一设备，否则 `CONTROL_UNAVAILABLE`。
+- **放行顺序**：
+  1. 读 worker 日志 `[worker-control]` 行和记录中的 cause（kind/reason/attempt/lane/provider）。不删除、
+     不改写 control 文件；不清理解析输出、receipt 或 group cache。`semantic_failed_closed/invalid_decision`
+     先按 §1.1b 判断被拒的是新答案还是已存缓存条目。
+  2. 修复原因并离线验证；不要用新 GPU/PDF 负载或注入故障试错。
+  3. 确认旧 wrapper/Python 与其 MinerU/语义子进程都已退出（`launchctl print`、`pgrep`）。放行命令
+     自己也要求可证明的收尾：label 未 loaded（`print` 精确的 113/`Could not find service`）或 loaded
+     且 `not running`，进程表可读且无已知 owned 子进程；launchd 结果未知或进程表不可读都以 75 拒绝并
+     保持停止。dry-run 用 `native_closure`/`process_closure` 如实报告 `unknown`。
+  4. 先 dry-run，再执行：
+
+     ```bash
+     make worker-release-circuit SHA=sha256:<active> DECIDED_BY=<task-id> \
+       REASON="<修了什么>" FIXED_BY="<版本或证据 hash>" DRY_RUN=1
+     make worker-release-circuit SHA=sha256:<active> DECIDED_BY=<task-id> \
+       REASON="<修了什么>" FIXED_BY="<版本或证据 hash>"
+     ```
+
+     它持 `WORKER_NS` 单例和短控制锁，按原字节建只增归档、写放行决定、复核后才删除活动记录；任何
+     失败都保持停止，崩溃后同一决定重跑幂等。dry-run 不建锁文件、不占单例、不写任何文件。
+  5. 放行本身不 enable/启动：`launchctl enable gui/$(id -u)/com.agentinvest.disclosure-worker`；
+     已 loaded 未运行用 `launchctl kickstart gui/$(id -u)/com.agentinvest.disclosure-worker`（不带
+     `-k`）；未 loaded 则 bootstrap 已审阅 plist。
+  6. 恢复屏障重驱同一 attempt/run/输出，已成功 group 命中缓存，只有未缓存 group 可能再调模型；
+     观察第一轮 commit/ACK 后再离开。
+- **异常状态**：
+  - `INVALID_STOP`（损坏、权限、超限）：保留原件，按 status 给出的精确 SHA 放行；symlink/非普通/
+    超大未哈希的记录需先修复可信存储。`CONTROL_UNAVAILABLE`：先修挂载/权限/runtime 根（symlink、
+    属主、组或他人可写、sentinel 缺失或不在同一设备）或 launchd 读回，此时不能证明没有停止。
+  - 日志出现 `STOP_PERSISTENCE_FAILED`：若原生 disable 已生效，把紧随的 `STOP_RECORD` JSON 存为证据
+    文件，`make worker-record-circuit-stop EVIDENCE=<file> EVIDENCE_SHA256=sha256:<...> DECIDED_BY=...
+    REASON=... DRY_RUN=1` 核对后执行，得到 `operator_reconstructed` 记录再按上文放行。两路都失败时只有
+    当前 loaded job 的退出策略拦着（`SUPERVISOR_ONLY_STOP`，启动门同样拒绝），先 `launchctl disable`
+    再重建；确认是 wrapper 缺 env 的 78 时修 env 后显式 kickstart 或 bootout。
+  - `OPERATOR_DISABLED`：label 被禁用但没有记录，原因不由任何记录证明：可能是普通维护，也可能是记录
+    失败的原生停止。此时生产根上的一切业务启动（含手工 `worker loop|once`、pipeline/admin/replay 组合）
+    都拒绝。先查日志；确认普通维护后显式 `launchctl enable`（或安装器 `--confirm-operator-disabled`），
+    确认是原生公共停止则重建记录再放行。
+  - 退出 75：单例被另一 owner（commission/recovery 或旧进程排空）持有，不是故障，确认后手工重启。
+- 手工业务入口同样受门控且无绕过开关：`pipeline build-units|publish|process|rebuild-units` 与
+  current-source replay 以 78 拒绝，admin API build/publish 返回 503；staged commission/campaign/
+  recover 在组合时拒绝。pipeline/admin/replay 在原请求/工厂组合处检查（pipeline 在此之前已有只读 DB
+  角色检查，`process` 还有 MinerU 准入探测），任何语义/解析/发布副作用之前拒绝。只读与修复命令
+  （status/doctor/parse/track/sync/parse-requeue 等）不受影响。
+
+### 1.1g 本地执行升级（U01）与部署预检
+
+合同见 `../design/local-execution-upgrade.md`。只在“新代码只改了本地 writer，MinerU 计算/依赖/原生 epoch 与仍新鲜的
+父资格 Q0 完全相同”时使用；它不是新的资格，也不能串联第二条边。以下步骤均由 root 执行，产物全部为新建 0600 文件。
+
+1. worker 已停止且 unloaded（F5 或维护），代码已冻结，独立测试与独立代码审阅完成；记下三份证据的 SHA-256。
+2. 只读生成 E1 与派生身份（加载 worker.env/cninfo.env；此时环境仍是父配置）：
+
+   ```bash
+   PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.execution_upgrade release-manifest \
+     --source-revision <rev> --output /private/<dir>/release-E1.json
+   PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.execution_upgrade derive \
+     --parent-process-profile <P0> --parent-activation <A0> --output-dir /private/<dir>/derived
+   PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.execution_upgrade legacy-scope \
+     --output /private/<dir>/legacy-inventory.json
+   ```
+
+   `legacy-scope` 在一个 READ ONLY REPEATABLE READ 快照里记录全部 current V4 head（不按 owner/文档/数量过滤）；
+   存在 non-current `prepared`（staged superseder）时拒绝，先如实上报，不要绕过。
+3. 私有 env 改为 derive 打印的 R1/P1/A1 五个值（smoke/canary/validation 仍指向 Q0 原文件，容量不变），再
+   `execution_upgrade propose --release-manifest ... --runtime-bundle <derived>/runtime-bundle.json
+   --parent-process-profile <P0> --parent-activation <A0> --inventory ... --exact-change-manifest-sha256 ...
+   --test-evidence-sha256 ... --code-review-sha256 ... --output /private/<dir>/u01.json`。
+4. 审阅者对 u01.json 的文件 SHA-256 写 `worker-local-execution-upgrade-review.v1`（verdict=GO）。四个
+   `DISCLOSURE_WORKER_EXECUTION_UPGRADE_*` 一起写入私有 env；缺任何一个都拒绝。
+5. 预检（只读；不写库、不 claim、不 POST、不记停止）：
+
+   ```bash
+   PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.worker deployment-preflight \
+     --prepared-key-ttl-seconds <部署中实际的 key 生命周期> [--format json]
+   ```
+
+   退出 0 才可安装；78 时逐条处理 `BLOCKER`。TTL 是 provider 幂等 key 的生命周期（已安装 MinerU API 的
+   key/tombstone TTL，`enforce_key_lifecycle` 开启时强制；不是任务 retention），由 root 从运行中的 API 读回后
+   传入，产品不硬编码、不持久化。key 年龄 = 预检时钟 − key 的 `submission_epoch_unix`；未给 TTL 而存在
+   prepared/reconciling head 时为 `unverified` 并阻断，年龄达到 TTL 为 `expired` 并阻断（worker 没有过期重投
+   分支）；为时钟偏差与排空时间留余量，真实恢复前重新读回。停止/无效/不可读的 control 在 checker 与 DB 之前
+   即拒绝；`native_identity_match` 需要 API 健康且无 queued/processing（保留的 completed 任务不阻断）。
+6. `scripts/install_launchd.sh [--confirm-operator-disabled] --prepared-key-ttl-seconds <N>`：安装器在 F5 停止
+   预检之后、任何 plist/enable/bootstrap 之前运行同一预检，未就绪时 78 且零 launchd 变更。
+7. 启动后核对日志 `[execution-upgrade] scope verified ...` 与 `[execution-upgrade] boot receipt=... receipt_sha256=...`；
+   每次启动在 `$DISCLOSURE_RUNTIME_ROOT/reports/execution-boot/<owner>.json` 新建一份 0600 只读收据（绑定
+   owner、U01、E1、W0→W1、R0→R1、P0→P1、WP0→WP1、容量、A1、父资格日期、清单与观测范围），只作证据。在所有清单成员终结前，进度行显示
+   `blocked=admission_deferred:legacy obligations open (<open>/<total>)`，已有 head 继续 GET/结果/ACK
+   或以原请求/原 key 单次提交；`make doctor-full` 显示 `worker execution qualification`（compatible_parent，
+   继承）与 `worker legacy obligations`。
+8. worker 启动时在单例下重验 E1 字节与全部 head；不一致以 F5 `startup_fatal`/`execution_upgrade_scope_failed`
+   停止（按 §1.1f 查因与放行，不要改写清单/H0/Q0）；数据库暂不可达时非零退出、不记停止。
+9. 父资格按原日期老化（默认 30 天）：到期后 admission 拒绝，需要对当前 runtime 重新做真实资格，而不是再造一条升级边。
+   回退：恢复旧 release 字节与父配置（R0/P0/A0，去掉四个 U01 值），只有字节级恢复旧 writer 才能回到 exact 路径。
+
+**U01 v2（已在一次升级 E1 下冻结了未决责任，再发布 E2）。** v1 的清单成员必须绑定 Q0 的 R0/P0/WP0，不能覆盖
+在 E1（R1/P1/WP1）下冻结的责任；v2 把三个角色分开：`qualification_anchor`=Q0（原日期、原期限）、
+`recovery_origin`=归档的 E1（release/runtime bundle/P1/A1 归档文件）、`current_execution`=E2。合同见设计文档
+“U01 v2”一节。步骤与上面相同，差别只在：
+
+- `derive --contract-version v2 --anchor-process-profile <P0> --anchor-activation <A0> --output-dir ...`：从 Q0 的 M0 与
+  当前 writer 派生目标 R/P/A。本次改动若未触及 writer 指纹文件，目标 writer 等于 E1 的 W1，R/P/WP/A 与 E1 相同，
+  只有 release（E）变化；不要为了造出新 R 增删指纹成员。
+- `legacy-scope` 仍对全部 current V4 head 取一个只读快照；这些成员绑定的是 E1 的 R1/P1/WP1。
+- `propose --contract-version v2 --anchor-process-profile <P0> --anchor-activation <A0> --origin-release-manifest <归档 release-E1.json>
+  --origin-runtime-bundle <归档 E1 runtime-bundle.json> --origin-process-profile <归档 P1> --origin-activation <归档 A1>
+  --release-manifest <release-E2.json> --runtime-bundle <目标 runtime bundle> --inventory ... ...`；混用 `--parent-*` 为用法错误。
+- 预检终端分三行列出 qualification anchor / recovery origin / target；启动写 `worker-execution-boot-receipt.v2`，日志与
+  doctor 的 legacy 行附 `final_states=`（按终态计数，合法 `local_failed` 与 `acked` 同为终态）。
+- 目标 R 等于来源 R 时屏障照样生效：清单成员全部终结前不创建新 H0（`legacy obligations open (<open>/<total>)`）。
+
+### 1.1h 结果存储容量（capacity v2）与新合格运行时升级
+
+合同见 `../design/mineru-result-storage.md` 与 `../design/local-execution-upgrade.md` 的 “Qualified result runtime
+upgrade”。所有数值（D/H/P/C/M、单项许可、硬包络、Mac 配额与 W/J、传输期限与进展窗）由 root 按实测卷与支持包络
+选定并写入 `capacity-config.json`（v2），产品不推导、不带默认值；两卷以总字节绑定，原生输出卷不符时 API 拒绝启动。
+策略要求 C 容纳硬结果的物理计费（分配单元取整 + 每文件开销），硬结果恰等于 C 的策略会被拒绝。
+
+1. 发布：release package/plan/binding 以 v2 容量构建；binding 拒绝不能兑现一份最大 grant 的 Mac 上限（临时盘 ≥
+   Z_hard+S_single+W、decoded ≥ W、terminal output ≥ S_single+W、source_pdf 等于策略值），产出 process profile v3。
+   安装器与采集器对 v2 不投影 B/L 环境变量（容器 bootstrap 会拒绝它们）。
+2. 运行中核对：`/health` 的 `capacity_observation.result_storage` 给出 source/ingress/result 字节、生长中的
+   producer、未兑现承诺、completion 队列、各等待原因计数与 `blocked_tasks`；任务 status 的 `storage` 给出阶段、
+   等待原因与起始时间、hold 标志。等待是正常背压（同一任务、同一源，不重解析、不失败）；`blocked=true` 是 hold：
+   任务保持 processing，字节继续计费，不会自己恢复。原生 hold 原因为 hard_envelope_exceeded、
+   codec_bound_exceeded、tree_integrity（写入路径/根/叶身份不符，属完整性而非容量）与 seal_integrity。
+   Mac 工作卷实时余量不足（余量 < 下限 + 进程内全部在途承诺）时同一 attempt 记
+   `materialization_capacity_waiting` 并等待，不失败、不耗重试预算；续传/续解包与已准入 grant 等容量同样是健康等待。
+   Mac 工作配额 D（`mac_work_disk_limit_bytes`）按每个 attempt 在工作卷上的独立占用计：源快照 + max(临时盘,
+   压缩结果 + 输出) + 分配余量（(max_members + 8) × 4 KiB），已持久的 credit（恢复出的已有归属只计一次）加在途
+   阶段的承诺；会让总和越过 D 的转移在队列里等待（进度/观测的 `credit_blocked_by_lane` 显示 `work_disk_bytes`），
+   准入始终给一份最大 grant 留出 D（`work_disk_local_reserve_bytes`），并先为每个新文档扣掉分配余量再给快照字节，
+   所以只持有源快照的文档不会把 D 占到等待中的 grant 无法开始；排在车道队首等待的 grant 会挡住后面新的 grant，
+   只等前面的 LOCAL 工作排空（排空不需要增长）。只有增长受检，COMMIT/cleanup/ACK 不增长，从不被 D 挡住；策略拒绝
+   装不下一份最大 grant + 源快照 + 余量的 D。在另一策略下准入、超出 D 减预留的已恢复快照，会让装得下的 grant 越过
+   队首先跑、逐步排空。LOCAL 的那一次解码与 COMMIT 的重开/Unit 构建/就绪/晋升共用重活许可：
+   - 个数由本机 profile 决定。未设置 `DISCLOSURE_V4_HEAVY_WORK_PERMITS` 时为 1 个；设为 2 即
+     `staged-worker-composition.v3`，见下方“启用两个重活许可”。
+   - 等许可的 lane 显示 `heavy_work`，是健康等待，不耗重试预算。
+   - ACK、cleanup、续租与远端对账从不需要它。
+
+   启用两个重活许可（或回到 1 个）是本机 profile 身份变更。它只能走 U01 v3 关系
+   （`worker-local-execution-upgrade.v3`，合同见 `../design/local-execution-upgrade.md`“U01 v3”），按 §1.1g
+   的同一流程做：
+   1. 停 worker 并只读抓取 `legacy-scope` 清单。在途阶段被取消，head 保持未终结，不 cleanup、不 ACK，
+      作为名单成员在新许可数下继续。
+   2. `derive --contract-version v3`：与 v2 相同的 R/P/A 推导。只改许可数的 release 不动 writer，派生的
+      R/P/A 应与已部署 target 完全相同；不同即停止核查，不改旧资格。
+   3. 在基础 worker env 写入或删除 `DISCLOSURE_V4_HEAVY_WORK_PERMITS=2`（release binding overlay 不生成，
+      合并时保留基础值）。
+   4. `propose --contract-version v3`：在 v2 参数之外，显式写
+      `--anchor-heavy-work-permits implied --origin-heavy-work-permits <implied|2> --target-heavy-work-permits <2|implied>`。
+      输出中的 anchor worker profile 必须等于已部署提案的 anchor 值：Q0 的组合不变。
+      - `--anchor-process-profile`/`--anchor-activation` 用已部署提案 `qualification_anchor` 记录的 P0/A0
+        原路径，不用副本：完整 anchor 含这两个文件路径。
+      - propose 的进程环境不能含任何 `DISCLOSURE_WORKER_EXECUTION_UPGRADE_*`（有一项即 exit 65）。在目标配置
+        副本里去掉这四项、原值归档；这不是关掉生产的 U01 门。
+   5. 独立 GO 审阅：
+      - 旧 proposal 与旧 GO 的 SHA 只取自先前实际部署的记录：已部署私有 env 的
+        `DISCLOSURE_WORKER_EXECUTION_UPGRADE_SHA256`/`_REVIEW_SHA256`，或已有 boot 收据
+        （`$DISCLOSURE_RUNTIME_ROOT/reports/execution-boot/<owner>.json` 的 `upgrade_sha256`/`review_sha256`）。
+        按它们核对原字节以及旧 GO 的 proposal 引用；不能把本次重填并重新计算的文件充当历史批准。
+      - 机械比对新旧完整 qualification_anchor（包括 WP、Q0 日期和全部资格/文件引用）及 anchor form，再比对
+        本次 origin 与所选旧 current_execution 或 recovery_origin。选择必须符合清单冻结身份：成员同属一个
+        来源三元组，混合即停止核查。
+      - Q0 不保存 WP；这仍是已批准 derived claim 的延续，不宣称 Q0 实测了新 WP。
+      - 比较输出与旧 proposal、旧 GO、新 proposal 的哈希冻结为一份审阅记录。GO 的 `decision_reference`（合同
+        上限 256 个可打印字符）写该记录的 `sha256:<摘要>`；不另建业务台账，不重做资格。然后配置四项 U01。
+   6. `worker deployment-preflight --prepared-key-ttl-seconds <TTL>`。终端应显示 contract v3 和
+      `heavy-work permits:` 一行。
+   7. 启动。名单成员终结前不建新 H0，这是既有 hold，不另设排空。
+
+   同一 release 只改许可数时，origin 可以是当前 release（配置专用边）。启用后，之后的每次发布都用 v3：
+   origin 与 target 都写 `2`。v1/v2 会拒绝 v3 组合。不要关掉 U01 去走 exact 路径：Q0 不覆盖当前
+   writer/runtime。
+
+   运行后观察：
+   - worker RSS 与主机内存压力/swap；
+   - provider capacity/timeout 与 semantic degraded 比例；
+   - 事务 P 冲突或锁等待；
+   - 发布/语义漂移。
+
+   发生异常先保留第一原因、材料与原责任，区分正常可恢复等待和需要停止的错误。只有已知安全状态下才回退。
+   回退同样走 derive/propose/独立 GO/preflight/boot；许可回退不解决未知 P 或远端副作用。按停止时的实际责任
+   选分支（“上线提案”指启用两个许可时部署的 v3 提案）：
+   - 旧 WPv2 清单仍有未终态成员，尚无 WPv3 H0：origin 是上线提案的 recovery_origin（E_old/WPv2 的归档原件）；
+     target 是同一新实现 E_new 去掉 `DISCLOSURE_V4_HEAVY_WORK_PERMITS` 的单许可组合。forms 为
+     `{anchor:null,origin:null,target:null}`，E_old 与 E_new 必须不同：同 release 且 form 不变会被拒绝。
+     重新抓取完整未决清单并独立 GO。此时填 origin `2` 会因旧成员的冻结 WPv2 与 origin 不符而被正确拒绝，
+     不能改旧 H0 来绕过。
+   - 旧清单已终结，已有 WPv3/2 的新责任：origin 是上线提案的 current_execution（E_new/WPv3/2），target 是同一
+     E_new 的单许可组合；forms `{null,2,null}`，是配置专用边。
+   - 清单为空：origin 仍取实际最后批准/boot 的 target 及其 form；空清单不自动授权 WP 身份改变。
+   - 同一清单混有两种来源（任何单一 origin 都会拒绝其中一类成员），或提交结果未知：保持停止。不遗漏成员、
+     不篡改 spec，不盲关 U01 退回 exact。
+
+   优先保留新实现的 Future 修复而回到单许可，不退回存在该生命周期问题的旧源码。
+
+   就绪文件写到发布语料目录（D 之外），第一次写入前按实时余量承诺尚未落盘的文件（`publication_capacity_waiting`，健康等待）。
+   - 站点级 hold → F5 公共停止（§1.1f，`coordinator_circuit`）：原生 `blocked=true` 为
+     `native_storage_hold`；spool_owner_unproven、spool_progress_unproven、spool_part_identity、spool_part_short、
+     spool_prefix_mismatch 为 `transfer_integrity_hold`；任何账本都装不下的 grant 为
+     `stage_grant_unsatisfiable`。任务、证据、spool、ZIP 与 credit 原样保留，不失败、不 cleanup、不 ACK。
+   - 单文档 hold（decode_input_bytes、decode_output_bytes、transfer_logical_deadline、transfer_progress、
+     transfer_range_unsupported、publication_envelope）→ `stage_capacity_hold:<维度>`：该 attempt 保持 claim 可见，其它工作继续；
+     只要还有别的工作能推进就不停（含仍有未读准入页、会重探的 readiness 延后或安全 stream 暂停）。无在途、无
+     自唤醒路径而只剩 hold 或被 hold 挡住的排队时，一次以 `capacity_holds_exhausted` 停止：首因点名那份 hold，
+     诊断列出每个短缺维度的 owned/promised/requested/limit 与持有者；legacy obligations 未结不算唤醒。操作员
+     排空（TERM）时只剩 hold 以 operator_drain 结束，不写公共停止；下次启动 hold 仍在则再停一次。
+   - 放行后同一 attempt 只重派一次；原因仍在则以同一 reason/指纹再次停止，不循环。不要删文件、不要手工
+     ACK、不要改 registry 或重排来“腾空间”。
+   - 原生 hold 的唯一受管出口是对这一个任务的显式终止决定（持有 blocked 任务时安装器拒绝 idle 检查，
+     registry 也拒绝以不同策略载入在途任务，所以不能靠“先升包络”解开）。原生路由
+     `POST /agent/storage-holds/{task_id}` 与普通 worker 共用同一条 TCP/SSH 隧道 origin，所以它只认操作员凭据：
+     没有登记时一律 403 `storage_hold_operator_disabled`，缺失/错误凭据 401，都在读请求体、碰 registry 之前；
+     隐藏 OpenAPI、预览 sha 与 decided_by 都不是认证。凭据只由操作员生成与保管，不进 worker.env、settings、
+     仓库或日志，也不复用 admin API token 或隧道 key：
+     1. Mac 操作员：`umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' >
+        /private/<dir>/storage-hold-operator.token`（本人所有 0600，一行 43–128 个 URL 安全字符），再
+        `PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.storage_hold operator-verifier
+        --operator-token-file /private/<dir>/storage-hold-operator.token`，它只打印 `credential_sha256`。
+     2. Windows 管理员会话（不是隧道账户）在 API 容器内登记这个 sha（容器只存 sha，不存凭据）：
+        `docker exec mineru-api /usr/bin/python3.12 -I -c "import sys; from mineru.cli.agent_task_protocol_v2
+        import enroll_storage_hold_operator as enroll; print(enroll(sys.argv[1]))" sha256:<64 hex>`。登记写在
+        容器自身文件系统 `/run/agent-invest-operator/`（非 bind mount，0700/0600），立即生效，容器重建即失效；
+        用完撤销：`docker exec mineru-api /usr/bin/python3.12 -I -c "from mineru.cli.agent_task_protocol_v2
+        import revoke_storage_hold_operator as revoke; print(revoke())"`。
+     3. worker 停止状态下：`... storage_hold preview --attempt-id <attempt> --operator-token-file <token>
+        --out /private/<dir>/hold-preview.json` 审阅原生预览（任务/key/attempt/fence、hold 原因、字节、策略与
+        运行时身份及其 sha），再 `... storage_hold execute --attempt-id <attempt> --operator-token-file <token>
+        --expect-preview-sha256 <sha> --decided-by <人> --reason "<为何终止>" --fixed-by "<修复或 none>"
+        --out /private/<dir>/hold-decision.json`。
+     原生侧在自己的 registry 锁内把该任务记为 failed，闭合原因 `storage_hold_terminated` 带 hold 原因、决定
+     sha 与规范决定本身（`mineru.storage-hold-decision.v1`：预览 sha、decided_by、reason、fixed_by），应答前已
+     持久；字节与封存保留到普通 failed-task ACK。命令只接受 Mac 上仍为 submitted、无活 claim 的 attempt 所
+     对应的那个任务；过期预览、非 hold、已完成、在途 producer、别的决定都拒绝，同一决定重跑得到同一收据。
+     execute 的应答丢失（连接断开/超时）时，命令从该任务的普通 status 读回持久决定：与本次决定逐字段相同才完成，
+     否则拒绝并说明没有以本决定终止任何东西（重跑同一命令即可）。之后任何时候（worker 放行前）都可用
+     `... storage_hold recover --attempt-id <attempt> --out /private/<dir>/hold-decision.json` 只从持久决定重建
+     收据（走普通 status 路由，不需要操作员凭据，不改任何状态）。
+     然后按 §1.1f 放行：worker 轮询到失败 → `provider_storage_hold_terminated`（provider_terminal，不自动重试）
+     → cleanup → ACK。之后若包络已按新资格提高，再按 §5.1 对该失败 run 做 parse-requeue。
+   - Mac 单文档 hold 的出口是更大的已声明包络（新策略/资格）；本阶段没有 Mac 侧放弃命令。
+     `publication_envelope` 表示该文档某条私有发布记录被源码固定的 `PublicationEnvelopePolicyV1` 拒绝（请求
+     64 MiB、单 Unit 记录/行 hash 输入 64 MiB、准备 160 MiB、就绪与绑定聚合 8 MiB、winner 8 MiB＝已应用的数据库
+     CHECK、快照 128 MiB、语义 64 MiB；没有页数或 Unit 数上限，支持域是各预算同时满足，请求在预算内不等于其它
+     记录也装得下）：就绪在第一次写入前测量整条计划后拒绝，已物化的输出原样保留；出口是包络足够的新发布，不要
+     截断内容、手工改写记录或反复重排。winner 以保守上界（最宽 outbox 序号与提交时间）准入，`upper_bound` 拒绝
+     是保守拒绝，不证明事务 P 实际会写出超过 8 MiB 的 winner。
+     公共停止时 resident 在锁存首因之后只向 stderr 打印内容无关行：重试耗尽行与类型化诊断
+     `[staged-v4] diagnostic {…}`（排序 ASCII JSON，最多 64 条）。`capacity_hold` 的 `detail` 给出
+     `record_kind`、`bound`（exact|lower_bound|upper_bound）、`byte_count`、`limit`、`policy_sha256`；
+     `no_progress` 列出受阻队首、hold 与短缺维度。其它 errors 条目（可能含异常正文）照旧不打印；畸形诊断只计数。
+     回滚边界：新版本写出超过 56abdb93 读取上限（请求 8 MiB、准备 24 MiB、就绪 8 MiB）的记录后，旧版本读不回
+     这些记录，不能盲目回滚到更小包络的版本。
+3. 九个 E7 prepared 责任迁到新原生运行时（只在 Qnew 真实资格通过后）：
+   - 旧 API 仍在服务、worker 停止时，只读取得旧 API 实际 key/tombstone TTL，然后
+     `PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.execution_upgrade legacy-key-lookups
+     --inventory <清单> --key-ttl-seconds <实际 TTL> --output /private/<dir>/key-lookups.json`；
+     任何成员不是 prepared、已有 accepted、或查询不是闭合 404 都拒绝。这份证据是操作者采集的：文件哈希只固定字节，
+     不证明是正确的旧 API 作答；须在监督下对已识别的旧 origin API 采集，并附同一 API 读回的 TTL 记录。之后预检
+     必须传同一 TTL，传其他值即阻断。
+   - 新原生安装、attest、完整 canary 与 held-out 资格（Qnew）完成，环境指向目标 runtime/profile v3/容量 v2/activation v2，
+     smoke/canary/validation 指向 Qnew 文件后：`execution_upgrade propose-qualified --release-manifest ... --runtime-bundle ...
+     --origin-release-manifest <归档 E7> --origin-runtime-bundle ... --origin-process-profile ... --origin-activation ...
+     --inventory ... --key-lookups ... --exact-change-manifest-sha256 ... --test-evidence-sha256 ... --code-review-sha256 ...
+     --output /private/<dir>/qualified-upgrade.json`，审阅者写 GO review，四个 `DISCLOSURE_WORKER_EXECUTION_UPGRADE_*` 一起配置。
+   - 预检与启动同 §1.1g（预检终端列出 new qualification / recovery origin / target 与原 key 证据；启动收据为
+     `worker-execution-boot-receipt.v3`；doctor 显示 `exact (new qualification)`）。清单成员全部终结前不创建新 H0。
+   - key 过期的 prepared 没有本分支路径：预检阻断已过期的 key；运行中久等后才过期的，POST 边界以同一批准 TTL
+     按传输墙钟在发送前拒绝（查询命中的任务仍照常对账），head 保持 reconciling、协调器可见停止，不失败、不 POST。
+     key 仍有效时继续用受保护的原 key；只有已过期的才走受管结案（有条件，不是强制迁移）：
+     `PYTHONPATH=src .venv/bin/python -m disclosure_anchor.cli.expired_prepared_closure preview --inventory <清单>
+     --key-lookups <过期前监督采集的查询证据> --origin-runtime-identity-sha256 <旧 origin> --key-ttl-seconds <旧 API
+     实际 TTL> --out /private/<dir>/closure-plan.json`（只读；要求每个 key 在寿命内、清单采集后由 origin 作答闭合
+     404，且 head 仍是采集时从未提交的 prepared H0；过期后才查到的 404 不算证据；仍有效的只列出不结案），
+     审阅计划后在 worker 停止时 `... expired_prepared_closure execute --plan <计划> --expect-sha256 <sha>
+     --inventory <清单> --key-lookups <证据> --decided-by <人> --reason "<原因>" --out /private/<dir>/closure.json`。
+     它持 worker 单例，逐个成员以精确 CAS claim，经普通 V4 `pre_submission_failure`（`original_key_expired`，
+     重试类 `original_key_lifetime`）与自有本地 cleanup 到 `pre_submission_failed`，run/文档/outbox 同事务；不 POST、
+     不查询、不换 key、不 ACK、不改 TTL。成员按计划顺序逐个以各自的持久 CAS 提交，没有批量事务：某个成员被
+     拒（活 claim、别的决定、已推进的 head）时停在该成员、不为它写任何东西，前面的成员保持已结案；同一计划与
+     决定重跑是安全的——已结案成员原样报告，中断的只在失败原因恰为本决定时续做。
+     重排是另一个显式决定，结案从不自动重排：已 `make migrate` 到 0065（`ck_parse_requeue_decision_class` 接受
+     `original_key_lifetime`）之后，对每个结案 run 按 §5.1 做 parse-requeue（先 DRY_RUN），`FIXED_BY` 写明允许
+     以新 key 重新提交的合格运行时/新 H0 授权；在那之前这些 run 由队列的合同失败闸门保持在队列外。
+
+### 1.1i 同根注册表重确认（零职责 Docker 存储维护）
+
+合同见 `../design/mineru-release.md` §4a。只用于：全部旧责任已终态、Windows 输出根（C 上同一 NTFS 目录）不动、
+只做 Docker Desktop 存储维护（如官方 VHD 迁移）后 Linux 侧 `device`/`inode` 可能变化的情形。路径、uid、mode、
+根/控制目录 FileId、registry 原件或记录有任何其它变化都不是本操作可接管的对象：保持停止并人工判断。
+维护工具与 Windows stand-in 演练未完成前不为“优化”停 Docker；生产继续即可。
+
+前置（每一项都由人按序完成，工具只核验）：
+1. GC 全程保持关闭，只核验既有 not_loaded，不启动也不“恢复” GC。worker 按既有排他停止，**等 worker 与其子进程
+   优雅退出后再 bootout**；不得以风险接受替代恢复路径。
+2. worker 退出后（不早于）：`execution_upgrade legacy-scope --output <新文件>`，必须 0 成员；prestop 只接受
+   采集后 900 秒内的清单。原 scope 的 native 责任须已全部收口，不清空/缩 scope、不强 ACK、不重排。
+3. 用含本工具的已验证包；`--private-binding` 的 `previous_capacity_path` 指向当前在跑的容量字节。
+
+```sh
+REL="python -m disclosure_anchor.cli.mineru_release same-root"
+$REL prestop --package <pkg> --private-binding <bind> --legacy-scope-inventory <清单> --output <新目录>
+#   打印 operation_id（sr-…）。冻结三容器 ID/镜像/restart 策略，先全部 restart=no 再按 proxy→API→inference
+#   停止；记录 R0 与 Windows FileId/ACL；同一 VM 内 helper 基线观察须为 noop。之后不得 install/compose up。
+# —— 人工：Docker 完全停止、处于防自动启动状态后备份旧 VHD，再做官方存储维护；结果不明保持 API/生产者关闭，
+#    不强杀、不盲目重迁。Docker 可启动 daemon，三个业务容器不会自行启动（restart=no）。
+$REL observe --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>
+#   outcome=noop：直接 restore。outcome=reattest：
+$REL approve --package <pkg> --prestop-output <prestop 目录> --observe-output <observe 目录> \
+  --approved-by <人> --decision-reference <审阅记录> --output <新目录>   # 离线，用包内协议重算 R1
+$REL apply   --operation-id <op> --approval <approve 目录>/same-root-approval.json --package <pkg> --private-binding <bind> --output <新目录>
+$REL restore --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>
+#   只启动 inference 与 API；API 自身严格 reader 与闭合空闲 health 须证明新元组与 R1。proxy 保持关闭。
+$REL close   --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>
+#   启动 proxy、恢复冻结的 restart 策略、归档 pending；之后普通安装入口才重新开放。
+$REL status  --operation-id <op> --package <pkg> --private-binding <bind> --output <新目录>   # 只读
+```
+
+- 从 prestop 到 close 始终用同一个 `--package`（同一 release manifest）；换包后除 status 外每个阶段都会在任何
+  Docker 调用前拒绝（“was started by release …”），approve 也拒绝。
+- 每阶段结果写在 `--output/same-root-result.json`，`write_permission` 恒为 closed；`unknown`（Job 超时、helper
+  未退出、应答丢失、apply 后读回不符）不是成功：先 `status`，保持 pending 与停止状态，用同一 operation 重跑
+  同一阶段（helper 以同名对象续接；已发布的 R1 只做完成确认）。**不要删除 `pending.json`、不要手改 registry、
+  不要先启动 API“试试看”**。
+- prestop 中断：带同一 `--operation-id` 和一份新的 0 成员清单重跑 prestop 即续做；Windows 侧没有 pending 时仍要求
+  实时空闲与 API proof。若报 “operation directory exists without a pending marker”，说明中断发生在写 marker 之前、
+  尚未冻结或变更任何东西：不带 `--operation-id` 重新 prestop（新 operation），旧目录留作证据。
+- 成对记录（R0 副本→身份记录、apply 后身份记录→apply 记录）中断后由同一阶段重跑自动补齐，前提是与本次读回逐字节
+  或同一物理对象一致；不一致或记录残缺保持失败与 pending，交 root 只读判断，不删除、不手改任何记录。
+- apply 已提交但结果没回到 Mac：用同一 approval 重跑 apply，结果为 `already_recorded`（只确认 registry 仍是记录里
+  的同一对象，不写）。
+- close 一旦写下 `close-intent.json` 就只能继续 close（prestop/observe/apply/restore 都拒绝）：中断后直接重跑 close，
+  已恢复的策略只认该记录里的容器 ID 与策略。若 close 门因某个业务容器未运行而拒绝，经 root 判断后只允许
+  `docker start <close-intent.json 中该容器的 id>` 再重跑 close，不做其它改动。
+- 后续再次挂载（如回退存储）且尚未 close：重新 observe/approve/apply，原件是本操作最新的 registry，绝不回写
+  维护前的 R0。
+
+维护之后（不由本工具执行）：用普通 `install --operation-kind api-compatibility`（真实 live health 门）安装目标容量，
+首个新任务前核验 `min(Windows C 可用, API output-root 可用) >= D + H + X`（零职责物理预算，先扣已知同时写入），
+再按原计划做最终 epoch attest、Qnew 资格与 `bind`。此时 base env 必须是 **exact 隐式单许可**：
+`WORKER_DRAIN_EXISTING=false`，**不设置** `DISCLOSURE_V4_HEAVY_WORK_PERMITS`（不是设为 1），四项
+`DISCLOSURE_WORKER_EXECUTION_UPGRADE_*` 归档不继承。随后以现有 `staged_commission` 处理两份已登记、真实 eligible
+的 pending PDF（正式业务写入、结果保留，不是 scratch 实验）；全部责任收口、legacy-scope 再为零后，才按 §1.1h 走
+U01 v3（`implied/implied/2`、独立 GO、preflight）进入两个重活许可。不支持 Qnew 之后直接 exact heavy2。
+
+### 1.1j 私有 agent API 与显式处理请求（候选；以下步骤均未执行）
+
+设计：`../design/agent-api-processing-requests.md`。以下是联合上线顺序，须由当前生产控制者在取得部署授权后执行；
+只启动 AWS 网关或 mini API，不能让旧 worker 自动消费新请求。
+
+1. 冻结通过独立验证的 mini 候选与 AWS 网关，核对当时的 HANDOFF/RUNTIME、运行身份与全部未结职责，
+   按既有维护流程停止 worker。保留原件、已接受任务、处理结果、旧 release 与配置；不清库或重提 PDF。
+2. 迁移：在上述维护窗口按既有备份与迁移流程执行 `make migrate` 到 `0066_processing_request`
+   （只增三张 ops 表与授权）；随后跑 `make doctor`。API 和 worker 必须与迁移版本一致。
+3. worker：本改动包含 writer 指纹成员 `application/worker/queries.py`，不能用新代码配旧身份材料直接重启。
+   必须按 §1.1g 与 `../design/local-execution-upgrade.md`，依据当时的资格、恢复来源和全部未结职责选择适用
+   U01 版本，完成独立审阅、正式预检、受控安装及真实启动收据核验。不得改写旧资格/H0 或过滤职责来通过校验。
+   若现有资格不再适用，先明确所需验证范围；此 API 说明不授予额外 PDF/GPU 测试负载。
+   `WORKER_BATCH_REQUEST_DISCOVERY` 默认 2，设 0 只停止新的公告定位/发现尝试，
+   不停止 PDF 解析，也不撤销已绑定目标的下载/解析准入。
+4. agent API：在 `$(DISCLOSURE_ENV_DIR)/agent-api.env` 设置两个不同的 ≥32 字符令牌
+   （`DISCLOSURE_AGENT_API_READ_TOKEN`、`DISCLOSURE_AGENT_API_REQUEST_TOKEN`），必要时设置
+   `DISCLOSURE_AGENT_API_ALLOWED_HOSTS`；`make agent-api` 只绑定 loopback，单进程，无 access log。
+   常驻运行可用 mcp_builder `servers/disclosure/deploy/mini/install_agent_api.zsh` 安装 LaunchAgent
+   （仅在登录会话内常驻；已加载即拒绝，校验通过前不写文件）。
+5. AWS 访问只经协调者管理的专用反向转发到 `127.0.0.1:8712`；不改既有 nginx/隧道；
+   AWS 使用两个 mini 令牌，另设不同的 MCP 访问令牌。验证两端握手、分权与实际读取后，
+   用已批准的精确请求核对持久受理和原 worker 消费，不能仅凭网关返回成功宣布完成。
+   显式请求只释放公司门：解析仍按生产分类（有效类、公司覆盖、carrier、title_noise），超范围的报
+   `outside_parse_scope`，原件、quick text 与官方链接仍可用。验收应各用一条在范围与超范围的已归档公告。
+6. 回退：停 agent API 进程即可停止接收；已接受请求及尝试历史必须保留。
+   步骤 3 的发现开关不能取消已绑定职责；worker 代码回退仍须遵守 §1.1g 的身份与恢复约束。
+   不将 `0066` downgrade 作为常规回退，因为它会删除请求历史。
+
+运行事实：`pending` 公告发现需要 worker maintenance 在跑；drain_existing、public stop 时请求保持 pending/queued；
+状态中的 `*_queued` 是谓词选中事实，不是 worker 存活证明。
+
 ### 1.2 批量重解析与派生重置
 
 旧 NormalizedIR corpus reset/exact replay 工具已经删除：它维护第二套 manifest、备份、调度和状态分类，并会把旧 writer 重新引入生产入口。当前没有 production 数据；开发期需要重放时，使用明确的 document 列表走正常 Provider writer，先在仓外保留原 PDF 与 provider artifact，再由 operator 单独授权 DB/AgentSSD 变更。
@@ -613,24 +1141,67 @@ SELECT count(*) FROM disclosure_ops.pending_parse_v1 WHERE failed_parse_count > 
 `~/.config/agent-invest/disclosure_anchor/cninfo.env`（轮换后要 `make worker-restart`）。
 兜底：`make sync COMPANY=x` 走 `--channel web` 免凭据通道验证是否仅 WebAPI 侧故障。
 
+慢下载：HTTP 的 30 秒超时只约束每次 connect/read/write 的单次等待（read 是等下一块数据），
+不约束整个响应。网站与 API 两条下载通道因此共用一个整段逻辑下载预算
+`CNINFO_DOWNLOAD_DEADLINE_SECONDS`（默认 1800 秒）：token 等待、每次尝试、重试退避和流式读取的
+响应体都计入，重试不重置。超出即记一条 `transfer_deadline_exceeded`（retryable=true）下载失败，
+部分字节丢弃、不归档不登记；它计入同一 `CNINFO_MAX_RETRIES` 次数预算，并像 `transport_error`
+一样触发 `source_outage_break` 与既有 provider 冷却。实际上界是预算加一次钳制后的读等待
+（≤30 秒）和一个 token 间隔；响应头阶段与 chunked 分块头逐字节滴送、以及 DNS 解析不在逐块检查
+之内，这种病态情况仍由 maintenance watchdog 以 exit 70 兜底。报告里频繁出现该错误码说明当前
+provider 很慢：先看冷却是否生效，不要调高预算来硬等；确需调高时必须同时保持它比
+`WORKER_WEDGE_TIMEOUT_SECONDS` 至少低 60 秒（否则配置加载失败）。
+
+采集空间与原件交接：`DISCLOSURE_ACQUISITION_FREE_FLOOR_BYTES` 可显式设置 tmp/归档卷的保留空间，
+未设置时保留该卷总容量的 10%。API、网站下载与本地登记都在实际增长前检查：下载逐块写 owned staging，
+归档／quarantine 先检查新增整份副本所需空间，再逐块检查。已存在且 hash 一致的归档直接复用，不要求再留一份
+副本空间。这是实时余量检查，不是跨进程磁盘预留；其他写入者仍可能耗用空间。
+
+下载请求使用 `Accept-Encoding: identity`，非 identity 响应在读取正文前以 `unsupported_content_encoding`
+拒绝并落有限重试记录；Content-Length 仅用于提前判断和帧长度核对，完整 EOF、实际字节数和同一逻辑期限才决定
+下载成功。联系 provider 前空间不足不会新增失败行或消耗下载重试；开始下载后的失败保留既有 `source_access`
+计数。归档目标写入／fsync 的 ENOSPC/EIO 记为可重试 `io_error`，容量不足记为 `local_space_shortfall`，不能
+把这些存储故障标为无效 PDF。本地登记的存储错误也记录失败访问并显式抛出，输入文件保留。
+
+失败后先检查 `source_access.result_snapshot` 的 `transfer`、`capacity`、`quarantine_complete`、`input_missing`
+和 `retained_filename` / `retained_raw_file_hash` / `retained_byte_count`。未完成下载的片段不会登记为原件。
+完整下载会先 fsync 文件和目录；只有不可变归档或完整且已校验的 quarantine 副本接管后才删除 staging。
+若交接失败，唯一完整材料保留在配置的 `runtime/tmp`，由失败记录中的 basename/hash/size 定位；先核对材料和
+失败原因，再按已有具名恢复流程处理。不得把这些保留文件当普通临时文件清理。此阶段没有自动清扫或直接复用
+该 staging 的入口；普通下载重试仍会重新下载，并受既有有限重试限制。
+
+maintenance watchdog：采集平面按“已完成的条目”心跳（成功、已落库的失败与被处理的异常都算），
+只有单个 sync/下载条目、一次 projection 批次或其间一次数据库调用本身卡住超过
+`WORKER_WEDGE_TIMEOUT_SECONDS`（默认 2700 秒）才会触发 exit 70。证据是日志里的
+`[watchdog] … exiting 70` 与其后的线程栈，以及 launchd 的 last exit code 70；随后若有
+`[staged-v4] circuit opened during watchdog exit; no public stop latched`，那是 watchdog 自己终止
+语义子进程引起的取消，不是公共停止，也不会 disable launchd label。worker 保持停止，按栈定位
+卡住的条目后 `make worker-restart`（先确认 `make worker-control-status` 为 RUNNABLE）。
+
 ## 5. 死信处置
 
 | 死信 | 找到它 | 处置 |
 |---|---|---|
 | parse 重试耗尽 / 不可重试 | doctor `parse dead letters` WARN；`pending_parse_v1.last_failed_retryable=false` | 查 `processing_run.error` 根因；修复后 `make process DOC=<id>` 手动重跑 |
 | Unit build 重试耗尽 / fail-closed | doctor `build dead letters` FAIL、health degraded、`disclosure_ops.unit_build_terminal_v1`；worker 只在集合变化时告警；0048 起已被后续成功 Unit 代际修复的旧失败自动退出这些运维读面 | 查 `unit_build_error` 与 `semantic_adjudication_summary`；修复 provider/config/规则后 `make rebuild-units DOC=<id>` 生成新 run，再发布；不得改旧 run 或紧循环 |
-| provider 全部暂时不可用 | active run 的 `semantic_adjudication_status='degraded_unavailable'`、health/doctor WARN | Unit 集仍保留但无编造语义；恢复任一 provider 后显式 `rebuild-units`，确认新 run 为 complete_primary/backup |
+| provider 全部暂时不可用 | active run 的 `semantic_adjudication_status='degraded_unavailable'`、health/doctor WARN | Unit 集仍保留但无编造语义；恢复任一 provider 后显式 `rebuild-units`，确认新 run 为 complete_primary/backup。staged V4 中至少一个 provider 是 `transport_unavailable` 的断网不会进这里：它等网后自动继续（§1.1b） |
 | 空发布（0 unit） | doctor `empty publish dead letters`（实存案例：美的 3 篇「日常关联交易预计」，疑似表格型盲区） | 人工看原 PDF：确属无正文可切 → `make publish RUN=<id> ALLOW_EMPTY=1 REASON=...`；是切分盲区 → 修规则后 `make rebuild-units DOC=<id>` |
-| HUGE lane 长任务 | worker report 的 `parse_huge_dispatched` 与 processing_run 时长；不再有大小排除死信 | 以归档 actual byte_count/页数核对成本；正常长任务继续运行，只在极端 whole-future runaway 时由 launchd 监督重启 |
+| HUGE lane 长任务 | worker report 的 `parse_huge_dispatched` 与 processing_run 时长；不再有大小排除死信 | 以归档 actual byte_count/页数核对成本；正常长任务继续运行；极端 whole-future runaway 由 watchdog 以 70 退出，launchd 不再自动重启，排查后 `make worker-restart` |
 
 下载类死信（新增 2026-07-14）：`invalid_candidate_snapshot` / `raw_archive_error` /
 `subject_identity_conflict` 等 retryable=false 的下载失败永久出队，证据在
-`source_access(status='failed')` 与 quarantine 目录（含 sha256 manifest）。
+`source_access(status='failed')` 与 quarantine 目录（含 sha256 manifest）。可重试失败（含
+`transport_error`、`transfer_deadline_exceeded`）累计达到 `CNINFO_MAX_RETRIES` 次同样出队。
+0064 起三处计数（队列、health `download_dead_letters`、doctor `download dead letters`）共用
+`disclosure_ops.download_failure_resolution_v1`：只有被 §5.5 保留原件登记逐条解决、且 Document 仍一致的
+不可重试失败不再阻断；失败行本身永不删除，doctor 同时显示总数、已解决数与未解决数。新失败记录带
+`failure_phase`，注册阶段失败还带 `archive{raw_file_relpath, raw_file_hash, byte_count}` 与 index ID。
 
 ### 5.1 契约类 parse 失败的显式放行
 
 契约类 retry budget（`semantic_route_contract` / `provider_protocol` / `provider_artifact_contract` /
-`provider_runaway` / `provider_terminal`）永远不自动重试：调度端无法判断根因是否已修。doctor 的
+`provider_runaway` / `provider_terminal`）与受管过期 prepared 结案（§1.1h）的 `original_key_lifetime`（0065 起）
+永远不自动重试：调度端无法判断根因是否已修、是否要以新 key 重新提交。doctor 的
 `contract-class parse failures without requeue decision` WARN 列出这些文档（含 document id 与总数）。
 确认修复已经在跑的代码里生效之后，由 operator 显式登记一条 append-only 决定放行该次失败：
 
@@ -652,7 +1223,10 @@ receipt 把三件事分开，不给单一的「成功」：`decision_recorded`�
 （最新失败 run 及其 retryable/是否已放行、未放行契约类失败数、item/charged 计数与上限、document 状态、
 是否有 running run）。**登记决定本身不等于重新解析**：文档只会在正常 worker 轮询或已授权的 campaign
 扫到它时才真正进入 parse。若 `retry_budget_class` 缺失、畸形或不在上述闭集合内，或 `error.retryable`
-不是布尔值，命令一律拒绝——队列排除它并不能证明 operator 可以重新放行。
+不是布尔值，命令一律拒绝——队列排除它并不能证明 operator 可以重新放行。受管过期 prepared 结案
+（§1.1h）写的 `original_key_lifetime` 由 0065 加入这个闭集合（决定表 DB CHECK
+`ck_parse_requeue_decision_class` 与合同集合同步，只多这一类）：它同样被队列排除，只能由指名该 run 的
+决定放行；结案本身从不排队。0065 未 `make migrate` 的库仍拒绝这类决定。
 
 放行之后用 doctor 的 `released parse failures still pending` 跟踪：该行按决定之后最新一次 provider parse run
 的结果把决定分成 released_pending / released_refailed / resolved 三态（成功之后又失败算 refailed，不算 resolved），
@@ -683,12 +1257,93 @@ API 在失败发生处给出了 typed 暂时原因——VLM 最终 chat 请求�
   （仍清理并 ACK，不自动重试）。新 API 的 registry 只有在 typed failed 任务尚未 ACK 时才含该字段；旧 API 可读已排空的
   registry，遇到未 ACK 的 typed failed 记录会 fail closed，回滚前先让 Mac ACK 完。
 
+### 5.3 发布文本不可表示（`publication_text_unrepresentable`）与 U+0000 标记
+
+PostgreSQL TEXT/JSONB 存不了 U+0000。`provider_unit.v24` 起，provider 文本里未被 native 校正替换的每个 U+0000
+在 Unit 哈希前一对一换成 U+FFFD（`provider_text_nul_substitution.v1`），文档照常发布：被标记文本出现在 title、
+heading_path（含其后代 Unit）或 payload 的 Unit 为 `needs_review`，locator 为 `provider_unit_locator.v10` 并在
+`text_substitutions` 记下 source/payload、两侧 hash 与次数。原 PDF、MinerU artifact、ProviderDocument 不改；不要
+去猜丢失的字（例如 `第\x00节` 的节号），也不要在数据库适配层清洗。
+
+发布前的纯检查 `publication_text_representability.v1` 是兜底：v24 之前已封存的请求（或 native 校正文本仍含
+U+0000）会在 readiness/事务 P 之前被拒绝，记为 `error_code=publication_text_unrepresentable`、`retryable=false`、
+`retry_budget_class=provider_artifact_contract` 的 FailureReceipt，经既有清理/ACK 走到 `local_failed`；message 只含
+unit 序号、字段、下标/键序号（`#n`）、码位与次数，不含正文。封存的 preparation、源文件与既有发布全部保留，也不会
+被改写或重算。未知的 DataError、hash/locator/IO/完整性错误仍按 F5 停止处理，不属于这一类。
+
+处置（root 值守，不是自动）：
+
+1. 核对 doctor 的 `contract-class parse failures without requeue decision` 列出该文档，失败 run 的 message 以
+   `publication_text_representability.v1: request=sha256:...` 开头。
+2. 确认运行中的 release 已是 `provider_unit.v24`；若处于 U01 v2 排空期，等全部清单成员终结（该 `local_failed`
+   本身计为终态）后再放行。
+3. 按 §5.1 对该次失败登记一条 `parse-requeue`（`FIXED_BY` 写 v24 release 与审阅引用）。之后由正常 worker 扫描以新
+   attempt/fence/key 重新解析归档 PDF 一次，发布带 U+FFFD 标记与 `needs_review` 的首个 active 代际；不重复盲排。
+4. 查看已标记的 Unit：`SELECT asset_id, title, quality_status FROM disclosure_public.document_units_v1
+   WHERE artifact_locator->>'contract_version' = 'provider_unit_locator.v10';`
+
+### 5.4 大结果包包络超限（具名 `result_source_zip_envelope_exceeded`）
+
+capacity v2（结果存储）进程不再有这一失败：结果大小由策略硬包络、写前许可与阶段 grant 管理，超出硬包络是可见 hold
+（§1.1h）。以下仅适用于 v1 容量进程与已记录的历史事件。
+
+Windows API 的 `_retained_result_sources` 以 `required_envelope = 2 × source_bytes + member_count × 65536 + 1048576`
+与 268435456 B 的保守包络预算比较，超出即以有限失败结束该已接受任务；另有 4096 成员/FD、名称唯一与
+O_NOFOLLOW/regular/nlink 检查。这一预算是结果包络，不是 ZIP 实测大小、原 PDF 大小或显存上限。该类事件在运维记录中
+按 `result_source_zip_envelope_exceeded` 命名，保留 accepted identity → 原 trace → 已记录的失败/清理/ACK 链接；不改旧
+wire、不改写旧 FailureReceipt、不按 RuntimeError 类名或文本改判为暂时失败。不上调全局预算、不做 N/线程/压缩参数
+试验、不删语义所需文件凑预算；要重试该文档前，先取得真实包络分项与返回文件需求，只有有数据支持的选择性容量方案
+才值得重新资格（专用 typed 原因属于后续 Windows wire 小版本，不与本次 Mac 发布捆绑）。
+
+### 5.5 历史证券代码与保留原件登记（`registration_metadata_error`）
+
+症状：候选 `security_code` 是本公司已换掉的旧代码（首例 300114→302132），下载与归档成功后注册报
+`registration_metadata_error`（`security must be synced before download` 或历史绑定/证据不足），原件保留在
+`raw_documents/cninfo/<旧代码>/<年>/<pid>/`。契约见 `design/historical-security-retained-registration.md`。
+不要为此伪造旧代码 profile/USCC、改候选代码、删失败行、重下 PDF 或直接用 `register-local-pdf`
+（通用入口遇历史代码一律拒绝）。
+
+每批失败都单独走一次（原 42 条与之后新增的失败是不同 cohort，计划与批准范围不自动扩展）：
+
+```bash
+# 0. 前提：0064 已 make migrate；最终代码/发布身份已核对；维护停止窗口（否则常驻 worker 会解析新 Document）
+# 1. 绑定预览（只读）：决定文档写明官方证据、锚点 USCC/profile、旧新代码、生效日、批准索引接口与公告范围
+make source-recovery ARGS="binding-preview --request /ABS/binding-decision.json \
+  --evidence-file /ABS/official-announcement.pdf --out /ABS/binding-plan.json"
+# 2. 具名确认：--decided-by 必须等于决定中的 decided_by；同一决定重复执行返回原记录
+make source-recovery ARGS="binding-execute --plan /ABS/binding-plan.json --expect-sha256 sha256:<plan> \
+  --decided-by <decided_by> --evidence-file /ABS/official-announcement.pdf --out /ABS/binding-receipt.json"
+# 3. 保留原件预览（只读）：请求逐条给 failed/index SourceAccess ID 与期望 raw hash/字节；任何一项拒绝即无计划
+make source-recovery ARGS="replay-preview --failed-access-ids /ABS/request.json \
+  --binding-source-access-id <binding sa> --max-items <N> --out /ABS/replay-plan.json"
+# 4. 执行：逐项独立事务、首个拒绝即停、已提交前缀保留；重跑相同计划不新增 Document/回执/事件
+make source-recovery ARGS="replay-execute --plan /ABS/replay-plan.json --expect-sha256 sha256:<plan> \
+  --max-items <N> --out /ABS/replay-result.json"
+# 5. 核对（只读，以数据库回执为准；结果文件不能单独证明提交）
+make source-recovery ARGS="reconcile --plan /ABS/replay-plan.json --expect-sha256 sha256:<plan> \
+  --out /ABS/reconciliation.json"
+```
+
+- 输出文件从不覆盖；每次预览/执行用新路径。计划只在同一 recovery 代码摘要下执行，代码变更后须重新预览。
+- 预览拒绝常见原因：`INDEX_AFTER_FAILURE`、`INDEX_MISMATCH`、`RAW_ARCHIVE_NOT_VERIFIED`（目录缺失/多版本/链接/
+  非普通文件/名实不符/路径不安全）、`RAW_ARCHIVE_MISMATCH`（与请求期望或失败记录的归档事实不符）、
+  `OTHER_UNRESOLVED_FAILURE`（同 pid 还有请求外的失败——一并列入请求）、`RETRY_BUDGET_EXHAUSTED`（本入口不重置预算）、
+  `NEWER_VERSION_EXISTS`、`SUBJECT_NOT_VERIFIED`（绑定范围/锚点/org 否证）。
+- 执行停止常见原因：`RAW_ARCHIVE_NOT_VERIFIED`（原件变化或被换成特殊文件——不会阻塞）、`RAW_ARCHIVE_MISMATCH`
+  （计划 raw 路径不是本条自身的归档路径）、`SUBJECT_CHANGED`/`INDEX_CHANGED`/`FAILURE_RECORD_CHANGED`（计划谱系与
+  重验结果不符——重新预览，不要手改计划）、`RECEIPT_CONFLICT`（已有回执不是该失败的同一义务：跨 provider、链接
+  错位、错 pid、raw/主体不同或无匹配 Document——停止并人工核查，不要删回执）。
+- 执行中断或提交结果不明：先 `reconcile`，不要删除回执重跑；同计划重跑会跳过已核实完成项。
+- 核对出口：`resolved + unresolved + conflict = item_count`、`failure_history_unchanged = item_count`、每条失败至多一个回执、
+  每个 (provider, pid, raw hash) 至多一个 Document；doctor `download dead letters` 的已解决数随之增加，失败历史总数不变。
+- 登记只把原件变成 `registered` Document；之后是否解析、分类如何，由既有公司范围与分类规则决定。
+
 ## 6. TCC / launchd 假死
 
 worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_worker_once.sh` 头部注释）。
 处置：系统设置 → 隐私与安全性 → 完全磁盘访问 给 `/bin/zsh`（或按注释操作），然后
-`make worker-restart`。KeepAlive 30 秒节流重启属预期；除 §1.1 首次 staged cutover 外，
-不要手工 bootout。
+`make worker-restart`。非 0 退出不会被 launchd 自动重启（`SuccessfulExit=true`），授权修复前不会
+反复自杀；除 §1.1 首次 staged cutover 外，不要手工 bootout。
 
 ## 7. 磁盘与产物治理
 
@@ -729,3 +1384,25 @@ worker 以 exit 77 自杀 = TCC 拒绝访问外置盘（详见 `scripts/run_work
   窗口，不能把 Alembic 事务内的索引创建冒充无阻塞 online migration。
 - admin API 需要 `DISCLOSURE_ADMIN_TOKEN`（Bearer）且仅回环可用；token 在 worker.env，
   轮换用 `openssl rand -hex 32` 换值后 `make worker-restart` + 重启 API。
+
+
+### 零职责 owner-memory 诊断完整安装
+
+仅在原 release/current pins 下自然完成全部 prepared/submitted/publish/ACK 职责，并由 root 停止 worker、
+保持 worker/GC unloaded 和持续 producer exclusion 后，使用既有 scope capture 得到新鲜零成员 inventory。
+非 current staged heads 必须由既有 capture guard 拒绝；API/vLLM idle 不代替业务零职责。
+审核并冻结 source/package/profile 后，正式入口为：
+
+```sh
+python -m disclosure_anchor.cli.mineru_release install \
+  --operation-kind full-install --package <verified-package> \
+  --private-binding <owner-only-binding> --legacy-scope-inventory <fresh-owner-only-inventory> \
+  --output <new-operation-directory>
+```
+
+这是既有 full-project installer 分支，不是新的 inference migration。它允许 drained API/proxy 获得新 epoch；
+保留原始数据、注册、输出根、registry/consumed tombstone、旧 receipt 和精确 backups。
+诊断包由 v2 deployment profile/v2 release manifest 绑定派生镜像源；raw v1 包继续保持原行为。
+未知 daemon 结果保持 writes closed，按既有只读 reconciliation 处理，不自动重复 build/recreate/rollback。
+安装通过后继续执行新实际 attestation、完整 qualification/epoch bracket、G5、bind 和 deployment preflight，
+再由 root 恢复普通 producer。source/image/worker 加载证据不足或任何旧职责未关闭均拒绝部署。

@@ -8,6 +8,7 @@ behavior.  POST ambiguity is reconciled only by the durable idempotency key.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 import hashlib
 from math import isfinite
 import os
@@ -44,9 +45,14 @@ from disclosure_anchor.adapters.parsers.mineru_medium.protocol_v2_wire import (
     validate_absence_payload_v2,
 )
 from disclosure_anchor.application.contracts.remote_parse_evidence_v4 import (
+    TERMINAL_RECEIPT_V5_CONTRACT,
     AcceptedSubmissionReceiptV4,
     SubmissionAbsenceProofV4,
     TerminalReceiptV4,
+    TerminalResultStorageV1,
+)
+from disclosure_anchor.application.contracts.worker_execution_upgrade import (
+    VerifiedQualifiedExecution,
 )
 from disclosure_anchor.application.ports.remote_provider_v4 import (
     AcceptedProviderSubmissionV4,
@@ -55,11 +61,15 @@ from disclosure_anchor.application.ports.remote_provider_v4 import (
     RemoteProviderFailedV4,
     RemoteProviderPollOutcomeV4,
     RemoteProviderProtocolErrorV4,
+    RemoteProviderStorageWaitV4,
     RemoteProviderUnavailableV4,
     RemoteProviderWaitingV4,
+    RemoteResultRangeIgnoredV4,
+    RemoteResultRangeUnsatisfiableV4,
     RemoteSubmissionAmbiguousV4,
     RemoteSubmissionCommandV4,
 )
+from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 from disclosure_anchor.application.ports.mineru_stream_pressure import StreamSubmissionGuard
 from disclosure_anchor.application.ports.staged_provider_parser import (
     PrivateProviderCapabilityV4,
@@ -104,6 +114,25 @@ class _GuardedUpload:
         return self._source.tell()
 
 
+_STORAGE_WAIT_REASONS = frozenset({"source_growth_capacity", "completion_capacity", "free_floor"})
+
+
+def _storage_capacity_refusal(exact: bytes) -> str | None:
+    """The reason of a storage-managed runtime's typed capacity refusal, else None."""
+    try:
+        decoded = strict_json_loads(exact)
+    except ValueError:
+        return None
+    detail = decoded.get("detail") if type(decoded) is dict and set(decoded) == {"detail"} else None
+    if (
+        type(detail) is not dict or set(detail) != {"code", "reason"}
+        or detail["code"] != "storage_capacity_wait"
+        or detail["reason"] not in _STORAGE_WAIT_REASONS
+    ):
+        return None
+    return cast(str, detail["reason"])
+
+
 class MinerUHttpRemoteV4:
     """Exact one-episode HTTP implementation of the V4 remote provider port."""
 
@@ -116,9 +145,12 @@ class MinerUHttpRemoteV4:
         request_timeout_seconds: float,
         allow_task_submission: bool = True,
         submission_guard: StreamSubmissionGuard | None = None,
+        legacy_execution: VerifiedQualifiedExecution | None = None,
+        result_storage_policy_sha256: str | None = None,
     ) -> None:
         if (
             type(allow_task_submission) is not bool
+            or (legacy_execution is not None and type(legacy_execution) is not VerifiedQualifiedExecution)
             or not callable(token_factory)
             or not callable(wall_clock)
             or isinstance(request_timeout_seconds, bool)
@@ -132,6 +164,16 @@ class MinerUHttpRemoteV4:
         self._request_timeout_seconds = float(request_timeout_seconds)
         self._allow_task_submission = allow_task_submission
         self._submission_guard = submission_guard
+        self._legacy_execution = legacy_execution
+        # A storage-managed runtime (capacity v2) adds a closed storage
+        # envelope to every task payload; only a bound reader accepts it.
+        if result_storage_policy_sha256 is not None and (
+            type(result_storage_policy_sha256) is not str
+            or len(result_storage_policy_sha256) != 71
+            or not result_storage_policy_sha256.startswith("sha256:")
+        ):
+            raise ValueError("MinerU V4 result storage policy identity is invalid")
+        self._result_storage_policy_sha256 = result_storage_policy_sha256
         self._client = httpx.Client(
             timeout=httpx.Timeout(self._request_timeout_seconds),
             follow_redirects=False,
@@ -239,11 +281,10 @@ class MinerUHttpRemoteV4:
                 }
                 def mark_post_started() -> None:
                     nonlocal post_started
+                    admitted_runtime = self._admitted_runtime(command)
                     if self._submission_guard is not None:
                         self._submission_guard.assert_submission_allowed(
-                            runtime_identity_sha256=cast(
-                                str, command.parser_options.runtime_bundle_identity_sha256
-                            ),
+                            runtime_identity_sha256=admitted_runtime,
                         )
                     post_started = True
                     # The instant the first real POST leaves this process; the
@@ -282,6 +323,17 @@ class MinerUHttpRemoteV4:
                         absence_proof=absence,
                     )
                 else:
+                    storage_wait = (
+                        _storage_capacity_refusal(exact) if status_code == 429 else None
+                    )
+                    if storage_wait is not None:
+                        # The provider refused before acceptance, possibly
+                        # before reading the body; only a closed absence on
+                        # the same key turns that into a capacity wait.
+                        return self._reconcile_storage_refusal(
+                            command, api_origin=api_origin, token=token,
+                            absence_proof=absence, reason=storage_wait,
+                        )
                     if (
                         upload.byte_count != command.source_byte_count
                         or upload.sha256 != intent.source_pdf_sha256
@@ -318,7 +370,7 @@ class MinerUHttpRemoteV4:
                             absence_proof=absence,
                         )
             return accepted
-        except RemoteSubmissionAmbiguousV4:
+        except (RemoteSubmissionAmbiguousV4, RemoteProviderStorageWaitV4):
             raise
         except Exception as exc:
             if post_started:
@@ -380,6 +432,7 @@ class MinerUHttpRemoteV4:
                 expected_status_url=accepted.status_url,
                 expected_result_url=accepted.result_url,
                 artifact_byte_limit=command.artifact_byte_limit,
+                storage_policy_sha256=self._result_storage_policy_sha256,
             )
             response_sha256, response_bytes = response_identity_v2(exact)
         except MinerUProtocolV2WireError as exc:
@@ -387,11 +440,14 @@ class MinerUHttpRemoteV4:
                 "MinerU V4 status payload violated protocol v2"
             ) from exc
         if observation.status in {"pending", "processing"}:
+            storage = observation.storage
             return RemoteProviderWaitingV4(
                 remote_task_identity=observation.task_id,
                 status=cast(Literal["pending", "processing"], observation.status),
                 response_sha256=response_sha256,
                 response_byte_count=response_bytes,
+                storage_wait_reason=None if storage is None else storage.wait_reason,
+                storage_blocked=False if storage is None else storage.blocked,
             )
         if observation.status == "failed":
             return RemoteProviderFailedV4(
@@ -465,6 +521,7 @@ class MinerUHttpRemoteV4:
             raise RemoteProviderProtocolErrorV4(
                 "MinerU V4 completed status lost its result identity"
             )
+        storage = observation.storage
         terminal = TerminalReceiptV4(
             attempt_id=intent.attempt_id,
             fence_identity=intent.fence_identity,
@@ -475,6 +532,18 @@ class MinerUHttpRemoteV4:
             artifact_byte_count=observation.artifact_byte_count,
             provider_protocol_version=accepted.provider_protocol_version,
         )
+        if storage is not None:
+            # A storage-managed result also carries its sealed native envelope.
+            terminal = replace(
+                terminal,
+                contract_version=TERMINAL_RECEIPT_V5_CONTRACT,
+                result_storage=TerminalResultStorageV1(
+                    policy_sha256=storage.policy_sha256,
+                    selected_bytes=storage.selected_bytes,
+                    member_count=storage.member_count,
+                    inventory_sha256=cast(str, storage.inventory_sha256),
+                ),
+            )
         return RemoteProviderCompletedV4(
             receipt=terminal,
             result_lease_until_unix=lease.lease_until_unix,
@@ -492,7 +561,25 @@ class MinerUHttpRemoteV4:
         result_lease_seconds: int,
         step_guard: V4StageGuard,
         before_result_get: Callable[[], None],
+        range_start: int = 0,
+        strong_validator: str | None = None,
     ) -> Iterable[bytes]:
+        """Stream the retained result, or its suffix from ``range_start``.
+
+        A resumed read sends one Range with If-Range naming the result's
+        strong validator; only an exact 206 for that suffix is streamed. A
+        full 200 is never appended and 416 is decided by the caller's prefix.
+        """
+        artifact_bytes = terminal_receipt.artifact_byte_count
+        if (
+            isinstance(range_start, bool) or not isinstance(range_start, int)
+            or not 0 <= range_start < artifact_bytes
+            or (range_start and strong_validator is None)
+        ):
+            raise RemoteProviderProtocolErrorV4("MinerU V4 result range request is invalid")
+        expected_validator = '"' + terminal_receipt.artifact_sha256.removeprefix("sha256:") + '"'
+        if strong_validator is not None and strong_validator != expected_validator:
+            raise RemoteProviderProtocolErrorV4("MinerU V4 result validator differs from terminal evidence")
         api_origin = self._validate_result_download(
             accepted=accepted_submission,
             terminal=terminal_receipt,
@@ -559,17 +646,35 @@ class MinerUHttpRemoteV4:
             raise RemoteProviderUnavailableV4(
                 "MinerU V4 fresh result lease lacks time for GET"
             )
+        headers = {"Accept-Encoding": "identity"}
+        if range_start:
+            assert strong_validator is not None
+            headers.update({"Range": f"bytes={range_start}-", "If-Range": strong_validator})
         request = self._client.build_request(
             "GET",
             accepted_submission.result_url,
-            headers={"Accept-Encoding": "identity"},
+            headers=headers,
             timeout=httpx.Timeout(timeout),
         )
         response: httpx.Response | None = None
         try:
             response = self._client.send(request, stream=True)
             checkpoint()
-            if response.status_code != 200:
+            expected_sha = terminal_receipt.artifact_sha256.removeprefix("sha256:")
+            expected_owner = terminal_receipt.result_owner_identity
+            same_identity = (
+                response.headers.get("X-MinerU-Result-SHA256") == expected_sha
+                and response.headers.get("X-MinerU-Result-Owner") == expected_owner
+                and (strong_validator is None or response.headers.get("ETag") == strong_validator)
+            )
+            if range_start and response.status_code == 200:
+                raise RemoteResultRangeIgnoredV4(same_identity=same_identity)
+            if range_start and response.status_code == 416:
+                raise RemoteResultRangeUnsatisfiableV4(
+                    "MinerU V4 result range is unsatisfiable"
+                )
+            expected_status = 206 if range_start else 200
+            if response.status_code != expected_status:
                 if (
                     response.status_code in {408, 409, 425, 429}
                     or 500 <= response.status_code <= 599
@@ -580,11 +685,8 @@ class MinerUHttpRemoteV4:
                 raise RemoteProviderProtocolErrorV4(
                     f"MinerU V4 result GET returned HTTP {response.status_code}"
                 )
-            expected_sha = terminal_receipt.artifact_sha256.removeprefix("sha256:")
-            expected_owner = terminal_receipt.result_owner_identity
             if (
-                response.headers.get("X-MinerU-Result-SHA256") != expected_sha
-                or response.headers.get("X-MinerU-Result-Owner") != expected_owner
+                not same_identity
                 or response.headers.get("Content-Type", "").split(";", 1)[0].strip()
                 != "application/zip"
                 or response.headers.get("Content-Encoding", "identity") != "identity"
@@ -593,11 +695,18 @@ class MinerUHttpRemoteV4:
                     "MinerU V4 result headers drifted from terminal evidence"
                 )
             content_length = response.headers.get("Content-Length")
-            if content_length != str(terminal_receipt.artifact_byte_count):
+            if content_length != str(artifact_bytes - range_start):
                 raise RemoteProviderProtocolErrorV4(
                     "MinerU V4 result length header drifted from terminal evidence"
                 )
+            if range_start and response.headers.get("Content-Range") != (
+                f"bytes {range_start}-{artifact_bytes - 1}/{artifact_bytes}"
+            ):
+                raise RemoteProviderProtocolErrorV4(
+                    "MinerU V4 result range drifted from the requested suffix"
+                )
             byte_count = 0
+            expected_count = artifact_bytes - range_start
             for chunk in response.iter_bytes(chunk_size=_FILE_CHUNK_BYTES):
                 checkpoint()
                 if type(chunk) is not bytes or not chunk:
@@ -605,13 +714,13 @@ class MinerUHttpRemoteV4:
                         "MinerU V4 result stream yielded an invalid chunk"
                     )
                 byte_count += len(chunk)
-                if byte_count > terminal_receipt.artifact_byte_count:
+                if byte_count > expected_count:
                     raise RemoteProviderProtocolErrorV4(
                         "MinerU V4 result exceeded its terminal byte count"
                     )
                 yield chunk
                 checkpoint()
-            if byte_count != terminal_receipt.artifact_byte_count:
+            if byte_count != expected_count:
                 raise RemoteProviderProtocolErrorV4(
                     "MinerU V4 result ended before its terminal byte count"
                 )
@@ -763,6 +872,35 @@ class MinerUHttpRemoteV4:
             )
         return value
 
+    def _admitted_runtime(self, command: RemoteSubmissionCommandV4) -> str:
+        """The runtime whose stream pressure and admission govern this POST.
+
+        A verified legacy member keeps its original request and key (bound to
+        the parent runtime) and is admitted under the active runtime; every
+        other command must be the active runtime's own. It runs immediately
+        before the POST is sent, so the proof is judged at that instant.
+        """
+
+        runtime = cast(str, command.parser_options.runtime_bundle_identity_sha256)
+        authorization = command.legacy_authorization
+        execution = self._legacy_execution
+        if execution is None:
+            if authorization is not None:
+                raise RemoteProviderProtocolErrorV4(
+                    "legacy submission proof reached a transport without the verified execution"
+                )
+            return runtime
+        if authorization is None:
+            if runtime != execution.current_runtime_identity_sha256:
+                raise RemoteProviderProtocolErrorV4(
+                    "submission runtime is neither current nor a verified legacy obligation"
+                )
+            return runtime
+        try:
+            return execution.require_submission(command, authorization, now_unix=self._lease_clock())
+        except ValueError as exc:
+            raise RemoteProviderProtocolErrorV4(str(exc)) from exc
+
     def _validate_submission_command(self, command: RemoteSubmissionCommandV4) -> None:
         if type(command) is not RemoteSubmissionCommandV4:
             raise RemoteProviderProtocolErrorV4(
@@ -834,6 +972,7 @@ class MinerUHttpRemoteV4:
                 idempotency_key=intent.client_submit_key,
                 attempt_identity=intent.attempt_id,
                 fence_identity=intent.fence_identity,
+                storage_policy_sha256=self._result_storage_policy_sha256,
             )
         except MinerUProtocolV2WireError as exc:
             raise RemoteProviderProtocolErrorV4(
@@ -893,6 +1032,42 @@ class MinerUHttpRemoteV4:
                 "MinerU V4 local capability entropy failed closed"
             )
         return token
+
+    def _reconcile_storage_refusal(
+        self,
+        command: RemoteSubmissionCommandV4,
+        *,
+        api_origin: str,
+        token: bytes,
+        absence_proof: SubmissionAbsenceProofV4,
+        reason: str,
+    ) -> AcceptedProviderSubmissionV4:
+        intent = command.submission_intent
+        status_code, exact = self._request_bytes(
+            method="GET",
+            url=task_lookup_url_v2(
+                api_origin=api_origin,
+                idempotency_key=intent.client_submit_key,
+            ),
+            guard=command.step_guard,
+            configured_timeout=self._request_timeout_seconds,
+        )
+        if status_code == 200:
+            observation = self._parse_submission_observation(
+                exact, command=command, api_origin=api_origin,
+            )
+            return self._accepted(command, observation, token=token, absence_proof=absence_proof)
+        if status_code == 404:
+            try:
+                validate_absence_payload_v2(exact)
+            except (MinerUProtocolV2WireError, ValueError) as exc:
+                raise RemoteSubmissionAmbiguousV4(
+                    "MinerU V4 storage refusal lacks a closed absence"
+                ) from exc
+            raise RemoteProviderStorageWaitV4(reason)
+        raise RemoteSubmissionAmbiguousV4(
+            "MinerU V4 storage refusal could not be reconciled"
+        )
 
     def _reconcile_once_after_post(
         self,

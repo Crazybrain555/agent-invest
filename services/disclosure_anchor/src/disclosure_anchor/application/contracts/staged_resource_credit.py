@@ -13,13 +13,22 @@ import json
 from types import MappingProxyType
 from typing import Literal
 
+from disclosure_anchor.application.contracts.mineru_capacity_config import (
+    MineruResultStoragePolicy,
+)
 from disclosure_anchor.application.contracts.mineru_process_profile import (
+    RESULT_STORAGE_PROCESS_PROFILE_CONTRACT,
     MineruProcessProfile,
+    legacy_result_budgets,
 )
 from disclosure_anchor.application.contracts.strict_json import strict_json_loads
 
 
 STAGED_RESOURCE_CREDIT_POLICY_CONTRACT = "staged-resource-credit-policy.v2"
+# v3 separates the scheduling estimate from the stage grant: the reservation
+# is sized from the result storage policy's estimate, and a verified terminal
+# result or materialization need grows it only through a coordinator grant.
+STAGED_RESOURCE_CREDIT_POLICY_V3_CONTRACT = "staged-resource-credit-policy.v3"
 STAGED_RESOURCE_RESERVATION_INPUT_CONTRACT = (
     "staged-resource-credit-reservation-input.v2"
 )
@@ -57,6 +66,21 @@ _RESERVATION_MECHANICS = MappingProxyType(
         "snapshot_bytes": "source_byte_count",
         "snapshot_items": "literal:1",
         "temp_disk_bytes": "min(profile.temporary_disk_bytes_limit,provider_result_bytes+output_bytes)",
+    }
+)
+
+_RESERVATION_MECHANICS_V3 = MappingProxyType(
+    {
+        **_RESERVATION_MECHANICS,
+        "provider_result_bytes": "min(storage.initial_result_estimate_bytes*bucket.result_reservation_multiplier,profile.terminal_output_bytes_limit,storage.native_normal_unacked_target_bytes)",
+    }
+)
+_GRANT_MECHANICS_V3 = MappingProxyType(
+    {
+        "authority": "only the coordinator admits growth, before the durable transition and within its ledger limit",
+        "materialization": "compressed=Z, decoded=storage.mac_decode_working_set_budget_bytes, temp_disk=Z+S+W, output=S+W from the verified native storage envelope",
+        "reservation": "the scheduling estimate; never a hard ceiling for a verified result",
+        "terminal": "provider_result_bytes and compressed_bytes grow to the verified terminal Z <= storage.native_result_hard_limit_bytes",
     }
 )
 
@@ -157,12 +181,18 @@ class StagedResourceCreditPolicy:
     contract_version: str = STAGED_RESOURCE_CREDIT_POLICY_CONTRACT
 
     def __post_init__(self) -> None:
-        if self.contract_version != STAGED_RESOURCE_CREDIT_POLICY_CONTRACT:
+        if self.contract_version not in {
+            STAGED_RESOURCE_CREDIT_POLICY_CONTRACT, STAGED_RESOURCE_CREDIT_POLICY_V3_CONTRACT,
+        }:
             raise ValueError("staged resource credit policy contract is unsupported")
 
     @property
+    def separates_grants(self) -> bool:
+        return self.contract_version == STAGED_RESOURCE_CREDIT_POLICY_V3_CONTRACT
+
+    @property
     def exact_bytes(self) -> bytes:
-        payload = {
+        payload: dict[str, object] = {
             "contract_version": self.contract_version,
             "credit_dimensions": [item.name for item in fields(ResourceCreditVector)],
             "max_integer": _MAX_INT,
@@ -177,7 +207,9 @@ class StagedResourceCreditPolicy:
                 for name, numerator, denominator, result_multiplier, temp_multiplier
                 in _BUCKETS
             ],
-            "reservation_mechanics": dict(_RESERVATION_MECHANICS),
+            "reservation_mechanics": dict(
+                _RESERVATION_MECHANICS_V3 if self.separates_grants else _RESERVATION_MECHANICS
+            ),
             "reader_policy": {
                 "full_tree_copy": "forbidden",
                 "read_source": "verified staged-or-output tree under the materialization lock",
@@ -201,6 +233,8 @@ class StagedResourceCreditPolicy:
                 )
             },
         }
+        if self.separates_grants:
+            payload["grant_mechanics"] = dict(_GRANT_MECHANICS_V3)
         return _canonical_json(payload)
 
     @property
@@ -209,6 +243,19 @@ class StagedResourceCreditPolicy:
 
 
 STAGED_RESOURCE_CREDIT_POLICY_V2 = StagedResourceCreditPolicy()
+STAGED_RESOURCE_CREDIT_POLICY_V3 = StagedResourceCreditPolicy(
+    contract_version=STAGED_RESOURCE_CREDIT_POLICY_V3_CONTRACT,
+)
+
+
+def staged_resource_credit_policy_for(
+    profile: MineruProcessProfile,
+) -> StagedResourceCreditPolicy:
+    """The one credit policy a process profile version admits."""
+
+    if profile.contract_version == RESULT_STORAGE_PROCESS_PROFILE_CONTRACT:
+        return STAGED_RESOURCE_CREDIT_POLICY_V3
+    return STAGED_RESOURCE_CREDIT_POLICY_V2
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +342,9 @@ class PerAttemptResourceAllowance:
     reservation_input_sha256: str
     reservation_input: EncodedResourceReservationInput = field(repr=False)
     limits: ResourceCreditVector
+    # A committed stage grant replaces the estimate as the hard ceiling; the
+    # grant's own hash is bound so the ceiling names exactly one grant.
+    stage_grant_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _require_sha(self.reservation_input_sha256, "reservation input")
@@ -302,11 +352,16 @@ class PerAttemptResourceAllowance:
             raise ValueError("attempt allowance requires exact reservation input")
         if type(self.limits) is not ResourceCreditVector:
             raise ValueError("attempt allowance requires an exact credit vector")
-        if (
-            self.reservation_input_sha256 != self.reservation_input.sha256
-            or self.limits != self.reservation_input.value.reservation
-        ):
+        if self.reservation_input_sha256 != self.reservation_input.sha256:
             raise ValueError("attempt allowance drifted from reservation input")
+        reservation = self.reservation_input.value.reservation
+        if self.stage_grant_sha256 is None:
+            if self.limits != reservation:
+                raise ValueError("attempt allowance drifted from reservation input")
+        else:
+            _require_sha(self.stage_grant_sha256, "stage grant")
+            if not reservation.fits(self.limits):
+                raise ValueError("a stage grant can only raise the reserved ceiling")
 
     def require_fits(self, observed: ResourceCreditVector) -> None:
         if type(observed) is not ResourceCreditVector or not observed.fits(self.limits):
@@ -314,12 +369,13 @@ class PerAttemptResourceAllowance:
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _canonical_json(
-            {
-                "limits": asdict(self.limits),
-                "reservation_input_sha256": self.reservation_input_sha256,
-            }
-        )
+        payload: dict[str, object] = {
+            "limits": asdict(self.limits),
+            "reservation_input_sha256": self.reservation_input_sha256,
+        }
+        if self.stage_grant_sha256 is not None:
+            payload["stage_grant_sha256"] = self.stage_grant_sha256
+        return _canonical_json(payload)
 
     @property
     def sha256(self) -> str:
@@ -530,8 +586,32 @@ def build_staged_resource_credit_envelope(
     source_pdf_sha256: str,
     source_byte_count: int,
     source_page_count: int,
-    policy: StagedResourceCreditPolicy = STAGED_RESOURCE_CREDIT_POLICY_V2,
+    policy: StagedResourceCreditPolicy | None = None,
+    storage_policy: MineruResultStoragePolicy | None = None,
 ) -> StagedResourceCreditEnvelope:
+    """Size one attempt's reservation from its profile's credit policy.
+
+    A v3 (storage-bound) profile sizes the provider result from the storage
+    policy's estimate; the verified actual result is granted later. The exact
+    bound storage policy object is required: its hash must be the profile's.
+    """
+    expected_policy = staged_resource_credit_policy_for(profile)
+    if policy is None:
+        policy = expected_policy
+    if policy != expected_policy:
+        raise ValueError("resource credit policy differs from the process profile version")
+    if policy.separates_grants:
+        if (
+            type(storage_policy) is not MineruResultStoragePolicy
+            or storage_policy.sha256 != profile.result_storage_policy_sha256
+        ):
+            raise ValueError("storage-bound credit requires the profile's exact storage policy")
+        reservation_bytes = storage_policy.initial_result_estimate_bytes
+        unacked_bytes = storage_policy.native_normal_unacked_target_bytes
+    else:
+        if storage_policy is not None:
+            raise ValueError("a legacy credit reservation cannot bind a storage policy")
+        reservation_bytes, unacked_bytes = legacy_result_budgets(profile)
     _require_sha(source_pdf_sha256, "source PDF")
     _require_positive_int(source_byte_count, "source byte count")
     _require_positive_int(source_page_count, "source page count")
@@ -558,9 +638,9 @@ def build_staged_resource_credit_envelope(
         raise ValueError("source facts do not fit a resource credit bucket")
     bucket, _, _, result_multiplier, temp_multiplier = selected
     provider_cap = _capped_mul(
-        profile.result_reservation_bytes,
+        reservation_bytes,
         result_multiplier,
-        min(profile.terminal_output_bytes_limit, profile.max_unacked_result_bytes),
+        min(profile.terminal_output_bytes_limit, unacked_bytes),
     )
     raster_per_page = _ceil_div(
         profile.rasterized_page_bytes_limit, profile.resident_pages_limit
@@ -624,7 +704,8 @@ def validate_staged_resource_credit_envelope(
     envelope: StagedResourceCreditEnvelope,
     *,
     profile: MineruProcessProfile,
-    policy: StagedResourceCreditPolicy = STAGED_RESOURCE_CREDIT_POLICY_V2,
+    policy: StagedResourceCreditPolicy | None = None,
+    storage_policy: MineruResultStoragePolicy | None = None,
 ) -> None:
     rebuilt = build_staged_resource_credit_envelope(
         profile=profile,
@@ -632,6 +713,7 @@ def validate_staged_resource_credit_envelope(
         source_byte_count=envelope.reservation_input.value.source_byte_count,
         source_page_count=envelope.reservation_input.value.source_page_count,
         policy=policy,
+        storage_policy=storage_policy,
     )
     if rebuilt != envelope:
         raise ValueError("staged resource credit envelope drifted")
@@ -940,6 +1022,8 @@ __all__ = [
     "ResourceReservationInput",
     "STAGED_RESOURCE_CREDIT_POLICY_CONTRACT",
     "STAGED_RESOURCE_CREDIT_POLICY_V2",
+    "STAGED_RESOURCE_CREDIT_POLICY_V3",
+    "STAGED_RESOURCE_CREDIT_POLICY_V3_CONTRACT",
     "STAGED_RESOURCE_RESERVATION_INPUT_CONTRACT",
     "STAGED_RESOURCE_STATE_TRANSITIONS",
     "StagedResourceCreditEnvelope",
@@ -949,5 +1033,6 @@ __all__ = [
     "encode_resource_reservation_input",
     "per_attempt_resource_allowance",
     "resource_credit_shape",
+    "staged_resource_credit_policy_for",
     "validate_staged_resource_credit_envelope",
 ]

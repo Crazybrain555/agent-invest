@@ -121,6 +121,7 @@ class OwnedStreamLifecycleTests(unittest.TestCase):
             disclosure_gpu_metrics_url="http://gpu.invalid/metrics",
             disclosure_runtime_root=self.root,
             worker_loop_interval_seconds=1,
+            worker_drain_existing=False,
         )
         self.events, self.journals, self.readers = [], [], []
         self.fail_phase = None

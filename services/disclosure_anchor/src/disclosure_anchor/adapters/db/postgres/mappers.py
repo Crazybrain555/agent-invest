@@ -132,6 +132,7 @@ def source_access_to_model(entity: e.SourceAccess) -> m.SourceAccess:
         result_snapshot=entity.result_snapshot,
         company_id=entity.company_id,
         security_id=entity.security_id,
+        recovery_of_source_access_id=entity.recovery_of_source_access_id,
     )
 
 
@@ -149,6 +150,7 @@ def source_access_to_entity(row: m.SourceAccess) -> e.SourceAccess:
         result_snapshot=row.result_snapshot,
         company_id=row.company_id,
         security_id=row.security_id,
+        recovery_of_source_access_id=row.recovery_of_source_access_id,
         created_at=row.created_at,
     )
 

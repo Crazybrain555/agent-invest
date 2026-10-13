@@ -38,7 +38,7 @@ from disclosure_anchor.adapters.runtime.synchronized_telemetry_observer import (
 )
 from disclosure_anchor.adapters.runtime.windows_resident_telemetry import windows_resident_collector_spec
 from disclosure_anchor.application.contracts.resident_combined_cpu import check_combined_resident_cpu_v4
-from disclosure_anchor.application.contracts.mineru_capacity_config import decode_mineru_capacity_config
+from disclosure_anchor.application.contracts.mineru_capacity_config import decode_any_mineru_capacity_config
 from disclosure_anchor.application.contracts.mineru_capacity_health import assert_profile_matches_capacity
 from disclosure_anchor.application.contracts.mineru_process_profile import decode_mineru_process_profile
 from disclosure_anchor.application.contracts.resident_combined_cpu import CheckedCombinedResidentCpu
@@ -169,7 +169,7 @@ def _validate_request(request: ResidentTelemetryOwnerRequest) -> None:
     if not request.observer_artifact_root.is_absolute():
         raise ValueError("resident owner observer root must be absolute")
     profile = decode_mineru_process_profile(request.process_profile_bytes)
-    capacity = decode_mineru_capacity_config(request.capacity_config_bytes)
+    capacity = decode_any_mineru_capacity_config(request.capacity_config_bytes)
     assert_profile_matches_capacity(profile, capacity)
     configurations = []
     for lane, plan in (("gpu_fast", request.gpu), ("host_slow", request.host)):
@@ -527,7 +527,7 @@ def run_resident_telemetry_session(
         # The host lane's raw API health is bound to the frozen capacity and to
         # the very API process the Linux sampler measures (from this READY).
         host_binding = HostQueueBinding(
-            expected_capacity=decode_mineru_capacity_config(request.capacity_config_bytes),
+            expected_capacity=decode_any_mineru_capacity_config(request.capacity_config_bytes),
             serving_namespace_pid=cast(int, cast(dict[str, object], _configuration(request.host)["backend"])["api_namespace_pid"]),
             api_boot_id=cast(str, host_value["boot_id"]),
             api_start_ticks=cast(int, cast(dict[str, object], cast(dict[str, object], host_value["members"])["api"])["start_ticks"]),

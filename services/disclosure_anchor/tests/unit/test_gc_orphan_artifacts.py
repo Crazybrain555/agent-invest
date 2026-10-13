@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 import json
 import os
@@ -11,6 +11,9 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from disclosure_anchor.application.contracts.publication_envelope_policy import (
+    PUBLICATION_ENVELOPE_POLICY_V1,
+)
 from scripts.gc_orphan_artifacts import (
     _Candidate,
     _build_manifest,
@@ -22,6 +25,7 @@ from scripts.gc_orphan_artifacts import (
     _write_manifest_before_delete,
     main,
 )
+from tests.unit._publication_family_fixture import publication_family_request
 from tests.unit.test_atomic_document_publication_v4 import (
     _artifact_preparation,
     _artifact_readiness,
@@ -218,51 +222,77 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         self.assertEqual([orphan.path for orphan in orphans], [receipt])
 
     def test_preparation_only_bundle_is_a_conservative_gc_owner(self) -> None:
-        preparation = _artifact_preparation(_request())
-        prep_relpath = Path(preparation.document_unit_snapshot_plan.relpath).with_name(
-            "atomic_publication_preparation.v1.json"
+        # The fixture's preparation and one past the 24 MiB earlier releases
+        # read (one escape-dense Unit: a ~14 MB request, a ~27 MB preparation)
+        # both own their bundle: GC reads up to the release's own envelope.
+        past_old_limit = _artifact_preparation(
+            publication_family_request(
+                units=1, unit_text_bytes=3_800_000, text_kind="escape"
+            )
         )
-        protected = {
-            "parser_artifacts": (
-                Path(preparation.parser_output_plan.published_relpath) / "result.json"
-            ),
-            "provider_documents": Path(preparation.provider_document_plan.relpath),
-            "document_units": Path(preparation.document_unit_snapshot_plan.relpath),
-            "semantic": Path(preparation.semantic_route_receipts_plan.relpath),
-            "preparation": prep_relpath,
-        }
-        for name, relpath in protected.items():
-            path = self._file(relpath.as_posix())
-            if name == "preparation":
-                path.write_bytes(preparation.canonical_bytes)
-                old = self.now_ts - 25 * 3600
-                os.utime(path, (old, old))
+        self.assertGreater(len(past_old_limit.canonical_bytes), 24 * 1024 * 1024)
+        self.assertLessEqual(
+            len(past_old_limit.canonical_bytes),
+            PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes,
+        )
+        for label, preparation in (
+            ("fixture", _artifact_preparation(_request())),
+            ("past_old_limit", past_old_limit),
+        ):
+            with self.subTest(preparation=label):
+                self.data_root = Path(self._tempdir.name) / label / "data"
+                prep_relpath = Path(
+                    preparation.document_unit_snapshot_plan.relpath
+                ).with_name("atomic_publication_preparation.v1.json")
+                protected = {
+                    "parser_artifacts": (
+                        Path(preparation.parser_output_plan.published_relpath)
+                        / "result.json"
+                    ),
+                    "provider_documents": Path(
+                        preparation.provider_document_plan.relpath
+                    ),
+                    "document_units": Path(
+                        preparation.document_unit_snapshot_plan.relpath
+                    ),
+                    "semantic": Path(preparation.semantic_route_receipts_plan.relpath),
+                    "preparation": prep_relpath,
+                }
+                for name, relpath in protected.items():
+                    path = self._file(relpath.as_posix())
+                    if name == "preparation":
+                        path.write_bytes(preparation.canonical_bytes)
+                        old = self.now_ts - 25 * 3600
+                        os.utime(path, (old, old))
 
-        preparation_owners = _snapshot_preparation_owners(self.data_root)
-        expected = _merge_expected_owners(
-            self._expected(),
-            preparation_owners,
-        )
-        candidates, _ = _scan_old_candidates(
-            self.data_root,
-            now_ts=self.now_ts,
-        )
-        orphans, _ = _collect_orphans(
-            candidates,
-            data_root=self.data_root,
-            expected=expected,
-            now_ts=self.now_ts,
-        )
+                preparation_owners = _snapshot_preparation_owners(self.data_root)
+                expected = _merge_expected_owners(
+                    self._expected(),
+                    preparation_owners,
+                )
+                candidates, _ = _scan_old_candidates(
+                    self.data_root,
+                    now_ts=self.now_ts,
+                )
+                orphans, _ = _collect_orphans(
+                    candidates,
+                    data_root=self.data_root,
+                    expected=expected,
+                    now_ts=self.now_ts,
+                )
 
-        self.assertEqual(orphans, [])
-        self.assertIn(
-            prep_relpath.as_posix(),
-            expected["document_unit_snapshots"],
-        )
-        self.assertIn(
-            prep_relpath.with_name("atomic_publication_readiness.v1.json").as_posix(),
-            expected["document_unit_snapshots"],
-        )
+                self.assertEqual(len(candidates), len(protected))
+                self.assertEqual(orphans, [])
+                self.assertIn(
+                    prep_relpath.as_posix(),
+                    expected["document_unit_snapshots"],
+                )
+                self.assertIn(
+                    prep_relpath.with_name(
+                        "atomic_publication_readiness.v1.json"
+                    ).as_posix(),
+                    expected["document_unit_snapshots"],
+                )
 
     def test_ready_bundle_and_invalid_preparation_are_not_silently_collected(
         self,
@@ -273,25 +303,93 @@ class OrphanDerivedArtifactsTests(unittest.TestCase):
         readiness_relpath = prep_relpath.with_name(
             "atomic_publication_readiness.v1.json"
         )
-        prep = self._file(prep_relpath.as_posix())
-        prep.write_bytes(preparation.canonical_bytes)
-        ready = self._file(readiness_relpath.as_posix())
-        ready.write_bytes(manifest.canonical_bytes)
-        old = self.now_ts - 25 * 3600
-        os.utime(prep, (old, old))
-        os.utime(ready, (old, old))
 
+        def ready_bundle(label: str) -> Path:
+            self.data_root = Path(self._tempdir.name) / label / "data"
+            prep = self._file(prep_relpath.as_posix())
+            prep.write_bytes(preparation.canonical_bytes)
+            ready = self._file(readiness_relpath.as_posix())
+            ready.write_bytes(manifest.canonical_bytes)
+            old = self.now_ts - 25 * 3600
+            os.utime(prep, (old, old))
+            os.utime(ready, (old, old))
+            return prep
+
+        ready_bundle("ready")
         owners = _snapshot_preparation_owners(self.data_root)
         self.assertIn(
             readiness_relpath.as_posix(),
             owners["document_unit_snapshots"],
         )
 
-        prep.write_bytes(b"not canonical")
-        with self.assertRaisesRegex(RuntimeError, "blocks GC"):
-            _snapshot_preparation_owners(self.data_root)
+        # Every unsafe or invalid authority file stops GC instead of being
+        # read as an owner or left to become a deletion candidate.
+        def symlink(prep: Path) -> None:
+            target = self.data_root / "outside" / prep.name
+            target.parent.mkdir()
+            prep.rename(target)
+            prep.symlink_to(target)
 
-        prep.unlink()
+        def another_run(prep: Path) -> None:
+            other = prep.parents[1] / "another-run" / prep.name
+            other.parent.mkdir()
+            other.write_bytes(prep.read_bytes())
+
+        invalid: dict[str, tuple[Callable[[Path], object], type[Exception], str]] = {
+            "not canonical": (
+                lambda prep: prep.write_bytes(b"not canonical"), ValueError, "",
+            ),
+            "past the envelope": (
+                lambda prep: os.truncate(
+                    prep, PUBLICATION_ENVELOPE_POLICY_V1.preparation_bytes + 1
+                ),
+                ValueError,
+                "authority file identity is unsafe",
+            ),
+            "second hard link": (
+                lambda prep: os.link(prep, prep.with_name("second-link")),
+                ValueError,
+                "authority file identity is unsafe",
+            ),
+            "symlink": (symlink, OSError, ""),
+            "another run's path": (
+                another_run, ValueError, "authority file path differs from its request",
+            ),
+        }
+        for label, (corrupt, cause_type, cause_text) in invalid.items():
+            with self.subTest(label):
+                corrupt(ready_bundle(label))
+                with self.assertRaisesRegex(
+                    RuntimeError, "invalid atomic publication preparation blocks GC"
+                ) as blocked:
+                    _snapshot_preparation_owners(self.data_root)
+                self.assertIsInstance(blocked.exception.__cause__, cause_type)
+                self.assertIn(cause_text, str(blocked.exception.__cause__))
+
+        prep = ready_bundle("changed while read")
+        read = os.read
+
+        def read_while_appending(fd: int, count: int) -> bytes:
+            chunk = read(fd, count)
+            with prep.open("ab") as handle:
+                handle.write(b" ")
+            return chunk
+
+        with (
+            patch(
+                "scripts.gc_orphan_artifacts.os.read",
+                side_effect=read_while_appending,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "invalid atomic publication preparation blocks GC"
+            ) as blocked,
+        ):
+            _snapshot_preparation_owners(self.data_root)
+        self.assertIn(
+            "authority file changed while read", str(blocked.exception.__cause__)
+        )
+
+        ready_bundle("orphan readiness").unlink()
         with self.assertRaisesRegex(RuntimeError, "readiness blocks GC"):
             _snapshot_preparation_owners(self.data_root)
 

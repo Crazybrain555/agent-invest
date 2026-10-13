@@ -180,6 +180,27 @@ class AdmissionHealthContractTests(unittest.TestCase):
 
 
 class AdmissionCollectorTests(unittest.TestCase):
+    def test_native_admission_validator_binds_the_selected_registry_version(self):
+        admission = wire_health()["task_admission"]
+        validate = CollectorIO(wire_health()).protocol.validate_mineru_task_admission
+        gauges = {"queued_tasks": 0, "processing_tasks": 0, "nonterminal_limit": 1}
+        validate(admission, **gauges)  # Legacy caller remains bound to v3.
+
+        storage_admission = {**admission, "registry_schema": "mineru-task-registry.v4"}
+        validate(storage_admission, registry_schema="mineru-task-registry.v4", **gauges)
+        for value, expected in (
+            (admission, "mineru-task-registry.v4"),
+            (storage_admission, "mineru-task-registry.v3"),
+            (storage_admission, "mineru-task-registry.v99"),
+        ):
+            with self.subTest(actual=value["registry_schema"], expected=expected):
+                with self.assertRaises(ValueError):
+                    validate(value, registry_schema=expected, **gauges)
+
+        inconsistent = {**storage_admission, "durable_nonterminal_tasks": 1}
+        with self.assertRaises(ValueError):
+            validate(inconsistent, registry_schema="mineru-task-registry.v4", **gauges)
+
     def test_full_candidate_collector_probe_requires_admission_runtime(self):
         for value in (wire_health(), responsibility("ingress"),
                       responsibility("finalizing")):

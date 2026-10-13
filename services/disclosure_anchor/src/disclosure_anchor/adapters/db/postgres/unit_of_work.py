@@ -13,6 +13,12 @@ from typing import Self
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
+from disclosure_anchor.adapters.db.postgres.file_open_interruption import (
+    is_interrupted_relation_file_open,
+)
+from disclosure_anchor.adapters.db.postgres.processing_requests import (
+    PostgresProcessingRequestRepository,
+)
 from disclosure_anchor.adapters.db.postgres.remote_parse_v4_repository import (
     RemoteParseV4Repository as PostgresRemoteParseV4Repository,
 )
@@ -37,6 +43,10 @@ from disclosure_anchor.adapters.db.postgres.repositories import (
     TrackedCompanyRepository,
 )
 from disclosure_anchor.application.ports import repositories as ports_repos
+from disclosure_anchor.application.ports.processing_requests import (
+    ProcessingRequestRepository as ProcessingRequestRepositoryPort,
+    ProcessingRequestUnitOfWork,
+)
 from disclosure_anchor.application.ports.remote_parse_v4_repository import (
     RemoteParseV4Repository as RemoteParseV4RepositoryPort,
 )
@@ -46,7 +56,11 @@ from disclosure_anchor.application.ports.remote_parse_v4_failure_committer impor
 from disclosure_anchor.application.ports.remote_parse_v4_ingress import (
     RemoteParseV4IngressCommitter as RemoteParseV4IngressCommitterPort,
 )
-from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
+from disclosure_anchor.application.ports.unit_of_work import (
+    DatabaseInterruptionRolledBack,
+    UnitOfWork,
+    transaction_replay_declared,
+)
 from disclosure_anchor.application.worker.locks import (
     acquire_corpus_write_session_lock,
     release_corpus_write_session_lock,
@@ -74,6 +88,7 @@ class SqlAlchemyUnitOfWork:
     document_units: ports_repos.DocumentUnitRepository
     outbox: ports_repos.OutboxRepository
     publish_evidence: ports_repos.PublishEvidenceRepository
+    processing_requests: ProcessingRequestRepositoryPort
 
     def __init__(
         self,
@@ -84,9 +99,13 @@ class SqlAlchemyUnitOfWork:
         self._connection: Connection | None = None
         self._session: Session | None = None
         self._corpus_write_lock_held = False
+        self._replay_declared = False
+        self._commit_started = False
 
     # -- context management -------------------------------------------------
     def __enter__(self) -> Self:
+        self._replay_declared = transaction_replay_declared()
+        self._commit_started = False
         # Session-level advisory locks belong to the physical PostgreSQL
         # connection, not to SQLAlchemy's Session. Binding the Session to an
         # explicitly checked-out Connection keeps that same backend pinned
@@ -117,6 +136,7 @@ class SqlAlchemyUnitOfWork:
         tb: object,
     ) -> None:
         cleanup_error: BaseException | None = None
+        rolled_back_cleanly = False
         try:
             try:
                 # Default-safe: rollback anything not explicitly committed.
@@ -127,10 +147,12 @@ class SqlAlchemyUnitOfWork:
                 self._connection.invalidate()
             assert self._session is not None
             assert self._connection is not None
+            lock_released = False
             try:
                 if self._corpus_write_lock_held:
                     if not self._connection.invalidated:
                         release_corpus_write_session_lock(self._session)
+                        lock_released = True
                     # A dead PostgreSQL backend releases all session advisory
                     # locks server-side.  Never reconnect merely to unlock:
                     # that would query a new backend, report a false lost-lock
@@ -146,6 +168,13 @@ class SqlAlchemyUnitOfWork:
                 # locks server-side; an apparently live but inconsistent one
                 # must be invalidated explicitly.
                 self._connection.invalidate()
+            # The rollback ran on a live connection whose backend still held
+            # this unit's session lock, then released it and ended cleanly.
+            rolled_back_cleanly = (
+                cleanup_error is None
+                and lock_released
+                and not self._connection.invalidated
+            )
         finally:
             assert self._session is not None
             assert self._connection is not None
@@ -160,6 +189,19 @@ class SqlAlchemyUnitOfWork:
                 "SqlAlchemyUnitOfWork cleanup also failed: "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"
             )
+        elif (
+            rolled_back_cleanly
+            and self._replay_declared
+            and not self._commit_started
+            and is_interrupted_relation_file_open(exc)
+        ):
+            # Only a declared-replayable transaction, interrupted before any
+            # commit began and proven rolled back above, carries the proof.
+            raise DatabaseInterruptionRolledBack(
+                "PostgreSQL interrupted a relation file open; the transaction "
+                "rolled back before any commit",
+                unit_of_work=self,
+            ) from exc
 
     def _bind_repositories(self, session: Session) -> None:
         self.companies = CompanyRepository(session)
@@ -184,6 +226,7 @@ class SqlAlchemyUnitOfWork:
         self.document_units = DocumentUnitRepository(session)
         self.outbox = OutboxRepository(session)
         self.publish_evidence = PublishEvidenceRepository(session)
+        self.processing_requests = PostgresProcessingRequestRepository(session)
 
     # -- transaction control ------------------------------------------------
     @property
@@ -193,6 +236,8 @@ class SqlAlchemyUnitOfWork:
         return self._session
 
     def commit(self) -> None:
+        # Marked before sending: a commit that fails may still be durable.
+        self._commit_started = True
         self.session.commit()
 
     def rollback(self) -> None:
@@ -204,5 +249,13 @@ class SqlAlchemyUnitOfWork:
 
 def unit_of_work_factory(engine: Engine) -> Callable[[], UnitOfWork]:
     """Build UnitOfWork instances from a process-level engine."""
+
+    return lambda: SqlAlchemyUnitOfWork(engine=engine)
+
+
+def processing_request_uow_factory(
+    engine: Engine,
+) -> Callable[[], ProcessingRequestUnitOfWork]:
+    """The same UnitOfWork, typed with its processing-request store."""
 
     return lambda: SqlAlchemyUnitOfWork(engine=engine)

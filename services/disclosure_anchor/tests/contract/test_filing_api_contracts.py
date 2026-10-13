@@ -107,6 +107,7 @@ class FilingApiContractsTests(unittest.TestCase):
             export_contracts(output_root)
             expected_paths = [
                 CONTRACTS_ROOT / "filing_api.openapi.yaml",
+                CONTRACTS_ROOT / "agent_api.openapi.yaml",
                 *(
                     PUBLIC_MODELS_ROOT / f"{name}.v1.json"
                     for name in sorted(PUBLIC_MODELS)

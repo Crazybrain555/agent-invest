@@ -22,6 +22,7 @@ from disclosure_anchor.application.services.semantic_adjudication import (
 )
 from disclosure_anchor.application.services.semantic_router import SemanticRouter
 from disclosure_anchor.application.services.staged_execution_guard import StageLeaseGuard, StageLeaseLost
+from tests.unit._codex_model_catalog_fixture import neutral_catalog
 from tests.unit.test_atomic_publication_request_builder_v4 import _Harness, _draft
 from tests.unit.test_semantic_adjudication import _batch, _Cache, _decisions, _identity
 from tests.unit.test_semantic_claude_cli import _stdout
@@ -248,7 +249,7 @@ class SemanticChainGuardTests(unittest.TestCase):
 class SemanticAdapterGuardTests(unittest.TestCase):
     def _adapters(self, directory):
         return (codex_cli.CodexCliSemanticAdjudicator(executable=Path('/not-run/codex'),
-                    runtime_tmp_root=Path(directory)),
+                    runtime_tmp_root=Path(directory), model_catalog=neutral_catalog()),
                 ClaudeCliSemanticAdjudicator(executable=Path('/not-run/claude')))
 
     @staticmethod

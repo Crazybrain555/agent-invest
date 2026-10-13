@@ -63,6 +63,118 @@ from disclosure_anchor.domain.errors import ParserOutputContractError
 _MAX_INT = (1 << 63) - 1
 
 
+
+class MaterializationCapacityBlockedV4(RuntimeError):
+    """A verified result is outside this worker's configured envelope.
+
+    The materializer keeps the spool and exact staging; the coordinator holds
+    the attempt visibly until larger limits exist. It is never a local
+    failure and never releases the provider result.
+    """
+
+    def __init__(self, dimension: str) -> None:
+        super().__init__(f"materialization capacity blocked: {dimension}")
+        self.dimension = dimension
+
+
+MATERIALIZATION_TRANSFER_HOLD_REASONS = frozenset({
+    "transfer_logical_deadline",
+    "transfer_progress",
+    "transfer_range_unsupported",
+    "spool_owner_unproven",
+    "spool_progress_unproven",
+    "spool_part_identity",
+    "spool_part_short",
+    "spool_prefix_mismatch",
+})
+# The durable local prefix cannot be proven: an integrity fault the whole site
+# stops for. The other reasons are one document's spent transfer budget.
+MATERIALIZATION_TRANSFER_INTEGRITY_HOLD_REASONS = frozenset({
+    "spool_owner_unproven",
+    "spool_progress_unproven",
+    "spool_part_identity",
+    "spool_part_short",
+    "spool_prefix_mismatch",
+})
+
+
+class MaterializationTransferContinuesV4(RuntimeError):
+    """A resumable result transfer stopped at a durable safe point after progress.
+
+    The spool prefix and its progress receipt are durable; the same stage
+    continues from that offset later. Only real durable growth is reported,
+    so this never becomes an unbounded retry of an idle transfer.
+    """
+
+    def __init__(self, *, durable_offset: int, artifact_byte_count: int) -> None:
+        super().__init__(
+            f"result transfer continues at {durable_offset} of {artifact_byte_count} bytes"
+        )
+        self.durable_offset = durable_offset
+        self.artifact_byte_count = artifact_byte_count
+
+
+class MaterializationCapacityWaitV4(RuntimeError):
+    """Live Mac free space cannot cover the floor plus every in-flight promise now.
+
+    Nothing was written for this step; the same attempt waits and retries. It
+    is never a failure and never releases the provider result.
+    """
+
+    def __init__(self, dimension: str) -> None:
+        super().__init__(f"materialization waits for capacity: {dimension}")
+        self.dimension = dimension
+
+
+class MaterializationHeavyWorkRequiredV4(RuntimeError):
+    """The stage reached a whole-object decode without the shared heavy-work permit.
+
+    The spool and every unpacked member are durable and re-verified, never
+    rewritten, when the same stage continues with the permit.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("materialization waits for the shared heavy-work permit")
+
+
+def require_heavy_work_permit(stage_guard: object) -> None:
+    """Refuse whole-object heavy work a scheduler dispatched without the permit.
+
+    A guard without the attribute, or with None, belongs to a standalone caller
+    that runs one stage at a time.
+    """
+
+    if getattr(stage_guard, "heavy_work_permitted", None) is False:
+        raise MaterializationHeavyWorkRequiredV4()
+
+
+class MaterializationUnpackContinuesV4(RuntimeError):
+    """A granted unpack stopped at a member boundary before its stage deadline.
+
+    Every completed member is durable in staging and is re-verified, never
+    rewritten, when the same stage continues.
+    """
+
+    def __init__(self, *, completed_members: int, member_count: int) -> None:
+        super().__init__(f"result unpack continues after {completed_members} of {member_count} members")
+        self.completed_members = completed_members
+        self.member_count = member_count
+
+
+class MaterializationTransferHeldV4(RuntimeError):
+    """A resumable transfer is held with its durable prefix for an operator.
+
+    Its logical or progress budget is spent, or its local prefix cannot be
+    proven; nothing is deleted, failed or released.
+    """
+
+    def __init__(self, reason: str) -> None:
+        if reason not in MATERIALIZATION_TRANSFER_HOLD_REASONS:
+            raise ValueError("transfer hold reason is outside the closed vocabulary")
+        super().__init__(f"result transfer held: {reason}")
+        self.reason = reason
+
+
 class SubmissionAcceptanceAmbiguous(ParserOutputContractError):
     """Remote POST began but its acceptance cannot yet be reconciled."""
 
@@ -1226,6 +1338,10 @@ def validate_v4_materialization_authorization(
     replay_context.require_evidence("materialization_intent", intent)
     replay_context.validate_current(checkpoint)
     reservation_input = allowance.reservation_input.value
+    # A v5 intent's ceilings are its admitted stage grant; v4 keeps the
+    # immutable reservation. Either way exactly one authority binds them.
+    grant = intent.resource_grant
+    bound_limits = reservation.reserved_credit if grant is None else grant.limits
     expected_held_resource_credit = ResourceCreditVector(
         documents=1,
         snapshot_items=1,
@@ -1234,8 +1350,8 @@ def validate_v4_materialization_authorization(
         provider_result_bytes=intent.artifact_byte_count,
         materialization_items=1,
         compressed_bytes=intent.artifact_byte_count,
-        decoded_bytes=reservation.reserved_credit.decoded_bytes,
-        temp_disk_bytes=reservation.reserved_credit.temp_disk_bytes,
+        decoded_bytes=bound_limits.decoded_bytes,
+        temp_disk_bytes=bound_limits.temp_disk_bytes,
         ack_items=1,
     )
     checkpoint_identity = (
@@ -1371,7 +1487,8 @@ def validate_v4_materialization_authorization(
         or allowance.sha256 != intent.allowance_sha256
         or allowance.reservation_input_sha256
         != checkpoint.reservation_input_sha256
-        or allowance.limits != reservation.reserved_credit
+        or allowance.limits != bound_limits
+        or allowance.stage_grant_sha256 != (None if grant is None else grant.sha256)
         or reservation_input.source_pdf_sha256 != reservation.source_pdf_sha256
         or reservation_input.source_byte_count != reservation.source_byte_count
         or reservation_input.source_page_count != reservation.source_page_count
@@ -1387,15 +1504,29 @@ def validate_v4_materialization_authorization(
         raise ValueError("v4 materialization authorization drifted")
     allowance.require_fits(intent.held_resource_credit)
     limits = allowance.limits
-    if (
+    if grant is None:
+        if (
+            intent.result_byte_limit > limits.provider_result_bytes
+            or intent.decoded_byte_limit > limits.decoded_bytes
+            or intent.temporary_disk_byte_limit > limits.temp_disk_bytes
+            or intent.output_byte_limit > limits.output_bytes
+            or intent.output_page_limit > limits.output_pages
+            or intent.uncompressed_byte_limit
+            > min(limits.temp_disk_bytes, limits.output_bytes)
+            or intent.member_count_limit > limits.decoded_bytes
+        ):
+            raise ValueError("v4 materialization limits exceed exact allowance")
+    # Disk bounds come from the grant's verified S/Z; decoded RAM is its own
+    # W credit, never the image bytes counted in S.
+    elif (
         intent.result_byte_limit > limits.provider_result_bytes
-        or intent.decoded_byte_limit > limits.decoded_bytes
+        or intent.decoded_byte_limit > intent.uncompressed_byte_limit
         or intent.temporary_disk_byte_limit > limits.temp_disk_bytes
         or intent.output_byte_limit > limits.output_bytes
         or intent.output_page_limit > limits.output_pages
         or intent.uncompressed_byte_limit
         > min(limits.temp_disk_bytes, limits.output_bytes)
-        or intent.member_count_limit > limits.decoded_bytes
+        or limits.decoded_bytes < grant.decode_working_set_bytes
     ):
         raise ValueError("v4 materialization limits exceed exact allowance")
 
@@ -2060,6 +2191,13 @@ class StagedProviderDocumentParserPort(Protocol):
 
 
 __all__ = [
+    "MATERIALIZATION_TRANSFER_HOLD_REASONS",
+    "MaterializationCapacityBlockedV4",
+    "MaterializationCapacityWaitV4",
+    "MaterializationTransferContinuesV4",
+    "MaterializationTransferHeldV4",
+    "MaterializationHeavyWorkRequiredV4",
+    "MaterializationUnpackContinuesV4",
     "DurableCheckpointWitness",
     "encode_durable_checkpoint_witness",
     "RemoteArtifactReceipt",
@@ -2088,4 +2226,5 @@ __all__ = [
     "validate_v4_cleanup_authorization",
     "validate_v4_materialization_authorization",
     "SubmissionAcceptanceAmbiguous",
+    "require_heavy_work_permit",
 ]

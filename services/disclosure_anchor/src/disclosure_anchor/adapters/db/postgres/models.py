@@ -1479,18 +1479,19 @@ class DurablePublishSupplement(Base):
 
 
 class ParseRequeueDecision(Base):
-    """Explicit, append-only release of one contract-class parse failure.
+    """Explicit, append-only release of one non-automatic parse failure.
 
-    The failed run stays exactly as it was recorded; this row is the only
-    evidence that an operator judged the cause fixed and re-admitted the
-    document to the parse queue.
+    Contract classes and the managed expired-prepared closure's
+    ``original_key_lifetime`` (0065). The failed run stays exactly as it was
+    recorded; this row is the only evidence that an operator judged the cause
+    fixed and re-admitted the document to the parse queue.
     """
 
     __tablename__ = "parse_requeue_decision"
     __table_args__ = (
         UniqueConstraint("processing_run_id", name="uq_parse_requeue_decision_run"),
         CheckConstraint("decision_id ~ '^prq_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_parse_requeue_decision_id"),
-        CheckConstraint("failure_retry_budget_class IN ('provider_artifact_contract','provider_protocol','provider_runaway','provider_terminal','semantic_route_contract')", name="ck_parse_requeue_decision_class"),
+        CheckConstraint("failure_retry_budget_class IN ('original_key_lifetime','provider_artifact_contract','provider_protocol','provider_runaway','provider_terminal','semantic_route_contract')", name="ck_parse_requeue_decision_class"),
         CheckConstraint("btrim(failure_error_code) <> '' AND btrim(fixed_by) <> '' AND btrim(reason) <> '' AND btrim(decided_by) <> ''", name="ck_parse_requeue_decision_evidence"),
         Index("ix_parse_requeue_decision_document", "document_id", "decided_at"),
         {"schema": OPS_SCHEMA},
@@ -1504,6 +1505,162 @@ class ParseRequeueDecision(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     decided_by: Mapped[str] = mapped_column(String(128), nullable=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ProcessingRequest(Base):
+    """One explicit caller intent, identified by its idempotency key (0066).
+
+    The row is immutable; status is always derived from existing document,
+    run, source-access and queue facts, never stored here.
+    """
+
+    __tablename__ = "processing_request"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_processing_request_idempotency_key"),
+        CheckConstraint("request_id ~ '^dreq_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_processing_request_id"),
+        CheckConstraint("idempotency_key ~ '^[A-Za-z0-9._:-]{16,128}$'", name="ck_processing_request_idempotency_key"),
+        CheckConstraint("intent_sha256 ~ '^sha256:[0-9a-f]{64}$'", name="ck_processing_request_intent"),
+        CheckConstraint("contract_version = 'disclosure-processing-request.v1'", name="ck_processing_request_contract"),
+        CheckConstraint(
+            "target_kind IN ('document','provider_document','title_match') "
+            "AND jsonb_typeof(target) = 'object' "
+            "AND (target->>'kind') IS NOT DISTINCT FROM target_kind",
+            name="ck_processing_request_target",
+        ),
+        CheckConstraint("btrim(requested_by) <> ''", name="ck_processing_request_requested_by"),
+        Index("ix_processing_request_created", "created_at"),
+        {"schema": OPS_SCHEMA},
+    )
+    request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(String(71), nullable=False)
+    contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    target: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    enqueue_parse: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ProcessingRequestAttempt(Base):
+    """One bounded resolution attempt of a processing request (0066)."""
+
+    __tablename__ = "processing_request_attempt"
+    __table_args__ = (
+        UniqueConstraint("request_id", "attempt_no", name="uq_processing_request_attempt_no"),
+        CheckConstraint("attempt_id ~ '^dpra_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_processing_request_attempt_id"),
+        CheckConstraint("attempt_no BETWEEN 1 AND 10", name="ck_processing_request_attempt_no"),
+        CheckConstraint(
+            "(finished_at IS NULL) = (outcome IS NULL) "
+            "AND (outcome IS NULL OR outcome IN "
+            "('matched','ambiguous','not_found','failed','abandoned','deferred')) "
+            "AND lease_expires_at > started_at "
+            "AND (outcome IS NULL "
+            "OR (outcome = 'abandoned') = (finished_at >= lease_expires_at)) "
+            "AND (next_attempt_at IS NULL "
+            "OR (outcome IS NOT NULL AND outcome IN ('failed','abandoned','deferred'))) "
+            "AND (outcome IS NULL OR outcome IN ('matched','ambiguous','not_found') "
+            "OR (error IS NOT NULL AND jsonb_typeof(error) = 'object')) "
+            "AND (outcome IS DISTINCT FROM 'ambiguous' "
+            "OR (choices IS NOT NULL AND jsonb_typeof(choices) = 'array')) "
+            "AND (outcome IS DISTINCT FROM 'matched' "
+            "OR index_source_access_id IS NOT NULL) "
+            "AND (provider_row_count IS NULL OR provider_row_count >= 0) "
+            "AND (choices IS NULL OR jsonb_typeof(choices) = 'array') "
+            "AND (error IS NULL OR jsonb_typeof(error) = 'object')",
+            name="ck_processing_request_attempt_outcome",
+        ),
+        Index(
+            "uq_processing_request_attempt_open",
+            "request_id",
+            unique=True,
+            postgresql_where=text("finished_at IS NULL"),
+        ),
+        {"schema": OPS_SCHEMA},
+    )
+    attempt_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str] = mapped_column(ForeignKey(f"{OPS_SCHEMA}.processing_request.request_id", ondelete="RESTRICT", name="fk_processing_request_attempt_request"), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    profile_source_access_id: Mapped[Optional[str]] = mapped_column(ForeignKey(f"{CORE_SCHEMA}.source_access.source_access_id", ondelete="RESTRICT", name="fk_processing_request_attempt_profile"), nullable=True)
+    index_source_access_id: Mapped[Optional[str]] = mapped_column(ForeignKey(f"{CORE_SCHEMA}.source_access.source_access_id", ondelete="RESTRICT", name="fk_processing_request_attempt_index"), nullable=True)
+    provider_row_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # None must reach the CHECKs as SQL NULL, never as the JSON null literal.
+    choices: Mapped[Optional[list[Any]]] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    choices_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    error: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB(none_as_null=True), nullable=True)
+
+
+class ProcessingRequestTarget(Base):
+    """The exact filing one processing request resolved to (0066).
+
+    ``admit_download``/``admit_parse`` are what the queue predicates read; the
+    row is bound once and never updated or deleted.
+    """
+
+    __tablename__ = "processing_request_target"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_processing_request_target_request"),
+        CheckConstraint("target_id ~ '^dprt_[0-9A-HJKMNP-TV-Z]{26}$'", name="ck_processing_request_target_id"),
+        CheckConstraint(
+            "resolution_method IN "
+            "('document_id','local_document','local_candidate','provider_discovery') "
+            "AND (resolution_method = 'provider_discovery') = (attempt_id IS NOT NULL) "
+            "AND (resolution_method NOT IN ('document_id','local_document') "
+            "OR document_id IS NOT NULL) "
+            "AND (resolution_method <> 'local_candidate' "
+            "OR (document_id IS NULL AND index_source_access_id IS NOT NULL)) "
+            "AND (resolution_method <> 'provider_discovery' "
+            "OR index_source_access_id IS NOT NULL)",
+            name="ck_processing_request_target_method",
+        ),
+        CheckConstraint(
+            "(document_id IS NULL) = (raw_file_hash IS NULL) "
+            "AND (raw_file_hash IS NULL OR raw_file_hash ~ '^sha256:[0-9a-f]{64}$') "
+            "AND (provider IS NULL OR provider = 'cninfo') "
+            "AND (provider IS NULL) = (provider_document_id IS NULL) "
+            "AND (document_id IS NOT NULL OR provider_document_id IS NOT NULL) "
+            "AND (provider_document_id IS NULL OR btrim(provider_document_id) <> '') "
+            "AND (NOT admit_download OR (document_id IS NULL "
+            "AND provider_document_id IS NOT NULL "
+            "AND index_source_access_id IS NOT NULL))",
+            name="ck_processing_request_target_identity",
+        ),
+        Index(
+            "ix_processing_request_target_download",
+            "provider",
+            "provider_document_id",
+            postgresql_where=text("admit_download"),
+        ),
+        Index(
+            "ix_processing_request_target_parse_document",
+            "document_id",
+            postgresql_where=text("admit_parse AND document_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_processing_request_target_parse_provider",
+            "provider",
+            "provider_document_id",
+            postgresql_where=text("admit_parse AND document_id IS NULL"),
+        ),
+        {"schema": OPS_SCHEMA},
+    )
+    target_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str] = mapped_column(ForeignKey(f"{OPS_SCHEMA}.processing_request.request_id", ondelete="RESTRICT", name="fk_processing_request_target_request"), nullable=False)
+    resolution_method: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_id: Mapped[Optional[str]] = mapped_column(ForeignKey(f"{OPS_SCHEMA}.processing_request_attempt.attempt_id", ondelete="RESTRICT", name="fk_processing_request_target_attempt"), nullable=True)
+    provider: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    provider_document_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    document_id: Mapped[Optional[str]] = mapped_column(ForeignKey(f"{CORE_SCHEMA}.document.document_id", ondelete="RESTRICT", name="fk_processing_request_target_document"), nullable=True)
+    raw_file_hash: Mapped[Optional[str]] = mapped_column(String(71), nullable=True)
+    index_source_access_id: Mapped[Optional[str]] = mapped_column(ForeignKey(f"{CORE_SCHEMA}.source_access.source_access_id", ondelete="RESTRICT", name="fk_processing_request_target_index"), nullable=True)
+    admit_download: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    admit_parse: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class ProgressRelayHead(Base):
@@ -1703,6 +1860,38 @@ class SourceAccess(Base):
         Index("ix_source_access_provider", "provider"),
         Index("ix_source_access_company", "company_id"),
         Index("ix_source_access_security", "security_id"),
+        # 0064: a recovery link exists only on a successful retained-archive
+        # registration, and resolves at most one failed attempt.
+        CheckConstraint(
+            "recovery_of_source_access_id IS NULL OR ("
+            "provider_interface IS NOT DISTINCT FROM 'local:register_retained_pdf.v1' "
+            "AND status = 'ok' AND result_hash IS NOT NULL "
+            "AND company_id IS NOT NULL AND security_id IS NOT NULL "
+            "AND recovery_of_source_access_id <> source_access_id)",
+            name="ck_source_access_recovery_receipt",
+        ),
+        Index(
+            "uq_source_access_successful_recovery",
+            "recovery_of_source_access_id",
+            unique=True,
+            postgresql_where=text("recovery_of_source_access_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "provider_interface IS DISTINCT FROM "
+            "'local:historical_security_binding.v1' OR ("
+            "status = 'ok' AND result_hash IS NOT NULL "
+            "AND company_id IS NOT NULL AND security_id IS NOT NULL "
+            "AND recovery_of_source_access_id IS NULL)",
+            name="ck_source_access_historical_binding",
+        ),
+        Index(
+            "uq_source_access_historical_binding_decision",
+            "result_hash",
+            unique=True,
+            postgresql_where=text(
+                "provider_interface = 'local:historical_security_binding.v1'"
+            ),
+        ),
         {"schema": CORE_SCHEMA},
     )
 
@@ -1727,6 +1916,15 @@ class SourceAccess(Base):
     )
     security_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey(f"{CORE_SCHEMA}.security.security_id"), nullable=True
+    )
+    recovery_of_source_access_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey(
+            f"{CORE_SCHEMA}.source_access.source_access_id",
+            name="fk_source_access_recovery_of",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

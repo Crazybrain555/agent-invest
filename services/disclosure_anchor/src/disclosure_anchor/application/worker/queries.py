@@ -182,6 +182,79 @@ def candidate_code_counts(conn: Connection) -> dict[str, int]:
     return {str(row.code): int(row.candidate_count) for row in rows}
 
 
+def successful_sync_ranges(
+    conn: Connection,
+    *,
+    company_id: str,
+    window_start: date,
+    window_end: date,
+) -> list[tuple[date, date]] | None:
+    """Merged closed coverage, or None if history admission is no longer valid.
+
+    The existing company index restricts receipt reads to one company. Date
+    clipping and server-side union bound returned ranges by the target window,
+    regardless of repeated hourly/overlap syncs. An eligible company with no
+    usable receipts returns [] (unknown coverage), never invented coverage.
+    """
+
+    rows = conn.execute(
+        text(
+            f"""
+            WITH eligible AS (
+                SELECT company_id
+                  FROM {CORE_SCHEMA}.tracked_company
+                 WHERE company_id = :company_id
+                   AND status = 'active' AND lookback IS NULL
+            ), successful AS (
+                SELECT (sa.query_params->>'sdate')::date AS query_start,
+                       (sa.query_params->>'edate')::date AS query_end
+                  FROM {CORE_SCHEMA}.source_access sa
+                  JOIN eligible e ON e.company_id = sa.company_id
+                 WHERE sa.provider = 'cninfo'
+                   AND sa.provider_interface IN (
+                       'cninfo:p_info3015', 'cninfo:hisAnnouncement')
+                   AND sa.status = 'ok'
+                   AND sa.result_hash ~ '^sha256:[0-9a-f]{{64}}$'
+                   AND sa.result_snapshot->>'result' IN ('ok', 'empty')
+                   AND jsonb_typeof(sa.result_snapshot->'candidates') = 'array'
+                   AND jsonb_typeof(sa.query_params->'sdate') = 'string'
+                   AND jsonb_typeof(sa.query_params->'edate') = 'string'
+                   AND sa.query_params->>'sdate' ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                   AND sa.query_params->>'edate' ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+            ), merged AS (
+                SELECT range_agg(daterange(
+                           greatest(query_start, CAST(:window_start AS date)),
+                           least(query_end, CAST(:window_end AS date)), '[]'
+                       )) AS coverage
+                  FROM successful
+                 WHERE query_start <= query_end
+                   AND query_start <= CAST(:window_end AS date)
+                   AND query_end >= CAST(:window_start AS date)
+            )
+            SELECT lower(r.covered_range) AS window_start,
+                   upper(r.covered_range) - 1 AS window_end
+              FROM eligible
+              CROSS JOIN merged
+              LEFT JOIN LATERAL unnest(merged.coverage) r(covered_range) ON true
+             ORDER BY window_start
+            """
+        ),
+        {
+            "company_id": company_id,
+            "window_start": window_start,
+            "window_end": window_end,
+        },
+    ).mappings()
+    values = list(rows)
+    if not values:
+        return None
+    return [
+        (row["window_start"], row["window_end"])
+        for row in values
+        if row["window_start"] is not None
+    ]
+
+
 def sync_due(
     conn: Connection, *, interval_seconds: int, limit: int
 ) -> list[dict[str, Any]]:
@@ -352,6 +425,64 @@ def _download_scope_sql(scope_classes: tuple[str, ...] | None) -> str:
     )
 
 
+# Explicit processing requests (0066) admit one exact filing through the admit
+# flags of processing_request_target; retry budgets, latches, the running-run
+# guard and the nonretryable-download exclusion still apply to it unchanged.
+# Download admission releases the pool and taxonomy gates for the first
+# acquisition of a not-yet-registered candidate. Parse admission releases only
+# the company gate: the effective classes, carrier guard and title noise still
+# decide, exactly as for ordinary documents. It is bound to the registered
+# document and its raw hash, or to the provider identity until the requested
+# candidate has been downloaded. The staged-v4 scanner, its locked H0 recheck
+# and source rejection all read this same predicate, so admission cannot pass
+# a page and then fail at commit.
+_DOWNLOAD_REQUEST_ADMISSION_SQL = f"""
+    (NOT q.already_registered
+     AND EXISTS (
+        SELECT 1
+          FROM {OPS_SCHEMA}.processing_request_target AS pra
+         WHERE pra.admit_download
+           AND pra.provider = 'cninfo'
+           AND pra.provider_document_id = q.provider_document_id))
+"""
+_PARSE_REQUEST_ADMISSION_SQL = f"""
+    EXISTS (
+        SELECT 1
+          FROM {OPS_SCHEMA}.processing_request_target AS pra
+         WHERE pra.admit_parse
+           AND ((pra.document_id = d.document_id
+                 AND pra.raw_file_hash = d.raw_file_hash)
+                OR (pra.document_id IS NULL
+                    AND pra.provider = d.provider
+                    AND pra.provider_document_id = d.provider_document_id)))
+"""
+_DOWNLOAD_POOL_SCOPE_SQL = f"""
+               AND (q.company_id IS NULL
+                    OR EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
+                                WHERE tc.company_id = q.company_id
+                                  AND tc.status = 'active'))"""
+
+
+def _download_admission_sql(scope_classes: tuple[str, ...] | None) -> str:
+    """Ordinary pool+taxonomy gate, or one exact explicit request."""
+
+    return (
+        f"AND ((true {_DOWNLOAD_POOL_SCOPE_SQL} {_download_scope_sql(scope_classes)})"
+        f" OR {_DOWNLOAD_REQUEST_ADMISSION_SQL})"
+    )
+
+
+def _parse_admission_sql(company_scope_sql: str, scope_sql: str) -> str:
+    """(Ordinary company gate OR one exact explicit request) AND the taxonomy gate."""
+
+    if not company_scope_sql:
+        return scope_sql
+    return (
+        f"AND ((true {company_scope_sql}) OR {_PARSE_REQUEST_ADMISSION_SQL})"
+        f" {scope_sql}"
+    )
+
+
 def pending_download_count(
     conn: Connection,
     *,
@@ -371,11 +502,7 @@ def pending_download_count(
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = q.company_id
              WHERE q.failed_download_count < :max_retries
-               AND (q.company_id IS NULL
-                    OR EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
-                                WHERE tc.company_id = q.company_id
-                                  AND tc.status = 'active'))
-               {_download_scope_sql(scope_classes)}
+               {_download_admission_sql(scope_classes)}
             """
         ),
         params,
@@ -423,8 +550,7 @@ def pending_parse_backlog_count(
              LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = d.company_id
              WHERE true
-               {company_scope_sql}
-               {scope_sql}
+               {_parse_admission_sql(company_scope_sql, scope_sql)}
             """
         ),
         params,
@@ -615,6 +741,7 @@ def pending_downloads(
     scope_classes: tuple[str, ...] | None = None,
     security_code: str | None = None,
     min_announcement_date: date | None = None,
+    provider_document_ids: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     # Pool membership drives acquisition: a company's candidates download
     # only while an ACTIVE tracked row exists. Covers both round19 (paused =
@@ -624,8 +751,15 @@ def pending_downloads(
     # ref stay eligible. The view keeps exposing every candidate; predicates
     # live here. security_code narrows to one company for the CLI sync's
     # immediate-download pass — same gates as the worker, never a bypass
-    # (round23).
+    # (round23). The one exception is an explicit processing request for an
+    # exact candidate (see _DOWNLOAD_REQUEST_ADMISSION_SQL), which never
+    # widens to the rest of that company's candidates.
+    # provider_document_ids narrows a status read to exact candidates.
     params: dict[str, Any] = {"max_retries": max_retries, "limit": limit}
+    if provider_document_ids is not None:
+        if not provider_document_ids:
+            return []
+        params["provider_document_ids"] = list(provider_document_ids)
     if scope_classes is not None:
         params["scope_classes"] = list(scope_classes)
         params["carrier_classes"] = list(CARRIER_CLASSES)
@@ -645,6 +779,11 @@ def pending_downloads(
         # cast before comparing with the date bind param (round23 review B1:
         # text >= date has no operator and crashed every CLI sync).
         date_sql = "AND (q.announcement_date)::date >= :min_announcement_date"
+    identity_sql = (
+        "AND q.provider_document_id = ANY(:provider_document_ids)"
+        if provider_document_ids is not None
+        else ""
+    )
     rows = conn.execute(
         text(
             f"""
@@ -656,13 +795,10 @@ def pending_downloads(
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = q.company_id
              WHERE q.failed_download_count < :max_retries
-               AND (q.company_id IS NULL
-                    OR EXISTS (SELECT 1 FROM {CORE_SCHEMA}.tracked_company tc
-                                WHERE tc.company_id = q.company_id
-                                  AND tc.status = 'active'))
                {company_sql}
                {date_sql}
-               {_download_scope_sql(scope_classes)}
+               {identity_sql}
+               {_download_admission_sql(scope_classes)}
              ORDER BY q.announcement_date, q.provider_document_id
              LIMIT :limit
             """
@@ -681,6 +817,8 @@ def pending_parse(
     require_active_company_scope: bool = True,
     after_document_id: str | None = None,
     document_ids: tuple[str, ...] | None = None,
+    through_document_id: str | None = None,
+    descending: bool = False,
 ) -> list[dict[str, Any]]:
     """Documents awaiting parse, excluding non-retryable and exhausted ones.
 
@@ -693,7 +831,15 @@ def pending_parse(
     view-derived, so the queue joins the same rules); code-less channels fall
     back to the registration filing_type. None → parse everything ('all').
     Current active-company admission is independent of that taxonomy scope;
-    only a raw-identity-guarded frozen replay may explicitly bypass it.
+    only a raw-identity-guarded frozen replay may explicitly bypass it. An
+    explicit processing request releases the company gate for its exact
+    document only; taxonomy and retry gates still apply, so every caller sees
+    the same eligibility.
+
+    ``after_document_id`` (exclusive) and ``through_document_id`` (inclusive)
+    bound one keyset window, and ``descending`` reverses its order; all apply
+    before ``LIMIT`` with this same predicate, so ``limit=1, descending=True``
+    reads the newest eligible document under an identical scope.
     """
 
     scope_sql = ""
@@ -723,6 +869,10 @@ def pending_parse(
     if after_document_id is not None:
         cursor_sql += " AND q.document_id > :after_document_id"
         params["after_document_id"] = after_document_id
+    if through_document_id is not None:
+        cursor_sql += " AND q.document_id <= :through_document_id"
+        params["through_document_id"] = through_document_id
+    order_sql = "q.document_id DESC" if descending else "q.document_id"
     rows = conn.execute(
         text(
             f"""
@@ -741,10 +891,9 @@ def pending_parse(
               LEFT JOIN {CORE_SCHEMA}.tracked_company tc_scope
                 ON tc_scope.company_id = d.company_id
              WHERE ({_PARSE_RETRY_ELIGIBLE_SQL})
-               {company_scope_sql}
-               {scope_sql}
+               {_parse_admission_sql(company_scope_sql, scope_sql)}
                {cursor_sql}
-             ORDER BY q.document_id
+             ORDER BY {order_sql}
              LIMIT :limit
             """
         ),
@@ -754,7 +903,12 @@ def pending_parse(
 
 
 def parse_admission_diagnosis(
-    conn: Connection, *, document_id: str, max_retries: int
+    conn: Connection,
+    *,
+    document_id: str,
+    max_retries: int,
+    scope_classes: tuple[str, ...] | None = None,
+    require_active_company_scope: bool = True,
 ) -> dict[str, Any]:
     """Explain one document's parse admission with the queue's own predicate.
 
@@ -762,7 +916,8 @@ def parse_admission_diagnosis(
     nothing by itself, and a successful write is not evidence that the worker
     will pick the document up. The caller therefore asks :func:`pending_parse`
     the eligibility question and reports the remaining blockers as facts,
-    rather than inferring them from the write.
+    rather than inferring them from the write. Pass the resident worker's
+    scope_classes to ask the question the resident scanner asks.
     """
 
     eligible = bool(
@@ -770,6 +925,8 @@ def parse_admission_diagnosis(
             conn,
             max_retries=max_retries,
             limit=1,
+            scope_classes=scope_classes,
+            require_active_company_scope=require_active_company_scope,
             document_ids=(document_id,),
         )
     )
@@ -879,6 +1036,45 @@ def pending_publish(conn: Connection, *, limit: int) -> list[dict[str, Any]]:
         {"limit": limit},
     ).mappings()
     return [dict(row) for row in rows]
+
+
+def post_parse_selected(
+    conn: Connection, *, document_id: str, max_retries: int
+) -> bool:
+    """Whether the build or publish queue currently selects this document.
+
+    Same predicates as :func:`pending_build` and :func:`pending_publish`,
+    narrowed to one document, so a status read cannot disagree with them.
+    """
+
+    return bool(
+        conn.execute(
+            text(
+                f"""
+                SELECT EXISTS (
+                         SELECT 1
+                           FROM {OPS_SCHEMA}.pending_build_v1 q
+                           JOIN {CORE_SCHEMA}.processing_run r
+                             ON r.processing_run_id = q.processing_run_id
+                          WHERE q.document_id = :document_id
+                            AND ({_BUILD_RETRY_ELIGIBLE_SQL})
+                            AND NOT ({_TERMINAL_PUBLISH_QUARANTINE_SQL}))
+                    OR EXISTS (
+                         SELECT 1
+                           FROM {OPS_SCHEMA}.pending_publish_v1 q
+                          WHERE q.document_id = :document_id
+                            AND EXISTS (
+                                SELECT 1 FROM {CORE_SCHEMA}.document_unit u
+                                 WHERE u.processing_run_id = q.processing_run_id))
+                """
+            ),
+            {
+                "document_id": document_id,
+                "max_retries": max_retries,
+                "max_retries_ceiling": max_retries * RETRY_CEILING_MULTIPLIER,
+            },
+        ).scalar_one()
+    )
 
 
 def pending_build_count(conn: Connection, *, max_retries: int) -> int:
@@ -1199,31 +1395,67 @@ def degraded_build_count(conn: Connection, *, active_only: bool = False) -> int:
 
 
 def download_dead_letter_count(conn: Connection, *, max_retries: int) -> int:
-    """Distinct candidates permanently out of the download queue: a terminal
-    (retryable=false) failure or an exhausted retry budget. Same expressions
-    the 0023 view/queries use — single definition lives here (08 §1)."""
+    """Distinct candidates permanently out of the download queue: an
+    unresolved terminal (retryable=false) failure or an exhausted retry
+    budget. Reads ops.download_failure_resolution_v1, the same facts the
+    pending view, legacy pending path and doctor use (08 §1); a failure
+    resolved by a retained registration no longer counts, every failed
+    attempt still counts toward the budget."""
 
     return int(
         conn.execute(
             text(
                 f"""
                 SELECT count(*) FROM (
-                    SELECT f.query_params->>'provider_document_id' AS pid
-                      FROM {CORE_SCHEMA}.source_access f
-                     WHERE f.provider = 'cninfo'
-                       AND f.provider_interface = 'cninfo:download_pdf'
-                       AND f.status = 'failed'
+                    SELECT f.provider_document_id
+                      FROM {OPS_SCHEMA}.download_failure_resolution_v1 f
                      GROUP BY 1
                     HAVING count(*) >= :max_retries
                         OR bool_or(
-                            f.error IS NOT NULL
-                            AND (f.error)::jsonb->>'retryable' = 'false')
+                            f.nonretryable
+                            AND f.resolved_by_source_access_id IS NULL)
                 ) dead
                 """
             ),
             {"max_retries": max_retries},
         ).scalar_one()
     )
+
+
+def download_failure_resolution_summary(
+    conn: Connection, *, max_retries: int
+) -> dict[str, int]:
+    """Failure history next to its current effect, for doctor.
+
+    Resolution never deletes history: the non-retryable total stays, the
+    resolved part is the retained registrations that still match their
+    Document, and the dead-letter count is what still blocks acquisition.
+    """
+
+    row = conn.execute(
+        text(
+            f"""
+            SELECT count(*) FILTER (WHERE f.nonretryable) AS nonretryable,
+                   count(*) FILTER (
+                       WHERE f.nonretryable
+                         AND f.resolved_by_source_access_id IS NOT NULL
+                   ) AS resolved,
+                   count(*) FILTER (
+                       WHERE f.nonretryable
+                         AND f.resolved_by_source_access_id IS NULL
+                   ) AS unresolved
+              FROM {OPS_SCHEMA}.download_failure_resolution_v1 f
+            """
+        )
+    ).mappings().one()
+    return {
+        "nonretryable_failures": int(row["nonretryable"] or 0),
+        "resolved_failures": int(row["resolved"] or 0),
+        "unresolved_failures": int(row["unresolved"] or 0),
+        "dead_letter_candidates": download_dead_letter_count(
+            conn, max_retries=max_retries
+        ),
+    }
 
 
 def parse_dead_letter_count(conn: Connection, *, max_retries: int) -> int:

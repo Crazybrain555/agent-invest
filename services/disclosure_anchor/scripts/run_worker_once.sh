@@ -2,8 +2,16 @@
 # Production worker entry for launchd/cron: loads the machine-local env
 # (worker.env: roots/DB/MinerU; cninfo.env: credentials), then runs one round
 # by default or the adaptive resident loop when invoked with `loop`.
-# Exit codes: 0 = worker stopped cleanly (per-item failures land in reports),
-# 77 = TCC write-access failure (see below), else fatal.
+# Exit codes (the worker's own status is passed through unchanged):
+#   0  = worker stopped cleanly: operator TERM/INT with no fault, owned work
+#        closed (per-item failures land in reports). The only status launchd
+#        restarts (KeepAlive SuccessfulExit=true).
+#   70 = liveness watchdog killed a wedged worker.
+#   75 = another owner holds the worker singleton (loop); not a fault.
+#   77 = TCC write-access failure (see below).
+#   78 = public stop recorded now or found at start (see `worker status
+#        --control-only`), or this wrapper's missing-env refusal.
+#   else fatal. Every nonzero status stays down until an operator acts.
 #
 # macOS TCC reality (observed 2026-07-08/09): launchd-spawned processes have
 # no grant for external volumes. zsh writes fail EPERM instantly; python's
@@ -100,6 +108,22 @@ while true; do
   # wait can be interrupted after the trap forwards a signal. Keep reaping
   # until the child really exits; never wait twice on an already-reaped PID
   # (the old double wait surfaced as launchd exit 127).
-  kill -0 "$WORKER_PID" 2>/dev/null || break
+  if kill -0 "$WORKER_PID" 2>/dev/null; then
+    continue
+  fi
+  if (( WORKER_STATUS > 128 )); then
+    # An interrupted wait (128+signal) can race the child's own exit. Its
+    # status is not consumed yet, so one more wait recovers the true code;
+    # an already consumed status answers 127 and is ignored.
+    if wait "$WORKER_PID" 2>/dev/null; then
+      WORKER_STATUS=0
+    else
+      REAPED_STATUS=$?
+      if (( REAPED_STATUS != 127 )); then
+        WORKER_STATUS=$REAPED_STATUS
+      fi
+    fi
+  fi
+  break
 done
 exit "$WORKER_STATUS"

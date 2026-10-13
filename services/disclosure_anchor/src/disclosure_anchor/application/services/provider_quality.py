@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import string
 
 from disclosure_anchor.application.contracts.document_outline import ResolvedHeading
@@ -12,8 +13,8 @@ from disclosure_anchor.application.contracts.provider_table_projection import Un
 from disclosure_anchor.application.contracts.provider_unit import ProviderUnitBuildResult, ProviderUnitLocator
 from disclosure_anchor.application.contracts.provider_quality import (
     EncodedTextOccurrence, ProviderQualityOccurrence, ProviderUnitQualityAssessment,
-    SourceFindingOccurrence, TableImageUnmatchedOccurrence, TruncatedTitleOccurrence,
-    UnboundTableOccurrence, ordered_quality_occurrences,
+    SourceFindingOccurrence, TableImageUnmatchedOccurrence, TextSubstitutionOccurrence,
+    TruncatedTitleOccurrence, UnboundTableOccurrence, ordered_quality_occurrences,
 )
 from disclosure_anchor.application.services.document_outline import build_document_outline
 
@@ -22,11 +23,23 @@ def assess_provider_unit_quality(
     *, document: ProviderDocument, unit_sources: frozenset[int],
     heading: ResolvedHeading | None, locator: ProviderUnitLocator,
 ) -> ProviderUnitQualityAssessment:
-    """Preserve the old needs-review disjunction and its Unit-local scope."""
+    """Preserve the old needs-review disjunction and its Unit-local scope.
+
+    A U+0000 marker is attached wherever the Unit depends on its block, but it
+    flags the Unit only where its text is exposed (see ``exposed_payloads``).
+    """
     occurrences: list[ProviderQualityOccurrence] = [
         SourceFindingOccurrence(locator.unit_index, finding)
         for finding in locator.source_quality_findings
     ]
+    blocks = document.blocks
+    if locator.text_substitutions:
+        exposed = exposed_payloads(blocks=blocks, locator=locator)
+        occurrences.extend(
+            TextSubstitutionOccurrence(locator.unit_index, substitution)
+            for substitution in locator.text_substitutions
+            if (substitution.source_index, substitution.payload_ordinal) in exposed
+        )
     occurrences.extend(
         _table_occurrence(document, locator.unit_index, part)
         for part in locator.unbound_table_parts
@@ -36,7 +49,6 @@ def assess_provider_unit_quality(
         occurrences.append(TruncatedTitleOccurrence(
             locator.unit_index, heading.heading_id, heading.source_fragments,
         ))
-    blocks = document.blocks
     for source_index in sorted(unit_sources):
         if _has_suspected_encoded_text(blocks[source_index]):
             occurrences.append(EncodedTextOccurrence(
@@ -46,6 +58,41 @@ def assess_provider_unit_quality(
         "needs_review" if occurrences else "ok",
         ordered_quality_occurrences(tuple(occurrences)),
     )
+
+
+def exposed_payloads(
+    *,
+    blocks: Sequence[ProviderBlock] | Mapping[int, ProviderBlock],
+    locator: ProviderUnitLocator,
+) -> frozenset[tuple[int, int]]:
+    """Return the provider payloads whose text this Unit's fields contain.
+
+    ``blocks`` is indexed by source index. ``title`` and every ``heading_path``
+    entry come from the heading chain and its continuation fragments, including
+    ancestors. A part copies the payloads of its owner block, the first listed
+    block; logical-table continuations and evidence-only blocks are never
+    copied. A leaf-heading payload inside an owner block is exposed through the
+    title instead. The builder proves this set equals what it actually copied
+    for every Unit it builds.
+    """
+    exposed = {
+        identity
+        for heading in locator.heading_chain
+        for identity in (
+            (heading.source_index, heading.payload_ordinal),
+            *(
+                (fragment.source_index, fragment.payload_ordinal)
+                for fragment in heading.continuation_fragments
+            ),
+        )
+    }
+    for part in locator.parts:
+        owner = part.block_source_indices[0]
+        exposed.update(
+            (owner, payload_ordinal)
+            for payload_ordinal in range(len(blocks[owner].payloads))
+        )
+    return frozenset(exposed)
 
 
 def assess_source_build_quality(

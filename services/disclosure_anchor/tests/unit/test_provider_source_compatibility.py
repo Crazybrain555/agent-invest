@@ -58,7 +58,10 @@ class ProviderSourceCompatibilityTests(unittest.TestCase):
                     **expected["effective_provider_document"], "table_image_unmatched": [],
                 })
                 result = build_provider_units(admitted)
-                self.assertEqual(json_value(result), expected["build"])
+                current = json_value(result)
+                for unit in current["units"]:
+                    self.assertEqual(unit["locator"].pop("text_substitutions"), [])
+                self.assertEqual(current, expected["build"])
                 replayed = [
                     [draft.unit_index, binding.source.target_id,
                      list(replay_provider_unit_search_binding(admitted, draft, binding)),

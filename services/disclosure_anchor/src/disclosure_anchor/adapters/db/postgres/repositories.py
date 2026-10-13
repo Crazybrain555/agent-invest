@@ -47,9 +47,16 @@ from disclosure_anchor.application.contracts.staged_credit import (
     STAGED_STATE_TRANSITIONS,
     credit_shape,
 )
+from disclosure_anchor.application.contracts.historical_security_registration import (
+    DOWNLOAD_FAILURE_INTERFACE,
+    HISTORICAL_SECURITY_BINDING_INTERFACE,
+    PROVIDER as CNINFO_PROVIDER,
+)
 from disclosure_anchor.application.ports.repositories import (
     ClaimedAttemptSnapshot,
     CreditTransitionGrant,
+    DownloadFailureResolution,
+    PendingDownloadCandidate,
     V3ResumeSecretIdentityMismatch,
     V3ResumeSecretKeyUnavailable,
     V3ResumeSecretMissing,
@@ -79,12 +86,16 @@ from disclosure_anchor.application.worker.locks import (
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain.entities import outbox_events
 from disclosure_anchor.domain.value_objects import canonical_security_identity
+from disclosure_anchor.adapters.db.postgres.schema import OPS_SCHEMA
 from disclosure_anchor.domain.errors import (
     DocumentIdentityConflictError,
+    SourceRecoveryError,
     SubjectIdentityRaceError,
 )
 
 _MAX_SIGNED_BIGINT = (1 << 63) - 1
+# ops.download_failure_resolution_v1 describes exactly these failed attempts.
+_RESOLUTION_VIEW_SCOPE = (CNINFO_PROVIDER, DOWNLOAD_FAILURE_INTERFACE)
 _SHA256_IDENTITY = re.compile(r"sha256:[0-9a-f]{64}")
 
 
@@ -180,6 +191,23 @@ class CompanyIdentifierRepository:
         )
         return mappers.company_identifier_to_entity(row) if row is not None else None
 
+    def list_by_scheme_value(
+        self, scheme: str, normalized_value: str
+    ) -> list[e.CompanyIdentifier]:
+        rows = (
+            self._session.query(models.CompanyIdentifier)
+            .filter(
+                models.CompanyIdentifier.scheme == scheme,
+                models.CompanyIdentifier.normalized_value == normalized_value,
+            )
+            .order_by(
+                models.CompanyIdentifier.created_at,
+                models.CompanyIdentifier.identifier_id,
+            )
+            .all()
+        )
+        return [mappers.company_identifier_to_entity(row) for row in rows]
+
     def update(self, identifier: e.CompanyIdentifier) -> e.CompanyIdentifier:
         row = self._session.get(models.CompanyIdentifier, identifier.identifier_id)
         if row is None:
@@ -222,6 +250,17 @@ class SecurityRepository:
 
     def get(self, security_id: str) -> Optional[e.Security]:
         row = self._session.get(models.Security, security_id)
+        return mappers.security_to_entity(row) if row is not None else None
+
+    def get_for_update(self, security_id: str) -> Optional[e.Security]:
+        # NO KEY UPDATE serializes lockers without blocking FK inserts that
+        # merely reference the security.
+        row = (
+            self._session.query(models.Security)
+            .filter(models.Security.security_id == security_id)
+            .with_for_update(key_share=True)
+            .one_or_none()
+        )
         return mappers.security_to_entity(row) if row is not None else None
 
     def get_by_code_exchange(
@@ -305,12 +344,69 @@ class SourceAccessRepository:
     def add(self, source_access: e.SourceAccess) -> e.SourceAccess:
         row = mappers.source_access_to_model(source_access)
         self._session.add(row)
-        self._session.flush()
+        try:
+            self._session.flush()
+        except IntegrityError as exc:
+            detail = str(getattr(exc, "orig", exc))
+            if "uq_source_access_successful_recovery" in detail:
+                raise SourceRecoveryError(
+                    "RECOVERY_ALREADY_RECORDED",
+                    "failed access already has a successful retained "
+                    f"registration: {source_access.recovery_of_source_access_id}",
+                ) from exc
+            if "uq_source_access_historical_binding_decision" in detail:
+                raise SourceRecoveryError(
+                    "BINDING_ALREADY_RECORDED",
+                    f"binding decision already recorded: {source_access.result_hash}",
+                ) from exc
+            raise
         return mappers.source_access_to_entity(row)
 
     def get(self, source_access_id: str) -> Optional[e.SourceAccess]:
         row = self._session.get(models.SourceAccess, source_access_id)
         return mappers.source_access_to_entity(row) if row is not None else None
+
+    def get_for_update(self, source_access_id: str) -> Optional[e.SourceAccess]:
+        # The per-failure recovery lock. NO KEY UPDATE still lets the same
+        # transaction insert the receipt that references this row.
+        row = (
+            self._session.query(models.SourceAccess)
+            .filter(models.SourceAccess.source_access_id == source_access_id)
+            .with_for_update(key_share=True)
+            .one_or_none()
+        )
+        return mappers.source_access_to_entity(row) if row is not None else None
+
+    def successful_recovery_for(
+        self, failed_source_access_id: str
+    ) -> Optional[e.SourceAccess]:
+        row = (
+            self._session.query(models.SourceAccess)
+            .filter(
+                models.SourceAccess.recovery_of_source_access_id
+                == failed_source_access_id
+            )
+            .one_or_none()
+        )
+        return mappers.source_access_to_entity(row) if row is not None else None
+
+    def list_historical_security_bindings(
+        self, *, security_id: str
+    ) -> list[e.SourceAccess]:
+        rows = (
+            self._session.query(models.SourceAccess)
+            .filter(
+                models.SourceAccess.provider_interface
+                == HISTORICAL_SECURITY_BINDING_INTERFACE,
+                models.SourceAccess.security_id == security_id,
+            )
+            .order_by(
+                models.SourceAccess.accessed_at,
+                models.SourceAccess.source_access_id,
+            )
+            .all()
+        )
+        return [mappers.source_access_to_entity(row) for row in rows]
 
     def list_candidate_snapshots(
         self, *, provider: str, provider_interface: str, company_id: str
@@ -343,8 +439,15 @@ class SourceAccessRepository:
         download_interface: str,
         max_retries: int,
         overlap_start: object,
-    ) -> list[dict[str, object]]:
+    ) -> list[PendingDownloadCandidate]:
         overlap_date = _coerce_date(overlap_start)
+        if (provider, download_interface) != _RESOLUTION_VIEW_SCOPE:
+            # The terminal predicate below is the shared facts view, which
+            # is defined for exactly this provider/interface pair.
+            raise ValueError(
+                "legacy pending candidates support only "
+                f"{_RESOLUTION_VIEW_SCOPE[0]}/{_RESOLUTION_VIEW_SCOPE[1]}"
+            )
         candidates = _candidate_rows(
             self._session.query(models.SourceAccess)
             .filter(
@@ -355,9 +458,9 @@ class SourceAccessRepository:
             .order_by(models.SourceAccess.accessed_at.asc())
             .all()
         )
-        pending: list[dict[str, object]] = []
+        pending: list[PendingDownloadCandidate] = []
         seen: set[str] = set()
-        for candidate in candidates:
+        for index_source_access_id, candidate in candidates:
             provider_document_id = candidate.get("provider_document_id")
             if (
                 not isinstance(provider_document_id, str)
@@ -366,8 +469,6 @@ class SourceAccessRepository:
                 continue
             seen.add(provider_document_id)
             if self._terminal_download_failure(
-                provider=provider,
-                download_interface=download_interface,
                 provider_document_id=provider_document_id,
                 max_retries=max_retries,
             ):
@@ -380,31 +481,52 @@ class SourceAccessRepository:
                 document=document,
                 overlap_start=overlap_date,
             ):
-                pending.append(candidate)
+                pending.append(
+                    PendingDownloadCandidate(
+                        candidate=candidate,
+                        index_source_access_id=index_source_access_id,
+                    )
+                )
         return pending
+
+    def download_failure_resolutions(
+        self, *, provider_document_id: str
+    ) -> list[DownloadFailureResolution]:
+        rows = self._session.execute(
+            sa.text(
+                "SELECT f.source_access_id, f.nonretryable, "
+                "f.resolved_by_source_access_id "
+                f"FROM {OPS_SCHEMA}.download_failure_resolution_v1 f "
+                "WHERE f.provider_document_id = :provider_document_id "
+                "ORDER BY f.accessed_at, f.source_access_id"
+            ),
+            {"provider_document_id": provider_document_id},
+        ).mappings()
+        return [
+            DownloadFailureResolution(
+                source_access_id=str(row["source_access_id"]),
+                nonretryable=bool(row["nonretryable"]),
+                resolved_by_source_access_id=row["resolved_by_source_access_id"],
+            )
+            for row in rows
+        ]
 
     def _terminal_download_failure(
         self,
         *,
-        provider: str,
-        download_interface: str,
         provider_document_id: str,
         max_retries: int,
     ) -> bool:
-        rows = (
-            self._session.query(models.SourceAccess)
-            .filter(
-                models.SourceAccess.provider == provider,
-                models.SourceAccess.provider_interface == download_interface,
-                models.SourceAccess.status == "failed",
-                models.SourceAccess.query_params.op("->>")("provider_document_id")
-                == provider_document_id,
-            )
-            .all()
+        # Same facts as ops.pending_download_v1 and the dead-letter count: all
+        # failed attempts count toward the budget, and only a non-retryable
+        # failure without a matching retained registration is terminal.
+        failures = self.download_failure_resolutions(
+            provider_document_id=provider_document_id
         )
-        if len(rows) >= max_retries:
-            return True
-        return any(_error_retryable(row.error) is False for row in rows)
+        return len(failures) >= max_retries or any(
+            failure.nonretryable and failure.resolved_by_source_access_id is None
+            for failure in failures
+        )
 
     def _latest_document(
         self, *, provider: str, provider_document_id: str
@@ -423,8 +545,12 @@ class SourceAccessRepository:
         return mappers.document_to_entity(row) if row is not None else None
 
 
-def _candidate_rows(rows: list[models.SourceAccess]) -> list[dict[str, object]]:
-    candidates: list[dict[str, object]] = []
+def _candidate_rows(
+    rows: list[models.SourceAccess],
+) -> list[tuple[str, dict[str, object]]]:
+    """Candidates with the index access that carried each of them."""
+
+    candidates: list[tuple[str, dict[str, object]]] = []
     for row in rows:
         snapshot = row.result_snapshot
         if not isinstance(snapshot, dict):
@@ -432,7 +558,11 @@ def _candidate_rows(rows: list[models.SourceAccess]) -> list[dict[str, object]]:
         raw_candidates = snapshot.get("candidates")
         if not isinstance(raw_candidates, list):
             continue
-        candidates.extend(item for item in raw_candidates if isinstance(item, dict))
+        candidates.extend(
+            (row.source_access_id, item)
+            for item in raw_candidates
+            if isinstance(item, dict)
+        )
     return candidates
 
 
@@ -444,17 +574,6 @@ def _coerce_date(value: object) -> date:
     raise TypeError(
         f"overlap_start must be date or ISO string, got {type(value).__name__}"
     )
-
-
-def _error_retryable(error: str | None) -> bool | None:
-    if not error:
-        return None
-    try:
-        payload = json.loads(error)
-    except json.JSONDecodeError:
-        return None
-    retryable = payload.get("retryable")
-    return retryable if isinstance(retryable, bool) else None
 
 
 def _should_download_candidate(

@@ -16,6 +16,9 @@ from disclosure_anchor.application.ports.disclosure_source import (
     SourceCompanyProfile,
     SourceSecurity,
 )
+from disclosure_anchor.application.contracts.historical_security_registration import (
+    INDEX_IDENTITY_CONTEXT_VERSION,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.application.services.subject_resolver import (
     SubjectCandidate,
@@ -88,7 +91,7 @@ def compute_sync_window(
     explicit_window_days: int | None,
     today: date,
     overlap_days: int,
-    initial_lookback_days: int = 1095,
+    initial_lookback_days: int = 1827,
     explicit_window_start: date | None = None,
     explicit_window_end: date | None = None,
 ) -> tuple[date, date]:
@@ -120,8 +123,8 @@ def compute_sync_window(
     with uow_factory() as uow:
         security = uow.securities.get_by_code_exchange(company, exchange)
         if security is None:
-            # First contact: default historical backfill (user decision
-            # 2026-07-06, 三年是底线); explicit window stays the override.
+            # First contact: five-year historical backfill, including two
+            # leap days; explicit windows retain precedence.
             return today - timedelta(days=initial_lookback_days), today
         checkpoint = uow.source_checkpoints.get_by_scope(
             "cninfo", f"{security.company_id}:p_info3015"
@@ -235,6 +238,7 @@ class SyncDisclosureIndex:
                 company_id=subject.company.company_id,
                 security_id=subject.security.security_id,
                 provider_org_id=profile.provider_org_id if profile else None,
+                profile_source_access_id=profile_access.source_access_id,
                 now=now,
             )
             checkpoint = self._upsert_checkpoint(
@@ -314,28 +318,13 @@ class SyncDisclosureIndex:
         profile: SourceCompanyProfile | None,
         profile_access: e.SourceAccess,
     ) -> Any:
-        # No profile (e.g. web fallback channel) → no legal-name claim; the
-        # resolver treats None as "unknown", never as a conflicting name.
-        legal_name = profile.legal_name if profile else None
-        return self._subject_resolver.resolve(
+        return resolve_index_subject(
             uow,
-            SubjectCandidate(
-                security_code=command.security_code,
-                exchange=command.exchange,
-                legal_name=legal_name,
-                board=_board_from_exchange(command.exchange),
-                credit_code=profile.uscc if profile else None,
-                identifier_source_access_id=(
-                    profile_access.source_access_id
-                    if profile is not None and profile.uscc
-                    else None
-                ),
-                identifier_observed_at=(
-                    profile_access.accessed_at
-                    if profile is not None and profile.uscc
-                    else None
-                ),
-            ),
+            resolver=self._subject_resolver,
+            security_code=command.security_code,
+            exchange=command.exchange,
+            profile=profile,
+            profile_access=profile_access,
         )
 
     def _record_cninfo_org_identifier(
@@ -347,25 +336,12 @@ class SyncDisclosureIndex:
         source_access_id: str,
         observed_at: datetime,
     ) -> None:
-        if not provider_org_id:
-            return
-        existing = uow.company_identifiers.get_by_scheme_value(
-            "cninfo_org_id", provider_org_id
-        )
-        if existing is not None:
-            return
-        uow.company_identifiers.add(
-            e.CompanyIdentifier(
-                identifier_id=ids.new_company_identifier_id(),
-                company_id=company_id,
-                scheme="cninfo_org_id",
-                raw_value=provider_org_id,
-                normalized_value=provider_org_id,
-                jurisdiction="CN",
-                source_access_id=source_access_id,
-                status="active",
-                observed_at=observed_at,
-            )
+        record_cninfo_org_identifier(
+            uow,
+            company_id=company_id,
+            provider_org_id=provider_org_id,
+            source_access_id=source_access_id,
+            observed_at=observed_at,
         )
 
     def _require_tracked(self, command: SyncDisclosureIndexCommand) -> None:
@@ -407,10 +383,11 @@ class SyncDisclosureIndex:
         company_id: str,
         security_id: str,
         provider_org_id: str | None,
+        profile_source_access_id: str,
         now: datetime,
     ) -> e.SourceAccess:
         candidates = [
-            _candidate_snapshot(
+            candidate_snapshot(
                 ref,
                 exchange=command.exchange,
                 provider_org_id=provider_org_id,
@@ -423,6 +400,16 @@ class SyncDisclosureIndex:
         }
         if candidates:
             snapshot["raw_records"] = [dict(ref.raw_record) for ref in refs]
+            # Candidate ``provider_org_id`` keeps its original meaning: the
+            # query profile's org projected onto every candidate. The
+            # candidate's own provider org is ``candidate_provider_org_id``.
+            # Snapshots without this context are legacy profile-context only.
+            snapshot["identity_context"] = {
+                "version": INDEX_IDENTITY_CONTEXT_VERSION,
+                "query_profile_org_id": provider_org_id,
+                "query_profile_source_access_id": profile_source_access_id,
+                "candidate_org_source": "announcement_ref",
+            }
         return uow.source_accesses.add(
             e.SourceAccess(
                 source_access_id=ids.new_source_access_id(),
@@ -432,7 +419,7 @@ class SyncDisclosureIndex:
                 query_params=_index_query_params(command),
                 accessed_at=now,
                 status="ok",
-                result_hash=_canonical_sha256(snapshot),
+                result_hash=canonical_snapshot_sha256(snapshot),
                 result_snapshot=snapshot,
                 company_id=company_id,
                 security_id=security_id,
@@ -458,16 +445,7 @@ class SyncDisclosureIndex:
                 query_params=_index_query_params(command),
                 accessed_at=now,
                 status="failed",
-                error=_json(
-                    error.to_error(stage="index")
-                    if isinstance(error, SourceRequestError)
-                    else {
-                        "stage": "index",
-                        "error_code": type(error).__name__,
-                        "retryable": False,
-                        "provider_document_id": None,
-                    }
-                ),
+                error=_json(index_failure_error(error)),
                 result_snapshot={"result": "failed"},
                 company_id=company_id,
                 security_id=security_id,
@@ -518,7 +496,86 @@ class SyncDisclosureIndex:
         return uow.source_checkpoints.update(existing)
 
 
-def _candidate_snapshot(
+def resolve_index_subject(
+    uow: UnitOfWork,
+    *,
+    resolver: SubjectResolver,
+    security_code: str,
+    exchange: str,
+    profile: SourceCompanyProfile | None,
+    profile_access: e.SourceAccess,
+) -> Any:
+    """Resolve the queried subject exactly as an index sync does."""
+
+    # No profile (e.g. web fallback channel) → no legal-name claim; the
+    # resolver treats None as "unknown", never as a conflicting name.
+    legal_name = profile.legal_name if profile else None
+    return resolver.resolve(
+        uow,
+        SubjectCandidate(
+            security_code=security_code,
+            exchange=exchange,
+            legal_name=legal_name,
+            board=_board_from_exchange(exchange),
+            credit_code=profile.uscc if profile else None,
+            identifier_source_access_id=(
+                profile_access.source_access_id
+                if profile is not None and profile.uscc
+                else None
+            ),
+            identifier_observed_at=(
+                profile_access.accessed_at
+                if profile is not None and profile.uscc
+                else None
+            ),
+        ),
+    )
+
+
+def record_cninfo_org_identifier(
+    uow: UnitOfWork,
+    *,
+    company_id: str,
+    provider_org_id: str | None,
+    source_access_id: str,
+    observed_at: datetime,
+) -> None:
+    if not provider_org_id:
+        return
+    existing = uow.company_identifiers.get_by_scheme_value(
+        "cninfo_org_id", provider_org_id
+    )
+    if existing is not None:
+        return
+    uow.company_identifiers.add(
+        e.CompanyIdentifier(
+            identifier_id=ids.new_company_identifier_id(),
+            company_id=company_id,
+            scheme="cninfo_org_id",
+            raw_value=provider_org_id,
+            normalized_value=provider_org_id,
+            jurisdiction="CN",
+            source_access_id=source_access_id,
+            status="active",
+            observed_at=observed_at,
+        )
+    )
+
+
+def index_failure_error(error: Exception) -> dict[str, object]:
+    """The typed error payload a failed index access records."""
+
+    if isinstance(error, SourceRequestError):
+        return dict(error.to_error(stage="index"))
+    return {
+        "stage": "index",
+        "error_code": type(error).__name__,
+        "retryable": False,
+        "provider_document_id": None,
+    }
+
+
+def candidate_snapshot(
     ref: AnnouncementRef,
     *,
     exchange: str,
@@ -540,6 +597,7 @@ def _candidate_snapshot(
         "exchange": exchange,
         "security_name": ref.security_name,
         "provider_org_id": provider_org_id,
+        "candidate_provider_org_id": ref.provider_org_id,
         "object_id": ref.object_id,
         "rec_id": ref.rec_id,
         "file_signature_hint": {
@@ -560,7 +618,7 @@ def _index_query_params(command: SyncDisclosureIndexCommand) -> dict[str, object
     return params
 
 
-def _canonical_sha256(payload: Mapping[str, object]) -> str:
+def canonical_snapshot_sha256(payload: Mapping[str, object]) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

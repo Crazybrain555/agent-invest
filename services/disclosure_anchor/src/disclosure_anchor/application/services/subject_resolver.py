@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from disclosure_anchor.application.contracts.historical_security_registration import (
+    HISTORICAL_SECURITY_STATUS,
+)
 from disclosure_anchor.application.ports.unit_of_work import UnitOfWork
 from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
+    HistoricalSecurityBindingRequiredError,
     RegistrationMetadataError,
     SubjectIdentityConflictError,
 )
@@ -61,6 +65,14 @@ class SubjectResolver:
             candidate.security_code, candidate.exchange
         )
         if security is not None:
+            if security.status == HISTORICAL_SECURITY_STATUS:
+                # A historical code is not an unconditional alias of its
+                # company. Refuse before any identifier is touched: the
+                # evidence-bound resolver is the only path that may use it.
+                raise HistoricalSecurityBindingRequiredError(
+                    f"{candidate.security_code}.{candidate.exchange} is a historical "
+                    "security; only its evidence-bound binding may use it"
+                )
             company = self._company_for_security(uow, security)
             company = self._upgrade_placeholder_name(uow, company, candidate)
             identifier = (

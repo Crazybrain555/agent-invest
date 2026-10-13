@@ -12,6 +12,7 @@ from disclosure_anchor.application.contracts.semantic_routes import (
     SEMANTIC_PROMPT_VERSION,
     SemanticAdjudicatedRoute,
     SemanticAdjudicationDecision,
+    SemanticDecisionCoverageError,
     SemanticDocumentContext,
     SemanticProviderAttempt,
     SemanticProviderIdentity,
@@ -29,6 +30,7 @@ from disclosure_anchor.application.ports.semantic_routes import (
     SemanticAdjudicationBatch,
     SemanticAdjudicationOutcome,
     SemanticAdjudicatorIdentity,
+    SemanticDecisionValidator,
     SemanticRouteAdjudicatorError,
 )
 from disclosure_anchor.application.services.provider_unit_builder import (
@@ -126,9 +128,34 @@ class _Executor:
         batch: SemanticAdjudicationBatch,
         *,
         group_hash: str,
+        validate: SemanticDecisionValidator | None = None,
     ) -> SemanticAdjudicationOutcome:
         self.calls += 1
         decisions = self.decide(batch)
+        if validate is not None:
+            # Same contract as the provider executor: an answer the router
+            # cannot route is a failed-closed attempt, never a success.
+            try:
+                validate(decisions)
+            except SemanticRouteContractError as exc:
+                reason_code = (
+                    "invalid_contract"
+                    if isinstance(exc, SemanticDecisionCoverageError)
+                    else "invalid_decision"
+                )
+                raise SemanticRouteAdjudicatorError(
+                    str(exc),
+                    reason_code=reason_code,
+                    retryable=False,
+                    attempts=(
+                        SemanticProviderAttempt(
+                            ordinal=1,
+                            provider=self._identity,
+                            outcome="failed_closed",
+                            reason_code=reason_code,
+                        ),
+                    ),
+                ) from exc
         response_hash = "sha256:" + "3" * 64
         return SemanticAdjudicationOutcome(
             policy_version=SEMANTIC_FAILOVER_POLICY_VERSION,
@@ -730,6 +757,22 @@ class SemanticTaxonomyTests(unittest.TestCase):
                     "公司简介和主要财务指标",
                     ("company_profile", "company_profile_metrics"),
                 ),
+            ],
+        )
+        self.assertEqual(
+            [
+                (item.label, item.keys)
+                for item in taxonomy.direct_composites
+            ],
+            [
+                (
+                    "存贷款情况",
+                    ("bank_customer_deposits", "bank_loans_advances"),
+                ),
+                (
+                    "存、贷款情况",
+                    ("bank_customer_deposits", "bank_loans_advances"),
+                ),
                 (
                     "合并和公司资产负债表",
                     ("balance_sheet", "balance_sheet_parent"),
@@ -772,6 +815,29 @@ class SemanticTaxonomyTests(unittest.TestCase):
                 ),
             ],
         )
+        # One exact title naming several whole carriers must be a declared
+        # direct composite; otherwise the router would offer the model
+        # mutually exclusive containers without a truthful single answer.
+        container_keys_by_label: dict[str, set[str]] = {}
+        for definition in taxonomy.definitions:
+            if definition.exclusive_container:
+                for label in (*definition.labels, *definition.heading_labels):
+                    container_keys_by_label.setdefault(
+                        _normalize_title(label), set()
+                    ).add(definition.key)
+        direct_keys_by_label = {
+            _normalize_title(item.label): set(item.keys)
+            for item in taxonomy.direct_composites
+        }
+        shared_container_labels = {
+            label: keys
+            for label, keys in container_keys_by_label.items()
+            if len(keys) > 1
+        }
+        self.assertEqual(len(shared_container_labels), 10)
+        for label, keys in shared_container_labels.items():
+            with self.subTest(shared_container_label=label):
+                self.assertEqual(direct_keys_by_label.get(label), keys)
         self.assertFalse(taxonomy.by_key()["decision_procedures"].overview_container)
         self.assertIn("share_buyback_cancellation_arrangement", taxonomy.by_key())
         self.assertIn("share_buyback_account", taxonomy.by_key())
@@ -5496,6 +5562,262 @@ class SemanticRouterTests(unittest.TestCase):
 
         self.assertEqual(result.units[0].semantic_keys, ("statement_container",))
         self.assertEqual(adjudicator.calls, 0)
+
+    def test_joint_statement_title_routes_every_named_statement_without_model(
+        self,
+    ) -> None:
+        taxonomy = load_semantic_route_taxonomy()
+        definitions = taxonomy.by_key()
+        joint_titles = tuple(
+            item
+            for item in taxonomy.direct_composites
+            if all(definitions[key].exclusive_container for key in item.keys)
+        )
+        self.assertEqual(len(joint_titles), 10)
+        context = SemanticDocumentContext(title=None, filing_type="quarterly_report")
+        table = (
+            "<table><tr><th>项目</th><th>合并本期</th><th>合并上期</th>"
+            "<th>公司本期</th><th>公司上期</th></tr>"
+            "<tr><td>甲项目</td><td>100</td><td>90</td><td>50</td><td>45</td></tr>"
+            "</table>"
+        )
+
+        def statement_unit(title: str, family: str):  # type: ignore[no-untyped-def]
+            # The provider folded the next subsection heading into the
+            # statement Unit, and a continuation line repeats the bare family
+            # name: the shapes that forced a model call and a parent-only lock.
+            document = _document(
+                pages=(
+                    (
+                        _block(
+                            0,
+                            0,
+                            "text",
+                            (ProviderPayload("text", None, "第四节 财务报表"),),
+                            annotation="title",
+                            level=1,
+                        ),
+                        _block(
+                            1,
+                            0,
+                            "text",
+                            (ProviderPayload("text", None, title),),
+                            annotation="title",
+                            level=2,
+                        ),
+                        _block(
+                            2,
+                            0,
+                            "text",
+                            (ProviderPayload("text", None, f"{family}（续）"),),
+                            annotation=None,
+                        ),
+                        _block(
+                            3,
+                            0,
+                            "text",
+                            (ProviderPayload("text", None, "（三） 审计报告"),),
+                            annotation=None,
+                        ),
+                        _block(
+                            4,
+                            0,
+                            "table",
+                            (ProviderPayload("table_body", None, table),),
+                            annotation=None,
+                        ),
+                    ),
+                ),
+                segments=(),
+            )
+            admitted = _admitted(document)
+            return admitted, build_provider_units(admitted).units
+
+        families: dict[str, tuple[str, ...]] = {}
+        for composite in joint_titles:
+            label = composite.label.replace("合并和", "合并及", 1)
+            family = label.removeprefix("合并及公司").removeprefix("合并及银行")
+            families[family] = composite.keys
+            for title in (label, f"（一）{label}（续）"):
+                with self.subTest(title=title):
+                    admitted, drafts = statement_unit(title, family)
+                    executor = _Executor(
+                        lambda _batch: self.fail("a joint statement title is exact")
+                    )
+                    router = SemanticRouter(taxonomy=taxonomy, executor=executor)
+                    routed = router.route(
+                        admitted=admitted,
+                        document=context,
+                        drafts=drafts,
+                    )
+
+                    unit = routed.units[-1]
+                    receipt = routed.receipts[-1]
+                    self.assertEqual(unit.semantic_keys, composite.keys)
+                    self.assertEqual(receipt.decision_source, "deterministic")
+                    self.assertEqual(receipt.candidate_keys, composite.keys)
+                    for evidence in receipt.evidence:
+                        self.assertIn("source_heading_exact", evidence.kinds)
+                        self.assertIn(f"u{unit.unit_index}:title", evidence.source_ids)
+                    self.assertEqual(
+                        unit.section_keys,
+                        ("financial_statements_section", *composite.keys),
+                    )
+                    self.assertEqual(unit.content_hash, drafts[-1].content_hash)
+                    self.assertEqual(executor.calls, 0)
+                    replayed = SemanticRouter(
+                        taxonomy=taxonomy,
+                        executor=_Executor(
+                            lambda _batch: self.fail("replay never calls a model")
+                        ),
+                    ).replay(
+                        admitted=admitted,
+                        document=context,
+                        drafts=drafts,
+                        receipts=routed.receipts,
+                    )
+                    self.assertEqual(replayed.units, routed.units)
+
+        # The same Unit titled by one statement keeps exactly one route.
+        self.assertEqual(len(families), 5)
+        for family, (consolidated, parent) in families.items():
+            for title, expected in (
+                (f"合并{family}", consolidated),
+                (family, parent),
+            ):
+                with self.subTest(title=title):
+                    admitted, drafts = statement_unit(title, family)
+                    routed = SemanticRouter(
+                        taxonomy=taxonomy,
+                        executor=_Executor(
+                            lambda _batch: self.fail("a unique statement title is exact")
+                        ),
+                    ).route(admitted=admitted, document=context, drafts=drafts)
+                    self.assertEqual(routed.units[-1].semantic_keys, (expected,))
+
+    def test_model_selected_containers_keep_only_containers_in_candidate_order(
+        self,
+    ) -> None:
+        # Two carriers sharing an undeclared exact label cannot lock, so the
+        # model sees both beside a body line item.  Each selected container
+        # stays a route; a line item never joins them.
+        taxonomy = SemanticRouteTaxonomy(
+            version="joint-container.v1",
+            definitions=(
+                SemanticRouteDefinition(
+                    key="statement_b",
+                    description="乙报表",
+                    labels=("甲乙合并报表",),
+                    exclusive_container=True,
+                ),
+                SemanticRouteDefinition(
+                    key="statement_a",
+                    description="甲报表",
+                    labels=("甲乙合并报表",),
+                    exclusive_container=True,
+                ),
+                SemanticRouteDefinition(
+                    key="statement_line_item",
+                    description="报表行项目",
+                    labels=("报表行项目",),
+                ),
+            ),
+        )
+        admitted, drafts = _drafts_with_body("甲乙合并报表", "报表行项目的期末余额")
+        context = SemanticDocumentContext(title=None, filing_type="other")
+        offered: list[SemanticRouteUnitInput] = []
+
+        def select(
+            *keys: str,
+        ) -> Callable[
+            [SemanticAdjudicationBatch], tuple[SemanticAdjudicationDecision, ...]
+        ]:
+            def decide(
+                batch: SemanticAdjudicationBatch,
+            ) -> tuple[SemanticAdjudicationDecision, ...]:
+                offered.extend(batch.units)
+                candidates = {
+                    candidate.key: candidate for candidate in batch.units[0].candidates
+                }
+                return (
+                    SemanticAdjudicationDecision(
+                        unit_index=batch.units[0].unit_index,
+                        routes=tuple(
+                            SemanticAdjudicatedRoute(
+                                key=key,
+                                support_ids=candidates[key].source_ids,
+                            )
+                            for key in keys
+                        ),
+                    ),
+                )
+
+            return decide
+
+        for selected, expected in (
+            (
+                ("statement_b", "statement_line_item", "statement_a"),
+                ("statement_a", "statement_b"),
+            ),
+            (("statement_line_item", "statement_b"), ("statement_b",)),
+            (("statement_line_item",), ("statement_line_item",)),
+        ):
+            with self.subTest(selected=selected):
+                executor = _Executor(select(*selected))
+                router = SemanticRouter(taxonomy=taxonomy, executor=executor)
+                routed = router.route(admitted=admitted, document=context, drafts=drafts)
+
+                self.assertEqual(executor.calls, 1)
+                self.assertEqual(
+                    tuple(item.key for item in offered[-1].candidates),
+                    ("statement_a", "statement_b", "statement_line_item"),
+                )
+                self.assertFalse(any(item.locked for item in offered[-1].candidates))
+                self.assertEqual(routed.receipts[0].decision_source, "model")
+                self.assertEqual(routed.units[0].semantic_keys, expected)
+                replayed = router.replay(
+                    admitted=admitted,
+                    document=context,
+                    drafts=drafts,
+                    receipts=routed.receipts,
+                )
+                self.assertEqual(replayed.units, routed.units)
+
+        # A frozen receipt pairing a container with a line item is tampering.
+        router = SemanticRouter(
+            taxonomy=taxonomy,
+            executor=_Executor(select("statement_a")),
+        )
+        receipt = router.route(
+            admitted=admitted,
+            document=context,
+            drafts=drafts,
+        ).receipts[0]
+        line_item = next(
+            item for item in offered[-1].candidates if item.key == "statement_line_item"
+        )
+        tampered = replace(
+            receipt,
+            semantic_keys=("statement_a", "statement_line_item"),
+            evidence=(
+                *receipt.evidence,
+                SemanticRouteEvidence(
+                    key="statement_line_item",
+                    kinds=(*line_item.evidence_kinds, "model_adjudicated"),
+                    source_ids=line_item.source_ids,
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            SemanticRouteContractError,
+            "cannot coexist with a line-item route",
+        ):
+            router.replay(
+                admitted=admitted,
+                document=context,
+                drafts=drafts,
+                receipts=(tampered,),
+            )
 
     def test_model_support_must_be_the_source_that_generated_candidate(self) -> None:
         admitted, drafts = _drafts_with_body(

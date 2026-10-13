@@ -1112,6 +1112,39 @@ class MinerUOutputQuiescenceTests(unittest.TestCase):
                                  42 if consumed else -1)
                 self.assertEqual(path.read_bytes(), before)
 
+    def test_empty_ingress_spool_keeps_the_registry_proof_and_empty_root_rules(self) -> None:
+        for consumed in (False, True):
+            with self.subTest(consumed=consumed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                _, path = (self._consumed_registry if consumed else self._empty_registry)(root)
+                before = path.read_bytes()
+                without_spool = _MODULE.inspect_quiescent_output_root(root)
+                (root / ".agent-ingress-spool").mkdir(mode=0o700)
+                # A started storage-managed process adds only its empty spool: the
+                # strict and allow-empty proofs equal the registry-only proof.
+                self.assertEqual(_MODULE.inspect_quiescent_output_root(root), without_spool)
+                self.assertEqual(_MODULE.inspect_quiescent_output_root(root, allow_empty=True), without_spool)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(list((root / ".agent-ingress-spool").iterdir()), [])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / ".agent-ingress-spool").mkdir(mode=0o700)
+            proof = _MODULE.inspect_quiescent_output_root(root, allow_empty=True)
+            self.assertEqual((proof["file_count"], proof["total_bytes"]), (0, 0))
+            self.assertEqual(
+                (proof["quiescence"]["registry_sha256"], proof["quiescence"]["record_count"],
+                 proof["quiescence"]["submission_watermark_bucket"]),
+                (None, 0, None),
+            )
+            with self.assertRaisesRegex(TaskProtocolConflict, "commissioned task registry is absent"):
+                _MODULE.inspect_quiescent_output_root(root)
+            self.assertEqual([item.name for item in root.iterdir()], [".agent-ingress-spool"])
+            # A body left in the spool is ingress, never an empty namespace.
+            (root / ".agent-ingress-spool" / "body").write_bytes(b"x")
+            with self.assertRaisesRegex(TaskProtocolConflict, "ingress spool is not empty"):
+                _MODULE.inspect_quiescent_output_root(root, allow_empty=True)
+            self.assertEqual((root / ".agent-ingress-spool" / "body").read_bytes(), b"x")
+
     def test_resource_states_and_uncleared_consumed_fields_are_rejected(self) -> None:
         mutations = [("state", state) for state in (
             "pending", "processing", "finalizing", "completed", "failed", "cleanup_pending"
@@ -1135,12 +1168,17 @@ class MinerUOutputQuiescenceTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(), raw)
 
     def test_unknown_directories_hidden_files_and_temp_records_are_rejected(self) -> None:
-        for name, is_directory in (("task", True), (".unknown", False),
-                                   (".agent-task-protocol-v2/.registry.tmp", False),
-                                   (".agent-task-protocol-v2/empty", True)):
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+        for name, is_directory, spool in (("task", True, False), (".unknown", False, False),
+                                          (".agent-task-protocol-v2/.registry.tmp", False, False),
+                                          (".agent-task-protocol-v2/empty", True, False),
+                                          (".unknown", False, True), ("task", True, True),
+                                          (".agent-ingress-spool/body", False, True),
+                                          (".agent-ingress-spool/empty", True, True)):
+            with self.subTest(name=name, spool=spool), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 self._empty_registry(root)
+                if spool:
+                    (root / ".agent-ingress-spool").mkdir(mode=0o700)
                 target = root / name
                 if is_directory:
                     target.mkdir()
@@ -1151,13 +1189,19 @@ class MinerUOutputQuiescenceTests(unittest.TestCase):
                 self.assertTrue(target.exists())
 
     def test_symlinks_hardlinks_fifo_and_permissions_fail_closed(self) -> None:
-        for kind in ("registry_link", "control_link", "root_link", "hardlink", "fifo", "mode"):
+        for kind in ("registry_link", "control_link", "root_link", "hardlink", "fifo", "mode",
+                     "spool_link", "spool_file"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 base = Path(directory).resolve()
                 root = base / "output"
                 root.mkdir()
                 _, path = self._empty_registry(root)
-                if kind == "hardlink":
+                if kind == "spool_link":
+                    (base / "elsewhere").mkdir()
+                    (root / ".agent-ingress-spool").symlink_to(base / "elsewhere", target_is_directory=True)
+                elif kind == "spool_file":
+                    (root / ".agent-ingress-spool").write_bytes(b"")
+                elif kind == "hardlink":
                     os.link(path, base / "other")
                 elif kind == "mode":
                     path.chmod(0o644)
@@ -1198,26 +1242,43 @@ class MinerUOutputQuiescenceTests(unittest.TestCase):
                     _MODULE.inspect_quiescent_output_root(root)
 
     def test_registry_replacement_during_read_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            _, path = self._empty_registry(root)
-            original_read = os.read
-            replaced = False
+        for kind in ("registry", "spool_entry", "spool_entry_removed", "spool_replaced", "spool_created"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory).resolve()
+                root = base / "output"
+                root.mkdir()
+                _, path = self._empty_registry(root)
+                spool = root / ".agent-ingress-spool"
+                if kind in {"spool_entry", "spool_entry_removed", "spool_replaced"}:
+                    spool.mkdir(mode=0o700)
+                original_read = os.read
+                replaced = False
 
-            def replace_on_read(descriptor, size):
-                nonlocal replaced
-                raw = original_read(descriptor, size)
-                if not replaced:
-                    replaced = True
-                    replacement = path.with_name("replacement")
-                    replacement.write_bytes(path.read_bytes())
-                    replacement.chmod(0o600)
-                    os.replace(replacement, path)
-                return raw
+                def replace_on_read(descriptor, size):
+                    nonlocal replaced
+                    raw = original_read(descriptor, size)
+                    if not replaced:
+                        replaced = True
+                        if kind == "registry":
+                            replacement = path.with_name("replacement")
+                            replacement.write_bytes(path.read_bytes())
+                            replacement.chmod(0o600)
+                            os.replace(replacement, path)
+                        elif kind in {"spool_entry", "spool_entry_removed"}:
+                            (spool / "body").write_bytes(b"x")
+                            if kind == "spool_entry_removed":
+                                (spool / "body").unlink()
+                        elif kind == "spool_replaced":
+                            spool.rename(base / "old-spool")
+                            spool.mkdir(mode=0o700)
+                        else:
+                            spool.mkdir(mode=0o700)
+                    return raw
 
-            with patch.object(_MODULE.os, "read", side_effect=replace_on_read):
-                with self.assertRaises(TaskProtocolConflict):
-                    _MODULE.inspect_quiescent_output_root(root)
+                with patch.object(_MODULE.os, "read", side_effect=replace_on_read):
+                    with self.assertRaises(TaskProtocolConflict):
+                        _MODULE.inspect_quiescent_output_root(root)
+                self.assertTrue(replaced)
 
 
 if __name__ == "__main__":

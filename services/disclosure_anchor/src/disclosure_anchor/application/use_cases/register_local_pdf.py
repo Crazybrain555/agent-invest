@@ -9,10 +9,15 @@ from pathlib import Path
 import re
 from typing import cast
 
+from disclosure_anchor.application.contracts.historical_security_registration import (
+    HISTORICAL_SECURITY_STATUS,
+)
 from disclosure_anchor.application.ports.file_store import (
+    AcquisitionCapacityError,
     QuarantineResult,
     RawDocumentStorePort,
     RawDocumentWriteResult,
+    storage_failure_text,
 )
 from disclosure_anchor.application.services.register_document import (
     DocumentRegistration,
@@ -29,6 +34,7 @@ from disclosure_anchor.domain import entities as e
 from disclosure_anchor.domain import ids
 from disclosure_anchor.domain.errors import (
     DocumentIdentityConflictError,
+    HistoricalSecurityBindingRequiredError,
     InvalidRawDocumentError,
     RegistrationMetadataError,
     SubjectIdentityConflictError,
@@ -155,6 +161,13 @@ class RegisterLocalPdf:
                 quarantined_path=quarantine.path,
                 quarantine_reason=quarantine.reason,
             )
+        except (AcquisitionCapacityError, OSError) as exc:
+            # Local storage refused or failed, reading the input or writing the
+            # archive: that says nothing about the input's bytes, so nothing is
+            # quarantined or called invalid and the operator's file is
+            # untouched. Record the attempt, then keep the failure visible.
+            self._record_archive_storage_failure(command=command, exc=exc)
+            raise
 
         return self._register_after_raw_archive_with_retry(command=command, raw=raw)
 
@@ -210,6 +223,13 @@ class RegisterLocalPdf:
             security = uow.securities.get_by_code_exchange(
                 command.security_code, command.exchange
             )
+            if security is not None and security.status == HISTORICAL_SECURITY_STATUS:
+                # Refuse before archiving: a local file cannot claim a
+                # historical code without its binding evidence.
+                raise HistoricalSecurityBindingRequiredError(
+                    f"{command.security_code}.{command.exchange} is a historical "
+                    "security; register it through the evidence-bound path"
+                )
             if security is not None:
                 security_company = self._company_for_existing_security(
                     uow=uow, security=security
@@ -343,11 +363,52 @@ class RegisterLocalPdf:
                         # basename only: absolute paths stay out of the DB
                         "quarantine_filename": quarantine.path.name,
                         "byte_count": quarantine.byte_count,
+                        # An incomplete copy is an empty marker, not the
+                        # input; the operator's file stays where it was.
+                        "quarantine_complete": quarantine.transfer_complete,
+                        "input_missing": quarantine.input_missing,
                     },
                 )
             )
             uow.commit()
             return source_access
+
+    def _record_archive_storage_failure(
+        self,
+        *,
+        command: RegisterLocalPdfCommand,
+        exc: AcquisitionCapacityError | OSError,
+    ) -> None:
+        if isinstance(exc, AcquisitionCapacityError):
+            error_code, reason = exc.error_code, str(exc)
+            detail: dict[str, object] = {"capacity": exc.snapshot()}
+        else:
+            error_code, reason = "io_error", storage_failure_text(exc)
+            detail = {}
+        with self._uow_factory() as uow:
+            uow.source_accesses.add(
+                e.SourceAccess(
+                    source_access_id=ids.new_source_access_id(),
+                    provider=command.provider,
+                    provider_interface="local:register_pdf",
+                    dataset_key="local_pdf",
+                    query_params={
+                        "provider_document_id": command.provider_document_id,
+                        "filename": command.file_path.name,
+                    },
+                    accessed_at=datetime.now(timezone.utc),
+                    status="failed",
+                    error=reason,
+                    result_snapshot={
+                        "error_code": error_code,
+                        "retryable": True,
+                        "failure_phase": "archive",
+                        "archive": {"archive_completed": False},
+                        **detail,
+                    },
+                )
+            )
+            uow.commit()
 
     @staticmethod
     def _company_for_existing_security(

@@ -17,12 +17,23 @@ from disclosure_anchor.application.contracts.closed_document import (
     require_bool,
     require_fields,
     require_int,
+    require_sha256,
     require_str,
     sha256_of,
 )
 
 
 DEPLOYMENT_PROFILE_CONTRACT = "mineru.deployment-profile.v1"
+DIAGNOSTIC_DEPLOYMENT_PROFILE_CONTRACT = "mineru.deployment-profile.v2"
+OWNER_MEMORY_WORKER_CLASS = "mineru_inference_memory.worker.OwnerMemoryWorker"
+OWNER_MEMORY_MODE = "mineru.owner-memory.v1"
+OWNER_MEMORY_BASE = "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
+OWNER_MEMORY_PREIMAGES = {
+    "vllm/v1/worker/worker_base.py": "sha256:e6017acf80e442405f09f99413c0227515ae097d3e1dc79005b0b5c266932f12",
+    "vllm/v1/worker/gpu_worker.py": "sha256:53196cef1d32b5c5207c8986a5666352fd5ba0b79c418c074311147f266cadc4",
+    "vllm/v1/worker/gpu_model_runner.py": "sha256:95b7ee3ff5eecdb0fa791f375b2aeedc6ac507f3ea4a9683700d3b202b2caf08",
+    "vllm/v1/worker/gpu/mm/encoder_runner.py": "sha256:909181912d39bf4734d5202340a77813252136bc1f38c458f879b05743a522bf",
+}
 _MAX_BYTES = 16 * 1024
 _FIELDS = frozenset({
     "contract_version",
@@ -74,6 +85,24 @@ class InferenceDeclaredDefaults:
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceDiagnostic:
+    """One reviewed diagnostic context; its content-derived tag is never an image-ID proof."""
+
+    contract_version: str
+    context_sha256: str
+    worker_class: str
+
+    def __post_init__(self) -> None:
+        if self.contract_version != OWNER_MEMORY_MODE or self.worker_class != OWNER_MEMORY_WORKER_CLASS:
+            raise ValueError("inference diagnostic selection is unsupported")
+        require_sha256(self.context_sha256, label="inference diagnostic context sha256")
+
+    @property
+    def image_reference(self) -> str:
+        return "agent-invest/mineru-inference:owner-memory-" + self.context_sha256[7:]
+
+
+@dataclass(frozen=True, slots=True)
 class MineruDeploymentProfile:
     contract_version: str
     project_name: str
@@ -90,9 +119,17 @@ class MineruDeploymentProfile:
     inference_max_num_seqs: int
     inference_mm_processor_cache_gb: int
     inference_declared_defaults: InferenceDeclaredDefaults
+    inference_diagnostic: InferenceDiagnostic | None = None
 
     def __post_init__(self) -> None:
-        if self.contract_version != DEPLOYMENT_PROFILE_CONTRACT:
+        if self.contract_version == DEPLOYMENT_PROFILE_CONTRACT:
+            if self.inference_diagnostic is not None:
+                raise ValueError("raw v1 deployment profile cannot select a diagnostic")
+        elif self.contract_version == DIAGNOSTIC_DEPLOYMENT_PROFILE_CONTRACT:
+            if type(self.inference_diagnostic) is not InferenceDiagnostic:
+                raise ValueError("v2 deployment profile requires the exact diagnostic type")
+            self.inference_diagnostic.__post_init__()
+        else:
             raise ValueError("MinerU deployment profile contract is unsupported")
         if _PROJECT_NAME_RE.fullmatch(require_str(self.project_name, label="project_name", maximum=64)) is None:
             raise ValueError("deployment profile project_name is invalid")
@@ -120,6 +157,12 @@ class MineruDeploymentProfile:
         if type(self.inference_declared_defaults) is not InferenceDeclaredDefaults:
             raise ValueError("deployment profile declared engine defaults must use the exact type")
         self.inference_declared_defaults.__post_init__()
+        if self.inference_diagnostic is not None and (
+            self.base_image_repo_digest != OWNER_MEMORY_BASE
+            or self.inference_max_num_seqs != 128 or self.inference_mm_processor_cache_gb != 0
+            or self.inference_declared_defaults != InferenceDeclaredDefaults(500_000, 1, 1, False, True)
+        ):
+            raise ValueError("owner-memory diagnostic must preserve the observed base and engine settings")
 
     @property
     def api_device_mode(self) -> str:
@@ -128,7 +171,10 @@ class MineruDeploymentProfile:
     @property
     def exact_bytes(self) -> bytes:
         self.__post_init__()
-        return canonical_bytes(asdict(self))
+        value = asdict(self)
+        if self.contract_version == DEPLOYMENT_PROFILE_CONTRACT:
+            del value["inference_diagnostic"]
+        return canonical_bytes(value)
 
     @property
     def sha256(self) -> str:
@@ -139,19 +185,103 @@ def decode_mineru_deployment_profile(payload: bytes) -> MineruDeploymentProfile:
     """Decode any strict JSON layout of the closed document; identity is canonical."""
 
     value = load_closed_object(payload, label="MinerU deployment profile", maximum_bytes=_MAX_BYTES)
-    require_fields(value, _FIELDS, label="MinerU deployment profile")
+    expected = _FIELDS | {"inference_diagnostic"} if value.get("contract_version") == DIAGNOSTIC_DEPLOYMENT_PROFILE_CONTRACT else _FIELDS
+    require_fields(value, expected, label="MinerU deployment profile")
     declared = value["inference_declared_defaults"]
     if type(declared) is not dict:
         raise ValueError("deployment profile declared engine defaults must be an object")
     require_fields(declared, _DECLARED_FIELDS, label="deployment profile declared engine defaults")
     fields: dict[str, Any] = dict(value)
     fields["inference_declared_defaults"] = InferenceDeclaredDefaults(**declared)
+    if "inference_diagnostic" in fields:
+        diagnostic = fields["inference_diagnostic"]
+        if type(diagnostic) is not dict:
+            raise ValueError("inference diagnostic must be an object")
+        require_fields(diagnostic, {"contract_version", "context_sha256", "worker_class"}, label="inference diagnostic")
+        fields["inference_diagnostic"] = InferenceDiagnostic(**diagnostic)
     return MineruDeploymentProfile(**fields)
 
 
 __all__ = [
     "DEPLOYMENT_PROFILE_CONTRACT",
+    "DIAGNOSTIC_DEPLOYMENT_PROFILE_CONTRACT",
+    "InferenceDiagnostic",
+    "OWNER_MEMORY_WORKER_CLASS",
+    "OWNER_MEMORY_PREIMAGES",
+    "verify_inference_diagnostic",
+    "inference_diagnostic_config",
     "InferenceDeclaredDefaults",
     "MineruDeploymentProfile",
     "decode_mineru_deployment_profile",
 ]
+
+def verify_inference_diagnostic(observation: dict[str, Any], profile: Any, sources: dict[str, str]) -> dict[str, Any]:
+    if type(profile) is not MineruDeploymentProfile:
+        raise ValueError("diagnostic deployment profile must use the exact type")
+    profile.__post_init__()
+    require_fields(sources, {"Dockerfile", "mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py"}, label="diagnostic context sources")
+    for name, digest in sources.items():
+        require_sha256(digest, label=name)
+    diagnostic = profile.inference_diagnostic
+    if diagnostic is None or sha256_of(canonical_bytes(sources)) != diagnostic.context_sha256:
+        raise ValueError("diagnostic context differs from deployment input")
+    value = observation.get("inference_diagnostic")
+    if type(value) is not dict or set(value) != {"contract_version", "image_labels", "module_sha256", "actual_source_sha256", "actual_diagnostic_source_sha256", "loaded_workers", "container_epoch"}:
+        raise ValueError("remote diagnostic source observation is not closed")
+    expected_labels = {
+        "io.agent-invest.mineru.owner-memory-module-sha256": sources["mineru_inference_memory/worker.py"],
+        "io.agent-invest.mineru.owner-memory-dockerfile-sha256": sources["Dockerfile"],
+        "io.agent-invest.mineru.owner-memory-base-repo-digest": OWNER_MEMORY_BASE,
+        "io.agent-invest.mineru.owner-memory-context-sha256": diagnostic.context_sha256,
+    }
+    if (value["contract_version"] != "mineru.owner-memory-observation.v1"
+            or value["image_labels"] != expected_labels
+            or value["module_sha256"] != sources["mineru_inference_memory/worker.py"]
+            or value["actual_source_sha256"] != OWNER_MEMORY_PREIMAGES
+            or value["actual_diagnostic_source_sha256"] != {name: digest for name, digest in sources.items() if name != "Dockerfile"}):
+        raise ValueError("remote diagnostic image/module/source preimages drifted")
+    # Current container/process facts prove loading, but never enter stable R.
+    inference = observation.get("inference")
+    epoch = value["container_epoch"]
+    if (type(inference) is not dict or type(epoch) is not dict
+            or set(epoch) != {"container_id", "started_at"}
+            or re.fullmatch(r"[0-9a-f]{64}", str(epoch.get("container_id"))) is None
+            or type(epoch.get("started_at")) is not str
+            or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z", epoch["started_at"]) is None
+            or epoch != {key: inference.get(key) for key in ("container_id", "started_at")}):
+        raise ValueError("remote diagnostic container epoch is not the observed current epoch")
+    workers = value["loaded_workers"]
+    if type(workers) is not list or len(workers) != 1:
+        raise ValueError("remote diagnostic worker loading was not observed")
+    worker = workers[0]
+    fields = {"contract_version", "module_sha256", "worker_class", "pid", "proc_start_ticks", "device",
+              "instance_id", "observed_proc_start_ticks", "namespace_init_start_ticks"}
+    if (type(worker) is not dict or set(worker) != fields
+            or worker["contract_version"] != "mineru.owner-memory-identity.v1"
+            or worker["module_sha256"] != value["module_sha256"]
+            or worker["worker_class"] != diagnostic.worker_class or worker["device"] != "cuda:0"
+            or type(worker["pid"]) is not int or worker["pid"] <= 0
+            or type(worker["proc_start_ticks"]) is not int or worker["proc_start_ticks"] <= 0
+            or type(worker["observed_proc_start_ticks"]) is not int
+            or worker["proc_start_ticks"] != worker["observed_proc_start_ticks"]
+            or type(worker["namespace_init_start_ticks"]) is not int or worker["namespace_init_start_ticks"] <= 0
+            or worker["namespace_init_start_ticks"] > worker["proc_start_ticks"]
+            or type(worker["instance_id"]) is not str or not 1 <= len(worker["instance_id"]) <= 128):
+        raise ValueError("remote diagnostic loaded worker identity drifted")
+    return dict(value)
+
+
+
+def inference_diagnostic_config(proof: dict[str, Any], profile: MineruDeploymentProfile) -> dict[str, Any]:
+    """Stable source/config identity, excluding process and epoch observations."""
+
+    if profile.inference_diagnostic is None:
+        raise ValueError("diagnostic configuration requires a diagnostic profile")
+    return {
+        "contract_version": proof["contract_version"],
+        "image_labels": proof["image_labels"],
+        "module_sha256": proof["module_sha256"],
+        "actual_source_sha256": proof["actual_source_sha256"],
+        "actual_diagnostic_source_sha256": proof["actual_diagnostic_source_sha256"],
+        "worker_class": profile.inference_diagnostic.worker_class,
+    }

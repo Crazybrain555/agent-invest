@@ -167,6 +167,7 @@ def run_commissioning(
                             stop_requested=lambda: (
                                 stop_requested() or time.monotonic() >= deadline or extra_stop()
                             ),
+                            wait_for_stream_admission=True,
                         )
                         after = _documents(engine, document_ids)
                         outcomes = _outcomes(document_ids, before, after)
