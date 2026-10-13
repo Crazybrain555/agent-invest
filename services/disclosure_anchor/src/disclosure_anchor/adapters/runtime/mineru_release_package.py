@@ -8,6 +8,7 @@ package's own inputs; it needs neither Git nor a previous package.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -24,8 +25,10 @@ from disclosure_anchor.application.contracts.mineru_capacity_config import (
     decode_any_mineru_capacity_config,
 )
 from disclosure_anchor.application.contracts.mineru_deployment_profile import (
+    OWNER_MEMORY_RECLAIM_MODE,
     MineruDeploymentProfile,
     decode_mineru_deployment_profile,
+    inference_diagnostic_source_names,
 )
 from disclosure_anchor.application.contracts.mineru_local_worker_profile import (
     MineruLocalWorkerProfile,
@@ -36,6 +39,7 @@ from disclosure_anchor.application.contracts.mineru_release_manifest import (
     NATIVE_M6_PRODUCTION_SOURCES,
     RELEASE_MANIFEST_CONTRACT,
     DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT,
+    RECLAIM_RELEASE_MANIFEST_CONTRACT,
     RELEASE_PROJECTION_CONTRACT,
     TELEMETRY_SUPERVISOR_SOURCES,
     MineruReleaseManifest,
@@ -85,15 +89,22 @@ for _name in TELEMETRY_SUPERVISOR_SOURCES:
     RELEASE_SOURCE_FILES[f"windows/{_name}"] = f"scripts/windows/{_name}"
 for _name in NATIVE_M6_PRODUCTION_SOURCES:
     RELEASE_SOURCE_FILES[f"native-m6/{_name}"] = f"scripts/windows/{_name}"
-INFERENCE_SOURCE_FILES = {
-    "inference-context/Dockerfile": "scripts/windows/Dockerfile.mineru_owner_memory",
-    **{f"inference-context/mineru_inference_memory/{name}": f"scripts/windows/mineru_inference_memory/{name}"
-       for name in ("__init__.py", "core.py", "worker.py")},
-}
+def inference_source_files(mode: str) -> dict[str, str]:
+    """Package path to tracked path for one diagnostic mode's build context."""
+
+    return {
+        f"inference-context/{name}": ("scripts/windows/Dockerfile.mineru_owner_memory" if name == "Dockerfile"
+                                      else f"scripts/windows/{name}")
+        for name in inference_diagnostic_source_names(mode)
+    }
 
 
-def release_source_files(diagnostic: bool) -> dict[str, str]:
-    return {**RELEASE_SOURCE_FILES, **(INFERENCE_SOURCE_FILES if diagnostic else {})}
+def release_source_files(inference_mode: str | None) -> dict[str, str]:
+    return {**RELEASE_SOURCE_FILES, **({} if inference_mode is None else inference_source_files(inference_mode))}
+
+
+def _inference_sources(digest: Callable[[str], str], mode: str) -> dict[str, str]:
+    return {path.removeprefix("inference-context/"): digest(path) for path in inference_source_files(mode)}
 
 
 IMPLICIT_EXTERNAL_READ_PATTERNS = (
@@ -255,7 +266,9 @@ def build_release_package(
             continue
         blobs[path] = parts[2]
 
-    source_files = release_source_files(inputs.deployment_profile.inference_diagnostic is not None)
+    diagnostic = inputs.deployment_profile.inference_diagnostic
+    inference_mode = None if diagnostic is None else diagnostic.contract_version
+    source_files = release_source_files(inference_mode)
     files: dict[str, tuple[bytes, dict[str, str]]] = {}
     drift: list[str] = []
     candidates: list[tuple[str, str, Path, bytes]] = []
@@ -332,7 +345,11 @@ def build_release_package(
     native_sources = {name: digest(f"native-m6/{name}") for name in NATIVE_M6_PRODUCTION_SOURCES}
     built_at = (now or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     manifest = MineruReleaseManifest(
-        contract_version=(DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT if inputs.deployment_profile.inference_diagnostic is not None else RELEASE_MANIFEST_CONTRACT),
+        contract_version=(
+            RELEASE_MANIFEST_CONTRACT if inference_mode is None
+            else RECLAIM_RELEASE_MANIFEST_CONTRACT if inference_mode == OWNER_MEMORY_RECLAIM_MODE
+            else DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT
+        ),
         built_at_utc=built_at,
         source={"head": source_head, "tracked_scope_prefix": TRACKED_SCOPE_PREFIX,
                 "source_manifest_sha256": source_manifest_sha256},
@@ -374,10 +391,11 @@ def build_release_package(
             "telemetry_assembly_builder_sha256": digest("windows/build_mineru_telemetry_assembly.ps1"),
             "telemetry_assembly_loader_sha256": digest("windows/load_mineru_telemetry_assembly.ps1"),
         },
-        inference_build=(None if inputs.deployment_profile.inference_diagnostic is None else {
+        inference_build=(None if inference_mode is None else {
             "context": "inference-context",
-            "context_sha256": sha256_of(canonical_bytes({path.removeprefix("inference-context/"): digest(path) for path in INFERENCE_SOURCE_FILES})),
-            "sources": {path.removeprefix("inference-context/"): digest(path) for path in INFERENCE_SOURCE_FILES},
+            "context_sha256": sha256_of(canonical_bytes(_inference_sources(digest, inference_mode))),
+            "sources": _inference_sources(digest, inference_mode),
+            **({"mode": inference_mode} if inference_mode == OWNER_MEMORY_RECLAIM_MODE else {}),
         }),
         files=tuple(
             ReleaseFile(path=path, sha256=sha256_of(raw), bytes=len(raw), provenance=provenance)
@@ -385,7 +403,6 @@ def build_release_package(
         ),
     )
     if manifest.inference_build is not None:
-        diagnostic = inputs.deployment_profile.inference_diagnostic
         if diagnostic is None or manifest.inference_build["context_sha256"] != diagnostic.context_sha256:
             raise ReleaseIdentityError("diagnostic deployment profile context differs from the frozen source bytes")
     manifest_bytes = manifest.exact_bytes
@@ -445,7 +462,7 @@ def verify_release_package(package: Path, *, check_active_dependencies: bool = F
         present[entry.path] = raw
         if len(raw) != entry.bytes or sha256_of(raw) != entry.sha256:
             problems.append(f"{entry.path}: bytes differ from the manifest")
-    source_files = release_source_files(manifest.inference_build is not None)
+    source_files = release_source_files(manifest.inference_mode)
     listed = {entry.path for entry in manifest.files}
     for path in sorted(str(p.relative_to(package)).replace(os.sep, "/") for p in package.rglob("*") if p.is_file()):
         if path != MANIFEST_NAME and path not in listed:
@@ -531,11 +548,11 @@ def verify_release_package(package: Path, *, check_active_dependencies: bool = F
         return sha256_of(present[path])
 
     diagnostic = inputs.deployment_profile.inference_diagnostic
-    if (diagnostic is None) != (manifest.inference_build is None):
+    if (None if diagnostic is None else diagnostic.contract_version) != manifest.inference_mode:
         problems.append("inference build selection differs from the deployment profile")
     elif diagnostic is not None:
         assert manifest.inference_build is not None
-        sources = {path.removeprefix("inference-context/"): digest(path) for path in INFERENCE_SOURCE_FILES}
+        sources = _inference_sources(digest, diagnostic.contract_version)
         if sources != manifest.inference_build["sources"] or sha256_of(canonical_bytes(sources)) != diagnostic.context_sha256:
             problems.append("inference build sources differ from the deployment profile or packaged bytes")
     build = manifest.api_build

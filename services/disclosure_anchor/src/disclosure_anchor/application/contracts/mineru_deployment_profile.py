@@ -27,6 +27,10 @@ DEPLOYMENT_PROFILE_CONTRACT = "mineru.deployment-profile.v1"
 DIAGNOSTIC_DEPLOYMENT_PROFILE_CONTRACT = "mineru.deployment-profile.v2"
 OWNER_MEMORY_WORKER_CLASS = "mineru_inference_memory.worker.OwnerMemoryWorker"
 OWNER_MEMORY_MODE = "mineru.owner-memory.v1"
+# Observation plus the idle-cadenced owner release (``reclaim.py``), whose API
+# heartbeat vLLM loads with ``--middleware``.
+OWNER_MEMORY_RECLAIM_MODE = "mineru.owner-memory-reclaim.v1"
+OWNER_MEMORY_RECLAIM_MIDDLEWARE = "mineru_inference_memory.reclaim.OwnerMemoryReclaimMiddleware"
 OWNER_MEMORY_BASE = "mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458"
 OWNER_MEMORY_PREIMAGES = {
     "vllm/v1/worker/worker_base.py": "sha256:e6017acf80e442405f09f99413c0227515ae097d3e1dc79005b0b5c266932f12",
@@ -34,6 +38,26 @@ OWNER_MEMORY_PREIMAGES = {
     "vllm/v1/worker/gpu_model_runner.py": "sha256:95b7ee3ff5eecdb0fa791f375b2aeedc6ac507f3ea4a9683700d3b202b2caf08",
     "vllm/v1/worker/gpu/mm/encoder_runner.py": "sha256:909181912d39bf4734d5202340a77813252136bc1f38c458f879b05743a522bf",
 }
+# The reclaim mode also pins the engine utility dispatch and the uni executor's
+# same-thread worker call that its owner-thread release relies on.
+OWNER_MEMORY_RECLAIM_PREIMAGES = {
+    **OWNER_MEMORY_PREIMAGES,
+    "vllm/v1/engine/core.py": "sha256:53ff4df24745e3ac4ac09028ddeb310f6627b90f6374dbfa82548e97c9bc65bc",
+    "vllm/v1/executor/uniproc_executor.py": "sha256:93fac0cbecffb9800b1a90746fd179bfdc7c61bf22c6c1337ebe0d917157f247",
+}
+_DIAGNOSTIC_PACKAGE_FILES = {
+    OWNER_MEMORY_MODE: ("__init__.py", "core.py", "worker.py"),
+    OWNER_MEMORY_RECLAIM_MODE: ("__init__.py", "core.py", "reclaim.py", "worker.py"),
+}
+
+
+def inference_diagnostic_source_names(mode: str) -> tuple[str, ...]:
+    """The exact build-context source names of one diagnostic mode, Dockerfile first."""
+
+    files = _DIAGNOSTIC_PACKAGE_FILES.get(mode)
+    if files is None:
+        raise ValueError("inference diagnostic mode is unsupported")
+    return ("Dockerfile", *(f"mineru_inference_memory/{name}" for name in files))
 _MAX_BYTES = 16 * 1024
 _FIELDS = frozenset({
     "contract_version",
@@ -93,13 +117,26 @@ class InferenceDiagnostic:
     worker_class: str
 
     def __post_init__(self) -> None:
-        if self.contract_version != OWNER_MEMORY_MODE or self.worker_class != OWNER_MEMORY_WORKER_CLASS:
+        if (self.contract_version not in _DIAGNOSTIC_PACKAGE_FILES
+                or self.worker_class != OWNER_MEMORY_WORKER_CLASS):
             raise ValueError("inference diagnostic selection is unsupported")
         require_sha256(self.context_sha256, label="inference diagnostic context sha256")
 
     @property
     def image_reference(self) -> str:
         return "agent-invest/mineru-inference:owner-memory-" + self.context_sha256[7:]
+
+    @property
+    def reclaim(self) -> bool:
+        return self.contract_version == OWNER_MEMORY_RECLAIM_MODE
+
+    @property
+    def source_names(self) -> tuple[str, ...]:
+        return inference_diagnostic_source_names(self.contract_version)
+
+    @property
+    def preimages(self) -> dict[str, str]:
+        return dict(OWNER_MEMORY_RECLAIM_PREIMAGES if self.reclaim else OWNER_MEMORY_PREIMAGES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,8 +243,13 @@ __all__ = [
     "DEPLOYMENT_PROFILE_CONTRACT",
     "DIAGNOSTIC_DEPLOYMENT_PROFILE_CONTRACT",
     "InferenceDiagnostic",
+    "OWNER_MEMORY_MODE",
+    "OWNER_MEMORY_RECLAIM_MODE",
+    "OWNER_MEMORY_RECLAIM_MIDDLEWARE",
     "OWNER_MEMORY_WORKER_CLASS",
     "OWNER_MEMORY_PREIMAGES",
+    "OWNER_MEMORY_RECLAIM_PREIMAGES",
+    "inference_diagnostic_source_names",
     "verify_inference_diagnostic",
     "inference_diagnostic_config",
     "InferenceDeclaredDefaults",
@@ -219,11 +261,13 @@ def verify_inference_diagnostic(observation: dict[str, Any], profile: Any, sourc
     if type(profile) is not MineruDeploymentProfile:
         raise ValueError("diagnostic deployment profile must use the exact type")
     profile.__post_init__()
-    require_fields(sources, {"Dockerfile", "mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py"}, label="diagnostic context sources")
+    diagnostic = profile.inference_diagnostic
+    if diagnostic is None:
+        raise ValueError("diagnostic context differs from deployment input")
+    require_fields(sources, set(diagnostic.source_names), label="diagnostic context sources")
     for name, digest in sources.items():
         require_sha256(digest, label=name)
-    diagnostic = profile.inference_diagnostic
-    if diagnostic is None or sha256_of(canonical_bytes(sources)) != diagnostic.context_sha256:
+    if sha256_of(canonical_bytes(sources)) != diagnostic.context_sha256:
         raise ValueError("diagnostic context differs from deployment input")
     value = observation.get("inference_diagnostic")
     if type(value) is not dict or set(value) != {"contract_version", "image_labels", "module_sha256", "actual_source_sha256", "actual_diagnostic_source_sha256", "loaded_workers", "container_epoch"}:
@@ -237,7 +281,7 @@ def verify_inference_diagnostic(observation: dict[str, Any], profile: Any, sourc
     if (value["contract_version"] != "mineru.owner-memory-observation.v1"
             or value["image_labels"] != expected_labels
             or value["module_sha256"] != sources["mineru_inference_memory/worker.py"]
-            or value["actual_source_sha256"] != OWNER_MEMORY_PREIMAGES
+            or value["actual_source_sha256"] != diagnostic.preimages
             or value["actual_diagnostic_source_sha256"] != {name: digest for name, digest in sources.items() if name != "Dockerfile"}):
         raise ValueError("remote diagnostic image/module/source preimages drifted")
     # Current container/process facts prove loading, but never enter stable R.
@@ -275,13 +319,19 @@ def verify_inference_diagnostic(observation: dict[str, Any], profile: Any, sourc
 def inference_diagnostic_config(proof: dict[str, Any], profile: MineruDeploymentProfile) -> dict[str, Any]:
     """Stable source/config identity, excluding process and epoch observations."""
 
-    if profile.inference_diagnostic is None:
+    diagnostic = profile.inference_diagnostic
+    if diagnostic is None:
         raise ValueError("diagnostic configuration requires a diagnostic profile")
-    return {
+    config = {
         "contract_version": proof["contract_version"],
         "image_labels": proof["image_labels"],
         "module_sha256": proof["module_sha256"],
         "actual_source_sha256": proof["actual_source_sha256"],
         "actual_diagnostic_source_sha256": proof["actual_diagnostic_source_sha256"],
-        "worker_class": profile.inference_diagnostic.worker_class,
+        "worker_class": diagnostic.worker_class,
     }
+    if diagnostic.reclaim:
+        # Only the reclaim mode adds keys; the observation identity is unchanged.
+        config["mode"] = diagnostic.contract_version
+        config["middleware"] = OWNER_MEMORY_RECLAIM_MIDDLEWARE
+    return config

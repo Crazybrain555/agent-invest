@@ -1,7 +1,8 @@
 FROM mineru@sha256:109016f8f7666c3a86b0a6585f5b7003d1dd63c2d318f6ecd7ab1db5aa582458
 
-# The existing installer binds all four context files and records the built
-# image ID. No dependency install, model download or CUDA import occurs here.
+# The existing installer binds every context file of the selected mode and
+# records the built image ID. No dependency install, model download or CUDA
+# import occurs here.
 COPY mineru_inference_memory/ /tmp/mineru_inference_memory/
 RUN test ! -e /usr/local/lib/python3.12/dist-packages/mineru_inference_memory \
     && install -d -o root -g root -m 0555 /usr/local/lib/python3.12/dist-packages/mineru_inference_memory \

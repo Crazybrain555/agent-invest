@@ -42,7 +42,7 @@ can enter it.
 | `stage_fault` | stage call | `<lane>_unexpected_failure`, `stage_lease_lost` |
 | `deadline_exhausted` | stage call / coordinator | `bounded_stage_deadline_exceeded` |
 | `ownership_lost` | coordinator / startup recovery | `claim_renewal_failed`, `in_flight_claim_lost`, `in_flight_claim_reconcile_failed`, `process_guard_failed`, `singleton_lost` |
-| `coordinator_circuit` | coordinator / resident | `retry_stage_stuck`, `durable_transition_contract_violation`, `unsupported_durable_state`, `admission_interrupted`, `admission_*_contract_violation`, `resource_credit_grant_unavailable`, `stream_pressure_closed`, `native_storage_hold`, `transfer_integrity_hold`, `stage_grant_unsatisfiable`, `capacity_holds_exhausted`, `unclassified_circuit` |
+| `coordinator_circuit` | coordinator / resident | `retry_stage_stuck`, `durable_transition_contract_violation`, `unsupported_durable_state`, `admission_interrupted`, `admission_*_contract_violation`, `resource_credit_grant_unavailable`, `stream_pressure_closed`, `stream_idle_gpu_memory_deficit`, `stream_idle_host_memory_deficit`, `stream_idle_gpu_host_memory_deficit` (mineru-stream-admission.md), `native_storage_hold`, `transfer_integrity_hold`, `stage_grant_unsatisfiable`, `capacity_holds_exhausted`, `unclassified_circuit` |
 | `coordinator_fault` | coordinator / resident | `controller_unexpected_failure`, `coordinator_run_failed` |
 | `maintenance_fatal` | maintenance | `maintenance_loop_failed` |
 | `startup_fatal` | startup recovery / staged startup | `startup_recovery_failed`, `staged_startup_verification_failed`, `execution_upgrade_scope_failed` (local-execution-upgrade.md) |

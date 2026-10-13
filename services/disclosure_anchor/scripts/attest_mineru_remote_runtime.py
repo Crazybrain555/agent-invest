@@ -1180,8 +1180,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.deployment_profile is not None:
         from disclosure_anchor.application.contracts.mineru_deployment_profile import decode_mineru_deployment_profile
         deployment_profile = decode_mineru_deployment_profile(args.deployment_profile.read_bytes())
+        if deployment_profile.inference_diagnostic is None:
+            parser.error("inference context requires a diagnostic deployment profile")
         inference_sources = {name: "sha256:" + hashlib.sha256((args.inference_context / name).read_bytes()).hexdigest()
-                             for name in ("Dockerfile", "mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py")}
+                             for name in deployment_profile.inference_diagnostic.source_names}
     expected_compat_patcher_sha256 = (
         "sha256:" + hashlib.sha256(args.compat_patcher_source.read_bytes()).hexdigest()
     )

@@ -693,7 +693,7 @@ container ID、StartedAt 与 image ID 均未改变。以上供应链约束不等
 
 - **触发**：staged V4 语义 `failed_closed`（如 `forbidden_tool_call`）、未能对账的 claim/lease 丢失、
   stage/claim 截止、协调器 circuit（重试预算耗尽、持久转移契约违例、credit 不可得、stream pressure
-  关闭、admission 中断；容量 hold 中单个 attempt 自己解不开的：`native_storage_hold`、
+  关闭、空闲内存短缺超时 `stream_idle_*_memory_deficit`（见下文 reclaim 一节）、admission 中断；容量 hold 中单个 attempt 自己解不开的：`native_storage_hold`、
   `transfer_integrity_hold`、`stage_grant_unsatisfiable`、`capacity_holds_exhausted`，见 §1.1h）、
   控制器/维护/启动恢复致命错误。第一个原因不可覆盖。worker 依次 latch 停止
   所有平面、对受监督根绑定的 label `launchctl disable` 并回读（launchd 或手工启动都一样；其它根不调用
@@ -1406,3 +1406,27 @@ python -m disclosure_anchor.cli.mineru_release install \
 未知 daemon 结果保持 writes closed，按既有只读 reconciliation 处理，不自动重复 build/recreate/rollback。
 安装通过后继续执行新实际 attestation、完整 qualification/epoch bracket、G5、bind 和 deployment preflight，
 再由 root 恢复普通 producer。source/image/worker 加载证据不足或任何旧职责未关闭均拒绝部署。
+
+### owner-memory reclaim 模式与空闲内存短缺停止
+
+机制与限制见 `../checks/gpu-owner-memory.md` 的 Reclaim mode 和 `../design/mineru-stream-admission.md`。
+reclaim 包使用 v2 deployment profile 的 `mineru.owner-memory-reclaim.v1` 与 `m6.release.v3`；首次安装或
+源码变化同上走零职责 full install，同一已安装包可用 same-config `inference-recreate`。
+
+- **核对加载**：推理容器日志依次出现 vLLM non-default args 中的 `--worker-cls` 与 `--middleware`、
+  `MINERU_GPU_OWNER_MEMORY` startup、`MINERU_GPU_OWNER_RECLAIM` 的 `heartbeat_start`，以及首次调用后的
+  `bound`。缺少 `heartbeat_start` 即没有空闲释放；`heartbeat_stop` 说明心跳已终止（原因字段），只有重建
+  推理容器才会重新开始，不能当作已修复。
+- **读取释放**：每段 owner 空闲至多一条 `reclaim` 记录（`released`/`no_benefit`/`failed`），附前后分配器
+  计数与设备级 free；整卡 free 另以 Windows exporter 的时间戳读数单独对照，不相减。`failed` 后 owner 锁定
+  不再释放，CUDA 异常同时出现在 vLLM 的 utility 失败日志中。
+- **空闲短缺停止**：worker 公共停止原因为 `coordinator_circuit` 加 `stream_idle_gpu_memory_deficit`、
+  `stream_idle_host_memory_deficit` 或 `stream_idle_gpu_host_memory_deficit` 时，表示新 POST 关闭、provider
+  空闲、内存低于原恢复下限的已证实时长达到 `stream_idle_deficit_stop_seconds`；已接受任务与 tail/ACK
+  已排空，prepared 责任仍保留。
+  1. 任何恢复前先保存推理容器的 owner 记录（`MINERU_GPU_OWNER_MEMORY`/`MINERU_GPU_OWNER_RECLAIM`）、
+     exporter 与 API 压力样本，不清理 control 文件或业务数据。
+  2. GPU 或 GPU+host：查看最后的 `reclaim` 记录与心跳状态，再由 root 走同配置 `inference-recreate`
+     （其自身的 producer 排他与远端静默门照常适用，不要求本地 prepared 为零）及新的 qualification/bind。
+     host：先找出并处理宿主内存占用，不以重建推理冒充 host 修复。
+  3. 按 §1.1f 用 hash 绑定的放行解除停止。不降低 floor、不循环重启、不删除或重建职责。

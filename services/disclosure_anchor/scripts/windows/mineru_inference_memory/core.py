@@ -6,6 +6,8 @@ runtime, tensor type and vLLM output types, and calls the hooks only from the
 engine thread that initialized the worker's device. Every value comes from
 allocator bookkeeping or tensor metadata; nothing synchronizes the device,
 collects garbage, releases cached blocks or changes allocator settings.
+``OwnerMemoryMonitor.idle_evidence`` only reports the owner's own hook
+timeline; the separately reviewed ``reclaim`` module decides and acts on it.
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ MAX_SOURCE_BYTES = 4 * 1024 * 1024
 OWNER_IDENTITY_PATH = Path("/tmp/mineru-owner-memory/owner.json")
 OWNER_IDENTITY_CONTRACT = "mineru.owner-memory-identity.v1"
 OWNER_WORKER_CLASS = "mineru_inference_memory.worker.OwnerMemoryWorker"
+# The reclaim mode's collective_rpc target on OwnerMemoryWorker.
+RECLAIM_METHOD = "mineru_owner_memory_reclaim"
 MAX_OWNER_IDENTITY_BYTES = 16 * 1024
 
 EXPECTED_VLLM_VERSION = "0.21.0"
@@ -595,6 +599,24 @@ class _Owner:
     device_index: int
 
 
+@dataclass(frozen=True)
+class IdleEvidence:
+    """The owner's hook timeline at one instant; never a proof of global idle.
+
+    ``last_step`` is ``None`` when no step ran since warmup, ``cleanup`` when the
+    last step scheduled no tokens and returned a final output, else ``work``.
+    """
+
+    owner_call: bool
+    warm: bool
+    instance: str
+    pid: int | None
+    device_index: int | None
+    quiet_ns: int | None
+    last_return_ns: int | None
+    last_step: str | None
+
+
 class OwnerMemoryMonitor:
     """Worker hooks. Startup binding may raise; serving-path hooks never do.
 
@@ -634,6 +656,8 @@ class OwnerMemoryMonitor:
         self._last_record_ns: int | None = None
         self._last_return_ns: int | None = None
         self._previous_output: str | None = None
+        self._step_tokens: int | None = None
+        self._last_step: str | None = None
         self._activity = _Activity()
         self._foreign_calls = 0
         self._foreign_reported = False
@@ -673,6 +697,24 @@ class OwnerMemoryMonitor:
         write_owner_identity(OWNER_IDENTITY_PATH if path is None else path, identity)
         return identity
 
+    def idle_evidence(self) -> IdleEvidence:
+        """Read-only view for an owner-thread caller; no CUDA call and no record."""
+        owner = self._owner
+        owner_call = (owner is not None and self._getpid() == owner.pid
+                      and self._thread_ident() == owner.thread)
+        last = self._last_return_ns
+        now = self._clock_ns()
+        return IdleEvidence(
+            owner_call=owner_call,
+            warm=self._warm,
+            instance=self._instance,
+            pid=None if owner is None else owner.pid,
+            device_index=None if owner is None else owner.device_index,
+            quiet_ns=None if last is None or now < last else now - last,
+            last_return_ns=last,
+            last_step=self._last_step,
+        )
+
     def after_warmup(self) -> None:
         self._guard("post_warmup", self._after_warmup)
 
@@ -698,8 +740,12 @@ class OwnerMemoryMonitor:
         owner = self._owner_call("step_entry") if self._warm else None
         if owner is None:
             return
+        # A step is in progress until its return is classified.
+        self._last_step = "work"
+        self._step_tokens = None
         now = self._clock_ns()
         summary = summarize_scheduler_output(scheduler_output)
+        self._step_tokens = summary["tokens"]
         if self._periodic_due(now):
             quiet = None if self._last_return_ns is None else now - self._last_return_ns
             context = {
@@ -718,12 +764,17 @@ class OwnerMemoryMonitor:
         owner = self._owner_call("step_return") if self._warm else None
         if owner is None:
             return
+        self._last_step = "work"
         now = self._clock_ns()
         self._last_return_ns = now
         if result is None and not sampled:
             return  # execute_model deferred this step's output to sample_tokens.
         kind = self._output_kind(result)
         self._previous_output = kind
+        # The scheduler reports finished requests in one zero-token schedule
+        # whose execute_model returns a final output; any other return is work.
+        if not sampled and kind == "final" and self._step_tokens == 0:
+            self._last_step = "cleanup"
         if self._first_use == "pending":
             self._first_use = "done"
             self._sample(owner, "first_use", now, {"output": kind})

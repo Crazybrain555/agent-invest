@@ -20,10 +20,22 @@ from disclosure_anchor.application.contracts.closed_document import (
     require_str,
     sha256_of,
 )
+from disclosure_anchor.application.contracts.mineru_deployment_profile import (
+    OWNER_MEMORY_MODE,
+    OWNER_MEMORY_RECLAIM_MODE,
+    inference_diagnostic_source_names,
+)
 
 
 RELEASE_MANIFEST_CONTRACT = "m6.release.v1"
 DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT = "m6.release.v2"
+# The owner-memory reclaim mode; its inference build names the mode, and v2
+# keeps the observation mode's exact build fields.
+RECLAIM_RELEASE_MANIFEST_CONTRACT = "m6.release.v3"
+_INFERENCE_MANIFEST_CONTRACTS = {
+    DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT: OWNER_MEMORY_MODE,
+    RECLAIM_RELEASE_MANIFEST_CONTRACT: OWNER_MEMORY_RECLAIM_MODE,
+}
 RELEASE_PROJECTION_CONTRACT = "m6.release-projection.v1"
 _MAX_BYTES = 256 * 1024
 _FIELDS = frozenset({
@@ -104,17 +116,23 @@ class MineruReleaseManifest:
         if self.contract_version == RELEASE_MANIFEST_CONTRACT:
             if self.inference_build is not None:
                 raise ValueError("raw release cannot contain an inference build")
-        elif self.contract_version == DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT:
+        elif self.contract_version in _INFERENCE_MANIFEST_CONTRACTS:
+            mode = _INFERENCE_MANIFEST_CONTRACTS[self.contract_version]
             build = self.inference_build
             if not isinstance(build, dict):
                 raise ValueError("diagnostic release requires an inference build object")
-            require_fields(build, {"context", "context_sha256", "sources"}, label="inference build")
+            fields = {"context", "context_sha256", "sources"}
+            if mode == OWNER_MEMORY_RECLAIM_MODE:
+                fields.add("mode")
+            require_fields(build, fields, label="inference build")
+            if build.get("mode", mode) != mode:
+                raise ValueError("inference build mode differs from the release contract")
             if build["context"] != "inference-context":
                 raise ValueError("inference build context is unsupported")
             require_sha256(build["context_sha256"], label="inference context sha256")
             if type(build["sources"]) is not dict:
                 raise ValueError("inference build sources must be an object")
-            require_fields(build["sources"], {"Dockerfile", "mineru_inference_memory/__init__.py", "mineru_inference_memory/core.py", "mineru_inference_memory/worker.py"}, label="inference sources")
+            require_fields(build["sources"], set(inference_diagnostic_source_names(mode)), label="inference sources")
             for name, digest in build["sources"].items():
                 require_sha256(digest, label=name)
             if sha256_of(canonical_bytes(build["sources"])) != build["context_sha256"]:
@@ -223,6 +241,11 @@ class MineruReleaseManifest:
     def sha256(self) -> str:
         return sha256_of(self.exact_bytes)
 
+    @property
+    def inference_mode(self) -> str | None:
+        """The diagnostic inference mode this release builds, or None for raw inference."""
+        return _INFERENCE_MANIFEST_CONTRACTS.get(self.contract_version)
+
 
 def native_source_manifest_sha256(sources: dict[str, str]) -> str:
     """The native suite's production manifest digest: ``name sha`` lines in list order plus a trailing newline."""
@@ -239,7 +262,7 @@ def capacity_sources_sha256(sources: dict[str, str]) -> str:
 
 def decode_mineru_release_manifest(payload: bytes) -> MineruReleaseManifest:
     value = load_closed_object(payload, label="release manifest", maximum_bytes=_MAX_BYTES)
-    fields_expected = _FIELDS | {"inference_build"} if value.get("contract_version") == DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT else _FIELDS
+    fields_expected = _FIELDS | {"inference_build"} if value.get("contract_version") in _INFERENCE_MANIFEST_CONTRACTS else _FIELDS
     require_fields(value, fields_expected, label="release manifest")
     files = value["files"]
     if type(files) is not list:
@@ -261,6 +284,8 @@ def decode_mineru_release_manifest(payload: bytes) -> MineruReleaseManifest:
 __all__ = [
     "CAPACITY_SOURCE_NAMES",
     "NATIVE_M6_PRODUCTION_SOURCES",
+    "DIAGNOSTIC_RELEASE_MANIFEST_CONTRACT",
+    "RECLAIM_RELEASE_MANIFEST_CONTRACT",
     "RELEASE_MANIFEST_CONTRACT",
     "RELEASE_PROJECTION_CONTRACT",
     "TELEMETRY_SUPERVISOR_SOURCES",

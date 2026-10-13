@@ -174,12 +174,22 @@ API-only `ApiDeviceProfile` transition 参数；独立 full device expectation �
 `m6.release.v2` 在既有 inventory/provenance 中加入 `inference-context/` 四个源文件及 `inference_build` 源映射，
 照常要求冻结 tracked source 与执行中 generator 完全相等。dirty checkout 不能借用旧 HEAD 表述新源码。
 
+`inference_diagnostic.contract_version` 也可为 `mineru.owner-memory-reclaim.v1`（同一 worker class）：
+context 在上述四个文件外加 `mineru_inference_memory/reclaim.py`，release 使用 `m6.release.v3`，其
+`inference_build` 封闭字段为 `context`/`context_sha256`/`sources`/`mode`，`mode` 必须等于该模式；
+`m6.release.v2` 及观察模式的字段、argv、源前像和 server-config 字节保持不变。reclaim 模式的 argv 在
+`--worker-cls` 后追加 `--middleware mineru_inference_memory.reclaim.OwnerMemoryReclaimMiddleware`；
+实际 vLLM 源前像在观察模式四个文件外加 `vllm/v1/engine/core.py` 与 `vllm/v1/executor/uniproc_executor.py`；
+server-config 的 `diagnostic` 额外记录 `mode` 与 `middleware`。wrapper 只对 v3 向安装器传 `-InferenceOwnerReclaim`，
+安装器与 collector 的内容探针列出实际安装的 `.py` 文件，且仅在 `reclaim.py` 存在时哈希这两个引擎源，
+由 Mac 按声明模式做精确比较。机制与限制见 `../checks/gpu-owner-memory.md` 的 Reclaim mode。
+
 同一诊断包的 `inference-recreate` 继续使用既有 same-config 分支：active compose/collector、已安装
 receipt 的 context/source/image ID、实际 image/source/loaded-worker 全部相等才可进入，禁止重建/retag/source change；
 仍保留 API/proxy epoch 与 root/registry witness。首次或不同诊断源则必须 full install。
 
-诊断 Compose 只替换 inference image 并追加封闭 `--worker-cls`，proxy 继续使用原 raw digest；模型、依赖、
-容量、并发、显存比例与 floor 不变。既有 full branch 在 full up 前构建并内容探测派生镜像，记录真实 image ID、
+诊断 Compose 只替换 inference image 并追加封闭 `--worker-cls`（reclaim 模式再加封闭 `--middleware`），
+proxy 继续使用原 raw digest；模型、依赖、容量、并发、显存比例与 floor 不变。既有 full branch 在 full up 前构建并内容探测派生镜像，记录真实 image ID、
 模块及实际 vLLM 源前像，再使用既有备份/registry witness/full deployment/unknown 处理。
 旧 compose、collector、receipt 保留精确 backup；不得删 consumed tombstone 或原件来制造 quiescence。
 API/proxy epoch 可变化，其实际结果进入新 qualification；不新增 U01 或 inference 业务兼容关系。
